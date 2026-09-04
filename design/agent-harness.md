@@ -1,15 +1,15 @@
 # Agent harness: conversations as commit chains — design note
 
 > **Historical context only.** The authoritative chat design is
-> [`chat.md`](chat.md). The schemas and ref layouts described below document
-> the superseded prototype; the current design does not read or migrate them.
-> Current chat is isolated below `refs/caos/v2/`; the old unversioned refs may
-> remain in place and are invisible to the v2 clients.
+> [`chat.md`](chat.md) (v3). The schemas and ref layouts described below
+> document the superseded prototype; the current design does not read or
+> migrate them. Current chat is isolated below `refs/caos/v3/`; the old
+> refs may remain in place and are invisible to the v3 clients.
 
 **Status:** historical for conversation storage and turn lifecycle. The
 run-then, tool, and model-loop background remains useful, but the commit shapes,
 multi-ref protocol, progress/status refs, and client ownership described below
-were superseded by the single append-only event log in `chat.md`. Treat that
+were superseded by the conversation spine in `chat.md`. Treat that
 document and the current code as normative; this note is retained as the
 implementation history that led to them. The implemented background includes
 run-then and first-class commits, the bounded bash tool
@@ -437,4 +437,4 @@ deadlines are comfortable; the top-level pending timeout
 8. **Talk while thinking** — interjections as a second commit branch that the
    turn merge reconciles: steer a running turn at round boundaries via a
    client→worker `-inject` ref, mirror of the progress ref. **Design**
-   (`talk-while-thinking.md`).
+   (historical `talk-while-thinking.md`, since removed).

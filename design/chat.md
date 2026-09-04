@@ -1,353 +1,192 @@
-# Chat: durable conversation log
+# Chat v3: conversation and code as separate histories
 
-**Status:** implemented except for the items under Deferred work.
+**Status:** implemented through subagents and branch-only publication.
+Selected solely by the `refs/caos/v3/` namespace; v2 refs stay untouched
+and invisible. The binding definition is the code:
+`rust/crates/conversation-protocol/src/v3/` (records, kinds, paths,
+validation) and its golden fixture (`fixtures.rs`), which pins the bytes.
 
-Chat v2 is selected solely by the `refs/caos/v2/` namespace. Events contain no
-version field. Existing unversioned chat refs remain untouched and invisible to
-the new UI: there is no migration, compatibility reader, or requirement to
-delete old data.
+## Conversation, workspace, and publication roles
 
-## Distilled
+| Plane | Meaning | Where |
+| --- | --- | --- |
+| `C` | conversation | commits under `refs/caos/v3/conversations/<key>/head` |
+| `W` | workspace code | ordinary git history, named by sha from `C` |
+| `P` | publication | the selected `W` commit at `refs/heads/caos/<conversation-id>` under the current `preserve` policy |
 
-A conversation is one append-only ref:
+A `C` commit is `tree` = the complete conversation state, `parent` = the
+previous `C` (the source `C` for a fork, the fixed v3 genesis commit
+`G3` for a `conversation.root`),
+`message` = the transition kind, one word. No `C` parents a code commit:
+the two DAGs are joined only by shas written inside `C`'s tree.
 
-```text
-refs/caos/v2/conversations/<id>/head
+Invariants:
+
+1. Every `C` has exactly one parent; its tree holds `.caos/` and, when
+   nonempty, `files/`; `git log` never enters code history.
+2. Every change is explained: the kind fixes the delta; a no-op is invalid.
+3. Code is named by sha in `C`'s records and fetched by oid. Nothing is
+   kept alive by a parent edge; gc protection is not built (the server
+   collects nothing yet).
+4. `W` and `P` are code roles: no `G3` ancestry, never parsed as
+   conversation trees. Ordinary code commits need no format conversion.
+   The host currently rejects workspace inputs containing reserved `.caos`
+   entries other than `.caos/conflicts`; publication rejects any `.caos`
+   entry. These are host restrictions in addition to the protocol's records.
+5. Refs only name heads: a conversation or subagent head, a membership,
+   a published branch. Everything else is an exact sha, resolved before
+   it enters a content-addressed key.
+6. Publication leaves workspace pointers unchanged. It appends publication
+   records to `C` and updates the remote published branch; it rewrites no
+   conversation history. `preserve` creates no additional code commits.
+7. The transcript is append-only.
+
+## Refs and keys
+
+```
+refs/caos/v3/conversations/<hex(id)>/head
+refs/caos/v3/users/<hex(user)>/conversations/{active,archived}/<hex(id)>
+refs/heads/caos/<id>                       (publication, on origin)
 ```
 
-Its first-parent history is the ordered event log, and each event's tree is the
-workspace at that point. This ref is the only authority for transcript and run
-state. Titles and per-user sidebar membership are separate presentation state;
-workers and replay never consult them.
+Heads advance only by exact-oid leased CAS (concurrency control, not
+validation). A membership ref's existence is the fact; its value is a
+stale-tolerant hint. The server is conversation-agnostic
+(`client-owned-conversation-refs.md`); repair treats `refs/caos/v3/` as
+target-only and never rewinds it through the reflog.
 
-Every event message is a JSON object. Every event has a first parent, including
-the oldest event: that root records `base`, equal to its first parent, and replay
-stops there. A fork instead first-parents its source event, records the same
-commit as `forked_from`, and inherits the source's root. It never creates a
-second `base`. Readers validate the event spine through that explicit boundary
-and reject a missing or inconsistent root rather than guessing where ordinary
-Git history begins. Writers validate new events before appending them, and
-readers fail loudly if an invalid boundary reaches the log.
+## The tree
 
-Writers advance the head with an exact compare-and-swap (CAS): ordinary
-`git push --force-with-lease` names the head they observed. Commit messages,
-trees, and the append-only event discipline are opaque to the server.
-A losing writer reloads the canonical head and reconciles according to the
-event: text-only events can be rebuilt on the new tip, while independent
-workspace changes require a three-way merge. There is deliberately no generic
-"force the losing commit on top" rule.
-
-A foreground turn is admitted as two commits published by one head update. The
-user event `B` plus the chosen `llm-step` configuration determines request hash
-`R`; its immediate child `C` records `request: R`, `request_head: B`, and
-`status: queued`. `R` is the sole run identity. A worker can claim it only after
-verifying that exact relationship on the canonical spine. Interjections append
-to the same history without acquiring lifecycle ownership. Any follower that
-sees an admitted queued or running request can safely submit `R` again, so
-dispatch loss and server restart do not require unique client state.
-
-Model steps, tool calls, results, and lifecycle changes are events on that same
-log. Ordinary tools suspend the turn and are serial: the call is recorded before
-execution, and its result before the next model step. Independent work has a
-deterministic wrapper request `Q`; repeating `run_async` reads its durable status
-and eventual ordinary CAOS result.
-
-Three invariants organize the design:
-
-1. Record an action before launching it and a result before consuming it.
-2. Accepted events become reachable immediately and survive client loss.
-3. Conversation heads advance only along first-parent history by CAS.
-
-## With details
-
-### Ref layout and compatibility boundary
-
-The canonical and auxiliary refs are:
-
-```text
-refs/caos/v2/conversations/<id>/head
-refs/caos/v2/conversations/<id>/title
-refs/caos/v2/users/<user-key>/conversations/active/<conversation-key>
-refs/caos/v2/users/<user-key>/conversations/archived/<conversation-key>
+```
+.caos/format                  "3"
+.caos/identity.json           id, kind, optional owner (parent/head/request/round/tool for a child)
+.caos/title
+.caos/workspaces/<name>/{commit,initial[,origin]}   bare shas
+.caos/transcript/<shard>/<ordinal>-<message-id>.json  + payload dir
+.caos/requests/<id>.json      .caos/requests/active
+.caos/tools/<request>/<round>/<call-id>.json  + payload dir
+.caos/async/  .caos/subagents/  .caos/publications/
+files/                        conversation-owned files
 ```
 
-Only this namespace participates in discovery, following, and writes. Clients
-assign conversation meaning and append-only discipline to these ordinary Git
-refs; the server does not. Clients coordinate title and membership refs with
-atomic leases. The reader does not parse, rename, import, or republish the old
-unversioned layout.
+Records are canonical JSON (sorted keys, integers only, LF); protocol
+ids are `SHA-256("caos-v3-id\0" || tag || 0 || canonical)`.
 
-The head is durable execution state. Title and membership refs support the UI
-only. A single case-sensitive user identity is used for message attribution and
-membership. Canonical head and title refs embed the validated conversation ID
-directly; membership ref paths use reversible, lowercase hexadecimal encodings
-of user and conversation IDs so arbitrary display values cannot introduce path
-components or file/directory collisions. Active and archived membership for
-the same user and conversation are mutually exclusive. The particular UI
-commands and environment fallbacks used to select an identity are outside this
-design.
+The protocol accepts an explicit workspace map, including zero or multiple
+workspaces. The host currently creates one: the TUI defaults to `main` at
+the local default branch tip; the CLI defaults to `HEAD`, or uses `--base`.
+With an explicit base its workspace is named `main`; otherwise the CLI
+uses the default branch name, the current branch name, or `main` as a
+fallback. The selected code commit is adopted without rewriting it.
 
-### Event and replay contract
+## Host and launcher inputs
 
-An event commit has:
+Separate histories do not yet make launching independent of the checkout.
+The host resolves `DEEP-DEPS/llm-step` and `DEEP-DEPS/llm-call` by evaluating
+its local tracked working tree. In this repository the root `.caos-expr`
+expands the root `DEPS` declarations into those mounts. The checkout's
+`.caos-secrets/` store grants the model key to those paths; absent readers
+grant nothing. The host also
+snapshots local `main`/`master` refs for the merge tool and publishes through
+the checkout's `origin` remote.
 
-- first parent = the preceding event, except that the root first-parents the
-  ordinary workspace base and a fork marker first-parents its source event;
-- tree = the workspace after the event, plus reserved `.caos` state;
-- message = one JSON object describing one or more compatible projections.
+These inputs come from the host checkout, which may differ from the selected
+workspace commit. An independent launcher supplying harness, secret, and
+repository inputs remains a followup.
 
-A root user event is schematically:
+## Transitions
 
-```json
-{
-  "base": "0123456789abcdef0123456789abcdef01234567",
-  "author": "user",
-  "username": "Ada",
-  "content": "Fix the race."
-}
+Twenty-three kinds, each a one-word commit message:
+
+```
+conversation.root  conversation.fork  metadata.title.set
+message.append     request.admit  request.claim  request.interject
+request.escape     request.terminal   model.complete
+tool.start         tool.complete      files.apply
+workspace.create   workspace.rollback workspace.remove
+async.start        async.terminal
+subagent.spawn     subagent.terminal  subagent.apply
+publication.pending  publication.terminal
 ```
 
-There is no `v` field. Durable object and request IDs accepted at protocol
-boundaries are canonical lowercase 40-character Git SHA-1 values. Ordinary
-workspace bases and user proposals may not introduce the reserved top-level
-`.caos` path.
+A turn: the client appends the user entry and admits a request in one
+leased push (creation also writes the active membership ref, with the
+archived one proven absent). The worker claims it, calls the model from
+the exact head, records `model.complete`, handles the tool calls, then
+records `request.terminal`. Dispatched workspace tools first append
+`tool.start` pinning their task and input workspace, then `tool.complete` with
+the result. Inline tools and immediate errors complete directly without a
+`tool.start`. Conversation-file calls have no workspace target. For inline
+file tools, an explicit workspace makes every path workspace-relative;
+without one, the `files/` prefix selects conversation-owned files.
 
-Replay walks the first-parent event spine through its first `base` event, whose
-value must equal that event's first parent; ancestry below it is ordinary
-workspace history and is not interpreted as events. A parentless event, a
-non-object message before the boundary, a missing boundary, or a boundary that
-disagrees with its parent makes the conversation malformed. The append protocol
-rejects any later `base`, preserving the one-root invariant. A fork marker must
-have `forked_from` equal to its first parent and must not carry `base`.
+Interjections and escapes are records the worker drains at its next
+boundary. Async tasks and subagents have start/spawn records on the
+parent's spine and a relay appends their terminal records. A subagent has
+its own `conversation.root` parenting `G3`, with owner metadata naming the
+parent's exact head. It receives the selected workspace, if any, rather
+than inheriting the parent's transcript or files. Its workspace result
+reaches the parent only through `subagent.apply`.
 
-The first parent gives total event order. An extra parent is used only to keep
-independently prepared workspace history reachable, such as a user's worktree
-proposal or a mutating tool result. It does not create another event stream.
+**Reconciliation.** A missing workspace pointer produces a conflict.
+Otherwise the proposal must descend from its declared base, and the
+following cases are tried in order:
 
-Projections fold oldest to newest. `author` plus `content` adds a transcript
-message. For scalar state, the newest specified value wins and null clears it.
-Keyed state folds independently: an async event for task `Q2` cannot erase
-`Q1`. Tool activity is identified by `(request, round, tool_use_id)`, since a
-model's call ID is only round-local. Invalid optional projection payloads may be
-ignored where isolation is safe, but a malformed event envelope or history
-boundary fails the conversation rather than falling back to an older format.
+- Already applied: the proposal equals its base or the current commit,
+  is an ancestor of the current commit, or has the same tree as current.
+- Direct: current equals the base, or current descends from the base and
+  the proposal descends from current.
+- Merged: a three-way merge using the declared base succeeds; mint a
+  commit with current and proposal as its two parents.
+- Conflict: record the candidate and any conflicting paths, leaving the
+  workspace pointer unchanged.
 
-### Creation, append, and conflicts
+The same table serves dispatched tool proposals, subagent application,
+and the host's manual tree update. `/update-tree` commits outstanding local
+edits, includes already-committed edits, and uses the merge base of local
+`HEAD` and the selected workspace as the proposal base. It refuses unrelated
+histories or multiple merge bases before staging files.
 
-To append event `B` to canonical head `A` at ref `F`:
+**Publication.** `preserve` policy only: push the named workspace's
+commit to `refs/heads/caos/<id>` on the host checkout's `origin`. Selection
+is required when there is more than one workspace; they currently share
+that one destination branch. The existing remote tip must be an ancestor
+of the selected commit. A leased push then protects against subsequent
+remote changes, bracketed by `publication.pending` and
+`publication.terminal` (complete, conflict, or uncertain).
 
-1. Build `B` with first parent `A`.
-2. Upload its closed object graph.
-3. Run `git push --force-with-lease=F:A B:F`.
-4. The client validates the event envelopes and first-parent relationship; Git
-   advances `F` only if it is still `A`.
+Before retrying, the host reconciles pending records for the same repository
+and ref using the observed remote tip: the planned head means complete;
+an unchanged expected tip means uncertain; another tip means conflict.
+It records these outcomes without replaying the old pushes. Squash,
+per-workspace destinations, and pull-request creation are deferred.
 
-The remote ref is authoritative; a local ref is only a cache. The server accepts
-ordinary Git reset and deletion operations: append-only history is a client
-protocol invariant, not storage policy. Conversation writers enforce that an
-update extends the observed first-parent spine and that an update to an existing
-head introduces neither `base` nor `forked_from`; replay validates that boundary
-again.
-If an append response is lost, finding the candidate at the observed tip or on
-its first-parent spine proves success and prevents a duplicate append.
-Transcript and run semantics remain client/worker validation, not server
-storage policy.
+**Forks, title, membership.** `conversation.fork` creates a new identity
+with the source `C` as its parent; it is not a `conversation.root`.
+The source must be quiescent (no active or cancelling request, no started
+tool, no pending async task or publication). The fork inherits its state
+with every running child record dropped. A title update changes only the
+title file and commits through CAS on the conversation head; conditional
+title updates also compare the expected title. Archiving moves the
+membership ref.
 
-Creation uses an expected-absent head. One atomic, create-only push publishes
-the initial head, deterministic fallback title, and creator's active membership
-while proving the archived membership absent. After an ambiguous transport
-failure, the client reads the canonical head: its proposal or a descendant
-proves success, while unrelated history is a name collision. Presentation-ref
-churn after the head is known to exist cannot turn successful creation into a
-reported failure.
+## Validation
 
-A failed CAS is reconciled by event meaning:
+A reader accepts a `C` by structural checks (one parent, registered
+kind, root-parents-`G3` and only-root-parents-`G3`, no-op, tree escapes,
+non-blob modes, `format`, `title`, canonical bytes of every changed
+record) and then by reconstruction: the transition is rebuilt from the
+changed records, re-applied to the parent tree in memory, and the
+resulting tree oid must equal the child's. `validate_spine` walks a head
+back to its root at `G3` or an already-validated boundary. It adds newly
+validated commits to the cache only after the whole walk succeeds, so a
+failed validation cannot certify a descendant. Workers validate on load
+and when adopting remote advances; ordinary appends use the shared
+transition application without re-validating the resulting spine.
 
-| Candidate | Reconciliation after reloading the head |
-| --- | --- |
-| Tree-neutral message or progress | Rebuild it on the new tip. |
-| New foreground turn | Rebuild its user event, request, and admission together; if a run is now active, append an interjection instead. |
-| Foreground worker event | Revalidate the exact request and continuation before appending. |
-| Async status | Refold and update only that task `Q`. |
-| Workspace proposal based on `P` | Three-way merge the `P..proposal` delta into the new tip and retain the proposal as an extra parent. |
+## Known shortcomings
 
-A clean Git tree merge does not by itself make an event logically valid;
-request, round, and call identities are rechecked. If a new foreground
-submission has a tree conflict, the canonical tree remains clean and a terminal
-conflict event records the base, current and proposed commits and paths while
-retaining the proposal as a second parent. A conflicting interjection is
-rejected without changing the active request, and the client restores its text.
-A mutating-tool conflict likewise keeps the current tree, retains the proposal
-as a second parent, and records a failed tool result for the owning request.
-
-### Foreground turns and recovery
-
-For an idle conversation, submission follows this path:
-
-```text
-message and workspace
-  -> user event B
-  -> llm-step request R derived from B and its configuration
-  -> upload R's closed request graph
-  -> admission event C, the immediate child of B
-  -> one CAS publishes B and C
-  -> submit R to CAOS
-```
-
-The admission event binds `{request: R, request_head: B, status: queued}`. Its
-request graph is durable before the admission becomes reachable. Although the
-ref update crosses two commits, observers see neither without the other. If
-that CAS loses, the client must rebuild `B`, derive a new `R`, and build its
-matching `C`; a request commits to its exact starting event and cannot be
-grafted onto a rebased message.
-
-Foreground lifecycle, model, and tool events carry `R`. Before claiming work,
-the worker refolds the canonical log and verifies that `B` is present and its
-immediate child admits both `R` and `request_head: B`. A terminal request is not
-revived, and a stale worker cannot append `running` over a newer request.
-Admission begins at `queued`; the owner appends `running`, then a request-scoped
-terminal `idle` or `failed` event, which clears the active request projection.
-
-An interjection appends a user message without claiming or terminating the
-active request; execution remains attached to the already admitted `R` and
-joins or reissues it only as needed. The worker incorporates such messages at
-safe boundaries. If an interjection wins the CAS immediately before a terminal
-event, the worker refolds and continues `R`; it does not replay the stale
-terminal event over new input.
-
-CAOS uses the request hash as its cache and single-flight identity. The chat
-protocol does not assume that an in-flight run survives server restart. It does
-ensure that its admission and completed progress survive: any follower that
-observes admitted `queued` or `running` state can resubmit the same request, and
-`llm-step` reconstructs its continuation from the log and ordinary tool
-results.
-
-### Interrupts
-
-Escape is an ordinary tree-neutral event scoped to `R`. A worker that loses CAS
-reads the commits after its attempted base; an intervening Escape preserves its
-result, closes unrun calls, and ends `R` idle without another model step.
-
-### Workspace changes and forks
-
-For a checkout based on `P`, the client snapshots the proposal as `U` and
-three-way merges `P`, the current conversation tree, and `U`. The event's first
-parent is the canonical head and `U` is retained as a second parent when the
-histories differ. This applies only the user's `P..U` delta instead of treating
-all changes since `P` as user edits.
-
-PR publication is an ordinary turn: when the exact fetched base is not already
-an ancestor of the conversation head, the agent calls `merge` with it, then
-resolves and tests. When it is already an ancestor, the turn is explicitly told
-not to merge it again. A clean conversation head without `.caos` becomes the PR
-branch tip, preserving the conversation history so later publications are
-fast-forwards.
-
-`/from` materializes a new conversation before its first new message. Its
-source must be a recognized conversation event whose complete inherited event
-spine validates through a matching explicit root. The marker uses the source
-event as both first parent and `forked_from`, inherits the source tree and root
-boundary, and is published atomically with its title and creator membership.
-Replay therefore includes the inherited transcript, while workspace diffing can
-treat the source as the fork point. If concurrent creators produce equivalent
-markers with different timestamp-derived commit IDs, the loser may adopt the
-canonical marker and create only its missing membership; it never rewrites the
-head or title. Plain workspace commits, mid-tool-batch resume semantics, and
-inherited async-task ownership are not defined yet.
-
-### Ordinary tools
-
-Before running tools, `llm-step` validates that each tool-use ID is a string and
-is unique within that model response, then records the response and its ordered
-`{id, name, args}` calls. Inline tools run directly. A compute tool suspends the
-turn through an ordinary serial `run-then`; the worker result resumes
-`llm-step`, which records it before making another model call. Calls are serial
-for now.
-
-The recorded call and input workspace determine the same CAOS request during
-recovery. Re-emitting it joins in-flight work, uses a cached result, or reruns it
-without inventing another chat identity. An ordinary tool worker never updates
-the conversation ref; only `llm-step` records its result.
-
-### Independent work
-
-For subrequest `R` and target conversation ref `F`:
-
-```text
-Q = std/run-and-update-ref { subreq: R, target-ref: F }
-task ID = hash(Q)
-```
-
-`Q` contains both the work and its destination, and is the task identity. When
-no state exists for `Q`, `llm-step` first appends
-`{"async":{"task":"<Q>","status":"pending"}}`, then calls `caos sub-run Q`
-without waiting. Repeating the same tool request refolds `Q` and does not reset
-a terminal task to pending.
-
-`run-and-update-ref` executes the exact subrequest `R`. Its finish stage first
-makes the result addressable, then CAS-appends a tree-neutral `complete` or
-`failed` event containing both `Q` and that result object ID, retrying on a new
-canonical head. Success returns `R`'s ordinary result unchanged; a caught
-failure returns the same small failure result named by its event. The
-conversation stores neither the subrequest nor its output payload, only its
-content address.
-
-At `llm-step` entry and foreground terminal boundaries, recovery considers each
-task independently. A pending `Q` is reissued. A terminal event is already
-converged because it carries the exact result object ID and is appended only
-after that object exists; it never needs a separate result-ref lookup. If
-concurrent executions publish different terminal outcomes, the newest terminal
-event for `Q` wins. Before any redispatch, `llm-step` opens `Q`, validates its
-subrequest, and proves its recorded `target-ref` is this conversation's `F`.
-
-`spawn_agent` atomically creates an owner-indexed child conversation on a clean
-snapshot descended from the parent workspace. Its transcript starts at its own
-root, while the shared workspace ancestry lets ordinary `merge` apply its
-result. Its prompt supplies the normal fallback title, and the sidebar groups it
-under the parent recorded by `spawned_by`. Parent call/result and child
-prompt/parent link are durable events; the child runs through `run_async`.
-
-### Following and presentation state
-
-A follower refreshes membership, heads, and titles away from the input/render
-thread, with at most one refresh in flight. A changed selected head triggers one
-coherent spine load from which the snapshot, transcript, and workspace diff are
-derived. The result is applied only if its conversation and observed-head
-generation are still current, so stale network work cannot roll back the UI.
-
-Each local submission remains optimistically visible until its exact durable
-commit appears. Peer appends cannot erase it. On failure, the client restores
-the submitted text only if doing so will not replace a newer draft.
-
-Activity is refolded from the durable log whenever the head changes. The client
-retains only its selection and scroll position across that refresh.
-
-The initial transaction creates a deterministic fallback title. Asynchronous
-title generation may replace only that exact value by CAS; a manual or foreign
-rename wins. Membership changes similarly use atomic leases so active and
-archived state cannot both win.
-
-The client passes an explicit model to every `llm-step`. `/model` changes the
-client's last-used model for later turns. Assistant events retain the model for
-display. Escape interrupts a running request; otherwise it focuses the
-conversation list.
-
-### Deferred work
-
-- **Async recovery.** Add a durable follower that redispatches pending detached
-  tasks after the foreground `llm-step` exits; today only a later invocation
-  provides another recovery boundary.
-- **Fork contract.** Decide how plain commits create an empty transcript, which
-  event positions are safe turn boundaries, and whether inherited async tasks
-  are reset, translated, or treated as read-only. A pending task currently names
-  the source conversation and cannot safely be redispatched by its fork.
-- **Client policy and responsiveness.** Persist a trusted default identity and
-  choose a single membership policy for line-client appends. Move the remaining
-  synchronous Git/network paths off the TUI thread and separate frequent
-  exact-head following from broader sidebar discovery.
-- **Long histories.** Cache validated event suffixes and folded projections by
-  canonical head instead of rebuilding the full spine after every change.
-- **Retention and scale.** Define bounded retention for result refs and server
-  reflogs without breaking request-object negotiation or the documented repair
-  window. Shard presentation refs if aggregate advertisement size becomes
-  material.
+- No gc protection for code shas named only from `C` (invariant 3).
+- No retention or erasure policy; reflogs are kept forever.
+- Publication is branch-only; no squash policy, no PR.
+- Stacks and surfaces above one conversation are not designed.

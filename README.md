@@ -385,7 +385,7 @@ the object machinery through a one-way dependency. Their difference is the
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `talk` / `chat` — agent conversations over the current protocol
-    (`design/chat.md`; `design/agent-harness.md` records historical rationale);
+    (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form;
   - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
