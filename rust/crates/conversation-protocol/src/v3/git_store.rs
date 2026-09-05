@@ -747,6 +747,7 @@ impl CodeOps for GitStore {
             parents: vec![base.clone()],
             author: base_commit.author.clone(),
             committer: base_commit.committer.clone(),
+            extra_headers: Vec::new(),
             message: message.to_vec(),
         };
         let ours_head = self
@@ -798,6 +799,7 @@ impl CodeOps for GitStore {
             parents: parents.to_vec(),
             author: signature.clone(),
             committer: signature.clone(),
+            extra_headers: Vec::new(),
             message: message.as_bytes().to_vec(),
         })
         .map_err(String::from)
@@ -995,6 +997,7 @@ mod tests {
                 parents: parents.to_vec(),
                 author: signature(),
                 committer: signature(),
+                extra_headers: Vec::new(),
                 message: message.as_bytes().to_vec(),
             })
             .expect("write commit")
@@ -1044,6 +1047,7 @@ mod tests {
             parents: Vec::new(),
             author: signature(),
             committer: signature(),
+            extra_headers: Vec::new(),
             message: b"round trip\n".to_vec(),
         };
         let commit = store.write_commit(&commit_info).expect("write commit");
@@ -1089,6 +1093,7 @@ mod tests {
             parents: Vec::new(),
             author: signature(),
             committer: signature(),
+            extra_headers: Vec::new(),
             message: b"loose commit\n".to_vec(),
         };
         let commit_bytes = encode_commit_bytes(&commit_info);
@@ -1530,7 +1535,21 @@ mod tests {
         init(&repository, false);
         let mut store = GitStore::open(&repository, None).expect("open git store");
         let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
-        let base = write_commit(&mut store, &base_tree, &[], "base\n");
+        // GitHub's signed commits are ordinary workspace inputs. Keep their
+        // headers and object identity through reads, writes, and merges.
+        let base_bytes = format!(
+            "tree {base_tree}\nauthor Git Store <git-store@example.com> 1700000000 +0000\n\
+             committer Git Store <git-store@example.com> 1700000000 +0000\n\
+             encoding UTF-8\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n signed data\n \
+             -----END PGP SIGNATURE-----\n\nbase\n"
+        )
+        .into_bytes();
+        let base = store.write_object(ObjectKind::Commit, &base_bytes).unwrap();
+        let base_info = store.read_commit(&base).expect("read signed code commit");
+        assert_eq!(encode_commit_bytes(&base_info), base_bytes);
+        assert_eq!(store.write_commit(&base_info).unwrap(), base);
+        assert_eq!(base, hash_object(&repository, "commit", &base_bytes));
+        assert_eq!(store.tree_of(&base).unwrap(), base_tree);
         let ours_tree = update_tree(&mut store, Some(&base_tree), "ours.txt", b"ours\n");
         let ours = write_commit(
             &mut store,
@@ -1665,19 +1684,42 @@ mod tests {
             std::slice::from_ref(&base),
             "equal proposal\n",
         );
-        assert_eq!(
-            reconcile(
-                &mut store,
-                &base,
-                &equal_proposal,
-                Some(&equal_current),
-                &signature()
-            )
-            .unwrap(),
-            WorkspaceResolution::AlreadyApplied {
-                current: equal_current,
-                candidate: Some(equal_proposal),
-            }
+        let output = match reconcile(
+            &mut store,
+            &base,
+            &equal_proposal,
+            Some(&equal_current),
+            &signature(),
+        )
+        .unwrap()
+        {
+            WorkspaceResolution::Merged { output, .. } => output,
+            other => panic!("equal trees must retain both histories: {other:?}"),
+        };
+        assert_eq!(store.tree_of(&output).unwrap(), equal_tree);
+        assert!(store.is_ancestor(&equal_current, &output).unwrap());
+        assert!(store.is_ancestor(&equal_proposal, &output).unwrap());
+
+        // A merge can add ancestry without changing the workspace tree.
+        let upstream = write_commit(
+            &mut store,
+            &base_tree,
+            std::slice::from_ref(&base),
+            "upstream metadata\n",
         );
+        let proposal = write_commit(
+            &mut store,
+            &ours_tree,
+            &[ours.clone(), upstream.clone()],
+            "merge upstream\n",
+        );
+        let output =
+            match reconcile(&mut store, &ours, &proposal, Some(&ours), &signature()).unwrap() {
+                WorkspaceResolution::Direct { output, .. } => output,
+                other => panic!("merge ancestry must advance the workspace: {other:?}"),
+            };
+        assert_eq!(output, proposal);
+        assert_eq!(store.tree_of(&output).unwrap(), ours_tree);
+        assert!(store.is_ancestor(&upstream, &output).unwrap());
     }
 }

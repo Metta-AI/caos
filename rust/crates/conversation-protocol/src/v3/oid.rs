@@ -109,6 +109,7 @@ pub fn genesis_commit() -> CommitInfo {
         parents: Vec::new(),
         author: signature.clone(),
         committer: signature,
+        extra_headers: Vec::new(),
         message: G3_MESSAGE.as_bytes().to_vec(),
     }
 }
