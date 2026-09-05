@@ -911,6 +911,7 @@ enum AppAction {
     UpdateTree,
     Workspace,
     Workspaces,
+    UpdateStack,
     NewConversation,
     Checkout,
     Activity,
@@ -1638,7 +1639,7 @@ enum UiMessage {
     },
     WorkspaceUpdated {
         conversation: String,
-        result: Result<(String, Box<ConversationLoad>), String>,
+        result: Result<(Result<String, String>, Box<ConversationLoad>), String>,
     },
     Reconciled {
         conversation: String,
@@ -1690,7 +1691,13 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 12] = [
+const PALETTE_COMMANDS: [PaletteCommand; 13] = [
+    PaletteCommand {
+        label: "Update stack",
+        shortcut: None,
+        keywords: "workspace base merge stale",
+        action: AppAction::UpdateStack,
+    },
     PaletteCommand {
         label: "Workspaces",
         shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
@@ -2516,6 +2523,7 @@ impl App {
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Workspace => self.run_workspace_command(arguments),
             AppAction::Workspaces => self.open_workspace_picker(),
+            AppAction::UpdateStack => self.update_selected_stack(None),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2634,10 +2642,28 @@ impl App {
         }
     }
 
+    fn update_selected_stack(&mut self, name: Option<String>) {
+        let selected = name.or_else(|| self.selected().selected_workspace.clone());
+        self.start_workspace_mutation("updating stack", move |transport, conversation| {
+            let updated = caos_cli::workspaces::update_stack(
+                transport,
+                conversation,
+                selected.as_deref().filter(|name| *name != "--all"),
+            )?;
+            Ok(if updated.is_empty() {
+                "Stack is up to date.".into()
+            } else {
+                format!("Updated {}.", updated.join(", "))
+            })
+        });
+    }
+
     fn run_workspace_command(&mut self, arguments: &str) {
         let parts = arguments.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
             [] => self.open_workspace_picker(),
+            ["update"] => self.update_selected_stack(None),
+            ["update", name] => self.update_selected_stack(Some((*name).to_string())),
             ["use", name] => match self.selected_mut().select_workspace(name) {
                 Ok(()) => {
                     self.selected_mut()
@@ -2693,7 +2719,7 @@ impl App {
                 });
             }
             _ => self.selected_mut().show_command_error(
-                "usage: /workspace [use <name>|create <name> [<rev>]|stack <name>|rollback <name> <rev>|remove <name>]",
+                "usage: /workspace [use <name>|create <name> [<rev>]|stack <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
             ),
         }
     }
@@ -2717,7 +2743,7 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let info = operation(transport, &conversation)?;
+                let info = operation(transport, &conversation);
                 let load = conversation_load(transport, &conversation)?
                     .ok_or_else(|| format!("conversation {conversation:?} disappeared"))?;
                 Ok((info, Box::new(load)))
@@ -2999,7 +3025,10 @@ impl App {
                                 if let [name] = created.as_slice() {
                                     let _ = state.select_workspace(name);
                                 }
-                                state.push_info(info);
+                                match info {
+                                    Ok(info) => state.push_info(info),
+                                    Err(error) => state.show_command_error(error),
+                                }
                             }
                             Err(error) => state.show_command_error(error),
                         }
@@ -3702,6 +3731,7 @@ impl App {
     fn execute_action(&mut self, action: AppAction) {
         match action {
             AppAction::Workspaces => self.open_workspace_picker(),
+            AppAction::UpdateStack => self.update_selected_stack(None),
             AppAction::NewConversation => {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;

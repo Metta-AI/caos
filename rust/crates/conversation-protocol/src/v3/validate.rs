@@ -392,14 +392,21 @@ fn reconstruct(
             let config = child_snapshot.workspace_config(&name)?;
             Ok(Transition::WorkspaceConfigure { name, config })
         }
-        Kind::WorkspaceRollback => {
+        Kind::WorkspaceAdvance | Kind::WorkspaceRollback => {
             let name = single_workspace_name(changes, kind)?;
             let record = child_snapshot
                 .workspace(&name)?
                 .ok_or_else(|| format!("{}: changed workspace is absent", kind.as_str()))?;
-            Ok(Transition::WorkspaceRollback {
-                name,
-                commit: record.commit,
+            Ok(if kind == Kind::WorkspaceAdvance {
+                Transition::WorkspaceAdvance {
+                    name,
+                    commit: record.commit,
+                }
+            } else {
+                Transition::WorkspaceRollback {
+                    name,
+                    commit: record.commit,
+                }
             })
         }
         Kind::WorkspaceRemove => Ok(Transition::WorkspaceRemove {
@@ -842,7 +849,7 @@ mod tests {
             kinds,
             Kind::ALL
                 .into_iter()
-                .filter(|kind| *kind != Kind::WorkspaceConfigure)
+                .filter(|kind| !matches!(kind, Kind::WorkspaceConfigure | Kind::WorkspaceAdvance))
                 .collect()
         );
         assert_eq!(
@@ -881,6 +888,24 @@ mod tests {
             config
         );
         assert_eq!(store.read_commit(&head).unwrap(), parent);
+        let transition = Transition::WorkspaceAdvance {
+            name: "main".into(),
+            commit: oid('e'),
+        };
+        let previous = store.read_commit(&next).unwrap();
+        let applied = apply(&mut store, Some(&previous.tree), &transition).unwrap();
+        let advanced = crate::v3::apply::mint(
+            &mut store,
+            &next,
+            &applied.tree,
+            transition.kind(),
+            &parent.author,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_spine(&store, &advanced, &mut known_valid).unwrap(),
+            vec![advanced]
+        );
     }
 
     #[test]

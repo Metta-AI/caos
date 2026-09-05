@@ -95,6 +95,10 @@ pub enum Transition {
         name: String,
         config: super::WorkspaceConfig,
     },
+    WorkspaceAdvance {
+        name: String,
+        commit: Oid,
+    },
     WorkspaceRollback {
         name: String,
         commit: Oid,
@@ -138,6 +142,7 @@ impl Transition {
             Transition::SubagentApply { .. } => Kind::SubagentApply,
             Transition::WorkspaceCreate { .. } => Kind::WorkspaceCreate,
             Transition::WorkspaceConfigure { .. } => Kind::WorkspaceConfigure,
+            Transition::WorkspaceAdvance { .. } => Kind::WorkspaceAdvance,
             Transition::WorkspaceRollback { .. } => Kind::WorkspaceRollback,
             Transition::WorkspaceRemove { .. } => Kind::WorkspaceRemove,
             Transition::PublicationPending { .. } => Kind::PublicationPending,
@@ -627,7 +632,8 @@ pub fn apply(
                 );
             }
         }
-        Transition::WorkspaceRollback { name, commit } => {
+        Transition::WorkspaceAdvance { name, commit }
+        | Transition::WorkspaceRollback { name, commit } => {
             let conversation = parent(store, parent_tree)?;
             let workspace = conversation
                 .workspace(name)?
@@ -637,7 +643,7 @@ pub fn apply(
                 name,
                 &workspace.commit,
                 Some(commit),
-                "workspace rollback",
+                "workspace pointer update",
             )?;
         }
         Transition::WorkspaceRemove { name } => {
