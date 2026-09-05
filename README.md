@@ -384,6 +384,11 @@ the object machinery through a one-way dependency. Their difference is the
     host path;
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
+  - `tui` — interactive conversations, with a bundled harness independent of
+    attached repositories. From a checkout it starts with that checkout's HEAD;
+    `caos tui --empty` starts without code. Ctrl+O opens workspaces: `n`
+    creates a change, `a` attaches a repository, `u` updates its stack.
+    Ctrl+P previews workspace PRs before publishing them;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form;
@@ -395,7 +400,12 @@ Conversations read their model credential from that local store rather than
 putting it in a curried worker. The easiest setup is `caos tui`: when the store
 has no `anthropic-api-key`, it prompts for the key (pasted, or the path to a
 file holding it), then writes the entry below with fresh entropy and the
-ignore rule (rust/crates/caos-cli/TUI.md). The same setup by hand is:
+ignore rule (rust/crates/caos-cli/TUI.md). The TUI reuses the launching
+checkout's existing store; otherwise it uses `~/.local/share/caos/secrets`
+(or `$XDG_DATA_HOME/caos/secrets`). Its internal harness checkout keeps this
+store ignored and separate from attached code. Set `--server <url>` to choose
+a server outside a checkout (default: `http://localhost:9090`).
+The same setup by hand for checkout-based line clients is:
 
 ```text
 # .gitignore

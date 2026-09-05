@@ -62,6 +62,14 @@ pub struct TurnOptions {
     pub base_url: Option<String>,
     pub username: Option<String>,
     pub workspace: Option<String>,
+    /// None preserves checkout-based callers; Some(empty) starts without code.
+    pub initial_workspaces: Option<BTreeMap<String, InitialWorkspace>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialWorkspace {
+    pub commit: String,
+    pub config: conversation_protocol::v3::WorkspaceConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -473,6 +481,115 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     t.ensure_pushed(commit.as_str())
 }
 
+fn mint_conversation_root(
+    t: &GitTransport,
+    store: &mut GitStore,
+    options: &TurnOptions,
+    id: &str,
+    title: &str,
+    signature: &Signature,
+) -> Result<Oid, String> {
+    let legacy;
+    let seeds = match &options.initial_workspaces {
+        Some(seeds) => seeds,
+        None => {
+            legacy = BTreeMap::from([(
+                default_workspace_name(t, options)?,
+                InitialWorkspace {
+                    commit: resolve_base(t, options)?,
+                    config: Default::default(),
+                },
+            )]);
+            &legacy
+        }
+    };
+    let mut workspaces = BTreeMap::new();
+    for (name, seed) in seeds {
+        let commit = oid(&seed.commit, "initial workspace")?;
+        ensure_code_commit(t, store, &commit)?;
+        reject_reserved_caos(t, commit.as_str(), "initial workspace")?;
+        workspaces.insert(name.clone(), (commit, None));
+    }
+    let genesis = ensure_genesis(store)?;
+    let transition = Transition::ConversationRoot {
+        identity: Identity {
+            id: id.into(),
+            kind: IdentityKind::Root,
+            owner: None,
+        },
+        title: title.into(),
+        workspaces,
+        files_seed: None,
+    };
+    let tree = apply(store, None, &transition)?.tree;
+    let mut head = mint(store, &genesis, &tree, transition.kind(), signature)?;
+    let configs = seeds
+        .iter()
+        .map(|(name, seed)| (name.clone(), seed.config.clone()))
+        .collect();
+    for name in conversation_protocol::v3::workspace_order(&configs)? {
+        let config = &seeds[&name].config;
+        if config != &Default::default() {
+            head = mint_transition(
+                store,
+                &head,
+                &Transition::WorkspaceConfigure {
+                    name,
+                    config: config.clone(),
+                },
+                signature,
+            )?;
+        }
+    }
+    Ok(head)
+}
+
+/// Create a durable conversation before its first message, so attachments and
+/// conversation-owned files do not require a seed workspace or an LLM request.
+pub fn create_conversation(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    title: &str,
+) -> Result<String, String> {
+    let user = resolve_username(t, options.username.as_deref())?;
+    let refname = refs::head_ref(id)?;
+    let mut store = open_store(t)?;
+    if store.read_ref(&refname)?.is_some() {
+        return Err(format!("conversation {id:?} already exists"));
+    }
+    let head = mint_conversation_root(t, &mut store, options, id, title, &signature(&user)?)?;
+    let updates = [
+        RefUpdate {
+            refname: refname.clone(),
+            expected: None,
+            new: Some(head.clone()),
+        },
+        RefUpdate {
+            refname: refs::active_membership_ref(&user, id)?,
+            expected: None,
+            new: Some(head.clone()),
+        },
+        RefUpdate {
+            refname: refs::archived_membership_ref(&user, id)?,
+            expected: None,
+            new: None,
+        },
+    ];
+    if let Err(error) = store.push(&updates) {
+        let Some(remote) = store.fetch_ref(&refname)? else {
+            return Err(error);
+        };
+        validate_cached(&store, &remote)?;
+        if !spine_contains(&store, remote.clone(), &head)? {
+            return Err(error);
+        }
+        repair_creation_membership(&store, &user, id, &remote)?;
+    }
+    update_local_cache(t, &refname, head.as_str())?;
+    Ok(head.to_string())
+}
+
 struct PreparedRequest {
     request: String,
     configuration: String,
@@ -677,31 +794,15 @@ where
         }
 
         let parent = match &observed {
-            None => {
-                let base = oid(&resolve_base(t, options)?, "conversation base")?;
-                ensure_code_commit(t, &mut store, &base)?;
-                reject_reserved_caos(t, base.as_str(), "base workspace")?;
-                let workspace_name = default_workspace_name(t, options)?;
-                let genesis = oid(G3, "v3 genesis")?;
-                let root_transition = Transition::ConversationRoot {
-                    identity: Identity {
-                        id: id.to_string(),
-                        kind: IdentityKind::Root,
-                        owner: None,
-                    },
-                    title: default_title(message),
-                    workspaces: BTreeMap::from([(workspace_name, (base, None))]),
-                    files_seed: None,
-                };
-                let root_tree = apply(&mut store, None, &root_transition)?.tree;
-                mint(
-                    &mut store,
-                    &genesis,
-                    &root_tree,
-                    root_transition.kind(),
-                    &signature,
-                )?
-            }
+            None => mint_conversation_root(
+                t,
+                &mut store,
+                options,
+                id,
+                &default_title(message),
+                &signature,
+            )?,
+
             Some(observed) => observed.clone(),
         };
         let outcome = build_message_candidate(
@@ -3012,13 +3113,28 @@ fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, Strin
         .ok_or_else(|| format!("cannot resolve conversation base {rev:?}"))
 }
 
+// Git terminates config output; remove only that delimiter, preserving path whitespace.
+fn git_config_value(t: &GitTransport, key: &str) -> Option<String> {
+    let value = t
+        .git_capture(&["config", "--null", "--get", key], None)
+        .ok()?;
+    value.strip_suffix('\0').map(str::to_string)
+}
+
 fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
-    let mut store = open_store(t)?;
+    let checkout = git_config_value(t, "caos.checkout");
+    let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
+    // An empty independent launcher has no legacy repository refs.
+    if source.is_none() && git_config_value(t, "caos.launcher").as_deref() == Some("true") {
+        return Ok(String::new());
+    }
+    let source = source.as_ref().unwrap_or(t);
+    let mut store = GitStore::open(source.work_dir(), None)?;
     let genesis = ensure_genesis(&mut store)?;
     let mut lines = String::new();
     for name in MERGE_REF_CANDIDATES {
         let candidate = format!("{name}^{{commit}}");
-        let Ok(hash) = t.git_capture(&["rev-parse", "--verify", "--quiet", &candidate], None)
+        let Ok(hash) = source.git_capture(&["rev-parse", "--verify", "--quiet", &candidate], None)
         else {
             continue;
         };
@@ -3026,6 +3142,10 @@ fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
         let hash = oid(hash, "merge ref")?;
         if conversation_protocol::v3::CodeOps::is_ancestor(&store, &genesis, &hash)? {
             continue;
+        }
+        if source.work_dir() != t.work_dir() {
+            GitStore::open(t.work_dir(), Some(&source.work_dir().to_string_lossy()))?
+                .ensure_local(&hash)?;
         }
         t.ensure_pushed(hash.as_str())?;
         lines.push_str(name);
@@ -3351,6 +3471,50 @@ mod tests {
     }
 
     #[test]
+    fn launcher_preparation_reads_checkout_config_without_adding_or_trimming_whitespace() {
+        let (root, transport, base) = fixture("launcher-checkout");
+        let checkout = root.join("checkout with trailing whitespace \n");
+        std::fs::rename(transport.work_dir(), &checkout).unwrap();
+        let client = root.join("launcher");
+        std::fs::create_dir(&client).unwrap();
+        git(&client, &["init", "--quiet"]);
+        no_background_maintenance(&client);
+        git(
+            &client,
+            &[
+                "remote",
+                "add",
+                CAOS_REMOTE,
+                root.join("remote.git").to_str().unwrap(),
+            ],
+        );
+        git(&client, &["config", "caos.launcher", "true"]);
+        git(
+            &client,
+            &["config", "caos.checkout", checkout.to_str().unwrap()],
+        );
+        let launcher = GitTransport::discover(&client).unwrap();
+
+        // This is the ref preparation performed before evaluating the first LLM request.
+        let refs = snapshot_merge_refs(&launcher).unwrap();
+        assert!(refs.lines().any(|line| line == format!("main {base}")));
+        assert_eq!(
+            workspaces::repository_url(&launcher, &Default::default()).unwrap(),
+            root.join("origin.git").to_str().unwrap()
+        );
+        assert_eq!(git(&client, &["cat-file", "-t", &base]), "commit");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_launcher_does_not_offer_its_harness_as_workspace_merge_refs() {
+        let (root, transport, _) = fixture("launcher-empty");
+        git(transport.work_dir(), &["config", "caos.launcher", "true"]);
+        assert_eq!(snapshot_merge_refs(&transport).unwrap(), "");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn generated_title_parser_is_strict() {
         assert_eq!(
             parse_generated_title("  `Fix parser race`\n").unwrap(),
@@ -3545,6 +3709,52 @@ mod tests {
             target.branch
         );
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_conversations_accept_messages_and_later_attachments() {
+        let (root, transport, base) = fixture("empty-launch");
+        let options = TurnOptions {
+            initial_workspaces: Some(BTreeMap::new()),
+            ..options()
+        };
+        let head = create_conversation(&transport, &options, "empty", "New conversation").unwrap();
+        let load = conversation_load(&transport, "empty").unwrap().unwrap();
+        assert!(load.workspaces.is_empty());
+        assert!(create_conversation(&transport, &options, "empty", "duplicate").is_err());
+        submit_message_inner_with(
+            &transport,
+            &options,
+            "empty",
+            "plan first",
+            false,
+            None,
+            None,
+            |_, _, _, _| Ok(base.clone()),
+        )
+        .unwrap();
+        interrupt_request(&transport, "empty").unwrap();
+        create_workspace(&transport, "empty", "code", &base).unwrap();
+        assert_eq!(
+            conversation_load(&transport, "empty")
+                .unwrap()
+                .unwrap()
+                .workspaces
+                .len(),
+            1
+        );
+        let store = open_store(&transport).unwrap();
+        assert!(spine_contains(
+            &store,
+            oid(
+                &conversation_head(&transport, "empty").unwrap().unwrap(),
+                "head"
+            )
+            .unwrap(),
+            &oid(&head, "root").unwrap()
+        )
+        .unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -68,10 +68,16 @@ pub struct PublicationTarget {
 pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<String, String> {
     let repository = match &config.repository {
         Some(repository) => repository.clone(),
-        None => t
-            .git_capture(&["remote", "get-url", "origin"], None)?
-            .trim()
-            .to_string(),
+        None => {
+            let checkout = git_config_value(t, "caos.checkout");
+            let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
+            source
+                .as_ref()
+                .unwrap_or(t)
+                .git_capture(&["remote", "get-url", "origin"], None)?
+                .trim()
+                .to_string()
+        }
     };
     WorkspaceConfig {
         repository: Some(repository.clone()),

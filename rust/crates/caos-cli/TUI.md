@@ -7,8 +7,9 @@ dependencies out of the worker-side `caos` binary.
 The interface keeps independent virtual conversations in a left sidebar. Each
 entry has a stable task title and a second row reserved for live operation or
 attention status. Idle conversations do not show a stripped message preview.
-`Ctrl+N` only allocates local state; the first submitted message atomically
-publishes the conversation head, fallback title, and active membership. The
+`Ctrl+N` allocates local state; a workspace operation or the first submitted
+message publishes its conversation head and active membership. The launcher's
+initial conversation is created immediately so its attachments are visible. The
 first message also runs one separate, stateless `llm-call` title job concurrently
 with the agent turn. The result uses
 the existing durable title metadata, so reopening the TUI does not regenerate
@@ -19,13 +20,20 @@ completed-turn hashes, and workspace diff.
 Turns continue running when another conversation is selected, so several agent
 workspaces can advance concurrently without touching the working checkout.
 Agents may use `spawn_agent` to create an indexed child conversation. It runs
-through `run_async`; applying its result is an ordinary `merge`. Child rows use
+through `run_async`; harvesting reconciles its result into a named workspace.
+Temporary child workspaces stay inside the child; promote a completed result
+when it needs separate review. Child rows use
 their prompt title and appear beneath the parent conversation.
 
 ## Build and run
 
-Run the client from a Git working tree whose `caos` remote points at a running
-CAOS server:
+The packaged TUI can run anywhere. Inside a checkout, it seeds the conversation
+from HEAD and uses that checkout's `caos` remote. Outside a checkout, it starts
+without code and defaults to `http://localhost:9090`; `--server` overrides it.
+The harness and object database live under `$XDG_DATA_HOME/caos/clients`
+(default `~/.local/share/caos/clients`), independently of attached repositories.
+
+To build and launch from the caos checkout:
 
 ```bash
 git remote add caos http://localhost:9090
@@ -34,7 +42,7 @@ nix build
 ```
 
 During development, launch it with
-`cargo run -p caos-cli --bin caos-cli -- tui`.
+`cargo run -p caos-cli --bin caos-cli -- tui --harness <caos-checkout>`.
 The TUI checks the configured server before entering the alternate screen. If
 it cannot connect within five seconds, it exits with the server URL and asks
 you to check the running service and the `caos` git remote.
@@ -55,6 +63,8 @@ never overwritten.
 caos tui                  continue the most recent conversation
 caos tui --username alice use alice's active conversation list
 caos tui --new            start a fresh conversation
+caos tui --empty          start without a workspace; attach one later
+caos tui --server URL     use a specific server
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
@@ -63,16 +73,10 @@ caos tui --unarchive ID   restore one conversation to the active list
 `--username` defaults to `$USER`. If `$USER` is a shared container account such
 as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
 work. Active and archived membership is stored on the
-CAOS server under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
-not in local TUI state. `<user-key>` is `u-` plus lowercase hex of the
-normalized username's UTF-8 bytes; usernames are limited to 126 UTF-8 bytes.
-Each membership ref ends in one `<conversation-key>` component: `c-` plus
-lowercase hex of the conversation ID's UTF-8 bytes. Conversation IDs are
-limited to 124 UTF-8 bytes so Git can create the encoded ref lockfile. This
-preserves IDs containing `/` without creating Git ref file/directory
-collisions. Only these v2 membership refs populate the sidebar. Unversioned
-chat refs remain stored but invisible: v2 clients do not read, import, rename,
-migrate, or delete them.
+CAOS server under `refs/caos/v3/users/<user-key>/conversations/{active,archived}/`.
+User and conversation keys are lowercase hex of their UTF-8 IDs, without an
+extra prefix. Usernames are limited to 126 bytes and conversation IDs to 124.
+Only v3 refs populate this sidebar; earlier namespaces remain untouched.
 
 ## Controls
 
@@ -111,9 +115,10 @@ so it never leaves the conversation pane.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
-| `Ctrl+P` twice | Prepare the selected workspace against an `origin` base and open or update its PR |
-| `/publish-branch` | Push the selected workspace to `refs/heads/caos/<conversation id>` on `origin` |
+| `Ctrl+L` | Check out the selected workspace in the original matching checkout |
+| `Ctrl+O` | Select, create, attach, or update workspaces |
+| `Ctrl+P` | Preview selected workspaces and their PR destinations; Enter confirms |
+| `/publish-branch` | Push the selected workspace to its configured repository and branch |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -125,7 +130,7 @@ to the transcript or title.
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
 TUI. Enter `/title <new title>` to change the shared title without changing the
-conversation ID or HEAD. Enter `/model <name>` to select the client-wide model
+conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
 client default. Enter `/update-tree <message>` to send an ordinary
 user turn whose commit also folds in your current working-tree changes — the
@@ -134,18 +139,26 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+P` to publish a pull request for the selected workspace. The base
-prompt defaults to `origin`'s advertised default branch. Type a branch name
-(or `origin/<branch>`) to override it; press `Ctrl+P` again to confirm, or
-`Escape` to cancel. Your message draft is preserved. The same action is
-available as **Publish pull request** in the `Ctrl+Shift+P` command palette.
+Press `Ctrl+O` for workspaces. Enter switches focus; `n` creates from the
+highlighted workspace's current code, and Tab chooses a separate or dependent
+change. `a` attaches a repository using name, URL and optional branch/full
+commit. `u` updates the connected stack. Selection preserves the draft and
+does not retarget an already admitted request.
 
-Publication fetches that base, then runs a visible agent turn to merge it if
-needed and build and test the workspace. After preparation, CAOS pushes to
-`refs/heads/caos/<conversation id>` on `origin` and uses authenticated `gh` to
-open a ready-for-review PR. If an open PR already matches that head and base,
-CAOS reuses it and refreshes its title. The PR URL appears in the transcript.
-Enter `/publish-branch` for a direct branch push without preparation or a PR.
+Press `Ctrl+P` for the publication plan. Space selects workspaces, `a`
+toggles all, `b` edits a base (branch or `@workspace`), and `h` edits the
+published branch. Enter or Ctrl+P confirms; Escape cancels. Selected workspaces
+are prepared in dependency order through ordinary agent merge/build/test turns.
+A stable repository/head branch identifies each PR; changing its base updates
+the existing PR and preserves a manually edited title. Completed PR URLs remain
+visible if a later workspace fails. Conversation records are not exported.
+
+`/workspace` opens the picker. Scriptable forms include
+`create <name>`, `stack <name>`, `attach <name> <repo> [<branch>|<sha>]`,
+`update [<name>|--all]`, `branch <name> <branch>`, and `remove <name>`.
+Base changes appear as “needs update” in the picker. Stack updates stop on the
+first conflict and leave that workspace unchanged.
+`/publish-branch` remains a direct push without preparation or a PR.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -157,8 +170,9 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-Fresh conversations start from the local branch named by `origin/HEAD`,
-without fetching from `origin`. `--base` and `/from <turn-hash>` override that default.
+The launcher uses the original checkout's HEAD, with `--base` or
+`--from` as overrides. With no checkout or `--empty`, the conversation starts
+without code. `/from <turn-hash>` forks the selected conversation history.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
@@ -220,48 +234,16 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 ## Workspace safety
 
-Agent workspaces remain virtual commit trees under independent conversation
-refs. Opening, switching, and running conversations never overwrite the working
-checkout. Loading changes requires one `Ctrl+L` press and a clean working
-tree, then detaches HEAD onto the conversation's head commit so the checkout
-matches it exactly.
+Workspace code is referenced by ordinary commit hashes from the separate
+conversation history. Opening and running conversations never overwrite a
+checkout. Ctrl+L requires a clean original checkout matching the selected
+workspace's repository; it imports the code objects and detaches that checkout
+at the workspace head. /update-tree commits local edits there and imports their
+closure into the client before submission. These commands never replace the
+internal harness.
 
-Publishing also leaves the checkout and index untouched. `/publish-branch`
-pushes the selected workspace directly to
-`refs/heads/caos/<conversation id>` on `origin`; it does not run an agent
-merge-and-test preparation turn. `Ctrl+P` runs that preparation as an ordinary
-conversation turn, then publishes its resulting workspace through the same
-branch publisher. It stops before pushing if the turn was interrupted, the
-workspace does not contain the fetched base, conflict markers remain, or the
-workspace has advanced since preparation. The workspace tip must contain no
-reserved `.caos` state before the branch moves.
-Updates must fast-forward the remote branch; merge remote changes into the
-workspace before publishing again. Selecting another workspace cannot discard
-the branch's existing history. Retrying also records the observed outcome of
-unfinished publications; an unchanged remote is reported as uncertain, not as
-a failed push.
-
-`/update-tree <message>` is the one command that reads the working tree back
-into a conversation. It sends an ordinary user turn — authored by your git
-identity, carrying your `<message>` — but the turn's commit takes its tree from
-your local checkout instead of inheriting the head's. It first commits your
-working tree: `git add -A` then a commit with `<message>` when the tree is
-dirty (nothing is committed if you already committed the changes yourself). So
-the snapshot covers tracked edits, new files, and deletions, honoring
-`.gitignore`, and — because your changes are now committed — the checkout is
-left clean. That matters: after a later agent turn you can press `Ctrl+L` again
-to check out the new head without the clean-tree guard tripping on leftover
-local changes. The agent then runs over the changes you folded in. A working
-tree carrying the harness's reserved top-level `.caos` entry is refused.
-
-The intended loop is `Ctrl+L` (check out the head) → edit files → `/update-tree
-<message>` → let the agent respond → `Ctrl+L` again. You can also commit the
-changes yourself first and then run `/update-tree <message>`; the already-clean
-tree is committed no further. Both committed and uncommitted edits are reconciled
-from the shared ancestor of the local checkout and the selected workspace,
-so concurrent workspace edits are preserved or reported as conflicts. Unrelated
-histories or multiple merge bases are refused before staging local files.
-
-API responses currently arrive one completed model round at a time. The
-backend also does not yet provide reliable cancellation for a running turn;
-the UI states both limitations rather than simulating them client-side.
+Publication preserves workspace history, uses leased branch updates, and
+rejects unresolved conflicts or reserved conversation state. It leaves the local
+checkout and index unchanged. Credentials remain in the local secret store;
+the launcher reuses an existing checkout store or its own persistent store under
+the data directory.

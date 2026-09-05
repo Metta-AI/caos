@@ -1,6 +1,7 @@
 # Chat v3: conversation and code as separate histories
 
-**Status:** implemented through subagents, workspace navigation, and publication plans.
+**Status:** implemented, including workspace navigation, PR plans, stack updates,
+repository attachments, and a checkout-independent TUI launcher.
 Selected solely by the `refs/caos/v3/` namespace; v2 refs stay untouched
 and invisible. The binding definition is the code:
 `rust/crates/conversation-protocol/src/v3/` (records, kinds, paths,
@@ -76,38 +77,50 @@ files/                        conversation-owned files
 Records are canonical JSON (sorted keys, integers only, LF); protocol
 ids are `SHA-256("caos-v3-id\0" || tag || 0 || canonical)`.
 
-The protocol accepts an explicit workspace map, including zero or multiple
-workspaces. The host currently creates one: the TUI defaults to `main` at
-the local default branch tip; the CLI defaults to `HEAD`, or uses `--base`.
-With an explicit base its workspace is named `main`; otherwise the CLI
-uses the default branch name, the current branch name, or `main` as a
-fallback. The selected code commit is adopted without rewriting it.
+The protocol and host accept an explicit workspace map, including zero or
+multiple workspaces. The TUI launcher seeds `main` from the launching checkout's
+HEAD (or `--base`/`--from`), recording its repository and integrated branch
+base. With no checkout or with `--empty`, it starts with no code. The line
+clients keep their existing HEAD/--base defaults. Code commits are adopted
+without rewriting them.
 
 ## Host and launcher inputs
 
-Separate histories do not yet make launching independent of the checkout.
-The host resolves `DEEP-DEPS/llm-step` and `DEEP-DEPS/llm-call` by evaluating
-its local tracked working tree. In this repository the root `.caos-expr`
-expands the root `DEPS` declarations into those mounts. The checkout's
-`.caos-secrets/` store grants the model key to those paths; absent readers
-grant nothing. The host also
-snapshots local `main`/`master` refs for the merge tool and publishes through
-the checkout's `origin` remote.
+The packaged TUI bundles its harness source and creates a cached client Git
+store under `$XDG_DATA_HOME/caos/clients` (default
+`~/.local/share/caos/clients`). That store contains the harness's tracked
+DEPS/std tree and object database; attaching or editing code never checks it
+out over the harness. Development binaries can use `--harness <caos checkout>`.
+Importing a checkout preserves its full commit history, including unpushed
+commits. A partial clone downloads missing objects through its configured
+promisor remote during the import; its branch, index and working files stay
+unchanged.
 
-These inputs come from the host checkout, which may differ from the selected
-workspace commit. An independent launcher supplying harness, secret, and
-repository inputs remains a followup.
+The server comes from `--server`, the launching checkout's `caos` remote,
+or `http://localhost:9090`. An existing checkout's local secret store is reused
+through an ignored link; otherwise credentials live under the launcher data
+directory's `secrets`. They are never copied into attached code or conversation
+trees. The runtime store is keyed by harness content and local server/checkout/
+secret-store choices, preventing one launch from retargeting another.
+
+A new conversation may exist before its first message, so repository attachment
+needs neither an initial workspace nor a model request. Checkout and
+`/update-tree` commands act on the original matching checkout, importing the
+necessary objects first; they cannot replace the internal harness. Without a
+matching local checkout those commands explain how to open one. The generic
+CLI and line clients continue to use their caller's checkout directly.
 
 ## Transitions
 
-Twenty-four kinds, each a one-word commit message:
+Twenty-five kinds, each a one-word commit message:
 
 ```
 conversation.root  conversation.fork  metadata.title.set
 message.append     request.admit  request.claim  request.interject
 request.escape     request.terminal   model.complete
 tool.start         tool.complete      files.apply
-workspace.create   workspace.configure workspace.rollback workspace.remove
+workspace.create   workspace.configure workspace.advance
+workspace.rollback workspace.remove
 async.start        async.terminal
 subagent.spawn     subagent.terminal  subagent.apply
 publication.pending  publication.terminal
@@ -130,7 +143,8 @@ parent's spine and a relay appends their terminal records. A subagent has
 its own `conversation.root` parenting `G3`, with owner metadata naming the
 parent's exact head. It receives the selected workspace, if any, rather
 than inheriting the parent's transcript or files. Its workspace result
-reaches the parent only through `subagent.apply`.
+reaches an existing parent workspace through `subagent.apply`; explicit
+promotion creates a separately reviewable parent workspace.
 
 **Reconciliation.** A missing workspace pointer produces a conflict.
 Otherwise the proposal must descend from its declared base, and the
