@@ -1,1321 +1,789 @@
-//! Append durable events to a conversation's one authoritative ref.
-//!
-//! Event objects use the server's content-addressed object API; ref reads and
-//! compare-and-swap writes use ordinary Git smart HTTP from this worker's
-//! Git-bearing runtime. A successful return therefore means the event is
-//! reachable from `refs/caos/v2/conversations/<id>/head`; failures are never
-//! downgraded to observability warnings.
+//! V3 conversation storage and exact-head append/retry.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashSet;
+use std::fs;
+use std::process::{Command, Stdio};
 
-use conversation_protocol::{
-    conversation_ref as protocol_conversation_ref,
-    validate_conversation_ref as protocol_validate_conversation_ref,
-    ConversationEvent as ProtocolEvent, EventBoundary,
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Applied, Transition};
+use conversation_protocol::v3::paths;
+use conversation_protocol::v3::tree::encode_commit_bytes;
+use conversation_protocol::v3::view::Conversation;
+use conversation_protocol::v3::{
+    validate_spine, Block, ChildRecord, GitStore, ObjectStore, Oid, RefUpdate, TranscriptEntry,
 };
-use serde_json::Value;
-use worker_common::git::{RefUpdate, Repo};
+use worker_common::{path, scratch};
 
-use crate::validate_hash;
+const MAX_APPEND_ATTEMPTS: usize = 32;
+const MAX_RECOVERY_WALK: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendResult {
-    /// The event commit now reachable from the conversation ref.
-    pub commit: String,
-    /// The head this event commit directly follows on the first-parent spine.
-    pub previous_head: String,
-    /// Number of compare-and-swap races lost before the successful append.
-    pub retries: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Appended {
+    /// The commit produced by this logical transition. `head` can be newer
+    /// when the push response was lost and another writer appended after it.
+    pub commit: Oid,
+    pub head: Oid,
+    pub ordinal: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConditionalAppend {
-    Appended(AppendResult),
-    /// Another event won before this event could be published. The contained
-    /// hash is the head observed after the failed compare-and-swap.
-    HeadChanged(String),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TryAppend {
+    Appended(Appended),
+    HeadChanged(Oid),
 }
 
-#[derive(Debug, Clone)]
-struct RemoteCommit {
-    tree: String,
-    parents: Vec<String>,
-    timestamp: i64,
-    message: String,
+pub trait RefStore: ObjectStore {
+    fn fetch_ref_value(&mut self, refname: &str) -> Result<Option<Oid>, String>;
+    fn push_ref_value(
+        &mut self,
+        refname: &str,
+        expected: Option<&Oid>,
+        new: Option<&Oid>,
+    ) -> Result<(), String>;
 }
 
-type CommitCache = Mutex<HashMap<(String, String), RemoteCommit>>;
+impl RefStore for GitStore {
+    fn fetch_ref_value(&mut self, refname: &str) -> Result<Option<Oid>, String> {
+        self.fetch_ref(refname)
+    }
 
-// One llm-step process owns one turn. Conversation commits are immutable, so
-// retaining each parsed commit for that process bounds repeat spine reads to
-// newly appended events instead of another HTTP GET for the entire history.
-static COMMIT_CACHE: OnceLock<CommitCache> = OnceLock::new();
-static GIT_REPO: OnceLock<Result<Repo, String>> = OnceLock::new();
-
-fn git_repo() -> Result<&'static Repo, String> {
-    GIT_REPO
-        .get_or_init(|| Repo::new("llm-step-git"))
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// One chat event on the canonical first-parent conversation spine.
-#[derive(Debug, Clone)]
-pub struct ConversationEvent {
-    pub commit: String,
-    pub tree: String,
-    pub value: Value,
-}
-
-/// A chronological snapshot of the canonical conversation event log.
-#[derive(Debug, Clone)]
-pub struct ConversationLog {
-    pub head: String,
-    pub events: Vec<ConversationEvent>,
-}
-
-/// Publish an ordinary conversation, title, and owner membership in one exact
-/// ref transaction. `false` means another worker created the deterministic
-/// conversation first.
-pub fn create_agent_conversation(
-    conversation: &str,
-    owner: &str,
-    root: &str,
-    tree: &str,
-    request: &str,
-    title: &str,
-) -> Result<bool, String> {
-    let head_ref = conversation_ref(conversation)?;
-    validate_hash(root, "agent root")?;
-    validate_hash(tree, "agent workspace tree")?;
-    validate_hash(request, "agent request")?;
-    let base = server_base()?;
-    let admission = serde_json::json!({
-        "request": request,
-        "request_head": root,
-        "status": "queued",
-    });
-    let admission_message = serde_json::to_string(&admission)
-        .map_err(|error| format!("serializing agent admission: {error}"))?;
-    let head = store_commit(&base, tree, &[root], &admission_message)?;
-    let title = store_object(&base, "blob", title.as_bytes())?;
-    let user = utf8_ref_key("u-", owner);
-    let agent = utf8_ref_key("c-", conversation);
-    let active_ref = format!("refs/caos/v2/users/{user}/conversations/active/{agent}");
-    let archived_ref = format!("refs/caos/v2/users/{user}/conversations/archived/{agent}");
-    let title_ref = format!("refs/caos/v2/conversations/{conversation}/title");
-    let updates = [
-        (head_ref.as_str(), None, Some(head.as_str())),
-        (title_ref.as_str(), None, Some(title.as_str())),
-        (active_ref.as_str(), None, Some(head.as_str())),
-        (archived_ref.as_str(), None, None),
-    ];
-
-    match push_transaction(&updates) {
-        Ok(()) => Ok(true),
-        Err(error) => match read_ref(&head_ref)? {
-            Some(_) => Ok(false),
-            None => Err(error),
-        },
+    fn push_ref_value(
+        &mut self,
+        refname: &str,
+        expected: Option<&Oid>,
+        new: Option<&Oid>,
+    ) -> Result<(), String> {
+        self.push(&[RefUpdate {
+            refname: refname.to_string(),
+            expected: expected.cloned(),
+            new: new.cloned(),
+        }])
     }
 }
 
-/// Store the child prompt and readable parent link before deriving its request.
-#[allow(clippy::too_many_arguments)]
-pub fn store_agent_root(
-    base_commit: &str,
-    tree: &str,
-    prompt: &str,
-    owner: &str,
-    parent: &str,
-    run: &str,
-    round: u64,
-    call: &str,
-    title: &str,
-) -> Result<String, String> {
-    validate_hash(base_commit, "agent base commit")?;
-    validate_hash(tree, "agent workspace tree")?;
-    validate_hash(run, "parent request")?;
-    let base = server_base()?;
-    let root_event = serde_json::json!({
-        "base": base_commit,
-        "author": "user",
-        "username": owner,
-        "content": prompt,
-        "title": title,
-        "spawned_by": {
-            "conversation": parent,
-            "request": run,
-            "round": round,
-            "call": call,
-        },
-    });
-    let root_message = serde_json::to_string(&root_event)
-        .map_err(|error| format!("serializing agent root event: {error}"))?;
-    store_commit(&base, tree, &[base_commit], &root_message)
+pub struct State<S: RefStore = GitStore> {
+    store: S,
+    refname: String,
+    head: Oid,
+    known_valid: HashSet<Oid>,
+    fresh_after_append: bool,
 }
 
-pub fn agent_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    let compact = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_CHARS {
-        compact
-    } else {
-        compact
-            .chars()
-            .take(MAX_CHARS - 1)
-            .chain(std::iter::once('…'))
-            .collect()
+impl State<GitStore> {
+    pub fn open(conversation: &str) -> Result<Self, String> {
+        let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+        let server =
+            std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
+        let store = GitStore::scratch("llm-step-git", server.trim_end_matches('/'))?;
+        let head = store
+            .fetch_ref(&refname)?
+            .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
+        Self::from_store(store, refname, head)
     }
-}
 
-/// Return the queued request of an existing deterministic child. Later events
-/// may have advanced the child; its root and admission remain first.
-pub fn agent_request(conversation: &str, prompt: &str) -> Result<Option<String>, String> {
-    let refname = conversation_ref(conversation)?;
-    if read_ref(&refname)?.is_none() {
-        return Ok(None);
+    /// Publish a commit object after its referenced tree and parents are known
+    /// to be present on the server. Unlike a content-addressed ref push, this
+    /// uses the in-process object endpoint and creates no advertised ref.
+    pub fn publish_commit(&mut self, commit: &Oid) -> Result<(), String> {
+        let info = self.store.read_commit(commit).map_err(String::from)?;
+        for object in std::iter::once(&info.tree).chain(&info.parents) {
+            require_server_object(commit, object)?;
+        }
+        let directory = scratch(&crate::fresh_name("publish-commit"))?;
+        let source = directory.join("commit");
+        fs::write(&source, encode_commit_bytes(&info))
+            .map_err(|error| format!("writing {}: {error}", source.display()))?;
+        let target = crate::fresh("published-commit");
+        let output = Command::new("caos")
+            .args(["put-commit", path(&source), &target])
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|error| format!("running caos put-commit: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("caos put-commit exited with {}", output.status));
+        }
+        let published = String::from_utf8(output.stdout)
+            .map_err(|error| format!("caos put-commit stdout is not UTF-8: {error}"))?;
+        let published = Oid::parse(published.trim(), "published commit oid")?;
+        if published != *commit {
+            return Err(format!(
+                "caos put-commit published {published}, expected {commit}"
+            ));
+        }
+        crate::timing::phase("publish commit");
+        Ok(())
     }
-    let log = conversation_log(conversation)?;
-    let root = log
-        .events
-        .first()
-        .ok_or_else(|| format!("agent conversation {conversation:?} has no root event"))?;
-    if root.value.get("content").and_then(Value::as_str) != Some(prompt)
-        || root.value.get("author").and_then(Value::as_str) != Some("user")
-    {
-        return Err(format!(
-            "agent conversation {conversation:?} does not match its spawning call"
-        ));
-    }
-    let admission = log
-        .events
-        .get(1)
-        .ok_or_else(|| format!("agent conversation {conversation:?} has no admission event"))?;
-    if admission.value.get("request_head").and_then(Value::as_str) != Some(root.commit.as_str()) {
-        return Err(format!(
-            "agent conversation {conversation:?} has a malformed admission"
-        ));
-    }
-    let request = admission
-        .value
-        .get("request")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("agent conversation {conversation:?} has no request"))?;
-    validate_hash(request, "agent request")?;
-    Ok(Some(request.to_string()))
-}
 
-fn push_transaction(updates: &[(&str, Option<&str>, Option<&str>)]) -> Result<(), String> {
-    let updates = updates
-        .iter()
-        .map(|(refname, expected, new)| RefUpdate {
-            refname,
-            expected: *expected,
-            new: *new,
-        })
-        .collect::<Vec<_>>();
-    git_repo()?.push_atomic(&updates)
-}
-
-fn utf8_ref_key(prefix: &str, value: &str) -> String {
-    let hex = value
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{prefix}{hex}")
-}
-
-/// Append only while `expected_head` is still the canonical tip. Unlike
-/// a rebasing append, this never retries over a CAS loser. Terminal state uses
-/// this guard so a user message that arrives at the end of a model round is
-/// either answered by this request or starts a later request; it is never
-/// buried underneath a blindly retried `status: idle` event.
-pub fn append_event_at_head(
-    conversation: &str,
-    expected_head: &str,
-    event: &Value,
-    tree: &str,
-) -> Result<ConditionalAppend, String> {
-    let refname = conversation_ref(conversation)?;
-    validate_hash(expected_head, "expected conversation head")?;
-    validate_hash(tree, "event tree")?;
-    validate_event(event)?;
-    let base = server_base()?;
-    let observed =
-        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
-    if observed != expected_head {
-        return Ok(ConditionalAppend::HeadChanged(observed));
-    }
-    let current_tree = fetch_commit(&base, expected_head)?.tree;
-    if current_tree != tree {
-        return Err(format!(
-            "conditional event would replace workspace tree {current_tree} with {tree}"
-        ));
-    }
-    append_event_at_head_inner(&base, &refname, expected_head, event, tree, None)
-}
-
-/// Attempt one exact-head append, optionally retaining a workspace mutation as
-/// a second parent. The caller is responsible for deriving `tree` from the
-/// proposal's observed base before calling this function. A lost CAS is
-/// returned, never silently rebased, so event-specific checks can be repeated.
-pub fn append_event_at_head_with_parent(
-    conversation: &str,
-    expected_head: &str,
-    event: &Value,
-    tree: &str,
-    extra_parent: Option<&str>,
-) -> Result<ConditionalAppend, String> {
-    let refname = conversation_ref(conversation)?;
-    validate_hash(expected_head, "expected conversation head")?;
-    validate_hash(tree, "event tree")?;
-    if let Some(parent) = extra_parent {
-        validate_hash(parent, "extra parent")?;
-    }
-    validate_event(event)?;
-    let base = server_base()?;
-    let observed =
-        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
-    if observed != expected_head {
-        return Ok(ConditionalAppend::HeadChanged(observed));
-    }
-    append_event_at_head_inner(&base, &refname, expected_head, event, tree, extra_parent)
-}
-
-fn append_event_at_head_inner(
-    base: &str,
-    refname: &str,
-    expected_head: &str,
-    event: &Value,
-    tree: &str,
-    extra_parent: Option<&str>,
-) -> Result<ConditionalAppend, String> {
-    let message =
-        serde_json::to_string(event).map_err(|e| format!("serializing conversation event: {e}"))?;
-    let mut parents = vec![expected_head];
-    if let Some(parent) = extra_parent {
-        if parent != expected_head {
-            parents.push(parent);
+    /// Publish a code commit before a conversation record names it. The ref is
+    /// content-addressed, so an existing equal value is the same publication.
+    pub fn push_code(&mut self, commit: &Oid) -> Result<(), String> {
+        self.store.ensure_local(commit)?;
+        self.store.read_commit(commit).map_err(String::from)?;
+        let refname = format!("refs/caos/req/{commit}");
+        let pushed = self.store.push(&[RefUpdate {
+            refname: refname.clone(),
+            expected: None,
+            new: Some(commit.clone()),
+        }]);
+        crate::timing::phase("push code");
+        match pushed {
+            Ok(()) => Ok(()),
+            Err(push_error) => match self.store.fetch_ref(&refname)? {
+                Some(current) if current == *commit => Ok(()),
+                Some(current) => Err(format!(
+                    "content-addressed code ref {refname} names {current}, not {commit}"
+                )),
+                None => Err(push_error),
+            },
         }
     }
-    let candidate = store_commit(base, tree, &parents, &message)?;
-    let appended = || {
-        ConditionalAppend::Appended(AppendResult {
-            commit: candidate.clone(),
-            previous_head: expected_head.to_string(),
-            retries: 0,
-        })
-    };
 
-    match push_ref(refname, Some(expected_head), &candidate) {
-        Ok(()) => Ok(appended()),
-        Err(error) => {
-            let observed = read_ref(refname).map_err(|read_error| {
-                format!(
-                    "pushing {refname} failed ({error}); rereading it also failed: {read_error}"
-                )
-            })?;
-            let Some(observed) = observed else {
-                return Err(format!(
-                    "conversation ref {refname} disappeared during append"
-                ));
-            };
-            if observed == candidate || first_parent_contains(base, &observed, &candidate)? {
-                Ok(appended())
-            } else if observed != expected_head {
-                Ok(ConditionalAppend::HeadChanged(observed))
-            } else {
-                Err(error)
-            }
+    pub fn fetch_object(&mut self, oid: &Oid) -> Result<(), String> {
+        self.store.ensure_local(oid)
+    }
+
+    /// Atomically close a spawn call and create its child ref. A failed push
+    /// is classified by rereading both refs: the immutable spawn intent and
+    /// initial child spine distinguish a joined transaction from corruption.
+    pub fn atomic_spawn(
+        &mut self,
+        expected: &Oid,
+        transition: Transition,
+        child: &ChildRecord,
+    ) -> Result<TryAppend, String> {
+        if &self.head != expected {
+            return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-    }
-}
-
-fn validate_event(event: &Value) -> Result<(), String> {
-    ProtocolEvent::parse_append(event).map(|_| ())
-}
-
-/// Read all chat events reachable from the canonical conversation head,
-/// following only the first parent through the event that explicitly names
-/// its ordinary workspace parent as `base`.
-pub fn conversation_log(conversation: &str) -> Result<ConversationLog, String> {
-    let refname = conversation_ref(conversation)?;
-    let base = server_base()?;
-    let head =
-        read_ref(&refname)?.ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
-    let mut newest_first = Vec::new();
-    let mut current = head.clone();
-
-    loop {
-        let commit = fetch_commit(&base, &current)?;
-        let value = serde_json::from_str::<Value>(commit.message.trim()).map_err(|error| {
-            format!("conversation history commit {current} is not a JSON event: {error}")
-        })?;
-        let event = ProtocolEvent::parse(&value)
-            .map_err(|error| format!("invalid conversation event {current}: {error}"))?;
-        let parent = commit.parents.first().cloned();
-        let parent = required_event_parent(parent.as_deref(), &current)?;
-        let boundary = event.boundary(&parent)?;
-        newest_first.push(ConversationEvent {
-            commit: current.clone(),
-            tree: commit.tree,
-            value,
-        });
-        current = parent;
-        if boundary == EventBoundary::Root {
-            break;
+        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
+        let kind = transition.kind();
+        let Applied { tree, ordinal } =
+            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
+        if ordinal.is_some() {
+            return Err("subagent.spawn unexpectedly appended a transcript entry".to_string());
         }
-    }
-    newest_first.reverse();
-    Ok(ConversationLog {
-        head,
-        events: newest_first,
-    })
-}
-
-fn required_event_parent(parent: Option<&str>, event: &str) -> Result<String, String> {
-    parent
-        .map(str::to_string)
-        .ok_or_else(|| format!("conversation event {event} has no first parent"))
-}
-
-pub(crate) fn conversation_ref(conversation: &str) -> Result<String, String> {
-    protocol_conversation_ref(conversation)
-}
-
-/// Validate an already-formed canonical conversation head ref with the same
-/// grammar used when this crate constructs one from a conversation id.
-pub(crate) fn validate_conversation_ref(refname: &str) -> Result<(), String> {
-    protocol_validate_conversation_ref(refname)
-        .map_err(|_| format!("invalid target conversation ref {refname:?}"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceConflict {
-    pub paths: Vec<String>,
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetryTree {
-    Merged(String),
-    Conflict(WorkspaceConflict),
-}
-
-/// Reconcile a tool's proposed workspace tree with changes appended to the
-/// conversation after the tool started. This existing tree-level merge stays
-/// directly against the server's object store; Git in this worker is transport
-/// for mutable refs, not a second workspace implementation. Changes to
-/// different paths merge recursively; two changes to the same entry become a
-/// durable conflict disposition so the caller can retain the proposal as an
-/// event parent.
-pub fn retry_tree(base: &str, proposed: &str, current: &str) -> Result<RetryTree, String> {
-    if current == base {
-        return Ok(RetryTree::Merged(proposed.to_string()));
-    } else if proposed == base || proposed == current {
-        return Ok(RetryTree::Merged(current.to_string()));
-    }
-
-    validate_hash(base, "tool base tree")?;
-    validate_hash(proposed, "tool proposed tree")?;
-    validate_hash(current, "current conversation tree")?;
-    let mut store = RemoteTreeStore {
-        base: server_base()?,
-    };
-    match merge_tree(&mut store, Some(base), proposed, current, "") {
-        Ok(tree) => Ok(RetryTree::Merged(tree)),
-        Err(error) => match conflict_path(&error) {
-            Some(path) => Ok(RetryTree::Conflict(WorkspaceConflict {
-                paths: vec![path.to_string()],
-                detail: error,
-            })),
-            None => Err(error),
-        },
-    }
-}
-
-const WORKSPACE_CONFLICT_PREFIX: &str = "conversation workspace conflict at ";
-
-fn conflict_path(error: &str) -> Option<&str> {
-    error
-        .strip_prefix(WORKSPACE_CONFLICT_PREFIX)?
-        .split_once(':')
-        .map(|(path, _)| path)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TreeEntry {
-    mode: u32,
-    oid: String,
-}
-
-impl TreeEntry {
-    fn is_tree(&self) -> bool {
-        self.mode == 0o040000
-    }
-
-    fn is_regular_file(&self) -> bool {
-        matches!(self.mode, 0o100644 | 0o100755)
-    }
-}
-
-trait TreeStore {
-    fn read_tree(&mut self, oid: &str) -> Result<BTreeMap<Vec<u8>, TreeEntry>, String>;
-    fn write_tree(&mut self, entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Result<String, String>;
-}
-
-struct RemoteTreeStore {
-    base: String,
-}
-
-impl TreeStore for RemoteTreeStore {
-    fn read_tree(&mut self, oid: &str) -> Result<BTreeMap<Vec<u8>, TreeEntry>, String> {
-        validate_hash(oid, "tree")?;
-        let serialized = fetch_object(&self.base, oid)?;
-        parse_serialized_tree(&serialized).map_err(|error| format!("tree {oid}: {error}"))
-    }
-
-    fn write_tree(&mut self, entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Result<String, String> {
-        let content = serialize_tree(entries)?;
-        store_object(&self.base, "tree", &content)
-    }
-}
-
-/// Merge three trees with `base` as the common ancestor. `base = None` is the
-/// empty tree used when both sides independently add the same directory.
-fn merge_tree<S: TreeStore>(
-    store: &mut S,
-    base: Option<&str>,
-    proposed: &str,
-    current: &str,
-    path: &str,
-) -> Result<String, String> {
-    if base == Some(current) {
-        return Ok(proposed.to_string());
-    }
-    if base == Some(proposed) || proposed == current {
-        return Ok(current.to_string());
-    }
-
-    let base_entries = match base {
-        Some(oid) => store.read_tree(oid)?,
-        None => BTreeMap::new(),
-    };
-    let proposed_entries = store.read_tree(proposed)?;
-    let current_entries = store.read_tree(current)?;
-    let mut names = BTreeSet::new();
-    names.extend(base_entries.keys().cloned());
-    names.extend(proposed_entries.keys().cloned());
-    names.extend(current_entries.keys().cloned());
-
-    let mut merged = BTreeMap::new();
-    for name in names {
-        let base_entry = base_entries.get(&name);
-        let proposed_entry = proposed_entries.get(&name);
-        let current_entry = current_entries.get(&name);
-        let display_name = String::from_utf8_lossy(&name);
-        let child_path = if path.is_empty() {
-            display_name.into_owned()
-        } else {
-            format!("{path}/{display_name}")
-        };
-        if let Some(entry) = merge_entry(
-            store,
-            base_entry,
-            proposed_entry,
-            current_entry,
-            &child_path,
-        )? {
-            merged.insert(name, entry);
-        }
-    }
-    store.write_tree(&merged)
-}
-
-fn merge_entry<S: TreeStore>(
-    store: &mut S,
-    base: Option<&TreeEntry>,
-    proposed: Option<&TreeEntry>,
-    current: Option<&TreeEntry>,
-    path: &str,
-) -> Result<Option<TreeEntry>, String> {
-    if current == base {
-        return Ok(proposed.cloned());
-    }
-    if proposed == base || proposed == current {
-        return Ok(current.cloned());
-    }
-
-    if let (Some(proposed), Some(current)) = (proposed, current) {
-        if proposed.is_tree() && current.is_tree() && base.is_none_or(TreeEntry::is_tree) {
-            let oid = merge_tree(
-                store,
-                base.map(|entry| entry.oid.as_str()),
-                &proposed.oid,
-                &current.oid,
-                path,
-            )?;
-            return Ok(Some(TreeEntry {
-                mode: 0o040000,
-                oid,
+        let signature = inherited_signature(&self.store, expected)?;
+        let candidate = mint(
+            &mut self.store,
+            expected,
+            &tree,
+            transition.kind(),
+            &signature,
+        )?;
+        let child_ref = conversation_protocol::v3::refs::head_ref(&child.id)?;
+        let updates = [
+            RefUpdate {
+                refname: self.refname.clone(),
+                expected: Some(expected.clone()),
+                new: Some(candidate.clone()),
+            },
+            RefUpdate {
+                refname: child_ref.clone(),
+                expected: None,
+                new: Some(child.initial_head.clone()),
+            },
+        ];
+        let pushed = self.store.push(&updates);
+        crate::timing::phase(&format!("push {}", kind.as_str()));
+        if pushed.is_ok() {
+            self.head = candidate.clone();
+            self.known_valid.insert(candidate.clone());
+            self.fresh_after_append = true;
+            return Ok(TryAppend::Appended(Appended {
+                commit: candidate.clone(),
+                head: candidate,
+                ordinal: None,
             }));
         }
-        if let Some(base) = base {
-            // Git can cleanly combine a chmod on one side with a content edit
-            // on the other. Restrict this component-wise merge to regular
-            // files: a regular-file/symlink transition changes the meaning of
-            // the blob and must remain a conflict.
-            if base.is_regular_file() && proposed.is_regular_file() && current.is_regular_file() {
-                if let (Some(mode), Some(oid)) = (
-                    merge_scalar(base.mode, proposed.mode, current.mode),
-                    merge_scalar(&base.oid, &proposed.oid, &current.oid),
-                ) {
-                    return Ok(Some(TreeEntry {
-                        mode,
-                        oid: oid.clone(),
-                    }));
+
+        let push_error = pushed.unwrap_err();
+        let observed_parent = self.store.fetch_ref(&self.refname).map_err(|read_error| {
+            format!(
+                "atomic spawn push failed ({push_error}); rereading {} also failed: {read_error}",
+                self.refname
+            )
+        })?;
+        let observed_child = self.store.fetch_ref(&child_ref).map_err(|read_error| {
+            format!(
+                "atomic spawn push failed ({push_error}); rereading {child_ref} also failed: {read_error}"
+            )
+        })?;
+        let Some(observed_parent) = observed_parent else {
+            return Err(format!(
+                "atomic spawn push failed ({push_error}); parent ref {} disappeared",
+                self.refname
+            ));
+        };
+        self.head = observed_parent.clone();
+        self.fresh_after_append = false;
+        self.validate()?;
+        let observed_record = self.conversation()?.child(&child.id)?;
+        match (observed_record, observed_child) {
+            (Some(record), Some(child_head)) => {
+                if !same_spawn(&record, child) {
+                    return Err(format!(
+                        "corrupt subagent spawn {}: parent record disagrees with the durable spawn intent",
+                        child.id
+                    ));
+                }
+                if !parent_chain_contains(&self.store, &observed_parent, &candidate)? {
+                    return Err(format!(
+                        "corrupt subagent spawn {}: parent record is not descended from the reconstructed spawn commit {candidate}",
+                        child.id
+                    ));
+                }
+                validate_spine(&self.store, &child_head, &mut HashSet::new())
+                    .map_err(|error| format!("corrupt subagent spawn {}: {error}", child.id))?;
+                if !parent_chain_contains(&self.store, &child_head, &child.initial_head)? {
+                    return Err(format!(
+                        "corrupt subagent spawn {}: child ref {child_ref} at {child_head} does not contain initial head {}",
+                        child.id, child.initial_head
+                    ));
+                }
+                Ok(TryAppend::Appended(Appended {
+                    commit: candidate,
+                    head: observed_parent,
+                    ordinal: None,
+                }))
+            }
+            (Some(_), None) => Err(format!(
+                "corrupt subagent spawn {}: parent record exists but child ref {child_ref} is absent",
+                child.id
+            )),
+            (None, Some(child_head)) => Err(format!(
+                "corrupt subagent spawn {}: child ref {child_ref} exists at {child_head} without its parent record",
+                child.id
+            )),
+            (None, None) => Ok(TryAppend::HeadChanged(observed_parent)),
+        }
+    }
+}
+
+fn require_server_object(commit: &Oid, object: &Oid) -> Result<(), String> {
+    let base =
+        std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
+    let url = format!("{}/object/{object}", base.trim_end_matches('/'));
+    let response = minreq::head(&url)
+        .with_timeout(30)
+        .send()
+        .map_err(|error| format!("HEAD {url}: {error}"))?;
+    match response.status_code {
+        200..=299 => Ok(()),
+        404 => Err(format!(
+            "cannot publish commit {commit}: server is missing object {object}"
+        )),
+        status => Err(format!("HEAD {url}: {status} {}", response.reason_phrase)),
+    }
+}
+
+impl<S: RefStore> State<S> {
+    pub fn from_store(store: S, refname: String, head: Oid) -> Result<Self, String> {
+        let mut state = State {
+            store,
+            refname,
+            head,
+            known_valid: HashSet::new(),
+            fresh_after_append: false,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn head(&self) -> &Oid {
+        &self.head
+    }
+
+    pub fn refname(&self) -> &str {
+        &self.refname
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
+    pub fn conversation(&self) -> Result<Conversation<'_>, String> {
+        Conversation::open(&self.store, &self.head)
+    }
+
+    pub fn conversation_at(&self, head: &Oid) -> Result<Conversation<'_>, String> {
+        Conversation::open(&self.store, head)
+    }
+
+    pub fn reload(&mut self) -> Result<Oid, String> {
+        let head = self
+            .store
+            .fetch_ref_value(&self.refname)?
+            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
+        self.head = head.clone();
+        self.fresh_after_append = false;
+        self.validate()?;
+        Ok(head)
+    }
+
+    pub fn take_fresh_after_append(&mut self) -> bool {
+        std::mem::take(&mut self.fresh_after_append)
+    }
+
+    pub fn append(&mut self, transition: Transition) -> Result<Appended, String> {
+        for _ in 0..MAX_APPEND_ATTEMPTS {
+            let expected = self.head.clone();
+            match self.try_append_at(&expected, transition.clone())? {
+                TryAppend::Appended(appended) => return Ok(appended),
+                TryAppend::HeadChanged(_) => {
+                    if let Some(appended) = self.joined(&transition)? {
+                        return Ok(appended);
+                    }
                 }
             }
         }
+        Err("conversation kept changing while appending a transition".to_string())
     }
 
-    Err(format!(
-        "{WORKSPACE_CONFLICT_PREFIX}{path}: base {}, proposed {}, concurrent {}",
-        describe_entry(base),
-        describe_entry(proposed),
-        describe_entry(current)
-    ))
-}
-
-fn merge_scalar<T: Eq>(base: T, proposed: T, current: T) -> Option<T> {
-    if current == base {
-        Some(proposed)
-    } else if proposed == base || proposed == current {
-        Some(current)
-    } else {
-        None
-    }
-}
-
-fn describe_entry(entry: Option<&TreeEntry>) -> String {
-    match entry {
-        Some(entry) => format!("{:o} {}", entry.mode, entry.oid),
-        None => "absent".to_string(),
-    }
-}
-
-fn parse_serialized_tree(serialized: &[u8]) -> Result<BTreeMap<Vec<u8>, TreeEntry>, String> {
-    let content = serialized_object_content(serialized, "tree")?;
-    let mut entries = BTreeMap::new();
-    let mut offset = 0;
-    while offset < content.len() {
-        let mode_end = content[offset..]
-            .iter()
-            .position(|byte| *byte == b' ')
-            .map(|position| offset + position)
-            .ok_or("tree entry has no mode terminator")?;
-        let mode_text = std::str::from_utf8(&content[offset..mode_end])
-            .map_err(|error| format!("tree mode is not ASCII: {error}"))?;
-        let mode = u32::from_str_radix(mode_text, 8)
-            .map_err(|error| format!("invalid tree mode {mode_text:?}: {error}"))?;
-        if !matches!(mode, 0o040000 | 0o100644 | 0o100755 | 0o120000 | 0o160000) {
-            return Err(format!("unsupported tree mode {mode_text:?}"));
+    pub fn try_append_at(
+        &mut self,
+        expected: &Oid,
+        transition: Transition,
+    ) -> Result<TryAppend, String> {
+        if &self.head != expected {
+            return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let name_start = mode_end + 1;
-        let name_end = content[name_start..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .map(|position| name_start + position)
-            .ok_or("tree entry has no name terminator")?;
-        let name = content[name_start..name_end].to_vec();
-        if name.is_empty() || name.contains(&b'/') {
-            return Err(format!("invalid tree entry name {name:?}"));
+        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
+        let transition =
+            retarget_transcript_transition(&self.store, &parent_info.tree, transition)?;
+        let Applied { tree, ordinal } =
+            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
+        let signature = inherited_signature(&self.store, expected)?;
+        let candidate = mint(
+            &mut self.store,
+            expected,
+            &tree,
+            transition.kind(),
+            &signature,
+        )?;
+        let pushed = self
+            .store
+            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
+        crate::timing::phase(&format!("push {}", transition.kind().as_str()));
+        if pushed.is_ok() {
+            self.head = candidate.clone();
+            self.known_valid.insert(candidate.clone());
+            self.fresh_after_append = true;
+            return Ok(TryAppend::Appended(Appended {
+                commit: candidate.clone(),
+                head: candidate,
+                ordinal,
+            }));
         }
-        let oid_start = name_end + 1;
-        let oid_end = oid_start + 20;
-        if oid_end > content.len() {
-            return Err("tree entry has a truncated object id".to_string());
+
+        let push_error = pushed.unwrap_err();
+        let observed = self
+            .store
+            .fetch_ref_value(&self.refname)
+            .map_err(|read_error| {
+                format!(
+                    "pushing {} failed ({push_error}); rereading it also failed: {read_error}",
+                    self.refname
+                )
+            })?
+            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
+        self.head = observed.clone();
+        self.fresh_after_append = false;
+        self.validate()?;
+        if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
+            return Ok(TryAppend::Appended(Appended {
+                commit: candidate,
+                head: observed,
+                ordinal,
+            }));
         }
-        let oid = hex_oid(&content[oid_start..oid_end]);
-        if entries
-            .insert(name.clone(), TreeEntry { mode, oid })
-            .is_some()
-        {
-            return Err(format!("duplicate tree entry name {name:?}"));
+        if &observed != expected {
+            Ok(TryAppend::HeadChanged(observed))
+        } else {
+            Err(push_error)
         }
-        offset = oid_end;
     }
-    Ok(entries)
-}
 
-fn serialize_tree(entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Result<Vec<u8>, String> {
-    let mut ordered: Vec<_> = entries.iter().collect();
-    ordered.sort_by(|(left_name, left), (right_name, right)| {
-        git_tree_name_cmp(left_name, left.is_tree(), right_name, right.is_tree())
-    });
-    let mut content = Vec::new();
-    for (name, entry) in ordered {
-        if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
-            return Err(format!("invalid tree entry name {name:?}"));
+    pub fn try_append_pair_at(
+        &mut self,
+        expected: &Oid,
+        first: Transition,
+        second: Transition,
+    ) -> Result<TryAppend, String> {
+        if &self.head != expected {
+            return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        content.extend_from_slice(format!("{:o} ", entry.mode).as_bytes());
-        content.extend_from_slice(name);
-        content.push(0);
-        content.extend_from_slice(&decode_oid(&entry.oid)?);
-    }
-    Ok(content)
-}
+        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
+        let first = retarget_transcript_transition(&self.store, &parent_info.tree, first)?;
+        let Applied {
+            tree: first_tree,
+            ordinal,
+        } = apply(&mut self.store, Some(&parent_info.tree), &first)?;
+        let signature = inherited_signature(&self.store, expected)?;
+        let first_candidate = mint(
+            &mut self.store,
+            expected,
+            &first_tree,
+            first.kind(),
+            &signature,
+        )?;
 
-/// Git compares a directory name as though it had a trailing slash. This is
-/// observably different from sorting only by the raw name (`foo.bar` sorts
-/// before directory `foo`).
-fn git_tree_name_cmp(
-    left: &[u8],
-    left_is_tree: bool,
-    right: &[u8],
-    right_is_tree: bool,
-) -> Ordering {
-    let common = left.len().min(right.len());
-    match left[..common].cmp(&right[..common]) {
-        Ordering::Equal => {
-            let left_next =
-                left.get(common)
-                    .copied()
-                    .unwrap_or(if left_is_tree { b'/' } else { 0 });
-            let right_next =
-                right
-                    .get(common)
-                    .copied()
-                    .unwrap_or(if right_is_tree { b'/' } else { 0 });
-            left_next.cmp(&right_next)
+        let second = retarget_transcript_transition(&self.store, &first_tree, second)?;
+        let Applied {
+            tree: second_tree,
+            ordinal: second_ordinal,
+        } = apply(&mut self.store, Some(&first_tree), &second)?;
+        let second_signature = inherited_signature(&self.store, &first_candidate)?;
+        let candidate = mint(
+            &mut self.store,
+            &first_candidate,
+            &second_tree,
+            second.kind(),
+            &second_signature,
+        )?;
+        let pushed = self
+            .store
+            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
+        crate::timing::phase(&format!(
+            "push {}+{}",
+            first.kind().as_str(),
+            second.kind().as_str()
+        ));
+        if pushed.is_ok() {
+            self.head = candidate.clone();
+            self.known_valid.insert(first_candidate);
+            self.known_valid.insert(candidate.clone());
+            self.fresh_after_append = true;
+            return Ok(TryAppend::Appended(Appended {
+                commit: candidate.clone(),
+                head: candidate,
+                ordinal: ordinal.or(second_ordinal),
+            }));
         }
-        ordering => ordering,
-    }
-}
 
-fn decode_oid(oid: &str) -> Result<Vec<u8>, String> {
-    validate_hash(oid, "tree entry")?;
-    let mut bytes = Vec::with_capacity(20);
-    for pair in oid.as_bytes().chunks_exact(2) {
-        let pair = std::str::from_utf8(pair).expect("hex object id is ASCII");
-        bytes.push(
-            u8::from_str_radix(pair, 16)
-                .map_err(|error| format!("invalid object id {oid:?}: {error}"))?,
-        );
-    }
-    Ok(bytes)
-}
-
-fn hex_oid(bytes: &[u8]) -> String {
-    let mut oid = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        oid.push_str(&format!("{byte:02x}"));
-    }
-    oid
-}
-
-fn store_commit(base: &str, tree: &str, parents: &[&str], message: &str) -> Result<String, String> {
-    if parents.is_empty() {
-        return Err("conversation event commit requires a parent".to_string());
-    }
-    let timestamp = inherited_timestamp(base, parents[0])?;
-    let content = commit_content(tree, parents, timestamp, message)?;
-    store_object(base, "commit", content.as_bytes())
-}
-
-fn commit_content(
-    tree: &str,
-    parents: &[&str],
-    timestamp: i64,
-    message: &str,
-) -> Result<String, String> {
-    validate_hash(tree, "commit tree")?;
-    if parents.is_empty() {
-        return Err("conversation event commit requires a parent".to_string());
-    }
-    let mut content = format!("tree {tree}\n");
-    for parent in parents {
-        validate_hash(parent, "commit parent")?;
-        content.push_str(&format!("parent {parent}\n"));
-    }
-    // Inheriting the first parent's timestamp keeps a proposal stable for a
-    // given event, tree, and observed head while giving published conversation
-    // commits the real date of the user turn that caused them.
-    content.push_str(&format!(
-        "author caos-agent <caos@caos> {timestamp} +0000\n\
-         committer caos-agent <caos@caos> {timestamp} +0000\n\n"
-    ));
-    content.push_str(message);
-    if !message.ends_with('\n') {
-        content.push('\n');
-    }
-    Ok(content)
-}
-
-fn inherited_timestamp(base: &str, parent: &str) -> Result<i64, String> {
-    let mut current = parent.to_string();
-    for _ in 0..4096 {
-        let commit = fetch_commit(base, &current)?;
-        if commit.timestamp > 0 {
-            return Ok(commit.timestamp);
+        let push_error = pushed.unwrap_err();
+        let observed = self
+            .store
+            .fetch_ref_value(&self.refname)
+            .map_err(|read_error| {
+                format!(
+                    "pushing {} failed ({push_error}); rereading it also failed: {read_error}",
+                    self.refname
+                )
+            })?
+            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
+        self.head = observed.clone();
+        self.fresh_after_append = false;
+        self.validate()?;
+        if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
+            return Ok(TryAppend::Appended(Appended {
+                commit: candidate,
+                head: observed,
+                ordinal: ordinal.or(second_ordinal),
+            }));
         }
-        let Some(parent) = commit.parents.first() else {
-            return Ok(commit.timestamp);
+        if &observed != expected {
+            Ok(TryAppend::HeadChanged(observed))
+        } else {
+            Err(push_error)
+        }
+    }
+
+    fn validate(&mut self) -> Result<(), String> {
+        validate_spine(&self.store, &self.head, &mut self.known_valid)
+            .map(|_| ())
+            .map_err(String::from)
+    }
+
+    fn joined(&self, transition: &Transition) -> Result<Option<Appended>, String> {
+        let view = self.conversation()?;
+        let ordinal = match transition_entry(transition) {
+            Some(entry) => crate::message_ordinal(&view, &entry.message_id)?,
+            None => None,
         };
-        current = parent.clone();
+        if let Some(ordinal) = ordinal {
+            return Ok(Some(Appended {
+                commit: self.head.clone(),
+                head: self.head.clone(),
+                ordinal: Some(ordinal),
+            }));
+        }
+        let joined = match transition {
+            Transition::AsyncStart { record } => {
+                view.async_task(&record.task)?.as_ref() == Some(record)
+            }
+            Transition::ToolStart { record } | Transition::ToolComplete { record, .. } => {
+                view.tool(&record.request, record.round, &record.id)?
+                    .as_ref()
+                    == Some(record)
+            }
+            Transition::SubagentApply { child, application } => view
+                .child(child)?
+                .is_some_and(|record| record.applications.contains(application)),
+            _ => false,
+        };
+        Ok(joined.then(|| Appended {
+            commit: self.head.clone(),
+            head: self.head.clone(),
+            ordinal: None,
+        }))
     }
-    Err(format!(
-        "timestamp inheritance walk from {parent} exceeded 4096 commits"
-    ))
 }
 
-fn store_object(base: &str, kind: &str, content: &[u8]) -> Result<String, String> {
-    let mut body = format!("{kind} {}\0", content.len()).into_bytes();
-    body.extend_from_slice(content);
-    let url = format!("{base}/object/");
-    let resp = minreq::post(&url)
-        .with_body(body)
-        .with_timeout(30)
-        .send()
-        .map_err(|e| format!("POST {url}: {e}"))?;
-    if !(200..300).contains(&resp.status_code) {
-        return Err(format!(
-            "POST {url}: {} {}",
-            resp.status_code, resp.reason_phrase
-        ));
+fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
+    observed.id == expected.id
+        && observed.initial_head == expected.initial_head
+        && observed.initial_workspace == expected.initial_workspace
+        && observed.request == expected.request
+        && observed.relay == expected.relay
+        && observed.spawn_intent == expected.spawn_intent
+}
+
+fn transition_entry(transition: &Transition) -> Option<&TranscriptEntry> {
+    match transition {
+        Transition::MessageAppend { entry, .. } | Transition::ModelComplete { entry, .. } => {
+            Some(entry)
+        }
+        _ => None,
     }
-    let hash = resp
-        .as_str()
-        .map_err(|e| format!("POST {url}: invalid response: {e}"))?
-        .trim()
-        .to_string();
-    validate_hash(&hash, "stored object")?;
-    Ok(hash)
 }
 
-fn fetch_commit(base: &str, hash: &str) -> Result<RemoteCommit, String> {
-    let cache = COMMIT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    fetch_commit_cached(cache, base, hash, || fetch_object(base, hash))
-}
-
-fn fetch_commit_cached(
-    cache: &CommitCache,
-    base: &str,
-    hash: &str,
-    fetch: impl FnOnce() -> Result<Vec<u8>, String>,
-) -> Result<RemoteCommit, String> {
-    validate_hash(hash, "commit")?;
-    let key = (base.trim_end_matches('/').to_string(), hash.to_string());
-    if let Some(commit) = cache
-        .lock()
-        .map_err(|_| "conversation commit cache lock is poisoned".to_string())?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(commit);
+fn retarget_transcript_transition(
+    store: &dyn ObjectStore,
+    parent_tree: &Oid,
+    mut transition: Transition,
+) -> Result<Transition, String> {
+    let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
+    match &mut transition {
+        Transition::MessageAppend { entry, payloads }
+        | Transition::RequestInterject {
+            entry, payloads, ..
+        }
+        | Transition::ModelComplete {
+            entry, payloads, ..
+        } => retarget_entry(entry, payloads, ordinal),
+        _ => {}
     }
-    let serialized = fetch()?;
-    let commit = parse_serialized_commit(&serialized)
-        .map_err(|e| format!("object {hash}: invalid commit object: {e}"))?;
-    cache
-        .lock()
-        .map_err(|_| "conversation commit cache lock is poisoned".to_string())?
-        .insert(key, commit.clone());
-    Ok(commit)
+    Ok(transition)
 }
 
-fn fetch_object(base: &str, hash: &str) -> Result<Vec<u8>, String> {
-    validate_hash(hash, "object")?;
-    let url = format!("{base}/object/{hash}");
-    let resp = minreq::get(&url)
-        .with_timeout(30)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !(200..300).contains(&resp.status_code) {
-        return Err(format!(
-            "GET {url}: {} {}",
-            resp.status_code, resp.reason_phrase
-        ));
+fn retarget_entry(entry: &mut TranscriptEntry, payloads: &[(String, Vec<u8>)], ordinal: u64) {
+    let dir = paths::transcript_payload_dir(ordinal, &entry.message_id);
+    for block in &mut entry.blocks {
+        let target = match block {
+            Block::Payload { path } => Some(path),
+            Block::ToolUse { arguments, .. } => Some(arguments),
+            Block::Text { .. } => None,
+        };
+        if let Some(target) = target {
+            if let Some(name) = payloads
+                .iter()
+                .map(|(name, _)| name)
+                .find(|name| target.rsplit('/').next() == Some(name.as_str()))
+            {
+                *target = format!("{dir}/{name}");
+            }
+        }
     }
-    Ok(resp.into_bytes())
 }
 
-/// Error-path recovery for an accepted push whose response was lost and whose
-/// candidate already gained newer first-parent descendants before the reread.
-fn first_parent_contains(base: &str, tip: &str, needle: &str) -> Result<bool, String> {
-    let mut current = tip.to_string();
-    for _ in 0..4096 {
-        if current == needle {
+fn parent_chain_contains(store: &dyn ObjectStore, tip: &Oid, needle: &Oid) -> Result<bool, String> {
+    let mut current = tip.clone();
+    for _ in 0..MAX_RECOVERY_WALK {
+        if &current == needle {
             return Ok(true);
         }
-        let commit = fetch_commit(base, &current)?;
-        let Some(parent) = commit.parents.first() else {
+        let info = store.read_commit(&current).map_err(String::from)?;
+        let Some(parent) = info.parents.first() else {
             return Ok(false);
         };
         current = parent.clone();
     }
     Err(format!(
-        "first-parent recovery walk from {tip} exceeded 4096 commits"
+        "conversation recovery walk from {tip} exceeded {MAX_RECOVERY_WALK} commits"
     ))
-}
-
-fn parse_serialized_commit(serialized: &[u8]) -> Result<RemoteCommit, String> {
-    let content = serialized_object_content(serialized, "commit")?;
-    let text =
-        std::str::from_utf8(content).map_err(|e| format!("commit content is not UTF-8: {e}"))?;
-    let (headers, message) = text
-        .split_once("\n\n")
-        .ok_or("commit has no header/message separator")?;
-    let tree = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("tree "))
-        .ok_or("commit has no tree")?
-        .to_string();
-    validate_hash(&tree, "commit tree")?;
-    let mut parents = Vec::new();
-    for line in headers.lines() {
-        if let Some(parent) = line.strip_prefix("parent ") {
-            validate_hash(parent, "commit parent")?;
-            parents.push(parent.to_string());
-        }
-    }
-    let timestamp = headers
-        .lines()
-        .find(|line| line.starts_with("committer "))
-        .and_then(|line| line.split_whitespace().rev().nth(1))
-        .ok_or("commit has no committer timestamp")?
-        .parse::<i64>()
-        .map_err(|error| format!("commit has an invalid committer timestamp: {error}"))?;
-    Ok(RemoteCommit {
-        tree,
-        parents,
-        timestamp,
-        message: message.to_string(),
-    })
-}
-
-fn serialized_object_content<'a>(
-    serialized: &'a [u8],
-    expected_kind: &str,
-) -> Result<&'a [u8], String> {
-    let nul = serialized
-        .iter()
-        .position(|b| *b == 0)
-        .ok_or("object has no header terminator")?;
-    let header = std::str::from_utf8(&serialized[..nul])
-        .map_err(|e| format!("object header is not UTF-8: {e}"))?;
-    let (kind, size) = header
-        .split_once(' ')
-        .ok_or_else(|| format!("malformed object header {header:?}"))?;
-    if kind != expected_kind {
-        return Err(format!("expected {expected_kind}, got {kind:?}"));
-    }
-    let declared: usize = size
-        .parse()
-        .map_err(|e| format!("invalid object size {size:?}: {e}"))?;
-    let content = &serialized[nul + 1..];
-    if declared != content.len() {
-        return Err(format!(
-            "declared size {declared} does not match {} bytes",
-            content.len()
-        ));
-    }
-    Ok(content)
-}
-
-fn server_base() -> Result<String, String> {
-    let base =
-        std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
-    Ok(base.trim_end_matches('/').to_string())
-}
-
-/// Ask whether one exact object exists without parsing subprocess stderr.
-/// Missing is a user-facing 404; transport and server failures remain typed
-/// infrastructure errors.
-pub(crate) fn object_exists(hash: &str) -> Result<bool, String> {
-    validate_hash(hash, "object")?;
-    let url = format!("{}/object/{hash}", server_base()?);
-    let response = minreq::head(&url)
-        .with_timeout(30)
-        .send()
-        .map_err(|error| format!("HEAD {url}: {error}"))?;
-    object_status(&url, response.status_code, &response.reason_phrase)
-}
-
-fn object_status(url: &str, status: i32, reason: &str) -> Result<bool, String> {
-    match status {
-        200..=299 => Ok(true),
-        404 => Ok(false),
-        code => Err(format!("HEAD {url}: {code} {reason}")),
-    }
-}
-
-fn push_ref(refname: &str, expected: Option<&str>, new_hash: &str) -> Result<(), String> {
-    if let Some(expected) = expected {
-        validate_hash(expected, "expected ref")?;
-    }
-    validate_hash(new_hash, "new ref")?;
-
-    git_repo()?.push_ref(refname, expected, new_hash)
-}
-
-/// Read exactly one ref through ordinary Git protocol-v2 fetch.
-fn read_ref(refname: &str) -> Result<Option<String>, String> {
-    git_repo()?.read_ref(refname)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use conversation_protocol::v3::apply::{client_signature, mint};
+    use conversation_protocol::v3::oid::ensure_genesis;
+    use conversation_protocol::v3::{Identity, IdentityKind, MemoryStore};
+
     use super::*;
 
-    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const C: &str = "cccccccccccccccccccccccccccccccccccccccc";
-
-    #[test]
-    fn recognized_root_event_is_rejected() {
-        assert!(required_event_parent(None, A)
-            .unwrap_err()
-            .contains("no first parent"));
+    struct RacingStore {
+        objects: MemoryStore,
+        head: Oid,
+        race_once: bool,
+        pushes: usize,
     }
 
-    #[test]
-    fn validates_conversation_ids_and_reserves_ref_channel_components() {
-        assert_eq!(
-            conversation_ref("project/talk-1").unwrap(),
-            "refs/caos/v2/conversations/project/talk-1/head"
-        );
-        assert!(conversation_ref(&"a".repeat(124)).is_ok());
-        assert!(conversation_ref(&"a".repeat(125)).is_err());
-        for invalid in [
-            "",
-            "bad name",
-            "a//b",
-            "a/../b",
-            ".hidden",
-            "a.lock",
-            "head",
-            "a/head/b",
-            "title",
-            "a/title/b",
-            "a~b",
-            "a@{b",
-        ] {
-            assert!(
-                conversation_ref(invalid).is_err(),
-                "accepted invalid id {invalid:?}"
-            );
-        }
-        assert!(validate_hash(&"a".repeat(40), "test hash").is_ok());
-        assert!(validate_hash(&"A".repeat(40), "test hash")
-            .unwrap_err()
-            .contains("lowercase"));
-        assert!(
-            validate_conversation_ref("refs/caos/v2/conversations/project/talk-1/head").is_ok()
-        );
-        assert!(
-            validate_conversation_ref("refs/caos/v2/conversations/project/head/talk-1/head")
-                .is_err()
-        );
-        assert!(validate_conversation_ref("refs/caos/conversations/project/talk-1/head").is_err());
-    }
+    conversation_protocol::delegate_object_store!(RacingStore, objects);
 
-    #[test]
-    fn object_status_distinguishes_missing_from_broken() {
-        assert_eq!(object_status("http://caos/object/q", 200, "OK"), Ok(true));
-        assert_eq!(
-            object_status("http://caos/object/q", 404, "Not Found"),
-            Ok(false)
-        );
-        assert!(object_status("http://caos/object/q", 503, "Unavailable")
-            .unwrap_err()
-            .contains("503 Unavailable"));
-    }
-
-    #[derive(Default)]
-    struct MemoryTreeStore {
-        trees: BTreeMap<String, BTreeMap<Vec<u8>, TreeEntry>>,
-        next: u64,
-    }
-
-    impl MemoryTreeStore {
-        fn insert(&mut self, id: u64, entries: &[(&str, u32, u64)]) -> String {
-            let oid = test_oid(id);
-            self.trees.insert(
-                oid.clone(),
-                entries
-                    .iter()
-                    .map(|(name, mode, child)| {
-                        (
-                            name.as_bytes().to_vec(),
-                            TreeEntry {
-                                mode: *mode,
-                                oid: test_oid(*child),
-                            },
-                        )
-                    })
-                    .collect(),
-            );
-            oid
-        }
-    }
-
-    impl TreeStore for MemoryTreeStore {
-        fn read_tree(&mut self, oid: &str) -> Result<BTreeMap<Vec<u8>, TreeEntry>, String> {
-            self.trees
-                .get(oid)
-                .cloned()
-                .ok_or_else(|| format!("test tree {oid} is absent"))
+    impl RefStore for RacingStore {
+        fn fetch_ref_value(&mut self, _refname: &str) -> Result<Option<Oid>, String> {
+            Ok(Some(self.head.clone()))
         }
 
-        fn write_tree(&mut self, entries: &BTreeMap<Vec<u8>, TreeEntry>) -> Result<String, String> {
-            self.next += 1;
-            let oid = test_oid(10_000 + self.next);
-            self.trees.insert(oid.clone(), entries.clone());
-            Ok(oid)
-        }
-    }
-
-    fn test_oid(id: u64) -> String {
-        format!("{id:040x}")
-    }
-
-    fn tree_entry<'a>(entries: &'a BTreeMap<Vec<u8>, TreeEntry>, name: &str) -> &'a TreeEntry {
-        entries.get(name.as_bytes()).unwrap()
-    }
-
-    #[test]
-    fn retry_tree_keeps_tree_neutral_fast_paths() {
-        assert_eq!(
-            retry_tree(A, B, A).unwrap(),
-            RetryTree::Merged(B.to_string())
-        );
-        assert_eq!(
-            retry_tree(A, A, C).unwrap(),
-            RetryTree::Merged(C.to_string())
-        );
-        assert_eq!(
-            retry_tree(A, B, B).unwrap(),
-            RetryTree::Merged(B.to_string())
-        );
-    }
-
-    #[test]
-    fn workspace_conflict_paths_are_structured() {
-        let detail =
-            format!("{WORKSPACE_CONFLICT_PREFIX}src/main.rs: base a, proposed b, concurrent c");
-        assert_eq!(conflict_path(&detail), Some("src/main.rs"));
-        assert_eq!(conflict_path("reading tree failed"), None);
-    }
-
-    #[test]
-    fn three_way_tree_merge_combines_tool_and_async_status_changes() {
-        let mut store = MemoryTreeStore::default();
-        let source_base = store.insert(1, &[("main.rs", 0o100644, 101)]);
-        let source_proposed = store.insert(2, &[("main.rs", 0o100644, 102)]);
-        let async_base = store.insert(3, &[("status", 0o100644, 103)]);
-        let async_current = store.insert(4, &[("status", 0o100644, 104)]);
-        let base = store.insert(5, &[(".caos", 0o040000, 3), ("src", 0o040000, 1)]);
-        let proposed = store.insert(6, &[(".caos", 0o040000, 3), ("src", 0o040000, 2)]);
-        let current = store.insert(7, &[(".caos", 0o040000, 4), ("src", 0o040000, 1)]);
-
-        let merged = merge_tree(&mut store, Some(&base), &proposed, &current, "").unwrap();
-        let root = store.read_tree(&merged).unwrap();
-        assert_eq!(tree_entry(&root, ".caos").oid, async_current);
-        assert_eq!(tree_entry(&root, "src").oid, source_proposed);
-        assert_ne!(source_base, source_proposed);
-        assert_ne!(async_base, async_current);
-    }
-
-    #[test]
-    fn three_way_tree_merge_recurses_for_changes_in_one_directory() {
-        let mut store = MemoryTreeStore::default();
-        store.insert(1, &[("left", 0o100644, 101), ("right", 0o100644, 102)]);
-        store.insert(2, &[("left", 0o100644, 103), ("right", 0o100644, 102)]);
-        store.insert(3, &[("left", 0o100644, 101), ("right", 0o100644, 104)]);
-        let base = store.insert(4, &[("nested", 0o040000, 1)]);
-        let proposed = store.insert(5, &[("nested", 0o040000, 2)]);
-        let current = store.insert(6, &[("nested", 0o040000, 3)]);
-
-        let merged = merge_tree(&mut store, Some(&base), &proposed, &current, "").unwrap();
-        let root = store.read_tree(&merged).unwrap();
-        let nested = store.read_tree(&tree_entry(&root, "nested").oid).unwrap();
-        assert_eq!(tree_entry(&nested, "left").oid, test_oid(103));
-        assert_eq!(tree_entry(&nested, "right").oid, test_oid(104));
-    }
-
-    #[test]
-    fn three_way_tree_merge_combines_independently_added_directory_contents() {
-        let mut store = MemoryTreeStore::default();
-        let empty = store.insert(1, &[]);
-        store.insert(2, &[("from-tool", 0o100644, 101)]);
-        store.insert(3, &[("from-async", 0o100644, 102)]);
-        let proposed = store.insert(4, &[("new", 0o040000, 2)]);
-        let current = store.insert(5, &[("new", 0o040000, 3)]);
-
-        let merged = merge_tree(&mut store, Some(&empty), &proposed, &current, "").unwrap();
-        let root = store.read_tree(&merged).unwrap();
-        let new_dir = store.read_tree(&tree_entry(&root, "new").oid).unwrap();
-        assert_eq!(tree_entry(&new_dir, "from-tool").oid, test_oid(101));
-        assert_eq!(tree_entry(&new_dir, "from-async").oid, test_oid(102));
-    }
-
-    #[test]
-    fn three_way_tree_merge_reports_same_path_and_modify_delete_conflicts() {
-        let mut store = MemoryTreeStore::default();
-        let base = store.insert(1, &[("shared", 0o100644, 101)]);
-        let proposed = store.insert(2, &[("shared", 0o100644, 102)]);
-        let current = store.insert(3, &[("shared", 0o100644, 103)]);
-        let error = merge_tree(&mut store, Some(&base), &proposed, &current, "").unwrap_err();
-        assert!(error.contains("conflict at shared"), "{error}");
-
-        let deleted = store.insert(4, &[]);
-        let error = merge_tree(&mut store, Some(&base), &proposed, &deleted, "").unwrap_err();
-        assert!(error.contains("conflict at shared"), "{error}");
-        assert!(error.contains("concurrent absent"), "{error}");
-    }
-
-    #[test]
-    fn three_way_tree_merge_combines_chmod_with_content_change() {
-        let mut store = MemoryTreeStore::default();
-        let base = store.insert(1, &[("script", 0o100644, 101)]);
-        let proposed = store.insert(2, &[("script", 0o100755, 101)]);
-        let current = store.insert(3, &[("script", 0o100644, 102)]);
-
-        let merged = merge_tree(&mut store, Some(&base), &proposed, &current, "").unwrap();
-        let root = store.read_tree(&merged).unwrap();
-        assert_eq!(
-            tree_entry(&root, "script"),
-            &TreeEntry {
-                mode: 0o100755,
-                oid: test_oid(102),
+        fn push_ref_value(
+            &mut self,
+            _refname: &str,
+            expected: Option<&Oid>,
+            new: Option<&Oid>,
+        ) -> Result<(), String> {
+            self.pushes += 1;
+            if self.race_once {
+                self.race_once = false;
+                let transition = Transition::MessageAppend {
+                    entry: entry("22222222222222222222222222222222", "concurrent"),
+                    payloads: Vec::new(),
+                };
+                self.head = append_object(&mut self.objects, &self.head, transition)?;
+                return Err("simulated lost compare-and-swap".to_string());
             }
-        );
+            if expected != Some(&self.head) {
+                return Err("stale expected head".to_string());
+            }
+            self.head = new.cloned().ok_or("test ref deletion is unsupported")?;
+            Ok(())
+        }
     }
 
-    #[test]
-    fn tree_serialization_uses_git_order_and_round_trips() {
-        let entries = BTreeMap::from([
-            (
-                b"foo".to_vec(),
-                TreeEntry {
-                    mode: 0o040000,
-                    oid: test_oid(1),
-                },
-            ),
-            (
-                b"foo.bar".to_vec(),
-                TreeEntry {
-                    mode: 0o100644,
-                    oid: test_oid(2),
-                },
-            ),
-        ]);
-        let content = serialize_tree(&entries).unwrap();
-        assert!(content.starts_with(b"100644 foo.bar\0"));
-        let mut serialized = format!("tree {}\0", content.len()).into_bytes();
-        serialized.extend_from_slice(&content);
-        assert_eq!(parse_serialized_tree(&serialized).unwrap(), entries);
+    fn entry(message_id: &str, text: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            message_id: message_id.to_string(),
+            conversation: "conversation".to_string(),
+            role: conversation_protocol::v3::Role::System,
+            actor: "test".to_string(),
+            request: None,
+            round: None,
+            model: None,
+            blocks: vec![Block::Text {
+                text: text.to_string(),
+            }],
+            proposal: None,
+            workspace_resolution: None,
+        }
     }
 
-    #[test]
-    fn append_events_are_unversioned_objects_without_a_base() {
-        assert!(validate_event(&serde_json::json!({"status": "idle"})).is_ok());
-        assert!(validate_event(&serde_json::json!({"kind": "future-field"})).is_ok());
-        assert!(validate_event(&serde_json::json!({"v": 2})).is_err());
-        assert!(validate_event(&serde_json::json!({"base": A})).is_err());
-        assert!(validate_event(&serde_json::json!({"forked_from": A})).is_err());
-        assert!(validate_event(&serde_json::json!([])).is_err());
+    fn append_object(
+        store: &mut dyn ObjectStore,
+        parent: &Oid,
+        transition: Transition,
+    ) -> Result<Oid, String> {
+        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
+        let applied = apply(store, Some(&parent_tree), &transition)?;
+        let signature = inherited_signature(store, parent)?;
+        mint(store, parent, &applied.tree, transition.kind(), &signature)
     }
 
-    #[test]
-    fn fork_markers_inherit_instead_of_replacing_the_root_boundary() {
-        assert_eq!(
-            ProtocolEvent::parse(&serde_json::json!({"forked_from": A}))
-                .unwrap()
-                .boundary(A),
-            Ok(EventBoundary::Fork)
-        );
-        assert!(
-            ProtocolEvent::parse(&serde_json::json!({"base": A, "forked_from": A}))
-                .unwrap()
-                .boundary(A)
-                .is_err()
-        );
-        assert!(ProtocolEvent::parse(&serde_json::json!({"forked_from": B}))
-            .unwrap()
-            .boundary(A)
-            .is_err());
-    }
-
-    #[test]
-    fn parses_git_serialized_commit() {
-        let content = format!(
-            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"author\":\"assistant\"}}\n"
-        );
-        let mut object = format!("commit {}\0", content.len()).into_bytes();
-        object.extend_from_slice(content.as_bytes());
-        let parsed = parse_serialized_commit(&object).unwrap();
-        assert_eq!(parsed.tree, A);
-        assert_eq!(parsed.timestamp, 0);
-    }
-
-    #[test]
-    fn fetched_commit_cache_reuses_immutable_spine_objects_per_server() {
-        let content = format!(
-            "tree {A}\nparent {B}\nauthor x <x@x> 0 +0000\ncommitter x <x@x> 0 +0000\n\n{{\"status\":\"idle\"}}\n"
-        );
-        let mut object = format!("commit {}\0", content.len()).into_bytes();
-        object.extend_from_slice(content.as_bytes());
-        let cache = Mutex::new(HashMap::new());
-        let fetches = std::cell::Cell::new(0);
-        let fetch = || {
-            fetches.set(fetches.get() + 1);
-            Ok(object.clone())
+    fn root(store: &mut MemoryStore) -> Result<Oid, String> {
+        let genesis = ensure_genesis(store)?;
+        let transition = Transition::ConversationRoot {
+            identity: Identity {
+                id: "conversation".to_string(),
+                kind: IdentityKind::Root,
+                owner: None,
+            },
+            title: "test".to_string(),
+            workspaces: BTreeMap::new(),
+            files_seed: None,
         };
-
-        assert_eq!(
-            fetch_commit_cached(&cache, "http://server", C, fetch)
-                .unwrap()
-                .tree,
-            A
-        );
-        assert_eq!(
-            fetch_commit_cached(&cache, "http://server/", C, fetch)
-                .unwrap()
-                .tree,
-            A
-        );
-        assert_eq!(fetches.get(), 1, "the same commit was fetched twice");
-
-        fetch_commit_cached(&cache, "http://other-server", C, fetch).unwrap();
-        assert_eq!(fetches.get(), 2, "cache entries leaked across servers");
+        let applied = apply(store, None, &transition)?;
+        mint(
+            store,
+            &genesis,
+            &applied.tree,
+            transition.kind(),
+            &client_signature("test", "test@example.invalid", 1),
+        )
     }
 
     #[test]
-    fn event_commit_has_ordered_parents_and_stable_identity() {
-        let content = commit_content(
-            A,
-            &[B, C],
-            1_700_000_000,
-            r#"{"author":"assistant","content":"hi"}"#,
+    fn append_reapplies_after_a_lost_compare_and_swap() {
+        let mut objects = MemoryStore::new();
+        let root = root(&mut objects).unwrap();
+        let store = RacingStore {
+            objects,
+            head: root.clone(),
+            race_once: true,
+            pushes: 0,
+        };
+        let mut state = State::from_store(
+            store,
+            "refs/caos/v3/conversations/conversation/head".to_string(),
+            root,
         )
         .unwrap();
+
+        state
+            .append(Transition::MessageAppend {
+                entry: entry("11111111111111111111111111111111", "requested"),
+                payloads: Vec::new(),
+            })
+            .unwrap();
+
+        let view = state.conversation().unwrap();
+        assert_eq!(view.transcript_len().unwrap(), 2);
         assert_eq!(
-            content,
-            format!(
-                "tree {A}\nparent {B}\nparent {C}\nauthor caos-agent <caos@caos> 1700000000 +0000\ncommitter caos-agent <caos@caos> 1700000000 +0000\n\n{{\"author\":\"assistant\",\"content\":\"hi\"}}\n"
-            )
+            view.transcript_entry(0).unwrap().unwrap().1.blocks,
+            entry("22222222222222222222222222222222", "concurrent").blocks
+        );
+        assert_eq!(
+            view.transcript_entry(1).unwrap().unwrap().1.blocks,
+            entry("11111111111111111111111111111111", "requested").blocks
         );
     }
 
     #[test]
-    fn invalid_object_size_is_rejected() {
-        let object = format!("commit 1\0tree {A}\n\nmsg\n");
-        assert!(parse_serialized_commit(object.as_bytes()).is_err());
+    fn append_pair_mints_two_commits_with_one_push() {
+        let mut objects = MemoryStore::new();
+        let root = root(&mut objects).unwrap();
+        let store = RacingStore {
+            objects,
+            head: root.clone(),
+            race_once: false,
+            pushes: 0,
+        };
+        let mut state = State::from_store(
+            store,
+            "refs/caos/v3/conversations/conversation/head".to_string(),
+            root.clone(),
+        )
+        .unwrap();
+
+        let appended = state
+            .try_append_pair_at(
+                &root,
+                Transition::MessageAppend {
+                    entry: entry("11111111111111111111111111111111", "first"),
+                    payloads: Vec::new(),
+                },
+                Transition::MessageAppend {
+                    entry: entry("22222222222222222222222222222222", "second"),
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+        let TryAppend::Appended(appended) = appended else {
+            panic!("pair append lost an uncontended race");
+        };
+
+        assert_eq!(state.store().pushes, 1);
+        assert_eq!(appended.commit, *state.head());
+        assert_eq!(appended.ordinal, Some(0));
+        let info = state.store().read_commit(state.head()).unwrap();
+        let first = info.parents.first().expect("terminal parent");
+        assert_eq!(
+            state.store().read_commit(first).unwrap().parents,
+            vec![root]
+        );
+        assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
+        assert!(state.take_fresh_after_append());
+        assert!(!state.take_fresh_after_append());
     }
 }

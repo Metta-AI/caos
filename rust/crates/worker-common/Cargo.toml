@@ -5,12 +5,7 @@ edition = "2021"
 
 # Shared glue for the Rust workers: thin wrappers over the `caos` CLI plus the
 # bits of std file I/O every worker repeats. No Rust dependencies, so workers
-# still build to tiny static binaries. Its optional direct-Git module is used
-# only by workers whose selected runtime explicitly provides `git`.
-
-[features]
-default = []
-git = []
+# still build to tiny static binaries.
 
 [lib]
 name = "worker_common"
