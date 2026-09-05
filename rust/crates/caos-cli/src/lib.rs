@@ -1,5 +1,7 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
+pub mod workspaces;
+
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -110,6 +112,7 @@ pub enum ConversationRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceDiff {
+    pub config: conversation_protocol::v3::WorkspaceConfig,
     pub name: String,
     pub base_commit: String,
     pub head: String,
@@ -315,6 +318,7 @@ fn push_cas(
 enum Step {
     Done(String),
     Mint(Transition),
+    MintMany(Vec<Transition>),
 }
 
 fn append_transition(
@@ -329,11 +333,16 @@ fn append_transition(
         let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
             return Err(format!("no conversation {id:?}"));
         };
-        let transition = match step(&mut store, &head)? {
+        let transitions = match step(&mut store, &head)? {
             Step::Done(result) => return Ok(result),
-            Step::Mint(transition) => transition,
+            Step::Mint(transition) => vec![transition],
+            Step::MintMany(transitions) => transitions,
         };
-        let candidate = mint_transition(&mut store, &head, &transition, &signature("CAOS")?)?;
+        let mut candidate = head.clone();
+        let signature = signature("CAOS")?;
+        for transition in transitions {
+            candidate = mint_transition(&mut store, &candidate, &transition, &signature)?;
+        }
         if push_cas(&store, refname, Some(&head), &candidate)? {
             let _ = update_local_cache(t, refname, candidate.as_str());
             return Ok(candidate.to_string());
@@ -1210,7 +1219,18 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
                     round,
                     tool_use_id: call_id.clone(),
                     name: call_name.clone(),
-                    summary: tool_call_summary(call_name, &args),
+                    summary: {
+                        let text = tool_call_summary(call_name, &args);
+                        match conversation
+                            .tool(&request, round, call_id)?
+                            .and_then(|tool| tool.workspace_name)
+                        {
+                            Some(name) if conversation.workspace_names()?.len() > 1 => {
+                                format!("[{name}] {text}")
+                            }
+                            _ => text,
+                        }
+                    },
                     step_commit: request.to_string(),
                 });
                 if let Some(tool) = conversation.tool(&request, round, call_id)? {
@@ -1286,6 +1306,7 @@ fn workspace_diff(
         None,
     )?;
     Ok(WorkspaceDiff {
+        config: Default::default(),
         name: name.to_string(),
         base_commit: initial.to_string(),
         head: commit.to_string(),
@@ -1385,13 +1406,14 @@ fn load_at(
     let conversation = Conversation::open(store, head)?;
     let mut workspaces = Vec::new();
     for (name, workspace) in conversation.workspaces()? {
-        workspaces.push(workspace_diff(
-            t,
-            store,
-            &name,
-            &workspace.initial,
-            &workspace.commit,
-        )?);
+        let config = conversation.workspace_config(&name)?;
+        let base = config
+            .base
+            .as_ref()
+            .map_or(&workspace.initial, |base| base.commit());
+        let mut diff = workspace_diff(t, store, &name, base, &workspace.commit)?;
+        diff.config = config;
+        workspaces.push(diff);
     }
     Ok(ConversationLoad {
         snapshot: snapshot_at(store, id, head)?,
@@ -2603,6 +2625,9 @@ fn resolve_llm(
     };
     let merge_refs = snapshot_merge_refs(t)?;
     let mut config = vec![format!("--system={system}"), format!("--conversation={id}")];
+    if let Some(workspace) = &options.workspace {
+        config.push(format!("--focus-workspace={workspace}"));
+    }
     if !merge_refs.is_empty() {
         config.push(format!("--merge-refs={merge_refs}"));
     }
@@ -3427,6 +3452,67 @@ mod tests {
             drop(store);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn workspace_creation_inherits_the_selected_snapshot_and_repository() {
+        use conversation_protocol::v3::{WorkspaceBase, WorkspaceConfig};
+        let (root, transport, base) = fixture("workspace-create");
+        create_idle_conversation(&transport, "workspaces-talk", &base);
+        workspaces::create_from_workspace(&transport, "workspaces-talk", "plain", "main", false)
+            .unwrap();
+        conversation_load(&transport, "workspaces-talk")
+            .unwrap()
+            .unwrap();
+        let next = commit_file(&transport, &base, "selected workspace\n", "side");
+        create_workspace(&transport, "workspaces-talk", "side", &next).unwrap();
+        workspaces::configure(
+            &transport,
+            "workspaces-talk",
+            "side",
+            WorkspaceConfig {
+                repository: Some("git@example.com:team/repo.git".into()),
+                branch: Some("feature/side".into()),
+                base: Some(WorkspaceBase::Branch {
+                    name: "main".into(),
+                    commit: oid(&base, "base").unwrap(),
+                }),
+            },
+        )
+        .unwrap();
+        workspaces::create_from_workspace(&transport, "workspaces-talk", "separate", "side", false)
+            .unwrap();
+        workspaces::create_from_workspace(&transport, "workspaces-talk", "dependent", "side", true)
+            .unwrap();
+        let load = conversation_load(&transport, "workspaces-talk")
+            .unwrap()
+            .unwrap();
+        let separate = load
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "separate")
+            .unwrap();
+        assert_eq!(separate.head, next);
+        assert!(separate.patch.contains("selected workspace"));
+        assert_eq!(
+            separate.config.repository.as_deref(),
+            Some("git@example.com:team/repo.git")
+        );
+        assert_eq!(separate.config.branch, None);
+        assert!(matches!(
+            separate.config.base,
+            Some(WorkspaceBase::Branch { .. })
+        ));
+        let dependent = load
+            .workspaces
+            .iter()
+            .find(|ws| ws.name == "dependent")
+            .unwrap();
+        assert!(
+            matches!(&dependent.config.base, Some(WorkspaceBase::Workspace { name, commit }) if name == "side" && commit.as_str() == next)
+        );
+        assert!(remove_workspace(&transport, "workspaces-talk", "side").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         app.view,
         !app.selection_locked
             && app.palette.is_none()
+            && app.workspace_picker.is_none()
             && state.publish_base.is_none()
             && app.focus() == Focus::Conversation,
         frame,
@@ -55,6 +56,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     );
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
+    render_workspace_picker(app, frame);
     render_screen_selection(app, frame);
 }
 
@@ -1767,6 +1769,118 @@ pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &S
 pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
     scroll.resolve(line_count.saturating_sub(visible))
+}
+
+pub(super) fn workspace_picker_area(terminal: Rect) -> Rect {
+    terminal.centered(
+        Constraint::Length(terminal.width.saturating_sub(4).min(100)),
+        Constraint::Length(terminal.height.saturating_sub(2).min(18)),
+    )
+}
+
+fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
+    let Some(picker) = &app.workspace_picker else {
+        return;
+    };
+    let state = app.selected();
+    let area = workspace_picker_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Workspaces ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    if let Some(name) = &picker.creating {
+        let source = picker.source.as_deref().unwrap_or("");
+        let relationship = if picker.stacked {
+            "Dependent change: PR will target the source workspace's branch"
+        } else {
+            "Separate change: starts from the source workspace's current commit"
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                "New workspace from {source}\n\nName: {name}\n\n{relationship}"
+            )),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Tab changes relationship   Enter creates   Esc cancels")
+                .style(Style::default().fg(Color::DarkGray)),
+            rows[1],
+        );
+    } else {
+        let items = state
+            .workspaces
+            .iter()
+            .map(|ws| {
+                let selected = if Some(&ws.name) == state.selected_workspace.as_ref() {
+                    "*"
+                } else {
+                    " "
+                };
+                let additions = ws
+                    .patch
+                    .lines()
+                    .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+                    .count();
+                let deletions = ws
+                    .patch
+                    .lines()
+                    .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+                    .count();
+                let repository = ws
+                    .config
+                    .repository
+                    .as_deref()
+                    .unwrap_or("checkout repository");
+                let publication = state
+                    .publications
+                    .iter()
+                    .find(|item| item.workspace == ws.name)
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "unpublished".into());
+                let base = ws
+                    .config
+                    .base
+                    .as_ref()
+                    .map(|base| format!("base {}", base.name()))
+                    .unwrap_or_default();
+                ListItem::new(vec![
+                    Line::from(format!(
+                        "{selected} {}   +{additions} -{deletions}   {publication}",
+                        ws.name
+                    )),
+                    Line::styled(
+                        format!("  {repository}  {base}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            frame.render_widget(Paragraph::new("No workspace attached yet."), rows[0]);
+        } else {
+            let mut selection = ListState::default().with_selected(Some(picker.selected));
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[0],
+                &mut selection,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(
+                "Up/Down selects   Enter switches   n creates from selected   Esc closes",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
+            rows[1],
+        );
+    }
 }
 
 #[cfg(test)]

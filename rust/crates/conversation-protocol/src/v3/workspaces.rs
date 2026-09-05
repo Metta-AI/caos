@@ -166,6 +166,44 @@ pub fn workspace_order(configs: &BTreeMap<String, WorkspaceConfig>) -> Result<Ve
     Ok(ordered)
 }
 
+/// Create a named line of work from one pinned workspace snapshot. The caller
+/// publishes this sequence atomically with any associated operation receipt.
+pub fn create_from_workspace(
+    view: &super::view::Conversation<'_>,
+    name: &str,
+    source: &str,
+    stacked: bool,
+) -> Result<Vec<super::apply::Transition>, String> {
+    use super::apply::Transition;
+    paths::validate_workspace_name(name)?;
+    if view.workspace(name)?.is_some() {
+        return Err(format!("workspace {name:?} already exists"));
+    }
+    let ws = view
+        .workspace(source)?
+        .ok_or_else(|| format!("no workspace {source:?}"))?;
+    let mut config = view.workspace_config(source)?;
+    config.branch = None;
+    if stacked {
+        config.base = Some(WorkspaceBase::Workspace {
+            name: source.to_string(),
+            commit: ws.commit.clone(),
+        });
+    }
+    let mut transitions = vec![Transition::WorkspaceCreate {
+        name: name.to_string(),
+        commit: ws.commit,
+        origin: None,
+    }];
+    if config != WorkspaceConfig::default() {
+        transitions.push(Transition::WorkspaceConfigure {
+            name: name.to_string(),
+            config,
+        });
+    }
+    Ok(transitions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

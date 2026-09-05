@@ -6,6 +6,7 @@ mod progress;
 mod subagents;
 mod timing;
 mod tools;
+mod workspaces;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -64,6 +65,7 @@ struct Config {
     model: String,
     base_url: String,
     conversation: String,
+    focus_workspace: Option<String>,
 }
 
 fn image_arg(name: &str) -> Result<Option<String>, String> {
@@ -85,6 +87,7 @@ impl Config {
         Ok(Self {
             api_key: secret("anthropic-api-key")?,
             system: read_arg("system")?,
+            focus_workspace: read_arg_opt("focus-workspace")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
@@ -722,7 +725,7 @@ fn llm_round(
         "max_tokens": MAX_TOKENS,
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
-        "system": cfg.system,
+        "system": format!("{}{}", cfg.system, workspaces::context(&state.conversation()?, cfg.focus_workspace.as_deref())?),
         "tools": registry(cfg, workspaces)?,
         "messages": messages,
     });
@@ -987,6 +990,10 @@ fn drive_call(
         return Ok(true);
     }
 
+    if call.name == "workspaces" {
+        workspaces::run(state, &site)?;
+        return Ok(true);
+    }
     if call.name == subagents::SPAWN_TOOL {
         return spawn_agent_call(cfg, state, &site);
     }
@@ -1862,6 +1869,20 @@ fn spawn_agent_call(
     let parent_view = state.conversation()?;
     let parent_id = parent_view.identity()?.id;
     let actor = newest_user_actor(&parent_view)?;
+    let child_config = target
+        .as_ref()
+        .map(|(name, _)| parent_view.workspace_config(name))
+        .transpose()?
+        .map(|mut config| {
+            config.branch = None;
+            if matches!(
+                config.base,
+                Some(conversation_protocol::v3::WorkspaceBase::Workspace { .. })
+            ) {
+                config.base = None;
+            }
+            config
+        });
     let prompt_path = tool_arguments_path(&parent_view, request, site.round, &call.id)?;
     drop(parent_view);
     let child_id = ids::child_id(&parent_id, request, site.round, &call.id)?;
@@ -1896,6 +1917,22 @@ fn spawn_agent_call(
         root_transition.kind(),
         &signature,
     )?;
+    let root = if let (Some((name, _)), Some(config)) = (
+        target.as_ref(),
+        child_config.filter(|config| config != &Default::default()),
+    ) {
+        mint_detached(
+            state,
+            &root,
+            &Transition::WorkspaceConfigure {
+                name: name.clone(),
+                config,
+            },
+            &signature,
+        )?
+    } else {
+        root
+    };
     let prompt_message = ids::protocol_id("subagent-prompt", &json!({"child": child_id.as_str()}))?;
     let prompt_transition = Transition::MessageAppend {
         entry: TranscriptEntry {
@@ -2836,7 +2873,7 @@ fn workspace_paths(state: &mut progress::State) -> Result<Vec<String>, String> {
 }
 
 fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
-    let mut registry = vec![with_workspace(bash_tool())];
+    let mut registry = vec![with_workspace(bash_tool()), workspaces::declaration()];
     registry.extend(tools::declarations().into_iter().map(with_workspace));
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
