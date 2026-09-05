@@ -115,6 +115,23 @@ impl<'s> Conversation<'s> {
         }))
     }
 
+    pub fn workspace_config(&self, name: &str) -> Result<super::WorkspaceConfig, String> {
+        if self.workspace(name)?.is_none() {
+            return Err(format!("workspace {name:?} does not exist"));
+        }
+        self.optional_blob(&paths::workspace_config_path(name))?
+            .map(|bytes| super::WorkspaceConfig::parse(&bytes))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn workspace_configs(&self) -> Result<BTreeMap<String, super::WorkspaceConfig>, String> {
+        self.workspace_names()?
+            .into_iter()
+            .map(|name| self.workspace_config(&name).map(|config| (name, config)))
+            .collect()
+    }
+
     pub fn workspaces(&self) -> Result<BTreeMap<String, WorkspaceRecord>, String> {
         self.workspace_names()?
             .into_iter()

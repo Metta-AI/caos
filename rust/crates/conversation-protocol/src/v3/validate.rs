@@ -220,7 +220,7 @@ fn canonical_record_path(path: &str) -> bool {
     path == paths::IDENTITY
         || matches!(
             paths::parse_workspace_path(path),
-            Some((_, WorkspaceFile::Origin))
+            Some((_, WorkspaceFile::Origin | WorkspaceFile::Config))
         )
         || transcript_record_path(path)
         || request_record_id(path).is_some()
@@ -386,6 +386,11 @@ fn reconstruct(
                 commit: record.commit,
                 origin: record.origin,
             })
+        }
+        Kind::WorkspaceConfigure => {
+            let name = single_workspace_name(changes, kind)?;
+            let config = child_snapshot.workspace_config(&name)?;
+            Ok(Transition::WorkspaceConfigure { name, config })
         }
         Kind::WorkspaceRollback => {
             let name = single_workspace_name(changes, kind)?;
@@ -833,11 +838,49 @@ mod tests {
             .iter()
             .map(|commit| Kind::parse_message(&store.read_commit(commit).unwrap().message).unwrap())
             .collect();
-        assert_eq!(kinds, Kind::ALL.into_iter().collect());
+        assert_eq!(
+            kinds,
+            Kind::ALL
+                .into_iter()
+                .filter(|kind| *kind != Kind::WorkspaceConfigure)
+                .collect()
+        );
         assert_eq!(
             validate_spine(&store, &head, &mut known_valid),
             Ok(Vec::new())
         );
+
+        // Extend the original byte-pinned fixture without rewriting its history.
+        let config = crate::v3::WorkspaceConfig {
+            branch: Some("caos/review".to_string()),
+            ..Default::default()
+        };
+        let transition = Transition::WorkspaceConfigure {
+            name: "main".to_string(),
+            config: config.clone(),
+        };
+        let parent = store.read_commit(&head).unwrap();
+        let applied = apply(&mut store, Some(&parent.tree), &transition).unwrap();
+        let next = crate::v3::apply::mint(
+            &mut store,
+            &head,
+            &applied.tree,
+            transition.kind(),
+            &parent.author,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_spine(&store, &next, &mut known_valid).unwrap(),
+            vec![next.clone()]
+        );
+        assert_eq!(
+            Conversation::open(&store, &next)
+                .unwrap()
+                .workspace_config("main")
+                .unwrap(),
+            config
+        );
+        assert_eq!(store.read_commit(&head).unwrap(), parent);
     }
 
     #[test]
