@@ -91,6 +91,15 @@ impl App {
                     }
                     return;
                 }
+                KeyCode::Char('u') => {
+                    let name = self
+                        .selected()
+                        .workspaces
+                        .get(picker.selected)
+                        .map(|ws| ws.name.clone());
+                    self.update_selected_stack(name);
+                    return;
+                }
                 KeyCode::Char('n') => {
                     if let Some(ws) = self.selected().workspaces.get(picker.selected) {
                         picker.source = Some(ws.name.clone());
@@ -101,5 +110,32 @@ impl App {
             }
         }
         self.workspace_picker = Some(picker);
+    }
+}
+
+impl ConversationState {
+    pub(super) fn workspace_is_stale(&self, name: &str) -> bool {
+        let mut name = name;
+        // The protocol rejects cycles; keep the UI bounded even for partial loads.
+        for _ in 0..self.workspaces.len() {
+            let Some(ws) = self.workspaces.iter().find(|ws| ws.name == name) else {
+                return false;
+            };
+            let Some(conversation_protocol::v3::WorkspaceBase::Workspace {
+                name: parent,
+                commit,
+            }) = &ws.config.base
+            else {
+                return false;
+            };
+            let Some(base) = self.workspaces.iter().find(|ws| ws.name == *parent) else {
+                return false;
+            };
+            if base.head != commit.as_str() {
+                return true;
+            }
+            name = parent;
+        }
+        false
     }
 }

@@ -1823,8 +1823,13 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
                     .unwrap_or_default();
                 ListItem::new(vec![
                     Line::from(format!(
-                        "{selected} {}   +{additions} -{deletions}   {publication}",
-                        ws.name
+                        "{selected} {}   +{additions} -{deletions}   {publication}{}",
+                        ws.name,
+                        if state.workspace_is_stale(&ws.name) {
+                            "   needs update"
+                        } else {
+                            ""
+                        }
                     )),
                     Line::styled(
                         format!("  {repository}  {base}"),
@@ -1849,7 +1854,7 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
         }
         frame.render_widget(
             Paragraph::new(
-                "Up/Down selects   Enter switches   n creates from selected   Esc closes",
+                "Up/Down selects   Enter switches   n creates   u updates stack   Esc closes",
             )
             .style(Style::default().fg(Color::DarkGray)),
             rows[1],

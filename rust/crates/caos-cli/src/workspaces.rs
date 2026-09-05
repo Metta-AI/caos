@@ -287,3 +287,119 @@ pub fn publish_prepared_target(
         Some((&target.repository, &target.branch)),
     )
 }
+
+// Update a connected stack, or every stack when selection is None. Each step
+// snapshots its upstream once; retries reconcile against that same code.
+pub fn update_stack(
+    t: &GitTransport,
+    id: &str,
+    selection: Option<&str>,
+) -> Result<Vec<String>, String> {
+    use conversation_protocol::v3::{workspace_order, WorkspaceBase};
+    let store = open_store(t)?;
+    let (refname, head) =
+        fetch_validated_head(t, &store, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    let configs = Conversation::open(&store, &head)?.workspace_configs()?;
+    let order = workspace_order(&configs)?;
+    fn root<'a>(mut name: &'a str, configs: &'a BTreeMap<String, WorkspaceConfig>) -> &'a str {
+        while let Some(WorkspaceBase::Workspace { name: parent, .. }) = &configs[name].base {
+            name = parent;
+        }
+        name
+    }
+    if selection.is_some_and(|name| !configs.contains_key(name)) {
+        return Err("selected workspace no longer exists".into());
+    }
+    let selected_root = selection.map(|name| root(name, &configs));
+    let mut updated = Vec::new();
+    for name in order {
+        if selected_root.is_some_and(|selected| root(&name, &configs) != selected) {
+            continue;
+        }
+        let config = &configs[&name];
+        let Some(base) = &config.base else { continue };
+        let result = (|| {
+            let source = match base {
+                WorkspaceBase::Branch { name: branch, .. } => oid(
+                    &branch_snapshot(t, &repository_url(t, config)?, branch)?,
+                    "upstream",
+                )?,
+                WorkspaceBase::Workspace { name: parent, .. } => {
+                    let (_, head) =
+                        fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+                    Conversation::open(&store, &head)?
+                        .workspace(parent)?
+                        .ok_or("base workspace disappeared")?
+                        .commit
+                }
+            };
+            if source == *base.commit() {
+                return Ok(false);
+            }
+            let mut next_config = config.clone();
+            next_config.base = Some(base.with_commit(source.clone()));
+            append_transition(
+                t,
+                id,
+                &refname,
+                "updating the workspace stack",
+                |store, head| {
+                    let view = Conversation::open(store, head)?;
+                    let current_config = view.workspace_config(&name)?;
+                    if current_config == next_config {
+                        return Ok(Step::Done(head.to_string()));
+                    }
+                    if current_config != *config {
+                        return Err(format!(
+                            "workspace {name:?} settings changed; update the stack again"
+                        ));
+                    }
+                    let current = view
+                        .workspace(&name)?
+                        .ok_or("workspace disappeared")?
+                        .commit;
+                    ensure_code_commit(t, store, &source)?;
+                    store.ensure_local(&current)?;
+                    store.ensure_local(base.commit())?;
+                    let signature = inherited_signature(store, head)?;
+                    let resolution =
+                        reconcile(store, base.commit(), &source, Some(&current), &signature)?;
+                    if let WorkspaceResolution::Conflict { merge, .. } = &resolution {
+                        let paths = merge
+                            .as_ref()
+                            .and_then(|m| m.conflict_paths.as_ref())
+                            .map(|paths| paths.join(", "))
+                            .unwrap_or_default();
+                        return Err(format!("workspace {name:?} conflicts with {} at {source}: {paths}. Resolve using merge in this workspace, then run Update stack again; its head and base pin are unchanged.", base.name()));
+                    }
+                    let mut transitions = Vec::new();
+                    if let Some(output) = resolution.new_pointer() {
+                        ensure_code_commit(t, store, output)?;
+                        transitions.push(Transition::WorkspaceAdvance {
+                            name: name.clone(),
+                            commit: output.clone(),
+                        });
+                    }
+                    transitions.push(Transition::WorkspaceConfigure {
+                        name: name.clone(),
+                        config: next_config.clone(),
+                    });
+                    Ok(Step::MintMany(transitions))
+                },
+            )?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => updated.push(name),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(if updated.is_empty() {
+                    error
+                } else {
+                    format!("Updated {}. Stopped: {error}", updated.join(", "))
+                })
+            }
+        }
+    }
+    Ok(updated)
+}

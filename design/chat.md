@@ -257,3 +257,19 @@ receipt atomically. Subagent working copies remain inside their child
 conversations; promotion of a completed child creates a visible workspace when
 that result deserves separate review. Ordinary harvesting still applies the
 child result to an existing workspace.
+
+
+### Updating workspace stacks
+
+A workspace base records the commit it has incorporated. In the workspace picker,
+“needs update” means that a parent workspace (or one of its ancestors) has moved.
+Use **Update stack**, picker **u**, or `/workspace update [<name>|--all]` to update
+a connected stack in dependency order. Remote branch bases are checked at that
+point; the picker does not poll repositories.
+
+Updates use the same three-way reconciliation as other workspace changes and
+preserve both histories. Each workspace head and its new base pin land under one
+conversation lease. An upstream rewrite is an error. A conflict stops the batch
+and leaves that workspace unchanged, reporting the source commit and paths;
+resolve it with the existing merge tool, then update again. Earlier successful
+updates remain visible. Repeating an up-to-date operation creates no commits.

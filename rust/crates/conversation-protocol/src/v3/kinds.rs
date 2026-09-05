@@ -19,6 +19,7 @@ pub enum Kind {
     SubagentApply,
     WorkspaceCreate,
     WorkspaceConfigure,
+    WorkspaceAdvance,
     WorkspaceRollback,
     WorkspaceRemove,
     PublicationPending,
@@ -27,7 +28,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 24] = [
+    pub const ALL: [Kind; 25] = [
         Kind::ConversationRoot,
         Kind::ConversationFork,
         Kind::MetadataTitleSet,
@@ -47,6 +48,7 @@ impl Kind {
         Kind::SubagentApply,
         Kind::WorkspaceCreate,
         Kind::WorkspaceConfigure,
+        Kind::WorkspaceAdvance,
         Kind::WorkspaceRollback,
         Kind::WorkspaceRemove,
         Kind::PublicationPending,
@@ -75,6 +77,7 @@ impl Kind {
             Kind::SubagentApply => "subagent.apply",
             Kind::WorkspaceCreate => "workspace.create",
             Kind::WorkspaceConfigure => "workspace.configure",
+            Kind::WorkspaceAdvance => "workspace.advance",
             Kind::WorkspaceRollback => "workspace.rollback",
             Kind::WorkspaceRemove => "workspace.remove",
             Kind::PublicationPending => "publication.pending",

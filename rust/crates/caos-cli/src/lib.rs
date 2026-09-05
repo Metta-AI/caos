@@ -3589,6 +3589,116 @@ mod tests {
     }
 
     #[test]
+    fn stack_updates_pin_bases_and_stop_without_moving_conflicts() {
+        let (root, transport, base) = fixture("stack-update");
+        let id = "stack";
+        let advance = |name: &str, code: &str| {
+            let commit = oid(code, "code").unwrap();
+            let mut store = open_store(&transport).unwrap();
+            ensure_code_commit(&transport, &mut store, &commit).unwrap();
+            append_transition(
+                &transport,
+                id,
+                &refs::head_ref(id).unwrap(),
+                "test edit",
+                |_, _| {
+                    Ok(Step::Mint(Transition::WorkspaceAdvance {
+                        name: name.into(),
+                        commit: commit.clone(),
+                    }))
+                },
+            )
+            .unwrap();
+        };
+        create_idle_conversation(&transport, id, &base);
+        workspaces::create_from_workspace(&transport, id, "child", "main", true).unwrap();
+        let parent = commit_file(
+            &transport,
+            &base,
+            "parent edit
+",
+            "parent",
+        );
+        advance("main", &parent);
+        // Independent child changes merge with the parent.
+        git(
+            transport.work_dir(),
+            &["checkout", "--quiet", "--detach", &base],
+        );
+        std::fs::write(
+            transport.work_dir().join("child-file"),
+            "child
+",
+        )
+        .unwrap();
+        git(transport.work_dir(), &["add", "child-file"]);
+        git(transport.work_dir(), &["commit", "--quiet", "-m", "child"]);
+        let child = git(transport.work_dir(), &["rev-parse", "HEAD"]);
+        advance("child", &child);
+        assert_eq!(
+            workspaces::update_stack(&transport, id, Some("child")).unwrap(),
+            vec!["child"]
+        );
+        let head = conversation_head(&transport, id).unwrap().unwrap();
+        let store = open_store(&transport).unwrap();
+        let view = Conversation::open(&store, &oid(&head, "head").unwrap()).unwrap();
+        let merged = view.workspace("child").unwrap().unwrap().commit;
+        assert!(conversation_protocol::v3::CodeOps::is_ancestor(
+            &store,
+            &oid(&parent, "parent").unwrap(),
+            &merged
+        )
+        .unwrap());
+        assert!(conversation_protocol::v3::CodeOps::is_ancestor(
+            &store,
+            &oid(&child, "child").unwrap(),
+            &merged
+        )
+        .unwrap());
+        assert_eq!(
+            view.workspace_config("child")
+                .unwrap()
+                .base
+                .unwrap()
+                .commit()
+                .as_str(),
+            parent
+        );
+        assert!(workspaces::update_stack(&transport, id, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(conversation_head(&transport, id).unwrap().unwrap(), head);
+
+        let parent2 = commit_file(
+            &transport,
+            &parent,
+            "new parent
+",
+            "parent2",
+        );
+        let child2 = commit_file(
+            &transport,
+            merged.as_str(),
+            "conflicting child
+",
+            "child2",
+        );
+        advance("main", &parent2);
+        advance("child", &child2);
+        let before = conversation_head(&transport, id).unwrap().unwrap();
+        let error = workspaces::update_stack(&transport, id, None).unwrap_err();
+        assert!(error.contains("workspace \"child\" conflicts"), "{error}");
+        assert!(error.contains("workspace"), "{error}");
+        assert_eq!(conversation_head(&transport, id).unwrap().unwrap(), before);
+        // An upstream rewind is explicit and must not be mistaken for an update.
+        advance("main", &base);
+        assert!(workspaces::update_stack(&transport, id, None)
+            .unwrap_err()
+            .contains("does not descend"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn publication_fast_forwards_but_rejects_divergent_workspaces() {
         let (root, transport, base) = fixture("publish-advance");
         create_idle_conversation(&transport, "advance-talk", &base);
