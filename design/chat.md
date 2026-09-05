@@ -1,6 +1,6 @@
 # Chat v3: conversation and code as separate histories
 
-**Status:** implemented through subagents and workspace PR publication.
+**Status:** implemented through subagents, workspace navigation, and publication plans.
 Selected solely by the `refs/caos/v3/` namespace; v2 refs stay untouched
 and invisible. The binding definition is the code:
 `rust/crates/conversation-protocol/src/v3/` (records, kinds, paths,
@@ -12,7 +12,7 @@ validation) and its golden fixture (`fixtures.rs`), which pins the bytes.
 | --- | --- | --- |
 | `C` | conversation | commits under `refs/caos/v3/conversations/<key>/head` |
 | `W` | workspace code | ordinary git history, named by sha from `C` |
-| `P` | publication | the selected `W` commit at `refs/heads/caos/<conversation-id>` under the current `preserve` policy |
+| `P` | publication | a named `W` commit on its configured repository and branch, under the current `preserve` policy |
 
 A `C` commit is `tree` = the complete conversation state, `parent` = the
 previous `C` (the source `C` for a fork, the fixed v3 genesis commit
@@ -48,7 +48,8 @@ Invariants:
 ```
 refs/caos/v3/conversations/<hex(id)>/head
 refs/caos/v3/users/<hex(user)>/conversations/{active,archived}/<hex(id)>
-refs/heads/caos/<id>                       (publication, on origin)
+refs/heads/caos/<id>                       (legacy/single-workspace default)
+refs/heads/caos-workspaces/<id>/<workspace>  (new multi-workspace defaults)
 ```
 
 Heads advance only by exact-oid leased CAS (concurrency control, not
@@ -165,12 +166,13 @@ reconfigured. Missing settings retain the existing checkout-based defaults.
 These records supply the common model for workspace navigation, publication
 plans, stack updates, and repository attachment.
 
-**Publication.** `preserve` policy only: push the named workspace's
-commit to `refs/heads/caos/<id>` on the host checkout's `origin`. Selection
-is required when there is more than one workspace; they currently share
-that one destination branch. The existing remote tip must be an ancestor
-of the selected commit. A leased push then protects against subsequent
-remote changes, bracketed by `publication.pending` and
+**Publication.** `preserve` policy pushes a named workspace's commit to its
+repository and branch. Each workspace has a distinct destination. Existing
+publication records retain their branch; new multi-workspace branches use
+`caos-workspaces/<id>/<workspace>` so they can coexist with a legacy `caos/<id>`
+branch. A workspace's settings can override its destination. The existing remote
+tip must be an ancestor of the selected commit. A leased push protects against
+subsequent remote changes, bracketed by `publication.pending` and
 `publication.terminal` (complete, conflict, or uncertain).
 
 Before retrying, the host reconciles pending records for the same repository
@@ -178,19 +180,28 @@ and ref using the observed remote tip: the planned head means complete;
 an unchanged expected tip means uncertain; another tip means conflict.
 It records these outcomes without replaying the old pushes.
 
-The TUI also supports PR publication through `Ctrl+P` (or **Publish pull
-request** in its command palette). The user confirms a base, defaulting to
-`origin`'s advertised default branch. The host fetches its current commit and
-runs an ordinary conversation turn to merge it into the selected workspace
-when necessary, then build and test. This preparation can advance `W`; the
-subsequent publication operation still leaves workspace pointers unchanged.
-Before publishing, the host rejects interruption, missing base ancestry,
-remaining conflict markers, reserved `.caos` state, or a workspace changed
-since preparation. It uses the same leased branch publisher, then `gh` to
-find an open PR for that repository, head, and base or create one.
-`/publish-branch` skips preparation and PR creation. Squash, per-workspace
-destinations, multi-workspace PR stacks, and conversation publication remain
-deferred.
+`Ctrl+P` opens a publication preview, initially selecting the current workspace.
+Space selects individual rows; `a` toggles all. `b` edits a PR base (a branch or
+`@workspace`), and `h` edits the published branch. Enter or a second Ctrl+P
+confirms. The preview loads repository defaults and existing PRs in the
+background. Dependency edges determine publication order; duplicate destinations,
+cycles, and cross-repository bases are rejected.
+
+For each selected workspace, the host checks that the preview is still current,
+fetches its PR base, and runs an ordinary conversation turn to merge when needed,
+then build and test. A dependent workspace requires its parent to be published
+at its current head, either already or earlier in the same plan. Preparation can
+advance `W`; publishing the prepared result leaves workspace pointers unchanged.
+The host rejects interruption, missing base ancestry, unresolved conflicts,
+reserved `.caos` state, or a workspace changed since preparation. It records the
+reviewed destination and integrated base in the workspace settings, then uses
+the leased publisher and `gh` to find an open PR by repository and head branch.
+An existing PR gets its base updated while retaining its title; otherwise a new
+PR is created. Cancelling stops further work in the batch. A partial failure
+reports completed PRs and the workspace where publication stopped.
+
+`/publish-branch` uses the selected workspace's destination and skips preparation
+and PR creation. Squash and conversation publication remain deferred.
 
 **Forks, title, membership.** `conversation.fork` creates a new identity
 with the source `C` as its parent; it is not a `conversation.root`.

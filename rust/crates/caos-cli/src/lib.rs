@@ -2020,7 +2020,7 @@ pub fn compare_and_set_conversation_title(
     Ok(matched)
 }
 
-fn normalize_repository_identity(url: &str) -> Result<String, String> {
+pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("origin has an empty URL".to_string());
@@ -2271,7 +2271,7 @@ pub fn publish_workspace_branch(
     id: &str,
     workspace: Option<&str>,
 ) -> Result<PublishedBranch, String> {
-    publish_workspace_branch_inner(t, id, workspace, None)
+    publish_workspace_branch_inner(t, id, workspace, None, None)
 }
 
 /// Publish exactly the workspace that completed PR preparation.
@@ -2281,7 +2281,7 @@ pub fn publish_prepared_workspace_branch(
     workspace: &str,
     prepared_head: &str,
 ) -> Result<PublishedBranch, String> {
-    publish_workspace_branch_inner(t, id, Some(workspace), Some(prepared_head))
+    publish_workspace_branch_inner(t, id, Some(workspace), Some(prepared_head), None)
 }
 
 fn publish_workspace_branch_inner(
@@ -2289,6 +2289,7 @@ fn publish_workspace_branch_inner(
     id: &str,
     workspace: Option<&str>,
     prepared_head: Option<&str>,
+    destination: Option<(&str, &str)>,
 ) -> Result<PublishedBranch, String> {
     refs::validate_conversation_id(id)?;
     let mut store = open_store(t)?;
@@ -2308,6 +2309,27 @@ fn publish_workspace_branch_inner(
     }
     let initial = record.initial;
     let publications = conversation.publications()?;
+    let config = conversation.workspace_config(&workspace)?;
+    let (repository_url, branch) = match destination {
+        Some((repository, branch)) => (repository.to_string(), branch.to_string()),
+        None => {
+            let repository = workspaces::repository_url(t, &config)?;
+            let branch = workspaces::publication_branch(
+                &conversation,
+                id,
+                &workspace,
+                &normalize_repository_identity(&repository)?,
+            )?;
+            (repository, branch)
+        }
+    };
+    conversation_protocol::v3::WorkspaceConfig {
+        repository: Some(repository_url.clone()),
+        branch: Some(branch.clone()),
+        base: None,
+    }
+    .validate()?;
+    let repository = normalize_repository_identity(&repository_url)?;
     drop(conversation);
 
     store.ensure_local(&planned_head)?;
@@ -2315,10 +2337,8 @@ fn publish_workspace_branch_inner(
     reject_publish_caos(t, &planned_head)?;
     ensure_code_commit(t, &mut store, &planned_head)?;
 
-    let repository = origin_repository(t)?;
-    let branch = format!("caos/{id}");
     let branch_ref = format!("refs/heads/{branch}");
-    let origin = GitStore::open(t.work_dir(), Some("origin"))?;
+    let origin = GitStore::open(t.work_dir(), Some(&repository_url))?;
     let expected_old = origin.read_ref(&branch_ref)?;
     for previous in publications {
         if previous.status == PublicationStatus::Pending
@@ -3512,6 +3532,59 @@ mod tests {
             matches!(&dependent.config.base, Some(WorkspaceBase::Workspace { name, commit }) if name == "side" && commit.as_str() == next)
         );
         assert!(remove_workspace(&transport, "workspaces-talk", "side").is_err());
+        git(
+            transport.work_dir(),
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        git(
+            &root.join("origin.git"),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        let plan = workspaces::publication_plan(&transport, "workspaces-talk").unwrap();
+        let dependent = plan
+            .iter()
+            .find(|target| target.workspace == "dependent")
+            .unwrap();
+        assert_eq!(dependent.base, "feature/side");
+        assert_eq!(dependent.parent.as_deref(), Some("side"));
+        let order = workspaces::publication_order(&plan).unwrap();
+        assert!(
+            order.iter().position(|name| name == "side")
+                < order.iter().position(|name| name == "dependent")
+        );
+        let mut collision = plan.clone();
+        collision
+            .iter_mut()
+            .find(|target| target.workspace == "separate")
+            .unwrap()
+            .branch = "feature/side".into();
+        assert!(workspaces::publication_order(&collision)
+            .unwrap_err()
+            .contains("several workspaces"));
+        let target = plan
+            .iter()
+            .find(|target| target.workspace == "main")
+            .unwrap();
+        let published = workspaces::publish_prepared_target(
+            &transport,
+            "workspaces-talk",
+            target,
+            &base,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(published.status, PublicationStatus::Complete);
+        assert_eq!(published.branch, target.branch);
+        let next_plan = workspaces::publication_plan(&transport, "workspaces-talk").unwrap();
+        assert_eq!(
+            next_plan
+                .iter()
+                .find(|target| target.workspace == "main")
+                .unwrap()
+                .branch,
+            target.branch
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3539,6 +3612,19 @@ mod tests {
 
         let side = commit_file(&transport, &base, "side workspace\n", "side");
         create_workspace(&transport, "advance-talk", "side", &side).unwrap();
+        let side_publication =
+            publish_workspace_branch(&transport, "advance-talk", Some("side")).unwrap();
+        assert_eq!(side_publication.status, PublicationStatus::Complete);
+        assert_eq!(side_publication.branch, "caos-workspaces/advance-talk/side");
+        // An outside writer can still advance a workspace's own branch. Preserve it.
+        git(
+            &root.join("origin.git"),
+            &[
+                "update-ref",
+                "refs/heads/caos-workspaces/advance-talk/side",
+                &next,
+            ],
+        );
         let error = publish_workspace_branch(&transport, "advance-talk", Some("side")).unwrap_err();
         assert!(error.contains("would not fast-forward"), "{error}");
         assert_eq!(

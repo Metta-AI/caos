@@ -114,47 +114,9 @@ pub(crate) fn remote_base_is_ancestor(
     }
 }
 
-pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
-    let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
-    let stdout = require_success("git", output)?;
-    parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
-}
-
-fn parse_remote_default_branch(output: &str) -> Result<String, String> {
-    for line in output.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(marker), Some(reference), Some(target)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if marker == "ref:" && target == "HEAD" {
-            let branch = reference
-                .strip_prefix("refs/heads/")
-                .ok_or_else(|| format!("origin HEAD points outside refs/heads: {reference}"))?;
-            if branch.is_empty() {
-                return Err("origin HEAD advertises an empty default branch".to_string());
-            }
-            return Ok(branch.to_string());
-        }
-    }
-    Err("origin HEAD did not advertise a default branch".to_string())
-}
-
 /// Accept either a branch name or the familiar origin/<branch> spelling.
 pub(crate) fn pr_base_branch(input: &str) -> &str {
     input.trim().strip_prefix("origin/").unwrap_or(input.trim())
-}
-
-pub(crate) fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
-    let reference = format!("refs/heads/{branch}");
-    capture_required("git", &["check-ref-format", &reference], cwd)?;
-    let origin = conversation_protocol::v3::GitStore::open(cwd, Some("origin"))?;
-    let head = origin
-        .read_ref(&reference)?
-        .ok_or_else(|| format!("origin has no branch {branch:?}"))?;
-    origin.fetch_object(&head)?;
-    Ok(head.to_string())
 }
 
 pub(crate) fn validate_prepared_workspace(
@@ -194,18 +156,51 @@ pub(crate) fn validate_prepared_workspace(
     Ok(())
 }
 
-pub(crate) fn find_or_open_workspace_pr(
+pub(crate) fn find_or_open_workspace_pr_in(
+    repository: &str,
     name: &str,
     title: &str,
     published: &caos_cli::PublishedBranch,
     base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
-    let transport = caos::GitTransport::discover(cwd)?;
-    let repository = caos_cli::origin_repository(&transport)?;
+    let repository = caos_cli::normalize_repository_identity(repository)?;
     find_or_open_workspace_pr_with(&repository, name, title, published, base, |args| {
         capture_required("gh", args, cwd)
     })
+}
+
+pub(crate) fn lookup_workspace_pr(
+    repository: &str,
+    branch: &str,
+    cwd: &Path,
+) -> Result<Option<String>, String> {
+    let repository = caos_cli::normalize_repository_identity(repository)?;
+    lookup_workspace_pr_with(&repository, branch, &mut |args| {
+        capture_required("gh", args, cwd)
+    })
+}
+
+fn lookup_workspace_pr_with(
+    repository: &str,
+    branch: &str,
+    gh: &mut impl FnMut(&[&str]) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let matches = gh(&[
+        "pr", "list", "--repo", repository, "--head", branch, "--state", "open", "--json", "url",
+        "--jq", ".[].url",
+    ])?;
+    let urls = matches
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    match urls.as_slice() {
+        [] => Ok(None),
+        [url] => Ok(Some((*url).to_string())),
+        _ => Err(format!(
+            "several open PRs use branch {branch:?}; choose a distinct publication branch"
+        )),
+    }
 }
 
 fn find_or_open_workspace_pr_with(
@@ -216,26 +211,9 @@ fn find_or_open_workspace_pr_with(
     base: &str,
     mut gh: impl FnMut(&[&str]) -> Result<String, String>,
 ) -> Result<String, String> {
-    let title = format!("caos conversation: {title}");
-    let existing = gh(&[
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--head",
-        &published.branch,
-        "--base",
-        base,
-        "--state",
-        "open",
-        "--json",
-        "url",
-        "--jq",
-        ".[0].url // empty",
-    ])?;
-    if !existing.is_empty() {
+    if let Some(existing) = lookup_workspace_pr_with(repository, &published.branch, &mut gh)? {
         gh(&[
-            "pr", "edit", &existing, "--repo", repository, "--title", &title,
+            "pr", "edit", &existing, "--repo", repository, "--base", base,
         ])?;
         return Ok(existing);
     }
@@ -253,7 +231,7 @@ fn find_or_open_workspace_pr_with(
         "--base",
         base,
         "--title",
-        &title,
+        title,
         "--body",
         &body,
     ])
@@ -333,17 +311,26 @@ mod tests {
         std::fs::write(repo.join("file.txt"), "unstaged\n").unwrap();
         let index = capture_required("git", &["write-tree"], &repo).unwrap();
 
-        assert_eq!(remote_default_branch(&repo).unwrap(), "release/next");
+        let transport = caos::GitTransport::discover(&repo).unwrap();
+        let remote_url = remote.to_str().unwrap();
+        assert_eq!(
+            caos_cli::workspaces::default_branch(&transport, remote_url).unwrap(),
+            "release/next"
+        );
         assert_eq!(pr_base_branch(" origin/release/next "), "release/next");
         assert_eq!(pr_base_branch("release/next"), "release/next");
         assert_eq!(
-            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             base
         );
-        assert!(fetch_remote_branch_tip("missing", &repo)
-            .unwrap_err()
-            .contains("no branch"));
-        assert!(fetch_remote_branch_tip("../invalid", &repo).is_err());
+        assert!(
+            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "missing")
+                .unwrap_err()
+                .contains("does not exist")
+        );
+        assert!(
+            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "../invalid").is_err()
+        );
         validate_prepared_workspace(&base, &base, &repo).unwrap();
         assert!(validate_prepared_workspace(&base, &local, &repo)
             .unwrap_err()
@@ -355,7 +342,7 @@ mod tests {
             "conflict",
         );
         assert_eq!(
-            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             conflicted
         );
         assert!(validate_prepared_workspace(&base, &conflicted, &repo)
@@ -418,20 +405,28 @@ mod tests {
                     "https://github.com/owner/repo",
                     "--head",
                     "caos/talk-1",
-                    "--base",
-                    "release/next",
                     "--state",
                     "open",
                     "--json",
                     "url",
                     "--jq",
-                    ".[0].url // empty"
+                    ".[].url"
                 ]
             );
             assert_eq!(calls[1][1], if existing { "edit" } else { "create" });
-            assert!(calls[1]
-                .windows(2)
-                .any(|pair| pair == ["--title", "caos conversation: Fix documentation"]));
+            if existing {
+                assert!(
+                    !calls[1].iter().any(|arg| arg == "--title"),
+                    "preserve a manually edited PR title"
+                );
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--base", "release/next"]));
+            } else {
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--title", "Fix documentation"]));
+            }
             assert!(calls[1]
                 .windows(2)
                 .any(|pair| pair == ["--repo", "https://github.com/owner/repo"]));

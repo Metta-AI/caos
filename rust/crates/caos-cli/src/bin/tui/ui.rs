@@ -49,7 +49,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         !app.selection_locked
             && app.palette.is_none()
             && app.workspace_picker.is_none()
-            && state.publish_base.is_none()
+            && state.publish_plan.is_none()
             && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
@@ -57,6 +57,7 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
     render_workspace_picker(app, frame);
+    render_publication_plan(app, frame);
     render_screen_selection(app, frame);
 }
 
@@ -183,7 +184,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() || state.publish_base.is_some() {
+    let notice_height = if state.command_error.is_some() {
         3
     } else if state.reference_notice.is_some() {
         4
@@ -224,33 +225,6 @@ fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         );
         return;
     }
-    if let Some(prompt) = state.publish_base.as_ref() {
-        let branch = if prompt.input.is_empty() {
-            Span::styled(
-                format!("origin/{} (default)", prompt.default_base),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan))
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::raw("Base branch: "), branch])).block(
-                Block::default()
-                    .title(" Publish PR — Ctrl+P confirms, Esc cancels ")
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .borders(Borders::ALL),
-            ),
-            area,
-        );
-        frame.set_cursor_position(Position::new(
-            area.x
-                .saturating_add(14)
-                .saturating_add(prompt.input.cell_width())
-                .min(area.right().saturating_sub(2)),
-            area.y.saturating_add(1),
-        ));
-        return;
-    }
     if let Some(reference) = state.reference_notice.as_ref() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -281,7 +255,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || state.publish_base.is_some() || app.palette.is_some() {
+    if state.command_error.is_some() || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;
@@ -1715,9 +1689,9 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
-    } else if app.selected().publish_base.is_some() {
+    } else if app.selected().publish_plan.is_some() {
         Line::raw(
-            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
+            " Publish PRs: Space selects  b edits base  h edits branch  Enter/^P confirms  Esc cancels",
         )
     } else if app.focus() == Focus::List {
         Line::raw(
@@ -1881,6 +1855,94 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
             rows[1],
         );
     }
+}
+
+fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
+    let Some(prompt) = &app.selected().publish_plan else {
+        return;
+    };
+    let terminal = frame.area();
+    let area = terminal.centered(
+        Constraint::Length(terminal.width.saturating_sub(4).min(112)),
+        Constraint::Length(terminal.height.saturating_sub(2).min(24)),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Publish workspaces ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    if prompt.loading {
+        frame.render_widget(
+            Paragraph::new("Loading repositories and pull requests..."),
+            rows[0],
+        );
+    } else {
+        let items = prompt
+            .rows
+            .iter()
+            .map(|row| {
+                let check = if row.included { "[x]" } else { "[ ]" };
+                let operation = row.pull_request.as_deref().unwrap_or("Create or update PR");
+                ListItem::new(vec![
+                    Line::from(format!(
+                        "{check} {}   {}",
+                        row.target.workspace,
+                        short_hash(&row.target.head)
+                    )),
+                    Line::from(format!("    {} -> {}", row.target.branch, row.target.base)),
+                    Line::styled(
+                        format!("    {}   {operation}", row.target.repository),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let mut selection = ListState::default().with_selected(Some(prompt.selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[0],
+            &mut selection,
+        );
+    }
+    if let Some((base, input)) = &prompt.edit {
+        let label = if *base {
+            "Base branch or @workspace"
+        } else {
+            "Publication branch"
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{label}: {input}\nEnter saves the choice")),
+            rows[1],
+        );
+    } else if let Some(error) = &prompt.error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new("Selected workspaces will be prepared, tested, and published in dependency order.\nEach workspace gets its own branch and PR."), rows[1]);
+    }
+    frame.render_widget(
+        Paragraph::new(
+            "Space select   a all   b base   h branch   Enter/Ctrl+P publish   Esc cancel",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
 }
 
 #[cfg(test)]
