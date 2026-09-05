@@ -2226,44 +2226,47 @@ impl App {
     }
 
     fn start_turn(&mut self) {
-        if self.selected().forking {
-            self.selected_mut()
-                .show_command_error("wait for this conversation fork to finish");
+        let raw = self.selected().composer.expanded_text().trim().to_string();
+        if raw.is_empty() {
             return;
         }
-        if self.selected().workspace_operation {
-            self.selected_mut()
-                .show_command_error("wait for the workspace operation to finish");
-            return;
-        }
-        if self.selected().publishing {
-            self.selected_mut()
-                .show_command_error("finish publishing before sending another message");
-            return;
-        }
-        let interjecting = self.selected().running;
-        let Some(raw) = self.selected_mut().composer.take_message() else {
-            return;
-        };
-        let state = self.selected_mut();
-        state.reference_notice = None;
-        // Recognized local commands stop here as one class. Unrecognized slash
-        // text and message-submitting commands continue through the ordinary
-        // turn path.
-        let mut human_tree = None;
-        let mut proposal_base = None;
-        let message = if let Some((command, arguments)) = parse_command(&raw) {
+        self.selected_mut().reference_notice = None;
+        let command = parse_command(&raw);
+        // Local commands dispatch before message admission guards. Each action
+        // enforces its own restrictions; read-only UI commands need no idle turn.
+        if let Some((command, arguments)) = command {
             if command.action != AppAction::Workspace
                 && command.takes_argument == arguments.is_empty()
             {
+                self.selected_mut().composer.clear();
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
                 return;
             }
             if !command.action.submits_message() {
+                self.selected_mut().composer.clear();
                 self.run_local_command(command, arguments);
                 return;
             }
+        }
+        let blocked = if self.selected().forking {
+            Some("wait for this conversation fork to finish")
+        } else if self.selected().workspace_operation {
+            Some("wait for the workspace operation to finish")
+        } else if self.selected().publishing {
+            Some("finish publishing before sending another message")
+        } else {
+            None
+        };
+        if let Some(error) = blocked {
+            self.selected_mut().show_command_error(error);
+            return;
+        }
+        self.selected_mut().composer.clear();
+        let interjecting = self.selected().running;
+        let mut human_tree = None;
+        let mut proposal_base = None;
+        let message = if let Some((_, arguments)) = command {
             let workspace = match self.selected().require_selected_workspace() {
                 Ok(workspace) => workspace.head.clone(),
                 Err(error) => {
@@ -7038,6 +7041,22 @@ mod tests {
         assert!(rendered_main_pane(&terminal)
             .join("\n")
             .contains("finish publishing before sending another message"));
+        for raw in ["  /unknown-command \n", "/update-tree do not commit"] {
+            app.selected_mut().composer.take_message();
+            app.selected_mut().composer.insert_str(raw);
+            app.start_turn();
+            assert_eq!(app.selected().composer.text, raw);
+            assert!(app.selected().pending_submissions.is_empty());
+        }
+        app.selected_mut().composer.take_message();
+        app.selected_mut().remote_head = Some("a".repeat(40));
+        app.selected_mut().composer.insert_str("/ref");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.selected().command_error.is_none());
+        assert!(app.selected().reference_notice.is_some());
+        assert!(app.selected().composer.text.is_empty());
+        assert!(app.selected().publishing);
+        assert!(app.selected().transcript.is_empty());
     }
 
     fn rendered_screen(app: &App) -> String {
