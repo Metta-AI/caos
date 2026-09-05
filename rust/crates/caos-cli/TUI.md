@@ -112,6 +112,7 @@ so it never leaves the conversation pane.
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected conversation's head commit in the working tree |
+| `Ctrl+P` twice | Prepare the selected workspace against an `origin` base and open or update its PR |
 | `/publish-branch` | Push the selected workspace to `refs/heads/caos/<conversation id>` on `origin` |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
@@ -133,9 +134,18 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Enter `/publish-branch` to push the selected workspace to
-`refs/heads/caos/<conversation id>` on `origin`. Pull request creation is not
-available.
+Press `Ctrl+P` to publish a pull request for the selected workspace. The base
+prompt defaults to `origin`'s advertised default branch. Type a branch name
+(or `origin/<branch>`) to override it; press `Ctrl+P` again to confirm, or
+`Escape` to cancel. Your message draft is preserved. The same action is
+available as **Publish pull request** in the `Ctrl+Shift+P` command palette.
+
+Publication fetches that base, then runs a visible agent turn to merge it if
+needed and build and test the workspace. After preparation, CAOS pushes to
+`refs/heads/caos/<conversation id>` on `origin` and uses authenticated `gh` to
+open a ready-for-review PR. If an open PR already matches that head and base,
+CAOS reuses it and refreshes its title. The PR URL appears in the transcript.
+Enter `/publish-branch` for a direct branch push without preparation or a PR.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -147,8 +157,8 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-Fresh conversations start from the fetched tip of `origin`'s advertised
-default branch. `--base` and `/from <turn-hash>` override that default.
+Fresh conversations start from the local branch named by `origin/HEAD`,
+without fetching from `origin`. `--base` and `/from <turn-hash>` override that default.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
@@ -219,8 +229,12 @@ matches it exactly.
 Publishing also leaves the checkout and index untouched. `/publish-branch`
 pushes the selected workspace directly to
 `refs/heads/caos/<conversation id>` on `origin`; it does not run an agent
-merge-and-test preparation turn. Pull request creation is not available. The
-workspace tip must contain no reserved `.caos` state before the branch moves.
+merge-and-test preparation turn. `Ctrl+P` runs that preparation as an ordinary
+conversation turn, then publishes its resulting workspace through the same
+branch publisher. It stops before pushing if the turn was interrupted, the
+workspace does not contain the fetched base, conflict markers remain, or the
+workspace has advanced since preparation. The workspace tip must contain no
+reserved `.caos` state before the branch moves.
 Updates must fast-forward the remote branch; merge remote changes into the
 workspace before publishing again. Selecting another workspace cannot discard
 the branch's existing history. Retrying also records the observed outcome of

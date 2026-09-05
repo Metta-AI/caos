@@ -1,4 +1,4 @@
-//! Local-checkout policy for the conversation TUI.
+//! Local-checkout and PR publication policy for the conversation TUI.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -98,6 +98,167 @@ pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), S
     Ok((branch, commit))
 }
 
+pub(crate) fn remote_base_is_ancestor(
+    target: &str,
+    head: &str,
+    cwd: &Path,
+) -> Result<bool, String> {
+    let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
+    match ancestry.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            require_success("git merge-base --is-ancestor", ancestry)?;
+            unreachable!("a successful command has exit status 0")
+        }
+    }
+}
+
+pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
+    let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
+    let stdout = require_success("git", output)?;
+    parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
+}
+
+fn parse_remote_default_branch(output: &str) -> Result<String, String> {
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(marker), Some(reference), Some(target)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if marker == "ref:" && target == "HEAD" {
+            let branch = reference
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| format!("origin HEAD points outside refs/heads: {reference}"))?;
+            if branch.is_empty() {
+                return Err("origin HEAD advertises an empty default branch".to_string());
+            }
+            return Ok(branch.to_string());
+        }
+    }
+    Err("origin HEAD did not advertise a default branch".to_string())
+}
+
+/// Accept either a branch name or the familiar origin/<branch> spelling.
+pub(crate) fn pr_base_branch(input: &str) -> &str {
+    input.trim().strip_prefix("origin/").unwrap_or(input.trim())
+}
+
+pub(crate) fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
+    let reference = format!("refs/heads/{branch}");
+    capture_required("git", &["check-ref-format", &reference], cwd)?;
+    let origin = conversation_protocol::v3::GitStore::open(cwd, Some("origin"))?;
+    let head = origin
+        .read_ref(&reference)?
+        .ok_or_else(|| format!("origin has no branch {branch:?}"))?;
+    origin.fetch_object(&head)?;
+    Ok(head.to_string())
+}
+
+pub(crate) fn validate_prepared_workspace(
+    target: &str,
+    head: &str,
+    cwd: &Path,
+) -> Result<(), String> {
+    if !remote_base_is_ancestor(target, head, cwd)? {
+        return Err("the preparation turn did not merge the selected PR base".to_string());
+    }
+    let markers = command_output(
+        "git",
+        &[
+            "grep",
+            "-I",
+            "-n",
+            "-e",
+            "^<<<<<<< ",
+            "-e",
+            "^=======$",
+            "-e",
+            "^>>>>>>> ",
+            head,
+            "--",
+        ],
+        cwd,
+    )?;
+    if markers.status.success() {
+        return Err(format!(
+            "unresolved merge markers:\n{}",
+            String::from_utf8_lossy(&markers.stdout).trim_end()
+        ));
+    }
+    if markers.status.code() != Some(1) {
+        require_success("git grep", markers)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn find_or_open_workspace_pr(
+    name: &str,
+    title: &str,
+    published: &caos_cli::PublishedBranch,
+    base: &str,
+    cwd: &Path,
+) -> Result<String, String> {
+    let transport = caos::GitTransport::discover(cwd)?;
+    let repository = caos_cli::origin_repository(&transport)?;
+    find_or_open_workspace_pr_with(&repository, name, title, published, base, |args| {
+        capture_required("gh", args, cwd)
+    })
+}
+
+fn find_or_open_workspace_pr_with(
+    repository: &str,
+    name: &str,
+    title: &str,
+    published: &caos_cli::PublishedBranch,
+    base: &str,
+    mut gh: impl FnMut(&[&str]) -> Result<String, String>,
+) -> Result<String, String> {
+    let title = format!("caos conversation: {title}");
+    let existing = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        repository,
+        "--head",
+        &published.branch,
+        "--base",
+        base,
+        "--state",
+        "open",
+        "--json",
+        "url",
+        "--jq",
+        ".[0].url // empty",
+    ])?;
+    if !existing.is_empty() {
+        gh(&[
+            "pr", "edit", &existing, "--repo", repository, "--title", &title,
+        ])?;
+        return Ok(existing);
+    }
+    let body = format!(
+        "Published workspace `{}` from CAOS conversation `{name}` at `{}`.",
+        published.workspace, published.head
+    );
+    gh(&[
+        "pr",
+        "create",
+        "--repo",
+        repository,
+        "--head",
+        &published.branch,
+        "--base",
+        base,
+        "--title",
+        &title,
+        "--body",
+        &body,
+    ])
+}
+
 pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     capture_required_bytes(program, args, cwd)
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
@@ -152,6 +313,158 @@ mod tests {
         capture_required("git", &["add", "file.txt"], dir).unwrap();
         capture_required("git", &["commit", "-q", "-m", message], dir).unwrap();
         capture_required("git", &["rev-parse", "HEAD"], dir).unwrap()
+    }
+
+    #[test]
+    fn pr_preparation_fetches_the_base_without_touching_local_edits() {
+        let remote = temp_repo("pr-origin");
+        capture_required("git", &["branch", "-M", "release/next"], &remote).unwrap();
+        let base = commit_file(&remote, "base\n", "base");
+        let repo = temp_repo("pr-local");
+        let local = commit_file(&repo, "local\n", "local");
+        capture_required(
+            "git",
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+            &repo,
+        )
+        .unwrap();
+        std::fs::write(repo.join("file.txt"), "staged\n").unwrap();
+        capture_required("git", &["add", "file.txt"], &repo).unwrap();
+        std::fs::write(repo.join("file.txt"), "unstaged\n").unwrap();
+        let index = capture_required("git", &["write-tree"], &repo).unwrap();
+
+        assert_eq!(remote_default_branch(&repo).unwrap(), "release/next");
+        assert_eq!(pr_base_branch(" origin/release/next "), "release/next");
+        assert_eq!(pr_base_branch("release/next"), "release/next");
+        assert_eq!(
+            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            base
+        );
+        assert!(fetch_remote_branch_tip("missing", &repo)
+            .unwrap_err()
+            .contains("no branch"));
+        assert!(fetch_remote_branch_tip("../invalid", &repo).is_err());
+        validate_prepared_workspace(&base, &base, &repo).unwrap();
+        assert!(validate_prepared_workspace(&base, &local, &repo)
+            .unwrap_err()
+            .contains("did not merge"));
+        assert!(validate_prepared_workspace("bad-revision", &base, &repo).is_err());
+        let conflicted = commit_file(
+            &remote,
+            "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n",
+            "conflict",
+        );
+        assert_eq!(
+            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            conflicted
+        );
+        assert!(validate_prepared_workspace(&base, &conflicted, &repo)
+            .unwrap_err()
+            .contains("unresolved merge markers"));
+        assert_eq!(
+            capture_required("git", &["rev-parse", "HEAD"], &repo).unwrap(),
+            local
+        );
+        assert_eq!(
+            capture_required("git", &["write-tree"], &repo).unwrap(),
+            index
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "unstaged\n"
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[test]
+    fn pr_publication_creates_or_reuses_the_matching_origin_pr() {
+        let published = caos_cli::PublishedBranch {
+            workspace: "docs".to_string(),
+            branch: "caos/talk-1".to_string(),
+            head: "a".repeat(40),
+            publication: "publication-1".to_string(),
+            status: conversation_protocol::v3::PublicationStatus::Complete,
+            observed: Some("a".repeat(40)),
+        };
+        let url = "https://github.com/owner/repo/pull/1";
+        for existing in [false, true] {
+            let mut calls = Vec::new();
+            let result = find_or_open_workspace_pr_with(
+                "https://github.com/owner/repo",
+                "talk-1",
+                "Fix documentation",
+                &published,
+                "release/next",
+                |args| {
+                    calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                    Ok(if args[1] == "list" && !existing {
+                        ""
+                    } else {
+                        url
+                    }
+                    .to_string())
+                },
+            )
+            .unwrap();
+            assert_eq!(result, url);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(
+                calls[0],
+                [
+                    "pr",
+                    "list",
+                    "--repo",
+                    "https://github.com/owner/repo",
+                    "--head",
+                    "caos/talk-1",
+                    "--base",
+                    "release/next",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
+                    "--jq",
+                    ".[0].url // empty"
+                ]
+            );
+            assert_eq!(calls[1][1], if existing { "edit" } else { "create" });
+            assert!(calls[1]
+                .windows(2)
+                .any(|pair| pair == ["--title", "caos conversation: Fix documentation"]));
+            assert!(calls[1]
+                .windows(2)
+                .any(|pair| pair == ["--repo", "https://github.com/owner/repo"]));
+            if existing {
+                assert_eq!(calls[1][2], url);
+            } else {
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--head", "caos/talk-1"]));
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--base", "release/next"]));
+                assert!(!calls[1].iter().any(|arg| arg == "--draft"));
+            }
+        }
+        let mut calls = 0;
+        let error = find_or_open_workspace_pr_with(
+            "owner/repo",
+            "talk-1",
+            "title",
+            &published,
+            "main",
+            |_| {
+                calls += 1;
+                Err("GitHub unavailable".to_string())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "GitHub unavailable");
+        assert_eq!(
+            calls, 1,
+            "a failed lookup must not attempt to create another PR"
+        );
     }
 
     #[test]

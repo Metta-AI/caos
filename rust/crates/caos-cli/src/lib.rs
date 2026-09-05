@@ -2044,7 +2044,7 @@ fn normalize_repository_identity(url: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn origin_repository(t: &GitTransport) -> Result<String, String> {
+pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
     let url = t
         .git_capture(&["remote", "get-url", "origin"], None)
         .map_err(|error| format!("repository has no origin remote: {error}"))?;
@@ -2249,6 +2249,25 @@ pub fn publish_workspace_branch(
     id: &str,
     workspace: Option<&str>,
 ) -> Result<PublishedBranch, String> {
+    publish_workspace_branch_inner(t, id, workspace, None)
+}
+
+/// Publish exactly the workspace that completed PR preparation.
+pub fn publish_prepared_workspace_branch(
+    t: &GitTransport,
+    id: &str,
+    workspace: &str,
+    prepared_head: &str,
+) -> Result<PublishedBranch, String> {
+    publish_workspace_branch_inner(t, id, Some(workspace), Some(prepared_head))
+}
+
+fn publish_workspace_branch_inner(
+    t: &GitTransport,
+    id: &str,
+    workspace: Option<&str>,
+    prepared_head: Option<&str>,
+) -> Result<PublishedBranch, String> {
     refs::validate_conversation_id(id)?;
     let mut store = open_store(t)?;
     let Some((conversation_ref, head)) = fetch_validated_head(t, &store, id)? else {
@@ -2260,6 +2279,11 @@ pub fn publish_workspace_branch(
         .workspace(&workspace)?
         .ok_or_else(|| format!("workspace {workspace:?} disappeared"))?;
     let planned_head = record.commit;
+    if prepared_head.is_some_and(|prepared| prepared != planned_head.as_str()) {
+        return Err(format!(
+            "workspace {workspace:?} changed after PR preparation; prepare it again before publishing"
+        ));
+    }
     let initial = record.initial;
     let publications = conversation.publications()?;
     drop(conversation);
@@ -3447,7 +3471,19 @@ mod tests {
         create_idle_conversation(&transport, "publish-talk", &base);
         let branch_ref = "refs/heads/caos/publish-talk";
 
-        let first = publish_workspace_branch(&transport, "publish-talk", None).unwrap();
+        let before = conversation_head(&transport, "publish-talk").unwrap();
+        let error =
+            publish_prepared_workspace_branch(&transport, "publish-talk", "main", &"0".repeat(40))
+                .unwrap_err();
+        assert!(error.contains("changed after PR preparation"), "{error}");
+        assert_eq!(
+            conversation_head(&transport, "publish-talk").unwrap(),
+            before
+        );
+        assert!(git(&root.join("origin.git"), &["for-each-ref", branch_ref]).is_empty());
+
+        let first =
+            publish_prepared_workspace_branch(&transport, "publish-talk", "main", &base).unwrap();
         assert_eq!(first.workspace, "main");
         assert_eq!(first.branch, "caos/publish-talk");
         assert_eq!(first.head, base);

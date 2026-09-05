@@ -46,7 +46,10 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_composer(
         state,
         app.view,
-        !app.selection_locked && app.palette.is_none() && app.focus() == Focus::Conversation,
+        !app.selection_locked
+            && app.palette.is_none()
+            && state.publish_base.is_none()
+            && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
@@ -178,7 +181,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() {
+    let notice_height = if state.command_error.is_some() || state.publish_base.is_some() {
         3
     } else if state.reference_notice.is_some() {
         4
@@ -219,6 +222,33 @@ fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         );
         return;
     }
+    if let Some(prompt) = state.publish_base.as_ref() {
+        let branch = if prompt.input.is_empty() {
+            Span::styled(
+                format!("origin/{} (default)", prompt.default_base),
+                Style::default().fg(Color::DarkGray),
+            )
+        } else {
+            Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::raw("Base branch: "), branch])).block(
+                Block::default()
+                    .title(" Publish PR — Ctrl+P confirms, Esc cancels ")
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::ALL),
+            ),
+            area,
+        );
+        frame.set_cursor_position(Position::new(
+            area.x
+                .saturating_add(14)
+                .saturating_add(prompt.input.cell_width())
+                .min(area.right().saturating_sub(2)),
+            area.y.saturating_add(1),
+        ));
+        return;
+    }
     if let Some(reference) = state.reference_notice.as_ref() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -249,7 +279,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || app.palette.is_some() {
+    if state.command_error.is_some() || state.publish_base.is_some() || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;
@@ -1683,6 +1713,10 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
+    } else if app.selected().publish_base.is_some() {
+        Line::raw(
+            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
+        )
     } else if app.focus() == Focus::List {
         Line::raw(
             " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
@@ -1705,7 +1739,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P PR  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);

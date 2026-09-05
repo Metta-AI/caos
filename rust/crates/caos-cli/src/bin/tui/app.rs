@@ -10,12 +10,13 @@ use caos_cli::{
     conversation_load_at, conversation_ref, conversation_snapshot, create_workspace, default_title,
     describe_tool_set, first_available_conversation_name, fork_conversation,
     generate_conversation_title, interrupt_request, invite_user_to_conversation,
-    list_user_conversations, publication_diagnostic, publish_user_conversation,
-    publish_workspace_branch, remove_workspace, resume_request, rollback_workspace, run_chat_turn,
-    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
-    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, PublishedBranch,
-    RequestStatus, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
-    UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
+    list_user_conversations, publication_diagnostic, publish_prepared_workspace_branch,
+    publish_user_conversation, publish_workspace_branch, remove_workspace, resume_request,
+    rollback_workspace, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, PublicationSummary, PublishedBranch, RequestStatus, ToolSetDescription,
+    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -25,7 +26,9 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip,
+    commit_working_tree, fetch_remote_branch_tip, find_or_open_workspace_pr,
+    load_conversation_workspace, local_default_branch_tip, pr_base_branch, remote_base_is_ancestor,
+    remote_default_branch, validate_prepared_workspace,
 };
 
 #[path = "ui.rs"]
@@ -896,6 +899,7 @@ enum AppAction {
     Invite,
     Model,
     Commands,
+    Publish,
     PublishBranch,
     Reference,
     Title,
@@ -1061,6 +1065,7 @@ struct ConversationState {
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
+    publish_base: Option<PublishBasePrompt>,
     forking: bool,
     workspace_operation: bool,
     scroll: ScrollState,
@@ -1106,6 +1111,7 @@ impl ConversationState {
             reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
+            publish_base: None,
             forking: false,
             workspace_operation: false,
             scroll: ScrollState::default(),
@@ -1609,6 +1615,10 @@ enum UiMessage {
         conversation: String,
         result: Result<String, String>,
     },
+    Published {
+        conversation: String,
+        result: Result<String, String>,
+    },
     BranchPublished {
         conversation: String,
         result: Result<(PublishedBranch, Option<String>), String>,
@@ -1641,6 +1651,12 @@ fn spawn<T>(
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishBasePrompt {
+    default_base: String,
+    input: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shortcut {
     keys: &'static str,
@@ -1667,7 +1683,7 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 10] = [
+const PALETTE_COMMANDS: [PaletteCommand; 11] = [
     PaletteCommand {
         label: "New conversation",
         shortcut: Some(Shortcut::new("n", "Ctrl+N", false)),
@@ -1679,6 +1695,12 @@ const PALETTE_COMMANDS: [PaletteCommand; 10] = [
         shortcut: Some(Shortcut::new("l", "Ctrl+L", false)),
         keywords: "load workspace git",
         action: AppAction::Checkout,
+    },
+    PaletteCommand {
+        label: "Publish pull request",
+        shortcut: Some(Shortcut::new("p", "Ctrl+P twice", false)),
+        keywords: "workspace push pr github origin",
+        action: AppAction::Publish,
     },
     PaletteCommand {
         label: "Publish branch",
@@ -2032,6 +2054,10 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
+        if let Some(prompt) = self.selected_mut().publish_base.as_mut() {
+            prompt.input.push_str(text.trim());
+            return;
+        }
         self.selected_mut().composer.insert_paste(text);
     }
 
@@ -2449,6 +2475,7 @@ impl App {
                     .push_info(format!("Model for future turns: {model}"));
             }
             AppAction::From => self.start_from_hash(arguments),
+            AppAction::Publish => self.publish_selected(),
             AppAction::PublishBranch => self.publish_branch_selected(),
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
@@ -2783,6 +2810,37 @@ impl App {
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
                         self.finish_title_generation(index, result);
+                    }
+                }
+                UiMessage::Published {
+                    conversation,
+                    result,
+                } => {
+                    let transport = self.transport();
+                    let user = self.user.clone();
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.publishing = false;
+                        state.local_turn = false;
+                        let refreshed = transport
+                            .as_ref()
+                            .ok()
+                            .and_then(|transport| state.reload(transport, &user));
+                        if refreshed.is_none() {
+                            state.running = false;
+                            state.active_request = None;
+                            state.remote_head = None;
+                        }
+                        match result {
+                            Ok(url) => state.push_info(format!("PR ready: {url}")),
+                            Err(error) => {
+                                state.sidebar_attention =
+                                    Some("PR failed — open for details".to_string());
+                                state.show_command_error_preserving_status(format!(
+                                    "PR failed: {error}"
+                                ));
+                            }
+                        }
                     }
                 }
                 UiMessage::BranchPublished {
@@ -3282,6 +3340,33 @@ impl App {
             self.handle_palette_key(key);
             return;
         }
+        if shortcut == Some(AppAction::Publish) {
+            self.publish_selected();
+            return;
+        }
+        if let Some(prompt) = self.selected_mut().publish_base.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.selected_mut().publish_base = None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.selected_mut().publish_base = None;
+                }
+                KeyCode::Backspace => {
+                    prompt.input.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    prompt.input.clear();
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                {
+                    prompt.input.push(ch);
+                }
+                _ => {}
+            }
+            return;
+        }
         if key.code == KeyCode::Esc && self.selected().reference_notice.is_some() {
             self.selected_mut().reference_notice = None;
             return;
@@ -3543,6 +3628,7 @@ impl App {
                 self.focus = Focus::Conversation;
             }
             AppAction::Checkout => self.load_selected(),
+            AppAction::Publish => self.publish_selected(),
             AppAction::PublishBranch => self.publish_branch_selected(),
             AppAction::Activity => {
                 self.view = if self.view == View::Activity {
@@ -3583,6 +3669,7 @@ impl App {
             AppAction::Archive => self.close_selected(),
             AppAction::SelectionLock => self.selection_locked = !self.selection_locked,
             AppAction::Commands => {
+                self.selected_mut().publish_base = None;
                 self.palette = self.palette.take().is_none().then(CommandPalette::default);
             }
             AppAction::From
@@ -3764,6 +3851,7 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
+        self.selected_mut().publish_base = None;
         self.selected = index;
         let needs_load =
             self.selected().workspaces.is_empty() && self.selected().remote_head.is_some();
@@ -3917,6 +4005,144 @@ impl App {
         }
     }
 
+    fn publish_selected(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().publish_base = None;
+            self.selected_mut()
+                .show_command_error("finish this conversation's operation before publishing it");
+            return;
+        }
+        let workspace = match self.selected().require_selected_workspace() {
+            Ok(workspace) => workspace.name.clone(),
+            Err(error) => {
+                self.selected_mut().publish_base = None;
+                self.selected_mut().show_command_error(error);
+                return;
+            }
+        };
+        let Some(prompt) = self.selected_mut().publish_base.take() else {
+            match remote_default_branch(&self.repo_dir) {
+                Ok(default_base) => {
+                    self.selected_mut().command_error = None;
+                    self.selected_mut().publish_base = Some(PublishBasePrompt {
+                        default_base,
+                        input: String::new(),
+                    });
+                }
+                Err(error) => self.selected_mut().show_command_error(error),
+            }
+            return;
+        };
+        let base = pr_base_branch(if prompt.input.trim().is_empty() {
+            &prompt.default_base
+        } else {
+            &prompt.input
+        })
+        .to_string();
+        let conversation = self.selected().id.clone();
+        let title = self.selected().title.clone();
+        let mut options = self.selected().turn_options.clone();
+        options.workspace = Some(workspace.clone());
+        let state = self.selected_mut();
+        state.publishing = true;
+        state.running = true;
+        state.local_turn = true;
+        state.command_error = None;
+        state.sidebar_attention = None;
+        state.status = format!("fetching origin/{base}");
+        let event_tx = self.tx.clone();
+        let finished_conversation = conversation.clone();
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
+                let status = |text: String| {
+                    let _ = event_tx.send(UiMessage::Turn {
+                        conversation: conversation.clone(),
+                        event: TurnEvent::Status(text),
+                    });
+                };
+                let target = fetch_remote_branch_tip(&base, transport.work_dir())?;
+                let load = conversation_load(transport, &conversation)?
+                    .ok_or_else(|| format!("conversation {conversation:?} disappeared"))?;
+                let head = load
+                    .workspaces
+                    .iter()
+                    .find(|value| value.name == workspace)
+                    .ok_or_else(|| format!("workspace {workspace:?} disappeared"))?;
+                let base_is_ancestor =
+                    remote_base_is_ancestor(&target, &head.head, transport.work_dir())?;
+                if !base_is_ancestor {
+                    status("sending the PR base to the conversation server".to_string());
+                    transport.ensure_pushed(&target)?;
+                }
+                let message = publish_turn_message(&workspace, &target, base_is_ancestor);
+                status("preparing the workspace for publication".to_string());
+                let outcome = run_chat_turn(
+                    transport,
+                    &options,
+                    &conversation,
+                    &message,
+                    None,
+                    None,
+                    |_| {},
+                    |event| {
+                        let _ = event_tx.send(UiMessage::Turn {
+                            conversation: conversation.clone(),
+                            event,
+                        });
+                    },
+                )?;
+                let prepared = conversation_load_at(transport, &conversation, &outcome.commit)?;
+                let _ = event_tx.send(UiMessage::Completed {
+                    conversation: conversation.clone(),
+                    outcome: outcome.clone(),
+                });
+                if outcome.interrupted {
+                    return Err("publication preparation was interrupted".to_string());
+                }
+                let prepared = prepared
+                    .workspaces
+                    .iter()
+                    .find(|value| value.name == workspace)
+                    .ok_or_else(|| {
+                        format!("workspace {workspace:?} disappeared during preparation")
+                    })?;
+                validate_prepared_workspace(&target, &prepared.head, transport.work_dir())?;
+                status(format!("publishing workspace {workspace:?}"));
+                let published = publish_prepared_workspace_branch(
+                    transport,
+                    &conversation,
+                    &workspace,
+                    &prepared.head,
+                )?;
+                if published.status != conversation_protocol::v3::PublicationStatus::Complete {
+                    let diagnostic =
+                        publication_diagnostic(transport, &conversation, &published.publication)?;
+                    return Err(format!(
+                        "branch publication is {:?}: {}",
+                        published.status,
+                        diagnostic
+                            .as_deref()
+                            .unwrap_or("inspect the publication record before retrying")
+                    ));
+                }
+                status("finding or opening the pull request".to_string());
+                find_or_open_workspace_pr(
+                    &conversation,
+                    &title,
+                    &published,
+                    &base,
+                    transport.work_dir(),
+                )
+            },
+            move |result| UiMessage::Published {
+                conversation: finished_conversation,
+                result,
+            },
+        );
+    }
+
     fn publish_branch_selected(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut().show_command_error(
@@ -3956,6 +4182,16 @@ impl App {
             },
         );
     }
+}
+
+fn publish_turn_message(workspace: &str, target: &str, base_is_ancestor: bool) -> String {
+    let preparation = if base_is_ancestor {
+        format!("The selected PR base `{target}` is already an ancestor of this workspace; do not merge it again.")
+    } else {
+        let arguments = serde_json::json!({"workspace": workspace, "theirs": target});
+        format!("First call the existing `merge` tool with these arguments: {arguments}. Resolve every entry in `.caos/conflicts`, then remove `.caos/conflicts`.")
+    };
+    format!("Prepare workspace {workspace:?} for publication. {preparation} Build and test that workspace. Finish only when it is ready to publish.")
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -6816,6 +7052,82 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn publish_base_prompt_preserves_the_draft_and_recovers_from_a_bad_base() {
+        let (repo, remote, tip) = repo_with_default_branch("pr-prompt", "release/next");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let mut conversation = state("talk-1");
+        conversation.workspaces = vec![WorkspaceDiff {
+            name: "docs".to_string(),
+            base_commit: tip.clone(),
+            head: tip,
+            patch: String::new(),
+        }];
+        conversation.selected_workspace = Some("docs".to_string());
+        conversation.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+        let publish = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(publish);
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().default_base,
+            "release/next"
+        );
+        assert!(rendered_screen(&app).contains("origin/release/next (default)"));
+        app.insert_paste(
+            "origin/another
+",
+        );
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().input,
+            "origin/another"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().input,
+            "origin/anothe"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().publish_base.is_none());
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        app.handle_key(publish);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.palette.is_some());
+        assert!(app.selected().publish_base.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(publish);
+        app.insert_paste("origin/missing");
+        app.handle_key(publish);
+        assert!(app.selected().publishing);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.selected().publishing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_messages();
+        }
+        assert!(!app.selected().publishing);
+        assert!(!app.selected().running);
+        assert!(app.selected().publish_base.is_none());
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("no branch"));
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        assert!(app.selected().transcript.is_empty());
+        let prompt = publish_turn_message("docs", &"a".repeat(40), false);
+        assert!(prompt.contains("\"workspace\":\"docs\""));
+        assert!(prompt.contains(".caos/conflicts"));
+        assert!(
+            publish_turn_message("docs", &"a".repeat(40), true).contains("do not merge it again")
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
