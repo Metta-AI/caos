@@ -1,0 +1,16 @@
+[package]
+name = "llm-test-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+conversation-protocol = { path = "DEEP-DEPS/conversation-protocol", features = ["git-cli"] }
+serde_json = "1"
+
+[[bin]]
+name = "llm-test-tool"
+path = "src/main.rs"
+
+[profile.dev]
+debug = false
+strip = true

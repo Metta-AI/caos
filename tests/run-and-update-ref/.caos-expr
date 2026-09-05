@@ -9,4 +9,4 @@
 # `prepare.sh` is gone with it. It existed to make a worker call
 # `prepare-request` on a curried image; this script IS a worker, so it makes
 # that call itself.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --updater:@=DEEP-DEPS/run-and-update-ref --succeed:@=succeed.sh --fail:@=fail.sh
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --updater:@=DEEP-DEPS/run-and-update-ref --tool:@=DEEP-DEPS/llm-test-tool --succeed:@=succeed.sh --fail:@=fail.sh
