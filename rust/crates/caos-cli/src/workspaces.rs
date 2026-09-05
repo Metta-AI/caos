@@ -403,3 +403,121 @@ pub fn update_stack(
     }
     Ok(updated)
 }
+
+/// Import a repository snapshot, preserving its transport URL for Git auth.
+/// Full hashes are pinned attachments; branch names also establish an update base.
+pub fn attach(
+    t: &GitTransport,
+    id: &str,
+    name: &str,
+    repository: &str,
+    revision: Option<&str>,
+) -> Result<String, String> {
+    use conversation_protocol::v3::WorkspaceBase;
+    paths::validate_workspace_name(name)?;
+    let mut config = WorkspaceConfig {
+        repository: Some(repository.to_string()),
+        ..Default::default()
+    };
+    config.validate()?;
+    let reference = match revision {
+        Some(reference) => reference.to_string(),
+        None => default_branch(t, repository)?,
+    };
+    let commit = if let Ok(commit) = oid(&reference, "attachment commit") {
+        GitStore::open(t.work_dir(), Some(repository))?.ensure_local(&commit)?;
+        commit
+    } else {
+        let branch = reference.strip_prefix("refs/heads/").unwrap_or(&reference);
+        let commit = oid(
+            &branch_snapshot(t, repository, branch)?,
+            "attachment commit",
+        )?;
+        config.base = Some(WorkspaceBase::Branch {
+            name: branch.to_string(),
+            commit: commit.clone(),
+        });
+        commit
+    };
+    ensure_code_commit(t, &mut open_store(t)?, &commit)?;
+    reject_reserved_caos(t, commit.as_str(), "attached workspace")?;
+    append_transition(
+        t,
+        id,
+        &refs::head_ref(id)?,
+        "attaching a repository",
+        |store, head| {
+            let view = Conversation::open(store, head)?;
+            if let Some(existing) = view.workspace(name)? {
+                if existing.commit == commit
+                    && existing.initial == commit
+                    && view.workspace_config(name)? == config
+                {
+                    return Ok(Step::Done(head.to_string()));
+                }
+                return Err(format!("workspace {name:?} already exists"));
+            }
+            Ok(Step::MintMany(vec![
+                Transition::WorkspaceCreate {
+                    name: name.to_string(),
+                    commit: commit.clone(),
+                    origin: None,
+                },
+                Transition::WorkspaceConfigure {
+                    name: name.to_string(),
+                    config: config.clone(),
+                },
+            ]))
+        },
+    )
+}
+
+/// Capture only relevant named branch tips, grouped by repository identity.
+/// Agent-created workspaces in an attached repo inherit this request snapshot.
+pub(super) fn snapshot_repository_refs(t: &GitTransport, head: &Oid) -> Result<String, String> {
+    let store = open_store(t)?;
+    let mut repositories: BTreeMap<String, (String, HashSet<String>)> = BTreeMap::new();
+    for config in Conversation::open(&store, head)?
+        .workspace_configs()?
+        .into_values()
+    {
+        let Some(repository) = config.repository else {
+            continue;
+        };
+        let identity = normalize_repository_identity(&repository)?;
+        let (_, branches) = repositories
+            .entry(identity)
+            .or_insert_with(|| (repository, HashSet::new()));
+        branches.extend(MERGE_REF_CANDIDATES.iter().map(|name| name.to_string()));
+        if let Some(conversation_protocol::v3::WorkspaceBase::Branch { name, .. }) = config.base {
+            branches.insert(name);
+        }
+    }
+    let mut snapshots = BTreeMap::new();
+    for (identity, (repository, branches)) in repositories {
+        let output = t.git_capture(&["ls-remote", "--heads", "--", &repository], None)?;
+        let remote = GitStore::open(t.work_dir(), Some(&repository))?;
+        let mut refs = String::new();
+        for line in output.lines() {
+            let Some((hash, reference)) = line.split_once('\t') else {
+                continue;
+            };
+            let Some(name) = reference.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            if !branches.contains(name) {
+                continue;
+            }
+            let commit = oid(hash, "repository ref")?;
+            remote.ensure_local(&commit)?;
+            t.ensure_pushed(hash)?;
+            refs.push_str(&format!(
+                "{name} {hash}
+origin/{name} {hash}
+"
+            ));
+        }
+        snapshots.insert(identity, refs);
+    }
+    serde_json::to_string(&snapshots).map_err(|error| error.to_string())
+}

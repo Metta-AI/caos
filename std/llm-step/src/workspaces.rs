@@ -161,3 +161,94 @@ fn plan(
         action => Err(format!("unknown workspace action {action:?}")),
     }
 }
+
+/// Workspace instructions and schemas apply only to their own repository.
+pub(super) fn repository_context(
+    view: &Conversation<'_>,
+    roots: &[String],
+) -> Result<String, String> {
+    let mut context = String::new();
+    for ((name, _), root) in view.workspaces()?.iter().zip(roots) {
+        let rules = Path::new(root).join("AGENTS.md");
+        if rules.exists() {
+            caos(["get", path(&rules)])?;
+            let text =
+                fs::read_to_string(&rules).map_err(|e| format!("reading {name}/AGENTS.md: {e}"))?;
+            let bounded: String = text.chars().take(64_000).collect();
+            context.push_str(&format!("
+
+Repository instructions for workspace {name:?} only (follow applicable nested AGENTS.md when editing):
+{bounded}"));
+        }
+        let tools = tools::tree_tools(root)?
+            .iter()
+            .map(tools::tree_tool_declaration)
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            context.push_str(&format!(
+                "
+
+Repository tools for workspace {name:?}; invoke using workspace_tool: {}",
+                serde_json::to_string(&tools).map_err(|e| e.to_string())?
+            ));
+        }
+    }
+    Ok(context)
+}
+
+/// Bind other workspaces by content before ToolStart is committed. The input
+/// tree is part of the task's cache key and survives later pointer moves.
+pub(super) fn pin_inputs(
+    state: &mut progress::State,
+    input: &Value,
+) -> Result<Option<String>, String> {
+    let Some(inputs) = input.get("inputs") else {
+        return Ok(None);
+    };
+    let inputs = inputs.as_object().ok_or("bash inputs must be an object")?;
+    let dir = scratch("workspace-inputs")?;
+    for (alias, spec) in inputs {
+        paths::validate_workspace_name(alias)?;
+        let name = spec
+            .as_str()
+            .or_else(|| spec["workspace"].as_str())
+            .ok_or("each input needs a workspace")?;
+        let commit = state
+            .conversation()?
+            .workspace(name)?
+            .ok_or_else(|| format!("no input workspace {name:?}"))?
+            .commit;
+        let (tree, _) = materialize_workspace(state, &commit)?;
+        let item = dir.join(alias);
+        fs::create_dir(&item).map_err(|e| e.to_string())?;
+        link(&tree, item.join("tree"))?;
+        let paths = match spec.get("paths") {
+            None => ".".to_string(),
+            Some(Value::Array(paths)) => {
+                let paths = paths
+                    .iter()
+                    .map(|path| path.as_str().ok_or("input paths must be strings"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for path in &paths {
+                    if *path != "."
+                        && (path.is_empty()
+                            || Path::new(path)
+                                .components()
+                                .any(|part| !matches!(part, std::path::Component::Normal(_))))
+                    {
+                        return Err(format!("invalid input path {path:?}"));
+                    }
+                }
+                paths.join(
+                    "
+",
+                )
+            }
+            _ => return Err("input paths must be an array".into()),
+        };
+        fs::write(item.join("paths"), paths).map_err(|e| e.to_string())?;
+    }
+    let captured = fresh("workspace-inputs");
+    caos(["put", path(&dir), &captured])?;
+    Ok(Some(captured))
+}

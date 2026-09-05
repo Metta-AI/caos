@@ -18,11 +18,11 @@ feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 
 MIXED_CALLS='[
  {"id":"tu_mw","input":{"file-path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
- {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < mix.txt > mix3.txt","paths":["mix.txt"]},"name":"bash","type":"tool_use"},
- {"id":"tu_me","input":{"file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
- {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
- {"id":"tu_mm","input":{"theirs":"feature"},"name":"merge","type":"tool_use"},
  {"id":"tu_create","input":{"action":"create","name":"side","source":"main","stacked":true},"name":"workspaces","type":"tool_use"},
+ {"id":"tu_mb","input":{"workspace":"main","cmd":"tr a-z A-Z < \"$CAOS_INPUTS/side/mix.txt\" > mix3.txt; test ! -w \"$CAOS_INPUTS/side/mix.txt\"","inputs":{"side":{"workspace":"side","paths":["mix.txt"]}},"paths":["mix.txt"]},"name":"bash","type":"tool_use"},
+ {"id":"tu_me","input":{"workspace":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
+ {"id":"tu_mg","input":{"workspace":"main","pattern":"world"},"name":"grep","type":"tool_use"},
+ {"id":"tu_mm","input":{"workspace":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
  {"id":"tu_side","input":{"workspace":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
@@ -90,7 +90,8 @@ side_workspace=$(workspace_commit "$head" side)
 fetch_code "$side_workspace" "fetching the new named workspace"
 [ "$(git show "$side_workspace:side.txt")" = isolated ] || fail "explicit side edit missing"
 if git cat-file -e "$workspace:side.txt" 2>/dev/null; then fail "side edit leaked into main"; fi
-record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$workspace" '.base.kind == "workspace" and .base.name == "main" and .base.commit == $commit' >/dev/null || fail "workspace creation did not pin its source"
+record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$write_output" '.base.kind == "workspace" and .base.name == "main" and .base.commit == $commit' >/dev/null || fail "workspace creation did not pin its source"
+[ "$(git show "$side_workspace:mix.txt")" = hello ] || fail "input snapshot changed with main"
 grep -qF 'side' /tmp/stub/request-2.json || fail "new workspace missing from model context"
 
 pass chat-tools-mixed

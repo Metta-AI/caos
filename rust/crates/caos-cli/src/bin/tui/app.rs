@@ -2077,7 +2077,9 @@ impl App {
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
         if let Some(picker) = &mut self.workspace_picker {
-            if let Some(input) = &mut picker.creating {
+            if let Some(form) = &mut picker.attaching {
+                form.fields[form.selected].push_str(text.trim());
+            } else if let Some(input) = &mut picker.creating {
                 input.push_str(text.trim());
             }
             return;
@@ -2674,6 +2676,26 @@ impl App {
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
             },
+            ["attach", name, repository] | ["attach", name, repository, _] => {
+                let name = (*name).to_string();
+                let repository = (*repository).to_string();
+                let revision = parts.get(3).map(|value| (*value).to_string());
+                self.start_workspace_mutation("attaching repository", move |transport, conversation| {
+                    caos_cli::workspaces::attach(transport, conversation, &name, &repository, revision.as_deref())?;
+                    Ok(format!("Attached {repository} as workspace {name:?}."))
+                });
+            }
+            ["branch", name, branch] => {
+                let name = (*name).to_string();
+                let branch = (*branch).to_string();
+                self.start_workspace_mutation("setting publication branch", move |transport, conversation| {
+                    let load = conversation_load(transport, conversation)?.ok_or("conversation disappeared")?;
+                    let mut config = load.workspaces.into_iter().find(|ws| ws.name == name).ok_or("workspace disappeared")?.config;
+                    config.branch = Some(branch.clone());
+                    caos_cli::workspaces::configure(transport, conversation, &name, config)?;
+                    Ok(format!("Workspace {name:?} will publish to {branch}."))
+                });
+            }
             ["create", name] | ["stack", name] => {
                 let source = match self.selected().require_selected_workspace() {
                     Ok(workspace) => workspace.name.clone(),
@@ -2719,7 +2741,7 @@ impl App {
                 });
             }
             _ => self.selected_mut().show_command_error(
-                "usage: /workspace [use <name>|create <name> [<rev>]|stack <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
+                "usage: /workspace [use <name>|create <name> [<rev>]|attach <name> <repo> [<branch>|<sha>]|branch <name> <branch>|stack <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
             ),
         }
     }

@@ -1766,7 +1766,30 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    if let Some(name) = &picker.creating {
+    if let Some(form) = &picker.attaching {
+        let labels = [
+            "Workspace name",
+            "Repository URL or absolute path",
+            "Branch or full commit (blank: default branch)",
+        ];
+        let mut lines = vec![Line::from("Attach repository"), Line::from("")];
+        for (index, label) in labels.iter().enumerate() {
+            lines.push(Line::styled(
+                format!("{label}: {}", form.fields[index]),
+                Style::default().fg(if index == form.selected {
+                    Color::Cyan
+                } else {
+                    Color::White
+                }),
+            ));
+            lines.push(Line::from(""));
+        }
+        frame.render_widget(Paragraph::new(lines), rows[0]);
+        frame.render_widget(
+            Paragraph::new("Tab/Enter advances   Enter on last field attaches   Esc cancels"),
+            rows[1],
+        );
+    } else if let Some(name) = &picker.creating {
         let source = picker.source.as_deref().unwrap_or("");
         let relationship = if picker.stacked {
             "Dependent change: PR will target the source workspace's branch"
@@ -1854,7 +1877,7 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
         }
         frame.render_widget(
             Paragraph::new(
-                "Up/Down selects   Enter switches   n creates   u updates stack   Esc closes",
+                "Up/Down selects   Enter switches   n creates   a attaches   u updates stack   Esc closes",
             )
             .style(Style::default().fg(Color::DarkGray)),
             rows[1],

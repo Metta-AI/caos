@@ -52,6 +52,7 @@ fn main() -> std::process::ExitCode {
     exit
 }
 
+#[derive(Clone)]
 struct Config {
     api_key: String,
     system: String,
@@ -62,6 +63,7 @@ struct Config {
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     merge_refs: Option<String>,
+    repository_refs: BTreeMap<String, String>,
     model: String,
     base_url: String,
     conversation: String,
@@ -78,6 +80,16 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 }
 
 impl Config {
+    fn for_workspace(&self, view: &Conversation<'_>, name: &str) -> Result<Self, String> {
+        let mut scoped = self.clone();
+        if let Some(repository) = view.workspace_config(name)?.repository {
+            let identity =
+                conversation_protocol::v3::workspaces::normalize_repository_identity(&repository)?;
+            scoped.merge_refs = self.repository_refs.get(&identity).cloned();
+        }
+        Ok(scoped)
+    }
+
     fn read() -> Result<Self, String> {
         let run_and_update_ref_image = if read_arg_opt("subagent")?.is_some() {
             None
@@ -98,6 +110,10 @@ impl Config {
                 .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
             merge_refs: read_arg_opt("merge-refs")?,
+            repository_refs: serde_json::from_str(
+                &read_arg_opt("repository-refs")?.unwrap_or_else(|| "{}".into()),
+            )
+            .map_err(|e| format!("repository refs: {e}"))?,
             model: read_arg("model")?,
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             conversation: read_arg_opt("conversation")?
@@ -272,7 +288,7 @@ fn callback(
             CallSite::at(request, round, &call, &declaration).failed(state, &block, target)?;
             return resume(cfg, state, request, request_head);
         }
-        return launch_evaluated_tool(cfg, state, request, request_head, round, &id, &tool);
+        return launch_evaluated_tool(cfg, state, request, request_head, round, &id);
     }
 
     let record = state
@@ -725,7 +741,7 @@ fn llm_round(
         "max_tokens": MAX_TOKENS,
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
-        "system": format!("{}{}", cfg.system, workspaces::context(&state.conversation()?, cfg.focus_workspace.as_deref())?),
+        "system": format!("{}{}", cfg.system, format!("{}{}", workspaces::context(&state.conversation()?, cfg.focus_workspace.as_deref())?, workspaces::repository_context(&state.conversation()?, workspaces)?)),
         "tools": registry(cfg, workspaces)?,
         "messages": messages,
     });
@@ -1026,7 +1042,19 @@ fn drive_call(
         unreachable!("non-inline code tools cannot target conversation files")
     };
     let (ws, wc) = materialize_workspace(state, &commit)?;
-    match prepare_compute(cfg, call, &ws, &wc, request, round)? {
+    let scoped = cfg.for_workspace(&state.conversation()?, &name)?;
+    let inputs = if call.name == "bash" {
+        match workspaces::pin_inputs(state, &call.input) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                site.fail(state, &error)?;
+                return Ok(true);
+            }
+        }
+    } else {
+        None
+    };
+    match prepare_compute(&scoped, call, &ws, &wc, request, round, inputs.as_deref())? {
         Prepared::Result(block) => {
             site.complete(state, block, Some((name, commit)), None, None)?;
             Ok(true)
@@ -1158,6 +1186,7 @@ enum Prepared {
     Task(Oid),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_compute(
     cfg: &Config,
     call: &Call,
@@ -1165,10 +1194,42 @@ fn prepare_compute(
     wc: &str,
     request: &Oid,
     round: &RoundState,
+    inputs: Option<&str>,
 ) -> Result<Prepared, String> {
     let clean = call_without_workspace(call);
     match call.name.as_str() {
-        "bash" => prepare_bash(cfg, &clean, ws),
+        "bash" => prepare_bash(cfg, &clean, ws, inputs),
+        "workspace_tool" => {
+            let Some(name) = clean["input"]["tool"].as_str() else {
+                return Ok(Prepared::Result(error_block(
+                    &call.id,
+                    "workspace_tool needs tool",
+                )));
+            };
+            let Some(tool) = tools::tree_tool(ws, name)? else {
+                return Ok(Prepared::Result(error_block(
+                    &call.id,
+                    "no such tool in the selected workspace",
+                )));
+            };
+            let nested = json!({"id":call.id,"name":call.name,"input":clean["input"].get("arguments").cloned().unwrap_or_else(|| json!({}))});
+            match tools::tree_tool_args(&nested, &tool) {
+                Err(block) => Ok(Prepared::Result(block)),
+                Ok(bound) => {
+                    launch_tree_evaluation(
+                        &nested,
+                        name,
+                        &bound,
+                        tool.git,
+                        ws,
+                        wc,
+                        request,
+                        round.declaring_round,
+                    )?;
+                    Ok(Prepared::Evaluation)
+                }
+            }
+        }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
@@ -1202,7 +1263,12 @@ fn prepare_compute(
     }
 }
 
-fn prepare_bash(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
+fn prepare_bash(
+    cfg: &Config,
+    call: &Value,
+    ws: &str,
+    inputs: Option<&str>,
+) -> Result<Prepared, String> {
     let Some(cmd) = call["input"]["cmd"].as_str() else {
         return Ok(Prepared::Result(error_block(
             call["id"].as_str().unwrap_or(""),
@@ -1229,6 +1295,9 @@ fn prepare_bash(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     };
     let dir = scratch("toolin")?;
     link(ws, dir.join("tree"))?;
+    if let Some(inputs) = inputs {
+        link(inputs, dir.join("inputs"))?;
+    }
     fs::write(dir.join("cmd"), cmd).map_err(|error| format!("writing cmd: {error}"))?;
     fs::write(dir.join("paths"), paths.join("\n"))
         .map_err(|error| format!("writing paths: {error}"))?;
@@ -1353,7 +1422,10 @@ fn launch_tree_evaluation(
         round,
         id,
         &[
-            ("current-tool", Arg::Lit(name)),
+            (
+                "current-tool",
+                Arg::Lit(call["name"].as_str().unwrap_or(name)),
+            ),
             ("ws", Arg::Path(ws)),
             ("tool-eval", Arg::Lit(name)),
             ("tool-args", Arg::Lit(&serialized)),
@@ -1372,7 +1444,6 @@ fn launch_evaluated_tool(
     request_head: &Oid,
     round: u64,
     id: &str,
-    name: &str,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
     let current = round_state(&state.conversation()?, &record)?;
@@ -1388,11 +1459,13 @@ fn launch_evaluated_tool(
     let target = resolve_target(&state.conversation()?, &call)?;
     let Target::Workspace {
         name: workspace_name,
-        commit,
+        commit: _,
     } = target
     else {
         return Err("tree tool unexpectedly targeted conversation files".to_string());
     };
+    let commit = Oid::parse(&cas_hash(&arg("wc"))?, "evaluated tool workspace")?;
+    let scoped = cfg.for_workspace(&state.conversation()?, &workspace_name)?;
     let (ws, wc) = materialize_workspace(state, &commit)?;
     let tool_tree = cas_hash(&arg("result"))?;
     let raw = read_arg("tool-args")?;
@@ -1411,7 +1484,7 @@ fn launch_evaluated_tool(
         .collect();
     if git {
         args.push(("wc", Arg::Path(&wc)));
-        if let Some(refs) = cfg.merge_refs.as_deref() {
+        if let Some(refs) = scoped.merge_refs.as_deref() {
             args.push(("refs", Arg::Lit(refs)));
         }
     }
@@ -1422,7 +1495,7 @@ fn launch_evaluated_tool(
         request: request.clone(),
         round,
         id: id.to_string(),
-        name: name.to_string(),
+        name: call.name.clone(),
         declaration_message: current.declaration_message,
         workspace_name: Some(workspace_name),
         input_workspace: Some(commit),
@@ -2895,10 +2968,21 @@ fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
             }
         }
     }
-    let mut dynamic_names = HashSet::new();
-    for workspace in workspaces {
+    registry.push(json!({
+        "name":"workspace_tool",
+        "description":"Run a repository-defined tool from exactly one workspace. Its schema is listed in that workspace's context. Built-in tools keep their usual names.",
+        "input_schema":{"type":"object","properties":{
+            "workspace":{"type":"string"},"tool":{"type":"string"},"arguments":{"type":"object"}
+        },"required":["workspace","tool"]}
+    }));
+    // Preserve short names for a sole workspace, except built-in name collisions.
+    if let [workspace] = workspaces {
+        let mut names: HashSet<String> = registry
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect();
         for tool in tools::tree_tools(workspace)? {
-            if dynamic_names.insert(tool.name.clone()) {
+            if names.insert(tool.name.clone()) {
                 registry.push(with_workspace(tools::tree_tool_declaration(&tool)));
             }
         }
@@ -2940,6 +3024,7 @@ fn bash_tool() -> Value {
             "type": "object",
             "properties": {
                 "cmd": {"type":"string", "description":"The shell command to run."},
+                "inputs": {"type":"object","description":"Read-only snapshots of other workspaces, exposed as $CAOS_INPUTS/<alias>. Values are workspace names, or {workspace: name, paths: [relative paths]} to load only selected paths. All snapshots are pinned when the tool starts; only the target workspace is writable."},
                 "paths": {"type":"array", "items":{"type":"string"}, "description":"Workspace-relative paths the command reads or modifies; only these are materialized into the sandbox."}
             },
             "required": ["cmd"]

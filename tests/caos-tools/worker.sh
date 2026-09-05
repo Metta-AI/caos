@@ -87,7 +87,7 @@ stage "script the stub LLM (edit; bad call; dead sub-run; good call; end)"
 # All calls share one response and run in order. The missing arg must be
 # answered in place, and the dead sub-run must preserve the bash-edited
 # workspace, so the final valid hello call can still run the v2 script.
-R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{},"name":"hello","type":"tool_use"},{"id":"toolu_03","input":{},"name":"boom","type":"tool_use"},{"id":"toolu_04","input":{"word":"banana","suffix":"-split"},"name":"hello","type":"tool_use"}]'
+R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{},"name":"hello","type":"tool_use"},{"id":"toolu_03","input":{},"name":"boom","type":"tool_use"},{"id":"toolu_04","input":{"workspace":"main","tool":"hello","arguments":{"word":"banana","suffix":"-split"}},"name":"workspace_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \

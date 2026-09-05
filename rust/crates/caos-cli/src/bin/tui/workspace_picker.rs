@@ -7,6 +7,13 @@ pub(super) struct WorkspacePicker {
     pub creating: Option<String>,
     pub source: Option<String>,
     pub stacked: bool,
+    pub attaching: Option<AttachmentForm>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct AttachmentForm {
+    pub fields: [String; 3],
+    pub selected: usize,
 }
 
 impl App {
@@ -22,6 +29,7 @@ impl App {
             creating: None,
             source: None,
             stacked: false,
+            attaching: None,
         });
         self.palette = None;
     }
@@ -35,7 +43,42 @@ impl App {
         {
             return;
         }
-        if let Some(input) = picker.creating.as_mut() {
+        if let Some(form) = picker.attaching.as_mut() {
+            match key.code {
+                KeyCode::Tab => form.selected = (form.selected + 1) % 3,
+                KeyCode::BackTab => form.selected = (form.selected + 2) % 3,
+                KeyCode::Enter if form.selected < 2 => form.selected += 1,
+                KeyCode::Enter => {
+                    let [name, repository, reference] =
+                        form.fields.clone().map(|value| value.trim().to_string());
+                    self.start_workspace_mutation(
+                        "attaching repository",
+                        move |transport, conversation| {
+                            caos_cli::workspaces::attach(
+                                transport,
+                                conversation,
+                                &name,
+                                &repository,
+                                (!reference.is_empty()).then_some(reference.as_str()),
+                            )?;
+                            Ok(format!("Attached {repository} as workspace {name:?}."))
+                        },
+                    );
+                    return;
+                }
+                KeyCode::Backspace => {
+                    form.fields[form.selected].pop();
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                {
+                    form.fields[form.selected].push(ch)
+                }
+                _ => {}
+            }
+        } else if let Some(input) = picker.creating.as_mut() {
             match key.code {
                 KeyCode::Enter => {
                     let name = input.trim().to_string();
@@ -100,6 +143,7 @@ impl App {
                     self.update_selected_stack(name);
                     return;
                 }
+                KeyCode::Char('a') => picker.attaching = Some(AttachmentForm::default()),
                 KeyCode::Char('n') => {
                     if let Some(ws) = self.selected().workspaces.get(picker.selected) {
                         picker.source = Some(ws.name.clone());
