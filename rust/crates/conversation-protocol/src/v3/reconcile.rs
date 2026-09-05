@@ -49,12 +49,6 @@ pub fn reconcile(
             candidate: None,
         });
     }
-    if ops.tree_of(proposal)? == ops.tree_of(current)? {
-        return Ok(WorkspaceResolution::AlreadyApplied {
-            current: current.clone(),
-            candidate: Some(proposal.clone()),
-        });
-    }
     if current == base || (ops.is_ancestor(base, current)? && ops.is_ancestor(current, proposal)?) {
         return Ok(WorkspaceResolution::Direct {
             current: current.clone(),
@@ -258,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_equal_unreachable_proposal_is_already_applied_with_candidate() {
+    fn tree_equal_unreachable_proposal_preserves_both_histories() {
         let base = oid('a');
         let proposal = oid('b');
         let current = oid('c');
@@ -267,13 +261,13 @@ mod tests {
         ops.add(&base, &oid('0'), &[]);
         ops.add(&proposal, &tree, &[&base]);
         ops.add(&current, &tree, &[&base]);
-        assert_eq!(
-            reconcile(&mut ops, &base, &proposal, Some(&current), &signature()).unwrap(),
-            WorkspaceResolution::AlreadyApplied {
-                current,
-                candidate: Some(proposal),
-            }
-        );
+        let output =
+            match reconcile(&mut ops, &base, &proposal, Some(&current), &signature()).unwrap() {
+                WorkspaceResolution::Merged { output, .. } => output,
+                other => panic!("expected merge, got {other:?}"),
+            };
+        assert!(ops.is_ancestor(&current, &output).unwrap());
+        assert!(ops.is_ancestor(&proposal, &output).unwrap());
     }
 
     #[test]

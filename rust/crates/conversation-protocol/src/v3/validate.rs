@@ -77,6 +77,9 @@ pub fn validate_spine(
 
 fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Validated, String> {
     let info = store.read_commit(commit).map_err(String::from)?;
+    if !info.extra_headers.is_empty() {
+        return Err("conversation commits must not have extra headers".to_string());
+    }
     if info.parents.len() != 1 {
         return Err("exactly one parent required".to_string());
     }
@@ -710,6 +713,7 @@ mod tests {
                 parents,
                 author: signature.clone(),
                 committer: signature,
+                extra_headers: Vec::new(),
                 message,
             })
             .unwrap()
@@ -884,8 +888,12 @@ mod tests {
     }
 
     #[test]
-    fn json_kind_message_is_malformed() {
+    fn non_protocol_headers_and_messages_are_malformed() {
         let (mut store, _, source) = setup();
+        let mut signed = store.read_commit(&source).unwrap();
+        signed.extra_headers = b"gpgsig signature\n continuation\n".to_vec();
+        let bad = store.write_commit(&signed).unwrap();
+        assert_reason(&store, &bad, "must not have extra headers");
         let tree = store.read_commit(&source).unwrap().tree;
         let bad = write_commit(
             &mut store,
