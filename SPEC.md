@@ -419,26 +419,23 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
 # Merging and conflict resolution
 
-An agent resolves a git merge from inside a conversation. The obstacle is
-that git's "resolve in the working tree, then `git add` to the index, then
-`git commit`" ceremony has no place to live: there is no index, and a
-conversation advances by whole commits, not staged files. Caos collapses the
-ceremony — resolving a conflict is just producing the next commit — and
-provides two tools:
+An agent merges into a selected workspace using
+`merge --theirs=<ref|hash>`, then resolves conflicts by producing ordinary
+workspace commits. There is no index or staging step in the worker.
 
-- `merge --theirs=<ref|hash>` — three-way merge the given commit into the
-  conversation head. A git-bearing SUB-RUN, not in-process (below).
+[Chat v3](design/chat.md) defines the conversation and workspace histories,
+their refs, reconciliation, and publication. Conversation commits hold
+protocol state; workspace commits hold code. They are connected by hashes
+in conversation records, never by parent edges.
 
-`read`/`ls` default to the current workspace but accept a `root` — a commit,
-tree, or blob hash — to read/list as of another revision (below). A bare blob
-`root` with no path reads that object directly (what a standalone `read-oid`
-once did).
+`read`/`ls` default to the selected workspace and accept a `root` hash to
+inspect another revision or a conflict stage (below).
 
 ## Tools thread a commit, not a tree
 
 To let `merge` record `theirs` as an ancestor, a tool's unit of work is a
-COMMIT, not a bare tree: the step loop threads a workspace commit through the
-call queue, and every tool is `commit -> (commit, result)`.
+COMMIT, not a bare tree: workspace tools consume the selected workspace
+commit and return a proposal commit and a result.
 
 - **Read-only tools** (`read`, `ls`, `grep`) return the input
   commit UNCHANGED — no new object, no no-op commit.
@@ -448,26 +445,19 @@ call queue, and every tool is `commit -> (commit, result)`.
   [input commit, theirs])` — the only tool that fills a second parent, but
   otherwise an ordinary tool with the ordinary signature.
 
-Reachability does the rest. A merge commit `M` carries both its parents, so
-anyone who has `M` has `ours` and `theirs`; the sole requirement is that `M`
-be reachable from the conversation head. That is automatic: the step commit a
-round mints hangs the round's FINAL workspace commit off itself (as a second
-parent — the first-parent spine and the transcript walk are untouched), and
-that workspace commit chains back through the round's per-mutation commits —
-`M` among them — to the head. So `theirs` is wired in with no note, no
-sidecar, no turn-ending special case; `merge` is not privileged, it just
-returns the commit it built.
+A tool's proposal is reconciled against the selected workspace pointer using
+the rules in [Chat v3](design/chat.md). Accepted workspace commits
+preserve the mutation and merge ancestry. Equal trees do not make that
+ancestry redundant. Read-only proposals leave the workspace unchanged.
 
-This makes commits per MUTATION (reads stay free). Publication preserves these
-commits along with the conversation-event spine, so the PR branch records the
-prompts, tool calls, results, and workspace mutations that produced its tip.
-Caching is unaffected — sub-runs key on their input TREE, not on commits.
+Publication preserves the selected workspace's code history. Conversation
+records (prompts, tool calls, and results) stay on the conversation branch;
+publishing them is deferred.
 
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the
-  workspace commit threaded into the call — the head plus whatever this turn
-  already did, so no earlier edit is cut out.
+  selected workspace commit at dispatch, including earlier accepted edits.
 - The merge is index-free and worktree-free: `git merge-tree --write-tree
   <ours> <theirs>` is a pure `(commit, commit) -> (tree, conflict report)`,
   which memoizes like any other job and needs no materialized working copy
@@ -545,29 +535,14 @@ assertion, trusted exactly as git trusts `add` (no re-scan). An empty
 `.caos/conflicts` means done; the agent need not remove the file (inline tools
 have no delete — `bash rm` does, for a clean mid-conversation checkout).
 
-`.caos/conflicts` is workspace state: it lives in the workspace tree `ws` the
-tools thread, so it rides into `M` and every mutation commit on top of it for
-free — it is part of `ws` like any file. This does NOT collide with
-`.caos/step.json`, which shares the `.caos/` name but never the same place:
-step.json exists ONLY in a step-commit tree (`mint_step` injects it), never in
-`ws`; conflicts exists ONLY in `ws`. They meet in one `.caos/` directory only
-inside a step tree, and the harness tells them apart by FILENAME. So four small
-local rules, no "persistence exemption":
+`.caos/conflicts` lives in the workspace tree, alongside the code. Inline
+file tools can edit it; compute tools receive it with the rest of the
+workspace. Conversation protocol files live in a separate tree, so no
+step metadata needs to be injected or preserved in the workspace.
 
-- **Inline tools** refuse `.caos/step.json` specifically, not all of `.caos/`,
-  so `.caos/conflicts` is editable like any file (deleting a path's rows is an
-  `edit`).
-- **`mint_step`** PRESERVES an existing `.caos/` when it injects `step.json`
-  (symlinking `.caos/conflicts` in alongside), rather than assuming `.caos/` is
-  absent.
-- **Compute tools** (`bash`/build/test) see `ws` as-is, `.caos/conflicts`
-  included — it is workspace state. (A build run mid-merge keys on a tree that
-  still carries the file, so it won't cache-hit the post-resolution build;
-  negligible, and only during resolution.)
-- **Publish** (the tui's PR flow) requires the conversation TIP to have no
-  `.caos/` entry after the guard below. Earlier merge commits remain in the
-  published history with their conflict scaffolding, but the PR's final tree
-  cannot carry even a leftover empty `.caos/conflicts`.
+Publication rejects any `.caos` entry in the final workspace tree, including
+an empty `.caos/conflicts`. Earlier workspace commits retain their conflict
+scaffolding.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
@@ -597,23 +572,14 @@ revision (and made the history tools' hashes readable the same way).
   remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
   actually leaves the conversation.
 
-## Conversation branch exchange
+## Publication
 
-The TUI publishes a complete conversation by pointing
-`refs/heads/caos/<conversation-id>` directly at its validated event head. A
-branch-only publication does not open a PR or run PR-base preparation; it is a
-sharing mechanism for the transcript and workspace history already present.
+The [Chat v3 publication flow](design/chat.md) pushes the selected
+workspace commit to `refs/heads/caos/<conversation-id>` on `origin`.
+`Ctrl+P` prepares it against the selected base and opens or reuses a PR;
+`/publish-branch` pushes the branch without preparation or PR creation.
+Neither exports the conversation state or imports conversations from GitHub.
 
-Loading `<remote>/caos/<conversation-id>` or a GitHub PR whose head has that
-shape imports the exact first-parent event spine into the canonical CAOS
-conversation ref and indexes it for the current user. The imported head may
-create an absent conversation or fast-forward an existing copy. A stale import
-leaves a newer canonical head in place, and divergent history under the same ID
-is refused rather than force-pushed.
-
-## Caveat
-
-Per-mutation commits mean real, sometimes marker-bearing, non-building commits
-land in the published conversation history. Only the validated branch tip is
-promised to be ready for review; an intermediate commit (a mid-resolution merge
-commit especially) is NOT safe to cherry-pick or check out in isolation.
+Per-mutation commits remain in the published workspace history. Only the
+prepared PR tip is checked for unresolved conflicts and reserved state;
+intermediate commits may contain conflict markers or fail to build.

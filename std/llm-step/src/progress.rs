@@ -366,43 +366,7 @@ impl<S: RefStore> State<S> {
             .store
             .push_ref_value(&self.refname, Some(expected), Some(&candidate));
         crate::timing::phase(&format!("push {}", transition.kind().as_str()));
-        if pushed.is_ok() {
-            self.head = candidate.clone();
-            self.known_valid.insert(candidate.clone());
-            self.fresh_after_append = true;
-            return Ok(TryAppend::Appended(Appended {
-                commit: candidate.clone(),
-                head: candidate,
-                ordinal,
-            }));
-        }
-
-        let push_error = pushed.unwrap_err();
-        let observed = self
-            .store
-            .fetch_ref_value(&self.refname)
-            .map_err(|read_error| {
-                format!(
-                    "pushing {} failed ({push_error}); rereading it also failed: {read_error}",
-                    self.refname
-                )
-            })?
-            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
-        self.head = observed.clone();
-        self.fresh_after_append = false;
-        self.validate()?;
-        if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
-            return Ok(TryAppend::Appended(Appended {
-                commit: candidate,
-                head: observed,
-                ordinal,
-            }));
-        }
-        if &observed != expected {
-            Ok(TryAppend::HeadChanged(observed))
-        } else {
-            Err(push_error)
-        }
+        self.finish_append(expected, candidate, ordinal, pushed)
     }
 
     pub fn try_append_pair_at(
@@ -451,14 +415,29 @@ impl<S: RefStore> State<S> {
             second.kind().as_str()
         ));
         if pushed.is_ok() {
-            self.head = candidate.clone();
             self.known_valid.insert(first_candidate);
+        }
+        self.finish_append(expected, candidate, ordinal.or(second_ordinal), pushed)
+    }
+
+    // A failed response is ambiguous: the push may have landed, and another
+    // writer may already have advanced past it. Single and paired appends use
+    // the same reread, validation, and ancestry check before retrying.
+    fn finish_append(
+        &mut self,
+        expected: &Oid,
+        candidate: Oid,
+        ordinal: Option<u64>,
+        pushed: Result<(), String>,
+    ) -> Result<TryAppend, String> {
+        if pushed.is_ok() {
+            self.head = candidate.clone();
             self.known_valid.insert(candidate.clone());
             self.fresh_after_append = true;
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate.clone(),
                 head: candidate,
-                ordinal: ordinal.or(second_ordinal),
+                ordinal,
             }));
         }
 
@@ -480,7 +459,7 @@ impl<S: RefStore> State<S> {
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate,
                 head: observed,
-                ordinal: ordinal.or(second_ordinal),
+                ordinal,
             }));
         }
         if &observed != expected {
@@ -619,6 +598,7 @@ mod tests {
         objects: MemoryStore,
         head: Oid,
         race_once: bool,
+        lost_ack: bool,
         pushes: usize,
     }
 
@@ -649,6 +629,16 @@ mod tests {
                 return Err("stale expected head".to_string());
             }
             self.head = new.cloned().ok_or("test ref deletion is unsupported")?;
+            if self.lost_ack {
+                self.head = append_object(
+                    &mut self.objects,
+                    &self.head,
+                    Transition::TitleSet {
+                        title: "concurrent title".to_string(),
+                    },
+                )?;
+                return Err("simulated lost push acknowledgement".to_string());
+            }
             Ok(())
         }
     }
@@ -711,6 +701,7 @@ mod tests {
             objects,
             head: root.clone(),
             race_once: true,
+            lost_ack: true,
             pushes: 0,
         };
         let mut state = State::from_store(
@@ -741,49 +732,53 @@ mod tests {
 
     #[test]
     fn append_pair_mints_two_commits_with_one_push() {
-        let mut objects = MemoryStore::new();
-        let root = root(&mut objects).unwrap();
-        let store = RacingStore {
-            objects,
-            head: root.clone(),
-            race_once: false,
-            pushes: 0,
-        };
-        let mut state = State::from_store(
-            store,
-            "refs/caos/v3/conversations/conversation/head".to_string(),
-            root.clone(),
-        )
-        .unwrap();
-
-        let appended = state
-            .try_append_pair_at(
-                &root,
-                Transition::MessageAppend {
-                    entry: entry("11111111111111111111111111111111", "first"),
-                    payloads: Vec::new(),
-                },
-                Transition::MessageAppend {
-                    entry: entry("22222222222222222222222222222222", "second"),
-                    payloads: Vec::new(),
-                },
+        for lost_ack in [false, true] {
+            let mut objects = MemoryStore::new();
+            let root = root(&mut objects).unwrap();
+            let store = RacingStore {
+                objects,
+                head: root.clone(),
+                race_once: false,
+                lost_ack,
+                pushes: 0,
+            };
+            let mut state = State::from_store(
+                store,
+                "refs/caos/v3/conversations/conversation/head".to_string(),
+                root.clone(),
             )
             .unwrap();
-        let TryAppend::Appended(appended) = appended else {
-            panic!("pair append lost an uncontended race");
-        };
 
-        assert_eq!(state.store().pushes, 1);
-        assert_eq!(appended.commit, *state.head());
-        assert_eq!(appended.ordinal, Some(0));
-        let info = state.store().read_commit(state.head()).unwrap();
-        let first = info.parents.first().expect("terminal parent");
-        assert_eq!(
-            state.store().read_commit(first).unwrap().parents,
-            vec![root]
-        );
-        assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
-        assert!(state.take_fresh_after_append());
-        assert!(!state.take_fresh_after_append());
+            let appended = state
+                .try_append_pair_at(
+                    &root,
+                    Transition::MessageAppend {
+                        entry: entry("11111111111111111111111111111111", "first"),
+                        payloads: Vec::new(),
+                    },
+                    Transition::MessageAppend {
+                        entry: entry("22222222222222222222222222222222", "second"),
+                        payloads: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let TryAppend::Appended(appended) = appended else {
+                panic!("pair append lost an uncontended race");
+            };
+
+            assert_eq!(state.store().pushes, 1);
+            assert_eq!(appended.head, *state.head());
+            assert_eq!(appended.commit == *state.head(), !lost_ack);
+            assert_eq!(appended.ordinal, Some(0));
+            let info = state.store().read_commit(&appended.commit).unwrap();
+            let first = info.parents.first().expect("terminal parent");
+            assert_eq!(
+                state.store().read_commit(first).unwrap().parents,
+                vec![root]
+            );
+            assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
+            assert_eq!(state.take_fresh_after_append(), !lost_ack);
+            assert!(!state.take_fresh_after_append());
+        }
     }
 }

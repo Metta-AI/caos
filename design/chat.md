@@ -29,7 +29,9 @@ Invariants:
    kept alive by a parent edge; gc protection is not built (the server
    collects nothing yet).
 4. `W` and `P` are code roles: no `G3` ancestry, never parsed as
-   conversation trees. Ordinary code commits need no format conversion.
+   conversation trees. Ordinary code commits need no format conversion;
+   their extra Git headers (including signatures) are preserved. Conversation
+   commits have only tree, parent, author, and committer headers.
    The host currently rejects workspace inputs containing reserved `.caos`
    entries other than `.caos/conflicts`; publication rejects any `.caos`
    entry. These are host restrictions in addition to the protocol's records.
@@ -133,13 +135,18 @@ Otherwise the proposal must descend from its declared base, and the
 following cases are tried in order:
 
 - Already applied: the proposal equals its base or the current commit,
-  is an ancestor of the current commit, or has the same tree as current.
+  or is an ancestor of the current commit.
 - Direct: current equals the base, or current descends from the base and
   the proposal descends from current.
 - Merged: a three-way merge using the declared base succeeds; mint a
   commit with current and proposal as its two parents.
 - Conflict: record the candidate and any conflicting paths, leaving the
   workspace pointer unchanged.
+
+Tree equality alone does not mean already applied: a commit can add merge
+ancestry without changing any files. Such proposals still advance or merge
+according to the table. Readers continue to accept older already-applied
+records with a retained candidate.
 
 The same table serves dispatched tool proposals, subagent application,
 and the host's manual tree update. `/update-tree` commits outstanding local
