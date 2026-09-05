@@ -15,33 +15,29 @@
 # Written for `set -euo pipefail`: no `[ … ] && …` tails, grep no-match guarded.
 set -euo pipefail
 
-_gh_n=0
-_fresh() { _gh_n=$((_gh_n + 1)); printf '/cas/gh-%s' "$_gh_n"; }
-
-declare -A _OBJ
-
 githist_init() {
   if ! caos get /cas/args/wc >/dev/null 2>&1; then
     echo "githist: no workspace commit available" >&2
     return 1
   fi
   WC=$(caos hash /cas/args/wc)
-  _OBJ[$WC]=/cas/args/wc
   REFS=""
   if caos get /cas/args/refs >/dev/null 2>&1; then REFS=$(cat /cas/args/refs); fi
 }
 
+# Callers use command substitutions, so shell-variable cache updates disappear.
+# Cache by object hash on disk; every subprocess then sees the same materialization.
 obj() {
-  local h=$1
-  if [ -z "${_OBJ[$h]:-}" ]; then
-    local p; p=$(_fresh)
-    if ! caos get-hash "$h" "$p" >/dev/null 2>&1; then
-      echo "object not found on this server: $h" >&2
+  local h=$1 p
+  if [ "$h" = "$WC" ]; then printf '%s' /cas/args/wc; return 0; fi
+  p="/cas/gh-object-$h"
+  if [ ! -e "$p" ]; then
+    if ! caos get-hash "$h" "$p" >/dev/null; then
+      echo "unable to fetch object: $h" >&2
       return 1
     fi
-    _OBJ[$h]=$p
   fi
-  printf '%s' "${_OBJ[$h]}"
+  printf '%s' "$p"
 }
 
 obj_commit() {
@@ -67,7 +63,16 @@ commit_parents() {
   done < "$p"
 }
 
-commit_first_parent() { commit_parents "$1" | head -n1; }
+# Drain the producer: head -n1 can give it SIGPIPE under pipefail, especially
+# for a long commit message. The selected line is still all we return.
+first_line() {
+  local line
+  IFS= read -r line || true
+  printf '%s\n' "$line"
+  cat >/dev/null
+}
+
+commit_first_parent() { commit_parents "$1" | first_line; }
 
 commit_message() {
   local p inbody=0 line; p=$(obj_commit "$1") || return 1
@@ -77,7 +82,7 @@ commit_message() {
   done < "$p"
 }
 
-commit_subject() { commit_message "$1" | head -n1; }
+commit_subject() { commit_message "$1" | first_line; }
 
 # "name<TAB>unixts" from the author line (`author <name> <email> <ts> <tz>`).
 commit_author_date() {
@@ -137,19 +142,18 @@ resolve_rev() {
 checkout_tree() {
   local commit=$1 sub=${2:-} th dst
   th=$(commit_tree "$commit") || return 1
-  dst=$(_fresh)
-  caos get-hash "$th" "$dst" >/dev/null 2>&1 || { echo "tree not found: $th" >&2; return 1; }
+  dst=$(obj "$th") || return 1
   local target=$dst comp
   if [ -n "$sub" ]; then
     local IFS=/
     for comp in $sub; do
       if [ -z "$comp" ] || [ "$comp" = . ]; then continue; fi
-      caos get "$target" >/dev/null 2>&1 || true
+      caos get "$target" >/dev/null || return 1
       if [ ! -e "$target/$comp" ]; then echo "no such path in $commit: $sub" >&2; return 1; fi
       target="$target/$comp"
     done
   fi
-  caos get -r "$target" >/dev/null 2>&1 || true
+  caos get -r "$target" >/dev/null || return 1
   printf '%s' "$target"
 }
 
@@ -157,21 +161,17 @@ checkout_tree() {
 path_oid() {
   local commit=$1 path=$2 th dst target comp
   th=$(commit_tree "$commit") || return 1
-  dst=$(_fresh)
-  caos get-hash "$th" "$dst" >/dev/null 2>&1 || return 1
+  dst=$(obj "$th") || return 1
   target=$dst
   local IFS=/
   for comp in $path; do
     if [ -z "$comp" ] || [ "$comp" = . ]; then continue; fi
-    caos get "$target" >/dev/null 2>&1 || true
+    caos get "$target" >/dev/null || return 1
     if [ ! -e "$target/$comp" ]; then printf ''; return 0; fi
     target="$target/$comp"
   done
-  caos hash "$target" 2>/dev/null || printf ''
+  caos hash "$target"
 }
-
-_tmp_n=0
-_fresh_tmp() { _tmp_n=$((_tmp_n + 1)); mkdir -p /tmp/gh; printf '/tmp/gh/f-%s' "$_tmp_n"; }
 
 # Unified diff between two revisions, optionally scoped to a path. The temp
 # checkout roots are rewritten to a/b so the headers read like git's.
@@ -179,7 +179,7 @@ diff_revs() {
   local from=$1 to=$2 sub=${3:-} A B raw rc line
   A=$(checkout_tree "$from" "$sub") || return 1
   B=$(checkout_tree "$to" "$sub") || return 1
-  raw=$(_fresh_tmp)
+  raw=$(mktemp /tmp/gh-diff.XXXXXXXXXX)
   if diff -ruN "$A" "$B" > "$raw"; then rc=0; else rc=$?; fi
   if [ "$rc" -gt 1 ]; then echo "diff failed (rc=$rc)" >&2; return 1; fi
   while IFS= read -r line; do

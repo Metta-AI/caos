@@ -21,7 +21,9 @@ MIXED_CALLS='[
  {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < mix.txt > mix3.txt","paths":["mix.txt"]},"name":"bash","type":"tool_use"},
  {"id":"tu_me","input":{"file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
- {"id":"tu_mm","input":{"theirs":"feature"},"name":"merge","type":"tool_use"}]'
+ {"id":"tu_mm","input":{"theirs":"feature"},"name":"merge","type":"tool_use"},
+ {"id":"tu_ml","input":{"count":"10"},"name":"log","type":"tool_use"},
+ {"id":"tu_md","input":{},"name":"diff","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
@@ -30,7 +32,10 @@ printf '%s\n' \
   > /tmp/stub/response-2.json
 start_stub /tmp/stub
 
-new_llm_conversation tools-mixed "$STUB_PORT" "$ws"
+# A long commit body also exercises log's subject extraction under pipefail.
+history_message=$(printf 'history fixture\n'; printf 'body line\n%.0s' {1..20000})
+history_base=$(mint_commit /cas/history-base "$ws" "$history_message")
+new_llm_conversation tools-mixed "$STUB_PORT" - "You are a coding agent." "$history_base"
 feature=$(mint_commit /cas/feature "$feature_tree" feature "$base")
 fetch_code "$feature" "fetching the feature commit"
 git push -q caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
@@ -55,7 +60,7 @@ write_output=$(jq -r 'select(.id == "tu_mw") | .workspace_resolution.output' \
   /tmp/mixed-tools.jsonl)
 assert_oid "$write_output" "inline write workspace"
 jq -s -e --arg input "$write_output" '
-  (map(.id) | sort) == (["tu_mw","tu_mb","tu_me","tu_mg","tu_mm"] | sort) and
+  (map(.id) | sort) == (["tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_ml","tu_md"] | sort) and
   (map(select(.id == "tu_mb"))[0] |
     .status == "complete" and .task != null and
     .input_workspace == $input and .workspace_resolution.kind == "direct") and
@@ -76,12 +81,18 @@ while read -r parent_oid parent_kind; do
 done < /tmp/mixed.parents
 [ "$start_found" -eq 1 ] || fail "tu_mb tool.start is absent from the spine"
 
-sequence=$(grep -o '"tool_use_id":"tu_m[wbegm]"' /tmp/stub/request-2.json \
-  | grep -o 'tu_m[wbegm]' | paste -sd,)
-[ "$sequence" = "tu_mw,tu_mb,tu_me,tu_mg,tu_mm" ] \
+sequence=$(grep -o '"tool_use_id":"tu_m[wbegmld]"' /tmp/stub/request-2.json \
+  | grep -o 'tu_m[wbegmld]' | paste -sd,)
+[ "$sequence" = "tu_mw,tu_mb,tu_me,tu_mg,tu_mm,tu_ml,tu_md" ] \
   || fail "results missing or misordered: $sequence"
 grep -qF 'mix.txt:1:world' /tmp/stub/request-2.json \
   || fail "grep did not report the post-edit content to the model"
+jq -e '[.messages[].content[]? | select(.type == "tool_result" and (.tool_use_id == "tu_ml" or .tool_use_id == "tu_md"))] | length == 2 and all(.is_error != true)' \
+  /tmp/stub/request-2.json >/dev/null || fail "history tools failed after merge"
+grep -qF 'history fixture' /tmp/stub/request-2.json \
+  || fail "history log did not reach the initial commit"
+grep -qF '+merged' /tmp/stub/request-2.json \
+  || fail "history diff did not report the merge change"
 [ ! -f /tmp/stub/request-3.json ] || fail "unexpected extra model round"
 
 pass chat-tools-mixed

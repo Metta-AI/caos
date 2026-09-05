@@ -24,7 +24,7 @@ const LOG: &str = include_str!("githist/log.sh");
 const SHOW: &str = include_str!("githist/show.sh");
 const DIFF: &str = include_str!("githist/diff.sh");
 
-const LOG_HELP: &str = "Show the workspace's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
+const LOG_HELP: &str = "Show the workspace's commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
 @param [rev] Where to start (default HEAD, the current workspace). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^.
 @param [path] Only show commits that changed this workspace-relative path.
 @param [count] Maximum number of commits to show (default 20).
@@ -33,7 +33,7 @@ const SHOW_HELP: &str = "Show one commit: its hash, parents, author, full messag
 @param [rev] The commit to show (default HEAD, the current workspace). A commit hash, a snapshot ref, or HEAD~N / ref^.
 @param [path] Restrict the shown diff to this workspace-relative path.
 @git";
-const DIFF_HELP: &str = "Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.
+const DIFF_HELP: &str = "Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest workspace commit changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.
 @param [from] The base revision (default HEAD~1, the commit before the workspace).
 @param [to] The revision to compare against the base (default HEAD, the current workspace).
 @param [path] Restrict the diff to this workspace-relative path.
@@ -91,7 +91,7 @@ mod tests {
         let expected = json!([
             {
                 "name": "log",
-                "description": "Show the workspace's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.",
+                "description": "Show the workspace's commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.",
                 "input_schema": {"type": "object", "properties": {
                     "rev": {"type": "string", "description": "Where to start (default HEAD, the current workspace). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^."},
                     "path": {"type": "string", "description": "Only show commits that changed this workspace-relative path."},
@@ -108,7 +108,7 @@ mod tests {
             },
             {
                 "name": "diff",
-                "description": "Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.",
+                "description": "Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest workspace commit changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.",
                 "input_schema": {"type": "object", "properties": {
                     "from": {"type": "string", "description": "The base revision (default HEAD~1, the commit before the workspace)."},
                     "to": {"type": "string", "description": "The revision to compare against the base (default HEAD, the current workspace)."},
