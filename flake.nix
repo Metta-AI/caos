@@ -1156,7 +1156,10 @@ sandbox = false''
               # loopback with the stack, so the address the server uses
               # (127.0.0.1) is meaningless to it.
               #
-              # SYS_ADMIN and the store volume are for the bind in bootstrap:
+              # SYS_ADMIN and the store volume are for the bind in bootstrap
+              # (and apparmor=unconfined with it: Ubuntu's docker-default
+              # profile denies the mount regardless of the capability, as
+              # runnerd notes for the worker's bind):
               # a volume cannot be mounted AT /nix, because this image's own
               # userland lives there and would be shadowed. Not a widening —
               # this container already holds the engine socket, which is
@@ -1167,6 +1170,7 @@ sandbox = false''
                 --network-alias caos-registry \
                 --network-alias caos-redis \
                 --cap-add SYS_ADMIN \
+                --security-opt apparmor=unconfined \
                 -p 9090:80 -p "$REGISTRY_PORT:5000" \
                 -v "$CAOS_DATA/stack:/state" \
                 -v caos-vol-mounted-nix:/mounted-nix \
