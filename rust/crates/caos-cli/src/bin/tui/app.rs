@@ -1945,7 +1945,15 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
-        if load_selected {
+        if !load_selected && states[selected].turn_options.initial_workspaces.is_some() {
+            caos_cli::create_conversation(
+                &transport,
+                &states[selected].turn_options,
+                &selected_id,
+                &states[selected].title,
+            )?;
+            let _ = states[selected].reload(&transport, &args.user);
+        } else if load_selected {
             let _ = states[selected].reload(&transport, &args.user);
         }
         let mut app = Self {
@@ -2338,7 +2346,18 @@ impl App {
                     return;
                 }
             };
-            match commit_working_tree(arguments, &workspace, &self.repo_dir) {
+            let committed = self
+                .checkout_selected_workspace(&workspace)
+                .and_then(|checkout| {
+                    let (commit, base) = commit_working_tree(arguments, &workspace, &checkout)?;
+                    super::launcher::import_checkout_commit(
+                        &checkout,
+                        &self.repo_dir,
+                        &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
+                    )?;
+                    Ok((commit, base))
+                });
+            match committed {
                 Ok((tree, base)) => {
                     human_tree = Some(tree);
                     proposal_base = Some(base);
@@ -2352,7 +2371,7 @@ impl App {
         } else {
             raw
         };
-        if !self.selected().virtual_conversation {
+        if !self.selected().virtual_conversation && !self.selected().workspaces.is_empty() {
             if let Err(error) = self.selected().require_selected_workspace() {
                 self.selected_mut().show_command_error(error);
                 self.selected_mut().composer.restore_message(&message);
@@ -2757,6 +2776,12 @@ impl App {
             );
             return;
         }
+        let initial = self.selected().virtual_conversation.then(|| {
+            (
+                self.selected().turn_options.clone(),
+                self.selected().title.clone(),
+            )
+        });
         let conversation = self.selected().id.clone();
         self.selected_mut().workspace_operation = true;
         self.selected_mut().status = status.to_string();
@@ -2765,6 +2790,9 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
+                if let Some((options, title)) = initial {
+                    caos_cli::create_conversation(transport, &options, &conversation, &title)?;
+                }
                 let info = operation(transport, &conversation);
                 let load = conversation_load(transport, &conversation)?
                     .ok_or_else(|| format!("conversation {conversation:?} disappeared"))?;
@@ -3376,7 +3404,11 @@ impl App {
                             id,
                             title,
                             options,
-                            format!("ready from {}; enter a prompt", short_hash(&base)),
+                            if base.is_empty() {
+                                "ready; enter a prompt or attach a repository".into()
+                            } else {
+                                format!("ready from {}; enter a prompt", short_hash(&base))
+                            },
                         );
                         replacement.composer = composer;
                         replacement.show_command_error(format!(
@@ -3930,7 +3962,11 @@ impl App {
                         id.clone(),
                         title.clone(),
                         options,
-                        format!("ready from {}; enter a prompt", short_hash(&base)),
+                        if base.is_empty() {
+                            "ready; enter a prompt or attach a repository".into()
+                        } else {
+                            format!("ready from {}; enter a prompt", short_hash(&base))
+                        },
                     ),
                     None,
                 )
@@ -4033,7 +4069,11 @@ impl App {
                 id,
                 title,
                 options,
-                format!("ready from {}; enter a prompt", short_hash(&base)),
+                if base.is_empty() {
+                    "ready; enter a prompt or attach a repository".into()
+                } else {
+                    format!("ready from {}; enter a prompt", short_hash(&base))
+                },
             ))
         } else {
             None
@@ -4115,6 +4155,11 @@ impl App {
         self.selected_mut().tool_set = Some(result);
     }
 
+    fn checkout_selected_workspace(&self, head: &str) -> Result<PathBuf, String> {
+        let config = &self.selected().require_selected_workspace()?.config;
+        super::launcher::checkout_for(&self.repo_dir, config, head)
+    }
+
     fn load_selected(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut()
@@ -4122,7 +4167,10 @@ impl App {
             return;
         }
         match self.selected().require_selected_workspace().cloned() {
-            Ok(diff) => match load_conversation_workspace(&diff.head, &self.repo_dir) {
+            Ok(diff) => match self
+                .checkout_selected_workspace(&diff.head)
+                .and_then(|checkout| load_conversation_workspace(&diff.head, &checkout))
+            {
                 Ok(()) => {
                     self.selected_mut().status = format!(
                         "checked out {} at {} in detached HEAD",
@@ -4218,6 +4266,30 @@ fn new_conversation_options(
     requested_base: Option<String>,
     repo_dir: &Path,
 ) -> Result<(TurnOptions, String), String> {
+    if let Some(seeds) = &mut options.initial_workspaces {
+        if let Some(base) = requested_base {
+            let config = seeds
+                .values()
+                .next()
+                .map(|seed| seed.config.clone())
+                .unwrap_or_default();
+            *seeds = std::collections::BTreeMap::from([(
+                "main".into(),
+                caos_cli::InitialWorkspace {
+                    commit: base.clone(),
+                    config,
+                },
+            )]);
+            options.base = Some(base.clone());
+            return Ok((options, base));
+        }
+        let base = seeds
+            .values()
+            .next()
+            .map(|seed| seed.commit.clone())
+            .unwrap_or_default();
+        return Ok((options, base));
+    }
     let base = match requested_base {
         Some(base) => base,
         None => local_default_branch_tip(repo_dir)?.1,

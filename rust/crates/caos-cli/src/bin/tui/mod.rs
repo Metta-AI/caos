@@ -21,6 +21,7 @@ use ratatui_crossterm::CrosstermBackend;
 
 mod app;
 mod args;
+mod launcher;
 mod setup;
 mod workspace;
 
@@ -308,7 +309,16 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
-    let args = Args::parse(raw)?;
+    let mut args = Args::parse(raw)?;
+    let archive_in_checkout = (args.list_archived || args.unarchive.is_some())
+        && args.server.is_none()
+        && args.harness.is_none()
+        && GitTransport::from_cwd().is_ok();
+    if !archive_in_checkout {
+        let repo = launcher::prepare(&mut args)?;
+        std::env::set_current_dir(&repo)
+            .map_err(|error| format!("opening client store: {error}"))?;
+    }
     if args.list_archived || args.unarchive.is_some() {
         let transport = GitTransport::from_cwd()?;
         transport.ensure_server_reachable()?;

@@ -428,8 +428,17 @@ their refs, reconciliation, and publication. Conversation commits hold
 protocol state; workspace commits hold code. They are connected by hashes
 in conversation records, never by parent edges.
 
-`read`/`ls` default to the selected workspace and accept a `root` hash to
-inspect another revision or a conflict stage (below).
+Workspace tools take an explicit workspace when several exist; the request's
+focus hint is frozen when admitted. `read`/`ls` accept a `root` hash to inspect
+another revision or conflict stage. Without an explicit workspace, inline
+`files/` paths refer to conversation-owned files.
+
+The TUI can launch without a code checkout using its bundled harness. Repository
+attachments supply code, repository instructions and scoped tool schemas.
+Bash integration inputs capture other workspaces by content outside the writable
+output tree. Workspace base edges define stacks; explicit Update stack merges
+upstream changes and records incorporated base pins, stopping on conflicts.
+See [Chat v3](design/chat.md) for the precise launcher and workspace contract.
 
 ## Tools thread a commit, not a tree
 
@@ -574,10 +583,13 @@ revision (and made the history tools' hashes readable the same way).
 
 ## Publication
 
-The [Chat v3 publication flow](design/chat.md) pushes the selected
-workspace commit to `refs/heads/caos/<conversation-id>` on `origin`.
-`Ctrl+P` prepares it against the selected base and opens or reuses a PR;
-`/publish-branch` pushes the branch without preparation or PR creation.
+The [Chat v3 publication flow](design/chat.md) publishes each workspace to its
+configured repository and branch. Single-workspace defaults retain
+`caos/<conversation-id>`; new multi-workspace destinations use
+`caos-workspaces/<conversation-id>/<workspace>`.
+`Ctrl+P` previews workspaces, branches and bases, prepares selected workspaces
+in dependency order, and opens or reuses each PR by repository and head branch.
+`/publish-branch` pushes the selected branch without preparation or PR creation.
 Neither exports the conversation state or imports conversations from GitHub.
 
 Per-mutation commits remain in the published workspace history. Only the
