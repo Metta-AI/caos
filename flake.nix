@@ -1128,6 +1128,9 @@ sandbox = false''
                 || docker network create "$NET" >/dev/null
               docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+              # Docker creates a missing bind source as root. Create it as the
+              # invoking user before repack_repos mounts it and tree staging writes it.
+              mkdir -p "$CAOS_DATA/stack"
               repack_repos
 
               # THE TREE, copied rather than mounted: a bind's source is
@@ -1139,7 +1142,6 @@ sandbox = false''
               # contents puts on disk is a SYMLINK").
               echo "==> staging the tree into $CAOS_DATA/stack/tree" >&2
               rm -rf "$CAOS_DATA/stack/tree.new"
-              mkdir -p "$CAOS_DATA/stack"
               cp -RL ${self} "$CAOS_DATA/stack/tree.new"
               chmod -R u+w "$CAOS_DATA/stack/tree.new"
               rm -rf "$CAOS_DATA/stack/tree"
