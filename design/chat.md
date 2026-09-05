@@ -273,3 +273,26 @@ conversation lease. An upstream rewrite is an error. A conflict stops the batch
 and leaves that workspace unchanged, reporting the source commit and paths;
 resolve it with the existing merge tool, then update again. Earlier successful
 updates remain visible. Repeating an up-to-date operation creates no commits.
+
+### Repository attachments and integration inputs
+
+The workspace picker’s **a** action attaches a repository URL and branch (or
+full commit), importing its code without checking it out over the client.
+`/workspace attach <name> <repository> [<branch>|<commit>]` does the same.
+A branch attachment remembers its base for Update stack; a commit attachment
+stays pinned. Forking a workspace inherits its repository. Repository identity
+comparison treats equivalent SSH and HTTPS spellings alike, while Git retains
+the original transport URL for authentication.
+
+Each workspace supplies its own AGENTS.md and repository tool schemas. In a
+multi-workspace conversation, use `workspace_tool` with explicit workspace,
+tool, and arguments; short names remain available for a single workspace.
+Named merge/history refs are captured per repository when the request starts.
+A repository attached later needs a new request to refresh those named refs;
+full commit hashes remain usable.
+
+Bash can read other workspaces through `inputs`, for example
+`{"api":{"workspace":"api","paths":["schema"]}}`. The command reads
+`$CAOS_INPUTS/api/schema`; these are immutable snapshots captured in the
+tool’s request. Only the target workspace is staged back. This permits
+integration builds without introducing live shared working directories.

@@ -142,7 +142,9 @@ pub fn workspace_order(configs: &BTreeMap<String, WorkspaceConfig>) -> Result<Ve
             if let (Some(repository), Some(parent_repository)) =
                 (&config.repository, &parent_config.repository)
             {
-                if repository != parent_repository {
+                if normalize_repository_identity(repository)?
+                    != normalize_repository_identity(parent_repository)?
+                {
                     return Err(format!(
                         "workspace {name:?} and its base {parent:?} use different repositories"
                     ));
@@ -202,6 +204,52 @@ pub fn create_from_workspace(
         });
     }
     Ok(transitions)
+}
+
+pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("origin has an empty URL".to_string());
+    }
+    let mut normalized = if let Some(scp) = url.strip_prefix("git@") {
+        let (host, path) = scp
+            .split_once(':')
+            .ok_or_else(|| format!("invalid origin URL {url:?}"))?;
+        if host.is_empty() || path.is_empty() {
+            return Err(format!("invalid origin URL {url:?}"));
+        }
+        format!("https://{host}/{path}")
+    } else {
+        url.to_string()
+    };
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if let Some(without_suffix) = normalized.strip_suffix(".git") {
+        normalized = without_suffix.to_string();
+    }
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if let Some((scheme, rest)) = normalized.split_once("://") {
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if authority.is_empty() {
+            return Err(format!("invalid origin URL {url:?}"));
+        }
+        let authority = match authority.rsplit_once('@') {
+            Some((user, host)) => format!("{user}@{}", host.to_ascii_lowercase()),
+            None => authority.to_ascii_lowercase(),
+        };
+        normalized = if path.is_empty() {
+            format!("{scheme}://{authority}")
+        } else {
+            format!("{scheme}://{authority}/{path}")
+        };
+    }
+    if normalized.is_empty() {
+        return Err(format!("invalid origin URL {url:?}"));
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]

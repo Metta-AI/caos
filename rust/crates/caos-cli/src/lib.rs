@@ -485,7 +485,7 @@ fn prepare_queued_request_detail(
     queued_head: &str,
 ) -> Result<PreparedRequest, String> {
     let store = conversation_secret_store(t)?;
-    let configuration = resolve_llm(t, options, id, &store)?;
+    let configuration = resolve_llm(t, options, id, queued_head, &store)?;
     let request = prepare_client_request_with_store(
         t,
         &configuration,
@@ -2020,51 +2020,7 @@ pub fn compare_and_set_conversation_title(
     Ok(matched)
 }
 
-pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("origin has an empty URL".to_string());
-    }
-    let mut normalized = if let Some(scp) = url.strip_prefix("git@") {
-        let (host, path) = scp
-            .split_once(':')
-            .ok_or_else(|| format!("invalid origin URL {url:?}"))?;
-        if host.is_empty() || path.is_empty() {
-            return Err(format!("invalid origin URL {url:?}"));
-        }
-        format!("https://{host}/{path}")
-    } else {
-        url.to_string()
-    };
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    if let Some(without_suffix) = normalized.strip_suffix(".git") {
-        normalized = without_suffix.to_string();
-    }
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    if let Some((scheme, rest)) = normalized.split_once("://") {
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if authority.is_empty() {
-            return Err(format!("invalid origin URL {url:?}"));
-        }
-        let authority = match authority.rsplit_once('@') {
-            Some((user, host)) => format!("{user}@{}", host.to_ascii_lowercase()),
-            None => authority.to_ascii_lowercase(),
-        };
-        normalized = if path.is_empty() {
-            format!("{scheme}://{authority}")
-        } else {
-            format!("{scheme}://{authority}/{path}")
-        };
-    }
-    if normalized.is_empty() {
-        return Err(format!("invalid origin URL {url:?}"));
-    }
-    Ok(normalized)
-}
+pub use conversation_protocol::v3::workspaces::normalize_repository_identity;
 
 pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
     let url = t
@@ -2632,6 +2588,7 @@ fn resolve_llm(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
+    queued_head: &str,
     store: &[ClientSecret],
 ) -> Result<String, String> {
     let system = match (&options.system, &options.system_file) {
@@ -2644,7 +2601,10 @@ fn resolve_llm(
         }
     };
     let merge_refs = snapshot_merge_refs(t)?;
+    let repository_refs =
+        workspaces::snapshot_repository_refs(t, &oid(queued_head, "queued conversation")?)?;
     let mut config = vec![format!("--system={system}"), format!("--conversation={id}")];
+    config.push(format!("--repository-refs={repository_refs}"));
     if let Some(workspace) = &options.workspace {
         config.push(format!("--focus-workspace={workspace}"));
     }
@@ -3586,6 +3546,63 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repository_attachment_imports_code_and_scopes_named_refs() {
+        let (root, transport, base) = fixture("attach-host");
+        let (other_root, other, other_base) = fixture("attach-other");
+        let other_head = commit_file(&other, &other_base, "other repository\n", "other");
+        git(
+            other.work_dir(),
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        git(
+            &other_root.join("origin.git"),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        create_idle_conversation(&transport, "attached", &base);
+        let repository = other_root.join("origin.git").to_str().unwrap().to_string();
+        workspaces::attach(&transport, "attached", "api", &repository, None).unwrap();
+        let before = conversation_head(&transport, "attached").unwrap().unwrap();
+        workspaces::attach(&transport, "attached", "api", &repository, Some("main")).unwrap();
+        assert_eq!(
+            conversation_head(&transport, "attached").unwrap().unwrap(),
+            before
+        );
+        let load = conversation_load(&transport, "attached").unwrap().unwrap();
+        let api = load.workspaces.iter().find(|ws| ws.name == "api").unwrap();
+        assert_eq!(api.head, other_head);
+        assert_eq!(api.config.repository.as_deref(), Some(repository.as_str()));
+        assert_eq!(
+            api.config.base.as_ref().unwrap().commit().as_str(),
+            other_head
+        );
+        let refs: BTreeMap<String, String> = serde_json::from_str(
+            &workspaces::snapshot_repository_refs(&transport, &oid(&before, "head").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refs[&normalize_repository_identity(&repository).unwrap()],
+            format!("main {other_head}\norigin/main {other_head}\n")
+        );
+        let store = open_store(&transport).unwrap();
+        use conversation_protocol::v3::CodeOps;
+        let remote = GitStore::open(&root.join("remote.git"), None).unwrap();
+        remote
+            .read_commit(&oid(&other_head, "attached").unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .tree_of(&oid(&other_head, "attached").unwrap())
+                .unwrap(),
+            remote
+                .tree_of(&oid(&other_head, "attached").unwrap())
+                .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
     }
 
     #[test]

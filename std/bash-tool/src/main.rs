@@ -75,10 +75,31 @@ fn run() -> Result<(), String> {
     let work = scratch("work")?;
     mirror(Path::new(&tree), &work)?;
 
+    // Input snapshots remain immutable CAS trees outside the writable output.
+    let inputs = scratch("inputs")?;
+    let input_root = format!("{base}/inputs");
+    if Path::new(&input_root).exists() {
+        caos(["get", &input_root])?;
+        for item in entries(&input_root)? {
+            caos(["get", path(&item)])?;
+            let tree = item.join("tree");
+            caos(["get", path(&tree)])?;
+            for declared in read_paths(path(&item.join("paths")))? {
+                if declared == "." {
+                    caos(["get", "-r", path(&tree)])?;
+                } else {
+                    materialize_declared(path(&tree), &declared)?;
+                }
+            }
+            link(&tree, inputs.join(file_name(&item)))?;
+        }
+    }
+
     // Run the command as this (already unprivileged) worker, cwd the tree root.
     let out = Command::new("/bin/sh")
         .args(["-c", &cmd])
         .current_dir(&work)
+        .env("CAOS_INPUTS", &inputs)
         .output()
         .map_err(|e| format!("running /bin/sh: {e}"))?;
     let exit = exit_code(&out.status);
@@ -124,10 +145,11 @@ fn read_paths(cas_path: &str) -> Result<Vec<String>, String> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter(|l| {
-            !l.starts_with('/')
-                && Path::new(l)
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            *l == "."
+                || (!l.starts_with('/')
+                    && Path::new(l)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))))
         })
         .map(|l| l.trim_end_matches('/').to_string())
         .collect())
@@ -140,6 +162,9 @@ fn read_paths(cas_path: &str) -> Result<Vec<String>, String> {
 /// doesn't exist (the command may be about to create it) or descends into a
 /// blob is left alone.
 fn materialize_declared(tree: &str, rel: &str) -> Result<(), String> {
+    if rel == "." {
+        return caos(["get", "-r", tree]);
+    }
     let mut cur = PathBuf::from(tree);
     let comps: Vec<&str> = rel.split('/').collect();
     for (i, comp) in comps.iter().enumerate() {
