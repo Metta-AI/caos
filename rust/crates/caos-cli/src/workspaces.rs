@@ -69,9 +69,7 @@ pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<Stri
     let repository = match &config.repository {
         Some(repository) => repository.clone(),
         None => {
-            let checkout = t
-                .git_capture(&["config", "--get", "caos.checkout"], None)
-                .ok();
+            let checkout = git_config_value(t, "caos.checkout");
             let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
             source
                 .as_ref()

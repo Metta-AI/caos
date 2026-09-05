@@ -3113,18 +3113,19 @@ fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, Strin
         .ok_or_else(|| format!("cannot resolve conversation base {rev:?}"))
 }
 
+// Git terminates config output; remove only that delimiter, preserving path whitespace.
+fn git_config_value(t: &GitTransport, key: &str) -> Option<String> {
+    let value = t
+        .git_capture(&["config", "--null", "--get", key], None)
+        .ok()?;
+    value.strip_suffix('\0').map(str::to_string)
+}
+
 fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
-    let checkout = t
-        .git_capture(&["config", "--get", "caos.checkout"], None)
-        .ok();
+    let checkout = git_config_value(t, "caos.checkout");
     let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
     // An empty independent launcher has no legacy repository refs.
-    if source.is_none()
-        && t.git_capture(&["config", "--get", "caos.launcher"], None)
-            .ok()
-            .as_deref()
-            == Some("true")
-    {
+    if source.is_none() && git_config_value(t, "caos.launcher").as_deref() == Some("true") {
         return Ok(String::new());
     }
     let source = source.as_ref().unwrap_or(t);
@@ -3467,6 +3468,50 @@ mod tests {
         )
         .unwrap();
         interrupt_request(transport, id).unwrap();
+    }
+
+    #[test]
+    fn launcher_preparation_reads_checkout_config_without_adding_or_trimming_whitespace() {
+        let (root, transport, base) = fixture("launcher-checkout");
+        let checkout = root.join("checkout with trailing whitespace \n");
+        std::fs::rename(transport.work_dir(), &checkout).unwrap();
+        let client = root.join("launcher");
+        std::fs::create_dir(&client).unwrap();
+        git(&client, &["init", "--quiet"]);
+        no_background_maintenance(&client);
+        git(
+            &client,
+            &[
+                "remote",
+                "add",
+                CAOS_REMOTE,
+                root.join("remote.git").to_str().unwrap(),
+            ],
+        );
+        git(&client, &["config", "caos.launcher", "true"]);
+        git(
+            &client,
+            &["config", "caos.checkout", checkout.to_str().unwrap()],
+        );
+        let launcher = GitTransport::discover(&client).unwrap();
+
+        // This is the ref preparation performed before evaluating the first LLM request.
+        let refs = snapshot_merge_refs(&launcher).unwrap();
+        assert!(refs.lines().any(|line| line == format!("main {base}")));
+        assert_eq!(
+            workspaces::repository_url(&launcher, &Default::default()).unwrap(),
+            root.join("origin.git").to_str().unwrap()
+        );
+        assert_eq!(git(&client, &["cat-file", "-t", &base]), "commit");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standalone_launcher_does_not_offer_its_harness_as_workspace_merge_refs() {
+        let (root, transport, _) = fixture("launcher-empty");
+        git(transport.work_dir(), &["config", "caos.launcher", "true"]);
+        assert_eq!(snapshot_merge_refs(&transport).unwrap(), "");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
