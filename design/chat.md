@@ -221,3 +221,28 @@ transition application without re-validating the resulting spine.
 - No retention or erasure policy; reflogs are kept forever.
 - Publication uses one branch per conversation; no squash policy or multi-workspace PR stacks.
 - Stacks and surfaces above one conversation are not designed.
+
+
+## Named workspace navigation
+
+`Ctrl+O` and `/workspace` open a workspace picker showing repository, changes,
+publication state, and base. Enter selects a workspace; `n` creates from the
+highlighted workspace's current commit. Tab in the creation form chooses a
+separate change or a dependent change. `/workspace create <name>` uses the
+selected workspace, while an explicit revision remains available as
+`/workspace create <name> <rev>`. `/workspace stack <name>` records a dependency
+on the selected workspace.
+
+Selection belongs to the client. Each submitted request captures its focus in
+its immutable model configuration, and the model receives a named workspace
+inventory on each round. With multiple workspaces, tool calls must name their
+target; changing the picker cannot redirect a call already in flight. Local
+navigation and informational commands remain usable during a running turn or
+publication without submitting a message.
+
+The agent's `workspaces` tool lists, creates, removes, and promotes workspaces.
+Creation shares the host's rules and publishes settings and the operation's
+receipt atomically. Subagent working copies remain inside their child
+conversations; promotion of a completed child creates a visible workspace when
+that result deserves separate review. Ordinary harvesting still applies the
+child result to an existing workspace.

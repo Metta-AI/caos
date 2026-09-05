@@ -33,6 +33,9 @@ use super::workspace::{
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
+#[path = "workspace_picker.rs"]
+mod workspace_picker;
+use workspace_picker::WorkspacePicker;
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
@@ -905,6 +908,7 @@ enum AppAction {
     Title,
     UpdateTree,
     Workspace,
+    Workspaces,
     NewConversation,
     Checkout,
     Activity,
@@ -975,7 +979,7 @@ const COMMANDS: [Command; 10] = [
     },
     Command {
         name: "/workspace",
-        usage: "/workspace [use|create|rollback|remove] ...",
+        usage: "/workspace [use|create|stack|rollback|remove] ...",
         description: "list or manage named workspaces",
         action: AppAction::Workspace,
         takes_argument: true,
@@ -1683,7 +1687,13 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 11] = [
+const PALETTE_COMMANDS: [PaletteCommand; 12] = [
+    PaletteCommand {
+        label: "Workspaces",
+        shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
+        keywords: "select create switch repository stack",
+        action: AppAction::Workspaces,
+    },
     PaletteCommand {
         label: "New conversation",
         shortcut: Some(Shortcut::new("n", "Ctrl+N", false)),
@@ -1805,6 +1815,7 @@ pub(crate) struct App {
     should_quit: bool,
     selection_locked: bool,
     palette: Option<CommandPalette>,
+    workspace_picker: Option<WorkspacePicker>,
     selecting_transcript: bool,
     screen_selection: Option<ScreenSelection>,
     selecting_screen: bool,
@@ -1935,6 +1946,7 @@ impl App {
             should_quit: false,
             selection_locked: false,
             palette: None,
+            workspace_picker: None,
             selecting_transcript: false,
             screen_selection: None,
             selecting_screen: false,
@@ -2062,6 +2074,16 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if self.workspace_picker.is_some() {
+            if mouse.kind == MouseEventKind::ScrollUp {
+                self.handle_workspace_picker_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+            if mouse.kind == MouseEventKind::ScrollDown {
+                self.handle_workspace_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            return MouseAction::Redraw;
+        }
+
         if self.palette.is_some() {
             return MouseAction::Ignored;
         }
@@ -2226,6 +2248,25 @@ impl App {
     }
 
     fn start_turn(&mut self) {
+        let raw = self.selected().composer.expanded_text();
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return;
+        }
+        if let Some((command, arguments)) = parse_command(raw) {
+            if !command.action.submits_message() {
+                if command.action != AppAction::Workspace
+                    && command.takes_argument == arguments.is_empty()
+                {
+                    self.selected_mut()
+                        .show_command_error(format!("usage: {}", command.usage));
+                } else {
+                    self.selected_mut().composer.take_message();
+                    self.run_local_command(command, arguments);
+                }
+                return;
+            }
+        }
         if self.selected().forking {
             self.selected_mut()
                 .show_command_error("wait for this conversation fork to finish");
@@ -2247,21 +2288,16 @@ impl App {
         };
         let state = self.selected_mut();
         state.reference_notice = None;
-        // Recognized local commands stop here as one class. Unrecognized slash
-        // text and message-submitting commands continue through the ordinary
-        // turn path.
+        // Local commands were handled above; only message-submitting commands
+        // and ordinary text reach the request path.
         let mut human_tree = None;
         let mut proposal_base = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
-            if command.action != AppAction::Workspace
-                && command.takes_argument == arguments.is_empty()
-            {
+            debug_assert!(command.action.submits_message());
+            if arguments.is_empty() {
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
-                return;
-            }
-            if !command.action.submits_message() {
-                self.run_local_command(command, arguments);
+                self.selected_mut().composer.restore_message(&raw);
                 return;
             }
             let workspace = match self.selected().require_selected_workspace() {
@@ -2457,6 +2493,7 @@ impl App {
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Workspace => self.run_workspace_command(arguments),
+            AppAction::Workspaces => self.open_workspace_picker(),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2575,26 +2612,7 @@ impl App {
     fn run_workspace_command(&mut self, arguments: &str) {
         let parts = arguments.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
-            [] => {
-                let listing = if self.selected().workspaces.is_empty() {
-                    "This conversation has no workspace.".to_string()
-                } else {
-                    self.selected()
-                        .workspaces
-                        .iter()
-                        .map(|workspace| {
-                            format!(
-                                "{} {} (base {})",
-                                workspace.name,
-                                short_hash(&workspace.head),
-                                short_hash(&workspace.base_commit)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                self.selected_mut().push_info(listing);
-            }
+            [] => self.open_workspace_picker(),
             ["use", name] => match self.selected_mut().select_workspace(name) {
                 Ok(()) => {
                     self.selected_mut()
@@ -2605,18 +2623,25 @@ impl App {
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
             },
-            ["create", name, rest @ ..] if rest.len() <= 1 => {
-                self.start_workspace_mutation("creating workspace", {
-                    let name = (*name).to_string();
-                    let rev = rest.first().copied().unwrap_or("HEAD").to_string();
-                    move |transport, conversation| {
-                        let commit = resolve_workspace_revision(transport, &rev)?;
-                        create_workspace(transport, conversation, &name, &commit)?;
-                        Ok(format!(
-                            "Created workspace {name:?} at {}.",
-                            short_hash(&commit)
-                        ))
-                    }
+            ["create", name] | ["stack", name] => {
+                let source = match self.selected().require_selected_workspace() {
+                    Ok(workspace) => workspace.name.clone(),
+                    Err(error) => { self.selected_mut().show_command_error(error); return; }
+                };
+                let name = (*name).to_string();
+                let stacked = parts[0] == "stack";
+                self.start_workspace_mutation("creating workspace", move |transport, conversation| {
+                    caos_cli::workspaces::create_from_workspace(transport, conversation, &name, &source, stacked)?;
+                    Ok(format!("Created workspace {name:?} from {source:?}."))
+                });
+            }
+            ["create", name, rev] => {
+                let name = (*name).to_string();
+                let rev = (*rev).to_string();
+                self.start_workspace_mutation("creating workspace", move |transport, conversation| {
+                    let commit = resolve_workspace_revision(transport, &rev)?;
+                    create_workspace(transport, conversation, &name, &commit)?;
+                    Ok(format!("Created workspace {name:?} at {}.", short_hash(&commit)))
                 });
             }
             ["rollback", name, rev] => {
@@ -2643,7 +2668,7 @@ impl App {
                 });
             }
             _ => self.selected_mut().show_command_error(
-                "usage: /workspace [use <name>|create <name> [<rev>]|rollback <name> <rev>|remove <name>]",
+                "usage: /workspace [use <name>|create <name> [<rev>]|stack <name>|rollback <name> <rev>|remove <name>]",
             ),
         }
     }
@@ -2913,7 +2938,18 @@ impl App {
                         state.workspace_operation = false;
                         match result {
                             Ok((info, load)) => {
+                                let created = load
+                                    .workspaces
+                                    .iter()
+                                    .filter(|ws| {
+                                        !state.workspaces.iter().any(|old| old.name == ws.name)
+                                    })
+                                    .map(|ws| ws.name.clone())
+                                    .collect::<Vec<_>>();
                                 state.apply_load(*load, &user);
+                                if let [name] = created.as_slice() {
+                                    let _ = state.select_workspace(name);
+                                }
                                 state.push_info(info);
                             }
                             Err(error) => state.show_command_error(error),
@@ -3324,6 +3360,10 @@ impl App {
             }
             return;
         }
+        if self.workspace_picker.is_some() {
+            self.handle_workspace_picker_key(key);
+            return;
+        }
         if key.code == KeyCode::Esc && self.selected().running {
             self.interrupt_selected();
             return;
@@ -3623,6 +3663,7 @@ impl App {
 
     fn execute_action(&mut self, action: AppAction) {
         match action {
+            AppAction::Workspaces => self.open_workspace_picker(),
             AppAction::NewConversation => {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
@@ -4557,6 +4598,7 @@ mod tests {
                 tx: tx.clone(),
                 rx,
                 palette: None,
+                workspace_picker: None,
             },
             tx,
         )
@@ -4564,6 +4606,7 @@ mod tests {
 
     fn workspace_diff(name: &str, base: char, head: char, patch: &str) -> WorkspaceDiff {
         WorkspaceDiff {
+            config: Default::default(),
             name: name.to_string(),
             base_commit: base.to_string().repeat(40),
             head: head.to_string().repeat(40),
@@ -4659,6 +4702,21 @@ mod tests {
         assert!(rendered.contains("main [side]"));
         assert!(rendered.contains("SIDE PATCH"));
         assert!(!rendered.contains("MAIN PATCH"));
+
+        app.selected_mut().composer.insert_str("keep this draft");
+        app.selected_mut().running = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(rendered_screen(&app).contains("Workspaces"));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().selected_workspace.as_deref(), Some("main"));
+        assert_eq!(app.selected().composer.expanded_text(), "keep this draft");
+        assert_eq!(app.selected().turn_options.workspace, None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().running);
+        assert!(app.workspace_picker.is_none());
     }
 
     #[test]
@@ -6542,6 +6600,7 @@ mod tests {
 
         let mut selected = state("talk-1");
         selected.workspaces = vec![WorkspaceDiff {
+            config: Default::default(),
             name: "main".to_string(),
             base_commit: base,
             head: head.clone(),
@@ -6853,6 +6912,7 @@ mod tests {
                     }],
                 },
                 workspaces: vec![WorkspaceDiff {
+                    config: Default::default(),
                     name: "main".to_string(),
                     base_commit: "d".repeat(40),
                     head: head.clone(),
@@ -6969,6 +7029,7 @@ mod tests {
                     activity: Vec::new(),
                 },
                 workspaces: vec![WorkspaceDiff {
+                    config: Default::default(),
                     name: "main".to_string(),
                     base_commit: "e".repeat(40),
                     head: old_head,
@@ -7060,6 +7121,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut conversation = state("talk-1");
         conversation.workspaces = vec![WorkspaceDiff {
+            config: Default::default(),
             name: "docs".to_string(),
             base_commit: tip.clone(),
             head: tip,
