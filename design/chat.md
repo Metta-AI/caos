@@ -64,6 +64,7 @@ target-only and never rewinds it through the reflog.
 .caos/identity.json           id, kind, optional owner (parent/head/request/round/tool for a child)
 .caos/title
 .caos/workspaces/<name>/{commit,initial[,origin]}   bare shas
+.caos/workspaces/<name>/config.json             optional repository, branch, and base
 .caos/transcript/<shard>/<ordinal>-<message-id>.json  + payload dir
 .caos/requests/<id>.json      .caos/requests/active
 .caos/tools/<request>/<round>/<call-id>.json  + payload dir
@@ -98,14 +99,14 @@ repository inputs remains a followup.
 
 ## Transitions
 
-Twenty-three kinds, each a one-word commit message:
+Twenty-four kinds, each a one-word commit message:
 
 ```
 conversation.root  conversation.fork  metadata.title.set
 message.append     request.admit  request.claim  request.interject
 request.escape     request.terminal   model.complete
 tool.start         tool.complete      files.apply
-workspace.create   workspace.rollback workspace.remove
+workspace.create   workspace.configure workspace.rollback workspace.remove
 async.start        async.terminal
 subagent.spawn     subagent.terminal  subagent.apply
 publication.pending  publication.terminal
@@ -153,6 +154,16 @@ and the host's manual tree update. `/update-tree` commits outstanding local
 edits, includes already-committed edits, and uses the merge base of local
 `HEAD` and the selected workspace as the proposal base. It refuses unrelated
 histories or multiple merge bases before staging files.
+
+**Workspace settings.** Optional `config.json` records a repository URL,
+publication branch, and base. A base names either a repository branch or another
+workspace, together with the exact commit last integrated. `workspace.configure`
+updates only these settings; it never moves a workspace pointer. Workspace
+base edges must name existing workspaces, stay within a repository, and be
+acyclic. A referenced base cannot be removed until its dependents are
+reconfigured. Missing settings retain the existing checkout-based defaults.
+These records supply the common model for workspace navigation, publication
+plans, stack updates, and repository attachment.
 
 **Publication.** `preserve` policy only: push the named workspace's
 commit to `refs/heads/caos/<id>` on the host checkout's `origin`. Selection

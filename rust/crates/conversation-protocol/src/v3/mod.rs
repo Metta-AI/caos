@@ -14,6 +14,7 @@ pub mod refs;
 pub mod tree;
 pub mod validate;
 pub mod view;
+pub mod workspaces;
 
 #[cfg(feature = "git-cli")]
 pub use git_store::{GitStore, RefUpdate};
@@ -28,3 +29,4 @@ pub use tree::{
     CommitInfo, Mode, ObjectStore, Signature, Snapshot, StoreError, TreeBuilder, TreeEntry,
 };
 pub use validate::{validate_commit, validate_spine, Validated};
+pub use workspaces::{workspace_order, WorkspaceBase, WorkspaceConfig};
