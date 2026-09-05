@@ -1,6 +1,6 @@
 # Chat v3: conversation and code as separate histories
 
-**Status:** implemented through subagents and branch-only publication.
+**Status:** implemented through subagents and workspace PR publication.
 Selected solely by the `refs/caos/v3/` namespace; v2 refs stay untouched
 and invisible. The binding definition is the code:
 `rust/crates/conversation-protocol/src/v3/` (records, kinds, paths,
@@ -158,8 +158,21 @@ remote changes, bracketed by `publication.pending` and
 Before retrying, the host reconciles pending records for the same repository
 and ref using the observed remote tip: the planned head means complete;
 an unchanged expected tip means uncertain; another tip means conflict.
-It records these outcomes without replaying the old pushes. Squash,
-per-workspace destinations, and pull-request creation are deferred.
+It records these outcomes without replaying the old pushes.
+
+The TUI also supports PR publication through `Ctrl+P` (or **Publish pull
+request** in its command palette). The user confirms a base, defaulting to
+`origin`'s advertised default branch. The host fetches its current commit and
+runs an ordinary conversation turn to merge it into the selected workspace
+when necessary, then build and test. This preparation can advance `W`; the
+subsequent publication operation still leaves workspace pointers unchanged.
+Before publishing, the host rejects interruption, missing base ancestry,
+remaining conflict markers, reserved `.caos` state, or a workspace changed
+since preparation. It uses the same leased branch publisher, then `gh` to
+find an open PR for that repository, head, and base or create one.
+`/publish-branch` skips preparation and PR creation. Squash, per-workspace
+destinations, multi-workspace PR stacks, and conversation publication remain
+deferred.
 
 **Forks, title, membership.** `conversation.fork` creates a new identity
 with the source `C` as its parent; it is not a `conversation.root`.
@@ -188,5 +201,5 @@ transition application without re-validating the resulting spine.
 
 - No gc protection for code shas named only from `C` (invariant 3).
 - No retention or erasure policy; reflogs are kept forever.
-- Publication is branch-only; no squash policy, no PR.
+- Publication uses one branch per conversation; no squash policy or multi-workspace PR stacks.
 - Stacks and surfaces above one conversation are not designed.
