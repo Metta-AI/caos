@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 
 use caos::GitTransport;
 use caos_cli::InitialWorkspace;
-use conversation_protocol::v3::{GitStore, Oid, WorkspaceBase, WorkspaceConfig};
+use conversation_protocol::v3::{GitStore, Oid, WorkspaceConfig};
 
 use super::args::Args;
 
@@ -121,44 +121,8 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
             )?;
             let oid = Oid::parse(&commit, "initial checkout")?;
             import_checkout_commit(checkout, &client, &oid)?;
-            let repository = git(checkout, &["remote", "get-url", "origin"])
-                .unwrap_or_else(|_| checkout.to_string_lossy().into_owned());
-            let repository =
-                if Path::new(&repository).exists() || checkout.join(&repository).exists() {
-                    checkout
-                        .join(&repository)
-                        .canonicalize()
-                        .map_err(|e| e.to_string())?
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    repository
-                };
-            let mut config = WorkspaceConfig {
-                repository: Some(repository),
-                ..Default::default()
-            };
-            // A local remote-tracking tip is enough to identify the integrated
-            // base without fetching during startup. Update stack refreshes it.
-            let base_ref = git(
-                checkout,
-                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-            )
-            .or_else(|_| git(checkout, &["symbolic-ref", "--quiet", "HEAD"]))
-            .ok();
-            if let Some(base_ref) = base_ref {
-                let name = base_ref
-                    .strip_prefix("refs/remotes/origin/")
-                    .or_else(|| base_ref.strip_prefix("refs/heads/"))
-                    .unwrap_or(&base_ref);
-                if let Ok(base) = git(checkout, &["merge-base", &commit, &base_ref]) {
-                    config.base = Some(WorkspaceBase::Branch {
-                        name: name.into(),
-                        commit: Oid::parse(&base, "checkout base")?,
-                    });
-                }
-            }
-            config.validate()?;
+            let config =
+                caos_cli::workspaces::checkout_config(&GitTransport::discover(checkout)?, &commit)?;
             seeds.insert(
                 "main".into(),
                 InitialWorkspace {
@@ -208,17 +172,44 @@ fn copy_entry(source: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn create_client(
-    source: &Path,
-    data: &Path,
-    server: &str,
-    secrets: &Path,
-    checkout: Option<&Path>,
-) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
-    let clients = data.join("clients");
-    fs::create_dir_all(&clients).map_err(|e| e.to_string())?;
-    let staging = Staging(clients.join(format!(".new-{}", caos::fresh_entropy()?)));
+fn hash_key(dir: &Path, value: &serde_json::Value) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or("hash input missing")?
+        .write_all(value.to_string().as_bytes())
+        .map_err(|e| e.to_string())?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn create_harness(source: &Path, data: &Path) -> Result<PathBuf, String> {
+    let harnesses = data.join("harnesses");
+    fs::create_dir_all(&harnesses).map_err(|e| e.to_string())?;
+    let immutable = source.starts_with("/nix/store");
+    let pinned = if immutable {
+        Some(harnesses.join(hash_key(data, &serde_json::json!(["harness-v1", source]))?))
+    } else {
+        None
+    };
+    if let Some(path) = &pinned {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+    }
+    let staging = Staging(harnesses.join(format!(".new-{}", caos::fresh_entropy()?)));
     fs::create_dir(&staging.0).map_err(|e| e.to_string())?;
     let tracked = if source.join(".git").exists() {
         git(source, &["ls-files", "-z"])?
@@ -258,19 +249,7 @@ fn create_client(
     git(&staging.0, &["config", "gc.auto", "0"])?;
     git(&staging.0, &["add", "-A"])?;
     let tree = git(&staging.0, &["write-tree"])?;
-    // The key includes local policy too: never reuse another checkout's secret
-    // store or retarget an existing client's server.
-    fs::write(
-        staging.0.join(".git/launcher-key"),
-        format!(
-            "{server}\n{}\n{}",
-            secrets.display(),
-            checkout.map(|p| p.to_string_lossy()).unwrap_or_default()
-        ),
-    )
-    .map_err(|e| e.to_string())?;
-    let policy = git(&staging.0, &["hash-object", ".git/launcher-key"])?;
-    let destination = clients.join(format!("{tree}-{policy}"));
+    let destination = pinned.unwrap_or_else(|| harnesses.join(tree));
     if destination.exists() {
         return Ok(destination);
     }
@@ -287,6 +266,48 @@ fn create_client(
             "conversation harness",
         ],
     )?;
+    match fs::rename(&staging.0, &destination) {
+        Ok(()) => Ok(destination),
+        Err(_) if destination.exists() => Ok(destination),
+        Err(error) => Err(format!("installing harness: {error}")),
+    }
+}
+
+fn create_client(
+    source: &Path,
+    data: &Path,
+    server: &str,
+    secrets: &Path,
+    checkout: Option<&Path>,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let harness = create_harness(source, data)?;
+    let clients = data.join("clients");
+    fs::create_dir_all(&clients).map_err(|e| e.to_string())?;
+    // Structured policy avoids ambiguous keys when paths contain newlines.
+    let policy = hash_key(data, &serde_json::json!([server, secrets, checkout]))?;
+    let artifact = harness
+        .file_name()
+        .ok_or("harness has no name")?
+        .to_string_lossy();
+    let destination = clients.join(format!("{artifact}-{policy}"));
+    if destination.exists() {
+        return Ok(destination);
+    }
+    let staging = Staging(clients.join(format!(".new-{}", caos::fresh_entropy()?)));
+    git(
+        data,
+        &[
+            "clone",
+            "--quiet",
+            "--local",
+            "--no-hardlinks",
+            &harness.to_string_lossy(),
+            &staging.0.to_string_lossy(),
+        ],
+    )?;
+    git(&staging.0, &["remote", "remove", "origin"])?;
+    git(&staging.0, &["config", "gc.auto", "0"])?;
     git(&staging.0, &["remote", "add", "caos", server])?;
     git(&staging.0, &["config", "caos.launcher", "true"])?;
     if let Some(checkout) = checkout {
@@ -325,9 +346,10 @@ pub(super) fn checkout_for(
     {
         return Ok(client.into());
     }
-    let checkout = PathBuf::from(git(client, &["config", "--get", "caos.checkout"]).map_err(
-        |_| "this client has no local checkout; open caos from a checkout to use checkout commands",
-    )?);
+    let value = git(client, &["config", "--null", "--get", "caos.checkout"]).map_err(|_| {
+        "this client has no local checkout; open caos from a checkout to use checkout commands"
+    })?;
+    let checkout = PathBuf::from(value.strip_suffix('\0').ok_or("invalid checkout config")?);
     let repository = git(&checkout, &["remote", "get-url", "origin"])
         .unwrap_or_else(|_| checkout.to_string_lossy().into_owned());
     if config.repository.as_deref().is_none_or(|repo| {
@@ -470,6 +492,15 @@ mod tests {
         let second =
             create_client(&source, &data, "http://localhost:9091", &secrets, None).unwrap();
         assert_ne!(first, second);
+        assert_eq!(fs::read_dir(data.join("harnesses")).unwrap().count(), 1);
+        assert!(!fs::read_dir(data.join("harnesses"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join(caos::SECRETS_DIR)
+            .exists());
         fs::write(source.join("DEPS"), "changed\n").unwrap();
         let third = create_client(&source, &data, "http://localhost:9090", &secrets, None).unwrap();
         assert_ne!(first, third);

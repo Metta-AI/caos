@@ -1,7 +1,7 @@
 //! Preview and publish a selected set of named workspaces.
 use super::*;
 use caos_cli::workspaces::{
-    branch_snapshot, publication_order, publication_plan, publish_prepared_target,
+    publication_order, publication_plan, resolve_publication_plan, PublicationBase,
     PublicationTarget,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +12,6 @@ static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
 pub(super) struct PlanRow {
     pub target: PublicationTarget,
     pub included: bool,
-    pub pull_request: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -23,23 +22,6 @@ pub(super) struct PublishPlanPrompt {
     pub selected: usize,
     pub edit: Option<(bool, String)>, // true edits the PR base; false edits the branch.
     pub error: Option<String>,
-}
-
-impl PublishPlanPrompt {
-    fn refresh_bases(&mut self) {
-        let branches = self
-            .rows
-            .iter()
-            .map(|row| (row.target.workspace.clone(), row.target.branch.clone()))
-            .collect::<HashMap<_, _>>();
-        for row in &mut self.rows {
-            if let Some(parent) = &row.target.parent {
-                if let Some(branch) = branches.get(parent) {
-                    row.target.base = branch.clone();
-                }
-            }
-        }
-    }
 }
 
 impl App {
@@ -78,15 +60,9 @@ impl App {
                 publication_plan(transport, &conversation)?
                     .into_iter()
                     .map(|target| {
-                        let pull_request = super::super::workspace::lookup_workspace_pr(
-                            &target.repository,
-                            &target.branch,
-                            transport.work_dir(),
-                        )?;
                         Ok(PlanRow {
                             included: target.workspace == selected,
                             target,
-                            pull_request,
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()
@@ -150,11 +126,15 @@ impl App {
                                 Ok(()) => {
                                     let row = &mut prompt.rows[prompt.selected];
                                     if *base {
-                                        row.target.base = branch;
-                                        row.target.parent = parent;
+                                        row.target.base = match parent {
+                                            Some(parent) => PublicationBase::Workspace(parent),
+                                            None => PublicationBase::Branch(branch),
+                                        };
                                     } else {
                                         row.target.branch = branch;
-                                        row.pull_request = None;
+                                        if !row.target.repository.is_empty() {
+                                            row.target.diagnostic = None;
+                                        }
                                     }
                                     row.included = true;
                                     prompt.edit = None;
@@ -187,11 +167,10 @@ impl App {
                     let target = &prompt.rows[prompt.selected].target;
                     prompt.edit = Some((
                         true,
-                        target
-                            .parent
-                            .as_ref()
-                            .map(|parent| format!("@{parent}"))
-                            .unwrap_or_else(|| target.base.clone()),
+                        match &target.base {
+                            PublicationBase::Default => String::new(),
+                            other => other.to_string(),
+                        },
                     ));
                 }
                 KeyCode::Char('h') => {
@@ -210,7 +189,6 @@ impl App {
                 _ => {}
             }
         }
-        prompt.refresh_bases();
         self.selected_mut().publish_plan = Some(prompt);
     }
 
@@ -222,14 +200,18 @@ impl App {
             self.selected_mut().publish_plan = Some(prompt);
             return;
         }
-        // Changing a parent's branch changes its dependents' PR bases in this preview.
-        prompt.refresh_bases();
         let all = prompt
             .rows
             .iter()
             .map(|row| row.target.clone())
             .collect::<Vec<_>>();
-        let ordered = match publication_order(&all) {
+        let selected = prompt
+            .rows
+            .iter()
+            .filter(|row| row.included)
+            .map(|row| row.target.clone())
+            .collect::<Vec<_>>();
+        let ordered = match publication_order(&selected) {
             Ok(ordered) => ordered,
             Err(error) => {
                 prompt.error = Some(error);
@@ -272,33 +254,21 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let mut completed = Vec::new();
-                for target in &targets {
-                    let result = publish_target(
-                        transport,
-                        &conversation,
-                        &title,
-                        &options,
-                        target,
-                        &tx,
-                        &cancel,
-                    );
-                    match result {
-                        Ok(url) => completed.push(format!("{}: {url}", target.workspace)),
-                        Err(error) => {
-                            return Err(if completed.is_empty() {
-                                error
-                            } else {
-                                format!(
-                                    "{}\n\nPublication stopped at {}: {error}",
-                                    completed.join("\n"),
-                                    target.workspace
-                                )
-                            })
-                        }
-                    }
-                }
-                Ok(completed.join("\n"))
+                let targets = resolve_publication_plan(transport, &all, &targets)?;
+                caos_cli::publication::publish_plan(
+                    transport,
+                    &conversation,
+                    &title,
+                    &options,
+                    &targets,
+                    &cancel,
+                    |event| {
+                        let _ = tx.send(UiMessage::Turn {
+                            conversation: conversation.clone(),
+                            event,
+                        });
+                    },
+                )
             },
             move |result| UiMessage::Published {
                 conversation: finished_conversation,
@@ -306,114 +276,4 @@ impl App {
             },
         );
     }
-}
-
-fn publish_target(
-    transport: &GitTransport,
-    conversation: &str,
-    title: &str,
-    options: &TurnOptions,
-    target: &PublicationTarget,
-    tx: &Sender<UiMessage>,
-    cancel: &AtomicBool,
-) -> Result<String, String> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err("publication cancelled".into());
-    }
-    let load = conversation_load(transport, conversation)?.ok_or("conversation disappeared")?;
-    let workspace = load
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == target.workspace)
-        .ok_or("workspace disappeared")?;
-    if workspace.head != target.head || workspace.config != target.previous_config {
-        return Err(format!(
-            "workspace {:?} changed since the publication preview; review it again",
-            target.workspace
-        ));
-    }
-    let base =
-        branch_snapshot(transport, &target.repository, &target.base).map_err(
-            |error| match &target.parent {
-                Some(parent) => format!(
-                    "publish base workspace {parent:?} first or include it in the plan: {error}"
-                ),
-                None => error,
-            },
-        )?;
-    if let Some(parent) = &target.parent {
-        if load
-            .workspaces
-            .iter()
-            .find(|workspace| &workspace.name == parent)
-            .is_none_or(|workspace| workspace.head != base)
-        {
-            return Err(format!("base workspace {parent:?} has unpublished changes; include it in the publication plan"));
-        }
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return Err("publication cancelled".into());
-    }
-    let ancestor = remote_base_is_ancestor(&base, &target.head, transport.work_dir())?;
-    if !ancestor {
-        transport.ensure_pushed(&base)?;
-    }
-    let mut options = options.clone();
-    options.workspace = Some(target.workspace.clone());
-    let outcome = run_chat_turn(
-        transport,
-        &options,
-        conversation,
-        &publish_turn_message(&target.workspace, &base, ancestor),
-        None,
-        None,
-        |_| {
-            if cancel.load(Ordering::Relaxed) {
-                let _ = interrupt_request(transport, conversation);
-            }
-        },
-        |event| {
-            let _ = tx.send(UiMessage::Turn {
-                conversation: conversation.to_string(),
-                event,
-            });
-        },
-    )?;
-    if outcome.interrupted {
-        return Err("publication preparation was interrupted".into());
-    }
-    let prepared = conversation_load_at(transport, conversation, &outcome.commit)?;
-    let prepared = prepared
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == target.workspace)
-        .ok_or("workspace disappeared during preparation")?;
-    validate_prepared_workspace(&base, &prepared.head, transport.work_dir())?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err("publication cancelled".into());
-    }
-    let published =
-        publish_prepared_target(transport, conversation, target, &prepared.head, &base)?;
-    if published.status != conversation_protocol::v3::PublicationStatus::Complete {
-        return Err(format!(
-            "branch publication is {:?}: {}",
-            published.status,
-            publication_diagnostic(transport, conversation, &published.publication)?
-                .unwrap_or_default()
-        ));
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return Err(format!(
-            "branch {} was published; PR creation was cancelled",
-            published.branch
-        ));
-    }
-    super::super::workspace::find_or_open_workspace_pr_in(
-        &target.repository,
-        conversation,
-        &format!("{}: {title}", target.workspace),
-        &published,
-        &target.base,
-        transport.work_dir(),
-    )
 }

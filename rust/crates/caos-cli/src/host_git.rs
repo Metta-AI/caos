@@ -1,4 +1,4 @@
-//! Local-checkout and PR publication policy for the conversation TUI.
+//! Host Git and GitHub operations shared by clients.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 /// calling it. Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
-pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
+pub fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -39,7 +39,7 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
-pub(crate) fn commit_working_tree(
+pub fn commit_working_tree(
     message: &str,
     workspace: &str,
     cwd: &Path,
@@ -78,7 +78,7 @@ pub(crate) fn commit_working_tree(
 /// your checked-out branch as it is right now. It runs no `git ls-remote`/`git
 /// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
 /// round-trips to `origin`.
-pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+pub fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
     // `refs/remotes/origin/HEAD` is the local symref recording origin's default
     // branch; it is set at clone time and refreshed by `git remote set-head`.
     let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
@@ -98,11 +98,7 @@ pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), S
     Ok((branch, commit))
 }
 
-pub(crate) fn remote_base_is_ancestor(
-    target: &str,
-    head: &str,
-    cwd: &Path,
-) -> Result<bool, String> {
+pub fn remote_base_is_ancestor(target: &str, head: &str, cwd: &Path) -> Result<bool, String> {
     let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
     match ancestry.status.code() {
         Some(0) => Ok(true),
@@ -114,16 +110,12 @@ pub(crate) fn remote_base_is_ancestor(
     }
 }
 
-/// Accept either a branch name or the familiar origin/<branch> spelling.
-pub(crate) fn pr_base_branch(input: &str) -> &str {
+/// Accept either a branch name or the familiar `origin/<branch>` spelling.
+pub fn pr_base_branch(input: &str) -> &str {
     input.trim().strip_prefix("origin/").unwrap_or(input.trim())
 }
 
-pub(crate) fn validate_prepared_workspace(
-    target: &str,
-    head: &str,
-    cwd: &Path,
-) -> Result<(), String> {
+pub fn validate_prepared_workspace(target: &str, head: &str, cwd: &Path) -> Result<(), String> {
     if !remote_base_is_ancestor(target, head, cwd)? {
         return Err("the preparation turn did not merge the selected PR base".to_string());
     }
@@ -156,27 +148,16 @@ pub(crate) fn validate_prepared_workspace(
     Ok(())
 }
 
-pub(crate) fn find_or_open_workspace_pr_in(
+pub fn find_or_open_workspace_pr_in(
     repository: &str,
     name: &str,
     title: &str,
-    published: &caos_cli::PublishedBranch,
+    published: &crate::PublishedBranch,
     base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
-    let repository = caos_cli::normalize_repository_identity(repository)?;
+    let repository = crate::normalize_repository_identity(repository)?;
     find_or_open_workspace_pr_with(&repository, name, title, published, base, |args| {
-        capture_required("gh", args, cwd)
-    })
-}
-
-pub(crate) fn lookup_workspace_pr(
-    repository: &str,
-    branch: &str,
-    cwd: &Path,
-) -> Result<Option<String>, String> {
-    let repository = caos_cli::normalize_repository_identity(repository)?;
-    lookup_workspace_pr_with(&repository, branch, &mut |args| {
         capture_required("gh", args, cwd)
     })
 }
@@ -207,7 +188,7 @@ fn find_or_open_workspace_pr_with(
     repository: &str,
     name: &str,
     title: &str,
-    published: &caos_cli::PublishedBranch,
+    published: &crate::PublishedBranch,
     base: &str,
     mut gh: impl FnMut(&[&str]) -> Result<String, String>,
 ) -> Result<String, String> {
@@ -237,7 +218,7 @@ fn find_or_open_workspace_pr_with(
     ])
 }
 
-pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+pub fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     capture_required_bytes(program, args, cwd)
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
 }
@@ -314,23 +295,21 @@ mod tests {
         let transport = caos::GitTransport::discover(&repo).unwrap();
         let remote_url = remote.to_str().unwrap();
         assert_eq!(
-            caos_cli::workspaces::default_branch(&transport, remote_url).unwrap(),
+            crate::workspaces::default_branch(&transport, remote_url).unwrap(),
             "release/next"
         );
         assert_eq!(pr_base_branch(" origin/release/next "), "release/next");
         assert_eq!(pr_base_branch("release/next"), "release/next");
         assert_eq!(
-            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
+            crate::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             base
         );
         assert!(
-            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "missing")
+            crate::workspaces::branch_snapshot(&transport, remote_url, "missing")
                 .unwrap_err()
                 .contains("does not exist")
         );
-        assert!(
-            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "../invalid").is_err()
-        );
+        assert!(crate::workspaces::branch_snapshot(&transport, remote_url, "../invalid").is_err());
         validate_prepared_workspace(&base, &base, &repo).unwrap();
         assert!(validate_prepared_workspace(&base, &local, &repo)
             .unwrap_err()
@@ -342,7 +321,7 @@ mod tests {
             "conflict",
         );
         assert_eq!(
-            caos_cli::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
+            crate::workspaces::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             conflicted
         );
         assert!(validate_prepared_workspace(&base, &conflicted, &repo)
@@ -366,7 +345,7 @@ mod tests {
 
     #[test]
     fn pr_publication_creates_or_reuses_the_matching_origin_pr() {
-        let published = caos_cli::PublishedBranch {
+        let published = crate::PublishedBranch {
             workspace: "docs".to_string(),
             branch: "caos/talk-1".to_string(),
             head: "a".repeat(40),

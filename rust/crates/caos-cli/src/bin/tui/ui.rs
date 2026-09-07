@@ -1791,10 +1791,16 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
         );
     } else if let Some(name) = &picker.creating {
         let source = picker.source.as_deref().unwrap_or("");
-        let relationship = if picker.stacked {
-            "Dependent change: PR will target the source workspace's branch"
-        } else {
-            "Separate change: starts from the source workspace's current commit"
+        let relationship = match picker.creation {
+            caos_cli::workspaces::Creation::FromUpstream => {
+                "New change from upstream: excludes the source's unfinished changes"
+            }
+            caos_cli::workspaces::Creation::Stack => {
+                "Stack on this workspace: starts from its head; PR targets its branch"
+            }
+            caos_cli::workspaces::Creation::Copy => {
+                "Copy this snapshot: includes its code without depending on this workspace"
+            }
         };
         frame.render_widget(
             Paragraph::new(format!(
@@ -1918,7 +1924,11 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
             .iter()
             .map(|row| {
                 let check = if row.included { "[x]" } else { "[ ]" };
-                let operation = row.pull_request.as_deref().unwrap_or("Create or update PR");
+                let operation = row
+                    .target
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or("Create or update PR");
                 ListItem::new(vec![
                     Line::from(format!(
                         "{check} {}   {}",

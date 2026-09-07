@@ -3,12 +3,12 @@ use super::*;
 use conversation_protocol::v3::WorkspaceBase;
 
 pub(super) fn declaration() -> Value {
-    json!({"name":"workspaces", "description":"List workspaces, create a separate change from a named workspace, remove one, or promote a completed subagent result into a visible workspace. New workspaces share the source repository. Set stacked=true only when the new change depends on the source change and should have its own dependent PR. Temporary subagent workspaces remain inside their child conversation until promoted. Never remove a workspace with useful unmerged work without the user's agreement.",
+    json!({"name":"workspaces", "description":"List workspaces, create a separate change from a named workspace, remove one, or promote a completed subagent result into a visible workspace. New workspaces share the source repository. Choose mode=upstream for a new change excluding unfinished source edits, mode=stack to depend on the source with its own PR, or mode=copy to copy its current code without a dependency. Temporary subagent workspaces remain inside their child conversation until promoted. Never remove a workspace with useful unmerged work without the user's agreement.",
         "input_schema":{"type":"object","properties":{
             "action":{"type":"string","enum":["list","create","remove","promote"]},
             "name":{"type":"string","description":"Workspace to create or remove."},
             "source":{"type":"string","description":"Source workspace name (required for create; child workspace for promote)."},
-            "stacked":{"type":"boolean"},
+            "mode":{"type":"string","enum":["upstream","stack","copy"]},
             "child":{"type":"string","description":"Completed subagent ID to promote."}
         },"required":["action"]}})
 }
@@ -74,7 +74,19 @@ fn plan(
                 view,
                 name,
                 source,
-                input["stacked"].as_bool().unwrap_or(false),
+                match input["mode"].as_str() {
+                    Some("upstream") => {
+                        conversation_protocol::v3::workspaces::Creation::FromUpstream
+                    }
+                    Some("stack") => conversation_protocol::v3::workspaces::Creation::Stack,
+                    Some("copy") => conversation_protocol::v3::workspaces::Creation::Copy,
+                    // Accept requests prepared by older workers.
+                    None if input["stacked"].as_bool().unwrap_or(false) => {
+                        conversation_protocol::v3::workspaces::Creation::Stack
+                    }
+                    None => conversation_protocol::v3::workspaces::Creation::FromUpstream,
+                    Some(mode) => return Err(format!("unknown workspace creation mode {mode:?}")),
+                },
             )?;
             Ok((
                 transitions,
@@ -136,7 +148,13 @@ fn plan(
                     }
                 }
             }
-            config.branch = None;
+            config.branch = Some(
+                conversation_protocol::v3::workspaces::default_publication_branch(
+                    &view.identity()?.id,
+                    name,
+                    view.workspace_names()?.len() + 1,
+                ),
+            );
             Ok((
                 {
                     let mut transitions = vec![Transition::WorkspaceCreate {

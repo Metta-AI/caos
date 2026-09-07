@@ -438,6 +438,10 @@ attachments supply code, repository instructions and scoped tool schemas.
 Bash integration inputs capture other workspaces by content outside the writable
 output tree. Workspace base edges define stacks; explicit Update stack merges
 upstream changes and records incorporated base pins, stopping on conflicts.
+Code head and upstream checkpoint move together on rollback. Workspace creation
+explicitly distinguishes a new change from upstream, stacking on the selected
+workspace, and copying its snapshot. Repository and publication defaults are
+recorded when a workspace is created.
 See [Chat v3](design/chat.md) for the precise launcher and workspace contract.
 
 ## Tools thread a commit, not a tree
@@ -589,6 +593,10 @@ configured repository and branch. Single-workspace defaults retain
 `caos-workspaces/<conversation-id>/<workspace>`.
 `Ctrl+P` previews workspaces, branches and bases, prepares selected workspaces
 in dependency order, and opens or reuses each PR by repository and head branch.
+The preview uses local metadata; remote defaults are resolved only for the
+selected execution plan. The host library owns preparation and publication,
+while clients supply progress and cancellation. Forked conversations own new
+publication branches; historical receipts do not transfer branch ownership.
 `/publish-branch` pushes the selected branch without preparation or PR creation.
 Neither exports the conversation state or imports conversations from GitHub.
 

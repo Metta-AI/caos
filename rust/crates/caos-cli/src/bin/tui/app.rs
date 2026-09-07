@@ -27,7 +27,6 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::workspace::{
     commit_working_tree, load_conversation_workspace, local_default_branch_tip, pr_base_branch,
-    remote_base_is_ancestor, validate_prepared_workspace,
 };
 
 #[path = "ui.rs"]
@@ -2715,24 +2714,33 @@ impl App {
                     Ok(format!("Workspace {name:?} will publish to {branch}."))
                 });
             }
-            ["create", name] | ["stack", name] => {
+            ["create", name] | ["stack", name] | ["copy", name] => {
                 let source = match self.selected().require_selected_workspace() {
                     Ok(workspace) => workspace.name.clone(),
                     Err(error) => { self.selected_mut().show_command_error(error); return; }
                 };
                 let name = (*name).to_string();
-                let stacked = parts[0] == "stack";
+                let creation = match parts[0] {
+                    "stack" => caos_cli::workspaces::Creation::Stack,
+                    "copy" => caos_cli::workspaces::Creation::Copy,
+                    _ => caos_cli::workspaces::Creation::FromUpstream,
+                };
                 self.start_workspace_mutation("creating workspace", move |transport, conversation| {
-                    caos_cli::workspaces::create_from_workspace(transport, conversation, &name, &source, stacked)?;
+                    caos_cli::workspaces::create_from_workspace(transport, conversation, &name, &source, creation)?;
                     Ok(format!("Created workspace {name:?} from {source:?}."))
                 });
             }
             ["create", name, rev] => {
                 let name = (*name).to_string();
                 let rev = (*rev).to_string();
+                let config = self.selected().require_selected_workspace().ok().map(|workspace| workspace.config.clone());
                 self.start_workspace_mutation("creating workspace", move |transport, conversation| {
                     let commit = resolve_workspace_revision(transport, &rev)?;
-                    create_workspace(transport, conversation, &name, &commit)?;
+                    if let Some(config) = config {
+                        caos_cli::create_workspace_with_config(transport, conversation, &name, &commit, config)?;
+                    } else {
+                        create_workspace(transport, conversation, &name, &commit)?;
+                    }
                     Ok(format!("Created workspace {name:?} at {}.", short_hash(&commit)))
                 });
             }
@@ -2760,7 +2768,7 @@ impl App {
                 });
             }
             _ => self.selected_mut().show_command_error(
-                "usage: /workspace [use <name>|create <name> [<rev>]|attach <name> <repo> [<branch>|<sha>]|branch <name> <branch>|stack <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
+                "usage: /workspace [use <name>|create <name> [<rev>]|attach <name> <repo> [<branch>|<sha>]|branch <name> <branch>|stack <name>|copy <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
             ),
         }
     }
@@ -4225,16 +4233,6 @@ impl App {
     }
 }
 
-fn publish_turn_message(workspace: &str, target: &str, base_is_ancestor: bool) -> String {
-    let preparation = if base_is_ancestor {
-        format!("The selected PR base `{target}` is already an ancestor of this workspace; do not merge it again.")
-    } else {
-        let arguments = serde_json::json!({"workspace": workspace, "theirs": target});
-        format!("First call the existing `merge` tool with these arguments: {arguments}. Resolve every entry in `.caos/conflicts`, then remove `.caos/conflicts`.")
-    };
-    format!("Prepare workspace {workspace:?} for publication. {preparation} Build and test that workspace. Finish only when it is ready to publish.")
-}
-
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
     TranscriptPoint {
         row: row.clamp(area.y, area.bottom().saturating_sub(1)),
@@ -4268,11 +4266,16 @@ fn new_conversation_options(
 ) -> Result<(TurnOptions, String), String> {
     if let Some(seeds) = &mut options.initial_workspaces {
         if let Some(base) = requested_base {
-            let config = seeds
+            let mut config = seeds
                 .values()
                 .next()
                 .map(|seed| seed.config.clone())
                 .unwrap_or_default();
+            config = caos_cli::workspaces::config_at_commit(
+                &GitTransport::discover(repo_dir)?,
+                config,
+                &base,
+            )?;
             *seeds = std::collections::BTreeMap::from([(
                 "main".into(),
                 caos_cli::InitialWorkspace {
@@ -7160,15 +7163,14 @@ mod tests {
             error: None,
             rows: vec![PlanRow {
                 included: true,
-                pull_request: None,
                 target: PublicationTarget {
                     workspace: "docs".into(),
                     head: "a".repeat(40),
                     repository: "https://github.com/team/repo".into(),
                     branch: "caos/talk/docs".into(),
-                    base: "main".into(),
-                    parent: None,
+                    base: caos_cli::workspaces::PublicationBase::Branch("main".into()),
                     previous_config: Default::default(),
+                    diagnostic: None,
                 },
             }],
         });
@@ -7182,7 +7184,7 @@ mod tests {
             app.selected().publish_plan.as_ref().unwrap().rows[0]
                 .target
                 .base,
-            "release/next"
+            caos_cli::workspaces::PublicationBase::Branch("release/next".into())
         );
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

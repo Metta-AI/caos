@@ -168,13 +168,29 @@ pub fn workspace_order(configs: &BTreeMap<String, WorkspaceConfig>) -> Result<Ve
     Ok(ordered)
 }
 
+pub fn default_publication_branch(id: &str, name: &str, count: usize) -> String {
+    if count == 1 {
+        format!("caos/{id}")
+    } else {
+        format!("caos-workspaces/{id}/{name}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Creation {
+    #[default]
+    FromUpstream,
+    Stack,
+    Copy,
+}
+
 /// Create a named line of work from one pinned workspace snapshot. The caller
 /// publishes this sequence atomically with any associated operation receipt.
 pub fn create_from_workspace(
     view: &super::view::Conversation<'_>,
     name: &str,
     source: &str,
-    stacked: bool,
+    creation: Creation,
 ) -> Result<Vec<super::apply::Transition>, String> {
     use super::apply::Transition;
     paths::validate_workspace_name(name)?;
@@ -185,16 +201,29 @@ pub fn create_from_workspace(
         .workspace(source)?
         .ok_or_else(|| format!("no workspace {source:?}"))?;
     let mut config = view.workspace_config(source)?;
-    config.branch = None;
-    if stacked {
-        config.base = Some(WorkspaceBase::Workspace {
-            name: source.to_string(),
-            commit: ws.commit.clone(),
-        });
-    }
+    config.branch = Some(default_publication_branch(
+        &view.identity()?.id,
+        name,
+        view.workspace_names()?.len() + 1,
+    ));
+    let commit = match creation {
+        Creation::FromUpstream => config
+            .base
+            .as_ref()
+            .map(|base| base.commit().clone())
+            .unwrap_or(ws.initial),
+        Creation::Stack => {
+            config.base = Some(WorkspaceBase::Workspace {
+                name: source.to_string(),
+                commit: ws.commit.clone(),
+            });
+            ws.commit
+        }
+        Creation::Copy => ws.commit,
+    };
     let mut transitions = vec![Transition::WorkspaceCreate {
         name: name.to_string(),
-        commit: ws.commit,
+        commit,
         origin: None,
     }];
     if config != WorkspaceConfig::default() {

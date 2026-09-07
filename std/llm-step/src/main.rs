@@ -1206,29 +1206,8 @@ fn prepare_compute(
                     "workspace_tool needs tool",
                 )));
             };
-            let Some(tool) = tools::tree_tool(ws, name)? else {
-                return Ok(Prepared::Result(error_block(
-                    &call.id,
-                    "no such tool in the selected workspace",
-                )));
-            };
             let nested = json!({"id":call.id,"name":call.name,"input":clean["input"].get("arguments").cloned().unwrap_or_else(|| json!({}))});
-            match tools::tree_tool_args(&nested, &tool) {
-                Err(block) => Ok(Prepared::Result(block)),
-                Ok(bound) => {
-                    launch_tree_evaluation(
-                        &nested,
-                        name,
-                        &bound,
-                        tool.git,
-                        ws,
-                        wc,
-                        request,
-                        round.declaring_round,
-                    )?;
-                    Ok(Prepared::Evaluation)
-                }
-            }
+            prepare_repository_tool(&nested, name, ws, wc, request, round)
         }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
@@ -1237,29 +1216,43 @@ fn prepare_compute(
             prepare_githist(cfg, &clean, name, ws, wc)
         }
         name if !tools::is_inline(name) => {
-            let Some(tool) = tools::tree_tool(ws, name)? else {
-                return Err(format!(
-                    "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, write, edit, merge, caos-build, caos-test, caos-test-result, spawn_agent, wait_agent, harvest_agent; plus this workspace's caos-tools/<name>/ tools)"
-                ));
-            };
-            match tools::tree_tool_args(&clean, &tool) {
-                Err(block) => Ok(Prepared::Result(block)),
-                Ok(bound) => {
-                    launch_tree_evaluation(
-                        &clean,
-                        name,
-                        &bound,
-                        tool.git,
-                        ws,
-                        wc,
-                        request,
-                        round.declaring_round,
-                    )?;
-                    Ok(Prepared::Evaluation)
-                }
-            }
+            prepare_repository_tool(&clean, name, ws, wc, request, round)
         }
         name => Err(format!("model called unavailable tool {name:?}")),
+    }
+}
+
+// Both the explicit workspace_tool call and its single-workspace shorthand
+// bind and evaluate the same request. Keep the original name in the receipt.
+fn prepare_repository_tool(
+    call: &Value,
+    name: &str,
+    ws: &str,
+    wc: &str,
+    request: &Oid,
+    round: &RoundState,
+) -> Result<Prepared, String> {
+    let Some(tool) = tools::tree_tool(ws, name)? else {
+        return Ok(Prepared::Result(error_block(
+            call["id"].as_str().unwrap_or(""),
+            &format!("no tool {name:?} in the selected workspace"),
+        )));
+    };
+    match tools::tree_tool_args(call, &tool) {
+        Err(block) => Ok(Prepared::Result(block)),
+        Ok(bound) => {
+            launch_tree_evaluation(
+                call,
+                name,
+                &bound,
+                tool.git,
+                ws,
+                wc,
+                request,
+                round.declaring_round,
+            )?;
+            Ok(Prepared::Evaluation)
+        }
     }
 }
 
