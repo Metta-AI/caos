@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# A disposable, guided TUI walkthrough. No agent messages or PRs are sent by this script.
+set -euo pipefail
+
+setup_only=false
+case "${1:-}" in
+  --setup-only) setup_only=true ;;
+  "") ;;
+  *) echo "usage: $0 [--setup-only]" >&2; exit 2 ;;
+esac
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cli=${CAOS_DEMO_CLI:-$repo/result/bin/caos}
+if [ ! -x "$cli" ]; then
+  echo "Build result/bin/caos first, or set CAOS_DEMO_CLI to its absolute path." >&2
+  exit 1
+fi
+case "$cli" in
+  /*) ;;
+  *) echo "CAOS_DEMO_CLI must be an absolute path." >&2; exit 1 ;;
+esac
+case "$repo" in
+  *[[:space:]]*) echo "The TUI workspace commands currently require paths without spaces." >&2; exit 1 ;;
+esac
+
+mkdir -p "$repo/.caos-dev"
+demo=$(mktemp -d "$repo/.caos-dev/workspace-demo.XXXXXX")
+init_repo() {
+  git init -q -b main "$1"
+  git -C "$1" config user.name "Workspace Demo"
+  git -C "$1" config user.email "workspace-demo@example.invalid"
+}
+init_repo "$demo/app"
+printf '# Demo app\n\nA tiny repository for exploring workspaces.\n' > "$demo/app/README.md"
+git -C "$demo/app" add README.md
+git -C "$demo/app" commit -qm "Start demo app"
+base=$(git -C "$demo/app" rev-parse HEAD)
+git -C "$demo/app" checkout -qb demo-edit
+printf 'This is the example feature change.\n' > "$demo/app/feature.txt"
+git -C "$demo/app" add feature.txt
+git -C "$demo/app" commit -qm "Add an example feature"
+feature=$(git -C "$demo/app" rev-parse HEAD)
+# Keep the checkout on the feature commit while its upstream stays at main.
+git -C "$demo/app" remote add origin "$demo/app"
+git -C "$demo/app" fetch -q origin main
+git -C "$demo/app" branch --set-upstream-to=origin/main demo-edit >/dev/null
+
+init_repo "$demo/docs"
+printf '# Demo docs\n\nThis is a separate Git repository.\n' > "$demo/docs/README.md"
+git -C "$demo/docs" add README.md
+git -C "$demo/docs" commit -qm "Start demo docs"
+
+cat > "$demo/commands.txt" <<EOF
+/workspace create fresh
+/workspace use main
+/workspace copy copied
+/workspace use main
+/workspace stack followup
+/workspace attach docs $demo/docs main
+/workspace use main
+/workspace
+EOF
+
+cat > "$demo/WALKTHROUGH.md" <<EOF
+# Workspace walkthrough
+
+Start with ./launch from this directory. The TUI starts main at the app checkout,
+which contains feature.txt on top of its upstream main branch.
+It asks for an Anthropic key if none is configured; the workspace commands below
+do not call the model. Paste one command at a time and wait for it to finish.
+Ctrl+S sends a command; Enter inserts a newline. Keep this file open in another terminal.
+
+$(cat "$demo/commands.txt")
+
+The last command opens the workspace picker. Expected state:
+
+| Workspace | Current commit | Upstream |
+| --- | --- | --- |
+| main | $feature | app repository, main |
+| fresh | $base | app repository, main |
+| copied | $feature | app repository, main |
+| followup | $feature | workspace main |
+| docs | its own initial commit | docs repository, main |
+
+Create starts a separate change from upstream. Copy includes feature.txt but
+retains the repository upstream. Stack includes feature.txt and follows the main workspace.
+The source locator stays pinned; these operations choose no publication branch.
+Escape closes the picker. Ctrl+O reopens it; Ctrl+Q quits the TUI.
+
+## Update upstream
+
+In another terminal, run ./advance-upstream from this directory. It commits a
+new file on the app repository's main branch. Then in the TUI:
+
+/workspace update --all
+/workspace
+
+The app workspaces now include upstream.txt, and feature.txt stays in main,
+copied, and followup. The docs workspace is unchanged. An update with no new
+upstream commits is a no-op.
+
+## Preview publication
+
+Ctrl+P opens the publication preview. Inspect the workspace selection, destination
+branches, and the followup PR's dependency on main, then Escape to close it.
+These fixtures are local repositories, so they have no GitHub PR destination.
+Use an attached GitHub repository when you want to try actual PR publication.
+
+Each invocation of dev/demo-workspaces creates fresh fixtures. This directory
+is yours to edit; it does not modify the CAOS checkout or publish anything.
+EOF
+
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf 'cd %q\n' "$demo/app"
+  printf 'exec %q tui --new "$@"\n' "$cli"
+} > "$demo/launch"
+
+{
+  printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+  printf 'cd %q\n' "$demo/app"
+  cat <<'EOF'
+if git cat-file -e main:upstream.txt 2>/dev/null; then
+  echo "Upstream already advanced."
+  exit 0
+fi
+git checkout -q main
+printf 'An independent upstream change.\n' > upstream.txt
+git add upstream.txt
+git commit -qm "Advance demo upstream"
+git log -1 --oneline
+git checkout -q demo-edit
+EOF
+} > "$demo/advance-upstream"
+chmod +x "$demo/launch" "$demo/advance-upstream"
+
+printf 'Demo directory: %s\nWalkthrough: %s/WALKTHROUGH.md\n\n' "$demo" "$demo"
+cat "$demo/commands.txt"
+printf '\nStart a new demo conversation with: %s/launch\n' "$demo"
+if [ "$setup_only" = false ]; then
+  read -r -p "Press Enter to open the TUI. "
+  exec "$demo/launch"
+fi
