@@ -1242,9 +1242,15 @@ fn conversation_id_from_key(key: &str) -> Result<String, String> {
     if hex.is_empty() || hex.len() % 2 != 0 {
         return Err(format!("invalid conversation membership key {key:?}"));
     }
+    // `as_chunks::<2>()` rather than `chunks_exact(2)`: the pair is a `[u8; 2]`
+    // rather than a slice, so the indexing below cannot panic and needs no
+    // bounds check. The odd-length case is already rejected above, which is
+    // what makes the discarded remainder correct.
     let bytes = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let high = lowercase_hex_nibble(pair[0])?;
             let low = lowercase_hex_nibble(pair[1])?;
