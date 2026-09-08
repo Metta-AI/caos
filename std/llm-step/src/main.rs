@@ -82,7 +82,7 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 impl Config {
     fn for_workspace(&self, view: &Conversation<'_>, name: &str) -> Result<Self, String> {
         let mut scoped = self.clone();
-        if let Some(repository) = view.workspace_config(name)?.repository {
+        if let Some(repository) = view.workspace_config(name)?.repository() {
             let identity =
                 conversation_protocol::v3::workspaces::normalize_repository_identity(&repository)?;
             scoped.merge_refs = self.repository_refs.get(&identity).cloned();
@@ -1940,12 +1940,12 @@ fn spawn_agent_call(
         .map(|(name, _)| parent_view.workspace_config(name))
         .transpose()?
         .map(|mut config| {
-            config.branch = None;
+            config.publication = None;
             if matches!(
-                config.base,
+                config.upstream,
                 Some(conversation_protocol::v3::WorkspaceBase::Workspace { .. })
             ) {
-                config.base = None;
+                config.upstream = None;
             }
             config
         });

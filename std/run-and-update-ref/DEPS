@@ -5,3 +5,4 @@
 ../rustc rustc
 ../git-runner git-runner
 ../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator

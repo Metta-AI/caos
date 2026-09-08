@@ -2696,7 +2696,11 @@ impl App {
                 let repository = (*repository).to_string();
                 let revision = parts.get(3).map(|value| (*value).to_string());
                 self.start_workspace_mutation("attaching repository", move |transport, conversation| {
-                    caos_cli::workspaces::attach(transport, conversation, &name, &repository, revision.as_deref())?;
+                    if revision.is_none() && (repository.starts_with("git+") || repository.starts_with("github:")) {
+                        caos_cli::workspaces::attach_source(transport, conversation, &name, &repository)?;
+                    } else {
+                        caos_cli::workspaces::attach(transport, conversation, &name, &repository, revision.as_deref())?;
+                    }
                     Ok(format!("Attached {repository} as workspace {name:?}."))
                 });
             }
@@ -2706,7 +2710,11 @@ impl App {
                 self.start_workspace_mutation("setting publication branch", move |transport, conversation| {
                     let load = conversation_load(transport, conversation)?.ok_or("conversation disappeared")?;
                     let mut config = load.workspaces.into_iter().find(|ws| ws.name == name).ok_or("workspace disappeared")?.config;
-                    config.branch = Some(branch.clone());
+                    config.publication = Some(conversation_protocol::v3::PublicationDestination {
+                        repository: Some(caos_cli::workspaces::repository_url(transport, &config)?),
+                        branch: branch.clone(),
+                        base: config.publication.as_ref().and_then(|p| p.base.clone()),
+                    });
                     caos_cli::workspaces::configure(transport, conversation, &name, config)?;
                     Ok(format!("Workspace {name:?} will publish to {branch}."))
                 });

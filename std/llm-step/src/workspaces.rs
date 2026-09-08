@@ -19,7 +19,7 @@ pub(super) fn context(view: &Conversation<'_>, focus: Option<&str>) -> Result<St
     for (name, ws) in &workspaces {
         let config = view.workspace_config(name)?;
         rows.push(
-            json!({"name":name,"head":ws.commit,"repository":config.repository,"base":config.base}),
+            json!({"name":name,"head":ws.commit,"repository":config.repository(),"base":config.upstream}),
         );
     }
     Ok(format!("\n\nWorkspaces: {}\nWorkspace selected when this request started: {}. UI selection changes do not change this request's target. Pass workspace explicitly to tools when there are multiple workspaces. Use workspaces to organize independent changes; use spawn_agent for temporary parallel work and promote only results that deserve separate review.", serde_json::to_string(&rows).map_err(|error| error.to_string())?, focus.unwrap_or("none")))
@@ -131,15 +131,15 @@ fn plan(
                 .ok_or("child is missing its terminal checkpoint")?;
             let mut config = Conversation::open(store, terminal)?.workspace_config(source)?;
             // Child-local dependency names do not identify workspaces in the parent.
-            if matches!(config.base, Some(WorkspaceBase::Workspace { .. })) {
-                config.base = None;
+            if matches!(config.upstream, Some(WorkspaceBase::Workspace { .. })) {
+                config.upstream = None;
             }
             if child.spawn_intent.workspace_name.as_deref() == Some(source) {
                 if let Some(parent) = child.spawn_intent.workspace_name.as_deref() {
                     if view.workspace(parent)?.is_some()
-                        && view.workspace_config(parent)?.repository == config.repository
+                        && view.workspace_config(parent)?.repository() == config.repository()
                     {
-                        config.base = child.initial_workspace.as_ref().map(|commit| {
+                        config.upstream = child.initial_workspace.as_ref().map(|commit| {
                             WorkspaceBase::Workspace {
                                 name: parent.to_string(),
                                 commit: commit.clone(),
@@ -148,13 +148,7 @@ fn plan(
                     }
                 }
             }
-            config.branch = Some(
-                conversation_protocol::v3::workspaces::default_publication_branch(
-                    &view.identity()?.id,
-                    name,
-                    view.workspace_names()?.len() + 1,
-                ),
-            );
+            config.publication = None;
             Ok((
                 {
                     let mut transitions = vec![Transition::WorkspaceCreate {

@@ -31,4 +31,4 @@ pub use tree::{
     CommitInfo, Mode, ObjectStore, Signature, Snapshot, StoreError, TreeBuilder, TreeEntry,
 };
 pub use validate::{validate_commit, validate_spine, Validated};
-pub use workspaces::{workspace_order, WorkspaceBase, WorkspaceConfig};
+pub use workspaces::{workspace_order, PublicationDestination, WorkspaceBase, WorkspaceConfig};

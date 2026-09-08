@@ -91,6 +91,10 @@ pub enum Transition {
         commit: Oid,
         origin: Option<WorkspaceOrigin>,
     },
+    LegacyWorkspaceConfigure {
+        name: String,
+        encoded: Vec<u8>,
+    },
     WorkspaceConfigure {
         name: String,
         config: super::WorkspaceConfig,
@@ -141,7 +145,9 @@ impl Transition {
             Transition::SubagentTerminal { .. } => Kind::SubagentTerminal,
             Transition::SubagentApply { .. } => Kind::SubagentApply,
             Transition::WorkspaceCreate { .. } => Kind::WorkspaceCreate,
-            Transition::WorkspaceConfigure { .. } => Kind::WorkspaceConfigure,
+            Transition::WorkspaceConfigure { .. } | Transition::LegacyWorkspaceConfigure { .. } => {
+                Kind::WorkspaceConfigure
+            }
             Transition::WorkspaceAdvance { .. } => Kind::WorkspaceAdvance,
             Transition::WorkspaceRollback { .. } => Kind::WorkspaceRollback,
             Transition::WorkspaceRemove { .. } => Kind::WorkspaceRemove,
@@ -589,6 +595,21 @@ pub fn apply(
                 return Err(format!("workspace {name:?} already exists"));
             }
             put_workspace(&mut builder, name, commit, commit, origin.as_ref());
+        }
+        Transition::LegacyWorkspaceConfigure { name, encoded } => {
+            let conversation = parent(store, parent_tree)?;
+            let workspace = conversation
+                .workspace(name)?
+                .ok_or("workspace does not exist")?;
+            let config = super::workspaces::legacy_config(encoded, &workspace.initial)?;
+            let mut configs = conversation.workspace_configs()?;
+            configs.insert(name.clone(), config);
+            super::workspace_order(&configs)?;
+            builder.put(
+                &paths::workspace_config_path(name),
+                Mode::Blob,
+                encoded.clone(),
+            );
         }
         Transition::WorkspaceConfigure { name, config } => {
             let conversation = parent(store, parent_tree)?;

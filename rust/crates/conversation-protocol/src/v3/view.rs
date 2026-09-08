@@ -120,7 +120,16 @@ impl<'s> Conversation<'s> {
             return Err(format!("workspace {name:?} does not exist"));
         }
         self.optional_blob(&paths::workspace_config_path(name))?
-            .map(|bytes| super::WorkspaceConfig::parse(&bytes))
+            .map(|bytes| {
+                if super::workspaces::is_legacy_config(&bytes)? {
+                    super::workspaces::legacy_config(
+                        &bytes,
+                        &self.workspace(name)?.expect("checked above").initial,
+                    )
+                } else {
+                    super::WorkspaceConfig::parse(&bytes)
+                }
+            })
             .transpose()
             .map(Option::unwrap_or_default)
     }

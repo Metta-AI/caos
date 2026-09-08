@@ -89,6 +89,7 @@ spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
 [ "$(jq -r '.status' <<<"$spawn_record")" = complete ] \
   || fail "spawn tool record is not complete"
 
+
 $TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
   --round 0 --id toolu_spawn > /tmp/spawn-observation.json
 child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
@@ -222,7 +223,7 @@ printf '{"content":[{"id":"toolu_promote","input":{"action":"promote","child":"%
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
 [ "$(workspace_commit "$head2" review)" = "$child_main" ] || fail "promotion did not retain the completed child's snapshot"
-record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.base.name == "main" and .base.commit == $commit' >/dev/null || fail "promotion lost the child base"
+record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "promotion lost the child upstream or inherited publication settings"
 parent_after=$(workspace_commit "$head2")
 [ "$parent_after" != "$parent_main" ] || fail "harvest did not move parent main"
 fetch_code "$parent_after" "fetching harvested parent workspace"

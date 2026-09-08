@@ -389,6 +389,14 @@ fn reconstruct(
         }
         Kind::WorkspaceConfigure => {
             let name = single_workspace_name(changes, kind)?;
+            if let Some(encoded) = child_snapshot
+                .snapshot()
+                .read(&paths::workspace_config_path(&name))?
+            {
+                if super::workspaces::is_legacy_config(&encoded)? {
+                    return Ok(Transition::LegacyWorkspaceConfigure { name, encoded });
+                }
+            }
             let config = child_snapshot.workspace_config(&name)?;
             Ok(Transition::WorkspaceConfigure { name, config })
         }
@@ -859,7 +867,11 @@ mod tests {
 
         // Extend the original byte-pinned fixture without rewriting its history.
         let config = crate::v3::WorkspaceConfig {
-            branch: Some("caos/review".to_string()),
+            publication: Some(crate::v3::PublicationDestination {
+                repository: Some("https://example.com/repo".into()),
+                branch: "caos/review".into(),
+                base: None,
+            }),
             ..Default::default()
         };
         let transition = Transition::WorkspaceConfigure {

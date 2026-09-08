@@ -505,15 +505,8 @@ fn mint_conversation_root(
             &legacy
         }
     };
-    let mut seeds = seeds.clone();
-    let count = seeds.len();
-    for (name, seed) in &mut seeds {
-        seed.config
-            .branch
-            .get_or_insert_with(|| workspaces::generated_branch(id, name, count));
-    }
     let mut workspaces = BTreeMap::new();
-    for (name, seed) in &seeds {
+    for (name, seed) in seeds {
         let commit = oid(&seed.commit, "initial workspace")?;
         ensure_code_commit(t, store, &commit)?;
         reject_reserved_caos(t, commit.as_str(), "initial workspace")?;
@@ -1512,7 +1505,7 @@ fn load_at(
     for (name, workspace) in conversation.workspaces()? {
         let config = conversation.workspace_config(&name)?;
         let base = config
-            .base
+            .upstream
             .as_ref()
             .map_or(&workspace.initial, |base| base.commit());
         let mut diff = workspace_diff(t, store, &name, base, &workspace.commit)?;
@@ -2038,7 +2031,14 @@ pub fn fork_conversation(
     let configs = source.workspace_configs()?;
     let mut candidate = mint_transition(&mut store, &from, &transition, &signature(user)?)?;
     for (name, mut config) in configs.clone() {
-        config.branch = Some(workspaces::generated_branch(id, &name, configs.len()));
+        let Some(destination) = config.publication.as_mut() else {
+            continue;
+        };
+        let branch = workspaces::generated_branch(id, &name, configs.len());
+        if destination.branch == branch {
+            continue;
+        }
+        destination.branch = branch;
         candidate = mint_transition(
             &mut store,
             &candidate,
@@ -2176,6 +2176,8 @@ fn append_publication_pending(
     id: &str,
     refname: &str,
     pending: &PublicationRecord,
+    previous: &conversation_protocol::v3::WorkspaceConfig,
+    destination: conversation_protocol::v3::PublicationDestination,
 ) -> Result<PublicationRecord, String> {
     let mut result = None;
     append_transition(
@@ -2194,10 +2196,26 @@ fn append_publication_pending(
                 result = Some(existing);
                 return Ok(Step::Done(head.to_string()));
             }
-            result = Some(pending.clone());
-            Ok(Step::Mint(Transition::PublicationPending {
+            let mut config =
+                Conversation::open(store, head)?.workspace_config(&pending.workspace_name)?;
+            if &config != previous {
+                return Err(
+                    "workspace settings changed while preparing publication; review again".into(),
+                );
+            }
+            let mut transitions = Vec::new();
+            if config.publication.as_ref() != Some(&destination) {
+                config.publication = Some(destination.clone());
+                transitions.push(Transition::WorkspaceConfigure {
+                    name: pending.workspace_name.clone(),
+                    config,
+                });
+            }
+            transitions.push(Transition::PublicationPending {
                 record: pending.clone(),
-            }))
+            });
+            result = Some(pending.clone());
+            Ok(Step::MintMany(transitions))
         },
     )?;
     Ok(result.expect("publication append always records a result"))
@@ -2395,12 +2413,8 @@ fn publish_workspace_branch_inner(
             (repository, branch)
         }
     };
-    conversation_protocol::v3::WorkspaceConfig {
-        repository: Some(repository_url.clone()),
-        branch: Some(branch.clone()),
-        base: None,
-    }
-    .validate()?;
+    conversation_protocol::v3::workspaces::validate_repository(&repository_url)?;
+    conversation_protocol::v3::workspaces::validate_branch(&branch)?;
     let repository = normalize_repository_identity(&repository_url)?;
     drop(conversation);
 
@@ -2469,7 +2483,18 @@ fn publish_workspace_branch_inner(
         evidence: None,
         observed: None,
     };
-    let joined = append_publication_pending(t, id, &conversation_ref, &pending)?;
+    let joined = append_publication_pending(
+        t,
+        id,
+        &conversation_ref,
+        &pending,
+        &config,
+        conversation_protocol::v3::PublicationDestination {
+            repository: Some(repository_url),
+            branch: branch.clone(),
+            base: config.publication.as_ref().and_then(|p| p.base.clone()),
+        },
+    )?;
     if joined.status != PublicationStatus::Pending {
         return Ok(PublishedBranch {
             workspace,
@@ -2545,7 +2570,7 @@ pub fn create_workspace_with_config(
     append_transition(t, id, &refname, "creating a workspace", |store, head| {
         if let Some(existing) = Conversation::open(store, head)?.workspace(name)? {
             let mut existing_config = Conversation::open(store, head)?.workspace_config(name)?;
-            existing_config.branch = None;
+            existing_config.publication = None;
             if existing.commit == commit
                 && existing.initial == commit
                 && existing.origin.is_none()
@@ -2555,12 +2580,6 @@ pub fn create_workspace_with_config(
             }
             return Err(format!("workspace {name:?} already exists"));
         }
-        let mut config = config.clone();
-        config.branch = Some(workspaces::generated_branch(
-            id,
-            name,
-            Conversation::open(store, head)?.workspace_names()?.len() + 1,
-        ));
         Ok(Step::MintMany(vec![
             Transition::WorkspaceCreate {
                 name: name.to_string(),
@@ -2598,7 +2617,7 @@ pub fn rollback_workspace(
             let current_config = conversation.workspace_config(name)?;
             if workspace.commit == commit
                 && current_config
-                    .base
+                    .upstream
                     .as_ref()
                     .map(|base| {
                         conversation_protocol::v3::CodeOps::is_ancestor(
@@ -2631,7 +2650,7 @@ pub fn rollback_workspace(
                 .ok_or_else(|| format!("workspace {name:?} has never named commit {commit}"))?;
             let mut config = conversation.workspace_config(name)?;
             // Restore the integration checkpoint, not the publication destination.
-            config.base = historical.base;
+            config.upstream = historical.upstream;
             let mut transitions = Vec::new();
             if workspace.commit != commit {
                 transitions.push(Transition::WorkspaceRollback {
@@ -2665,7 +2684,7 @@ fn workspace_config_at(
         {
             let config = view.workspace_config(name)?;
             if config
-                .base
+                .upstream
                 .as_ref()
                 .map(|base| {
                     conversation_protocol::v3::CodeOps::is_ancestor(store, base.commit(), commit)
@@ -2792,7 +2811,7 @@ fn resolve_llm(
     let legacy = Conversation::open(&open_store(t)?, &queued)?
         .workspace_configs()?
         .values()
-        .any(|config| config.repository.is_none());
+        .any(|config| config.repository().is_none());
     let merge_refs = if legacy {
         snapshot_merge_refs(t)?
     } else {
@@ -3715,9 +3734,20 @@ mod tests {
             "workspaces-talk",
             "side",
             WorkspaceConfig {
-                repository: Some("git@example.com:team/repo.git".into()),
-                branch: Some("feature/side".into()),
-                base: Some(WorkspaceBase::Branch {
+                source: Some(
+                    conversation_protocol::v3::workspaces::source_locator(
+                        "git@example.com:team/repo.git",
+                        &oid(&base, "base").unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                publication: Some(conversation_protocol::v3::PublicationDestination {
+                    repository: Some("git@example.com:team/repo.git".into()),
+                    branch: "feature/side".into(),
+                    base: None,
+                }),
+                upstream: Some(WorkspaceBase::Branch {
+                    repository: Some("git@example.com:team/repo.git".into()),
                     name: "main".into(),
                     commit: oid(&base, "base").unwrap(),
                 }),
@@ -3767,15 +3797,12 @@ mod tests {
         assert_eq!(separate.head, base);
         assert!(!separate.patch.contains("selected workspace"));
         assert_eq!(
-            separate.config.repository.as_deref(),
-            Some("git@example.com:team/repo.git")
+            separate.config.repository().as_deref(),
+            Some("ssh://git@example.com/team/repo.git")
         );
-        assert_eq!(
-            separate.config.branch.as_deref(),
-            Some("caos-workspaces/workspaces-talk/separate")
-        );
+        assert_eq!(separate.config.publication, None);
         assert!(matches!(
-            separate.config.base,
+            separate.config.upstream,
             Some(WorkspaceBase::Branch { .. })
         ));
         let dependent = load
@@ -3784,7 +3811,7 @@ mod tests {
             .find(|ws| ws.name == "dependent")
             .unwrap();
         assert!(
-            matches!(&dependent.config.base, Some(WorkspaceBase::Workspace { name, commit }) if name == "side" && commit.as_str() == next)
+            matches!(&dependent.config.upstream, Some(WorkspaceBase::Workspace { name, commit }) if name == "side" && commit.as_str() == next)
         );
         create_workspace_with_config(
             &transport,
@@ -3802,9 +3829,9 @@ mod tests {
             .iter()
             .find(|workspace| workspace.name == "old-snapshot")
             .unwrap();
-        assert_eq!(snapshot.config.repository, dependent.config.repository);
+        assert_eq!(snapshot.config.repository(), dependent.config.repository());
         assert_eq!(
-            snapshot.config.base.as_ref().unwrap().commit().as_str(),
+            snapshot.config.upstream.as_ref().unwrap().commit().as_str(),
             base
         );
         assert!(remove_workspace(&transport, "workspaces-talk", "side").is_err());
@@ -3959,9 +3986,12 @@ mod tests {
         let load = conversation_load(&transport, "attached").unwrap().unwrap();
         let api = load.workspaces.iter().find(|ws| ws.name == "api").unwrap();
         assert_eq!(api.head, other_head);
-        assert_eq!(api.config.repository.as_deref(), Some(repository.as_str()));
         assert_eq!(
-            api.config.base.as_ref().unwrap().commit().as_str(),
+            api.config.repository().as_deref(),
+            Some(format!("file://{repository}").as_str())
+        );
+        assert_eq!(
+            api.config.upstream.as_ref().unwrap().commit().as_str(),
             other_head
         );
         let refs: BTreeMap<String, String> = serde_json::from_str(
@@ -4068,7 +4098,7 @@ mod tests {
         assert_eq!(
             view.workspace_config("child")
                 .unwrap()
-                .base
+                .upstream
                 .unwrap()
                 .commit()
                 .as_str(),
@@ -4086,7 +4116,13 @@ mod tests {
             .find(|ws| ws.name == "child")
             .unwrap();
         assert_eq!(
-            checkpoint.config.base.as_ref().unwrap().commit().as_str(),
+            checkpoint
+                .config
+                .upstream
+                .as_ref()
+                .unwrap()
+                .commit()
+                .as_str(),
             base
         );
         assert_eq!(
@@ -4107,7 +4143,11 @@ mod tests {
         .unwrap());
 
         let mut config = restored.config.clone();
-        config.branch = Some("review/child".into());
+        config.publication = Some(conversation_protocol::v3::PublicationDestination {
+            repository: Some(config.repository().unwrap()),
+            branch: "review/child".into(),
+            base: None,
+        });
         workspaces::configure(&transport, id, "child", config).unwrap();
         advance("child", &child); // Old clients could move the head without its checkpoint.
         assert!(workspaces::update_stack(&transport, id, Some("child"))
@@ -4120,9 +4160,16 @@ mod tests {
             .iter()
             .find(|ws| ws.name == "child")
             .unwrap();
-        assert_eq!(repaired.config.branch.as_deref(), Some("review/child"));
         assert_eq!(
-            repaired.config.base.as_ref().unwrap().commit().as_str(),
+            repaired
+                .config
+                .publication
+                .as_ref()
+                .map(|p| p.branch.as_str()),
+            Some("review/child")
+        );
+        assert_eq!(
+            repaired.config.upstream.as_ref().unwrap().commit().as_str(),
             base
         );
         workspaces::update_stack(&transport, id, Some("child")).unwrap();
@@ -4797,10 +4844,7 @@ mod tests {
         assert!(
             matches!(view.identity().unwrap().kind, IdentityKind::Fork { source: ref parent } if parent.as_str() == source)
         );
-        assert_eq!(
-            view.workspace_config("main").unwrap().branch.as_deref(),
-            Some("caos/forked")
-        );
+        assert_eq!(view.workspace_config("main").unwrap().publication, None);
         assert!(
             spine_contains(&store, fork_oid.clone(), &oid(&source, "source").unwrap()).unwrap()
         );

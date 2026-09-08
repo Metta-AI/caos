@@ -352,7 +352,7 @@ pub(super) fn checkout_for(
     let checkout = PathBuf::from(value.strip_suffix('\0').ok_or("invalid checkout config")?);
     let repository = git(&checkout, &["remote", "get-url", "origin"])
         .unwrap_or_else(|_| checkout.to_string_lossy().into_owned());
-    if config.repository.as_deref().is_none_or(|repo| {
+    if config.repository().as_deref().is_none_or(|repo| {
         caos_cli::normalize_repository_identity(repo).ok()
             != caos_cli::normalize_repository_identity(&repository).ok()
     }) {
