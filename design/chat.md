@@ -6,52 +6,106 @@
 | `W` workspace commit | `caos` remote | sha in a conversation commit's tree |
 | `P` publication branch | destination repository | `refs/heads/<branch>` points to a workspace commit |
 
+An edit creates a workspace commit `W₁` descending from `W₀`, then a new
+conversation commit `C₁` records `W₁`. Renaming the conversation creates another
+`C` pointing to the same `W₁`. Publishing sets a destination branch to `W₁`.
+Conversation history records what happened; workspace history records code changes.
+
+## Workspace commits
+
+A conversation has zero or more named workspaces. Each points to a `W`: a Git
+commit containing a code tree, parents, message, author, and committer. Edits
+create descendant commits; merges can have two parents. The pointer in `C`
+tracks the current head without requiring a separate named workspace branch.
+Each workspace also records its immutable starting commit as `initial`.
+
+### Sources and upstreams
+
+Attaching code imports existing commits and ancestry without rewriting them or
+changing the local checkout. A branch attachment remembers its upstream; an
+attachment by commit stays pinned. Workspace inputs cannot contain reserved
+`.caos` entries other than `.caos/conflicts`.
+
+`config.json` keeps three independent fields:
+
+- **Source:** an optional pinned locator, such as
+  `git+https://github.com/team/repo.git?rev=<full-commit-sha>`. It uses the
+  same parser as `:@@=`, but workspace attachment imports the commit and its
+  ancestry, not an evaluated tree. Mutable refs, `path:`, and `dir=` are
+  not workspace sources.
+- **Upstream:** a repository branch or another workspace, plus the exact
+  commit already integrated. This is a moving integration relationship;
+  the source locator remains pinned.
+- **Publication:** a repository, destination branch, and optional PR base
+  (repository default, named branch, or parent workspace). The host derives
+  defaults until the destination is chosen or published, then remembers it.
+  Choosing a PR base does not change which upstream future updates integrate.
+
+Workspace upstream dependencies must stay within a repository and cannot form
+cycles. A workspace with dependents cannot be removed. For a stacked PR, the
+parent's publication destination supplies the child's PR base.
+
+### Selecting and creating workspaces
+
+`Ctrl+O` or `/workspace` opens the picker. From the selected workspace:
+
+- **Create** starts at its incorporated upstream commit, or `initial` if it has
+  no upstream. It starts a separate change without the selected workspace's edits.
+- **Copy** starts at its current commit and retains its upstream relationship.
+- **Stack** starts at its current commit and makes the selected workspace its
+  upstream.
+
+All three inherit the pinned source and clear the publication destination.
+`/workspace create <name> <revision>` starts at an explicit revision.
+`/workspace attach <name> <repository> [<branch>|<commit>]` attaches a repository;
+a pinned locator can replace the repository and revision arguments:
+`/workspace attach <name> <locator>`.
+
+The changes view compares the current commit with its incorporated upstream
+commit, falling back to `initial`. Rollback can return to a previously recorded
+workspace commit that descends from `initial`; it restores that commit's upstream
+checkpoint while retaining the publication destination.
+
+Selection is local UI state. A submitted turn captures its focus; with multiple
+workspaces, tool calls name their target. Switching selection cannot redirect
+an in-flight call. Navigation and informational commands do not send messages.
+
+Each workspace supplies its own AGENTS.md and repository tools. Cross-workspace
+bash inputs are immutable snapshots; only the target workspace's output is
+adopted. Named repository refs are captured at turn start.
+
+### Applying changes and updating stacks
+
+Tools, subagents, and `/update-tree` use the same reconciliation rules. A
+proposal must descend from its declared base. Already-applied proposals do
+nothing; compatible descendants advance directly; otherwise try a three-way
+merge. A conflict records the candidate and leaves the workspace pointer alone.
+Equal trees are not enough to discard a commit: its ancestry may matter.
+
+`/update-tree` includes local committed and uncommitted changes, using the merge
+base with the workspace. Unrelated histories or multiple merge bases are errors.
+
+`/workspace update [<name>|--all]` integrates upstream changes in dependency
+order. Each workspace head and incorporated upstream commit update together.
+An upstream rewrite or conflict stops the batch; earlier successful updates
+remain. Resolve conflicts with the merge tool, then retry.
+
+A hash written in `C` does not keep `W` reachable to Git's garbage collector.
+CAOS currently disables automatic Git GC; retention and erasure policy remain
+undesigned.
+
 ## Conversation commits
 
 `C` commits contain:
 
 - `tree`: complete conversation state, below.
-- `parent`: exactly one. `G3` for a new root, otherwise the previous `C`
-  (or the source `C` when forking another conversation).
+- `parent`: exactly one. The fixed genesis commit `G3` for a new root, otherwise
+  the previous `C` (or the source `C` when forking another conversation).
 - `message`: transition kind, such as `message.append` or `tool.complete`.
 - `author` and `committer`.
 
 Conversation commits never have workspace commits as parents. They reference
 workspace commit hashes through files in their trees.
-
-`C`'s tree contains:
-
-```
-# Identity and metadata
-.caos/format                                        "caos-conversation-v3"
-.caos/identity.json                                 ID, root/fork origin, and subagent parent/spawning call
-.caos/title                                         displayed title
-
-# Transcript
-.caos/transcript/<shard>/<ordinal>-<message-id>.json  speaker, model, content blocks
-.caos/transcript/<shard>/<ordinal>-<message-id>/      message payload files
-
-# Workspaces
-.caos/workspaces/<name>/commit                       current code commit hash
-.caos/workspaces/<name>/initial                      starting commit; baseline for changes and rollback limits
-.caos/workspaces/<name>/config.json                  source locator, upstream/checkpoint, publication destination/base
-
-# Conversation-owned files
-files/                                              files separate from workspace code
-
-# Turns and calls
-.caos/requests/<id>.json                             starting snapshot, model settings, calls, status, outcome
-.caos/requests/active                                active turn hash; absent when none
-.caos/tools/<turn>/<round>/<call-id>.json          input workspace, optional task, status, result, applied changes
-.caos/tools/<turn>/<round>/<call-id>/              tool arguments and output files
-
-# Background work
-.caos/async/<hash>.json                 computation task status and result
-.caos/subagents/<child-id>.json             conversation task, spawn inputs, result, application history
-
-# Publication
-.caos/publications/                                  destinations, planned commits, expected remote tips, outcomes
-```
 
 ### Transitions and turns
 
@@ -95,8 +149,9 @@ share idempotence checks. Variant-specific data and validation remain separate.
 ### Forks, titles, and archiving
 
 A fork starts a new identity from an existing `C`. The source must have no
-active turn, tool execution, async task, or publication. Running child records
-are dropped from the inherited state. Renaming changes `.caos/title`.
+active turn, unfinished tool execution, or pending async task or publication.
+Completed records are allowed. Running child records are dropped from the
+inherited state. Renaming changes `.caos/title`.
 
 Archiving moves a conversation out of the active list without deleting its
 history.
@@ -107,88 +162,6 @@ JSON records use canonical bytes so hashing is stable. Readers check the commit
 and reconstruct its declared transition; the resulting tree must match. See
 [record formats](../rust/crates/conversation-protocol/src/v3/records.rs) and
 [validation](../rust/crates/conversation-protocol/src/v3/validate.rs) for exact rules.
-
-The established storage paths, transition labels (`request.*` and `tool.*`),
-and record field names remain unchanged, so existing histories keep their commit
-hashes. Turns and calls are the implementation names for the records stored
-under `requests` and `tools`. Computation and child records share one lifecycle
-state in code; their existing storage encodings remain separate. The combined
-task view is derived from those records, not stored alongside them.
-
-
-## Workspace commits
-
-A conversation has zero or more named workspaces. Each points to a `W`: a Git
-commit containing a code tree, parents, message, author, and committer. Edits
-create descendant commits; merges can have two parents. The pointer in `C`
-tracks the current head without requiring a separate named workspace branch.
-
-### Sources and upstreams
-
-Attaching code imports existing commits and ancestry without rewriting them or
-changing the local checkout. A branch attachment remembers its upstream; an
-attachment by commit stays pinned. Workspace inputs cannot contain reserved
-`.caos` entries other than `.caos/conflicts`.
-
-`config.json` keeps three independent fields:
-
-- **Source:** an optional pinned locator, such as
-  `git+https://github.com/team/repo.git?rev=<full-commit-sha>`. It uses the
-  same parser as `:@@=`, but workspace attachment imports the commit and its
-  ancestry, not an evaluated tree. Mutable refs, `path:`, and `dir=` are
-  not workspace sources.
-- **Upstream:** a repository branch or another workspace, plus the exact
-  commit already integrated. This is a moving integration relationship;
-  the source locator remains pinned.
-- **Publication:** a repository, destination branch, and optional PR base
-  (repository default, named branch, or parent workspace). The host derives
-  defaults until the destination is chosen or published, then remembers it.
-  Choosing a PR base does not change which upstream future updates integrate.
-
-Workspace upstream dependencies must stay within a repository and cannot form
-cycles. A workspace with dependents cannot be removed. For a stacked PR, the
-parent's publication destination supplies the child's PR base.
-
-The old `origin` field had no production writers; readers retain it for
-historical conversations. Old repository/branch/base settings are read through
-a compatibility adapter. If an old record omitted its repository, it retains
-the checkout-origin default; new attachments bind the repository explicitly.
-
-### Selecting and creating workspaces
-
-`Ctrl+O` or `/workspace` opens the picker. Create a workspace from the selected
-snapshot or an explicit revision; stack it on another workspace when it depends
-on that work. `/workspace attach <name> <repository> [<branch>|<commit>]` attaches
-another repository. A pinned locator can replace the repository and revision
-arguments: `/workspace attach <name> <locator>`.
-
-Selection is local UI state. A submitted turn captures its focus; with multiple
-workspaces, tool calls name their target. Switching selection cannot redirect
-an in-flight call. Navigation and informational commands do not send messages.
-
-Each workspace supplies its own AGENTS.md and repository tools. Cross-workspace
-bash inputs are immutable snapshots; only the target workspace's output is
-adopted. Named repository refs are captured at turn start.
-
-### Applying changes and updating stacks
-
-Tools, subagents, and `/update-tree` use the same reconciliation rules. A
-proposal must descend from its declared base. Already-applied proposals do
-nothing; compatible descendants advance directly; otherwise try a three-way
-merge. A conflict records the candidate and leaves the workspace pointer alone.
-Equal trees are not enough to discard a commit: its ancestry may matter.
-
-`/update-tree` includes local committed and uncommitted changes, using the merge
-base with the workspace. Unrelated histories or multiple merge bases are errors.
-
-`/workspace update [<name>|--all]` integrates upstream changes in dependency
-order. Each workspace head and incorporated upstream commit update together.
-An upstream rewrite or conflict stops the batch; earlier successful updates
-remain. Resolve conflicts with the merge tool, then retry.
-
-A hash written in `C` does not keep `W` reachable to Git's garbage collector.
-CAOS currently disables automatic Git GC; retention and erasure policy remain
-undesigned.
 
 ## Publication branches
 
@@ -233,3 +206,50 @@ The TUI keeps its bundled harness in a separate client store. Attaching or
 editing code never overwrites it. Checkout commands act on the original matching
 checkout. Server and secret-store choices belong to the local client;
 credentials are never copied into conversation or workspace trees.
+
+## Storage reference
+
+`C`'s tree contains:
+
+```
+# Identity and metadata
+.caos/format                                          "caos-conversation-v3"
+.caos/identity.json                                   ID, root/fork origin, and subagent parent/spawning call
+.caos/title                                           displayed title
+
+# Transcript
+.caos/transcript/<shard>/<ordinal>-<message-id>.json  speaker, model, content blocks
+.caos/transcript/<shard>/<ordinal>-<message-id>/      message payload files
+
+# Workspaces
+.caos/workspaces/<name>/commit                        current code commit hash
+.caos/workspaces/<name>/initial                       starting commit; fallback diff baseline and rollback limit
+.caos/workspaces/<name>/config.json                   source locator, upstream/checkpoint, publication destination/base
+
+# Conversation-owned files
+files/                                                files separate from workspace code
+
+# Turns and calls
+.caos/requests/<id>.json                              starting snapshot, model settings, calls, status, outcome
+.caos/requests/active                                 active turn hash; absent when none
+.caos/tools/<turn>/<round>/<call-id>.json             input workspace, optional task, status, result, applied changes
+.caos/tools/<turn>/<round>/<call-id>/                 tool arguments and output files
+
+# Background work
+.caos/async/<hash>.json                               computation task status and result
+.caos/subagents/<child-id>.json                       conversation task, spawn inputs, result, application history
+
+# Publication
+.caos/publications/                                   destinations, planned commits, expected remote tips, outcomes
+```
+
+### Compatibility
+
+Turns and calls are stored under `requests` and `tools`; transition labels and
+record field names retain those names. Computation and child records have
+separate encodings but share lifecycle code. The combined task view is derived,
+not stored alongside them.
+
+Readers accept historical `origin` and repository/branch/base fields. An old
+record without a repository uses the checkout's origin; new attachments bind
+the repository explicitly.
