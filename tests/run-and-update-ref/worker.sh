@@ -59,7 +59,7 @@ only_status_event() {
   [ "$(git rev-parse "$after^1")" = "$before" ] \
     || fail "the $status event did not append to the prior head"
   changed=$(git diff-tree --no-commit-id --name-only -r "$before" "$after")
-  [ "$changed" = ".caos/async/$task.json" ] \
+  [ "$changed" = ".caos/tasks/computations/$task.json" ] \
     || fail "the $status event changed paths other than its async record: $changed"
   record=$($TOOL async --repo /tmp/repo --head "$after" --task "$task") \
     || fail "reading terminal async record"

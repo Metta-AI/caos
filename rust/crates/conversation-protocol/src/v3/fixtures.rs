@@ -1,9 +1,21 @@
 use std::collections::BTreeMap;
 
-use super::apply::{apply, client_signature, mint, Applied, Transition};
+use super::apply::{client_signature, mint, Applied, Transition};
 use super::ids;
 use super::oid::{ensure_genesis, Oid};
-use super::paths;
+mod paths {
+    pub use crate::v3::paths::transcript_payload_dir;
+    pub fn call_payload_dir(turn: &str, round: u64, id: &str) -> String {
+        crate::v3::paths::legacy_path(&crate::v3::paths::call_payload_dir(turn, round, id)).unwrap()
+    }
+}
+fn apply(
+    store: &mut dyn ObjectStore,
+    tree: Option<&Oid>,
+    transition: &Transition,
+) -> Result<Applied, String> {
+    super::apply::apply_layout(store, tree, transition, true)
+}
 use super::records::*;
 use super::tree::{Mode, ObjectStore, TreeBuilder};
 
@@ -67,7 +79,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(request.clone(), request_head),
         },
         &signature,
@@ -75,7 +87,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestClaim {
+        Transition::TurnClaim {
             request: request.clone(),
             latest_message: "user-0".to_string(),
         },
@@ -84,7 +96,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestInterject {
+        Transition::TurnInterject {
             request: request.clone(),
             entry: TranscriptEntry {
                 message_id: "interjection-1".to_string(),
@@ -136,13 +148,13 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     );
     let read_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 0, "read-call")
+        paths::call_payload_dir(request.as_str(), 0, "read-call")
     );
     commit(
         store,
         &mut head,
         Transition::ToolComplete {
-            record: ToolRecord {
+            record: CallRecord {
                 request: request.clone(),
                 round: 0,
                 id: "read-call".to_string(),
@@ -150,7 +162,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                 declaration_message: "assistant-1".to_string(),
                 workspace_name: None,
                 input_workspace: None,
-                status: ToolStatus::Complete,
+                status: CallStatus::Complete,
                 task: None,
                 result: Some(ToolResult::Complete {
                     observation: read_observation,
@@ -165,7 +177,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         },
         &signature,
     );
-    let started_bash = ToolRecord {
+    let started_bash = CallRecord {
         request: request.clone(),
         round: 0,
         id: "bash-call".to_string(),
@@ -173,7 +185,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         declaration_message: "assistant-1".to_string(),
         workspace_name: Some("main".to_string()),
         input_workspace: Some(oid('d')),
-        status: ToolStatus::Started,
+        status: CallStatus::Started,
         task: Some(oid('2')),
         result: None,
         workspace_resolution: None,
@@ -190,14 +202,14 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     );
     let bash_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 0, "bash-call")
+        paths::call_payload_dir(request.as_str(), 0, "bash-call")
     );
     commit(
         store,
         &mut head,
         Transition::ToolComplete {
-            record: ToolRecord {
-                status: ToolStatus::Complete,
+            record: CallRecord {
+                status: CallStatus::Complete,
                 result: Some(ToolResult::Complete {
                     observation: bash_observation,
                     proposal: Some(oid('b')),
@@ -249,9 +261,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         ids::child_id("golden-conversation", &request, 1, "spawn-call").expect("derive child id");
     let spawn_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 1, "spawn-call")
+        paths::call_payload_dir(request.as_str(), 1, "spawn-call")
     );
-    let spawn_tool = ToolRecord {
+    let spawn_tool = CallRecord {
         request: request.clone(),
         round: 1,
         id: "spawn-call".to_string(),
@@ -259,7 +271,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         declaration_message: "assistant-2".to_string(),
         workspace_name: None,
         input_workspace: None,
-        status: ToolStatus::Complete,
+        status: CallStatus::Complete,
         task: None,
         result: Some(ToolResult::Complete {
             observation: spawn_observation,
@@ -319,7 +331,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestInterject {
+        Transition::TurnInterject {
             request: request.clone(),
             entry: TranscriptEntry {
                 message_id: "interjection-3".to_string(),
@@ -401,9 +413,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestTerminal {
+        Transition::TurnTerminal {
             request: request.clone(),
-            outcome: RequestOutcome::Idle {
+            outcome: TurnOutcome::Idle {
                 result: None,
                 interrupted: false,
             },
@@ -513,7 +525,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(queued_escape.clone(), queued_head),
         },
         &signature,
@@ -521,7 +533,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestEscape {
+        Transition::TurnEscape {
             request: queued_escape,
             reason: Some("cancel before claim".to_string()),
         },
@@ -533,7 +545,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(cancelling.clone(), cancelling_head),
         },
         &signature,
@@ -541,7 +553,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestClaim {
+        Transition::TurnClaim {
             request: cancelling.clone(),
             latest_message: "assistant-4".to_string(),
         },
@@ -550,7 +562,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestEscape {
+        Transition::TurnEscape {
             request: cancelling.clone(),
             reason: Some("stop running".to_string()),
         },
@@ -559,9 +571,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestTerminal {
+        Transition::TurnTerminal {
             request: cancelling,
-            outcome: RequestOutcome::Idle {
+            outcome: TurnOutcome::Idle {
                 result: None,
                 interrupted: true,
             },
@@ -596,8 +608,8 @@ fn commit(
     applied
 }
 
-fn request_record(id: Oid, request_head: Oid) -> RequestRecord {
-    RequestRecord {
+fn request_record(id: Oid, request_head: Oid) -> TurnRecord {
+    TurnRecord {
         id,
         request_head,
         request_workspaces: None,
@@ -606,7 +618,7 @@ fn request_record(id: Oid, request_head: Oid) -> RequestRecord {
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,

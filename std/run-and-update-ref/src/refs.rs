@@ -7,7 +7,7 @@ use conversation_protocol::v3::refs as conversation_refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
     validate_spine, AsyncStatus, ChildStatus, ChildWorkspace, CodeOps, GitStore, ObjectStore, Oid,
-    RefUpdate, RequestOutcome, RequestStatus,
+    RefUpdate, TurnOutcome, TurnStatus,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -69,22 +69,22 @@ fn terminal_facts(
 ) -> Result<(ChildStatus, BTreeMap<String, ChildWorkspace>), String> {
     let conversation = Conversation::open(store, terminal_head)?;
     let request = conversation
-        .request(subrequest)?
+        .turn(subrequest)?
         .ok_or_else(|| format!("child request {subrequest} does not exist at {terminal_head}"))?;
     let status = match (request.status, request.outcome) {
         (
-            RequestStatus::Idle,
-            Some(RequestOutcome::Idle {
+            TurnStatus::Idle,
+            Some(TurnOutcome::Idle {
                 interrupted: false, ..
             }),
         ) => ChildStatus::Completed,
         (
-            RequestStatus::Idle,
-            Some(RequestOutcome::Idle {
+            TurnStatus::Idle,
+            Some(TurnOutcome::Idle {
                 interrupted: true, ..
             }),
         ) => ChildStatus::Cancelled,
-        (RequestStatus::Failed, Some(RequestOutcome::Failed { .. })) => ChildStatus::Failed,
+        (TurnStatus::Failed, Some(TurnOutcome::Failed { .. })) => ChildStatus::Failed,
         _ => return Err("child request not terminal".to_string()),
     };
     let child_workspaces = conversation
@@ -278,8 +278,8 @@ mod tests {
     use conversation_protocol::v3::apply::client_signature;
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::{
-        AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, RequestRecord, Role,
-        TranscriptEntry, TreeBuilder,
+        AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, Role, TranscriptEntry,
+        TreeBuilder, TurnRecord,
     };
 
     use super::*;
@@ -494,8 +494,8 @@ mod tests {
         head = commit_transition(
             &mut store,
             &head,
-            &Transition::RequestAdmit {
-                record: RequestRecord {
+            &Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: head.clone(),
                     request_workspaces,
@@ -504,7 +504,7 @@ mod tests {
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -514,7 +514,7 @@ mod tests {
         head = commit_transition(
             &mut store,
             &head,
-            &Transition::RequestClaim {
+            &Transition::TurnClaim {
                 request: request.clone(),
                 latest_message: "prompt".to_string(),
             },
@@ -523,9 +523,9 @@ mod tests {
             head = commit_transition(
                 &mut store,
                 &head,
-                &Transition::RequestTerminal {
+                &Transition::TurnTerminal {
                     request: request.clone(),
-                    outcome: RequestOutcome::Idle {
+                    outcome: TurnOutcome::Idle {
                         result: None,
                         interrupted,
                     },

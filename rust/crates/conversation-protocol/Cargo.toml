@@ -17,3 +17,6 @@ sha2 = "0.10"
 default = ["git-cli"]
 git-cli = []
 memory-store = []
+
+[dependencies.git-locator]
+path = "../git-locator"

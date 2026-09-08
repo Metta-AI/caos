@@ -7,6 +7,7 @@ use super::paths;
 use super::records::*;
 use super::tree::{CommitInfo, Mode, ObjectStore, Signature, TreeBuilder};
 use super::view::Conversation;
+use super::{TaskOutcome, TaskRecord};
 
 #[allow(clippy::large_enum_variant, clippy::type_complexity)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,25 +29,25 @@ pub enum Transition {
         entry: TranscriptEntry,
         payloads: Vec<(String, Vec<u8>)>,
     },
-    RequestAdmit {
-        record: RequestRecord,
+    TurnAdmit {
+        record: TurnRecord,
     },
-    RequestClaim {
+    TurnClaim {
         request: Oid,
         latest_message: String,
     },
-    RequestInterject {
+    TurnInterject {
         request: Oid,
         entry: TranscriptEntry,
         payloads: Vec<(String, Vec<u8>)>,
     },
-    RequestEscape {
+    TurnEscape {
         request: Oid,
         reason: Option<String>,
     },
-    RequestTerminal {
+    TurnTerminal {
         request: Oid,
-        outcome: RequestOutcome,
+        outcome: TurnOutcome,
     },
     ModelComplete {
         request: Oid,
@@ -55,10 +56,10 @@ pub enum Transition {
         calls: Vec<DeclaredCall>,
     },
     ToolStart {
-        record: ToolRecord,
+        record: CallRecord,
     },
     ToolComplete {
-        record: ToolRecord,
+        record: CallRecord,
         payloads: Vec<(String, Vec<u8>)>,
         files: Vec<(String, Option<(Mode, Vec<u8>)>)>,
     },
@@ -72,7 +73,7 @@ pub enum Transition {
         reason: Option<String>,
     },
     SubagentSpawn {
-        tool: ToolRecord,
+        tool: CallRecord,
         payloads: Vec<(String, Vec<u8>)>,
         child: ChildRecord,
     },
@@ -90,6 +91,10 @@ pub enum Transition {
         name: String,
         commit: Oid,
         origin: Option<WorkspaceOrigin>,
+    },
+    LegacyWorkspaceConfigure {
+        name: String,
+        encoded: Vec<u8>,
     },
     WorkspaceConfigure {
         name: String,
@@ -127,11 +132,11 @@ impl Transition {
             Transition::ConversationFork { .. } => Kind::ConversationFork,
             Transition::TitleSet { .. } => Kind::MetadataTitleSet,
             Transition::MessageAppend { .. } => Kind::MessageAppend,
-            Transition::RequestAdmit { .. } => Kind::RequestAdmit,
-            Transition::RequestClaim { .. } => Kind::RequestClaim,
-            Transition::RequestInterject { .. } => Kind::RequestInterject,
-            Transition::RequestEscape { .. } => Kind::RequestEscape,
-            Transition::RequestTerminal { .. } => Kind::RequestTerminal,
+            Transition::TurnAdmit { .. } => Kind::TurnAdmit,
+            Transition::TurnClaim { .. } => Kind::TurnClaim,
+            Transition::TurnInterject { .. } => Kind::TurnInterject,
+            Transition::TurnEscape { .. } => Kind::TurnEscape,
+            Transition::TurnTerminal { .. } => Kind::TurnTerminal,
             Transition::ModelComplete { .. } => Kind::ModelComplete,
             Transition::ToolStart { .. } => Kind::ToolStart,
             Transition::ToolComplete { .. } => Kind::ToolComplete,
@@ -141,7 +146,9 @@ impl Transition {
             Transition::SubagentTerminal { .. } => Kind::SubagentTerminal,
             Transition::SubagentApply { .. } => Kind::SubagentApply,
             Transition::WorkspaceCreate { .. } => Kind::WorkspaceCreate,
-            Transition::WorkspaceConfigure { .. } => Kind::WorkspaceConfigure,
+            Transition::WorkspaceConfigure { .. } | Transition::LegacyWorkspaceConfigure { .. } => {
+                Kind::WorkspaceConfigure
+            }
             Transition::WorkspaceAdvance { .. } => Kind::WorkspaceAdvance,
             Transition::WorkspaceRollback { .. } => Kind::WorkspaceRollback,
             Transition::WorkspaceRemove { .. } => Kind::WorkspaceRemove,
@@ -158,10 +165,59 @@ pub struct Applied {
     pub ordinal: Option<u64>,
 }
 
+/// Writes new paths and removes their obsolete counterparts. Historical
+/// validation uses the same transition rules with the original path encoding.
+pub(crate) struct ProtocolBuilder {
+    pub(crate) tree: TreeBuilder,
+    pub(crate) legacy: bool,
+}
+impl ProtocolBuilder {
+    fn path(&self, path: &str) -> String {
+        if self.legacy {
+            paths::legacy_path(path).unwrap_or_else(|| path.into())
+        } else {
+            path.into()
+        }
+    }
+    fn remove_old(&mut self, path: &str) {
+        if !self.legacy {
+            if let Some(old) = paths::legacy_path(path) {
+                self.tree.delete(&old);
+            }
+        }
+    }
+    pub(crate) fn put(&mut self, path: &str, mode: Mode, bytes: Vec<u8>) {
+        self.remove_old(path);
+        self.tree.put(&self.path(path), mode, bytes);
+    }
+    pub(crate) fn put_oid(&mut self, path: &str, mode: Mode, oid: Oid) {
+        self.remove_old(path);
+        self.tree.put_oid(&self.path(path), mode, oid);
+    }
+    pub(crate) fn delete(&mut self, path: &str) {
+        if let Some(old) = paths::legacy_path(path) {
+            self.tree.delete(&old);
+        }
+        self.tree.delete(path);
+    }
+    pub(crate) fn build(self, store: &mut dyn ObjectStore) -> Result<Oid, String> {
+        self.tree.build(store)
+    }
+}
+
 pub fn apply(
     store: &mut dyn ObjectStore,
     parent_tree: Option<&Oid>,
     transition: &Transition,
+) -> Result<Applied, String> {
+    apply_layout(store, parent_tree, transition, false)
+}
+
+pub(crate) fn apply_layout(
+    store: &mut dyn ObjectStore,
+    parent_tree: Option<&Oid>,
+    transition: &Transition,
+    legacy: bool,
 ) -> Result<Applied, String> {
     if matches!(transition, Transition::ConversationRoot { .. }) {
         if parent_tree.is_some() {
@@ -173,7 +229,10 @@ pub fn apply(
             transition.kind().as_str()
         ));
     }
-    let mut builder = TreeBuilder::from(parent_tree.cloned());
+    let mut builder = ProtocolBuilder {
+        tree: TreeBuilder::from(parent_tree.cloned()),
+        legacy,
+    };
     let mut ordinal = None;
 
     match transition {
@@ -244,16 +303,16 @@ pub fn apply(
             put_transcript(&mut builder, next, entry, payloads)?;
             ordinal = Some(next);
         }
-        Transition::RequestAdmit { record } => {
+        Transition::TurnAdmit { record } => {
             let conversation = parent(store, parent_tree)?;
             canonical_shape(record, "request")?;
-            if conversation.active_request()?.is_some() {
+            if conversation.active_turn()?.is_some() {
                 return Err("cannot admit a request while another request is active".to_string());
             }
-            if conversation.request(&record.id)?.is_some() {
+            if conversation.turn(&record.id)?.is_some() {
                 return Err(format!("request {} already exists", record.id));
             }
-            if record.status != RequestStatus::Queued
+            if record.status != TurnStatus::Queued
                 || record.round != 0
                 || !record.calls.is_empty()
                 || !record.interjections.is_empty()
@@ -264,23 +323,23 @@ pub fn apply(
                 );
             }
             put_request(&mut builder, record);
-            builder.put(paths::ACTIVE_REQUEST, Mode::Blob, record.id.encode_line());
+            builder.put(paths::ACTIVE_TURN, Mode::Blob, record.id.encode_line());
         }
-        Transition::RequestClaim {
+        Transition::TurnClaim {
             request,
             latest_message,
         } => {
             let conversation = parent(store, parent_tree)?;
             let mut record = require_active(&conversation, request)?;
-            if record.status != RequestStatus::Queued {
+            if record.status != TurnStatus::Queued {
                 return Err("request claim requires queued status".to_string());
             }
             paths::validate_protocol_id_component(latest_message)?;
-            record.status = RequestStatus::Running;
+            record.status = TurnStatus::Running;
             record.latest_message = Some(latest_message.clone());
             put_request(&mut builder, &record);
         }
-        Transition::RequestInterject {
+        Transition::TurnInterject {
             request,
             entry,
             payloads,
@@ -289,7 +348,7 @@ pub fn apply(
             let mut record = require_active(&conversation, request)?;
             if !matches!(
                 record.status,
-                RequestStatus::Queued | RequestStatus::Running | RequestStatus::Cancelling
+                TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
             ) {
                 return Err("request interject requires an active request status".to_string());
             }
@@ -300,46 +359,40 @@ pub fn apply(
             validate_entry_resolution(&conversation, entry, &mut builder)?;
             put_transcript(&mut builder, next, entry, payloads)?;
             record.interjections.push(entry.message_id.clone());
-            if matches!(
-                record.status,
-                RequestStatus::Running | RequestStatus::Cancelling
-            ) {
+            if matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
                 record.latest_message = Some(entry.message_id.clone());
             }
             put_request(&mut builder, &record);
             ordinal = Some(next);
         }
-        Transition::RequestEscape { request, reason } => {
+        Transition::TurnEscape { request, reason } => {
             let conversation = parent(store, parent_tree)?;
             let mut record = require_active(&conversation, request)?;
             match record.status {
-                RequestStatus::Queued => {
-                    record.status = RequestStatus::Idle;
+                TurnStatus::Queued => {
+                    record.status = TurnStatus::Idle;
                     record.escape_reason = reason.clone();
-                    record.outcome = Some(RequestOutcome::Idle {
+                    record.outcome = Some(TurnOutcome::Idle {
                         result: None,
                         interrupted: true,
                     });
-                    builder.delete(paths::ACTIVE_REQUEST);
+                    builder.delete(paths::ACTIVE_TURN);
                 }
-                RequestStatus::Running => {
-                    record.status = RequestStatus::Cancelling;
+                TurnStatus::Running => {
+                    record.status = TurnStatus::Cancelling;
                     record.escape_reason = reason.clone();
                 }
                 _ => return Err("request escape requires queued or running status".to_string()),
             }
             put_request(&mut builder, &record);
         }
-        Transition::RequestTerminal { request, outcome } => {
+        Transition::TurnTerminal { request, outcome } => {
             let conversation = parent(store, parent_tree)?;
             let mut record = require_active(&conversation, request)?;
-            if !matches!(
-                record.status,
-                RequestStatus::Running | RequestStatus::Cancelling
-            ) {
+            if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
                 return Err("request terminal requires running or cancelling status".to_string());
             }
-            if record.status == RequestStatus::Cancelling && record.round != 0 {
+            if record.status == TurnStatus::Cancelling && record.round != 0 {
                 for call in &record.calls {
                     let tool = conversation.tool(&record.id, record.round - 1, &call.id)?;
                     if !tool.is_some_and(|tool| tool.is_terminal()) {
@@ -350,23 +403,23 @@ pub fn apply(
                 }
             }
             record.status = match outcome {
-                RequestOutcome::Idle {
+                TurnOutcome::Idle {
                     result: Some(path), ..
                 } => {
                     validate_caos_path(path, "request result path")?;
-                    RequestStatus::Idle
+                    TurnStatus::Idle
                 }
-                RequestOutcome::Idle { .. } => RequestStatus::Idle,
-                RequestOutcome::Failed { error } => {
+                TurnOutcome::Idle { .. } => TurnStatus::Idle,
+                TurnOutcome::Failed { error } => {
                     validate_caos_path(error, "request error path")?;
                     record.escape_reason = None;
-                    RequestStatus::Failed
+                    TurnStatus::Failed
                 }
             };
             record.latest_message = None;
             record.outcome = Some(outcome.clone());
             put_request(&mut builder, &record);
-            builder.delete(paths::ACTIVE_REQUEST);
+            builder.delete(paths::ACTIVE_TURN);
         }
         Transition::ModelComplete {
             request,
@@ -376,7 +429,7 @@ pub fn apply(
         } => {
             let conversation = parent(store, parent_tree)?;
             let mut record = require_active(&conversation, request)?;
-            if record.status != RequestStatus::Running {
+            if record.status != TurnStatus::Running {
                 return Err("model.complete requires running request status".to_string());
             }
             if entry.role != Role::Assistant
@@ -415,7 +468,7 @@ pub fn apply(
             let conversation = parent(store, parent_tree)?;
             canonical_shape(record, "tool")?;
             let request = require_request_running_or_cancelling(&conversation, &record.request)?;
-            if record.status != ToolStatus::Started || record.task.is_none() {
+            if record.status != CallStatus::Started || record.task.is_none() {
                 return Err("tool.start requires started status and task".to_string());
             }
             if conversation
@@ -462,19 +515,18 @@ pub fn apply(
             reason,
         } => {
             let conversation = parent(store, parent_tree)?;
-            let mut record = conversation
+            let record = conversation
                 .async_task(task)?
                 .ok_or_else(|| format!("async task {task} does not exist"))?;
-            if record.status != AsyncStatus::Pending {
-                return Err("async terminal requires pending status".to_string());
-            }
-            if *status == AsyncStatus::Pending {
-                return Err("async terminal status must be terminal".to_string());
-            }
-            record.status = *status;
-            record.result = result.clone();
-            record.reason = reason.clone();
-            canonical_shape(&record, "async record")?;
+            let TaskRecord::Computation(record) =
+                TaskRecord::Computation(record).finish(TaskOutcome::Computation {
+                    status: *status,
+                    result: result.clone(),
+                    reason: reason.clone(),
+                })?
+            else {
+                unreachable!()
+            };
             put_async(&mut builder, &record);
         }
         Transition::SubagentSpawn {
@@ -502,8 +554,8 @@ pub fn apply(
                         .to_string(),
                 );
             };
-            if tool.task.is_some()
-                || tool.status != ToolStatus::Complete
+            if tool.task.as_ref().is_some_and(|task| task != &child.relay)
+                || tool.status != CallStatus::Complete
                 || tool.workspace_resolution.is_some()
                 || !tool.files.is_empty()
                 || tool.files_outcome.is_some()
@@ -546,11 +598,7 @@ pub fn apply(
                 );
             }
             put_tool(&mut builder, tool);
-            builder.put(
-                &paths::subagent_record_path(&child.id),
-                Mode::Blob,
-                child.encode(),
-            );
+            put_child(&mut builder, child);
         }
         Transition::SubagentTerminal {
             child,
@@ -559,19 +607,16 @@ pub fn apply(
             child_workspaces,
         } => {
             let conversation = parent(store, parent_tree)?;
-            let mut record = require_child(&conversation, child)?;
-            if record.status != ChildStatus::Running {
-                return Err("subagent terminal requires running status".to_string());
-            }
-            if *status == ChildStatus::Running {
-                return Err("subagent terminal status must be terminal".to_string());
-            }
-            for name in child_workspaces.keys() {
-                paths::validate_workspace_name(name)?;
-            }
-            record.status = *status;
-            record.terminal_head = Some(terminal_head.clone());
-            record.child_workspaces = Some(child_workspaces.clone());
+            let record = require_child(&conversation, child)?;
+            let TaskRecord::Conversation(record) =
+                TaskRecord::Conversation(record).finish(TaskOutcome::Conversation {
+                    status: *status,
+                    head: terminal_head.clone(),
+                    workspaces: child_workspaces.clone(),
+                })?
+            else {
+                unreachable!()
+            };
             put_child(&mut builder, &record);
         }
         Transition::SubagentApply { child, application } => {
@@ -613,6 +658,21 @@ pub fn apply(
                 return Err(format!("workspace {name:?} already exists"));
             }
             put_workspace(&mut builder, name, commit, commit, origin.as_ref());
+        }
+        Transition::LegacyWorkspaceConfigure { name, encoded } => {
+            let conversation = parent(store, parent_tree)?;
+            let workspace = conversation
+                .workspace(name)?
+                .ok_or("workspace does not exist")?;
+            let config = super::workspaces::legacy_config(encoded, &workspace.initial)?;
+            let mut configs = conversation.workspace_configs()?;
+            configs.insert(name.clone(), config);
+            super::workspace_order(&configs)?;
+            builder.put(
+                &paths::workspace_config_path(name),
+                Mode::Blob,
+                encoded.clone(),
+            );
         }
         Transition::WorkspaceConfigure { name, config } => {
             let conversation = parent(store, parent_tree)?;
@@ -719,12 +779,12 @@ pub fn apply(
 }
 
 fn validate_fork_quiescence(conversation: &Conversation<'_>) -> Result<(), String> {
-    if conversation.active_request()?.is_some() {
+    if conversation.active_turn()?.is_some() {
         return Err("cannot fork a conversation with an active or cancelling request".to_string());
     }
-    for request in conversation.request_ids()? {
+    for request in conversation.turn_ids()? {
         let record = conversation
-            .request(&request)?
+            .turn(&request)?
             .ok_or_else(|| format!("request {request} disappeared"))?;
         for round in 0..record.round {
             if conversation
@@ -818,7 +878,7 @@ fn canonical_shape<T: Record + PartialEq>(record: &T, what: &str) -> Result<(), 
 }
 
 fn put_workspace(
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
     name: &str,
     commit: &Oid,
     initial: &Oid,
@@ -843,39 +903,47 @@ fn put_workspace(
     }
 }
 
-fn put_request(builder: &mut TreeBuilder, record: &RequestRecord) {
+fn put_request(builder: &mut ProtocolBuilder, record: &TurnRecord) {
     builder.put(
-        &paths::request_record_path(record.id.as_str()),
+        &paths::turn_record_path(record.id.as_str()),
         Mode::Blob,
         record.encode(),
     );
 }
 
-fn put_tool(builder: &mut TreeBuilder, record: &ToolRecord) {
+fn put_tool(builder: &mut ProtocolBuilder, record: &CallRecord) {
     builder.put(
-        &paths::tool_record_path(record.request.as_str(), record.round, &record.id),
+        &paths::call_record_path(record.request.as_str(), record.round, &record.id),
         Mode::Blob,
         record.encode(),
     );
 }
 
-fn put_async(builder: &mut TreeBuilder, record: &AsyncRecord) {
+fn put_async(builder: &mut ProtocolBuilder, record: &AsyncRecord) {
     builder.put(
         &paths::async_record_path(record.task.as_str()),
         Mode::Blob,
-        record.encode(),
+        if builder.legacy {
+            record.encode()
+        } else {
+            TaskRecord::Computation(record.clone()).encode()
+        },
     );
 }
 
-fn put_child(builder: &mut TreeBuilder, record: &ChildRecord) {
+fn put_child(builder: &mut ProtocolBuilder, record: &ChildRecord) {
     builder.put(
         &paths::subagent_record_path(&record.id),
         Mode::Blob,
-        record.encode(),
+        if builder.legacy {
+            record.encode()
+        } else {
+            TaskRecord::Conversation(record.clone()).encode()
+        },
     );
 }
 
-fn put_publication(builder: &mut TreeBuilder, record: &PublicationRecord) {
+fn put_publication(builder: &mut ProtocolBuilder, record: &PublicationRecord) {
     builder.put(
         &paths::publication_record_path(&record.id),
         Mode::Blob,
@@ -884,7 +952,7 @@ fn put_publication(builder: &mut TreeBuilder, record: &PublicationRecord) {
 }
 
 fn put_transcript(
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
     ordinal: u64,
     entry: &TranscriptEntry,
     payloads: &[(String, Vec<u8>)],
@@ -906,14 +974,14 @@ fn put_transcript(
 }
 
 fn put_payloads(
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
     dir: &str,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<BTreeSet<String>, String> {
     let mut paths_set = BTreeSet::new();
     for (name, bytes) in payloads {
         paths::validate_component(name)?;
-        let full_path = format!("{dir}/{name}");
+        let full_path = builder.path(&format!("{dir}/{name}"));
         if !paths_set.insert(full_path.clone()) {
             return Err(format!("duplicate payload name {name:?}"));
         }
@@ -946,7 +1014,7 @@ fn validate_entry_payloads(
 fn validate_entry_resolution(
     conversation: &Conversation<'_>,
     entry: &TranscriptEntry,
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
 ) -> Result<(), String> {
     let proposal = entry
         .proposal
@@ -973,9 +1041,9 @@ fn validate_entry_resolution(
     Ok(())
 }
 
-fn require_active(conversation: &Conversation<'_>, request: &Oid) -> Result<RequestRecord, String> {
+fn require_active(conversation: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
     let active = conversation
-        .active_request()?
+        .active_turn()?
         .ok_or_else(|| "there is no active request".to_string())?;
     if active.id != *request {
         return Err(format!("active request is {}, not {request}", active.id));
@@ -986,12 +1054,9 @@ fn require_active(conversation: &Conversation<'_>, request: &Oid) -> Result<Requ
 fn require_request_running_or_cancelling(
     conversation: &Conversation<'_>,
     request: &Oid,
-) -> Result<RequestRecord, String> {
+) -> Result<TurnRecord, String> {
     let record = require_active(conversation, request)?;
-    if !matches!(
-        record.status,
-        RequestStatus::Running | RequestStatus::Cancelling
-    ) {
+    if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
         return Err("tool transition requires running or cancelling request".to_string());
     }
     Ok(record)
@@ -999,7 +1064,7 @@ fn require_request_running_or_cancelling(
 
 fn validate_tool_workspace(
     conversation: &Conversation<'_>,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(), String> {
     if record.workspace_name.is_some() != record.input_workspace.is_some() {
         return Err(
@@ -1017,7 +1082,7 @@ fn validate_tool_workspace(
     Ok(())
 }
 
-fn validate_current_call(request: &RequestRecord, record: &ToolRecord) -> Result<(), String> {
+fn validate_current_call(request: &TurnRecord, record: &CallRecord) -> Result<(), String> {
     if record.round.checked_add(1) != Some(request.round)
         || !request.calls.iter().any(|call| call.id == record.id)
     {
@@ -1029,19 +1094,19 @@ fn validate_current_call(request: &RequestRecord, record: &ToolRecord) -> Result
 #[allow(clippy::type_complexity)]
 fn validate_tool_completion(
     conversation: &Conversation<'_>,
-    request: &RequestRecord,
-    record: &ToolRecord,
+    request: &TurnRecord,
+    record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
     files: &[(String, Option<(Mode, Vec<u8>)>)],
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
 ) -> Result<(), String> {
     canonical_shape(record, "tool")?;
-    if record.status == ToolStatus::Started {
+    if record.status == CallStatus::Started {
         return Err("tool.complete requires a terminal status".to_string());
     }
     let existing = conversation.tool(&record.request, record.round, &record.id)?;
     if let Some(started) = &existing {
-        if started.status != ToolStatus::Started {
+        if started.status != CallStatus::Started {
             return Err("tool.complete requires an absent or started tool record".to_string());
         }
         if started.name != record.name
@@ -1052,8 +1117,10 @@ fn validate_tool_completion(
         {
             return Err("tool.complete identity fields do not match tool.start".to_string());
         }
-    } else if record.task.is_some() {
-        return Err("startless tool.complete must not carry a task".to_string());
+    } else if let Some(task) = &record.task {
+        if conversation.task(task)?.is_none() {
+            return Err("startless tool.complete must refer to an existing task".to_string());
+        }
     }
     if existing.is_none() {
         validate_current_call(request, record)?;
@@ -1063,7 +1130,7 @@ fn validate_tool_completion(
         .result
         .as_ref()
         .ok_or_else(|| "tool.complete requires a result".to_string())?;
-    if ToolRecord::expected_status(result, record.workspace_resolution.as_ref()) != record.status {
+    if CallRecord::expected_status(result, record.workspace_resolution.as_ref()) != record.status {
         return Err("tool status does not match result and resolution".to_string());
     }
     validate_new_tool_payloads(conversation, record, payloads)?;
@@ -1107,7 +1174,7 @@ fn validate_tool_completion(
 }
 
 fn move_workspace_pointer(
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
     name: &str,
     current: &Oid,
     pointer: Option<&Oid>,
@@ -1128,27 +1195,27 @@ fn move_workspace_pointer(
 }
 
 fn put_tool_payloads(
-    builder: &mut TreeBuilder,
-    record: &ToolRecord,
+    builder: &mut ProtocolBuilder,
+    record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<BTreeSet<String>, String> {
     put_payloads(
         builder,
-        &paths::tool_payload_dir(record.request.as_str(), record.round, &record.id),
+        &paths::call_payload_dir(record.request.as_str(), record.round, &record.id),
         payloads,
     )
 }
 
 fn validate_new_tool_payloads(
     conversation: &Conversation<'_>,
-    record: &ToolRecord,
+    record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let dir = paths::tool_payload_dir(record.request.as_str(), record.round, &record.id);
+    let dir = paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
     for (name, _) in payloads {
         paths::validate_component(name)?;
         let path = format!("{dir}/{name}");
-        if conversation.snapshot().exists(&path)? {
+        if conversation.optional_blob(&path)?.is_some() {
             return Err(format!("tool payload {path:?} already exists"));
         }
     }
@@ -1158,7 +1225,7 @@ fn validate_new_tool_payloads(
 #[allow(clippy::type_complexity)]
 fn apply_files(
     conversation: &Conversation<'_>,
-    builder: &mut TreeBuilder,
+    builder: &mut ProtocolBuilder,
     files: &[(String, Option<(Mode, Vec<u8>)>)],
     unique_what: &str,
 ) -> Result<(), String> {
@@ -1261,8 +1328,8 @@ mod tests {
         .unwrap()
     }
 
-    fn request() -> RequestRecord {
-        RequestRecord {
+    fn request() -> TurnRecord {
+        TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1271,7 +1338,7 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
@@ -1307,8 +1374,8 @@ mod tests {
         )
     }
 
-    fn started_tool() -> ToolRecord {
-        ToolRecord {
+    fn started_tool() -> CallRecord {
+        CallRecord {
             request: oid('1'),
             round: 0,
             id: "tool-1".to_string(),
@@ -1316,7 +1383,7 @@ mod tests {
             declaration_message: "assistant-1".to_string(),
             workspace_name: Some("main".to_string()),
             input_workspace: Some(oid('a')),
-            status: ToolStatus::Started,
+            status: CallStatus::Started,
             task: Some(oid('3')),
             result: None,
             workspace_resolution: None,
@@ -1325,14 +1392,14 @@ mod tests {
         }
     }
 
-    fn completed_tool() -> (ToolRecord, Vec<(String, Vec<u8>)>) {
+    fn completed_tool() -> (CallRecord, Vec<(String, Vec<u8>)>) {
         let observation = format!(
             "{}/observation",
-            paths::tool_payload_dir(oid('1').as_str(), 0, "tool-1")
+            paths::call_payload_dir(oid('1').as_str(), 0, "tool-1")
         );
         (
-            ToolRecord {
-                status: ToolStatus::Complete,
+            CallRecord {
+                status: CallStatus::Complete,
                 result: Some(ToolResult::Complete {
                     observation,
                     proposal: Some(oid('b')),
@@ -1366,7 +1433,7 @@ mod tests {
                 tool: "spawn".to_string(),
                 workspace_name: None,
                 input_workspace: None,
-                prompt: ".caos/tools/prompt".to_string(),
+                prompt: ".caos/calls/prompt".to_string(),
                 model: "model".to_string(),
                 configuration: "configuration-hash".to_string(),
                 files_seed: None,
@@ -1382,26 +1449,31 @@ mod tests {
         let paths: Vec<String> = diff(store, before, after)
             .unwrap()
             .into_iter()
-            .map(|change| change.path)
+            .map(|change| paths::current_path(&change.path))
             .collect();
+        let mut paths = paths;
+        paths.sort();
+        let mut expected = expected.to_vec();
+        expected.sort();
         assert_eq!(paths, expected);
     }
 
     #[test]
     fn complete_conversation_applies_exact_changes() {
-        const REQUEST_1: &str = ".caos/requests/1111111111111111111111111111111111111111.json";
-        const REQUEST_7: &str = ".caos/requests/7777777777777777777777777777777777777777.json";
-        const REQUEST_8: &str = ".caos/requests/8888888888888888888888888888888888888888.json";
-        const ACTIVE: &str = ".caos/requests/active";
+        const REQUEST_1: &str = ".caos/turns/1111111111111111111111111111111111111111.json";
+        const REQUEST_7: &str = ".caos/turns/7777777777777777777777777777777777777777.json";
+        const REQUEST_8: &str = ".caos/turns/8888888888888888888888888888888888888888.json";
+        const ACTIVE: &str = ".caos/turns/active";
         const WORKSPACE_MAIN: &str = ".caos/workspaces/main/commit";
         const CHILD: &str =
-            ".caos/subagents/subagent-e3b31a607694c2667a4116c48e822fae70329acef9b44f61803978fd175cf537.json";
-        const ASYNC: &str = ".caos/async/4444444444444444444444444444444444444444.json";
+            ".caos/tasks/conversations/subagent-e3b31a607694c2667a4116c48e822fae70329acef9b44f61803978fd175cf537.json";
+        const ASYNC: &str =
+            ".caos/tasks/computations/4444444444444444444444444444444444444444.json";
         const PUBLICATION: &str =
             ".caos/publications/f8c78ee8136e6bee1d121b22734b5f3210b113005643fac6c9d30e8e8863d61f.json";
         const USER_BODY: &str = ".caos/transcript/000000000/000000000000-user-0/body";
         const BASH_OBSERVATION: &str =
-            ".caos/tools/1111111111111111111111111111111111111111/0000/bash-call/observation";
+            ".caos/calls/1111111111111111111111111111111111111111/0000/bash-call/observation";
 
         const SPINE: &[(Kind, &[&str])] = &[
             (
@@ -1423,10 +1495,10 @@ mod tests {
                     USER_BODY,
                 ],
             ),
-            (Kind::RequestAdmit, &[REQUEST_1, ACTIVE]),
-            (Kind::RequestClaim, &[REQUEST_1]),
+            (Kind::TurnAdmit, &[REQUEST_1, ACTIVE]),
+            (Kind::TurnClaim, &[REQUEST_1]),
             (
-                Kind::RequestInterject,
+                Kind::TurnInterject,
                 &[
                     REQUEST_1,
                     ".caos/transcript/000000000/000000000001-interjection-1.json",
@@ -1445,18 +1517,18 @@ mod tests {
             (
                 Kind::ToolComplete,
                 &[
-                    ".caos/tools/1111111111111111111111111111111111111111/0000/read-call.json",
-                    ".caos/tools/1111111111111111111111111111111111111111/0000/read-call/observation",
+                    ".caos/calls/1111111111111111111111111111111111111111/0000/read-call.json",
+                    ".caos/calls/1111111111111111111111111111111111111111/0000/read-call/observation",
                 ],
             ),
             (
                 Kind::ToolStart,
-                &[".caos/tools/1111111111111111111111111111111111111111/0000/bash-call.json"],
+                &[".caos/calls/1111111111111111111111111111111111111111/0000/bash-call.json"],
             ),
             (
                 Kind::ToolComplete,
                 &[
-                    ".caos/tools/1111111111111111111111111111111111111111/0000/bash-call.json",
+                    ".caos/calls/1111111111111111111111111111111111111111/0000/bash-call.json",
                     BASH_OBSERVATION,
                     WORKSPACE_MAIN,
                     "files/tool.txt",
@@ -1475,13 +1547,13 @@ mod tests {
                 Kind::SubagentSpawn,
                 &[
                     CHILD,
-                    ".caos/tools/1111111111111111111111111111111111111111/0001/spawn-call.json",
-                    ".caos/tools/1111111111111111111111111111111111111111/0001/spawn-call/observation",
+                    ".caos/calls/1111111111111111111111111111111111111111/0001/spawn-call.json",
+                    ".caos/calls/1111111111111111111111111111111111111111/0001/spawn-call/observation",
                 ],
             ),
             (Kind::AsyncStart, &[ASYNC]),
             (
-                Kind::RequestInterject,
+                Kind::TurnInterject,
                 &[
                     REQUEST_1,
                     ".caos/transcript/000000000/000000000004-interjection-3.json",
@@ -1497,7 +1569,7 @@ mod tests {
                     ".caos/transcript/000000000/000000000005-assistant-4.json",
                 ],
             ),
-            (Kind::RequestTerminal, &[REQUEST_1, ACTIVE]),
+            (Kind::TurnTerminal, &[REQUEST_1, ACTIVE]),
             (
                 Kind::WorkspaceCreate,
                 &[
@@ -1518,12 +1590,12 @@ mod tests {
             (Kind::PublicationPending, &[PUBLICATION]),
             (Kind::PublicationTerminal, &[PUBLICATION]),
             (Kind::FilesApply, &["files/final.txt"]),
-            (Kind::RequestAdmit, &[REQUEST_7, ACTIVE]),
-            (Kind::RequestEscape, &[REQUEST_7, ACTIVE]),
-            (Kind::RequestAdmit, &[REQUEST_8, ACTIVE]),
-            (Kind::RequestClaim, &[REQUEST_8]),
-            (Kind::RequestEscape, &[REQUEST_8]),
-            (Kind::RequestTerminal, &[REQUEST_8, ACTIVE]),
+            (Kind::TurnAdmit, &[REQUEST_7, ACTIVE]),
+            (Kind::TurnEscape, &[REQUEST_7, ACTIVE]),
+            (Kind::TurnAdmit, &[REQUEST_8, ACTIVE]),
+            (Kind::TurnClaim, &[REQUEST_8]),
+            (Kind::TurnEscape, &[REQUEST_8]),
+            (Kind::TurnTerminal, &[REQUEST_8, ACTIVE]),
             (
                 Kind::ConversationFork,
                 &[".caos/identity.json", ".caos/title"],
@@ -1561,15 +1633,12 @@ mod tests {
         assert_eq!(view.file("notes.md").unwrap().unwrap(), b"seeded notes\n");
         assert_eq!(view.file("tool.txt").unwrap().unwrap(), b"tool output\n");
         assert_eq!(view.file("final.txt").unwrap().unwrap(), b"final\n");
-        assert!(view.active_request().unwrap().is_none());
+        assert!(view.active_turn().unwrap().is_none());
         assert_eq!(
-            view.request(&oid('1')).unwrap().unwrap().status,
-            RequestStatus::Idle
+            view.turn(&oid('1')).unwrap().unwrap().status,
+            TurnStatus::Idle
         );
-        assert_eq!(
-            view.request_ids().unwrap(),
-            vec![oid('1'), oid('7'), oid('8')]
-        );
+        assert_eq!(view.turn_ids().unwrap(), vec![oid('1'), oid('7'), oid('8')]);
         assert_eq!(view.tools(&oid('1'), 0).unwrap().len(), 2);
     }
 
@@ -1628,8 +1697,8 @@ mod tests {
             &applied.tree,
             &[
                 ".caos/identity.json",
-                ".caos/subagents/also-running-child.json",
-                ".caos/subagents/running-child.json",
+                ".caos/tasks/conversations/also-running-child.json",
+                ".caos/tasks/conversations/running-child.json",
                 ".caos/title",
             ],
         );
@@ -1669,7 +1738,7 @@ mod tests {
         let (head, applied) = commit_transition(
             &mut store,
             &head,
-            Transition::RequestAdmit { record: request() },
+            Transition::TurnAdmit { record: request() },
         );
         assert_eq!(
             fork_error(&mut store, &head, &applied.tree),
@@ -1684,20 +1753,20 @@ mod tests {
         let root_tree = store.read_commit(&head).unwrap().tree;
         let mut terminal = request();
         terminal.round = 1;
-        terminal.status = RequestStatus::Idle;
-        terminal.outcome = Some(RequestOutcome::Idle {
+        terminal.status = TurnStatus::Idle;
+        terminal.outcome = Some(TurnOutcome::Idle {
             result: None,
             interrupted: false,
         });
         let mut builder = TreeBuilder::from(Some(root_tree));
         builder.put(
-            &paths::request_record_path(terminal.id.as_str()),
+            &paths::turn_record_path(terminal.id.as_str()),
             Mode::Blob,
             terminal.encode(),
         );
         let tool = started_tool();
         builder.put(
-            &paths::tool_record_path(tool.request.as_str(), tool.round, &tool.id),
+            &paths::call_record_path(tool.request.as_str(), tool.round, &tool.id),
             Mode::Blob,
             tool.encode(),
         );
@@ -1815,12 +1884,12 @@ mod tests {
         let (queued_head, queued) = commit_transition(
             &mut store,
             &root_head,
-            Transition::RequestAdmit { record: request() },
+            Transition::TurnAdmit { record: request() },
         );
         assert!(apply(
             &mut store,
             Some(&queued.tree),
-            &Transition::RequestAdmit { record: request() }
+            &Transition::TurnAdmit { record: request() }
         )
         .is_err());
         assert!(apply(
@@ -1842,7 +1911,7 @@ mod tests {
         let (running_head, running) = commit_transition(
             &mut store,
             &queued_head,
-            Transition::RequestClaim {
+            Transition::TurnClaim {
                 request: oid('1'),
                 latest_message: "message".to_string(),
             },
@@ -1850,7 +1919,7 @@ mod tests {
         assert!(apply(
             &mut store,
             Some(&running.tree),
-            &Transition::RequestClaim {
+            &Transition::TurnClaim {
                 request: oid('1'),
                 latest_message: "message".to_string(),
             }
@@ -1926,7 +1995,7 @@ mod tests {
                 tool: "spawn".to_string(),
                 workspace_name: None,
                 input_workspace: None,
-                prompt: ".caos/tools/prompt".to_string(),
+                prompt: ".caos/calls/prompt".to_string(),
                 model: "model".to_string(),
                 configuration: "configuration-hash".to_string(),
                 files_seed: None,
@@ -1938,9 +2007,9 @@ mod tests {
         };
         let spawn_observation = format!(
             "{}/observation",
-            paths::tool_payload_dir(oid('1').as_str(), 0, "spawn")
+            paths::call_payload_dir(oid('1').as_str(), 0, "spawn")
         );
-        let spawn_tool = ToolRecord {
+        let spawn_tool = CallRecord {
             request: oid('1'),
             round: 0,
             id: "spawn".to_string(),
@@ -1948,7 +2017,7 @@ mod tests {
             declaration_message: "assistant-1".to_string(),
             workspace_name: None,
             input_workspace: None,
-            status: ToolStatus::Complete,
+            status: CallStatus::Complete,
             task: None,
             result: Some(ToolResult::Complete {
                 observation: spawn_observation,
@@ -1976,23 +2045,23 @@ mod tests {
         let idle_head = root(&mut store);
         let idle_tree = store.read_commit(&idle_head).unwrap().tree;
         let mut idle = request();
-        idle.status = RequestStatus::Idle;
-        idle.outcome = Some(RequestOutcome::Idle {
+        idle.status = TurnStatus::Idle;
+        idle.outcome = Some(TurnOutcome::Idle {
             result: None,
             interrupted: false,
         });
         let mut builder = TreeBuilder::from(Some(idle_tree));
         builder.put(
-            &paths::request_record_path(idle.id.as_str()),
+            &paths::turn_record_path(idle.id.as_str()),
             Mode::Blob,
             idle.encode(),
         );
-        builder.put(paths::ACTIVE_REQUEST, Mode::Blob, oid('1').encode_line());
+        builder.put(paths::ACTIVE_TURN, Mode::Blob, oid('1').encode_line());
         let corrupt_active_idle = builder.build(&mut store).unwrap();
         assert!(apply(
             &mut store,
             Some(&corrupt_active_idle),
-            &Transition::RequestEscape {
+            &Transition::TurnEscape {
                 request: oid('1'),
                 reason: None,
             }
@@ -2080,12 +2149,12 @@ mod tests {
         let (admitted, _) = commit_transition(
             &mut store,
             &root,
-            Transition::RequestAdmit { record: request() },
+            Transition::TurnAdmit { record: request() },
         );
         let (claimed, _) = commit_transition(
             &mut store,
             &admitted,
-            Transition::RequestClaim {
+            Transition::TurnClaim {
                 request: oid('1'),
                 latest_message: "message".to_string(),
             },
@@ -2093,7 +2162,7 @@ mod tests {
         let (cancelling, _) = commit_transition(
             &mut store,
             &claimed,
-            Transition::RequestEscape {
+            Transition::TurnEscape {
                 request: oid('1'),
                 reason: Some("stop".to_string()),
             },
@@ -2101,19 +2170,19 @@ mod tests {
         let (terminal, _) = commit_transition(
             &mut store,
             &cancelling,
-            Transition::RequestTerminal {
+            Transition::TurnTerminal {
                 request: oid('1'),
-                outcome: RequestOutcome::Failed {
-                    error: ".caos/requests/error".to_string(),
+                outcome: TurnOutcome::Failed {
+                    error: ".caos/turns/error".to_string(),
                 },
             },
         );
         let record = Conversation::open(&store, &terminal)
             .unwrap()
-            .request(&oid('1'))
+            .turn(&oid('1'))
             .unwrap()
             .unwrap();
-        assert_eq!(record.status, RequestStatus::Failed);
+        assert_eq!(record.status, TurnStatus::Failed);
         assert_eq!(record.escape_reason, None);
     }
 }

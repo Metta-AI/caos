@@ -1835,9 +1835,8 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
                     .count();
                 let repository = ws
                     .config
-                    .repository
-                    .as_deref()
-                    .unwrap_or("checkout repository");
+                    .repository()
+                    .unwrap_or_else(|| "checkout repository".into());
                 let publication = state
                     .publications
                     .iter()
@@ -1846,7 +1845,7 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
                     .unwrap_or_else(|| "unpublished".into());
                 let base = ws
                     .config
-                    .base
+                    .upstream
                     .as_ref()
                     .map(|base| format!("base {}", base.name()))
                     .unwrap_or_default();

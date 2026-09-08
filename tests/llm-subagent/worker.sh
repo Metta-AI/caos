@@ -88,8 +88,7 @@ spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
   || fail "spawn tool record has the wrong name"
 [ "$(jq -r '.status' <<<"$spawn_record")" = complete ] \
   || fail "spawn tool record is not complete"
-[ "$(jq -r '.task // "none"' <<<"$spawn_record")" = none ] \
-  || fail "spawn tool record is not startless"
+
 
 $TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
   --round 0 --id toolu_spawn > /tmp/spawn-observation.json
@@ -113,6 +112,9 @@ relay=$(jq -r '.relay' <<<"$child_record")
 assert_oid "$initial_head" "child initial head"
 assert_oid "$child_request" "child request"
 assert_oid "$relay" "child relay"
+[ "$(jq -r '.task' <<<"$spawn_record")" = "$relay" ] \
+  || fail "spawn call did not reference the child's task"
+
 wait_record=$(jq -c 'select(.id == "toolu_wait")' /tmp/parent-tools.jsonl)
 [ "$(jq -r '.status' <<<"$wait_record")" = complete ] \
   || fail "wait_agent did not complete"
@@ -221,7 +223,7 @@ printf '{"content":[{"id":"toolu_promote","input":{"action":"promote","child":"%
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
 [ "$(workspace_commit "$head2" review)" = "$child_main" ] || fail "promotion did not retain the completed child's snapshot"
-record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.base.name == "main" and .base.commit == $commit' >/dev/null || fail "promotion lost the child base"
+record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "promotion lost the child upstream or inherited publication settings"
 parent_after=$(workspace_commit "$head2")
 [ "$parent_after" != "$parent_main" ] || fail "harvest did not move parent main"
 fetch_code "$parent_after" "fetching harvested parent workspace"
@@ -253,7 +255,7 @@ while read -r _ kind harvest_present; do
     *) fail "unexpected parent event $kind while child ran" ;;
   esac
 done < <($TOOL parents --repo /tmp/repo --head "$head2" \
-    --present-path ".caos/tools/$request2/0000/toolu_harvest.json" \
+    --present-path ".caos/calls/$request2/0000/toolu_harvest.json" \
   | while read -r oid kind harvest_present; do
       if [ "$oid" = "$pre_spawn" ]; then break; fi
       printf '%s %s %s\n' "$oid" "$kind" "$harvest_present"

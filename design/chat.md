@@ -23,7 +23,7 @@ workspace commit hashes through files in their trees.
 
 ```
 # Identity and metadata
-.caos/format                                        protocol version: "3"
+.caos/format                                        "caos-conversation-v3"
 .caos/identity.json                                 ID, root/fork origin, and subagent parent/spawning call
 .caos/title                                         displayed title
 
@@ -34,21 +34,20 @@ workspace commit hashes through files in their trees.
 # Workspaces
 .caos/workspaces/<name>/commit                       current code commit hash
 .caos/workspaces/<name>/initial                      starting commit; baseline for changes and rollback limits
-.caos/workspaces/<name>/origin                       optional source label and original tree hash
-.caos/workspaces/<name>/config.json                  repository, publication branch, upstream and integrated commit
+.caos/workspaces/<name>/config.json                  source locator, upstream/checkpoint, publication destination/base
 
 # Conversation-owned files
 files/                                              files separate from workspace code
 
-# Agent turns and tools
-.caos/requests/<id>.json                             starting snapshot, model settings, calls, status, outcome
-.caos/requests/active                                active request hash; absent when none
-.caos/tools/<request>/<round>/<call-id>.json          input workspace, status, result, applied changes
-.caos/tools/<request>/<round>/<call-id>/              tool arguments and output files
+# Turns and calls
+.caos/turns/<id>.json                             starting snapshot, model settings, calls, status, outcome
+.caos/turns/active                                active turn hash; absent when none
+.caos/calls/<turn>/<round>/<call-id>.json          input workspace, optional task, status, result, applied changes
+.caos/calls/<turn>/<round>/<call-id>/              tool arguments and output files
 
 # Background work
-.caos/async/                                         task status and results
-.caos/subagents/                                     child conversations, spawn inputs, results, applied changes
+.caos/tasks/computations/<hash>.json                 computation task status and result
+.caos/tasks/conversations/<child-id>.json             conversation task, spawn inputs, result, application history
 
 # Publication
 .caos/publications/                                  destinations, planned commits, expected remote tips, outcomes
@@ -59,7 +58,7 @@ files/                                              files separate from workspac
 Each transition creates a new `C`. Its kind determines which changes are
 allowed; validation rejects unrelated changes and no-op transitions.
 
-A turn starts by appending the user message and admitting a request. The worker
+A turn starts by appending the user message and admitting a turn. The worker
 claims it, calls the model, records its response, and executes its tools. This
 repeats until the turn finishes or fails. Interruptions are handled at worker
 boundaries.
@@ -78,20 +77,20 @@ but does not inherit the parent's transcript or files.
 Completion is recorded in the parent. Harvesting applies child changes to an
 existing workspace; promotion creates a separate workspace for review.
 
-TODO: Unify bookkeeping around:
+Bookkeeping has three concepts:
 
-- **Turns:** model loop, interruption, outstanding calls. Rename conversation
-  `requests` to distinguish them from CAOS computation requests.
+- **Turns:** model loop, interruption, and outstanding calls. These records
+  are distinct from CAOS computation requests.
 - **Calls:** arguments, responses, applied changes, and an optional task reference.
-- **Tasks:** shared status, results, cancellation, and recovery. Start with
-  `async` and `subagents`, treating child conversations as a task variant;
-  retain spawn information and application records.
+- **Tasks:** shared pending/terminal status, results, cancellation, and recovery.
+  Computations and child conversations are explicit variants. Conversation
+  tasks retain their spawn inputs, terminal checkpoint, and application history.
 
 Launching, finishing, and applying work are separate events. Calls identify
 occurrences; computation hashes identify content, so calls can share cached
 work but still need separate responses. Immediate tools need no extra task
-record. Share lifecycle code with dispatched tools where useful, using explicit
-variants rather than one record full of optional fields.
+record. Recovery polls pending tasks through one path; terminal notifications
+share idempotence checks. Variant-specific data and validation remain separate.
 
 ### Forks, titles, and archiving
 
@@ -109,6 +108,13 @@ and reconstruct its declared transition; the resulting tree must match. See
 [record formats](../rust/crates/conversation-protocol/src/v3/records.rs) and
 [validation](../rust/crates/conversation-protocol/src/v3/validate.rs) for exact rules.
 
+Historical conversations remain readable without rewriting their commit hashes.
+Readers accept the old `requests`, `tools`, `async`, and `subagents` paths;
+new writes use turns, calls, and tagged task records. Updating a record removes
+its old counterpart. The transition labels `request.*` and `tool.*`, and
+existing record field names, remain stable wire encodings.
+
+
 ## Workspace commits
 
 A conversation has zero or more named workspaces. Each points to a `W`: a Git
@@ -123,28 +129,37 @@ changing the local checkout. A branch attachment remembers its upstream; an
 attachment by commit stays pinned. Workspace inputs cannot contain reserved
 `.caos` entries other than `.caos/conflicts`.
 
-Currently, `config.json` holds the repository, publication branch, and upstream.
-The upstream is a repository branch or another workspace, plus the exact commit
-already integrated. Workspace dependencies must stay within a repository and
-cannot form cycles. A workspace with dependents cannot be removed.
+`config.json` keeps three independent fields:
 
-TODO: Separate these concepts:
+- **Source:** an optional pinned locator, such as
+  `git+https://github.com/team/repo.git?rev=<full-commit-sha>`. It uses the
+  same parser as `:@@=`, but workspace attachment imports the commit and its
+  ancestry, not an evaluated tree. Mutable refs, `path:`, and `dir=` are
+  not workspace sources.
+- **Upstream:** a repository branch or another workspace, plus the exact
+  commit already integrated. This is a moving integration relationship;
+  the source locator remains pinned.
+- **Publication:** a repository, destination branch, and optional PR base
+  (repository default, named branch, or parent workspace). The host derives
+  defaults until the destination is chosen or published, then remembers it.
+  Choosing a PR base does not change which upstream future updates integrate.
 
-- **Source:** optional pinned locator using the existing `:@@=` syntax. Reuse
-  its parser, retaining the commit and ancestry rather than only a tree. Check
-  whether `origin` has callers beyond fixtures before replacing it.
-- **Upstream:** branch or workspace to integrate from, plus the incorporated
-  commit. An immutable source locator cannot replace a moving upstream.
-- **Publication destination:** derive a default; remember repository and branch
-  when chosen or published. Keep this with publication settings. Stacked PRs
-  still need their parent's destination.
+Workspace upstream dependencies must stay within a repository and cannot form
+cycles. A workspace with dependents cannot be removed. For a stacked PR, the
+parent's publication destination supplies the child's PR base.
+
+The old `origin` field had no production writers; readers retain it for
+historical conversations. Old repository/branch/base settings are read through
+a compatibility adapter. If an old record omitted its repository, it retains
+the checkout-origin default; new attachments bind the repository explicitly.
 
 ### Selecting and creating workspaces
 
 `Ctrl+O` or `/workspace` opens the picker. Create a workspace from the selected
 snapshot or an explicit revision; stack it on another workspace when it depends
 on that work. `/workspace attach <name> <repository> [<branch>|<commit>]` attaches
-another repository.
+another repository. A pinned locator can replace the repository and revision
+arguments: `/workspace attach <name> <locator>`.
 
 Selection is local UI state. A submitted turn captures its focus; with multiple
 workspaces, tool calls name their target. Switching selection cannot redirect

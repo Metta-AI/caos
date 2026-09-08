@@ -193,7 +193,7 @@ git -c fetch.negotiationAlgorithm=noop fetch -q caos "$workspace" \
 [ "$(git show "$workspace:notes/todo.txt")" = "hello notes" ] \
   || fail "completed conversation lost its base workspace"
 
-request_path=$(git ls-tree -r --name-only "$tip" .caos/requests | grep '\.json$' | tail -1)
+request_path=$(git ls-tree -r --name-only "$tip" .caos/turns | grep '\.json$' | tail -1)
 [ -n "$request_path" ] || fail "admission request record is missing"
 admission=$($TOOL read --repo "$PWD" --head "$tip" --path "$request_path")
 request=$(jq -r .id <<<"$admission")

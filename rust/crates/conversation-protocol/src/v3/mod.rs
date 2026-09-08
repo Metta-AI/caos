@@ -11,7 +11,9 @@ pub mod paths;
 pub mod reconcile;
 pub mod records;
 pub mod refs;
+pub mod tasks;
 pub mod tree;
+pub use tasks::{TaskOutcome, TaskRecord, TaskStatus};
 pub mod validate;
 pub mod view;
 pub mod workspaces;
@@ -29,4 +31,4 @@ pub use tree::{
     CommitInfo, Mode, ObjectStore, Signature, Snapshot, StoreError, TreeBuilder, TreeEntry,
 };
 pub use validate::{validate_commit, validate_spine, Validated};
-pub use workspaces::{workspace_order, WorkspaceBase, WorkspaceConfig};
+pub use workspaces::{workspace_order, PublicationDestination, WorkspaceBase, WorkspaceConfig};

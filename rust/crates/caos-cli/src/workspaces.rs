@@ -1,6 +1,8 @@
 //! Host operations on named workspaces. Settings and code move through the same lease.
 use super::*;
-pub use conversation_protocol::v3::workspaces::Creation;
+use conversation_protocol::v3::workspaces::{source_locator, validate_repository, validate_source};
+pub use conversation_protocol::v3::workspaces::{Creation, PublicationBase};
+use conversation_protocol::v3::PublicationDestination;
 use conversation_protocol::v3::WorkspaceConfig;
 
 /// Resolve checkout defaults once, when code is attached to a conversation.
@@ -22,7 +24,7 @@ pub fn checkout_config(t: &GitTransport, commit: &str) -> Result<WorkspaceConfig
         repository
     };
     let mut config = WorkspaceConfig {
-        repository: Some(repository),
+        source: Some(source_locator(&repository, &oid(commit, "source commit")?)?),
         ..Default::default()
     };
     let mut candidates = Vec::new();
@@ -54,7 +56,8 @@ pub fn checkout_config(t: &GitTransport, commit: &str) -> Result<WorkspaceConfig
             continue;
         };
         if let Ok(base) = t.git_capture(&["merge-base", commit, &reference], None) {
-            config.base = Some(conversation_protocol::v3::WorkspaceBase::Branch {
+            config.upstream = Some(conversation_protocol::v3::WorkspaceBase::Branch {
+                repository: Some(repository.clone()),
                 name: name.into(),
                 commit: oid(base.trim(), "checkout base")?,
             });
@@ -71,7 +74,7 @@ pub fn config_at_commit(
     mut config: WorkspaceConfig,
     commit: &str,
 ) -> Result<WorkspaceConfig, String> {
-    if let Some(upstream) = &config.base {
+    if let Some(upstream) = &config.upstream {
         let base = t
             .git_capture(
                 &["merge-base", "--all", commit, upstream.commit().as_str()],
@@ -83,9 +86,9 @@ pub fn config_at_commit(
         if base.lines().count() != 1 {
             return Err("revision has multiple merge bases with the selected upstream".into());
         }
-        config.base = Some(upstream.with_commit(oid(base.trim(), "snapshot checkpoint")?));
+        config.upstream = Some(upstream.with_commit(oid(base.trim(), "snapshot checkpoint")?));
     }
-    config.branch = None;
+    config.publication = None;
     Ok(config)
 }
 
@@ -153,25 +156,28 @@ pub struct PublicationTarget {
 }
 
 pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<String, String> {
-    let repository = match &config.repository {
+    let repository = match config
+        .publication
+        .as_ref()
+        .and_then(|p| p.repository.clone())
+        .or_else(|| config.repository())
+    {
         Some(repository) => repository.clone(),
-        None => {
-            let checkout = git_config_value(t, "caos.checkout");
-            let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
-            source
-                .as_ref()
-                .unwrap_or(t)
-                .git_capture(&["remote", "get-url", "origin"], None)?
-                .trim()
-                .to_string()
-        }
+        None => default_repository(t)?,
     };
-    WorkspaceConfig {
-        repository: Some(repository.clone()),
-        ..Default::default()
-    }
-    .validate()?;
+    validate_repository(&repository)?;
     Ok(repository)
+}
+
+fn default_repository(t: &GitTransport) -> Result<String, String> {
+    let checkout = git_config_value(t, "caos.checkout");
+    let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
+    Ok(source
+        .as_ref()
+        .unwrap_or(t)
+        .git_capture(&["remote", "get-url", "origin"], None)?
+        .trim()
+        .to_string())
 }
 
 pub(super) use conversation_protocol::v3::workspaces::default_publication_branch as generated_branch;
@@ -182,8 +188,11 @@ pub(super) fn publication_branch(
     name: &str,
     repository: &str,
 ) -> Result<String, String> {
-    if let Some(branch) = view.workspace_config(name)?.branch {
-        return Ok(branch);
+    if let Some(destination) = view.workspace_config(name)?.publication {
+        return Ok(destination.branch);
+    }
+    if matches!(view.identity()?.kind, IdentityKind::Fork { .. }) {
+        return Ok(generated_branch(id, name, view.workspace_names()?.len()));
     }
     let prior = view
         .publications()?
@@ -244,13 +253,19 @@ pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTar
                     diagnostic.get_or_insert(error);
                     String::new()
                 });
-            let base = match &config.base {
-                Some(WorkspaceBase::Branch { name, .. }) => PublicationBase::Branch(name.clone()),
-                Some(WorkspaceBase::Workspace { name, .. }) => {
-                    PublicationBase::Workspace(name.clone())
-                }
-                None => PublicationBase::Default,
-            };
+            let base = config
+                .publication
+                .as_ref()
+                .and_then(|p| p.base.clone())
+                .unwrap_or_else(|| match &config.upstream {
+                    Some(WorkspaceBase::Branch { name, .. }) => {
+                        PublicationBase::Branch(name.clone())
+                    }
+                    Some(WorkspaceBase::Workspace { name, .. }) => {
+                        PublicationBase::Workspace(name.clone())
+                    }
+                    None => PublicationBase::Default,
+                });
             Ok(PublicationTarget {
                 head: view
                     .workspace(&name)?
@@ -266,33 +281,6 @@ pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTar
             })
         })
         .collect()
-}
-
-/// An upstream stays typed until an execution plan resolves its destination.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PublicationBase {
-    Default,
-    Branch(String),
-    Workspace(String),
-}
-
-impl PublicationBase {
-    pub fn parent(&self) -> Option<&str> {
-        match self {
-            Self::Workspace(name) => Some(name),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for PublicationBase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Default => f.write_str("repository default"),
-            Self::Branch(name) => f.write_str(name),
-            Self::Workspace(name) => write!(f, "@{name}"),
-        }
-    }
 }
 
 /// A reviewed destination with its PR base resolved once. Code tips are fetched
@@ -447,23 +435,44 @@ pub fn publish_prepared_target(
     prepared_head: &str,
     base_commit: &str,
 ) -> Result<PublishedBranch, String> {
-    use conversation_protocol::v3::WorkspaceBase;
     let target = &resolved.target;
     let base_commit = oid(base_commit, "publication base")?;
-    let config = WorkspaceConfig {
+    let mut config = target.previous_config.clone();
+    config.publication = Some(PublicationDestination {
         repository: Some(target.repository.clone()),
-        branch: Some(target.branch.clone()),
-        base: Some(match target.base.parent() {
-            Some(parent) => WorkspaceBase::Workspace {
-                name: parent.to_string(),
-                commit: base_commit,
-            },
-            None => WorkspaceBase::Branch {
-                name: resolved.base_branch.clone(),
-                commit: base_commit,
-            },
+        branch: target.branch.clone(),
+        base: Some(match &target.base {
+            PublicationBase::Default => PublicationBase::Branch(resolved.base_branch.clone()),
+            other => other.clone(),
         }),
-    };
+    });
+    // Advance an existing matching integration checkpoint, never change upstream identity.
+    if let Some(upstream) = &config.upstream {
+        let matches = match (upstream, &target.base) {
+            (
+                conversation_protocol::v3::WorkspaceBase::Branch {
+                    repository, name, ..
+                },
+                PublicationBase::Branch(branch),
+            ) => {
+                repository
+                    .as_ref()
+                    .map(|repo| normalize_repository_identity(repo))
+                    .transpose()?
+                    .as_deref()
+                    == Some(normalize_repository_identity(&target.repository)?.as_str())
+                    && name == branch
+            }
+            (
+                conversation_protocol::v3::WorkspaceBase::Workspace { name, .. },
+                PublicationBase::Workspace(parent),
+            ) => name == parent,
+            _ => false,
+        };
+        if matches {
+            config.upstream = Some(upstream.with_commit(base_commit));
+        }
+    }
     append_transition(
         t,
         id,
@@ -516,7 +525,7 @@ pub fn update_stack(
     let configs = Conversation::open(&store, &head)?.workspace_configs()?;
     let order = workspace_order(&configs)?;
     fn root<'a>(mut name: &'a str, configs: &'a BTreeMap<String, WorkspaceConfig>) -> &'a str {
-        while let Some(WorkspaceBase::Workspace { name: parent, .. }) = &configs[name].base {
+        while let Some(WorkspaceBase::Workspace { name: parent, .. }) = &configs[name].upstream {
             name = parent;
         }
         name
@@ -531,11 +540,24 @@ pub fn update_stack(
             continue;
         }
         let config = &configs[&name];
-        let Some(base) = &config.base else { continue };
+        let Some(base) = &config.upstream else {
+            continue;
+        };
         let result = (|| {
             let source = match base {
-                WorkspaceBase::Branch { name: branch, .. } => oid(
-                    &branch_snapshot(t, &repository_url(t, config)?, branch)?,
+                WorkspaceBase::Branch {
+                    repository,
+                    name: branch,
+                    ..
+                } => oid(
+                    &branch_snapshot(
+                        t,
+                        &repository
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(|| default_repository(t))?,
+                        branch,
+                    )?,
                     "upstream",
                 )?,
                 WorkspaceBase::Workspace { name: parent, .. } => {
@@ -560,7 +582,7 @@ pub fn update_stack(
                 return Ok(false);
             }
             let mut next_config = config.clone();
-            next_config.base = Some(base.with_commit(source.clone()));
+            next_config.upstream = Some(base.with_commit(source.clone()));
             append_transition(
                 t,
                 id,
@@ -638,11 +660,8 @@ pub fn attach(
 ) -> Result<String, String> {
     use conversation_protocol::v3::WorkspaceBase;
     paths::validate_workspace_name(name)?;
-    let mut config = WorkspaceConfig {
-        repository: Some(repository.to_string()),
-        ..Default::default()
-    };
-    config.validate()?;
+    validate_repository(repository)?;
+    let mut config = WorkspaceConfig::default();
     let reference = match revision {
         Some(reference) => reference.to_string(),
         None => default_branch(t, repository)?,
@@ -656,12 +675,14 @@ pub fn attach(
             &branch_snapshot(t, repository, branch)?,
             "attachment commit",
         )?;
-        config.base = Some(WorkspaceBase::Branch {
+        config.upstream = Some(WorkspaceBase::Branch {
+            repository: Some(repository.to_string()),
             name: branch.to_string(),
             commit: commit.clone(),
         });
         commit
     };
+    config.source = Some(source_locator(repository, &commit)?);
     ensure_code_commit(t, &mut open_store(t)?, &commit)?;
     reject_reserved_caos(t, commit.as_str(), "attached workspace")?;
     append_transition(
@@ -674,19 +695,13 @@ pub fn attach(
             if let Some(existing) = view.workspace(name)? {
                 if existing.commit == commit && existing.initial == commit && {
                     let mut existing_config = view.workspace_config(name)?;
-                    existing_config.branch = None;
+                    existing_config.publication = None;
                     existing_config == config
                 } {
                     return Ok(Step::Done(head.to_string()));
                 }
                 return Err(format!("workspace {name:?} already exists"));
             }
-            let mut config = config.clone();
-            config.branch = Some(generated_branch(
-                id,
-                name,
-                view.workspace_names()?.len() + 1,
-            ));
             Ok(Step::MintMany(vec![
                 Transition::WorkspaceCreate {
                     name: name.to_string(),
@@ -702,6 +717,18 @@ pub fn attach(
     )
 }
 
+/// Attach the pinned commit named by the same locator grammar as :@@=.
+/// Do not evaluate or select a subtree: workspaces preserve code ancestry.
+pub fn attach_source(
+    t: &GitTransport,
+    id: &str,
+    name: &str,
+    source: &str,
+) -> Result<String, String> {
+    let parsed = validate_source(source)?;
+    attach(t, id, name, &parsed.fetch_url(), parsed.rev.as_deref())
+}
+
 /// Capture only relevant named branch tips, grouped by repository identity.
 /// Agent-created workspaces in an attached repo inherit this request snapshot.
 pub(super) fn snapshot_repository_refs(t: &GitTransport, head: &Oid) -> Result<String, String> {
@@ -711,7 +738,7 @@ pub(super) fn snapshot_repository_refs(t: &GitTransport, head: &Oid) -> Result<S
         .workspace_configs()?
         .into_values()
     {
-        let Some(repository) = config.repository else {
+        let Some(repository) = config.repository() else {
             continue;
         };
         let identity = normalize_repository_identity(&repository)?;
@@ -719,7 +746,8 @@ pub(super) fn snapshot_repository_refs(t: &GitTransport, head: &Oid) -> Result<S
             .entry(identity)
             .or_insert_with(|| (repository, HashSet::new()));
         branches.extend(MERGE_REF_CANDIDATES.iter().map(|name| name.to_string()));
-        if let Some(conversation_protocol::v3::WorkspaceBase::Branch { name, .. }) = config.base {
+        if let Some(conversation_protocol::v3::WorkspaceBase::Branch { name, .. }) = config.upstream
+        {
             branches.insert(name);
         }
     }

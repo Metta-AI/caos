@@ -175,7 +175,7 @@ impl ConversationState {
             let Some(conversation_protocol::v3::WorkspaceBase::Workspace {
                 name: parent,
                 commit,
-            }) = &ws.config.base
+            }) = &ws.config.upstream
             else {
                 return false;
             };

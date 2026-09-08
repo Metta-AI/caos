@@ -22,10 +22,10 @@ use conversation_protocol::v3::ids;
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    reconcile, validate_spine, Application, AsyncRecord, AsyncStatus, Block, ChildRecord,
-    ChildStatus, CodeOps, DeclaredCall, FilesOutcome, Identity, IdentityKind, Kind, Mode,
-    ObjectStore, Oid, Owner, RequestOutcome, RequestRecord, RequestStatus, Role, SpawnIntent,
-    ToolRecord, ToolResult, ToolStatus, TranscriptEntry, WorkspaceResolution,
+    reconcile, validate_spine, Application, AsyncRecord, AsyncStatus, Block, CallRecord,
+    CallStatus, ChildRecord, ChildStatus, CodeOps, DeclaredCall, FilesOutcome, Identity,
+    IdentityKind, Kind, Mode, ObjectStore, Oid, Owner, Role, SpawnIntent, ToolResult,
+    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus, WorkspaceResolution,
 };
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
@@ -82,7 +82,7 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 impl Config {
     fn for_workspace(&self, view: &Conversation<'_>, name: &str) -> Result<Self, String> {
         let mut scoped = self.clone();
-        if let Some(repository) = view.workspace_config(name)?.repository {
+        if let Some(repository) = view.workspace_config(name)?.repository() {
             let identity =
                 conversation_protocol::v3::workspaces::normalize_repository_identity(&repository)?;
             scoped.merge_refs = self.repository_refs.get(&identity).cloned();
@@ -152,12 +152,12 @@ fn start(
         validate_admission(state, request, request_head)?;
         let record = require_request(&state.conversation()?, request)?;
         match record.status {
-            RequestStatus::Queued => {
+            TurnStatus::Queued => {
                 let latest_message = newest_user_message(&state.conversation()?)?;
                 let expected = state.head().clone();
                 match state.try_append_at(
                     &expected,
-                    Transition::RequestClaim {
+                    Transition::TurnClaim {
                         request: request.clone(),
                         latest_message,
                     },
@@ -166,11 +166,9 @@ fn start(
                     progress::TryAppend::HeadChanged(_) => continue,
                 }
             }
-            RequestStatus::Running => break,
-            RequestStatus::Cancelling => return drain(state, request),
-            RequestStatus::Idle | RequestStatus::Failed => {
-                return finish_from_terminal(state, request)
-            }
+            TurnStatus::Running => break,
+            TurnStatus::Cancelling => return drain(state, request),
+            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
         }
     }
     reconcile_background_tasks(state)?;
@@ -229,8 +227,8 @@ fn state_conversation_id(state: &progress::State) -> Result<String, String> {
     conversation_protocol::v3::refs::parse_head_ref(state.refname())
 }
 
-fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<RequestRecord, String> {
-    view.request(request)?
+fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
+    view.turn(request)?
         .ok_or_else(|| format!("conversation has no request record for {request}"))
 }
 
@@ -264,7 +262,7 @@ fn callback(
 ) -> Result<(), String> {
     validate_admission(state, request, request_head)?;
     let status = require_request(&state.conversation()?, request)?.status;
-    if matches!(status, RequestStatus::Idle | RequestStatus::Failed) {
+    if matches!(status, TurnStatus::Idle | TurnStatus::Failed) {
         return finish_from_terminal(state, request);
     }
     let round = read_arg("round")?
@@ -350,12 +348,10 @@ fn resume(
         validate_admission(state, request, request_head)?;
         let record = require_request(&state.conversation()?, request)?;
         match record.status {
-            RequestStatus::Cancelling => return drain(state, request),
-            RequestStatus::Idle | RequestStatus::Failed => {
-                return finish_from_terminal(state, request)
-            }
-            RequestStatus::Queued => return start(cfg, state, request, request_head),
-            RequestStatus::Running => {}
+            TurnStatus::Cancelling => return drain(state, request),
+            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
+            TurnStatus::Queued => return start(cfg, state, request, request_head),
+            TurnStatus::Running => {}
         }
 
         let round = round_state(&state.conversation()?, &record)?;
@@ -370,7 +366,7 @@ fn resume(
         announce_background_tasks(&cfg.conversation, state)?;
         state.reload()?;
         let current = require_request(&state.conversation()?, request)?;
-        if current.status != RequestStatus::Running {
+        if current.status != TurnStatus::Running {
             continue;
         }
         let round = round_state(&state.conversation()?, &current)?;
@@ -438,12 +434,12 @@ impl<'a> CallSite<'a> {
         }
     }
 
-    fn stub(&self, target: Option<(String, Oid)>) -> ToolRecord {
+    fn stub(&self, target: Option<(String, Oid)>) -> CallRecord {
         let (workspace_name, input_workspace) = match target {
             Some((name, commit)) => (Some(name), Some(commit)),
             None => (None, None),
         };
-        ToolRecord {
+        CallRecord {
             request: self.request.clone(),
             round: self.round,
             id: self.call.id.clone(),
@@ -451,7 +447,7 @@ impl<'a> CallSite<'a> {
             declaration_message: self.declaration.to_string(),
             workspace_name,
             input_workspace,
-            status: ToolStatus::Complete,
+            status: CallStatus::Complete,
             task: None,
             result: None,
             workspace_resolution: None,
@@ -466,9 +462,11 @@ impl<'a> CallSite<'a> {
         block: &Value,
         target: Option<(String, Oid)>,
         resolution: Option<WorkspaceResolution>,
-        result: impl FnOnce(&ToolRecord) -> ToolResult,
+        task: Option<Oid>,
+        result: impl FnOnce(&CallRecord) -> ToolResult,
     ) -> Result<(), String> {
-        let stub = self.stub(target);
+        let mut stub = self.stub(target);
+        stub.task = task;
         let record = completed_record(&stub, result(&stub), resolution);
         let expected = state.head().clone();
         let _ = state.try_append_at(
@@ -486,7 +484,7 @@ impl<'a> CallSite<'a> {
         proposal: Option<Oid>,
         resolution: Option<WorkspaceResolution>,
     ) -> Result<(), String> {
-        self.finish(state, &block, target, resolution, |stub| {
+        self.finish(state, &block, target, resolution, None, |stub| {
             ToolResult::Complete {
                 observation: observation_path(stub),
                 proposal,
@@ -504,8 +502,10 @@ impl<'a> CallSite<'a> {
         block: &Value,
         target: Option<(String, Oid)>,
     ) -> Result<(), String> {
-        self.finish(state, block, target, None, |stub| ToolResult::Failed {
-            error: observation_path(stub),
+        self.finish(state, block, target, None, None, |stub| {
+            ToolResult::Failed {
+                error: observation_path(stub),
+            }
         })
     }
 }
@@ -516,7 +516,7 @@ fn close_pending_call(
     round: &RoundState,
     call: &Call,
     block: &Value,
-    result: impl FnOnce(&ToolRecord) -> ToolResult,
+    result: impl FnOnce(&CallRecord) -> ToolResult,
 ) -> Result<(), String> {
     let existing = state
         .conversation()?
@@ -545,7 +545,7 @@ fn close_pending_call(
     Ok(())
 }
 
-fn round_state(view: &Conversation<'_>, record: &RequestRecord) -> Result<RoundState, String> {
+fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundState, String> {
     if record.round == 0 {
         if !record.calls.is_empty() {
             return Err("round-zero request carries declared calls".to_string());
@@ -683,7 +683,7 @@ fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
                     }
                     let observation = format!(
                         "{}/observation.json",
-                        paths::tool_payload_dir(request.as_str(), round, id)
+                        paths::call_payload_dir(request.as_str(), round, id)
                     );
                     let observation: Value =
                         serde_json::from_slice(&view.payload(&observation)?)
@@ -699,7 +699,7 @@ fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
 
 fn render_tool_observation(
     view: &Conversation<'_>,
-    tool: &ToolRecord,
+    tool: &CallRecord,
     observation: Value,
 ) -> Result<Value, String> {
     if observation.get("type").and_then(Value::as_str) == Some("tool_result") {
@@ -721,7 +721,7 @@ fn render_tool_observation(
     Ok(result_block(
         &tool.id,
         &observation.to_string(),
-        tool.status == ToolStatus::Conflict,
+        tool.status == CallStatus::Conflict,
     ))
 }
 
@@ -862,18 +862,18 @@ fn terminate_end_turn(
         return record_response_after_escape(cfg, state, request, request_head, round);
     }
     match require_request(&state.conversation()?, request)?.status {
-        RequestStatus::Cancelling => return drain(state, request),
-        RequestStatus::Idle | RequestStatus::Failed => return finish_from_terminal(state, request),
-        RequestStatus::Queued => {
+        TurnStatus::Cancelling => return drain(state, request),
+        TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
+        TurnStatus::Queued => {
             return Err(format!(
                 "request {request} returned to queued after model completion"
             ))
         }
-        RequestStatus::Running => {}
+        TurnStatus::Running => {}
     }
-    let terminal = Transition::RequestTerminal {
+    let terminal = Transition::TurnTerminal {
         request: request.clone(),
-        outcome: RequestOutcome::Idle {
+        outcome: TurnOutcome::Idle {
             result: Some(result),
             interrupted: false,
         },
@@ -967,7 +967,7 @@ fn record_response_after_escape(
     round: u64,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
-    if record.status == RequestStatus::Cancelling && record.round == round {
+    if record.status == TurnStatus::Cancelling && record.round == round {
         // The shared v3 transition contract currently admits model.complete
         // only while a request is Running. Once request.escape has changed the
         // status to Cancelling there is no legal transition that can retain an
@@ -995,7 +995,7 @@ fn drive_call(
         .conversation()?
         .tool(request, round.declaring_round, &call.id)?
     {
-        if existing.status == ToolStatus::Started {
+        if existing.status == CallStatus::Started {
             if existing.name == subagents::WAIT_TOOL {
                 dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
             } else {
@@ -1061,7 +1061,7 @@ fn drive_call(
         }
         Prepared::Evaluation => Ok(false),
         Prepared::Task(task) => {
-            let record = ToolRecord {
+            let record = CallRecord {
                 request: request.clone(),
                 round: round.declaring_round,
                 id: call.id.clone(),
@@ -1069,7 +1069,7 @@ fn drive_call(
                 declaration_message: round.declaration_message.clone(),
                 workspace_name: Some(name),
                 input_workspace: Some(commit),
-                status: ToolStatus::Started,
+                status: CallStatus::Started,
                 task: Some(task.clone()),
                 result: None,
                 workspace_resolution: None,
@@ -1484,7 +1484,7 @@ fn launch_evaluated_tool(
     let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
     let task_text = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(&ws))])?;
     let task = Oid::parse(&task_text, "tree tool task")?;
-    let started = ToolRecord {
+    let started = CallRecord {
         request: request.clone(),
         round,
         id: id.to_string(),
@@ -1492,7 +1492,7 @@ fn launch_evaluated_tool(
         declaration_message: current.declaration_message,
         workspace_name: Some(workspace_name),
         input_workspace: Some(commit),
-        status: ToolStatus::Started,
+        status: CallStatus::Started,
         task: Some(task),
         result: None,
         workspace_resolution: None,
@@ -1518,7 +1518,7 @@ fn dispatch_started(
     request: &Oid,
     round: u64,
     call: &Call,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(), String> {
     let commit = record
         .input_workspace
@@ -1551,7 +1551,7 @@ fn dispatch_wait_started(
     request: &Oid,
     round: u64,
     call: &Call,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(), String> {
     if record.workspace_name.is_some() || record.input_workspace.is_some() {
         return Err("wait_agent tool.start unexpectedly names a workspace".to_string());
@@ -1582,7 +1582,7 @@ fn dispatch_wait_started(
 
 fn callback_result(
     state: &mut progress::State,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
         subagents::WAIT_TOOL => wait_callback_block(state, record),
@@ -1642,7 +1642,7 @@ fn mint_workspace_commit(
 
 fn complete_compute(
     state: &mut progress::State,
-    started: &ToolRecord,
+    started: &CallRecord,
     base_block: Value,
     proposal: Option<Oid>,
 ) -> Result<(), String> {
@@ -1725,12 +1725,12 @@ fn complete_compute(
 }
 
 fn completed_record(
-    started: &ToolRecord,
+    started: &CallRecord,
     result: ToolResult,
     resolution: Option<WorkspaceResolution>,
-) -> ToolRecord {
-    ToolRecord {
-        status: ToolRecord::expected_status(&result, resolution.as_ref()),
+) -> CallRecord {
+    CallRecord {
+        status: CallRecord::expected_status(&result, resolution.as_ref()),
         result: Some(result),
         workspace_resolution: resolution,
         files: Vec::new(),
@@ -1741,7 +1741,7 @@ fn completed_record(
 
 fn complete_started_failed(
     state: &mut progress::State,
-    started: &ToolRecord,
+    started: &CallRecord,
     block: &Value,
 ) -> Result<(), String> {
     let record = completed_record(
@@ -1770,16 +1770,16 @@ fn declaration_message(
     Ok(state.declaration_message)
 }
 
-fn observation_path(record: &ToolRecord) -> String {
+fn observation_path(record: &CallRecord) -> String {
     format!(
         "{}/observation.json",
-        paths::tool_payload_dir(record.request.as_str(), record.round, &record.id)
+        paths::call_payload_dir(record.request.as_str(), record.round, &record.id)
     )
 }
 
 #[allow(clippy::type_complexity)]
 fn tool_complete_transition(
-    record: ToolRecord,
+    record: CallRecord,
     block: &Value,
     files: Vec<(String, Option<(Mode, Vec<u8>)>)>,
 ) -> Result<Transition, String> {
@@ -1940,12 +1940,12 @@ fn spawn_agent_call(
         .map(|(name, _)| parent_view.workspace_config(name))
         .transpose()?
         .map(|mut config| {
-            config.branch = None;
+            config.publication = None;
             if matches!(
-                config.base,
+                config.upstream,
                 Some(conversation_protocol::v3::WorkspaceBase::Workspace { .. })
             ) {
-                config.base = None;
+                config.upstream = None;
             }
             config
         });
@@ -2022,8 +2022,8 @@ fn spawn_agent_call(
     let (configuration, child_request) =
         subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
     let request_workspaces = state.conversation_at(&prompt_head)?.workspaces_tree()?;
-    let admit = Transition::RequestAdmit {
-        record: RequestRecord {
+    let admit = Transition::TurnAdmit {
+        record: TurnRecord {
             id: child_request.clone(),
             request_head: prompt_head.clone(),
             request_workspaces,
@@ -2032,7 +2032,7 @@ fn spawn_agent_call(
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
@@ -2047,7 +2047,8 @@ fn spawn_agent_call(
         run_and_update_ref_image,
     )?;
     let observation = subagents::spawn_observation(&child_id, &initial_head, &child_request);
-    let stub = site.stub(target.clone());
+    let mut stub = site.stub(target.clone());
+    stub.task = Some(relay.clone());
     let tool = completed_record(
         &stub,
         ToolResult::Complete {
@@ -2168,7 +2169,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
         return Ok(true);
     };
     validate_child_relay(state, &child)?;
-    let started = ToolRecord {
+    let started = CallRecord {
         request: site.request.clone(),
         round: site.round,
         id: call.id.clone(),
@@ -2176,7 +2177,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
         declaration_message: site.declaration.to_string(),
         workspace_name: None,
         input_workspace: None,
-        status: ToolStatus::Started,
+        status: CallStatus::Started,
         task: Some(child.relay.clone()),
         result: None,
         workspace_resolution: None,
@@ -2211,7 +2212,7 @@ fn validate_child_relay(state: &progress::State, child: &ChildRecord) -> Result<
 
 fn wait_callback_block(
     state: &mut progress::State,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     let relay = record
         .task
@@ -2514,7 +2515,12 @@ fn run_async_call(
     }
     let (status, result) = async_status(&record);
     let block = async_work::result_block(&call.id, &task, status, result.as_deref());
-    site.complete(state, block, None, None, None)
+    site.finish(state, &block, None, None, Some(task), |stub| {
+        ToolResult::Complete {
+            observation: observation_path(stub),
+            proposal: None,
+        }
+    })
 }
 
 fn async_request_error(request: &str) -> Result<Option<String>, String> {
@@ -2553,63 +2559,46 @@ fn async_status(record: &AsyncRecord) -> (&'static str, Option<String>) {
     }
 }
 
-fn reconcile_async_tasks(state: &mut progress::State) -> Result<(), String> {
-    let tasks = state.conversation()?.async_tasks()?;
-    for task in tasks {
-        if task.status != AsyncStatus::Pending
-            || task.target_ref.as_deref() != Some(state.refname())
-        {
-            continue;
-        }
-        let (_, target) = async_work::task_request(&task.task)?;
-        if target != state.refname() {
-            return Err(format!(
-                "async task {} targets {target}, not {}",
-                task.task,
-                state.refname()
-            ));
-        }
-        let dispatched = async_work::dispatch(&task.task);
-        timing::phase("tool dispatch run_async recovery");
-        if let Err(error) = dispatched {
-            eprintln!(
-                "llm-step: could not re-admit async task {} (pending): {error}",
-                task.task
-            );
-        }
-    }
-    Ok(())
-}
-
-fn reconcile_subagents(state: &mut progress::State) -> Result<(), String> {
-    for child in state.conversation()?.children()? {
-        if child.status != ChildStatus::Running {
-            continue;
-        }
-        validate_child_relay(state, &child)?;
-        let dispatched = subagents::dispatch(&child.relay);
-        timing::phase("tool dispatch spawn_agent recovery");
-        if let Err(error) = dispatched {
-            eprintln!(
-                "llm-step: could not re-admit subagent {} relay {} (running): {error}",
-                child.id, child.relay
-            );
-        }
-    }
-    Ok(())
-}
-
 fn reconcile_background_tasks(state: &mut progress::State) -> Result<(), String> {
-    reconcile_async_tasks(state)?;
-    reconcile_subagents(state)
+    use conversation_protocol::v3::TaskRecord;
+    for task in state
+        .conversation()?
+        .tasks()?
+        .into_iter()
+        .filter(|task| task.is_pending())
+    {
+        match &task {
+            TaskRecord::Computation(task) => {
+                if task.target_ref.as_deref() != Some(state.refname()) {
+                    continue;
+                }
+                let (_, target) = async_work::task_request(&task.task)?;
+                if target != state.refname() {
+                    return Err(format!(
+                        "task {} targets {target}, not {}",
+                        task.task,
+                        state.refname()
+                    ));
+                }
+            }
+            TaskRecord::Conversation(child) => validate_child_relay(state, child)?,
+        }
+        if let Err(error) = async_work::dispatch(task.computation()) {
+            eprintln!(
+                "llm-step: could not re-admit task {} (pending): {error}",
+                task.computation()
+            );
+        }
+        timing::phase("background task recovery");
+    }
+    Ok(())
 }
 
 fn announce_background_tasks(
     conversation_id: &str,
     state: &mut progress::State,
 ) -> Result<(), String> {
-    announce(conversation_id, state, pending_async_notices)?;
-    announce(conversation_id, state, pending_subagent_notices)
+    announce(conversation_id, state, pending_task_notices)
 }
 
 fn announce(
@@ -2646,14 +2635,15 @@ fn background_notice(conversation_id: &str, message_id: String, text: String) ->
     }
 }
 
-fn pending_async_notices(
+fn pending_task_notices(
     conversation_id: &str,
     view: &Conversation<'_>,
 ) -> Result<Vec<TranscriptEntry>, String> {
+    use conversation_protocol::v3::TaskRecord;
     let tasks = view
-        .async_tasks()?
+        .tasks()?
         .into_iter()
-        .filter(|task| matches!(task.status, AsyncStatus::Complete | AsyncStatus::Failed))
+        .filter(|task| !task.is_pending())
         .collect::<Vec<_>>();
     if tasks.is_empty() {
         return Ok(Vec::new());
@@ -2665,66 +2655,42 @@ fn pending_async_notices(
         .collect();
     let mut notices = Vec::new();
     for task in tasks {
-        let message_id = ids::protocol_id("async-notice", &json!({"task":task.task.as_str()}))?;
-        if existing.contains(&message_id) {
-            continue;
+        // Keep notice identities stable when reading historical records.
+        let (message_id, text) = match task {
+            TaskRecord::Computation(task) => {
+                let id = ids::protocol_id("async-notice", &json!({"task":task.task.as_str()}))?;
+                let (status, result) = async_status(&task);
+                (
+                    id,
+                    format!(
+                        "Independent task {} is {status}. Its result is {}.",
+                        task.task,
+                        result.unwrap_or_else(|| "null".into())
+                    ),
+                )
+            }
+            TaskRecord::Conversation(child) => {
+                let terminal = child
+                    .terminal_head
+                    .as_ref()
+                    .ok_or("terminal child has no head")?;
+                let id = ids::protocol_id(
+                    "subagent-notice",
+                    &json!({"child":child.id.as_str(),"terminal_head":terminal.as_str()}),
+                )?;
+                (
+                    id,
+                    format!(
+                        "Subagent {} is {}. Its result is {terminal}.",
+                        child.id,
+                        child_status_text(child.status)
+                    ),
+                )
+            }
+        };
+        if !existing.contains(&message_id) {
+            notices.push(background_notice(conversation_id, message_id, text));
         }
-        let (status, result) = async_status(&task);
-        let result = result.unwrap_or_else(|| "null".to_string());
-        notices.push(background_notice(
-            conversation_id,
-            message_id,
-            format!(
-                "Independent task {} is {status}. Its result is {result}.",
-                task.task
-            ),
-        ));
-    }
-    Ok(notices)
-}
-
-fn pending_subagent_notices(
-    conversation_id: &str,
-    view: &Conversation<'_>,
-) -> Result<Vec<TranscriptEntry>, String> {
-    let children = view
-        .children()?
-        .into_iter()
-        .filter(|child| child.status != ChildStatus::Running)
-        .collect::<Vec<_>>();
-    if children.is_empty() {
-        return Ok(Vec::new());
-    }
-    let existing: HashSet<String> = view
-        .transcript(0, view.transcript_len()?)?
-        .into_iter()
-        .map(|(_, _, entry)| entry.message_id)
-        .collect();
-    let mut notices = Vec::new();
-    for child in children {
-        let terminal_head = child
-            .terminal_head
-            .as_ref()
-            .ok_or_else(|| format!("terminal subagent {} has no terminal head", child.id))?;
-        let message_id = ids::protocol_id(
-            "subagent-notice",
-            &json!({
-                "child": child.id.as_str(),
-                "terminal_head": terminal_head.as_str(),
-            }),
-        )?;
-        if existing.contains(&message_id) {
-            continue;
-        }
-        notices.push(background_notice(
-            conversation_id,
-            message_id,
-            format!(
-                "Subagent {} is {}. Its result is {terminal_head}.",
-                child.id,
-                child_status_text(child.status)
-            ),
-        ));
     }
     Ok(notices)
 }
@@ -2742,15 +2708,15 @@ fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
     loop {
         state.reload()?;
         let record = require_request(&state.conversation()?, request)?;
-        if matches!(record.status, RequestStatus::Idle | RequestStatus::Failed) {
+        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
             return finish_from_terminal(state, request);
         }
         let round = round_state(&state.conversation()?, &record)?;
         let Some(call) = round.pending.first() else {
             let result = newest_assistant_path(&state.conversation()?, request)?;
-            let terminal = state.append(Transition::RequestTerminal {
+            let terminal = state.append(Transition::TurnTerminal {
                 request: request.clone(),
-                outcome: RequestOutcome::Idle {
+                outcome: TurnOutcome::Idle {
                     result,
                     interrupted: true,
                 },
@@ -2783,17 +2749,14 @@ fn record_failure(
 ) -> Result<(), String> {
     loop {
         state.reload()?;
-        let Some(record) = state.conversation()?.request(request)? else {
+        let Some(record) = state.conversation()?.turn(request)? else {
             return Ok(());
         };
-        if matches!(record.status, RequestStatus::Idle | RequestStatus::Failed) {
+        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
             reconcile_background_tasks(state)?;
             return Ok(());
         }
-        if !matches!(
-            record.status,
-            RequestStatus::Running | RequestStatus::Cancelling
-        ) {
+        if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
             return Ok(());
         }
         let round = round_state(&state.conversation()?, &record)?;
@@ -2828,9 +2791,9 @@ fn record_failure(
         let ordinal = appended
             .ordinal
             .ok_or("failure message did not append a transcript entry")?;
-        state.append(Transition::RequestTerminal {
+        state.append(Transition::TurnTerminal {
             request: request.clone(),
-            outcome: RequestOutcome::Failed {
+            outcome: TurnOutcome::Failed {
                 error: paths::transcript_entry_path(ordinal, &message_id),
             },
         })?;
@@ -2843,8 +2806,8 @@ fn finish_from_terminal(state: &mut progress::State, request: &Oid) -> Result<()
     let terminal = terminal_head(state, request)?;
     let outcome = require_request(&state.conversation_at(&terminal)?, request)?.outcome;
     let failure = match outcome {
-        Some(RequestOutcome::Idle { .. }) => None,
-        Some(RequestOutcome::Failed { error }) => {
+        Some(TurnOutcome::Idle { .. }) => None,
+        Some(TurnOutcome::Failed { error }) => {
             let view = state.conversation_at(&terminal)?;
             let (ordinal, message_id) = paths::parse_transcript_entry_path(&error)?;
             let (_, entry) = view
@@ -2888,17 +2851,17 @@ fn terminal_head(state: &progress::State, request: &Oid) -> Result<Oid, String> 
 
 fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Result<Oid, String> {
     let mut current = head.clone();
-    let mut child = Conversation::open(store, &current)?.request(request)?;
+    let mut child = Conversation::open(store, &current)?.turn(request)?;
     for _ in 0..MAX_SPINE_WALK {
         let info = store.read_commit(&current).map_err(String::from)?;
         let Some(parent) = info.parents.first() else {
             break;
         };
-        let parent_record = Conversation::open(store, parent)?.request(request)?;
+        let parent_record = Conversation::open(store, parent)?.turn(request)?;
         let became_terminal = child.as_ref().is_some_and(|record| {
-            matches!(record.status, RequestStatus::Idle | RequestStatus::Failed)
+            matches!(record.status, TurnStatus::Idle | TurnStatus::Failed)
                 && !parent_record.as_ref().is_some_and(|parent| {
-                    matches!(parent.status, RequestStatus::Idle | RequestStatus::Failed)
+                    matches!(parent.status, TurnStatus::Idle | TurnStatus::Failed)
                 })
         });
         if became_terminal {
@@ -3540,8 +3503,8 @@ mod tests {
         let admitted = append_memory(
             &mut store,
             &user,
-            Transition::RequestAdmit {
-                record: RequestRecord {
+            Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
                     request_workspaces,
@@ -3550,7 +3513,7 @@ mod tests {
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -3560,7 +3523,7 @@ mod tests {
         let claimed = append_memory(
             &mut store,
             &admitted,
-            Transition::RequestClaim {
+            Transition::TurnClaim {
                 request: request.clone(),
                 latest_message: USER_ID.to_string(),
             },
@@ -3711,7 +3674,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::tool_payload_dir(golden.request.as_str(), 0, "first")
+                    paths::call_payload_dir(golden.request.as_str(), 0, "first")
                 ),
                 proposal: None,
             },
@@ -3734,7 +3697,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::tool_payload_dir(golden.request.as_str(), 0, "second")
+                    paths::call_payload_dir(golden.request.as_str(), 0, "second")
                 ),
                 proposal: None,
             },
@@ -3803,7 +3766,7 @@ mod tests {
         for id in ["first", "second"] {
             assert_eq!(
                 view.tool(&golden.request, 0, id).unwrap().unwrap().status,
-                ToolStatus::Cancelled
+                CallStatus::Cancelled
             );
         }
     }
@@ -3840,7 +3803,7 @@ mod tests {
         )
         .unwrap();
         let view = Conversation::open(&store, &terminal).unwrap();
-        let notices = pending_async_notices(CONVERSATION, &view).unwrap();
+        let notices = pending_task_notices(CONVERSATION, &view).unwrap();
         assert_eq!(notices.len(), 1);
         let notice_id = ids::protocol_id("async-notice", &json!({"task":task.as_str()})).unwrap();
         assert_eq!(notices[0].message_id, notice_id);
@@ -3862,7 +3825,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(pending_async_notices(
+        assert!(pending_task_notices(
             CONVERSATION,
             &Conversation::open(&store, &announced).unwrap()
         )
@@ -3877,10 +3840,21 @@ mod tests {
         let view = Conversation::open(&store, &head).unwrap();
         let child = view.children().unwrap().into_iter().next().unwrap();
         let terminal = child.terminal_head.clone().unwrap();
-        let notices = pending_subagent_notices("golden-conversation", &view).unwrap();
-        assert_eq!(notices.len(), 1);
+        let notices = pending_task_notices("golden-conversation", &view).unwrap();
+        assert_eq!(notices.len(), 2);
+        let notice = notices
+            .iter()
+            .find(|entry| {
+                entry.message_id
+                    == ids::protocol_id(
+                        "subagent-notice",
+                        &json!({"child":child.id.as_str(),"terminal_head":terminal.as_str()}),
+                    )
+                    .unwrap()
+            })
+            .unwrap();
         assert_eq!(
-            notices[0].blocks,
+            notice.blocks,
             vec![Block::Text {
                 text: format!(
                     "Subagent {} is completed. Its result is {terminal}.",
@@ -3888,16 +3862,19 @@ mod tests {
                 )
             }]
         );
-        let announced = append_memory(
-            &mut store,
-            &head,
-            Transition::MessageAppend {
-                entry: notices[0].clone(),
-                payloads: Vec::new(),
-            },
-        )
-        .unwrap();
-        assert!(pending_subagent_notices(
+        let mut announced = head.clone();
+        for notice in notices {
+            announced = append_memory(
+                &mut store,
+                &announced,
+                Transition::MessageAppend {
+                    entry: notice,
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        assert!(pending_task_notices(
             "golden-conversation",
             &Conversation::open(&store, &announced).unwrap()
         )
@@ -3932,8 +3909,8 @@ mod tests {
         let admitted = append_memory(
             &mut store,
             &user,
-            Transition::RequestAdmit {
-                record: RequestRecord {
+            Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
                     request_workspaces,
@@ -3942,7 +3919,7 @@ mod tests {
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -3953,7 +3930,7 @@ mod tests {
         let escaped = append_memory(
             &mut store,
             &admitted,
-            Transition::RequestEscape {
+            Transition::TurnEscape {
                 request: request.clone(),
                 reason: Some("escape".to_string()),
             },

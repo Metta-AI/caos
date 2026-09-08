@@ -9,8 +9,8 @@ use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition
 use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    AsyncRecord, AsyncStatus, Block, Identity, IdentityKind, RequestOutcome, RequestRecord,
-    RequestStatus, Role, ToolStatus, TranscriptEntry,
+    AsyncRecord, AsyncStatus, Block, CallStatus, Identity, IdentityKind, Role, TranscriptEntry,
+    TurnOutcome, TurnRecord, TurnStatus,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -508,13 +508,13 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             let view = Conversation::open(&store, &head)?;
             let id = view.identity()?.id;
             let request_record = view
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             let round = request_record.round;
             let status = request_status_name(&request_record.status);
             drop(view);
             let message_id = client_key()?;
-            let transition = Transition::RequestInterject {
+            let transition = Transition::TurnInterject {
                 request: request.clone(),
                 entry: TranscriptEntry {
                     message_id: message_id.clone(),
@@ -563,17 +563,17 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             let new = append(
                 &mut store,
                 &head,
-                Transition::RequestEscape {
+                Transition::TurnEscape {
                     request: request.clone(),
                     reason: None,
                 },
             )?;
             let request_record = Conversation::open(&store, &new)?
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             let interrupted = matches!(
                 request_record.outcome,
-                Some(RequestOutcome::Idle {
+                Some(TurnOutcome::Idle {
                     interrupted: true,
                     ..
                 })
@@ -638,8 +638,8 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let view = Conversation::open(&store, &head)?;
             let record = match id {
-                Some(id) => view.request(&id)?,
-                None => view.active_request()?,
+                Some(id) => view.turn(&id)?,
+                None => view.active_turn()?,
             };
             match record {
                 Some(record) => write_record(&record.encode())?,
@@ -689,7 +689,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let view = Conversation::open(&store, &head)?;
             let record = view
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             for round in 0..record.round {
                 for tool in view.tools(&request, round)? {
@@ -708,7 +708,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let path = format!(
                 "{}/observation.json",
-                paths::tool_payload_dir(request.as_str(), round, &id)
+                paths::call_payload_dir(request.as_str(), round, &id)
             );
             let bytes = Conversation::open(&store, &head)?.payload(&path)?;
             std::io::stdout().write_all(&bytes).map_err(|error| {
@@ -938,7 +938,7 @@ fn admit_request(
     let view = Conversation::open(store, head)?;
     let request_workspaces = view.workspaces_tree()?;
     drop(view);
-    let record = RequestRecord {
+    let record = TurnRecord {
         id: request.clone(),
         request_head: head.clone(),
         request_workspaces,
@@ -947,12 +947,12 @@ fn admit_request(
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,
     };
-    append(store, head, Transition::RequestAdmit { record })
+    append(store, head, Transition::TurnAdmit { record })
 }
 
 fn prepare_turn_request(
@@ -1244,13 +1244,13 @@ fn text_blocks(blocks: &[Block]) -> String {
         .join("\n\n")
 }
 
-fn request_status_name(status: &RequestStatus) -> &'static str {
+fn request_status_name(status: &TurnStatus) -> &'static str {
     match status {
-        RequestStatus::Queued => "queued",
-        RequestStatus::Running => "running",
-        RequestStatus::Cancelling => "cancelling",
-        RequestStatus::Idle => "idle",
-        RequestStatus::Failed => "failed",
+        TurnStatus::Queued => "queued",
+        TurnStatus::Running => "running",
+        TurnStatus::Cancelling => "cancelling",
+        TurnStatus::Idle => "idle",
+        TurnStatus::Failed => "failed",
     }
 }
 
@@ -1274,16 +1274,16 @@ fn wait_terminal(
                 };
                 seen = Some(head.clone());
                 let view = Conversation::open(&store, &head)?;
-                if let Some(record) = view.request(request)? {
+                if let Some(record) = view.turn(request)? {
                     match record.status {
-                        RequestStatus::Idle => {
+                        TurnStatus::Idle => {
                             println!("head {head}");
                             println!("status idle");
                             return Ok(());
                         }
-                        RequestStatus::Failed => {
+                        TurnStatus::Failed => {
                             let error = match record.outcome {
-                                Some(RequestOutcome::Failed { error }) => {
+                                Some(TurnOutcome::Failed { error }) => {
                                     let (ordinal, message_id) =
                                         paths::parse_transcript_entry_path(&error)?;
                                     let (found, entry) =
@@ -1306,9 +1306,7 @@ fn wait_terminal(
                             println!("error {error}");
                             return Err(ToolError::code(1));
                         }
-                        RequestStatus::Queued
-                        | RequestStatus::Running
-                        | RequestStatus::Cancelling => {}
+                        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling => {}
                     }
                 }
             }
@@ -1352,13 +1350,13 @@ fn parents(
             let (request, id) = started_tool.expect("checked as present");
             let view = Conversation::open(store, &current)?;
             let request_record = view
-                .request(request)?
+                .turn(request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             for round in 0..request_record.round {
                 if view
                     .tools(request, round)?
                     .iter()
-                    .any(|tool| tool.id == *id && tool.status == ToolStatus::Started)
+                    .any(|tool| tool.id == *id && tool.status == CallStatus::Started)
                 {
                     found_started_tool = true;
                     break;
@@ -1486,7 +1484,7 @@ mod tests {
             "--started-tool".to_string(),
             "toolu_01".to_string(),
             "--present-path".to_string(),
-            ".caos/tools/request/0000/toolu_01.json".to_string(),
+            ".caos/calls/request/0000/toolu_01.json".to_string(),
         ])
         .unwrap();
         assert!(matches!(
@@ -1495,7 +1493,7 @@ mod tests {
                 started_tool: Some((_, ref id)),
                 present_path: Some(ref path),
                 ..
-            } if id == "toolu_01" && path == ".caos/tools/request/0000/toolu_01.json"
+            } if id == "toolu_01" && path == ".caos/calls/request/0000/toolu_01.json"
         ));
     }
 }

@@ -90,7 +90,7 @@ side_workspace=$(workspace_commit "$head" side)
 fetch_code "$side_workspace" "fetching the new named workspace"
 [ "$(git show "$side_workspace:side.txt")" = isolated ] || fail "explicit side edit missing"
 if git cat-file -e "$workspace:side.txt" 2>/dev/null; then fail "side edit leaked into main"; fi
-record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$write_output" '.base.kind == "workspace" and .base.name == "main" and .base.commit == $commit' >/dev/null || fail "workspace creation did not pin its source"
+record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$write_output" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "workspace creation did not preserve its upstream and derive publication settings"
 [ "$(git show "$side_workspace:mix.txt")" = hello ] || fail "input snapshot changed with main"
 grep -qF 'side' /tmp/stub/request-2.json || fail "new workspace missing from model context"
 
