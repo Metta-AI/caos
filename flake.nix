@@ -1258,6 +1258,25 @@ sandbox = false''
           # The workspace stamped for the TEST world — what dev/stack-up builds
           # a dev stack from, so a host client cannot drive it (and vice versa).
           caos-test-world = testWorkspaceBins;
+
+          # The iroh tunnel a Claude Code cloud session reaches this stack
+          # through, patched to use the OS trust store.
+          #
+          # WHY OURS AND NOT n0's RELEASE. iroh compiles in a copy of Mozilla's
+          # roots, and a cloud container's egress is a TLS-intercepting proxy:
+          # the relay presents Anthropic's gateway certificate, which chains to
+          # a CA that only the system store knows, so the stock binary reaches
+          # no relay at all while curl and git on the same host are fine. See
+          # dev/claude-code/dumbpipe-system-certs.patch.
+          #
+          # STATIC, via pkgsStatic: the container is Ubuntu with no nix, so an
+          # ordinary nix build would name /nix/store paths that do not exist
+          # there. Same reason caos-x86_64-linux is built for musl.
+          dumbpipe-caos = pkgs.pkgsStatic.dumbpipe.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./dev/claude-code/dumbpipe-system-certs.patch
+            ];
+          });
           # The two stack-bring-up aggregates (see `stackInputs`): one nix
           # build each, and both are handed to the same build-builtins.
           caos-stack-inputs = stackInputs "caos-stack-inputs" workspaceBins;

@@ -1,0 +1,50 @@
+Make dumbpipe use the OS trust store, and any proxy the environment names.
+
+iroh defaults to a compiled-in copy of Mozilla's roots
+(`CaTlsConfig::EmbeddedWebPki`). Behind a TLS-intercepting egress proxy the
+relay presents the proxy's certificate, which chains to a CA only the system
+knows about -- so a stock build reaches NO relay ("Failed to connect to the
+home relay") on a host where curl and git work perfectly. `CaTlsConfig::system()`
+is iroh's own answer; dumbpipe simply never calls it.
+
+This changes the RELAY HOP ONLY. Payloads stay end-to-end encrypted between
+endpoint keys: the relay could not read them before and cannot now.
+
+`iroh-relay` becomes a direct dependency because `iroh` re-exports RelayConfig
+and RelayMap but not CaTlsConfig. Both it and rustls-platform-verifier are
+already in Cargo.lock as transitive entries, so no new crate is vendored.
+
+--- a/Cargo.toml	2026-09-08 14:34:01.244691652 -0700
++++ b/Cargo.toml	2026-09-08 14:34:01.487492265 -0700
+@@ -16,7 +16,8 @@
+ [dependencies]
+ clap = { version = "4.4.10", features = ["derive"] }
+ hex = "0.4.3"
+-iroh = { version = "1.0.0", default-features = false, features = ["tls-ring"] }
++iroh = { version = "1.0.0", default-features = false, features = ["tls-ring", "platform-verifier"] }
++iroh-relay = { version = "1.0.0", default-features = false, features = ["platform-verifier"] }
+ iroh-tickets = "1.0.0"
+ noq = "1.0.0"
+ tokio = { version = "1.34.0", features = ["full"] }
+--- a/src/main.rs	2026-09-08 14:34:01.245898685 -0700
++++ b/src/main.rs	2026-09-08 14:34:01.487847130 -0700
+@@ -307,6 +307,19 @@
+ ) -> Result<Endpoint> {
+     let mut builder = Endpoint::builder(presets::N0)
+         .secret_key(secret_key)
++        // The OS trust store, not the copy of Mozilla's roots compiled into
++        // iroh by default. Where egress goes through a TLS-intercepting
++        // proxy the relay presents that proxy's certificate, which chains to
++        // a CA only the system knows about -- so a default build reaches no
++        // relay at all while curl and git on the same host are fine.
++        //
++        // This changes the RELAY HOP ONLY. Payloads stay end-to-end
++        // encrypted between endpoint keys; the relay could not read them
++        // before and cannot now.
++        .ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
++        // And use the proxy when the environment names one, instead of
++        // attempting a direct connection it will not be allowed to make.
++        .proxy_from_env()
+         .alpns(alpns);
+     if let Some(addr) = common.ipv4_addr {
+         builder = builder.bind_addr(addr)?;
