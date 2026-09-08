@@ -346,27 +346,7 @@ impl<S: RefStore> State<S> {
         expected: &Oid,
         transition: Transition,
     ) -> Result<TryAppend, String> {
-        if &self.head != expected {
-            return Ok(TryAppend::HeadChanged(self.head.clone()));
-        }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let transition =
-            retarget_transcript_transition(&self.store, &parent_info.tree, transition)?;
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let candidate = mint(
-            &mut self.store,
-            expected,
-            &tree,
-            transition.kind(),
-            &signature,
-        )?;
-        let pushed = self
-            .store
-            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!("push {}", transition.kind().as_str()));
-        self.finish_append(expected, candidate, ordinal, pushed)
+        self.try_append_many_at(expected, vec![transition])
     }
 
     pub fn try_append_pair_at(
@@ -375,49 +355,48 @@ impl<S: RefStore> State<S> {
         first: Transition,
         second: Transition,
     ) -> Result<TryAppend, String> {
+        self.try_append_many_at(expected, vec![first, second])
+    }
+
+    pub fn try_append_many_at(
+        &mut self,
+        expected: &Oid,
+        transitions: Vec<Transition>,
+    ) -> Result<TryAppend, String> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let first = retarget_transcript_transition(&self.store, &parent_info.tree, first)?;
-        let Applied {
-            tree: first_tree,
-            ordinal,
-        } = apply(&mut self.store, Some(&parent_info.tree), &first)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let first_candidate = mint(
-            &mut self.store,
-            expected,
-            &first_tree,
-            first.kind(),
-            &signature,
-        )?;
-
-        let second = retarget_transcript_transition(&self.store, &first_tree, second)?;
-        let Applied {
-            tree: second_tree,
-            ordinal: second_ordinal,
-        } = apply(&mut self.store, Some(&first_tree), &second)?;
-        let second_signature = inherited_signature(&self.store, &first_candidate)?;
-        let candidate = mint(
-            &mut self.store,
-            &first_candidate,
-            &second_tree,
-            second.kind(),
-            &second_signature,
-        )?;
+        if transitions.is_empty() {
+            return Err("an append needs a transition".into());
+        }
+        let mut candidate = expected.clone();
+        let mut ordinal = None;
+        let mut intermediate = Vec::new();
+        let mut kinds = Vec::new();
+        for transition in transitions {
+            let parent = self.store.read_commit(&candidate).map_err(String::from)?;
+            let transition = retarget_transcript_transition(&self.store, &parent.tree, transition)?;
+            let applied = apply(&mut self.store, Some(&parent.tree), &transition)?;
+            let signature = inherited_signature(&self.store, &candidate)?;
+            candidate = mint(
+                &mut self.store,
+                &candidate,
+                &applied.tree,
+                transition.kind(),
+                &signature,
+            )?;
+            ordinal = ordinal.or(applied.ordinal);
+            kinds.push(transition.kind().as_str());
+            intermediate.push(candidate.clone());
+        }
         let pushed = self
             .store
             .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!(
-            "push {}+{}",
-            first.kind().as_str(),
-            second.kind().as_str()
-        ));
+        crate::timing::phase(&format!("push {}", kinds.join("+")));
         if pushed.is_ok() {
-            self.known_valid.insert(first_candidate);
+            self.known_valid.extend(intermediate);
         }
-        self.finish_append(expected, candidate, ordinal.or(second_ordinal), pushed)
+        self.finish_append(expected, candidate, ordinal, pushed)
     }
 
     // A failed response is ambiguous: the push may have landed, and another

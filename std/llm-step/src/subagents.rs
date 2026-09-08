@@ -100,6 +100,8 @@ pub fn child_request(
         "system",
         "subagent",
         "merge-refs",
+        "repository-refs",
+        "focus-workspace",
         "wc",
         "run",
         "round",

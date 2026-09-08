@@ -4564,6 +4564,7 @@ mod tests {
 
     fn workspace_diff(name: &str, base: char, head: char, patch: &str) -> WorkspaceDiff {
         WorkspaceDiff {
+            config: Default::default(),
             name: name.to_string(),
             base_commit: base.to_string().repeat(40),
             head: head.to_string().repeat(40),
@@ -6542,6 +6543,7 @@ mod tests {
 
         let mut selected = state("talk-1");
         selected.workspaces = vec![WorkspaceDiff {
+            config: Default::default(),
             name: "main".to_string(),
             base_commit: base,
             head: head.clone(),
@@ -6853,6 +6855,7 @@ mod tests {
                     }],
                 },
                 workspaces: vec![WorkspaceDiff {
+                    config: Default::default(),
                     name: "main".to_string(),
                     base_commit: "d".repeat(40),
                     head: head.clone(),
@@ -6969,6 +6972,7 @@ mod tests {
                     activity: Vec::new(),
                 },
                 workspaces: vec![WorkspaceDiff {
+                    config: Default::default(),
                     name: "main".to_string(),
                     base_commit: "e".repeat(40),
                     head: old_head,
@@ -7060,6 +7064,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut conversation = state("talk-1");
         conversation.workspaces = vec![WorkspaceDiff {
+            config: Default::default(),
             name: "docs".to_string(),
             base_commit: tip.clone(),
             head: tip,

@@ -91,6 +91,7 @@ spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
 [ "$(jq -r '.task // "none"' <<<"$spawn_record")" = none ] \
   || fail "spawn tool record is not startless"
 
+
 $TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
   --round 0 --id toolu_spawn > /tmp/spawn-observation.json
 child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
@@ -216,10 +217,12 @@ admit_turn "apply the child result"
 request2=$request
 start_turn
 wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
-printf '{"content":[{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
-  "$child" > /tmp/stub/response-6.json
+printf '{"content":[{"id":"toolu_promote","input":{"action":"promote","child":"%s","source":"main","name":"review"},"name":"workspaces","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s","workspace":"main"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+  "$child" "$child" > /tmp/stub/response-6.json
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
+[ "$(workspace_commit "$head2" review)" = "$child_main" ] || fail "promotion did not retain the completed child's snapshot"
+record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "promotion lost the child upstream or inherited publication settings"
 parent_after=$(workspace_commit "$head2")
 [ "$parent_after" != "$parent_main" ] || fail "harvest did not move parent main"
 fetch_code "$parent_after" "fetching harvested parent workspace"
@@ -247,7 +250,7 @@ while read -r _ kind harvest_present; do
         harvest_complete_count=$((harvest_complete_count + 1))
       fi
       ;;
-    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start) ;;
+    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start|workspace.create|workspace.configure) ;;
     *) fail "unexpected parent event $kind while child ran" ;;
   esac
 done < <($TOOL parents --repo /tmp/repo --head "$head2" \

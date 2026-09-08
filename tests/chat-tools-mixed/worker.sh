@@ -18,10 +18,12 @@ feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 
 MIXED_CALLS='[
  {"id":"tu_mw","input":{"file-path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
- {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < mix.txt > mix3.txt","paths":["mix.txt"]},"name":"bash","type":"tool_use"},
- {"id":"tu_me","input":{"file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
- {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
- {"id":"tu_mm","input":{"theirs":"feature"},"name":"merge","type":"tool_use"}]'
+ {"id":"tu_create","input":{"action":"create","name":"side","source":"main","stacked":true},"name":"workspaces","type":"tool_use"},
+ {"id":"tu_mb","input":{"workspace":"main","cmd":"tr a-z A-Z < \"$CAOS_INPUTS/side/mix.txt\" > mix3.txt; test ! -w \"$CAOS_INPUTS/side/mix.txt\"","inputs":{"side":{"workspace":"side","paths":["mix.txt"]}},"paths":["mix.txt"]},"name":"bash","type":"tool_use"},
+ {"id":"tu_me","input":{"workspace":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
+ {"id":"tu_mg","input":{"workspace":"main","pattern":"world"},"name":"grep","type":"tool_use"},
+ {"id":"tu_mm","input":{"workspace":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
+ {"id":"tu_side","input":{"workspace":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
@@ -55,7 +57,7 @@ write_output=$(jq -r 'select(.id == "tu_mw") | .workspace_resolution.output' \
   /tmp/mixed-tools.jsonl)
 assert_oid "$write_output" "inline write workspace"
 jq -s -e --arg input "$write_output" '
-  (map(.id) | sort) == (["tu_mw","tu_mb","tu_me","tu_mg","tu_mm"] | sort) and
+  (map(.id) | sort) == (["tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_create","tu_side"] | sort) and
   (map(select(.id == "tu_mb"))[0] |
     .status == "complete" and .task != null and
     .input_workspace == $input and .workspace_resolution.kind == "direct") and
@@ -83,5 +85,13 @@ sequence=$(grep -o '"tool_use_id":"tu_m[wbegm]"' /tmp/stub/request-2.json \
 grep -qF 'mix.txt:1:world' /tmp/stub/request-2.json \
   || fail "grep did not report the post-edit content to the model"
 [ ! -f /tmp/stub/request-3.json ] || fail "unexpected extra model round"
+
+side_workspace=$(workspace_commit "$head" side)
+fetch_code "$side_workspace" "fetching the new named workspace"
+[ "$(git show "$side_workspace:side.txt")" = isolated ] || fail "explicit side edit missing"
+if git cat-file -e "$workspace:side.txt" 2>/dev/null; then fail "side edit leaked into main"; fi
+record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$write_output" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "workspace creation did not preserve its upstream and derive publication settings"
+[ "$(git show "$side_workspace:mix.txt")" = hello ] || fail "input snapshot changed with main"
+grep -qF 'side' /tmp/stub/request-2.json || fail "new workspace missing from model context"
 
 pass chat-tools-mixed
