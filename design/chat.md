@@ -6,10 +6,119 @@
 | `W` workspace commit | `caos` remote | sha in a conversation commit's tree |
 | `P` publication branch | destination repository | `refs/heads/<branch>` points to a workspace commit |
 
-An edit creates a workspace commit `W₁` descending from `W₀`, then a new
-conversation commit `C₁` records `W₁`. Renaming the conversation creates another
-`C` pointing to the same `W₁`. Publishing sets a destination branch to `W₁`.
-Conversation history records what happened; workspace history records code changes.
+The chain of C_n records conversation. W_n records code changes.
+
+Each conversation transition creates a new `C`, including model responses and
+tool bookkeeping. Its tree holds the full conversation state so far. Many `C`
+commits point to the same `W`; accepting a code change advances that pointer.
+For example, a turn with one dispatched editing tool:
+
+```mermaid
+flowchart TB
+    subgraph caos["CAOS Git"]
+        message["C_0: save user message"]
+        request(["Build computation request using C_0<br/>No new conversation commit"])
+        before["C_1: record request hash and settings; queue run<br/>C_2: worker starts agent run<br/>C_3: model requests tool<br/>C_4: tool starts"]
+        after["C_5: tool completes edit<br/>C_6: model replies<br/>C_7: turn finishes"]
+        message --> request --> before -->|conversation continues| after
+        message -.->|records| W0["W_0: original code"]
+        before -.->|each records| W0
+        after -.->|each records| W1["W_1: edited code"]
+        W1 -->|Git parent| W0
+    end
+    subgraph destination["Destination Git, after publishing"]
+        P["P: refs/heads/branch"] -->|points to| published1["W_1"]
+        published1 -->|Git parent| published0["W_0"]
+    end
+    W1 -.->|publish same commits and history| published1
+```
+
+The flow follows execution order. Each listed `C` is a separate commit whose
+Git parent is the previous `C`; building the computation request creates no `C`.
+Grouped commits reference the same `W`. The model/tool loop can repeat within a
+turn, and read-only tools leave `W` unchanged. Publication preserves commit hashes.
+
+## Conversation commits
+
+`C` commits contain:
+
+- `tree`: complete conversation state, below.
+- `parent`: exactly one. The fixed genesis commit `G3` for a new root, otherwise
+  the previous `C` (or the source `C` when forking another conversation).
+- `message`: transition kind, such as `message.append` or `tool.complete`.
+- `author` and `committer`.
+
+Conversation commits never have workspace commits as parents. They reference
+workspace commit hashes through files in their trees.
+
+### Transitions and turns
+
+Each transition creates a new `C`. Its kind determines which changes are
+allowed; validation rejects unrelated changes and no-op transitions.
+
+Starting an agent run has three steps:
+
+1. Commit the user message as `C_0`.
+2. Build a computation request using `C_0` as its input snapshot. This computes
+   the request's hash without creating another conversation commit.
+3. Create `C_1` recording that request hash, its input snapshot, model and
+   configuration, and queued status. This marks the run as active.
+
+Step 3 is called **turn admission**. It needs a separate commit because the
+request hash depends on `C_0`: storing it inside `C_0` would make the two hashes
+depend on each other. The queued record identifies the concrete run to execute;
+it is more than a status flag.
+
+When a worker takes responsibility for the queued run, it records **turn claim**
+as another `C`, changing the run's status to running. It then calls the model,
+records its response, and executes its tools, repeating until the turn finishes
+or fails. Interruptions are handled at worker boundaries.
+
+Dispatched tools record `tool.start` before execution and `tool.complete`
+afterward. Immediate tools can complete without a start record. Results record
+both what the tool returned and how its changes were applied.
+
+### Background work and subagents
+
+`run_async` returns a task handle while computation continues. A subagent is a
+separate conversation rooted at `G3`; its identity names the parent conversation,
+parent commit, and spawning call. It receives the selected workspace, if any,
+but does not inherit the parent's transcript or files.
+
+Completion is recorded in the parent. Harvesting applies child changes to an
+existing workspace; promotion creates a separate workspace for review.
+
+Bookkeeping has three concepts:
+
+- **Turns:** model loop, interruption, and outstanding calls. These records
+  are distinct from CAOS computation requests.
+- **Calls:** arguments, responses, applied changes, and an optional task reference.
+- **Tasks:** shared pending/terminal status, results, cancellation, and recovery.
+  Computations and child conversations are explicit variants. Conversation
+  tasks retain their spawn inputs, terminal checkpoint, and application history.
+
+Launching, finishing, and applying work are separate events. Calls identify
+occurrences; computation hashes identify content, so calls can share cached
+work but still need separate responses. Immediate tools need no extra task
+record. Recovery polls pending tasks through one path; terminal notifications
+share idempotence checks. Variant-specific data and validation remain separate.
+
+### Forks, titles, and archiving
+
+A fork starts a new identity from an existing `C`. The source must have no
+active turn, unfinished tool execution, or pending async task or publication.
+Completed records are allowed. Running child records are dropped from the
+inherited state. Renaming changes `.caos/title`.
+
+Archiving moves a conversation out of the active list without deleting its
+history.
+
+### Validation
+
+JSON records use canonical bytes so hashing is stable. Readers check the commit
+and reconstruct its declared transition; the resulting tree must match. See
+[record formats](../rust/crates/conversation-protocol/src/v3/records.rs) and
+[validation](../rust/crates/conversation-protocol/src/v3/validate.rs) for exact rules.
 
 ## Workspace commits
 
@@ -93,75 +202,6 @@ remain. Resolve conflicts with the merge tool, then retry.
 A hash written in `C` does not keep `W` reachable to Git's garbage collector.
 CAOS currently disables automatic Git GC; retention and erasure policy remain
 undesigned.
-
-## Conversation commits
-
-`C` commits contain:
-
-- `tree`: complete conversation state, below.
-- `parent`: exactly one. The fixed genesis commit `G3` for a new root, otherwise
-  the previous `C` (or the source `C` when forking another conversation).
-- `message`: transition kind, such as `message.append` or `tool.complete`.
-- `author` and `committer`.
-
-Conversation commits never have workspace commits as parents. They reference
-workspace commit hashes through files in their trees.
-
-### Transitions and turns
-
-Each transition creates a new `C`. Its kind determines which changes are
-allowed; validation rejects unrelated changes and no-op transitions.
-
-A turn starts by appending the user message and admitting a turn. The worker
-claims it, calls the model, records its response, and executes its tools. This
-repeats until the turn finishes or fails. Interruptions are handled at worker
-boundaries.
-
-Dispatched tools record `tool.start` before execution and `tool.complete`
-afterward. Immediate tools can complete without a start record. Results record
-both what the tool returned and how its changes were applied.
-
-### Background work and subagents
-
-`run_async` returns a task handle while computation continues. A subagent is a
-separate conversation rooted at `G3`; its identity names the parent conversation,
-parent commit, and spawning call. It receives the selected workspace, if any,
-but does not inherit the parent's transcript or files.
-
-Completion is recorded in the parent. Harvesting applies child changes to an
-existing workspace; promotion creates a separate workspace for review.
-
-Bookkeeping has three concepts:
-
-- **Turns:** model loop, interruption, and outstanding calls. These records
-  are distinct from CAOS computation requests.
-- **Calls:** arguments, responses, applied changes, and an optional task reference.
-- **Tasks:** shared pending/terminal status, results, cancellation, and recovery.
-  Computations and child conversations are explicit variants. Conversation
-  tasks retain their spawn inputs, terminal checkpoint, and application history.
-
-Launching, finishing, and applying work are separate events. Calls identify
-occurrences; computation hashes identify content, so calls can share cached
-work but still need separate responses. Immediate tools need no extra task
-record. Recovery polls pending tasks through one path; terminal notifications
-share idempotence checks. Variant-specific data and validation remain separate.
-
-### Forks, titles, and archiving
-
-A fork starts a new identity from an existing `C`. The source must have no
-active turn, unfinished tool execution, or pending async task or publication.
-Completed records are allowed. Running child records are dropped from the
-inherited state. Renaming changes `.caos/title`.
-
-Archiving moves a conversation out of the active list without deleting its
-history.
-
-### Validation
-
-JSON records use canonical bytes so hashing is stable. Readers check the commit
-and reconstruct its declared transition; the resulting tree must match. See
-[record formats](../rust/crates/conversation-protocol/src/v3/records.rs) and
-[validation](../rust/crates/conversation-protocol/src/v3/validate.rs) for exact rules.
 
 ## Publication branches
 
