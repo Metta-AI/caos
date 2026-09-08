@@ -1,18 +1,20 @@
 # Conversations, code stacks, and publication
 
-This is the target design from the September 8 discussion. The current
-implementation still uses flat workspace records and tree-based execution
-bookkeeping; the changes below are not implemented yet.
+Target design from the September 8 discussion; not yet implemented.
 
-| What | Where | How it is referenced |
+**The goal is to delete much of the current workspace and lifecycle machinery.**
+Keep three things: conversation commits, code commits, and ordinary publication
+branches. Directories organize code references by convention; they are not a
+new collection of workspace objects.
+
+| Thing | Where | Meaning |
 | --- | --- | --- |
-| `C`: conversation commit | CAOS Git | A conversation branch points to its latest `C`. |
-| `W`: code commit | CAOS Git | A commit-valued entry anywhere in a conversation tree points to `W`. |
-| `P`: publication branch | Destination Git repository | A branch inferred from a stack entry's path points to the published `W`. |
+| `C` | CAOS Git | Conversation content in its tree; execution events in its commit message. |
+| `W` | CAOS Git | An ordinary code commit, referenced by an entry in a conversation tree. |
+| `P` | Destination Git | A publication branch pointing to an existing `W`. |
 
-The chain of `C` commits records the conversation. Each `W` has its own code
-tree and ordinary Git ancestry. Many consecutive `C` commits can refer to the
-same `W`: a model response or tool-start event need not change any code.
+Many `C` commits can reference the same `W`. Execution bookkeeping does not
+create a code change. A named PR boundary can span many `W` commits.
 
 ```mermaid
 flowchart TB
@@ -20,274 +22,201 @@ flowchart TB
         before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests tool<br/>C_4: tool starts"]
         after["C_5: tool completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
         before -->|conversation continues| after
-        before -.->|feature/dirty points to| W0["W_0: original code"]
-        after -.->|feature/dirty points to| W1["W_1: edited code"]
+        before -.->|feature/dirty| W0["W_0: original code"]
+        after -.->|feature/dirty| W1["W_1: edited code"]
         W1 -->|Git parent| W0
         after --> ready["C_8: rename dirty to 01-feature"]
-        ready -.->|feature/01-feature points to| W1
+        ready -.->|feature/01-feature| W1
     end
-    subgraph destination["Destination Git, after publishing"]
-        P["P: feature/01-feature"] -->|points to| published1["W_1"]
+    subgraph destination["Destination Git"]
+        P["P: feature/01-feature"] --> published1["W_1"]
         published1 -->|Git parent| published0["W_0"]
     end
     W1 -.->|publish same commits and ancestry| published1
 ```
 
-Each listed `C` is a separate commit; grouped commits happen to reference the
-same code. The numbered entry marks a PR boundary. Naming it does not create
-another `W`, and a PR may contain many code commits between boundaries.
+Each listed `C` is a separate commit. Naming the review boundary creates a
+new `C`, but no new `W`.
 
 ## Conversation commits
 
-A conversation separates **canonical content** from **execution history**:
+**Put things in files when we want a canonical, editable, compactable version.
+Put execution history in commit messages.**
 
-- The tree contains the current transcript, title, ordinary files, and code
-  references. These are the things we edit, compact, or reconcile when merging
-  conversations.
-- Structured commit messages record events: run requests, worker claims,
-  tool calls and results, background computations, and subagent lifecycle.
-  They do not need duplicate mutable records in the tree.
+The tree contains the title, canonical transcript, ordinary conversation files,
+and code references. These are the things to reconcile during a conversation
+merge. Keep protocol metadata under `.caos/`; ordinary content, including code
+references, belongs outside it. No `files/` wrapper is required.
 
-A normal `C` parents the previous `C`. A new conversation starts from the fixed
-genesis commit `G3`; a fork starts from its source conversation commit.
-Conversation merges retain both parent histories and reconcile canonical tree
-content. Fork provenance comes from history rather than a second copy in
-`.caos/identity.json`.
+Structured commit messages record run requests, worker claims, tool calls and
+results, and background/subagent activity. The TUI derives the latest relevant
+state for each operation. A disposable local index can accelerate that view;
+do not also store mutable request, call, and task records describing the same
+execution in the tree.
 
-Conversation parent edges never point to `W`. Code references live in the tree.
+A normal `C` parents the previous `C`; a new root starts from `G3`, the fixed
+genesis commit. Forks and merges retain their source histories through Git
+parents. Fork provenance need not be duplicated in `.caos/identity.json`.
+Conversation parent edges never point to code commits.
 
-### Starting and running an agent
+Keep one canonical, **unsharded** transcript. Inspect earlier or pre-merge
+conversation commits through a history tool instead of retaining every branch's
+transcript as another shard in the current tree.
 
-Starting a run still has three steps:
+### Why recording a run is a separate commit
 
 1. Commit the user message as `C_0`.
 2. Build a computation request using `C_0` as its input snapshot. Computing
-   the request hash does not create a conversation commit.
-3. Create `C_1` whose commit message records the request hash, input snapshot,
-   model/configuration, and queued status.
+   its hash creates no conversation commit.
+3. Create `C_1` with an event recording that request's hash, input snapshot,
+   model/settings, and queued status.
 
-Step 3 is **turn admission**. The request hash depends on `C_0`, so putting that
-hash inside `C_0` would make the two hashes depend on each other. The admission
-event identifies the concrete run to execute.
+The request hash depends on `C_0`; including it inside `C_0` would make the
+hashes depend on each other. Step 3 identifies the concrete run to execute.
 
-When a worker takes responsibility for that run, another `C` records the
-claim. Model responses, dispatched tool starts, tool completions, and run
-completion likewise create conversation commits. An event-only commit may
-reuse its parent's tree; validation must not reject it merely for that reason.
+The worker subsequently records that it has started the run. Model responses,
+tool starts/completions, and run completion also create `C` commits. An
+event-only commit can reuse its parent's tree.
 
-Turns identify agent runs; calls identify individual invocations; tasks identify
-background computations or child conversations. Their status is derived from
-events. The TUI shows the latest relevant state for each, without exposing the
-entire execution log by default. Local indexes are disposable accelerators,
-not another authoritative store.
+Moving events out of files avoids merging duplicate status records. Causal
+replay after a conversation merge, including in-flight work, still needs a
+precise rule; commit timestamps alone are not sufficient.
 
-Dispatched tools record a start and completion; immediate tools may complete
-without a start. Results record both the returned value and any applied code
-change. Calls can share cached computation but still need separate responses.
+## Code references and stack directories
 
-### Transcript, forks, and background work
+Use existing Git commit-valued tree entries (gitlinks, mode `160000`), not
+text files containing hashes. A reference's value is a `W`; that commit's
+identity does not depend on the repository from which it was fetched.
 
-The tree holds one canonical, unsharded transcript and its payloads. It need
-not preserve a separate transcript shard for every pre-merge branch. A history
-tool can inspect any earlier conversation commit when that context is needed.
+References may occur anywhere. The TUI discovers them by walking the
+conversation tree and presents that same hierarchy, optionally filtered to
+commit entries. It needs no special workspace index and no worker to reorganize
+content before it can be browsed.
 
-Subagents have their own conversations and receive the requested code snapshots.
-Spawn and completion events preserve the connection to the parent. The parent
-can apply a child's changes to a working entry, or expose its result as a named
-review boundary. Starting work, finishing it, and applying it remain separate.
-
-Moving lifecycle records into commit messages avoids merging mutable status
-files. It does not by itself settle which event wins after divergent histories
-merge. Event identity, causal replay, and treatment of in-flight work at a
-fork or merge still need a precise protocol.
-
-### Canonical tree content
-
-```text
-.caos/
-  format
-  identity.json             # conversation ID
-  title
-  transcript/               # canonical, unsharded context and payloads
-
-notes.md                    # ordinary conversation content
-skills/                     # optional ordinary files
-paintbot-feature/           # code references, described below
-```
-
-There is no required `files/` wrapper for ordinary content, and no
-`.caos/workspaces/` registry. Turn, call, async-task, and subagent bookkeeping
-move out of `.caos/requests`, `.caos/tools`, `.caos/async`, and
-`.caos/subagents`. Publication has no canonical directory either.
-
-## Code references and stacks
-
-A code reference uses the existing Git commit-valued tree entry (gitlink, mode
-`160000`). Its value is a `W`, not a live branch name or a text file containing
-a hash. Its repository of origin is not part of the commit's identity.
-
-References may appear anywhere. One task may need only `paintbot`; another may
-organize several features and repositories into directories. Turning a single
-reference into a stack means moving it into a directory and adding entries,
-not creating a second kind of workspace object.
-
-The TUI walks the conversation tree and displays its references in their
-existing directory structure. It can filter for commit entries and let the
-user select a directory or a particular entry. It needs neither a special flat
-index nor an agent or worker to organize the tree before it can be browsed.
-
-### A stack is a directory convention
-
-Encourage meaningful feature names and zero-padded numeric prefixes:
+A single reference such as `paintbot` is enough for simple work. When useful,
+move it into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
   .base-url                 # repository URL + base branch/ref
-  00-base          -> W_0   # exact base commit incorporated
+  00-base          -> W_0   # exact incorporated base
   01-add-targeting -> W_1   # first PR boundary
   02-improve-it    -> W_2   # second PR boundary
   dirty            -> W_d   # current work, when present
 ```
 
-- `.base-url` names the external repository and ref used for updates and, by
-  default, publication. It changes infrequently.
-- `00-base` records the exact base snapshot. Fetching a newer remote tip does
-  not mean that snapshot has been incorporated.
-- Numbered entries name review boundaries. Each may include many commits since
-  the preceding boundary; their Git ancestry preserves those intermediate edits.
-- `dirty` is the moving working entry. Every accepted edit still creates a real
-  code commit; the entry itself is overwritten, not multiplied into
-  `dirty-1`, `dirty-2`, and so on. Prior values remain in conversation history.
+`.base-url` says where to fetch and publish. `00-base` says which commit has
+actually been incorporated. They are distinct: fetching a newer remote tip
+does not integrate it.
 
-When a change is ready, rename `dirty` to the next numbered, descriptive entry.
-Create a fresh `dirty` at that same commit when starting more work. There is no
-need for separate working and publishing workspaces.
+Numbered entries are review boundaries, not individual edits. Use descriptive
+names and zero-padded numbers so lexical order is useful. The TUI compares each
+boundary with its predecessor, and `dirty` with the last boundary. Intermediate
+code commits remain in ordinary Git ancestry.
 
-The TUI compares neighboring commit entries in name order: `01` against
-`00-base`, `02` against `01`, and `dirty` against the last numbered entry.
-Ordering and PR boundaries come from paths; actual ancestry comes from Git.
-There is no per-entry `initial` field or stored upstream graph.
+Keep **one moving `dirty` reference**. Each accepted edit produces a real code
+commit and updates its value; previous values remain in conversation history.
+When ready, rename it to the next numbered boundary. Start another `dirty`
+from that commit when needed. There is no separate working-versus-publishing
+workspace pair.
 
-A standalone reference remains useful without a repository URL. Add a stack's
-base and destination context when updates, comparison, or publication require it.
-A directory convention must not become a requirement for browsing arbitrary
-commit references.
+Creating, copying, renaming, or removing references is ordinary tree editing.
+Convenience commands can perform those edits without adding persistent object
+types or separate protocol operations for each arrangement.
 
-### Edits, updates, and subagents
+### Editing, updating, and delegating
 
-Tools receive explicit code snapshots and a target entry. Selection is local
-UI state; a submitted operation captures its target and input commits so later
-navigation cannot redirect it. Repository instructions and tools come from the
-selected code, with conversation-owned context available separately.
+Tools receive explicit snapshots and a target reference. Capture these when
+work starts so changing UI selection cannot redirect an in-flight operation.
+Apply proposals against their captured base, preserving code ancestry and
+handling concurrent changes or conflicts explicitly.
 
-Applying a proposal preserves its code ancestry and reconciles against the
-captured base. Equal trees do not make ancestry redundant. A concurrent edit or
-conflict must not silently overwrite the target.
+Updating a stack fetches the ref in `.base-url`, then merges or rebases the
+code and updates `00-base` and the affected boundaries consistently. There is
+no additional upstream graph or checkpoint database. The UI can show the last
+fetched tip; it cannot know an unfetched remote update.
 
-Fetching resolves `.base-url` to a new candidate base. Incorporating it means
-merging or rebasing the stack and updating `00-base`, the numbered boundaries,
-and any working entry consistently. The TUI can report the last fetched tip;
-it must not imply that it knows the current remote tip without fetching.
+Subagents have separate conversations seeded with the requested snapshots.
+Record their relationship and completion in events. Combine their results into
+`dirty`, or expose them as separate numbered boundaries when they deserve
+separate PRs. Directory ordering does not replace actually integrating their
+Git histories.
 
-Subagents can work from the same boundary in parallel. Their results may be
-combined into `dirty`, or retained as separate numbered boundaries when they
-deserve separate PRs. The parent arranges and validates the resulting ancestry;
-directory names alone do not integrate code.
+### Starting a client
 
-### Multiple repositories
+Boot from the CAOS client/harness, independently of target code. There is no
+default `main` workspace or implicit import of the launching checkout.
 
-Keep coordinated stacks together, with a base for each repository:
+Offer an explicit TUI flag to load a local Git tree/snapshot at a visible
+conversation path, with a system message saying what was provided. Cloud
+sessions likewise start from a stable CAOS client repository/environment and
+attach target code afterward. This also makes bootstrap caching independent
+of the target repositories.
 
-```text
-add-feature/
-  library/
-    .base-url
-    00-base
-    01-api
-    dirty
-  application/
-    .base-url
-    00-base
-    01-use-api
-    dirty
-```
-
-Making both code trees available to a tool is useful, but does not automatically
-make the application's package manager consume the modified library.
-
-The next step is a Git endpoint such as `https://gitcommit/<hash>`, reachable
-from runners, that serves a commit and its history from CAOS. A consumer that
-accepts Git dependencies can pin that URL instead of requiring an intermediate
-push to GitHub. The agent can first update the library, then put its resulting
-commit URL into the application's dependency configuration and build it.
-
-Later, DEPS could refer to a sibling commit entry in the conversation tree and
-project its pinned Git URL into a build input. That would avoid manually copying
-hashes after each edit. Endpoint routing/access and package-manager or lockfile
-integration need specification; DEPS automation follows the basic endpoint.
-
-## Client startup
-
-Start from the CAOS client/harness, independently of the code being edited.
-There is no implicit `main` workspace or automatic import of the launching
-checkout.
-
-Provide an explicit TUI option to import a local Git tree/snapshot into the
-conversation. Preserve its commit when one exists, choose a visible content
-path, and insert a system message explaining what was made available. The exact
-flag and handling of uncommitted files remain to be specified.
-
-The same separation applies to cloud clients: boot from a stable CAOS client
-repository/environment and attach target code afterward. The initial cloud
-checkout must not accidentally become the conversation's code repository.
-Reusing that bootstrap environment also permits caching independently of the
-target repositories.
-
-Credentials, server selection, and client caches stay local. They are not
-conversation content.
+Credentials, server choice, and client caches remain local.
 
 ## Publication
 
-Publication derives its plan from a selected stack directory:
+Select a stack directory and derive the plan:
 
-1. Use `.base-url` to identify the repository and base ref, and `00-base` as
-   the incorporated snapshot.
-2. Derive branch names from entry paths, such as
-   `paintbot-feature/01-add-targeting` and `paintbot-feature/02-improve-it`.
-3. Publish numbered boundaries in order. The first PR targets the external
-   base branch; each later PR targets the preceding boundary's branch.
+- Repository and external base: `.base-url`.
+- Branch names: entry paths, such as `paintbot-feature/01-add-targeting`.
+- PR bases: the external branch for the first boundary, then the preceding
+  boundary's branch for each subsequent PR.
 
-`00-base` is not a PR. `dirty` is excluded until explicitly made into a review
-boundary. Publication preserves the existing `W` commits and their ancestry;
-it does not squash or invent an extra code commit at each boundary.
+Exclude `00-base` and `dirty`. A numbered boundary points at an existing code
+commit; publication preserves it and its ancestry. Naming a boundary does not
+squash the intervening commits.
 
-The TUI previews the inferred destinations and diffs before publishing. Preparing
-a boundary can integrate its base and run the appropriate checks. Publishing
-requires coherent ancestry, resolved conflicts, and entries that still point
-to the prepared commits. Concurrent remote updates must not be overwritten.
+Preview destinations and diffs, prepare and check the selected code, and publish
+in order. Verify that references still match the prepared commits and that
+remote branches have not moved unexpectedly.
 
-There is no `.caos/publications/` tree or per-reference publication config.
-Find existing PRs from their repository and inferred branch names. After an
-interrupted push, inspect the destination refs before retrying; any execution
-events needed for recovery belong in commit history, not canonical files.
+Find existing PRs by repository and inferred branch. Inspect destination refs
+after an interrupted push before retrying. Any recovery events belong in commit
+history. Do not recreate a canonical publication-state directory or per-entry
+destination records.
 
-Path-based naming still needs rules for invalid Git ref characters, collisions
-between conversations, and renamed entries with existing PRs. Destination
-overrides, if needed, should be explicit rather than reviving hidden defaults.
+Reject invalid or colliding derived branch names visibly. A renamed path changes
+the proposed destination; show that in the preview rather than maintaining a
+hidden second identity for the branch.
 
-## Implementation work still to specify
+## Multi-repo followup
 
-- Editing and materializing commit references through ordinary tools.
-- Event-message schema, replay across conversation merges, and active-work
-  behavior at forks and merges.
-- Exact `.base-url` syntax, import flags, stack-update conflict recovery, and
-  branch-name collision/rename handling.
-- Format version and migration from existing transcripts, workspace configs,
-  lifecycle records, and publication receipts. Historical commits stay intact;
-  do not silently reinterpret old histories as the new format.
-- Object retention: references in a conversation tree are not Git parent edges.
-  Define how code commits remain available through transport and GC.
-- The Git-by-commit endpoint, followed by optional DEPS integration.
+Keep coordinated stacks together, for example `feature/library/` and
+`feature/application/`, each with its own base and boundaries.
 
-The existing workspace commands and demos describe the current implementation;
-they must be revised when this model is implemented.
+Merely materializing both trees does not make the application's package manager
+use the modified library. The next useful primitive is a Git endpoint such as
+`https://gitcommit/<hash>`, reachable from runners, that serves a commit and
+its history from CAOS. Consumers supporting Git dependencies could pin that
+URL without first publishing the commit to GitHub.
+
+Start with the agent copying the new library commit URL into the application's
+dependency configuration. Later, DEPS could select a sibling commit reference
+and project its pinned URL into a build input. Resolve endpoint access and
+consumer/lockfile integration before adding that automation.
+
+## What this removes
+
+- Flat workspace registration and `.caos/workspaces/<name>/commit|initial|config`.
+- Per-workspace source, upstream, and publication object graphs.
+- Separate working/publishing workspaces and special create/copy/stack/promote
+  persistence machinery.
+- Mutable lifecycle files under `.caos/requests`, `.caos/tools`,
+  `.caos/async`, and `.caos/subagents`.
+- Transcript shards and duplicated fork provenance.
+- `.caos/publications` and stored publication defaults.
+
+Implement this by deleting those representations and using tree edits, Git
+history, and derived views. Moving the same structures behind new names would
+miss the goal.
+
+Remaining details are the event format/replay rule, ordinary-tool access to
+commit entries, `.base-url` and import syntax, and conflict/retention behavior.
+Choose a format transition explicitly and preserve old Git objects; decide
+separately whether an importer is needed instead of carrying legacy adapters
+through the new model.
+
+Current workspace commands and demos describe the old implementation. Revise
+them when this design is implemented.
