@@ -1,0 +1,14 @@
+# tests/githist, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A CLIENT TEST — it drives `caos-cli`, so its base is `DEEP-DEPS/cli-test`
+# (dev/cli-test), the image that stages a git worktree and then runs `worker1`.
+#
+# A CLIENT, not a worker, and that is forced rather than chosen. The subjects
+# walk history by hash, so every commit they touch has to be ON THE SERVER --
+# and only a client puts it there. `caos put-commit` records a commit in the
+# minting worker's CAS; binding it as `--x:@=` makes a gitlink, and git
+# reachability does not traverse gitlinks, so a worker-minted ancestor is
+# unreachable from the tool's container. `--wc:commit=` from a client resolves
+# through `ensure_pushed`, which ships the closure.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.

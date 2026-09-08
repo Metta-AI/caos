@@ -1,0 +1,11 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`). Undeclared is UNAVAILABLE, deliberately.
+#
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test
+# The three subjects. Naming them here evaluates them, so the test never
+# builds a tool itself; each brings std/githist-lib and std/bash with it.
+../../std/log-tool log-tool
+../../std/show-tool show-tool
+../../std/diff-tool diff-tool
