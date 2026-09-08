@@ -185,7 +185,7 @@ done < talk.parents
 [ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
   || fail "conversation spine did not end at G3"
 
-workspace_output=$($TOOL workspace --repo "$PWD" --head "$tip" --name main)
+workspace_output=$($TOOL workspace --repo "$PWD" --head "$tip" --name code/dirty)
 workspace=${workspace_output%%$'\n'*}
 workspace=${workspace#commit }
 git -c fetch.negotiationAlgorithm=noop fetch -q caos "$workspace" \
@@ -193,9 +193,8 @@ git -c fetch.negotiationAlgorithm=noop fetch -q caos "$workspace" \
 [ "$(git show "$workspace:notes/todo.txt")" = "hello notes" ] \
   || fail "completed conversation lost its base workspace"
 
-request_path=$(git ls-tree -r --name-only "$tip" .caos/requests | grep '\.json$' | tail -1)
-[ -n "$request_path" ] || fail "admission request record is missing"
-admission=$($TOOL read --repo "$PWD" --head "$tip" --path "$request_path")
+admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
+admission=$($TOOL request --repo "$PWD" --head "$admitted")
 request=$(jq -r .id <<<"$admission")
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \

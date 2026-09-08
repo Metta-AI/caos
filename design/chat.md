@@ -1,6 +1,6 @@
 # Conversations, code stacks, and publication
 
-Target design from the September 8 discussion; not yet implemented.
+Implemented conversation format v4, based on the September 8 discussion.
 
 **The goal is to delete much of the current workspace and lifecycle machinery.**
 Keep three things: conversation commits, code commits, and ordinary publication
@@ -44,8 +44,7 @@ new `C`, but no new `W`.
 Put execution history in commit messages.**
 
 The tree contains the title, canonical transcript, ordinary conversation files,
-and code references. These are the things to reconcile during a conversation
-merge. Keep protocol metadata under `.caos/`; ordinary content, including code
+and code references. These are the things a future conversation merge would reconcile. Keep protocol metadata under `.caos/`; ordinary content, including code
 references, belongs outside it. No `files/` wrapper is required.
 
 Structured commit messages record run requests, worker claims, tool calls and
@@ -55,11 +54,11 @@ do not also store mutable request, call, and task records describing the same
 execution in the tree.
 
 A normal `C` parents the previous `C`; a new root starts from `G3`, the fixed
-genesis commit. Forks and merges retain their source histories through Git
-parents. Fork provenance need not be duplicated in `.caos/identity.json`.
+genesis commit. Forks retain their source history through a Git parent. Provenance is derived
+from that edge, not stored again in `.caos/identity.json`.
 Conversation parent edges never point to code commits.
 
-Keep one canonical, **unsharded** transcript. Inspect earlier or pre-merge
+Keep one canonical, **unsharded** transcript under `.caos/transcript`. Inspect earlier or pre-merge
 conversation commits through a history tool instead of retaining every branch's
 transcript as another shard in the current tree.
 
@@ -78,9 +77,11 @@ The worker subsequently records that it has started the run. Model responses,
 tool starts/completions, and run completion also create `C` commits. An
 event-only commit can reuse its parent's tree.
 
-Moving events out of files avoids merging duplicate status records. Causal
-replay after a conversation merge, including in-flight work, still needs a
-precise rule; commit timestamps alone are not sufficient.
+Events are replayed in first-parent order, never by timestamp. A fork starts a
+new execution context while retaining ancestral tool results needed by its
+canonical transcript. Forking requires a quiescent request; it does not resume
+the source's background work. Conversation merging and transcript compaction
+commands remain follow-ups; this version supports code merges.
 
 ## Code references and stack directories
 
@@ -98,7 +99,7 @@ move it into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
-  .base-url                 # repository URL + base branch/ref
+  .base-url                 # two lines: repository URL, then base branch
   00-base          -> W_0   # exact incorporated base
   01-add-targeting -> W_1   # first PR boundary
   02-improve-it    -> W_2   # second PR boundary
@@ -131,8 +132,9 @@ work starts so changing UI selection cannot redirect an in-flight operation.
 Apply proposals against their captured base, preserving code ancestry and
 handling concurrent changes or conflicts explicitly.
 
-Updating a stack fetches the ref in `.base-url`, then merges or rebases the
-code and updates `00-base` and the affected boundaries consistently. There is
+Updating a stack fetches the branch in `.base-url`, merges its changes through
+the ordered boundaries and `dirty`, and updates all references in one conversation
+commit. A conflict leaves the conversation unchanged. There is
 no additional upstream graph or checkpoint database. The UI can show the last
 fetched tip; it cannot know an unfetched remote update.
 
@@ -147,8 +149,9 @@ Git histories.
 Boot from the CAOS client/harness, independently of target code. There is no
 default `main` workspace or implicit import of the launching checkout.
 
-Offer an explicit TUI flag to load a local Git tree/snapshot at a visible
-conversation path, with a system message saying what was provided. Cloud
+Use `caos tui --import feature` to load the committed HEAD of the checkout at
+`feature/dirty` (or choose a commit with `--base`). A system message states what
+was provided. Local uncommitted edits are not included. Cloud
 sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
@@ -181,21 +184,11 @@ Reject invalid or colliding derived branch names visibly. A renamed path changes
 the proposed destination; show that in the preview rather than maintaining a
 hidden second identity for the branch.
 
-## Multi-repo followup
+## Deferred multi-repo work
 
-Keep coordinated stacks together, for example `feature/library/` and
-`feature/application/`, each with its own base and boundaries.
-
-Merely materializing both trees does not make the application's package manager
-use the modified library. The next useful primitive is a Git endpoint such as
-`https://gitcommit/<hash>`, reachable from runners, that serves a commit and
-its history from CAOS. Consumers supporting Git dependencies could pin that
-URL without first publishing the commit to GitHub.
-
-Start with the agent copying the new library commit URL into the application's
-dependency configuration. Later, DEPS could select a sibling commit reference
-and project its pinned URL into a build input. Resolve endpoint access and
-consumer/lockfile integration before adding that automation.
+Separate directories can attach separate repositories. Making one package
+consume unpublished code from another still requires dependency configuration;
+a Git-by-hash endpoint and automatic DEPS projection are outside this change.
 
 ## What this removes
 
@@ -212,11 +205,28 @@ Implement this by deleting those representations and using tree edits, Git
 history, and derived views. Moving the same structures behind new names would
 miss the goal.
 
-Remaining details are the event format/replay rule, ordinary-tool access to
-commit entries, `.base-url` and import syntax, and conflict/retention behavior.
-Choose a format transition explicitly and preserve old Git objects; decide
-separately whether an importer is needed instead of carrying legacy adapters
-through the new model.
+## Commands and format transition
 
-Current workspace commands and demos describe the old implementation. Revise
-them when this design is implemented.
+- `/workspace` or `/workspace list`: browse commit-entry paths.
+- `/workspace use <path>`: select a code snapshot.
+- `/workspace attach <directory> <repository> [branch|commit]`: create
+  `.base-url`, `00-base`, and `dirty` in that directory.
+- `/workspace create <path> [commit]`: copy the selected snapshot, or use an
+  explicit commit. `copy` is an alias for copying the selected snapshot.
+- `/workspace rename <source> <destination>`: move a reference.
+- `/workspace seal 01-description`: rename selected `dirty` to a PR boundary.
+- `/workspace update [directory|--all]`: incorporate the fetched base atomically.
+- `/workspace rollback <path> <commit>` and `remove <path>`: move or remove a ref.
+- `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
+
+Inline file tools address conversation paths directly, traversing code references
+such as `feature/dirty/README.md`. An explicit `workspace` makes their paths
+relative to that code tree. Bash and repository tools take a target reference.
+
+The format marker is `caos-conversation-v4`. Old Git objects are preserved;
+use the previous build to open v3 conversations. There is no implicit migration
+or dual-format persistence. The internal v3 module and ref namespace names are
+retained; the format marker determines how a conversation is read.
+
+Run `dev/demo-workspaces` for local fixtures or `dev/demo-subagent-stack` for
+the guided subagent example.

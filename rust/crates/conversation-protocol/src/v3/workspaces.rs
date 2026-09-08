@@ -1,17 +1,13 @@
-//! Workspace relationships and publication settings, stored with the conversation.
-use std::collections::{BTreeMap, BTreeSet};
+//! Views derived from stack directory entries; none of these views are persisted.
 
 use serde::{Deserialize, Serialize};
 
-use super::canonical::{canonical_bytes, parse_canonical};
 use super::{paths, Oid};
 
-/// Source, integration progress, and publication policy are independent.
+/// Resolved neighbors and publication destination for a commit-valued path.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<WorkspaceBase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,24 +100,6 @@ impl WorkspaceBase {
     }
 }
 
-/// Make a pinned locator from Git's transport spelling. Parsing is shared with :@@=.
-pub fn source_locator(repository: &str, commit: &Oid) -> Result<String, String> {
-    validate_repository(repository)?;
-    let url = if repository.starts_with("git+") || repository.starts_with("github:") {
-        repository.to_string()
-    } else if repository.contains("://") {
-        format!("git+{repository}")
-    } else if let Some((host, path)) = repository.split_once(':').filter(|(h, _)| !h.contains('/'))
-    {
-        format!("git+ssh://{host}/{path}")
-    } else {
-        format!("git+file://{repository}")
-    };
-    let source = format!("{url}?rev={commit}");
-    validate_source(&source)?;
-    Ok(source)
-}
-
 pub fn validate_source(source: &str) -> Result<git_locator::GitRef, String> {
     let parsed = git_locator::parse_git_ref(source)?;
     if parsed.rev.is_none() || parsed.dir.is_some() {
@@ -151,19 +129,15 @@ pub fn validate_repository(repository: &str) -> Result<(), String> {
 
 impl WorkspaceConfig {
     pub fn repository(&self) -> Option<String> {
-        self.source
+        self.publication
             .as_ref()
-            .and_then(|s| validate_source(s).ok())
-            .map(|s| s.fetch_url())
+            .and_then(|p| p.repository.clone())
             .or_else(|| match &self.upstream {
                 Some(WorkspaceBase::Branch { repository, .. }) => repository.clone(),
                 _ => None,
             })
     }
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(source) = &self.source {
-            validate_source(source)?;
-        }
         if let Some(destination) = &self.publication {
             if let Some(repository) = &destination.repository {
                 validate_repository(repository)?;
@@ -189,77 +163,38 @@ impl WorkspaceConfig {
         }
         Ok(())
     }
-    pub fn encode(&self) -> Vec<u8> {
-        canonical_bytes(&serde_json::to_value(self).expect("workspace settings serialize"))
-            .expect("workspace settings are canonical")
-    }
+}
+
+/// The sole external locator in a stack. Two lines avoid ambiguous URL fragments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaseUrl {
+    pub repository: String,
+    pub branch: String,
+}
+impl BaseUrl {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let config: Self = serde_json::from_value(parse_canonical(bytes)?)
-            .map_err(|error| format!("workspace settings: {error}"))?;
-        config.validate()?;
-        if config.encode() != bytes {
-            return Err("workspace settings must omit absent values".into());
+        let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+        let lines: Vec<_> = text.lines().collect();
+        if lines.len() != 2 {
+            return Err(".base-url needs a repository URL and branch on separate lines".into());
         }
-        Ok(config)
+        validate_repository(lines[0])?;
+        validate_branch(lines[1])?;
+        Ok(Self {
+            repository: lines[0].into(),
+            branch: lines[1].into(),
+        })
+    }
+    pub fn encode(&self) -> Vec<u8> {
+        format!("{}\n{}\n", self.repository, self.branch).into_bytes()
     }
 }
 
-// Only used to read and replay historical config.json records.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    repository: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    base: Option<LegacyBase>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum LegacyBase {
-    Branch { name: String, commit: Oid },
-    Workspace { name: String, commit: Oid },
-}
-
-pub(crate) fn legacy_config(bytes: &[u8], initial: &Oid) -> Result<WorkspaceConfig, String> {
-    let old: LegacyConfig =
-        serde_json::from_value(parse_canonical(bytes)?).map_err(|e| e.to_string())?;
-    if canonical_bytes(&serde_json::to_value(&old).map_err(|e| e.to_string())?)? != bytes {
-        return Err("legacy settings must omit absent values".into());
-    }
-    let source = old
-        .repository
-        .as_ref()
-        .map(|repository| source_locator(repository, initial))
-        .transpose()?;
-    let upstream = old.base.map(|base| match base {
-        LegacyBase::Branch { name, commit } => WorkspaceBase::Branch {
-            repository: old.repository.clone(),
-            name,
-            commit,
-        },
-        LegacyBase::Workspace { name, commit } => WorkspaceBase::Workspace { name, commit },
-    });
-    let publication = old.branch.map(|branch| PublicationDestination {
-        repository: old.repository,
-        branch,
-        base: None,
-    });
-    let config = WorkspaceConfig {
-        source,
-        upstream,
-        publication,
-    };
-    config.validate()?;
-    Ok(config)
-}
-
-pub(crate) fn is_legacy_config(bytes: &[u8]) -> Result<bool, String> {
-    let value = parse_canonical(bytes)?;
-    Ok(["repository", "branch", "base"]
-        .iter()
-        .any(|key| value.get(key).is_some()))
+pub fn is_boundary(name: &str) -> bool {
+    name.len() > 3
+        && name.as_bytes()[..2].iter().all(u8::is_ascii_digit)
+        && name.as_bytes()[2] == b'-'
+        && !name.starts_with("00-")
 }
 
 pub fn validate_branch(branch: &str) -> Result<(), String> {
@@ -281,119 +216,25 @@ pub fn validate_branch(branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parents precede dependents. A stack is just these workspace base edges.
-pub fn workspace_order(configs: &BTreeMap<String, WorkspaceConfig>) -> Result<Vec<String>, String> {
-    fn visit(
-        name: &str,
-        configs: &BTreeMap<String, WorkspaceConfig>,
-        visiting: &mut BTreeSet<String>,
-        visited: &mut BTreeSet<String>,
-        ordered: &mut Vec<String>,
-    ) -> Result<(), String> {
-        if visited.contains(name) {
-            return Ok(());
-        }
-        if !visiting.insert(name.to_string()) {
-            return Err(format!("workspace base cycle at {name:?}"));
-        }
-        let config = configs
-            .get(name)
-            .ok_or_else(|| format!("base workspace {name:?} does not exist"))?;
-        config.validate()?;
-        if let Some(WorkspaceBase::Workspace { name: parent, .. }) = &config.upstream {
-            let parent_config = configs
-                .get(parent)
-                .ok_or_else(|| format!("base workspace {parent:?} does not exist"))?;
-            if let (Some(repository), Some(parent_repository)) =
-                (config.repository(), parent_config.repository())
-            {
-                if normalize_repository_identity(&repository)?
-                    != normalize_repository_identity(&parent_repository)?
-                {
-                    return Err(format!(
-                        "workspace {name:?} and its base {parent:?} use different repositories"
-                    ));
-                }
-            }
-            visit(parent, configs, visiting, visited, ordered)?;
-        }
-        visiting.remove(name);
-        visited.insert(name.to_string());
-        ordered.push(name.to_string());
-        Ok(())
-    }
-
-    let mut ordered = Vec::new();
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for name in configs.keys() {
-        paths::validate_workspace_name(name)?;
-        visit(name, configs, &mut visiting, &mut visited, &mut ordered)?;
-    }
-    Ok(ordered)
-}
-
-pub fn default_publication_branch(id: &str, name: &str, count: usize) -> String {
-    if count == 1 {
-        format!("caos/{id}")
-    } else {
-        format!("caos-workspaces/{id}/{name}")
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Creation {
-    #[default]
-    FromUpstream,
-    Stack,
-    Copy,
-}
-
 /// Create a named line of work from one pinned workspace snapshot. The caller
 /// publishes this sequence atomically with any associated operation receipt.
 pub fn create_from_workspace(
     view: &super::view::Conversation<'_>,
     name: &str,
     source: &str,
-    creation: Creation,
 ) -> Result<Vec<super::apply::Transition>, String> {
-    use super::apply::Transition;
     paths::validate_workspace_name(name)?;
-    if view.workspace(name)?.is_some() {
-        return Err(format!("workspace {name:?} already exists"));
+    if view.snapshot().exists(name)? {
+        return Err(format!("path {name:?} already exists"));
     }
     let ws = view
         .workspace(source)?
-        .ok_or_else(|| format!("no workspace {source:?}"))?;
-    let mut config = view.workspace_config(source)?;
-    config.publication = None;
-    let commit = match creation {
-        Creation::FromUpstream => config
-            .upstream
-            .as_ref()
-            .map(|base| base.commit().clone())
-            .unwrap_or(ws.initial),
-        Creation::Stack => {
-            config.upstream = Some(WorkspaceBase::Workspace {
-                name: source.to_string(),
-                commit: ws.commit.clone(),
-            });
-            ws.commit
-        }
-        Creation::Copy => ws.commit,
-    };
-    let mut transitions = vec![Transition::WorkspaceCreate {
-        name: name.to_string(),
-        commit,
-        origin: None,
-    }];
-    if config != WorkspaceConfig::default() {
-        transitions.push(Transition::WorkspaceConfigure {
-            name: name.to_string(),
-            config,
-        });
-    }
-    Ok(transitions)
+        .ok_or_else(|| format!("no code reference {source:?}"))?;
+    let commit = ws.commit;
+    Ok(vec![super::apply::Transition::reference(
+        name.to_string(),
+        Some(commit),
+    )])
 }
 
 pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
@@ -448,102 +289,4 @@ pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
         return Err(format!("invalid origin URL {url:?}"));
     }
     Ok(normalized)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_and_publication_do_not_retarget_upstream() {
-        let commit = super::super::oid::g3();
-        let source = source_locator("git@example.com:team/repo.git", &commit).unwrap();
-        assert_eq!(
-            validate_source(&source).unwrap().rev.as_deref(),
-            Some(commit.as_str())
-        );
-        for source in ["path:/tmp/repo".to_string(), format!("{source}&dir=src")] {
-            assert!(validate_source(&source).is_err());
-        }
-        let mut config = WorkspaceConfig {
-            source: Some(source),
-            upstream: Some(WorkspaceBase::Branch {
-                repository: Some("git@example.com:team/repo.git".into()),
-                name: "main".into(),
-                commit,
-            }),
-            publication: None,
-        };
-        let upstream = config.upstream.clone();
-        config.publication = Some(PublicationDestination {
-            repository: Some("https://example.com/fork".into()),
-            branch: "review/topic".into(),
-            base: Some(PublicationBase::Branch("release".into())),
-        });
-        let decoded = WorkspaceConfig::parse(&config.encode()).unwrap();
-        assert_eq!(decoded.upstream, upstream);
-        assert_eq!(decoded.source, config.source);
-    }
-
-    #[test]
-    fn legacy_defaults_and_explicit_repositories_survive_conversion() {
-        let commit = super::super::oid::g3();
-        for repository in [None, Some("https://example.com/repo")] {
-            let old = LegacyConfig {
-                repository: repository.map(str::to_string),
-                branch: Some("review/topic".into()),
-                base: Some(LegacyBase::Branch {
-                    name: "main".into(),
-                    commit: commit.clone(),
-                }),
-            };
-            let bytes = canonical_bytes(&serde_json::to_value(old).unwrap()).unwrap();
-            let config = legacy_config(&bytes, &commit).unwrap();
-            let publication = config.publication.as_ref().unwrap();
-            assert_eq!(publication.branch, "review/topic");
-            assert_eq!(publication.repository.as_deref(), repository);
-            assert_eq!(config.upstream.as_ref().unwrap().name(), "main");
-            assert_eq!(WorkspaceConfig::parse(&config.encode()).unwrap(), config);
-        }
-    }
-
-    #[test]
-    fn workspace_settings_validate_dependencies_and_round_trip() {
-        let commit = super::super::oid::g3();
-        let base = WorkspaceConfig {
-            source: Some(source_locator("https://example.com/code.git", &commit).unwrap()),
-            ..Default::default()
-        };
-        let mut child = base.clone();
-        child.upstream = Some(WorkspaceBase::Workspace {
-            name: "refactor".into(),
-            commit: commit.clone(),
-        });
-        assert_eq!(WorkspaceConfig::parse(&child.encode()).unwrap(), child);
-        let mut configs =
-            BTreeMap::from([("feature".into(), child.clone()), ("refactor".into(), base)]);
-        assert_eq!(
-            workspace_order(&configs).unwrap(),
-            vec!["refactor", "feature"]
-        );
-        configs.get_mut("refactor").unwrap().upstream = Some(WorkspaceBase::Workspace {
-            name: "feature".into(),
-            commit: commit.clone(),
-        });
-        assert!(workspace_order(&configs).unwrap_err().contains("cycle"));
-        configs.remove("refactor");
-        assert!(workspace_order(&configs)
-            .unwrap_err()
-            .contains("does not exist"));
-        for branch in ["../main", "a.lock", "a//b", "-main", "a@{b", "a b"] {
-            assert!(validate_branch(branch).is_err());
-        }
-        for branch in ["main", "caos/feature", "fix-one"] {
-            validate_branch(branch).unwrap();
-        }
-        child.source = Some(format!(
-            "git+https://user:password@example.com/repo?rev={commit}"
-        ));
-        assert!(child.validate().is_err());
-    }
 }

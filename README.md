@@ -385,9 +385,10 @@ the object machinery through a one-way dependency. Their difference is the
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `tui` — interactive conversations, with a bundled harness independent of
-    attached repositories. From a checkout it starts with that checkout's HEAD;
-    `caos tui --empty` starts without code. Ctrl+O opens workspaces: `n`
-    creates a change, `a` attaches a repository, `u` updates its stack.
+    attached repositories. It starts without code; `caos tui --import feature`
+    explicitly imports the checkout at `feature/dirty`. Ctrl+O lists code paths:
+    `n` copies a reference, `a` attaches a repository, `u` updates its stack.
+    `/workspace seal 01-description` names the selected dirty commit for review.
     Ctrl+P previews workspace PRs before publishing them;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);

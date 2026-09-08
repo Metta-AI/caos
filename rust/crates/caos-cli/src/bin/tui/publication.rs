@@ -1,8 +1,7 @@
 //! Preview and publish a selected set of named workspaces.
 use super::*;
 use caos_cli::workspaces::{
-    publication_order, publication_plan, resolve_publication_plan, PublicationBase,
-    PublicationTarget,
+    publication_order, publication_plan, resolve_publication_plan, PublicationTarget,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,7 +19,6 @@ pub(super) struct PublishPlanPrompt {
     pub loading: bool,
     pub rows: Vec<PlanRow>,
     pub selected: usize,
-    pub edit: Option<(bool, String)>, // true edits the PR base; false edits the branch.
     pub error: Option<String>,
 }
 
@@ -49,7 +47,6 @@ impl App {
             loading: true,
             rows: Vec::new(),
             selected: 0,
-            edit: None,
             error: None,
         });
         let finished_conversation = conversation.clone();
@@ -61,7 +58,8 @@ impl App {
                     .into_iter()
                     .map(|target| {
                         Ok(PlanRow {
-                            included: target.workspace == selected,
+                            included: target.workspace.rsplit_once('/').map(|(dir, _)| dir)
+                                == selected.rsplit_once('/').map(|(dir, _)| dir),
                             target,
                         })
                     })
@@ -89,66 +87,7 @@ impl App {
             self.selected_mut().publish_plan = Some(prompt);
             return;
         }
-        if let Some((base, input)) = prompt.edit.as_mut() {
-            match key.code {
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    input.clear()
-                }
-                KeyCode::Char(ch)
-                    if !key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
-                {
-                    input.push(ch)
-                }
-                KeyCode::Enter => {
-                    let value = input.trim().to_string();
-                    let parent = if *base {
-                        value.strip_prefix('@').map(str::to_string)
-                    } else {
-                        None
-                    };
-                    let branch = if let Some(parent) = &parent {
-                        prompt
-                            .rows
-                            .iter()
-                            .find(|row| &row.target.workspace == parent)
-                            .map(|row| row.target.branch.clone())
-                    } else {
-                        Some(pr_base_branch(&value).to_string())
-                    };
-                    match branch {
-                        Some(branch) => {
-                            match conversation_protocol::v3::workspaces::validate_branch(&branch) {
-                                Ok(()) => {
-                                    let row = &mut prompt.rows[prompt.selected];
-                                    if *base {
-                                        row.target.base = match parent {
-                                            Some(parent) => PublicationBase::Workspace(parent),
-                                            None => PublicationBase::Branch(branch),
-                                        };
-                                    } else {
-                                        row.target.branch = branch;
-                                        if !row.target.repository.is_empty() {
-                                            row.target.diagnostic = None;
-                                        }
-                                    }
-                                    row.included = true;
-                                    prompt.edit = None;
-                                    prompt.error = None;
-                                }
-                                Err(error) => prompt.error = Some(error),
-                            }
-                        }
-                        None => prompt.error = Some("unknown base workspace".into()),
-                    }
-                }
-                _ => {}
-            }
-        } else if !prompt.rows.is_empty() {
+        if !prompt.rows.is_empty() {
             let count = prompt.rows.len();
             match key.code {
                 KeyCode::Up => prompt.selected = (prompt.selected + count - 1) % count,
@@ -162,19 +101,6 @@ impl App {
                     for row in &mut prompt.rows {
                         row.included = include;
                     }
-                }
-                KeyCode::Char('b') => {
-                    let target = &prompt.rows[prompt.selected].target;
-                    prompt.edit = Some((
-                        true,
-                        match &target.base {
-                            PublicationBase::Default => String::new(),
-                            other => other.to_string(),
-                        },
-                    ));
-                }
-                KeyCode::Char('h') => {
-                    prompt.edit = Some((false, prompt.rows[prompt.selected].target.branch.clone()))
                 }
                 KeyCode::Enter => {
                     self.selected_mut().publish_plan = Some(prompt);
@@ -196,7 +122,7 @@ impl App {
         let Some(mut prompt) = self.selected_mut().publish_plan.take() else {
             return;
         };
-        if prompt.loading || prompt.edit.is_some() {
+        if prompt.loading {
             self.selected_mut().publish_plan = Some(prompt);
             return;
         }

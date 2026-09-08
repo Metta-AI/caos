@@ -24,12 +24,11 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
             owner: None,
         },
         title: "Golden Conversation".to_string(),
-        workspaces: BTreeMap::from([("main".to_string(), (oid('a'), None))]),
+        workspaces: BTreeMap::from([("main".to_string(), oid('a'))]),
         files_seed: Some(files_seed),
     };
     let applied = apply(store, None, &root).expect("apply root");
-    let mut head =
-        mint(store, &genesis, &applied.tree, root.kind(), &signature).expect("mint root");
+    let mut head = mint(store, &genesis, &applied, root.kind(), &signature).expect("mint root");
 
     commit(
         store,
@@ -413,31 +412,19 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::WorkspaceCreate {
-            name: "side".to_string(),
-            commit: oid('d'),
-            origin: Some(WorkspaceOrigin {
-                source: "seed".to_string(),
-                source_tree: oid('e'),
-            }),
-        },
+        Transition::reference("side".to_string(), Some(oid('d'))),
         &signature,
     );
     commit(
         store,
         &mut head,
-        Transition::WorkspaceRollback {
-            name: "main".to_string(),
-            commit: oid('f'),
-        },
+        Transition::reference("main".to_string(), Some(oid('f'))),
         &signature,
     );
     commit(
         store,
         &mut head,
-        Transition::WorkspaceRemove {
-            name: "side".to_string(),
-        },
+        Transition::reference("side".to_string(), None),
         &signature,
     );
 
@@ -589,10 +576,8 @@ fn commit(
     transition: Transition,
     signature: &super::tree::Signature,
 ) -> Applied {
-    let parent_tree = store.read_commit(head).expect("read parent").tree;
-    let applied = apply(store, Some(&parent_tree), &transition).expect("apply transition");
-    *head =
-        mint(store, head, &applied.tree, transition.kind(), signature).expect("mint transition");
+    let applied = apply(store, Some(head), &transition).expect("apply transition");
+    *head = mint(store, head, &applied, transition.kind(), signature).expect("mint transition");
     applied
 }
 
@@ -600,7 +585,7 @@ fn request_record(id: Oid, request_head: Oid) -> TurnRecord {
     TurnRecord {
         id,
         request_head,
-        request_workspaces: None,
+
         model: "model".to_string(),
         configuration: configuration(),
         round: 0,
@@ -662,69 +647,4 @@ fn configuration() -> String {
 
 fn oid(character: char) -> Oid {
     Oid::parse(&character.to_string().repeat(40), "fixture oid").expect("valid fixture oid")
-}
-
-#[cfg(test)]
-mod memory_tests {
-    use super::*;
-    use crate::v3::tree::MemoryStore;
-
-    const GOLDEN_HEAD: &str = "cc1df48f8601195e11f30072e684e06f60ed562b";
-    const GOLDEN_TREES: [&str; 33] = [
-        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-        "a398d70aa573940890a0877daddfcd1bd8dec0f8",
-        "b10226eb938788dae4ca857e7333218843b57c20",
-        "828429dd06a79479a9e0652f186d5f5b9534ab85",
-        "30fd822540cf7caab3a9535df99e7fb46938f5e9",
-        "fb62e9f83c59dd35c6a0b24ea3fef2d1a4f55ccd",
-        "bb96722aebb12654a1957e90cf1ce6db8c676e96",
-        "6cddae8c89b579277793c5021b191c0d1462df4a",
-        "76374b5318f392c83d84212472251d37a1eb5a85",
-        "e440db3d32a4de40afd32ead5a4aaf1850429d03",
-        "56f766f8af868960f42bd80cc8767946ce183d55",
-        "241fe3fe45263205123d93942098d00a5d780e94",
-        "6eae194b77e008fca3db31db0500c3db3481c954",
-        "4c15e9cf7a524fa3ce3b9380f494ed41d26a3b3e",
-        "e5f686e5d604841640b49e761791f4e30e768356",
-        "8ac550e6fb2aaddb5b6d95d8446b0d3a92237c94",
-        "6fd133d180f51e36105f39ba67c98f196c96ef9b",
-        "d2c119718013193f409e07664789dcc1258322f9",
-        "acbba4378f5062a40cb5465923010a4682d3c34c",
-        "60bba3b2c482c7d2954f0f2e4117ec01003b739e",
-        "02d6de0bb3eb05afb066d97d68c07e16f9c5ea8e",
-        "8209fee51b0400cbf65d97dd521bfc7dcc87f6e2",
-        "b0854834cbc76008973375a1b7d170d727018100",
-        "0b83c09973f68c2620dc33e37c8e248f96162107",
-        "c752ff5ec3119971670fa1fcf05457e2f4a99b8f",
-        "49717d887f9becfdf59f4edc9f471a3b78cf4b17",
-        "6c3662fcb9e4ef2e267aadfaf7eb122f952b8b59",
-        "0a8a7d38e77d50f27b1a5704ea93a6081137cfd0",
-        "d8ec34900a7741cd2c6f8e0026f7efcc7bcbca6b",
-        "dfde41a608e79d9e4c8b4ebfe381bf7420d37ac5",
-        "b61549f48b3800ebf3c3d84b2a0aed90381b721f",
-        "d8ebacbcd89e88512ad3a785e52f6cc879082a50",
-        "3b9aaddc6b0d2d5f685434644ea2187ef25aea87",
-    ];
-
-    #[test]
-    fn golden_spine_oids_are_stable() {
-        let mut store = MemoryStore::new();
-        let head = golden(&mut store);
-        assert_eq!(head.as_str(), GOLDEN_HEAD);
-        let mut trees = Vec::new();
-        let mut cursor = head;
-        loop {
-            let commit = store.read_commit(&cursor).unwrap();
-            trees.push(commit.tree);
-            let Some(parent) = commit.parents.first() else {
-                break;
-            };
-            cursor = parent.clone();
-        }
-        trees.reverse();
-        assert_eq!(
-            trees.iter().map(Oid::as_str).collect::<Vec<_>>(),
-            GOLDEN_TREES
-        );
-    }
 }

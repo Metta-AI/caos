@@ -111,8 +111,13 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     if let Some(file) = &mut args.turn.system_file {
         *file = cwd.join(&*file).to_string_lossy().into_owned();
     }
+    if let Some(file) = args.turn.system_file.take() {
+        args.turn.system =
+            Some(fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?);
+    }
     let mut seeds = BTreeMap::new();
-    if !args.empty {
+    if let Some(name) = &args.import {
+        conversation_protocol::v3::paths::validate_workspace_name(name)?;
         if let Some(checkout) = &checkout {
             let rev = args.turn.base.as_deref().unwrap_or("HEAD");
             let commit = git(
@@ -124,20 +129,24 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
             let config =
                 caos_cli::workspaces::checkout_config(&GitTransport::discover(checkout)?, &commit)?;
             seeds.insert(
-                "main".into(),
+                format!("{name}/dirty"),
                 InitialWorkspace {
                     commit: commit.clone(),
                     config,
                 },
             );
+            let supplied =
+                format!("Local Git snapshot {commit} was explicitly provided at {name}/dirty.");
+            args.turn.system = Some(match args.turn.system.take() {
+                Some(system) => format!("{system}\n\n{supplied}"),
+                None => supplied,
+            });
             args.turn.base = Some(commit.clone());
             if args.from_commit.is_some() {
                 args.from_commit = Some(commit);
             }
-        } else if args.turn.base.is_some() {
-            return Err(
-                "--base and --from require a checkout; use --empty and attach a repository".into(),
-            );
+        } else {
+            return Err("--import requires a Git checkout".into());
         }
     }
     args.turn.initial_workspaces = Some(seeds);

@@ -15,7 +15,7 @@ echo "hello files" > /tmp/ws/files/todo.txt
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
 
 INLINE_CALLS='[
- {"id":"tu_w","input":{"workspace":"main","file-path":"files/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
+ {"id":"tu_w","input":{"file-path":"main/files/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
  {"id":"tu_r","input":{"workspace":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"},
  {"id":"tu_e","input":{"workspace":"main","file-path":"files/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
  {"id":"tu_x","input":{"workspace":"main","file-path":"files/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
@@ -69,7 +69,7 @@ grep -qF 'old-string not found' /tmp/stub/request-2.json \
 stage "conversation files work without a workspace"
 mkdir -p /tmp/stub-zero
 printf '%s\n' \
-  '{"content":[{"id":"tu_no_workspace","input":{"file-path":"plan.md","content":"wrong place"},"name":"write","type":"tool_use"},{"id":"tu_files","input":{"file-path":"files/plan.md","content":"right place"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  '{"content":[{"id":"tu_no_workspace","input":{"file-path":"plan.md","content":"root plan"},"name":"write","type":"tool_use"},{"id":"tu_files","input":{"file-path":"files/plan.md","content":"right place"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
   > /tmp/stub-zero/response-1.json
 printf '%s\n' \
   '{"content":[{"text":"zero workspace done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -82,12 +82,10 @@ new_llm_conversation tools-zero "$zero_port" - "You are a coding agent." "" \
 dispatch_turn "exercise files without a workspace"
 wait_turn || fail "the zero-workspace turn did not finish"
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/zero-tools.jsonl
-jq -s -e 'any(.[]; .id == "tu_no_workspace" and .status == "failed")' \
-  /tmp/zero-tools.jsonl >/dev/null || fail "workspace-less write was not rejected"
-$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-  --round 0 --id tu_no_workspace > /tmp/no-workspace.json
-grep -qF 'no workspace' /tmp/no-workspace.json \
-  || fail "workspace-less write did not explain the missing workspace"
+jq -s -e 'length == 2 and all(.[]; .status == "complete")' \
+  /tmp/zero-tools.jsonl >/dev/null || fail "conversation writes did not complete"
+[ "$(record "$head" plan.md)" = "root plan" ] \
+  || fail "root conversation file did not land"
 [ "$(record "$head" files/plan.md)" = "right place" ] \
   || fail "conversation-files write did not land"
 

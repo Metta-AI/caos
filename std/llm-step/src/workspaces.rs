@@ -1,15 +1,13 @@
 //! Agent workspace management shares the host's creation rules and atomic append.
 use super::*;
-use conversation_protocol::v3::WorkspaceBase;
 
 pub(super) fn declaration() -> Value {
-    json!({"name":"workspaces", "description":"List workspaces, create a separate change from a named workspace, remove one, or promote a completed subagent result into a visible workspace. New workspaces share the source repository. Choose mode=upstream for a new change excluding unfinished source edits, mode=stack to depend on the source with its own PR, or mode=copy to copy its current code without a dependency. Temporary subagent workspaces remain inside their child conversation until promoted. Never remove a workspace with useful unmerged work without the user's agreement.",
+    json!({"name":"workspaces", "description":"Browse and edit code commit references in the conversation tree. Names are paths, not registered workspace objects. Group a stack as feature/.base-url (repository URL and base branch on two lines), feature/00-base, numbered PR boundaries, and one feature/dirty. Edit dirty; move it to 01-description when ready for review, then copy that boundary to a new dirty for further work. Publishing uses numbered paths as branch names. Creating/copying/moving refs does not merge code: merge subagent changes before sealing boundaries.",
         "input_schema":{"type":"object","properties":{
-            "action":{"type":"string","enum":["list","create","remove","promote"]},
-            "name":{"type":"string","description":"Workspace to create or remove."},
-            "source":{"type":"string","description":"Source workspace name (required for create; child workspace for promote)."},
-            "mode":{"type":"string","enum":["upstream","stack","copy"]},
-            "child":{"type":"string","description":"Completed subagent ID to promote."}
+            "action":{"type":"string","enum":["list","create","move","remove","promote"]},
+            "name":{"type":"string","description":"Destination commit-entry path."},
+            "source":{"type":"string","description":"Source commit-entry path; child path for promote."},
+            "child":{"type":"string","description":"Completed subagent ID for promote."}
         },"required":["action"]}})
 }
 
@@ -22,7 +20,7 @@ pub(super) fn context(view: &Conversation<'_>, focus: Option<&str>) -> Result<St
             json!({"name":name,"head":ws.commit,"repository":config.repository(),"base":config.upstream}),
         );
     }
-    Ok(format!("\n\nWorkspaces: {}\nWorkspace selected when this request started: {}. UI selection changes do not change this request's target. Pass workspace explicitly to tools when there are multiple workspaces. Use workspaces to organize independent changes; use spawn_agent for temporary parallel work and promote only results that deserve separate review.", serde_json::to_string(&rows).map_err(|error| error.to_string())?, focus.unwrap_or("none")))
+    Ok(format!("\n\nWorkspaces: {}\nWorkspace selected when this request started: {}. UI selection changes do not change this request's target. Pass workspace explicitly to tools when there are multiple workspaces. Use commit-entry paths to organize code. Edit dirty and move it to a numbered boundary when ready for review. Use spawn_agent for parallel work; merge its result into dirty or copy it into a review boundary.", serde_json::to_string(&rows).map_err(|error| error.to_string())?, focus.unwrap_or("none")))
 }
 
 fn required<'a>(input: &'a Value, name: &str) -> Result<&'a str, String> {
@@ -63,47 +61,38 @@ pub(super) fn run(state: &mut progress::State, site: &CallSite<'_>) -> Result<()
 fn plan(
     view: &Conversation<'_>,
     input: &Value,
-    store: &dyn ObjectStore,
+    _store: &dyn ObjectStore,
 ) -> Result<(Vec<Transition>, String), String> {
     match required(input, "action")? {
         "list" => Ok((Vec::new(), context(view, None)?)),
-        "create" => {
+        "create" | "move" => {
             let name = required(input, "name")?;
             let source = required(input, "source")?;
-            let transitions = conversation_protocol::v3::workspaces::create_from_workspace(
-                view,
-                name,
-                source,
-                match input["mode"].as_str() {
-                    Some("upstream") => {
-                        conversation_protocol::v3::workspaces::Creation::FromUpstream
-                    }
-                    Some("stack") => conversation_protocol::v3::workspaces::Creation::Stack,
-                    Some("copy") => conversation_protocol::v3::workspaces::Creation::Copy,
-                    // Accept requests prepared by older workers.
-                    None if input["stacked"].as_bool().unwrap_or(false) => {
-                        conversation_protocol::v3::workspaces::Creation::Stack
-                    }
-                    None => conversation_protocol::v3::workspaces::Creation::FromUpstream,
-                    Some(mode) => return Err(format!("unknown workspace creation mode {mode:?}")),
-                },
-            )?;
+            paths::validate_workspace_name(name)?;
+            if view.snapshot().exists(name)? {
+                return Err("destination already exists".into());
+            }
+            let ws = view
+                .workspace(source)?
+                .ok_or("source is not a commit entry")?;
+            let mut files = Vec::new();
+            if input["action"] == "move" {
+                files.push((source.to_string(), None));
+            }
+            files.push((
+                name.to_string(),
+                Some((Mode::Commit, ws.commit.encode_line())),
+            ));
             Ok((
-                transitions,
-                format!("Created workspace {name:?} from {source:?}."),
+                vec![Transition::FilesApply { files }],
+                format!("Updated {name}."),
             ))
         }
         "remove" => {
             let name = required(input, "name")?;
-            let mut configs = view.workspace_configs()?;
-            configs
-                .remove(name)
-                .ok_or_else(|| format!("no workspace {name:?}"))?;
-            conversation_protocol::v3::workspace_order(&configs)?;
+            view.workspace(name)?.ok_or("no such commit entry")?;
             Ok((
-                vec![Transition::WorkspaceRemove {
-                    name: name.to_string(),
-                }],
+                vec![Transition::reference(name.to_string(), None)],
                 format!("Removed workspace {name:?}."),
             ))
         }
@@ -125,43 +114,12 @@ fn plan(
                 .as_ref()
                 .and_then(|items| items.get(source))
                 .ok_or("child has no such workspace")?;
-            let terminal = child
-                .terminal_head
-                .as_ref()
-                .ok_or("child is missing its terminal checkpoint")?;
-            let mut config = Conversation::open(store, terminal)?.workspace_config(source)?;
-            // Child-local dependency names do not identify workspaces in the parent.
-            if matches!(config.upstream, Some(WorkspaceBase::Workspace { .. })) {
-                config.upstream = None;
-            }
-            if child.spawn_intent.workspace_name.as_deref() == Some(source) {
-                if let Some(parent) = child.spawn_intent.workspace_name.as_deref() {
-                    if view.workspace(parent)?.is_some()
-                        && view.workspace_config(parent)?.repository() == config.repository()
-                    {
-                        config.upstream = child.initial_workspace.as_ref().map(|commit| {
-                            WorkspaceBase::Workspace {
-                                name: parent.to_string(),
-                                commit: commit.clone(),
-                            }
-                        });
-                    }
-                }
-            }
-            config.publication = None;
             Ok((
                 {
-                    let mut transitions = vec![Transition::WorkspaceCreate {
-                        name: name.to_string(),
-                        commit: ws.commit.clone(),
-                        origin: None,
-                    }];
-                    if config != Default::default() {
-                        transitions.push(Transition::WorkspaceConfigure {
-                            name: name.to_string(),
-                            config,
-                        });
-                    }
+                    let transitions = vec![Transition::reference(
+                        name.to_string(),
+                        Some(ws.commit.clone()),
+                    )];
                     transitions
                 },
                 format!(

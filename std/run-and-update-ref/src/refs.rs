@@ -91,15 +91,16 @@ fn terminal_facts(
         .workspaces()?
         .into_iter()
         .map(|(name, workspace)| {
-            (
+            let initial = conversation.reference_start(&name)?;
+            Ok((
                 name,
                 ChildWorkspace {
                     commit: workspace.commit,
-                    initial: workspace.initial,
+                    initial,
                 },
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     Ok((status, child_workspaces))
 }
 
@@ -115,12 +116,12 @@ fn append_child_terminal_with<S: RefStore>(
     child_workspaces: &BTreeMap<String, ChildWorkspace>,
 ) -> Result<(), String> {
     cas_append(store, refname, |store, head| {
-        let (head_tree, record) = {
+        let record = {
             let conversation = Conversation::open(store, head)?;
             let record = conversation
                 .child(child)?
                 .ok_or_else(|| format!("subagent {child} was never recorded on {refname}"))?;
-            (conversation.tree().clone(), record)
+            record
         };
         if record.request != *subrequest {
             return Err(format!(
@@ -144,15 +145,12 @@ fn append_child_terminal_with<S: RefStore>(
             ));
         }
 
-        Ok(Some((
-            head_tree,
-            Transition::SubagentTerminal {
-                child: child.to_string(),
-                terminal_head: terminal_head.clone(),
-                status,
-                child_workspaces: child_workspaces.clone(),
-            },
-        )))
+        Ok(Some(Transition::SubagentTerminal {
+            child: child.to_string(),
+            terminal_head: terminal_head.clone(),
+            status,
+            child_workspaces: child_workspaces.clone(),
+        }))
     })
 }
 
@@ -164,12 +162,12 @@ fn append_status_with<S: RefStore>(
     result: &Oid,
 ) -> Result<(), String> {
     cas_append(store, refname, |store, head| {
-        let (head_tree, record) = {
+        let record = {
             let conversation = Conversation::open(store, head)?;
             let record = conversation
                 .async_task(task)?
                 .ok_or_else(|| format!("task {task} was never recorded on {refname}"))?;
-            (conversation.tree().clone(), record)
+            record
         };
 
         if record.status != TaskStatus::Pending {
@@ -182,33 +180,30 @@ fn append_status_with<S: RefStore>(
             ));
         }
 
-        Ok(Some((
-            head_tree,
-            Transition::AsyncTerminal {
-                task: task.clone(),
-                status,
-                result: Some(result.clone()),
-                reason: None,
-            },
-        )))
+        Ok(Some(Transition::AsyncTerminal {
+            task: task.clone(),
+            status,
+            result: Some(result.clone()),
+            reason: None,
+        }))
     })
 }
 
 fn cas_append<S: RefStore>(
     store: &mut S,
     refname: &str,
-    mut build: impl FnMut(&mut S, &Oid) -> Result<Option<(Oid, Transition)>, String>,
+    mut build: impl FnMut(&mut S, &Oid) -> Result<Option<Transition>, String>,
 ) -> Result<(), String> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let head = store
             .fetch_head(refname)?
             .ok_or_else(|| format!("target conversation ref {refname} does not exist"))?;
-        let Some((head_tree, transition)) = build(store, &head)? else {
+        let Some(transition) = build(store, &head)? else {
             return Ok(());
         };
-        let applied = apply(store, Some(&head_tree), &transition)?;
+        let applied = apply(store, Some(&head), &transition)?;
         let signature = inherited_signature(store, &head)?;
-        let candidate = mint(store, &head, &applied.tree, transition.kind(), &signature)?;
+        let candidate = mint(store, &head, &applied, transition.kind(), &signature)?;
         let update = RefUpdate {
             refname: refname.to_string(),
             expected: Some(head.clone()),
@@ -334,13 +329,12 @@ mod tests {
                         return Err("test lease mismatch".to_string());
                     }
                     self.head = Some(new.clone());
-                    let tree = self.read_commit(&new).map_err(String::from)?.tree;
                     let transition = Transition::TitleSet {
                         title: "Advanced after accepted push".to_string(),
                     };
-                    let applied = apply(self, Some(&tree), &transition)?;
+                    let applied = apply(self, Some(&new), &transition)?;
                     let signature = inherited_signature(self, &new)?;
-                    let advanced = mint(self, &new, &applied.tree, transition.kind(), &signature)?;
+                    let advanced = mint(self, &new, &applied, transition.kind(), &signature)?;
                     self.head = Some(advanced);
                     Err("injected lost response".to_string())
                 }
@@ -378,16 +372,8 @@ mod tests {
     }
 
     fn commit_transition(store: &mut MemoryStore, parent: &Oid, transition: &Transition) -> Oid {
-        let parent_tree = store.read_commit(parent).unwrap().tree;
-        let applied = apply(store, Some(&parent_tree), transition).unwrap();
-        mint(
-            store,
-            parent,
-            &applied.tree,
-            transition.kind(),
-            &signature(),
-        )
-        .unwrap()
+        let applied = apply(store, Some(parent), transition).unwrap();
+        mint(store, parent, &applied, transition.kind(), &signature()).unwrap()
     }
 
     fn conversation(with_task: bool) -> (FakeStore, String, Oid) {
@@ -406,14 +392,7 @@ mod tests {
             files_seed: None,
         };
         let applied = apply(&mut objects, None, &root).unwrap();
-        let mut head = mint(
-            &mut objects,
-            &genesis,
-            &applied.tree,
-            root.kind(),
-            &signature(),
-        )
-        .unwrap();
+        let mut head = mint(&mut objects, &genesis, &applied, root.kind(), &signature()).unwrap();
         if with_task {
             head = commit_transition(
                 &mut objects,
@@ -453,18 +432,11 @@ mod tests {
                 owner: None,
             },
             title: "Child".to_string(),
-            workspaces: BTreeMap::from([("main".to_string(), (oid('a'), None))]),
+            workspaces: BTreeMap::from([("main".to_string(), oid('a'))]),
             files_seed: None,
         };
         let applied = apply(&mut store, None, &root).unwrap();
-        let mut head = mint(
-            &mut store,
-            &genesis,
-            &applied.tree,
-            root.kind(),
-            &signature(),
-        )
-        .unwrap();
+        let mut head = mint(&mut store, &genesis, &applied, root.kind(), &signature()).unwrap();
         head = commit_transition(
             &mut store,
             &head,
@@ -487,10 +459,7 @@ mod tests {
             },
         );
         let request = oid('7');
-        let request_workspaces = Conversation::open(&store, &head)
-            .unwrap()
-            .workspaces_tree()
-            .unwrap();
+
         head = commit_transition(
             &mut store,
             &head,
@@ -498,7 +467,6 @@ mod tests {
                 record: TurnRecord {
                     id: request.clone(),
                     request_head: head.clone(),
-                    request_workspaces,
                     model: "model".to_string(),
                     configuration: "configuration".to_string(),
                     round: 0,

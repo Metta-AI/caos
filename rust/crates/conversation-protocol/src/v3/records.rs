@@ -96,7 +96,6 @@ mod arguments_path {
 pub(crate) trait Record: Sized {
     fn to_value(&self) -> Value;
     fn from_value(value: &Value) -> Result<Self, String>;
-    fn parse_record(bytes: &[u8]) -> Result<Self, String>;
 }
 
 macro_rules! impl_record {
@@ -129,10 +128,6 @@ macro_rules! impl_record {
 
             fn from_value(value: &Value) -> Result<Self, String> {
                 <$type>::from_value(value)
-            }
-
-            fn parse_record(bytes: &[u8]) -> Result<Self, String> {
-                Self::parse(bytes)
             }
         }
     };
@@ -213,23 +208,20 @@ impl From<Identity> for RawIdentity {
 }
 
 impl_record!(Identity, validate);
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceOrigin {
-    pub source: String,
-    pub source_tree: Oid,
+impl Identity {
+    pub fn content_bytes(&self) -> Vec<u8> {
+        let mut value = self.to_value();
+        let object = value.as_object_mut().expect("identity object");
+        object.remove("kind");
+        object.remove("source");
+        encode_record(value)
+    }
 }
-
-impl_record!(WorkspaceOrigin);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceRecord {
     pub commit: Oid,
-    pub initial: Oid,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    pub origin: Option<WorkspaceOrigin>,
 }
 
 impl_record!(WorkspaceRecord);
@@ -416,7 +408,6 @@ pub enum TurnOutcome {
 pub struct TurnRecord {
     pub id: Oid,
     pub request_head: Oid,
-    pub request_workspaces: Option<Oid>,
     pub model: String,
     pub configuration: String,
     pub round: u64,
@@ -433,8 +424,6 @@ pub struct TurnRecord {
 struct RawTurnRecord {
     id: Oid,
     request_head: Oid,
-    #[serde(deserialize_with = "nullable")]
-    request_workspaces: Option<Oid>,
     model: String,
     configuration: String,
     round: u64,
@@ -495,7 +484,6 @@ impl TryFrom<RawTurnRecord> for TurnRecord {
         let record = TurnRecord {
             id: raw.id,
             request_head: raw.request_head,
-            request_workspaces: raw.request_workspaces,
             model: raw.model,
             configuration: raw.configuration,
             round: raw.round,
@@ -524,7 +512,6 @@ impl From<TurnRecord> for RawTurnRecord {
         RawTurnRecord {
             id: record.id,
             request_head: record.request_head,
-            request_workspaces: record.request_workspaces,
             model: record.model,
             configuration: record.configuration,
             round: record.round,
@@ -1357,10 +1344,6 @@ mod tests {
             round: 3,
             tool: "tool".to_string(),
         };
-        let origin = WorkspaceOrigin {
-            source: "repo".to_string(),
-            source_tree: oid('d'),
-        };
         let merged = MergeInfo {
             base: oid('a'),
             ours: oid('b'),
@@ -1372,7 +1355,6 @@ mod tests {
         let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "configuration-hash".to_string(),
             round: 0,
@@ -1463,13 +1445,7 @@ mod tests {
                 owner: Some(owner),
             }
             .encode(),
-            origin.clone().encode(),
-            WorkspaceRecord {
-                commit: oid('a'),
-                initial: oid('b'),
-                origin: Some(origin),
-            }
-            .encode(),
+            WorkspaceRecord { commit: oid('a') }.encode(),
             Block::ToolUse {
                 id: "tool-1".to_string(),
                 name: "shell".to_string(),
@@ -1523,7 +1499,7 @@ mod tests {
             .encode(),
             publication.encode(),
         ];
-        const EXPECTED: [&str; 22] = [
+        const EXPECTED: [&str; 21] = [
             concat!(
                 r#"{"parent":"parent","parent_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":3,"tool":"tool"}"#,
                 "\n"
@@ -1533,11 +1509,7 @@ mod tests {
                 "\n"
             ),
             concat!(
-                r#"{"source":"repo","source_tree":"dddddddddddddddddddddddddddddddddddddddd"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","initial":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","origin":{"source":"repo","source_tree":"dddddddddddddddddddddddddddddddddddddddd"}}"#,
+                r#"{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
                 "\n"
             ),
             concat!(
@@ -1562,7 +1534,7 @@ mod tests {
             ),
             concat!(r#"{"id":"tool-1","name":"shell"}"#, "\n"),
             concat!(
-                r#"{"calls":[{"id":"tool-1","name":"shell"}],"configuration":"configuration-hash","escape_reason":"stop","id":"1111111111111111111111111111111111111111","interjections":["note"],"interrupted":true,"model":"model","request_head":"2222222222222222222222222222222222222222","request_workspaces":null,"result":".caos/requests/result","round":0,"status":"idle"}"#,
+                r#"{"calls":[{"id":"tool-1","name":"shell"}],"configuration":"configuration-hash","escape_reason":"stop","id":"1111111111111111111111111111111111111111","interjections":["note"],"interrupted":true,"model":"model","request_head":"2222222222222222222222222222222222222222","result":".caos/requests/result","round":0,"status":"idle"}"#,
                 "\n"
             ),
             concat!(
@@ -1642,19 +1614,7 @@ mod tests {
                 owner: None,
             }
         );
-        let origin = WorkspaceOrigin {
-            source: "repo".to_string(),
-            source_tree: oid('d'),
-        };
-        round_trip!(WorkspaceOrigin, origin.clone());
-        round_trip!(
-            WorkspaceRecord,
-            WorkspaceRecord {
-                commit: oid('a'),
-                initial: oid('b'),
-                origin: Some(origin),
-            }
-        );
+        round_trip!(WorkspaceRecord, WorkspaceRecord { commit: oid('a') });
         for block in [
             Block::Text {
                 text: "hello".to_string(),
@@ -1785,7 +1745,6 @@ mod tests {
         let base = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "configuration-hash".to_string(),
             round: 0,
@@ -1849,7 +1808,6 @@ mod tests {
         let mut request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "opaque value that is not a tree path".to_string(),
             round: 0,
@@ -1870,7 +1828,6 @@ mod tests {
         let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "configuration-hash".to_string(),
             round: 0,
@@ -1910,10 +1867,6 @@ mod tests {
             round: 0,
             tool: "tool".to_string(),
         };
-        let origin = WorkspaceOrigin {
-            source: "repo".to_string(),
-            source_tree: oid('a'),
-        };
         let merge = MergeInfo {
             base: oid('a'),
             ours: oid('b'),
@@ -1925,7 +1878,6 @@ mod tests {
         let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "configuration".to_string(),
             round: 0,
@@ -1980,15 +1932,7 @@ mod tests {
                 owner: Some(owner),
             }
         );
-        rejects_unknown!(WorkspaceOrigin, origin.clone());
-        rejects_unknown!(
-            WorkspaceRecord,
-            WorkspaceRecord {
-                commit: oid('a'),
-                initial: oid('b'),
-                origin: Some(origin),
-            }
-        );
+        rejects_unknown!(WorkspaceRecord, WorkspaceRecord { commit: oid('a') });
         rejects_unknown!(
             Block,
             Block::Text {
@@ -2129,7 +2073,6 @@ mod tests {
         let queued = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
-            request_workspaces: None,
             model: "model".to_string(),
             configuration: "configuration".to_string(),
             round: 0,
@@ -2223,7 +2166,6 @@ mod tests {
             },
             "current"
         );
-        rejects_missing!(TurnRecord, queued.clone(), "request_workspaces");
         rejects_missing!(
             TurnRecord,
             TurnRecord {

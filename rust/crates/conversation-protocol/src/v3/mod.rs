@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod canonical;
+pub mod events;
 #[cfg(any(test, feature = "memory-store"))]
 pub mod fixtures;
 #[cfg(feature = "git-cli")]
@@ -31,4 +32,7 @@ pub use tree::{
     CommitInfo, Mode, ObjectStore, Signature, Snapshot, StoreError, TreeBuilder, TreeEntry,
 };
 pub use validate::{validate_commit, validate_spine, Validated};
-pub use workspaces::{workspace_order, PublicationDestination, WorkspaceBase, WorkspaceConfig};
+pub use workspaces::{PublicationDestination, WorkspaceBase, WorkspaceConfig};
+
+#[cfg(test)]
+mod content_tests;

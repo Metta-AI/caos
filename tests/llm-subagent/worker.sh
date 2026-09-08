@@ -48,7 +48,7 @@ for request_number in 2 3 4 5; do
     "/tmp/stub/request-$request_number.json" >/dev/null; then
     if [ "$child_write_sent" -eq 0 ]; then
       printf '%s\n' \
-        '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","file-path":"child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+        '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","workspace":"main","file-path":"child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
         > "/tmp/stub/response-$request_number.json"
       child_write_sent=1
     else
@@ -223,7 +223,6 @@ printf '{"content":[{"id":"toolu_promote","input":{"action":"promote","child":"%
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
 [ "$(workspace_commit "$head2" review)" = "$child_main" ] || fail "promotion did not retain the completed child's snapshot"
-record "$head2" .caos/workspaces/review/config.json | jq -e --arg commit "$parent_main" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "promotion lost the child upstream or inherited publication settings"
 parent_after=$(workspace_commit "$head2")
 [ "$parent_after" != "$parent_main" ] || fail "harvest did not move parent main"
 fetch_code "$parent_after" "fetching harvested parent workspace"
@@ -241,24 +240,24 @@ spawn_count=0
 terminal_count=0
 apply_count=0
 harvest_complete_count=0
-while read -r _ kind harvest_present; do
+while read -r oid kind; do
   case "$kind" in
     subagent.spawn) spawn_count=$((spawn_count + 1)) ;;
     subagent.terminal) terminal_count=$((terminal_count + 1)) ;;
     subagent.apply) apply_count=$((apply_count + 1)) ;;
     tool.complete)
-      if [ "$harvest_present" = true ]; then
+      if git show -s --format=%b "$oid" | jq -e --arg request "$request2" \
+          '.events[] | select(.event == "tool" and .value.request == $request and .value.id == "toolu_harvest")' >/dev/null; then
         harvest_complete_count=$((harvest_complete_count + 1))
       fi
       ;;
-    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start|workspace.create|workspace.configure) ;;
+    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start|files.apply) ;;
     *) fail "unexpected parent event $kind while child ran" ;;
   esac
 done < <($TOOL parents --repo /tmp/repo --head "$head2" \
-    --present-path ".caos/tools/$request2/0000/toolu_harvest.json" \
-  | while read -r oid kind harvest_present; do
+  | while read -r oid kind; do
       if [ "$oid" = "$pre_spawn" ]; then break; fi
-      printf '%s %s %s\n' "$oid" "$kind" "$harvest_present"
+      printf '%s %s\n' "$oid" "$kind"
     done)
 [ "$spawn_count" -eq 1 ] || fail "parent has $spawn_count spawn commits"
 [ "$terminal_count" -eq 1 ] || fail "parent has $terminal_count terminal commits"

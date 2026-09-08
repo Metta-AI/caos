@@ -11,6 +11,7 @@ pub(crate) struct Args {
     pub(crate) new_conversation: bool,
     pub(crate) from_commit: Option<String>,
     pub(crate) empty: bool,
+    pub(crate) import: Option<String>,
     pub(crate) harness: Option<String>,
     pub(crate) server: Option<String>,
     pub(crate) turn: TurnOptions,
@@ -56,6 +57,7 @@ impl Args {
                     parsed.empty = true;
                     parsed.new_conversation = true;
                 }
+                "--import" => parsed.import = Some(value(&mut args, arg)?),
                 "--harness" => parsed.harness = Some(value(&mut args, arg)?),
                 "--server" => parsed.server = Some(value(&mut args, arg)?),
                 "--from" => parsed.from_commit = Some(value(&mut args, arg)?),
@@ -120,7 +122,7 @@ impl Args {
 
 pub(crate) fn usage() -> String {
     "usage: caos tui [--username <name>] [--list-archived | --unarchive <conversation-id>] \
-     [--new | --from <commit> | --empty] [--base <revspec>] [--server <url>] [--harness <path>] \
+     [--new | --from <commit> | --empty] [--import <path>] [--base <revspec>] [--server <url>] [--harness <path>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
         .to_string()
 }

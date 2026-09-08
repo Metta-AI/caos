@@ -82,8 +82,8 @@ done
 [ "$(git rev-parse "$completion_head^1")" = "$head1" ] \
   || fail "completion did not append to the idle head"
 changed=$(git diff-tree --no-commit-id --name-only -r "$head1" "$completion_head")
-[ "$changed" = ".caos/async/$task.json" ] \
-  || fail "completion changed more than its async record: $changed"
+[ -z "$changed" ] \
+  || fail "event-only completion changed content: $changed"
 [ "$(workspace_commit "$completion_head")" = "$workspace1" ] \
   || fail "completion changed main"
 $TOOL async --repo /tmp/repo --head "$completion_head" --task "$task" > /tmp/async.complete

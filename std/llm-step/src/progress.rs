@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Applied, Transition};
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::tree::encode_commit_bytes;
 use conversation_protocol::v3::view::Conversation;
@@ -153,18 +153,16 @@ impl State<GitStore> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
         let kind = transition.kind();
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        if ordinal.is_some() {
+        let applied = apply(&mut self.store, Some(expected), &transition)?;
+        if applied.ordinal.is_some() {
             return Err("subagent.spawn unexpectedly appended a transcript entry".to_string());
         }
         let signature = inherited_signature(&self.store, expected)?;
         let candidate = mint(
             &mut self.store,
             expected,
-            &tree,
+            &applied,
             transition.kind(),
             &signature,
         )?;
@@ -376,12 +374,12 @@ impl<S: RefStore> State<S> {
         for transition in transitions {
             let parent = self.store.read_commit(&candidate).map_err(String::from)?;
             let transition = retarget_transcript_transition(&self.store, &parent.tree, transition)?;
-            let applied = apply(&mut self.store, Some(&parent.tree), &transition)?;
+            let applied = apply(&mut self.store, Some(&candidate), &transition)?;
             let signature = inherited_signature(&self.store, &candidate)?;
             candidate = mint(
                 &mut self.store,
                 &candidate,
-                &applied.tree,
+                &applied,
                 transition.kind(),
                 &signature,
             )?;
@@ -644,10 +642,9 @@ mod tests {
         parent: &Oid,
         transition: Transition,
     ) -> Result<Oid, String> {
-        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
-        let applied = apply(store, Some(&parent_tree), &transition)?;
+        let applied = apply(store, Some(parent), &transition)?;
         let signature = inherited_signature(store, parent)?;
-        mint(store, parent, &applied.tree, transition.kind(), &signature)
+        mint(store, parent, &applied, transition.kind(), &signature)
     }
 
     fn root(store: &mut MemoryStore) -> Result<Oid, String> {
@@ -666,7 +663,7 @@ mod tests {
         mint(
             store,
             &genesis,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("test", "test@example.invalid", 1),
         )

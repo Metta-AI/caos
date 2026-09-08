@@ -1,42 +1,38 @@
-Add an --uppercase option to this tiny greeting command and organize the work
-as two reviewable changes using subagents and workspaces.
+Add an --uppercase option to this greeting command and organize the work as
+two reviewable changes using subagents.
 
-Start by confirming that the selected workspace is named main. Then:
+Start with feature/dirty. Confirm feature/.base-url names the destination and
+feature/00-base records its incorporated base. Code references are paths in
+the conversation tree, not registered workspace objects.
 
-1. Spawn two subagents from workspace main before waiting for either:
+1. Spawn two subagents from feature/dirty before waiting for either:
    - Code agent: edit only greet.sh. Support an optional leading --uppercase
-     flag, followed by an optional name. Keep "Hello, world!" as the default.
-     "bash greet.sh --uppercase Ada" must print "HELLO, ADA!".
-     "--uppercase" without a name must print "HELLO, WORLD!".
-     Reject unknown options and extra arguments with a nonzero exit status.
+     flag followed by an optional name. The default is "Hello, world!".
+     Uppercase Ada prints "HELLO, ADA!"; uppercase without a name prints
+     "HELLO, WORLD!". Reject unknown options and extra arguments.
      Use Bash only and preserve executable permissions.
-   - Documentation agent: edit only README.md. Document the same interface,
-     with examples for the default, a named greeting, and uppercase mode.
-     Do not change implementation files or add tests.
+   - Documentation agent: edit only README.md. Document the same interface
+     with examples. Do not change implementation files or add tests.
 
-2. Wait for both agents. Review their results and use harvest_agent to apply
-   each result to workspace main. Resolve any conflicts, check the documented
-   examples, and keep code plus documentation together in this workspace.
-   Do not promote either of these first two children.
+2. Wait for both agents. Review and harvest both results into feature/dirty.
+   Resolve conflicts and check the documented examples. With the workspaces
+   tool, move feature/dirty to feature/01-uppercase. This names a PR boundary
+   without changing or squashing its code commit.
 
-3. Spawn a third subagent from the updated main workspace:
-   - Test agent: add only test.sh, using Bash with no dependencies. Test the
-     default greeting, a named greeting, uppercase with and without a name,
-     unknown-option rejection, and extra-argument rejection. Run the tests.
-     Do not change greet.sh or README.md; report a defect if tests expose one.
+3. Create feature/dirty by copying feature/01-uppercase. Spawn a test subagent
+   from feature/dirty: add only test.sh using Bash with no dependencies. Cover
+   the default and named greeting, uppercase with and without a name, and
+   rejection of unknown options and extra arguments. Run the tests. Report
+   defects rather than changing greet.sh or README.md.
 
-4. Wait for the test agent and review its result. Promote its main workspace
-   into a parent-conversation workspace named checks using the workspaces tool
-   (action=promote, name=checks, child=<test agent ID>, source=main).
-   Do not harvest this child's changes into main. Promotion should make checks
-   depend on main at the commit from which that child started.
+4. Review and harvest the test result into feature/dirty, then move that
+   reference to feature/02-checks. The second boundary must descend from the
+   first in actual Git history; naming it does not perform that integration.
 
-5. Verify the final organization:
-   - main contains the feature and its documentation, with no test.sh.
-   - checks contains that same feature plus test.sh, and its upstream is main.
-   - Both workspaces retain the original GitHub repository as their destination.
-   Run the relevant checks in each workspace. Do not modify files merely to
-   create additional commits.
+5. Verify feature/01-uppercase contains code and docs without test.sh, and
+   feature/02-checks contains both plus passing tests. Keep .base-url and
+   00-base unchanged. Do not create unnecessary commits.
 
-Stop and summarize the two proposed PRs and validation results.
-Do not publish or merge anything; I will open the publication preview myself.
+Stop and summarize the two proposed PRs and validation. Do not publish or merge;
+I will open Ctrl+P to review feature/01-uppercase -> the external base and
+feature/02-checks -> feature/01-uppercase.

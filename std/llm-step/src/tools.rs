@@ -39,22 +39,22 @@ pub fn is_inline(name: &str) -> bool {
 /// then dashed `@param` tags. They are parsed by the same `parse_help` the tree
 /// tools use, so a built-in and a project tool are described one way — the docs
 /// live with the tool, not inside a hand-written JSON schema.
-const READ_HELP: &str = "Read a file's contents. Defaults to the current workspace; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
-@param [file-path] Workspace-relative path (the workspace root is the repo root).
+const READ_HELP: &str = "Read a file's contents. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit workspace they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
+@param [file-path] Conversation path, such as feature/dirty/README.md; code-relative when workspace is explicit.
 @param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current workspace.
 @param [offset] 1-based first line to return.
 @param [limit] Number of lines to return.";
 
-const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Defaults to the current workspace; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
-@param [path] Directory to list (relative to `root`, or to the workspace root); omit for the root itself.
+const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit workspace they are relative to its code tree; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
+@param [path] Directory to list (relative to `root`, or to the conversation root unless workspace is explicit); omit for the root itself.
 @param [root] Optional commit or tree hash to list as of another revision. Omit for the current workspace.";
 
-const WRITE_HELP: &str = "Write a file into the workspace (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
-@param file-path Workspace-relative path (the workspace root is the repo root).
+const WRITE_HELP: &str = "Write a file at a conversation path or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
+@param file-path Conversation path, such as feature/dirty/README.md; code-relative when workspace is explicit.
 @param content The full new file content.";
 
-const EDIT_HELP: &str = "Replace text in a workspace file. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
-@param file-path Workspace-relative path (the workspace root is the repo root).
+const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code reference. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
+@param file-path Conversation path, such as feature/dirty/README.md; code-relative when workspace is explicit.
 @param old-string Exact text to replace.
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";

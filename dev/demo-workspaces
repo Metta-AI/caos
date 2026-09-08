@@ -51,69 +51,48 @@ git -C "$demo/docs" add README.md
 git -C "$demo/docs" commit -qm "Start demo docs"
 
 cat > "$demo/commands.txt" <<EOF
-/workspace create fresh
-/workspace use main
-/workspace copy copied
-/workspace use main
-/workspace stack followup
-/workspace attach docs $demo/docs main
-/workspace use main
 /workspace
+/workspace use feature/dirty
+/workspace seal 01-feature
+/workspace use feature/01-feature
+/workspace create feature/dirty
+/workspace attach docs $demo/docs main
+/workspace use feature/dirty
+/workspace list
 EOF
 
 cat > "$demo/WALKTHROUGH.md" <<EOF
 # Workspace walkthrough
 
-Start with ./launch from this directory. The TUI starts main at the app checkout,
-which contains feature.txt on top of its upstream main branch.
-It asks for an Anthropic key if none is configured; the workspace commands below
-do not call the model. Paste one command at a time and wait for it to finish.
-Ctrl+S sends a command; Enter inserts a newline. Keep this file open in another terminal.
+Start ./launch. It explicitly imports the app's committed snapshot at
+feature/dirty; feature/00-base records its incorporated main base, and
+feature/.base-url contains the repository URL and main on separate lines.
+The checkout's uncommitted changes are not imported.
+
+Ctrl+S sends a command; Enter inserts a newline. Paste these one at a time:
 
 $(cat "$demo/commands.txt")
 
-The last command opens the workspace picker. Expected state:
+Sealing renames dirty to a numbered boundary at the same code commit. Creating
+feature/dirty copies that boundary, ready for the next change. Attaching docs
+creates its own directory with .base-url, 00-base and dirty. No workspace
+registry or dependency graph is stored.
 
-| Workspace | Current commit | Upstream |
-| --- | --- | --- |
-| main | $feature | app repository, main |
-| fresh | $base | app repository, main |
-| copied | $feature | app repository, main |
-| followup | $feature | workspace main |
-| docs | its own initial commit | docs repository, main |
+In another terminal run ./advance-upstream, then /workspace update feature.
+All feature boundaries and dirty incorporate upstream.txt together; the update
+leaves everything unchanged if a conflict prevents it from completing.
 
-Create starts a separate change from upstream. Copy includes feature.txt but
-retains the repository upstream. Stack includes feature.txt and follows the main workspace.
-The source locator stays pinned; these operations choose no publication branch.
-Escape closes the picker. Ctrl+O reopens it; Ctrl+Q quits the TUI.
+Select feature/01-feature and press Ctrl+P to preview its PR branch and base.
+These local repositories have no GitHub PR destination; use an attached GitHub
+repository for actual publication. Escape cancels the preview.
 
-## Update upstream
-
-In another terminal, run ./advance-upstream from this directory. It commits a
-new file on the app repository's main branch. Then in the TUI:
-
-/workspace update --all
-/workspace
-
-The app workspaces now include upstream.txt, and feature.txt stays in main,
-copied, and followup. The docs workspace is unchanged. An update with no new
-upstream commits is a no-op.
-
-## Preview publication
-
-Ctrl+P opens the publication preview. Inspect the workspace selection, destination
-branches, and the followup PR's dependency on main, then Escape to close it.
-These fixtures are local repositories, so they have no GitHub PR destination.
-Use an attached GitHub repository when you want to try actual PR publication.
-
-Each invocation of dev/demo-workspaces creates fresh fixtures. This directory
-is yours to edit; it does not modify the CAOS checkout or publish anything.
+This script creates fresh fixtures and does not send agent messages or publish.
 EOF
 
 {
   printf '#!/usr/bin/env bash\nset -euo pipefail\n'
   printf 'cd %q\n' "$demo/app"
-  printf 'exec %q tui --new "$@"\n' "$cli"
+  printf 'exec %q tui --new --import feature "$@"\n' "$cli"
 } > "$demo/launch"
 
 {

@@ -1,8 +1,8 @@
-//! Host operations on named workspaces. Settings and code move through the same lease.
+//! Host conveniences for ordinary code references and stack directories.
 use super::*;
-use conversation_protocol::v3::workspaces::{source_locator, validate_repository, validate_source};
-pub use conversation_protocol::v3::workspaces::{Creation, PublicationBase};
-use conversation_protocol::v3::PublicationDestination;
+pub use conversation_protocol::v3::workspaces::PublicationBase;
+use conversation_protocol::v3::workspaces::{validate_repository, validate_source};
+use conversation_protocol::v3::Mode;
 use conversation_protocol::v3::WorkspaceConfig;
 
 /// Resolve checkout defaults once, when code is attached to a conversation.
@@ -23,10 +23,7 @@ pub fn checkout_config(t: &GitTransport, commit: &str) -> Result<WorkspaceConfig
     } else {
         repository
     };
-    let mut config = WorkspaceConfig {
-        source: Some(source_locator(&repository, &oid(commit, "source commit")?)?),
-        ..Default::default()
-    };
+    let mut config = WorkspaceConfig::default();
     let mut candidates = Vec::new();
     if let Ok(reference) = t.git_capture(
         &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
@@ -92,38 +89,11 @@ pub fn config_at_commit(
     Ok(config)
 }
 
-pub fn configure(
-    t: &GitTransport,
-    id: &str,
-    name: &str,
-    config: WorkspaceConfig,
-) -> Result<String, String> {
-    let refname = refs::head_ref(id)?;
-    let mut preimage = None;
-    append_transition(t, id, &refname, "configuring a workspace", |store, head| {
-        let current = Conversation::open(store, head)?.workspace_config(name)?;
-        if current == config {
-            return Ok(Step::Done(head.to_string()));
-        }
-        if preimage.as_ref().is_some_and(|before| before != &current) {
-            return Err(format!(
-                "workspace {name:?} settings changed; reload before editing them"
-            ));
-        }
-        preimage = Some(current);
-        Ok(Step::Mint(Transition::WorkspaceConfigure {
-            name: name.to_string(),
-            config: config.clone(),
-        }))
-    })
-}
-
 pub fn create_from_workspace(
     t: &GitTransport,
     id: &str,
     name: &str,
     source: &str,
-    creation: Creation,
 ) -> Result<String, String> {
     let store = open_store(t)?;
     let (refname, head) =
@@ -133,7 +103,6 @@ pub fn create_from_workspace(
         &Conversation::open(&store, &head)?,
         name,
         source,
-        creation,
     )?;
     append_transition(t, id, &refname, "creating a workspace", |store, head| {
         let view = Conversation::open(store, head)?;
@@ -155,7 +124,7 @@ pub struct PublicationTarget {
     pub diagnostic: Option<String>,
 }
 
-pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<String, String> {
+pub fn repository_url(_t: &GitTransport, config: &WorkspaceConfig) -> Result<String, String> {
     let repository = match config
         .publication
         .as_ref()
@@ -163,48 +132,20 @@ pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<Stri
         .or_else(|| config.repository())
     {
         Some(repository) => repository.clone(),
-        None => default_repository(t)?,
+        None => return Err("add a .base-url file beside this reference before publishing".into()),
     };
     validate_repository(&repository)?;
     Ok(repository)
 }
 
-fn default_repository(t: &GitTransport) -> Result<String, String> {
-    let checkout = git_config_value(t, "caos.checkout");
-    let source = checkout.as_ref().map(GitTransport::discover).transpose()?;
-    Ok(source
-        .as_ref()
-        .unwrap_or(t)
-        .git_capture(&["remote", "get-url", "origin"], None)?
-        .trim()
-        .to_string())
-}
-
-pub(super) use conversation_protocol::v3::workspaces::default_publication_branch as generated_branch;
-
 pub(super) fn publication_branch(
-    view: &Conversation<'_>,
-    id: &str,
+    _view: &Conversation<'_>,
+    _id: &str,
     name: &str,
-    repository: &str,
+    _repository: &str,
 ) -> Result<String, String> {
-    if let Some(destination) = view.workspace_config(name)?.publication {
-        return Ok(destination.branch);
-    }
-    if matches!(view.identity()?.kind, IdentityKind::Fork { .. }) {
-        return Ok(generated_branch(id, name, view.workspace_names()?.len()));
-    }
-    let prior = view
-        .publications()?
-        .into_iter()
-        .filter(|record| record.workspace_name == name && record.repository == repository)
-        .map(|record| record.refname.trim_start_matches("refs/heads/").to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    match prior.len() {
-        1 => Ok(prior.into_iter().next().unwrap()),
-        0 => Ok(generated_branch(id, name, view.workspace_names()?.len())) ,
-        _ => Err(format!("workspace {name:?} has several published branches; choose its publication branch explicitly")),
-    }
+    conversation_protocol::v3::workspaces::validate_branch(name)?;
+    Ok(name.to_string())
 }
 
 pub fn default_branch(t: &GitTransport, repository: &str) -> Result<String, String> {
@@ -239,9 +180,11 @@ pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTar
     let view = Conversation::open(&store, &head)?;
     view.workspace_configs()?
         .into_iter()
+        .filter(|(name, _)| {
+            conversation_protocol::v3::workspaces::is_boundary(name.rsplit('/').next().unwrap())
+        })
         .map(|(name, config)| {
-            // Legacy missing destinations remain editable rows. Remote availability
-            // and default branches are checked only for the selected execution plan.
+            // Invalid directory conventions are diagnostics, never stored settings.
             let mut diagnostic = None;
             let repository = repository_url(t, &config).unwrap_or_else(|error| {
                 diagnostic = Some(error);
@@ -294,29 +237,6 @@ pub struct ResolvedPublicationTarget {
 /// Order only the selected workspaces. An excluded parent may already be
 /// published; execution verifies that its published tip matches its code head.
 pub fn publication_order(plan: &[PublicationTarget]) -> Result<Vec<String>, String> {
-    fn visit(
-        name: &str,
-        targets: &BTreeMap<&str, &PublicationTarget>,
-        visiting: &mut HashSet<String>,
-        done: &mut HashSet<String>,
-        ordered: &mut Vec<String>,
-    ) -> Result<(), String> {
-        if done.contains(name) {
-            return Ok(());
-        }
-        if !visiting.insert(name.into()) {
-            return Err(format!("workspace base cycle at {name:?}"));
-        }
-        if let Some(parent) = targets[name].base.parent() {
-            if targets.contains_key(parent) {
-                visit(parent, targets, visiting, done, ordered)?;
-            }
-        }
-        visiting.remove(name);
-        done.insert(name.into());
-        ordered.push(name.into());
-        Ok(())
-    }
     let mut destinations = HashSet::new();
     let mut targets = BTreeMap::new();
     for target in plan {
@@ -342,13 +262,8 @@ pub fn publication_order(plan: &[PublicationTarget]) -> Result<Vec<String>, Stri
             return Err(format!("duplicate workspace {:?}", target.workspace));
         }
     }
-    let mut ordered = Vec::new();
-    let mut visiting = HashSet::new();
-    let mut done = HashSet::new();
-    for name in targets.keys() {
-        visit(name, &targets, &mut visiting, &mut done, &mut ordered)?;
-    }
-    Ok(ordered)
+    // Paths in a directory already define the only supported stack order.
+    Ok(targets.keys().map(|name| name.to_string()).collect())
 }
 
 pub fn resolve_publication_plan(
@@ -365,27 +280,6 @@ pub fn resolve_publication_plan(
                 .find(|target| target.workspace == name)
                 .unwrap()
                 .clone();
-            let mut seen = HashSet::new();
-            let mut cursor = &target;
-            loop {
-                if !seen.insert(cursor.workspace.clone()) {
-                    return Err(format!("workspace base cycle at {:?}", cursor.workspace));
-                }
-                let Some(parent) = cursor.base.parent() else {
-                    break;
-                };
-                cursor = all
-                    .iter()
-                    .find(|candidate| candidate.workspace == parent)
-                    .ok_or_else(|| format!("unknown base workspace {parent:?}"))?;
-                if normalize_repository_identity(&cursor.repository)?
-                    != normalize_repository_identity(&target.repository)?
-                {
-                    return Err(format!(
-                        "workspace {name:?} and its base belong to different repositories"
-                    ));
-                }
-            }
             let base_branch = match &target.base {
                 PublicationBase::Branch(name) => name.clone(),
                 PublicationBase::Workspace(parent) => {
@@ -426,7 +320,7 @@ pub fn resolve_publication_plan(
         .collect()
 }
 
-/// Persist exactly the reviewed destination, then publish the prepared code to it.
+/// Verify the reviewed directory entries, then publish the prepared code.
 /// Later UI focus or metadata changes cannot retarget this publication.
 pub fn publish_prepared_target(
     t: &GitTransport,
@@ -436,72 +330,29 @@ pub fn publish_prepared_target(
     base_commit: &str,
 ) -> Result<PublishedBranch, String> {
     let target = &resolved.target;
-    let base_commit = oid(base_commit, "publication base")?;
-    let mut config = target.previous_config.clone();
-    config.publication = Some(PublicationDestination {
-        repository: Some(target.repository.clone()),
-        branch: target.branch.clone(),
-        base: Some(match &target.base {
-            PublicationBase::Default => PublicationBase::Branch(resolved.base_branch.clone()),
-            other => other.clone(),
-        }),
-    });
-    // Advance an existing matching integration checkpoint, never change upstream identity.
-    if let Some(upstream) = &config.upstream {
-        let matches = match (upstream, &target.base) {
-            (
-                conversation_protocol::v3::WorkspaceBase::Branch {
-                    repository, name, ..
-                },
-                PublicationBase::Branch(branch),
-            ) => {
-                repository
-                    .as_ref()
-                    .map(|repo| normalize_repository_identity(repo))
-                    .transpose()?
-                    .as_deref()
-                    == Some(normalize_repository_identity(&target.repository)?.as_str())
-                    && name == branch
-            }
-            (
-                conversation_protocol::v3::WorkspaceBase::Workspace { name, .. },
-                PublicationBase::Workspace(parent),
-            ) => name == parent,
-            _ => false,
-        };
-        if matches {
-            config.upstream = Some(upstream.with_commit(base_commit));
-        }
+    let _ = oid(base_commit, "publication base")?;
+    let store = open_store(t)?;
+    let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+    let view = Conversation::open(&store, &head)?;
+    if view
+        .workspace(&target.workspace)?
+        .is_none_or(|ws| ws.commit.as_str() != prepared_head)
+        || view.workspace_config(&target.workspace)?.publication
+            != target.previous_config.publication
+    {
+        return Err("stack changed after preparation; review it again".into());
     }
-    append_transition(
-        t,
-        id,
-        &refs::head_ref(id)?,
-        "saving the publication target",
-        |store, head| {
-            let view = Conversation::open(store, head)?;
-            if view
-                .workspace(&target.workspace)?
-                .is_none_or(|workspace| workspace.commit.as_str() != prepared_head)
-            {
-                return Err(format!(
-                    "workspace {:?} changed after preparation; review it again",
-                    target.workspace
-                ));
-            }
-            let current = view.workspace_config(&target.workspace)?;
-            if current == config {
-                return Ok(Step::Done(head.to_string()));
-            }
-            if current != target.previous_config {
-                return Err(format!("workspace {:?} settings changed after the publication preview; review them again", target.workspace));
-            }
-            Ok(Step::Mint(Transition::WorkspaceConfigure {
-                name: target.workspace.clone(),
-                config: config.clone(),
-            }))
-        },
-    )?;
+    if target.base.parent().is_some_and(|parent| {
+        view.workspace(parent)
+            .ok()
+            .flatten()
+            .is_none_or(|ws| ws.commit.as_str() != base_commit)
+    }) {
+        return Err("preceding boundary changed during preparation; review it again".into());
+    }
+    if target.branch != target.workspace {
+        return Err("publication branch is the entry path; rename the entry to change it".into());
+    }
     publish_workspace_branch_inner(
         t,
         id,
@@ -511,142 +362,114 @@ pub fn publish_prepared_target(
     )
 }
 
-// Update a connected stack, or every stack when selection is None. Each step
-// snapshots its upstream once; retries reconcile against that same code.
+/// Incorporate a fetched base into every boundary atomically. Conflicts leave
+/// the selected directory unchanged, so it never describes half an update.
 pub fn update_stack(
     t: &GitTransport,
     id: &str,
     selection: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    use conversation_protocol::v3::{workspace_order, WorkspaceBase};
-    let store = open_store(t)?;
-    let (refname, head) =
-        fetch_validated_head(t, &store, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
-    let configs = Conversation::open(&store, &head)?.workspace_configs()?;
-    let order = workspace_order(&configs)?;
-    fn root<'a>(mut name: &'a str, configs: &'a BTreeMap<String, WorkspaceConfig>) -> &'a str {
-        while let Some(WorkspaceBase::Workspace { name: parent, .. }) = &configs[name].upstream {
-            name = parent;
+    let mut store = open_store(t)?;
+    let (refname, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+    let view = Conversation::open(&store, &head)?;
+    let names = view.workspace_names()?;
+    let directory = |name: &str| {
+        name.rsplit_once('/')
+            .map(|(dir, _)| dir.to_string())
+            .unwrap_or_default()
+    };
+    let selected = selection.map(|name| {
+        if names.iter().any(|entry| entry == name) {
+            directory(name)
+        } else {
+            name.trim_end_matches('/').to_string()
         }
-        name
-    }
-    if selection.is_some_and(|name| !configs.contains_key(name)) {
-        return Err("selected workspace no longer exists".into());
-    }
-    let selected_root = selection.map(|name| root(name, &configs));
-    let mut updated = Vec::new();
-    for name in order {
-        if selected_root.is_some_and(|selected| root(&name, &configs) != selected) {
-            continue;
-        }
-        let config = &configs[&name];
-        let Some(base) = &config.upstream else {
+    });
+    let dirs: std::collections::BTreeSet<_> = names
+        .iter()
+        .map(|name| directory(name))
+        .filter(|dir| selected.as_ref().is_none_or(|selected| selected == dir))
+        .collect();
+    let mut changed = Vec::new();
+    let mut files = Vec::new();
+    for dir in dirs {
+        let join = |leaf: &str| {
+            if dir.is_empty() {
+                leaf.to_string()
+            } else {
+                format!("{dir}/{leaf}")
+            }
+        };
+        let view = Conversation::open(&store, &head)?;
+        let Some(bytes) = view.snapshot().read(&join(".base-url"))? else {
             continue;
         };
-        let result = (|| {
-            let source = match base {
-                WorkspaceBase::Branch {
-                    repository,
-                    name: branch,
-                    ..
-                } => oid(
-                    &branch_snapshot(
-                        t,
-                        &repository
-                            .clone()
-                            .map(Ok)
-                            .unwrap_or_else(|| default_repository(t))?,
-                        branch,
-                    )?,
-                    "upstream",
-                )?,
-                WorkspaceBase::Workspace { name: parent, .. } => {
-                    let (_, head) =
-                        fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
-                    Conversation::open(&store, &head)?
-                        .workspace(parent)?
-                        .ok_or("base workspace disappeared")?
-                        .commit
-                }
-            };
-            let (_, latest) =
-                fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
-            let current = Conversation::open(&store, &latest)?
-                .workspace(&name)?
-                .ok_or("workspace disappeared")?
-                .commit;
-            if !conversation_protocol::v3::CodeOps::is_ancestor(&store, base.commit(), &current)? {
-                return Err(format!("workspace {name:?} predates its upstream checkpoint; roll back to this commit again to restore its checkpoint"));
-            }
-            if source == *base.commit() {
-                return Ok(false);
-            }
-            let mut next_config = config.clone();
-            next_config.upstream = Some(base.with_commit(source.clone()));
-            append_transition(
-                t,
-                id,
-                &refname,
-                "updating the workspace stack",
-                |store, head| {
-                    let view = Conversation::open(store, head)?;
-                    let current_config = view.workspace_config(&name)?;
-                    if current_config == next_config {
-                        return Ok(Step::Done(head.to_string()));
-                    }
-                    if current_config != *config {
-                        return Err(format!(
-                            "workspace {name:?} settings changed; update the stack again"
-                        ));
-                    }
-                    let current = view
-                        .workspace(&name)?
-                        .ok_or("workspace disappeared")?
-                        .commit;
-                    ensure_code_commit(t, store, &source)?;
-                    store.ensure_local(&current)?;
-                    store.ensure_local(base.commit())?;
-                    let signature = inherited_signature(store, head)?;
-                    let resolution =
-                        reconcile(store, base.commit(), &source, Some(&current), &signature)?;
-                    if let WorkspaceResolution::Conflict { merge, .. } = &resolution {
-                        let paths = merge
-                            .as_ref()
-                            .and_then(|m| m.conflict_paths.as_ref())
-                            .map(|paths| paths.join(", "))
-                            .unwrap_or_default();
-                        return Err(format!("workspace {name:?} conflicts with {} at {source}: {paths}. Resolve using merge in this workspace, then run Update stack again; its head and base pin are unchanged.", base.name()));
-                    }
-                    let mut transitions = Vec::new();
-                    if let Some(output) = resolution.new_pointer() {
-                        ensure_code_commit(t, store, output)?;
-                        transitions.push(Transition::WorkspaceAdvance {
-                            name: name.clone(),
-                            commit: output.clone(),
-                        });
-                    }
-                    transitions.push(Transition::WorkspaceConfigure {
-                        name: name.clone(),
-                        config: next_config.clone(),
-                    });
-                    Ok(Step::MintMany(transitions))
-                },
-            )?;
-            Ok(true)
-        })();
-        match result {
-            Ok(true) => updated.push(name),
-            Ok(false) => {}
-            Err(error) => {
-                return Err(if updated.is_empty() {
-                    error
-                } else {
-                    format!("Updated {}. Stopped: {error}", updated.join(", "))
-                })
-            }
+        let base = conversation_protocol::v3::workspaces::BaseUrl::parse(&bytes)?;
+        let old = view
+            .workspace(&join("00-base"))?
+            .ok_or("stack has no 00-base")?
+            .commit;
+        let next = oid(
+            &branch_snapshot(t, &base.repository, &base.branch)?,
+            "new base",
+        )?;
+        if old == next {
+            continue;
         }
+        ensure_code_commit(t, &mut store, &next)?;
+        let mut previous_old = old;
+        let mut previous_new = next.clone();
+        for name in names.iter().filter(|name| {
+            directory(name) == dir
+                && (name.rsplit('/').next() == Some("dirty")
+                    || conversation_protocol::v3::workspaces::is_boundary(
+                        name.rsplit('/').next().unwrap(),
+                    ))
+        }) {
+            let current = Conversation::open(&store, &head)?
+                .workspace(name)?
+                .unwrap()
+                .commit;
+            ensure_code_commit(t, &mut store, &current)?;
+            let signature = inherited_signature(&store, &head)?;
+            let resolution = reconcile(
+                &mut store,
+                &previous_old,
+                &previous_new,
+                Some(&current),
+                &signature,
+            )?;
+            if matches!(resolution, WorkspaceResolution::Conflict { .. }) {
+                return Err(format!(
+                    "{name} conflicts with the updated base; resolve it before updating the stack"
+                ));
+            }
+            let output = resolution
+                .new_pointer()
+                .cloned()
+                .unwrap_or_else(|| current.clone());
+            ensure_code_commit(t, &mut store, &output)?;
+            if output != current {
+                files.push((name.clone(), Some((Mode::Commit, output.encode_line()))));
+                changed.push(name.clone());
+            }
+            previous_old = current;
+            previous_new = output;
+        }
+        files.push((join("00-base"), Some((Mode::Commit, next.encode_line()))));
     }
-    Ok(updated)
+    if files.is_empty() {
+        return Ok(changed);
+    }
+    append_transition(t, id, &refname, "updating code stack", |_store, current| {
+        if current != &head {
+            return Err("conversation changed; update the stack again".into());
+        }
+        Ok(Step::Mint(Transition::FilesApply {
+            files: files.clone(),
+        }))
+    })?;
+    Ok(changed)
 }
 
 /// Import a repository snapshot, preserving its transport URL for Git auth.
@@ -660,6 +483,8 @@ pub fn attach(
 ) -> Result<String, String> {
     use conversation_protocol::v3::WorkspaceBase;
     paths::validate_workspace_name(name)?;
+    let name = format!("{name}/dirty");
+    let name = name.as_str();
     validate_repository(repository)?;
     let mut config = WorkspaceConfig::default();
     let reference = match revision {
@@ -682,7 +507,13 @@ pub fn attach(
         });
         commit
     };
-    config.source = Some(source_locator(repository, &commit)?);
+    if config.upstream.is_none() {
+        config.upstream = Some(WorkspaceBase::Branch {
+            repository: Some(repository.to_string()),
+            name: default_branch(t, repository)?,
+            commit: commit.clone(),
+        });
+    }
     ensure_code_commit(t, &mut open_store(t)?, &commit)?;
     reject_reserved_caos(t, commit.as_str(), "attached workspace")?;
     append_transition(
@@ -693,7 +524,7 @@ pub fn attach(
         |store, head| {
             let view = Conversation::open(store, head)?;
             if let Some(existing) = view.workspace(name)? {
-                if existing.commit == commit && existing.initial == commit && {
+                if existing.commit == commit && {
                     let mut existing_config = view.workspace_config(name)?;
                     existing_config.publication = None;
                     existing_config == config
@@ -703,15 +534,8 @@ pub fn attach(
                 return Err(format!("workspace {name:?} already exists"));
             }
             Ok(Step::MintMany(vec![
-                Transition::WorkspaceCreate {
-                    name: name.to_string(),
-                    commit: commit.clone(),
-                    origin: None,
-                },
-                Transition::WorkspaceConfigure {
-                    name: name.to_string(),
-                    config: config.clone(),
-                },
+                Transition::reference(name.to_string(), Some(commit.clone())),
+                Transition::stack_base(name.to_string(), config.clone()),
             ]))
         },
     )
@@ -778,4 +602,47 @@ origin/{name} {hash}
         snapshots.insert(identity, refs);
     }
     serde_json::to_string(&snapshots).map_err(|error| error.to_string())
+}
+
+/// Rename a commit-valued entry; all prior names/values remain in C history.
+pub fn rename_reference(
+    t: &GitTransport,
+    id: &str,
+    source: &str,
+    destination: &str,
+) -> Result<String, String> {
+    paths::validate_workspace_name(destination)?;
+    let store = open_store(t)?;
+    let (_, captured) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+    let original = Conversation::open(&store, &captured)?
+        .workspace(source)?
+        .ok_or("source is not a code reference")?
+        .commit;
+    append_transition(
+        t,
+        id,
+        &refs::head_ref(id)?,
+        "renaming code reference",
+        |store, head| {
+            let view = Conversation::open(store, head)?;
+            if view
+                .workspace(source)?
+                .is_none_or(|ws| ws.commit != original)
+            {
+                return Err("source changed; retry".into());
+            }
+            if view.snapshot().exists(destination)? {
+                return Err("destination already exists".into());
+            }
+            Ok(Step::Mint(Transition::FilesApply {
+                files: vec![
+                    (source.to_string(), None),
+                    (
+                        destination.to_string(),
+                        Some((Mode::Commit, original.encode_line())),
+                    ),
+                ],
+            }))
+        },
+    )
 }

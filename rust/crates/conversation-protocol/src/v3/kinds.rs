@@ -17,18 +17,13 @@ pub enum Kind {
     SubagentSpawn,
     SubagentTerminal,
     SubagentApply,
-    WorkspaceCreate,
-    WorkspaceConfigure,
-    WorkspaceAdvance,
-    WorkspaceRollback,
-    WorkspaceRemove,
     PublicationPending,
     PublicationTerminal,
     FilesApply,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 25] = [
+    pub const ALL: [Kind; 20] = [
         Kind::ConversationRoot,
         Kind::ConversationFork,
         Kind::MetadataTitleSet,
@@ -46,11 +41,6 @@ impl Kind {
         Kind::SubagentSpawn,
         Kind::SubagentTerminal,
         Kind::SubagentApply,
-        Kind::WorkspaceCreate,
-        Kind::WorkspaceConfigure,
-        Kind::WorkspaceAdvance,
-        Kind::WorkspaceRollback,
-        Kind::WorkspaceRemove,
         Kind::PublicationPending,
         Kind::PublicationTerminal,
         Kind::FilesApply,
@@ -75,11 +65,6 @@ impl Kind {
             Kind::SubagentSpawn => "subagent.spawn",
             Kind::SubagentTerminal => "subagent.terminal",
             Kind::SubagentApply => "subagent.apply",
-            Kind::WorkspaceCreate => "workspace.create",
-            Kind::WorkspaceConfigure => "workspace.configure",
-            Kind::WorkspaceAdvance => "workspace.advance",
-            Kind::WorkspaceRollback => "workspace.rollback",
-            Kind::WorkspaceRemove => "workspace.remove",
             Kind::PublicationPending => "publication.pending",
             Kind::PublicationTerminal => "publication.terminal",
             Kind::FilesApply => "files.apply",
@@ -100,16 +85,7 @@ impl Kind {
     }
 
     pub fn parse_message(message: &[u8]) -> Result<Kind, String> {
-        let parsed = message
-            .strip_suffix(b"\n")
-            .and_then(|name| std::str::from_utf8(name).ok())
-            .and_then(|name| Self::parse(name).ok());
-        match parsed {
-            Some(kind) if kind.message() == message => Ok(kind),
-            _ => Err(format!(
-                "commit message is not a registered kind: {message:?}"
-            )),
-        }
+        super::events::decode(message).map(|(kind, _)| kind)
     }
 }
 
@@ -121,7 +97,10 @@ mod tests {
     fn registered_kinds_round_trip() {
         for kind in Kind::ALL {
             assert_eq!(Kind::parse(kind.as_str()), Ok(kind));
-            assert_eq!(Kind::parse_message(&kind.message()), Ok(kind));
+            assert_eq!(
+                Kind::parse_message(&super::super::events::encode(kind, &[])),
+                Ok(kind)
+            );
         }
     }
 

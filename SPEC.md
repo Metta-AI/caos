@@ -587,18 +587,16 @@ revision (and made the history tools' hashes readable the same way).
 
 ## Publication
 
-The [Chat v3 publication flow](design/chat.md) publishes each workspace to its
-configured repository and branch. Single-workspace defaults retain
-`caos/<conversation-id>`; new multi-workspace destinations use
-`caos-workspaces/<conversation-id>/<workspace>`.
-`Ctrl+P` previews workspaces, branches and bases, prepares selected workspaces
-in dependency order, and opens or reuses each PR by repository and head branch.
-The preview uses local metadata; remote defaults are resolved only for the
-selected execution plan. The host library owns preparation and publication,
-while clients supply progress and cancellation. Forked conversations own new
-publication branches; historical receipts do not transfer branch ownership.
-`/publish-branch` pushes the selected branch without preparation or PR creation.
-Neither exports the conversation state or imports conversations from GitHub.
+The [conversation publication flow](design/chat.md) derives a PR stack from a
+directory: `.base-url` supplies the repository and external base branch;
+numbered commit entries supply PR branches named by their full paths.
+`00-base` and `dirty` are excluded. The first PR targets the external branch;
+each later PR targets the preceding boundary. No publication defaults are stored.
+`Ctrl+P` previews the selected stack, prepares its boundaries in order, and
+opens or reuses each PR by repository and head branch. Publication verifies
+the captured content and remote tips; interrupted pushes are reconciled from
+the remote and execution events. `/publish-branch` pushes a selected review
+boundary without preparation or PR creation. Neither exports conversations.
 
 Per-mutation commits remain in the published workspace history. Only the
 prepared PR tip is checked for unresolved conflicts and reserved state;

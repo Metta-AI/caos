@@ -1791,25 +1791,12 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
         );
     } else if let Some(name) = &picker.creating {
         let source = picker.source.as_deref().unwrap_or("");
-        let relationship = match picker.creation {
-            caos_cli::workspaces::Creation::FromUpstream => {
-                "New change from upstream: excludes the source's unfinished changes"
-            }
-            caos_cli::workspaces::Creation::Stack => {
-                "Stack on this workspace: starts from its head; PR targets its branch"
-            }
-            caos_cli::workspaces::Creation::Copy => {
-                "Copy this snapshot: includes its code without depending on this workspace"
-            }
-        };
         frame.render_widget(
-            Paragraph::new(format!(
-                "New workspace from {source}\n\nName: {name}\n\n{relationship}"
-            )),
+            Paragraph::new(format!("Copy reference {source}\n\nNew path: {name}")),
             rows[0],
         );
         frame.render_widget(
-            Paragraph::new("Tab changes relationship   Enter creates   Esc cancels")
+            Paragraph::new("Enter creates   Esc cancels")
                 .style(Style::default().fg(Color::DarkGray)),
             rows[1],
         );
@@ -1836,7 +1823,7 @@ fn render_workspace_picker(app: &App, frame: &mut Frame<'_>) {
                 let repository = ws
                     .config
                     .repository()
-                    .unwrap_or_else(|| "checkout repository".into());
+                    .unwrap_or_else(|| "no publication repository".into());
                 let publication = state
                     .publications
                     .iter()
@@ -1953,17 +1940,8 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
             &mut selection,
         );
     }
-    if let Some((base, input)) = &prompt.edit {
-        let label = if *base {
-            "Base branch or @workspace"
-        } else {
-            "Publication branch"
-        };
-        frame.render_widget(
-            Paragraph::new(format!("{label}: {input}\nEnter saves the choice")),
-            rows[1],
-        );
-    } else if let Some(error) = &prompt.error {
+
+    if let Some(error) = &prompt.error {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .style(Style::default().fg(Color::Red))
@@ -1971,13 +1949,11 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
             rows[1],
         );
     } else {
-        frame.render_widget(Paragraph::new("Selected workspaces will be prepared, tested, and published in dependency order.\nEach workspace gets its own branch and PR."), rows[1]);
+        frame.render_widget(Paragraph::new("Selected workspaces will be prepared, tested, and published in stack order.\nEach workspace gets its own branch and PR."), rows[1]);
     }
     frame.render_widget(
-        Paragraph::new(
-            "Space select   a all   b base   h branch   Enter/Ctrl+P publish   Esc cancel",
-        )
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("Space select   a all   Enter/Ctrl+P publish   Esc cancel")
+            .style(Style::default().fg(Color::DarkGray)),
         rows[2],
     );
 }

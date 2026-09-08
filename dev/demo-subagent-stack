@@ -46,7 +46,7 @@ fi
 {
   printf '#!/usr/bin/env bash\nset -euo pipefail\n'
   printf 'cd %q\n' "$demo/repo"
-  printf 'exec %q tui --new "$@"\n' "$cli"
+  printf 'exec %q tui --new --import feature "$@"\n' "$cli"
 } > "$demo/launch"
 chmod +x "$demo/launch"
 printf 'Demo directory: %s\nPrompt: %s/PROMPT.md\nLaunch: %s/launch\n' "$demo" "$demo" "$demo"

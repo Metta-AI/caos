@@ -63,7 +63,9 @@ fn publish_target(
         .iter()
         .find(|workspace| workspace.name == target.workspace)
         .ok_or("workspace disappeared")?;
-    if workspace.head != target.head || workspace.config != target.previous_config {
+    if workspace.head != target.head
+        || workspace.config.publication != target.previous_config.publication
+    {
         return Err(format!(
             "workspace {:?} changed since the publication preview; review it again",
             target.workspace

@@ -1,13 +1,11 @@
 //! Workspace navigation stays local; creation goes through the conversation lease.
 use super::*;
-use caos_cli::workspaces::Creation;
 
 #[derive(Clone, Debug)]
 pub(super) struct WorkspacePicker {
     pub selected: usize,
     pub creating: Option<String>,
     pub source: Option<String>,
-    pub creation: Creation,
     pub attaching: Option<AttachmentForm>,
 }
 
@@ -29,7 +27,6 @@ impl App {
             selected,
             creating: None,
             source: None,
-            creation: Creation::FromUpstream,
             attaching: None,
         });
         self.palette = None;
@@ -88,7 +85,6 @@ impl App {
                     {
                         self.selected_mut().show_command_error(error);
                     } else if let Some(source) = picker.source.clone() {
-                        let creation = picker.creation;
                         self.start_workspace_mutation(
                             "creating workspace",
                             move |transport, conversation| {
@@ -97,19 +93,11 @@ impl App {
                                     conversation,
                                     &name,
                                     &source,
-                                    creation,
                                 )?;
                                 Ok(format!("Created workspace {name:?} from {source:?}."))
                             },
                         );
                         return;
-                    }
-                }
-                KeyCode::Tab => {
-                    picker.creation = match picker.creation {
-                        Creation::FromUpstream => Creation::Stack,
-                        Creation::Stack => Creation::Copy,
-                        Creation::Copy => Creation::FromUpstream,
                     }
                 }
                 KeyCode::Backspace => {

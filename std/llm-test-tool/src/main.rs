@@ -131,7 +131,6 @@ enum ToolCommand {
         head: Oid,
         validate: bool,
         started_tool: Option<(Oid, String)>,
-        present_path: Option<String>,
     },
 }
 
@@ -329,7 +328,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let validate = args.flag("--validate");
             let request = args.take("--request")?;
             let started_tool = args.take("--started-tool")?;
-            let present_path = args.take("--present-path")?;
             let started_tool = match (request, started_tool) {
                 (None, None) => None,
                 (Some(request), Some(tool)) => Some((parse_oid(&request, "request")?, tool)),
@@ -344,7 +342,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 head,
                 validate,
                 started_tool,
-                present_path,
             }
         }
         _ => return Err(ToolError::new(format!("unknown subcommand {command:?}"))),
@@ -659,7 +656,10 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 .workspace(&name)?
                 .ok_or_else(|| ToolError::code(4))?;
             println!("commit {}", workspace.commit);
-            println!("initial {}", workspace.initial);
+            println!(
+                "initial {}",
+                Conversation::open(&store, &head)?.reference_start(&name)?
+            );
         }
         ToolCommand::Transcript { repo, head } => {
             let store = open(&repo)?;
@@ -769,7 +769,6 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             head,
             validate,
             started_tool,
-            present_path,
         } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
@@ -777,7 +776,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 validate_spine(&store, &head, &mut HashSet::new())
                     .map_err(|error| ToolError::new(error.to_string()))?;
             }
-            parents(&store, head, started_tool.as_ref(), present_path.as_deref())?;
+            parents(&store, head, started_tool.as_ref())?;
         }
     }
     Ok(())
@@ -875,10 +874,7 @@ fn conversation_root(
     workspaces: Vec<(String, Oid)>,
 ) -> Result<Oid, ToolError> {
     let genesis = ensure_genesis(store)?;
-    let workspaces = workspaces
-        .into_iter()
-        .map(|(name, commit)| (name, (commit, None)))
-        .collect::<BTreeMap<_, _>>();
+    let workspaces = workspaces.into_iter().collect::<BTreeMap<_, _>>();
     let transition = Transition::ConversationRoot {
         identity: Identity {
             id,
@@ -890,14 +886,7 @@ fn conversation_root(
         files_seed: None,
     };
     let applied = apply(store, None, &transition)?;
-    mint(
-        store,
-        &genesis,
-        &applied.tree,
-        transition.kind(),
-        &signature(),
-    )
-    .map_err(ToolError::new)
+    mint(store, &genesis, &applied, transition.kind(), &signature()).map_err(ToolError::new)
 }
 
 fn append_user_message(
@@ -936,12 +925,12 @@ fn admit_request(
     configuration: String,
 ) -> Result<Oid, ToolError> {
     let view = Conversation::open(store, head)?;
-    let request_workspaces = view.workspaces_tree()?;
+
     drop(view);
     let record = TurnRecord {
         id: request.clone(),
         request_head: head.clone(),
-        request_workspaces,
+
         model,
         configuration,
         round: 0,
@@ -1017,6 +1006,7 @@ fn prepare_turn_request(
                 Mode::Blob => ("100644", "blob"),
                 Mode::Executable => ("100755", "blob"),
                 Mode::Tree => ("040000", "tree"),
+                Mode::Commit => ("160000", "commit"),
             };
             (
                 entry.name,
@@ -1214,9 +1204,8 @@ fn signature() -> conversation_protocol::v3::Signature {
 }
 
 fn append(store: &mut GitStore, head: &Oid, transition: Transition) -> Result<Oid, ToolError> {
-    let parent_tree = store.read_commit(head).map_err(String::from)?.tree;
-    let applied = apply(store, Some(&parent_tree), &transition)?;
-    mint(store, head, &applied.tree, transition.kind(), &signature()).map_err(ToolError::new)
+    let applied = apply(store, Some(head), &transition)?;
+    mint(store, head, &applied, transition.kind(), &signature()).map_err(ToolError::new)
 }
 
 fn client_key() -> Result<String, ToolError> {
@@ -1320,7 +1309,6 @@ fn parents(
     store: &GitStore,
     mut current: Oid,
     started_tool: Option<&(Oid, String)>,
-    present_path: Option<&str>,
 ) -> Result<(), ToolError> {
     let mut found_started_tool = started_tool.is_none();
     loop {
@@ -1337,15 +1325,7 @@ fn parents(
             )));
         }
         let kind = Kind::parse_message(&info.message)?;
-        if let Some(path) = present_path {
-            let present = Conversation::open(store, &current)?
-                .snapshot()
-                .read(path)?
-                .is_some();
-            println!("{current} {} {present}", kind.as_str());
-        } else {
-            println!("{current} {}", kind.as_str());
-        }
+        println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
             let (request, id) = started_tool.expect("checked as present");
             let view = Conversation::open(store, &current)?;
@@ -1483,17 +1463,14 @@ mod tests {
             "b".repeat(40),
             "--started-tool".to_string(),
             "toolu_01".to_string(),
-            "--present-path".to_string(),
-            ".caos/tools/request/0000/toolu_01.json".to_string(),
         ])
         .unwrap();
         assert!(matches!(
             command,
             ToolCommand::Parents {
                 started_tool: Some((_, ref id)),
-                present_path: Some(ref path),
                 ..
-            } if id == "toolu_01" && path == ".caos/tools/request/0000/toolu_01.json"
+            } if id == "toolu_01"
         ));
     }
 }

@@ -1,15 +1,20 @@
+use super::events::Event;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 use super::kinds::Kind;
 use super::oid::Oid;
 use super::paths;
 use super::records::{
-    parse_active_turn, parse_title, AsyncRecord, CallRecord, ChildRecord, Identity,
-    PublicationRecord, Record, TranscriptEntry, TurnRecord, WorkspaceOrigin, WorkspaceRecord,
+    parse_title, AsyncRecord, CallRecord, ChildRecord, Identity, PublicationRecord,
+    TranscriptEntry, TurnRecord, WorkspaceRecord,
 };
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
 pub struct Conversation<'s> {
+    store: &'s dyn ObjectStore,
+    events: OnceCell<Vec<Event>>,
+    context_len: OnceCell<usize>,
     commit: Option<Oid>,
     parent: Option<Oid>,
     kind: Option<Kind>,
@@ -27,6 +32,9 @@ impl<'s> Conversation<'s> {
         }
         let kind = Kind::parse_message(&info.message)?;
         let conversation = Conversation {
+            store,
+            events: OnceCell::new(),
+            context_len: OnceCell::new(),
             commit: Some(commit.clone()),
             parent: info.parents.first().cloned(),
             kind: Some(kind),
@@ -39,6 +47,9 @@ impl<'s> Conversation<'s> {
 
     pub fn open_tree(store: &'s dyn ObjectStore, tree: &Oid) -> Result<Conversation<'s>, String> {
         let conversation = Conversation {
+            store,
+            events: OnceCell::new(),
+            context_len: OnceCell::new(),
             commit: None,
             parent: None,
             kind: None,
@@ -47,6 +58,15 @@ impl<'s> Conversation<'s> {
         };
         conversation.require_format()?;
         Ok(conversation)
+    }
+
+    pub(crate) fn current_events(&self) -> Result<Vec<Event>, String> {
+        let head = self
+            .commit
+            .as_ref()
+            .ok_or("execution history requires a commit")?;
+        let info = self.store.read_commit(head).map_err(String::from)?;
+        super::events::decode(&info.message).map(|(_, events)| events)
     }
 
     pub fn commit(&self) -> Option<&Oid> {
@@ -70,7 +90,23 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn identity(&self) -> Result<Identity, String> {
-        Identity::parse(&self.required_blob(paths::IDENTITY)?)
+        let mut value = super::canonical::parse_canonical(&self.required_blob(paths::IDENTITY)?)?;
+        value["kind"] = serde_json::json!("root");
+        let mut current = self.commit.clone();
+        while let Some(head) = current {
+            let info = self.store.read_commit(&head).map_err(String::from)?;
+            match Kind::parse_message(&info.message)? {
+                Kind::ConversationFork => {
+                    value["kind"] = serde_json::json!("fork");
+                    value["source"] =
+                        serde_json::json!(info.parents.first().ok_or("fork has no source")?);
+                    break;
+                }
+                Kind::ConversationRoot => break,
+                _ => current = info.parents.first().cloned(),
+            }
+        }
+        Identity::from_value(&value)
     }
 
     pub fn title(&self) -> Result<String, String> {
@@ -78,60 +114,131 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn workspace_names(&self) -> Result<Vec<String>, String> {
-        let entries = self.list_optional(paths::WORKSPACES_DIR)?;
-        let mut names = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if entry.mode != Mode::Tree {
-                return Err(format!(
-                    "workspace entry {:?} is not a directory",
+        fn walk(view: &Conversation<'_>, dir: &str, names: &mut Vec<String>) -> Result<(), String> {
+            for entry in view.snapshot.list(dir)? {
+                if dir.is_empty() && entry.name == ".caos" {
+                    continue;
+                }
+                let path = if dir.is_empty() {
                     entry.name
-                ));
+                } else {
+                    format!("{dir}/{}", entry.name)
+                };
+                match entry.mode {
+                    Mode::Commit => names.push(path),
+                    Mode::Tree => walk(view, &path, names)?,
+                    _ => {}
+                }
             }
-            paths::validate_workspace_name(&entry.name)?;
-            names.push(entry.name);
+            Ok(())
         }
-        names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        let mut names = Vec::new();
+        walk(self, "", &mut names)?;
+        names.sort();
         Ok(names)
     }
 
     pub fn workspace(&self, name: &str) -> Result<Option<WorkspaceRecord>, String> {
         paths::validate_workspace_name(name)?;
-        let commit_path = paths::workspace_commit_path(name);
-        let Some(commit) = self.optional_blob(&commit_path)? else {
-            if self.snapshot.exists(&paths::workspace_dir(name))? {
-                return Err(format!("workspace {name:?} is missing commit"));
-            }
+        let Some(entry) = self.snapshot.entry(name)? else {
             return Ok(None);
         };
-        let initial = self.required_blob(&paths::workspace_initial_path(name))?;
-        let origin = self
-            .optional_blob(&paths::workspace_origin_path(name))?
-            .map(|bytes| WorkspaceOrigin::parse(&bytes))
-            .transpose()?;
-        Ok(Some(WorkspaceRecord {
-            commit: Oid::parse_line(&commit, "workspace sha")?,
-            initial: Oid::parse_line(&initial, "workspace sha")?,
-            origin,
-        }))
+        if entry.mode != Mode::Commit {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceRecord { commit: entry.oid }))
     }
 
-    pub fn workspace_config(&self, name: &str) -> Result<super::WorkspaceConfig, String> {
-        if self.workspace(name)?.is_none() {
-            return Err(format!("workspace {name:?} does not exist"));
+    /// The first value at this path in the current conversation context.
+    /// Read it from history only when a comparison or harvest needs a base.
+    pub fn reference_start(&self, name: &str) -> Result<Oid, String> {
+        paths::validate_workspace_name(name)?;
+        let mut initial = self
+            .snapshot
+            .entry(name)?
+            .filter(|entry| entry.mode == Mode::Commit)
+            .ok_or_else(|| format!("no code reference {name:?}"))?
+            .oid;
+        let mut current = self.commit.clone();
+        while let Some(head) = current {
+            let info = self.store.read_commit(&head).map_err(String::from)?;
+            let entry = Snapshot::new(self.store, info.tree).entry(name)?;
+            match entry {
+                Some(entry) if entry.mode == Mode::Commit => initial = entry.oid,
+                _ => break,
+            }
+            if matches!(
+                Kind::parse_message(&info.message)?,
+                Kind::ConversationRoot | Kind::ConversationFork
+            ) {
+                break;
+            }
+            current = info.parents.first().cloned();
         }
-        self.optional_blob(&paths::workspace_config_path(name))?
-            .map(|bytes| {
-                if super::workspaces::is_legacy_config(&bytes)? {
-                    super::workspaces::legacy_config(
-                        &bytes,
-                        &self.workspace(name)?.expect("checked above").initial,
-                    )
+        Ok(initial)
+    }
+
+    pub fn stack_predecessor(&self, name: &str) -> Result<Option<(String, Oid)>, String> {
+        let (dir, leaf) = name.rsplit_once('/').unwrap_or(("", name));
+        let mut previous = None;
+        for entry in self.snapshot.list(dir)? {
+            if entry.mode != Mode::Commit {
+                continue;
+            }
+            if entry.name == leaf {
+                return Ok(previous);
+            }
+            if super::workspaces::is_boundary(&entry.name) || entry.name == "00-base" {
+                let path = if dir.is_empty() {
+                    entry.name
                 } else {
-                    super::WorkspaceConfig::parse(&bytes)
+                    format!("{dir}/{}", entry.name)
+                };
+                previous = Some((path, entry.oid));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Derived from ordinary neighboring entries, never a stored workspace record.
+    pub fn workspace_config(&self, name: &str) -> Result<super::WorkspaceConfig, String> {
+        let dir = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let base_path = if dir.is_empty() {
+            ".base-url".into()
+        } else {
+            format!("{dir}/.base-url")
+        };
+        let Some(bytes) = self.snapshot.read(&base_path)? else {
+            return Ok(Default::default());
+        };
+        // A malformed optional convention must not make conversation files
+        // unreadable: the user needs to be able to edit .base-url to repair it.
+        let Ok(base) = super::workspaces::BaseUrl::parse(&bytes) else {
+            return Ok(Default::default());
+        };
+        let mut config = super::WorkspaceConfig::default();
+        if let Some((path, commit)) = self.stack_predecessor(name)? {
+            config.upstream = Some(if path.ends_with("/00-base") || path == "00-base" {
+                super::WorkspaceBase::Branch {
+                    repository: Some(base.repository.clone()),
+                    name: base.branch.clone(),
+                    commit,
                 }
-            })
-            .transpose()
-            .map(Option::unwrap_or_default)
+            } else {
+                super::WorkspaceBase::Workspace { name: path, commit }
+            });
+        }
+        config.publication = Some(super::PublicationDestination {
+            repository: Some(base.repository),
+            branch: name.to_string(),
+            base: Some(match &config.upstream {
+                Some(super::WorkspaceBase::Workspace { name, .. }) => {
+                    super::workspaces::PublicationBase::Workspace(name.clone())
+                }
+                _ => super::workspaces::PublicationBase::Branch(base.branch),
+            }),
+        });
+        Ok(config)
     }
 
     pub fn workspace_configs(&self) -> Result<BTreeMap<String, super::WorkspaceConfig>, String> {
@@ -152,127 +259,108 @@ impl<'s> Conversation<'s> {
             .collect()
     }
 
-    pub fn workspaces_tree(&self) -> Result<Option<Oid>, String> {
-        match self.snapshot.entry(paths::WORKSPACES_DIR)? {
-            None => Ok(None),
-            Some(entry) if entry.mode == Mode::Tree => Ok(Some(entry.oid)),
-            Some(_) => Err(".caos/workspaces is not a directory".to_string()),
+    /// Retain ancestral results for the canonical transcript. A fork starts a
+    /// new execution context without erasing the results its transcript refers to.
+    fn events(&self) -> Result<&[Event], String> {
+        if self.events.get().is_none() {
+            let mut result = Vec::new();
+            let mut current = self.commit.clone();
+            while let Some(head) = current {
+                let info = self.store.read_commit(&head).map_err(String::from)?;
+                let (kind, events) = super::events::decode(&info.message)?;
+                result.extend(events.into_iter().rev());
+                if kind == Kind::ConversationFork {
+                    let _ = self.context_len.set(result.len());
+                }
+                if kind == Kind::ConversationRoot {
+                    break;
+                }
+                current = info.parents.first().cloned();
+            }
+            let _ = self.context_len.set(result.len());
+            let _ = self.events.set(result);
         }
+        Ok(self.events.get().expect("loaded"))
+    }
+
+    fn context_events(&self) -> Result<&[Event], String> {
+        let events = self.events()?;
+        Ok(&events[..*self.context_len.get().expect("loaded")])
     }
 
     pub fn active_turn(&self) -> Result<Option<TurnRecord>, String> {
-        let Some(bytes) = self.optional_blob(paths::ACTIVE_TURN)? else {
-            return Ok(None);
-        };
-        let id = parse_active_turn(&bytes)?;
-        self.turn(&id)?
-            .map(Some)
-            .ok_or_else(|| format!("active request {id} has no request record"))
+        let latest = self.context_events()?.iter().find_map(|event| match event {
+            Event::Request(r) => Some(r.clone()),
+            _ => None,
+        });
+        Ok(latest.filter(|r| {
+            matches!(
+                r.status,
+                super::TurnStatus::Queued
+                    | super::TurnStatus::Running
+                    | super::TurnStatus::Cancelling
+            )
+        }))
     }
 
     pub fn turn(&self, id: &Oid) -> Result<Option<TurnRecord>, String> {
-        self.keyed::<TurnRecord>(
-            &paths::turn_record_path(id.as_str()),
-            |record| record.id == *id,
-            |record| format!("id {}", record.id),
-        )
+        Ok(self.events()?.iter().find_map(|event| match event {
+            Event::Request(r) if &r.id == id => Some(r.clone()),
+            _ => None,
+        }))
     }
 
     pub fn turn_ids(&self) -> Result<Vec<Oid>, String> {
-        let mut ids = Vec::new();
-        for entry in self.list_optional(paths::TURNS_DIR)? {
-            if entry.name == "active" {
-                continue;
-            }
-            if entry.mode != Mode::Blob {
-                return Err(format!("request entry {:?} is not a blob", entry.name));
-            }
-            let stem = entry
-                .name
-                .strip_suffix(".json")
-                .ok_or_else(|| format!("invalid request record name {:?}", entry.name))?;
-            ids.push(Oid::parse(stem, "request record id")?);
-        }
-        ids.sort();
-        Ok(ids)
+        Ok(self
+            .context_events()?
+            .iter()
+            .filter_map(|event| match event {
+                Event::Request(r) => Some(r.id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
     pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<CallRecord>, String> {
-        self.keyed::<CallRecord>(
-            &paths::call_record_path(request.as_str(), round, id),
-            |record| record.request == *request && record.round == round && record.id == id,
-            |record| {
-                format!(
-                    "request {}, round {}, id {:?}",
-                    record.request, record.round, record.id
-                )
-            },
-        )
+        Ok(self.tools(request, round)?.into_iter().find(|r| r.id == id))
     }
 
     pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<CallRecord>, String> {
-        let dir = format!("{}/{}/{round:04}", paths::CALLS_DIR, request.as_str());
-        let mut records = Vec::new();
-        for entry in self.list_optional(&dir)? {
-            if entry.mode == Mode::Tree {
-                continue;
+        let mut records = BTreeMap::new();
+        for event in self.events()? {
+            if let Event::Tool(r) = event {
+                if &r.request == request && r.round == round {
+                    records.entry(r.id.clone()).or_insert_with(|| r.clone());
+                }
             }
-            let path = format!("{dir}/{}", entry.name);
-            if !entry.name.ends_with(".json") {
-                return Err(format!("invalid tool record path {path:?}"));
-            }
-            let record = CallRecord::parse(&self.required_blob(&path)?)?;
-            if record.request != *request
-                || record.round != round
-                || paths::call_record_path(request.as_str(), round, &record.id) != path
-            {
-                return Err(format!("tool record {path:?} has mismatched identity"));
-            }
-            records.push(record);
         }
-        Ok(records)
+        Ok(records.into_values().collect())
     }
 
     pub fn transcript_len(&self) -> Result<u64, String> {
-        let shards = self.list_optional(paths::TRANSCRIPT_DIR)?;
-        let Some(last_shard) = shards.last() else {
-            return Ok(0);
-        };
-        if last_shard.mode != Mode::Tree
-            || last_shard.name.len() != 9
-            || !last_shard.name.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err(format!("invalid transcript shard {:?}", last_shard.name));
-        }
-        let dir = format!("{}/{}", paths::TRANSCRIPT_DIR, last_shard.name);
-        let entry = self
-            .snapshot
-            .list(&dir)?
-            .into_iter()
-            .rev()
-            .find(|entry| entry.mode != Mode::Tree)
-            .ok_or_else(|| format!("transcript shard {:?} has no entries", last_shard.name))?;
-        let path = format!("{dir}/{}", entry.name);
-        let (ordinal, _) = paths::parse_transcript_entry_path(&path)?;
-        ordinal
-            .checked_add(1)
-            .ok_or_else(|| "transcript ordinal overflow".to_string())
+        let index = self.transcript_index(
+            paths::TRANSCRIPT_DIR,
+            &self.list_optional(paths::TRANSCRIPT_DIR)?,
+        )?;
+        Ok(index
+            .last_key_value()
+            .map(|(ordinal, _)| ordinal + 1)
+            .unwrap_or(0))
     }
 
     pub fn transcript_entry(
         &self,
         ordinal: u64,
     ) -> Result<Option<(String, TranscriptEntry)>, String> {
-        let dir = format!(
-            "{}/{}",
+        let index = self.transcript_index(
             paths::TRANSCRIPT_DIR,
-            paths::transcript_shard(ordinal)
-        );
-        let entries = self.list_optional(&dir)?;
-        let index = self.transcript_index(&dir, &entries)?;
+            &self.list_optional(paths::TRANSCRIPT_DIR)?,
+        )?;
         index
             .get(&ordinal)
-            .map(|(message_id, path)| self.read_transcript_entry(path, message_id))
+            .map(|(id, path)| self.read_transcript_entry(path, id))
             .transpose()
     }
 
@@ -315,74 +403,70 @@ impl<'s> Conversation<'s> {
         to: u64,
     ) -> Result<Vec<(u64, String, TranscriptEntry)>, String> {
         if from > to {
-            return Err(format!("invalid transcript range {from}..{to}"));
+            return Err("invalid transcript range".into());
         }
-        let mut entries = Vec::new();
-        let mut ordinal = from;
-        while ordinal < to {
-            let dir = format!(
-                "{}/{}",
-                paths::TRANSCRIPT_DIR,
-                paths::transcript_shard(ordinal)
-            );
-            let listing = self.list_optional(&dir)?;
-            let index = self.transcript_index(&dir, &listing)?;
-            let shard_end = ordinal.saturating_add(1000 - ordinal % 1000).min(to);
-            while ordinal < shard_end {
-                let (message_id, path) = index
+        let index = self.transcript_index(
+            paths::TRANSCRIPT_DIR,
+            &self.list_optional(paths::TRANSCRIPT_DIR)?,
+        )?;
+        (from..to)
+            .map(|ordinal| {
+                let (id, path) = index
                     .get(&ordinal)
                     .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
-                let (message_id, entry) = self.read_transcript_entry(path, message_id)?;
-                entries.push((ordinal, message_id, entry));
-                ordinal += 1;
-            }
-        }
-        Ok(entries)
+                let (id, entry) = self.read_transcript_entry(path, id)?;
+                Ok((ordinal, id, entry))
+            })
+            .collect()
     }
 
     pub fn payload(&self, path: &str) -> Result<Vec<u8>, String> {
         paths::validate_tree_path(path)?;
+        for event in self.events()? {
+            if let Event::Payload {
+                path: stored,
+                bytes,
+            } = event
+            {
+                if stored == path {
+                    return Ok(bytes.clone());
+                }
+            }
+        }
         self.snapshot
             .read(path)?
             .ok_or_else(|| format!("required path {path} is absent"))
     }
 
     pub fn async_task(&self, task: &Oid) -> Result<Option<AsyncRecord>, String> {
-        self.keyed::<AsyncRecord>(
-            &paths::async_record_path(task.as_str()),
-            |record| record.task == *task,
-            |record| format!("task {}", record.task),
-        )
+        Ok(self.async_tasks()?.into_iter().find(|r| &r.task == task))
     }
 
     pub fn async_tasks(&self) -> Result<Vec<AsyncRecord>, String> {
-        self.keyed_all::<AsyncRecord, _>(
-            paths::TASK_COMPUTATIONS_DIR,
-            |stem| Oid::parse(stem, "async record task"),
-            |record, task| record.task == *task,
-            |record| format!("task {}", record.task),
-        )
+        let mut records = BTreeMap::new();
+        for event in self.context_events()? {
+            if let Event::Async(r) = event {
+                records.entry(r.task.clone()).or_insert_with(|| r.clone());
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     pub fn child(&self, id: &str) -> Result<Option<ChildRecord>, String> {
-        paths::validate_protocol_id_component(id)?;
-        self.keyed::<ChildRecord>(
-            &paths::subagent_record_path(id),
-            |record| record.id == id,
-            |record| format!("id {:?}", record.id),
-        )
+        Ok(self.events()?.iter().find_map(|event| match event {
+            Event::Child(r) if r.id == id => Some(r.clone()),
+            _ => None,
+        }))
     }
 
     pub fn children(&self) -> Result<Vec<ChildRecord>, String> {
-        self.keyed_all::<ChildRecord, _>(
-            paths::TASK_CONVERSATIONS_DIR,
-            |stem| {
-                paths::validate_protocol_id_component(stem)?;
-                Ok(stem.to_string())
-            },
-            |record, id| record.id == *id,
-            |record| format!("id {:?}", record.id),
-        )
+        let mut records = BTreeMap::new();
+        for event in self.context_events()? {
+            if let Event::Child(r) = event {
+                records.entry(r.id.clone()).or_insert_with(|| r.clone());
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     pub fn tasks(&self) -> Result<Vec<super::TaskRecord>, String> {
@@ -410,24 +494,17 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn publication(&self, id: &str) -> Result<Option<PublicationRecord>, String> {
-        paths::validate_protocol_id_component(id)?;
-        self.keyed::<PublicationRecord>(
-            &paths::publication_record_path(id),
-            |record| record.id == id,
-            |record| format!("id {:?}", record.id),
-        )
+        Ok(self.publications()?.into_iter().find(|r| r.id == id))
     }
 
     pub fn publications(&self) -> Result<Vec<PublicationRecord>, String> {
-        self.keyed_all::<PublicationRecord, _>(
-            paths::PUBLICATIONS_DIR,
-            |stem| {
-                paths::validate_protocol_id_component(stem)?;
-                Ok(stem.to_string())
-            },
-            |record, id| record.id == *id,
-            |record| format!("id {:?}", record.id),
-        )
+        let mut records = BTreeMap::new();
+        for event in self.context_events()? {
+            if let Event::Publication(r) = event {
+                records.entry(r.id.clone()).or_insert_with(|| r.clone());
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     pub fn file(&self, relative: &str) -> Result<Option<Vec<u8>>, String> {
@@ -436,15 +513,9 @@ impl<'s> Conversation<'s> {
     }
 
     fn require_format(&self) -> Result<(), String> {
-        for path in [".caos/turns", ".caos/calls", ".caos/tasks"] {
-            if self.snapshot.exists(path)? {
-                return Err("conversation uses PR196's interim storage layout; open it with the preserved PR196 build".into());
-            }
-        }
-
         let bytes = self.required_blob(paths::FORMAT)?;
         if bytes != paths::FORMAT_BYTES.as_bytes() {
-            return Err("unsupported conversation format".to_string());
+            return Err("unsupported conversation format; use the preserved build to open earlier conversations".to_string());
         }
         Ok(())
     }
@@ -466,303 +537,11 @@ impl<'s> Conversation<'s> {
             .ok_or_else(|| format!("required path {path} is absent"))
     }
 
-    fn keyed<T: Record>(
-        &self,
-        path: &str,
-        matches_path: impl FnOnce(&T) -> bool,
-        identity: impl FnOnce(&T) -> String,
-    ) -> Result<Option<T>, String> {
-        let record = self
-            .optional_blob(path)?
-            .map(|bytes| T::parse_record(&bytes))
-            .transpose()?;
-        if let Some(record) = record.as_ref() {
-            if !matches_path(record) {
-                return Err(format!(
-                    "record at {path:?} has identity {}, which does not match its path",
-                    identity(record)
-                ));
-            }
-        }
-        Ok(record)
-    }
-
-    fn keyed_all<T, K>(
-        &self,
-        dir: &str,
-        parse_key: impl Fn(&str) -> Result<K, String>,
-        matches_path: impl Fn(&T, &K) -> bool,
-        identity: impl Fn(&T) -> String,
-    ) -> Result<Vec<T>, String>
-    where
-        T: Record,
-    {
-        self.list_optional(dir)?
-            .into_iter()
-            .map(|entry| {
-                let stem = record_stem(dir, &entry)?;
-                let key = parse_key(stem)?;
-                let path = format!("{dir}/{}", entry.name);
-                self.keyed(
-                    &path,
-                    |record| matches_path(record, &key),
-                    |record| identity(record),
-                )?
-                .ok_or_else(|| format!("record {path:?} disappeared"))
-            })
-            .collect()
-    }
-
     fn list_optional(&self, dir: &str) -> Result<Vec<TreeEntry>, String> {
         match self.snapshot.entry(dir)? {
             None => Ok(Vec::new()),
             Some(entry) if entry.mode == Mode::Tree => self.snapshot.list(dir),
             Some(_) => Err(format!("path {dir} is not a directory")),
-        }
-    }
-}
-
-fn record_stem<'a>(dir: &str, entry: &'a TreeEntry) -> Result<&'a str, String> {
-    if entry.mode != Mode::Blob {
-        return Err(format!("invalid record entry {dir}/{:?}", entry.name));
-    }
-    entry
-        .name
-        .strip_suffix(".json")
-        .ok_or_else(|| format!("invalid record entry {dir}/{:?}", entry.name))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::v3::apply::{apply, client_signature, mint, Transition};
-    use crate::v3::oid::ensure_genesis;
-    use crate::v3::records::{IdentityKind, Role};
-    use crate::v3::tree::{MemoryStore, ObjectStore, TreeBuilder};
-
-    fn oid(character: char) -> Oid {
-        Oid::parse(&character.to_string().repeat(40), "test oid").unwrap()
-    }
-
-    fn conversation() -> (MemoryStore, Oid) {
-        let mut store = MemoryStore::new();
-        let genesis = ensure_genesis(&mut store).unwrap();
-        let transition = Transition::ConversationRoot {
-            identity: Identity {
-                id: "conversation".to_string(),
-                kind: IdentityKind::Root,
-                owner: None,
-            },
-            title: "Title".to_string(),
-            workspaces: BTreeMap::from([("main".to_string(), (oid('a'), None))]),
-            files_seed: None,
-        };
-        let root = apply(&mut store, None, &transition).unwrap();
-        let signature = client_signature("Tester", "tester@example.com", 1);
-        let root_head = mint(
-            &mut store,
-            &genesis,
-            &root.tree,
-            transition.kind(),
-            &signature,
-        )
-        .unwrap();
-        let message_id = "message-0";
-        let payload_path = format!("{}/body", paths::transcript_payload_dir(0, message_id));
-        let message = Transition::MessageAppend {
-            entry: TranscriptEntry {
-                message_id: message_id.to_string(),
-                conversation: "conversation".to_string(),
-                role: Role::User,
-                actor: "user".to_string(),
-                request: None,
-                round: None,
-                model: None,
-                blocks: vec![super::super::records::Block::Payload { path: payload_path }],
-                proposal: None,
-                workspace_resolution: None,
-            },
-            payloads: vec![("body".to_string(), b"body".to_vec())],
-        };
-        let appended = apply(&mut store, Some(&root.tree), &message).unwrap();
-        let head = mint(
-            &mut store,
-            &root_head,
-            &appended.tree,
-            message.kind(),
-            &signature,
-        )
-        .unwrap();
-        (store, head)
-    }
-
-    struct CountingStore {
-        inner: MemoryStore,
-        tree_reads: RefCell<BTreeMap<Oid, usize>>,
-    }
-
-    impl ObjectStore for CountingStore {
-        fn read_blob(&self, oid: &Oid) -> Result<Vec<u8>, super::super::tree::StoreError> {
-            self.inner.read_blob(oid)
-        }
-
-        fn read_tree(&self, oid: &Oid) -> Result<Vec<TreeEntry>, super::super::tree::StoreError> {
-            *self.tree_reads.borrow_mut().entry(oid.clone()).or_default() += 1;
-            self.inner.read_tree(oid)
-        }
-
-        fn read_commit(
-            &self,
-            oid: &Oid,
-        ) -> Result<super::super::tree::CommitInfo, super::super::tree::StoreError> {
-            self.inner.read_commit(oid)
-        }
-
-        fn write_blob(&mut self, bytes: &[u8]) -> Result<Oid, super::super::tree::StoreError> {
-            self.inner.write_blob(bytes)
-        }
-
-        fn write_tree(
-            &mut self,
-            entries: &[TreeEntry],
-        ) -> Result<Oid, super::super::tree::StoreError> {
-            self.inner.write_tree(entries)
-        }
-
-        fn write_commit(
-            &mut self,
-            commit: &super::super::tree::CommitInfo,
-        ) -> Result<Oid, super::super::tree::StoreError> {
-            self.inner.write_commit(commit)
-        }
-    }
-
-    #[test]
-    fn opens_commits_and_trees_and_reads_core_state() {
-        let (store, head) = conversation();
-        let expected_parent = store.read_commit(&head).unwrap().parents[0].clone();
-        let view = Conversation::open(&store, &head).unwrap();
-        assert_eq!(view.commit(), Some(&head));
-        assert_eq!(view.parent(), Some(&expected_parent));
-        assert_eq!(view.kind(), Some(Kind::MessageAppend));
-        assert_eq!(view.identity().unwrap().id, "conversation");
-        assert_eq!(view.title().unwrap(), "Title");
-        assert_eq!(view.workspace_names().unwrap(), vec!["main"]);
-        assert_eq!(view.transcript_len().unwrap(), 1);
-        assert_eq!(view.transcript_entry(0).unwrap().unwrap().0, "message-0");
-        assert!(view.transcript_entry(1).unwrap().is_none());
-        assert!(view.active_turn().unwrap().is_none());
-        assert!(view.async_tasks().unwrap().is_empty());
-        assert!(view.children().unwrap().is_empty());
-        assert!(view.publications().unwrap().is_empty());
-        let tree = view.tree().clone();
-        let tree_view = Conversation::open_tree(&store, &tree).unwrap();
-        assert!(tree_view.commit().is_none());
-        assert!(tree_view.parent().is_none());
-        assert!(tree_view.kind().is_none());
-    }
-
-    #[test]
-    fn executable_files_are_readable_and_missing_payloads_error() {
-        let (mut store, head) = conversation();
-        let tree = store.read_commit(&head).unwrap().tree;
-        let mut builder = TreeBuilder::from(Some(tree));
-        builder.put("files/run", Mode::Executable, b"#!/bin/sh\n".to_vec());
-        let tree = builder.build(&mut store).unwrap();
-        let view = Conversation::open_tree(&store, &tree).unwrap();
-        assert_eq!(view.file("run").unwrap().unwrap(), b"#!/bin/sh\n");
-        assert!(view.payload(".caos/missing").is_err());
-    }
-
-    #[test]
-    fn keyed_identity_error_names_path_and_record_identity() {
-        let (mut store, head) = conversation();
-        let tree = store.read_commit(&head).unwrap().tree;
-        let requested = oid('1');
-        let actual = oid('2');
-        let mut builder = TreeBuilder::from(Some(tree));
-        builder.put(
-            &paths::turn_record_path(requested.as_str()),
-            Mode::Blob,
-            TurnRecord {
-                id: actual.clone(),
-                request_head: oid('3'),
-                request_workspaces: None,
-                model: "model".to_string(),
-                configuration: "configuration".to_string(),
-                round: 0,
-                calls: Vec::new(),
-                interjections: Vec::new(),
-                status: super::super::records::TurnStatus::Queued,
-                latest_message: None,
-                escape_reason: None,
-                outcome: None,
-            }
-            .encode(),
-        );
-        let tree = builder.build(&mut store).unwrap();
-        let error = Conversation::open_tree(&store, &tree)
-            .unwrap()
-            .turn(&requested)
-            .unwrap_err();
-        assert!(error.contains(&paths::turn_record_path(requested.as_str())));
-        assert!(error.contains(actual.as_str()));
-    }
-
-    #[test]
-    fn transcript_reads_each_shard_tree_once() {
-        let (mut store, head) = conversation();
-        let base = store.read_commit(&head).unwrap().tree;
-        let mut builder = TreeBuilder::from(Some(base));
-        for ordinal in [999, 1000] {
-            let message_id = format!("message-{ordinal}");
-            builder.put(
-                &paths::transcript_entry_path(ordinal, &message_id),
-                Mode::Blob,
-                TranscriptEntry {
-                    message_id,
-                    conversation: "conversation".to_string(),
-                    role: Role::User,
-                    actor: "user".to_string(),
-                    request: None,
-                    round: None,
-                    model: None,
-                    blocks: Vec::new(),
-                    proposal: None,
-                    workspace_resolution: None,
-                }
-                .encode(),
-            );
-        }
-        let tree = builder.build(&mut store).unwrap();
-        let snapshot = Snapshot::new(&store, tree.clone());
-        let shards: Vec<Oid> = [999, 1000]
-            .into_iter()
-            .map(|ordinal| {
-                snapshot
-                    .entry(&format!(
-                        "{}/{}",
-                        paths::TRANSCRIPT_DIR,
-                        paths::transcript_shard(ordinal)
-                    ))
-                    .unwrap()
-                    .unwrap()
-                    .oid
-            })
-            .collect();
-        let store = CountingStore {
-            inner: store,
-            tree_reads: RefCell::new(BTreeMap::new()),
-        };
-        let view = Conversation::open_tree(&store, &tree).unwrap();
-        store.tree_reads.borrow_mut().clear();
-
-        assert_eq!(view.transcript(999, 1001).unwrap().len(), 2);
-        for shard in shards {
-            assert_eq!(store.tree_reads.borrow().get(&shard), Some(&1));
         }
     }
 }

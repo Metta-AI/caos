@@ -17,8 +17,8 @@ echo "merged" > /tmp/feat/feature.txt
 feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 
 MIXED_CALLS='[
- {"id":"tu_mw","input":{"file-path":"mix.txt","content":"hello"},"name":"write","type":"tool_use"},
- {"id":"tu_create","input":{"action":"create","name":"side","source":"main","stacked":true},"name":"workspaces","type":"tool_use"},
+ {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
+ {"id":"tu_create","input":{"action":"create","name":"side","source":"main"},"name":"workspaces","type":"tool_use"},
  {"id":"tu_mb","input":{"workspace":"main","cmd":"tr a-z A-Z < \"$CAOS_INPUTS/side/mix.txt\" > mix3.txt; test ! -w \"$CAOS_INPUTS/side/mix.txt\"","inputs":{"side":{"workspace":"side","paths":["mix.txt"]}},"paths":["mix.txt"]},"name":"bash","type":"tool_use"},
  {"id":"tu_me","input":{"workspace":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"workspace":"main","pattern":"world"},"name":"grep","type":"tool_use"},
@@ -90,7 +90,6 @@ side_workspace=$(workspace_commit "$head" side)
 fetch_code "$side_workspace" "fetching the new named workspace"
 [ "$(git show "$side_workspace:side.txt")" = isolated ] || fail "explicit side edit missing"
 if git cat-file -e "$workspace:side.txt" 2>/dev/null; then fail "side edit leaked into main"; fi
-record "$head" .caos/workspaces/side/config.json | jq -e --arg commit "$write_output" '.upstream.kind == "workspace" and .upstream.name == "main" and .upstream.commit == $commit and .publication == null' >/dev/null || fail "workspace creation did not preserve its upstream and derive publication settings"
 [ "$(git show "$side_workspace:mix.txt")" = hello ] || fail "input snapshot changed with main"
 grep -qF 'side' /tmp/stub/request-2.json || fail "new workspace missing from model context"
 

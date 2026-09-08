@@ -63,7 +63,7 @@ never overwritten.
 caos tui                  continue the most recent conversation
 caos tui --username alice use alice's active conversation list
 caos tui --new            start a fresh conversation
-caos tui --empty          start without a workspace; attach one later
+caos tui --import feature load this checkout at feature/dirty
 caos tui --server URL     use a specific server
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
@@ -118,7 +118,7 @@ so it never leaves the conversation pane.
 | `Ctrl+L` | Check out the selected workspace in the original matching checkout |
 | `Ctrl+O` | Select, create, attach, or update workspaces |
 | `Ctrl+P` | Preview selected workspaces and their PR destinations; Enter confirms |
-| `/publish-branch` | Push the selected workspace to its configured repository and branch |
+| `/publish-branch` | Push a review boundary to the repository in .base-url, using its path as the branch |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -139,26 +139,25 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+O` for workspaces. Enter switches focus; `n` creates from the
-highlighted workspace's current code, and Tab chooses a separate or dependent
-change. `a` attaches a repository using name, URL and optional branch/full
-commit. `u` updates the connected stack. Selection preserves the draft and
-does not retarget an already admitted request.
+Press `Ctrl+O` to browse commit-entry paths. Enter switches focus; `n` copies
+the highlighted snapshot to a new path. `a` attaches a repository in a directory
+containing `.base-url`, `00-base`, and `dirty`. `u` updates the selected stack.
+Selection preserves the draft and cannot retarget an admitted request.
 
-Press `Ctrl+P` for the publication plan. Space selects workspaces, `a`
-toggles all, `b` edits a base (branch or `@workspace`), and `h` edits the
-published branch. Enter or Ctrl+P confirms; Escape cancels. Selected workspaces
-are prepared in dependency order through ordinary agent merge/build/test turns.
-A stable repository/head branch identifies each PR; changing its base updates
-the existing PR and preserves a manually edited title. Completed PR URLs remain
-visible if a later workspace fails. Conversation records are not exported.
+Use `/workspace seal 01-description` to rename selected `dirty` to a review
+boundary, then `/workspace create feature/dirty` to start the next change from
+that boundary. `rename <from> <to>` and `remove <path>` are ordinary tree edits.
 
-`/workspace` opens the picker. Scriptable forms include
-`create <name>`, `stack <name>`, `attach <name> <repo> [<branch>|<sha>]`,
-`update [<name>|--all]`, `branch <name> <branch>`, and `remove <name>`.
-Base changes appear as “needs update” in the picker. Stack updates stop on the
-first conflict and leave that workspace unchanged.
-`/publish-branch` remains a direct push without preparation or a PR.
+`Ctrl+P` previews the selected directory's numbered boundaries. Branch names are
+their full paths; the first PR targets the branch in `.base-url` and later PRs
+target the preceding boundary. `00-base` and `dirty` are excluded. Space selects
+rows, `a` toggles all, Enter confirms, and Escape cancels. Change destinations by
+editing `.base-url` or renaming entries before previewing.
+
+`/workspace` and `/workspace list` open the picker. `update [directory|--all]`
+incorporates fetched base changes into all affected references atomically;
+conflicts leave the conversation unchanged. `/publish-branch` directly pushes
+the selected review boundary without preparation or PR creation.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -170,9 +169,10 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-The launcher uses the original checkout's HEAD, with `--base` or
-`--from` as overrides. With no checkout or `--empty`, the conversation starts
-without code. `/from <turn-hash>` forks the selected conversation history.
+The launcher starts without code. `--import feature` explicitly loads the
+checkout's committed HEAD at `feature/dirty`; `--base` selects another commit.
+`/from <turn-hash>` forks the selected conversation history. Old v3 conversations
+require the previous build; this version does not migrate them implicitly.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab

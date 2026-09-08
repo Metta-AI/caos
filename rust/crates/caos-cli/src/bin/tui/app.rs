@@ -25,9 +25,7 @@ use ratatui_crossterm::crossterm::event::{
 };
 
 use super::args::Args;
-use super::workspace::{
-    commit_working_tree, load_conversation_workspace, local_default_branch_tip, pr_base_branch,
-};
+use super::workspace::{commit_working_tree, load_conversation_workspace};
 
 #[path = "ui.rs"]
 pub(crate) mod ui;
@@ -981,7 +979,7 @@ const COMMANDS: [Command; 10] = [
     },
     Command {
         name: "/workspace",
-        usage: "/workspace [use|create|stack|rollback|remove] ...",
+        usage: "/workspace [list|use|attach|create|rename|seal|update|remove] ...",
         description: "list or manage named workspaces",
         action: AppAction::Workspace,
         takes_argument: true,
@@ -1151,6 +1149,18 @@ impl ConversationState {
                     .any(|workspace| workspace.name == name) =>
             {
                 previous_selection
+            }
+            _ if load
+                .workspaces
+                .iter()
+                .filter(|ws| ws.name.rsplit('/').next() == Some("dirty"))
+                .count()
+                == 1 =>
+            {
+                load.workspaces
+                    .iter()
+                    .find(|ws| ws.name.rsplit('/').next() == Some("dirty"))
+                    .map(|ws| ws.name.clone())
             }
             _ if load.workspaces.len() == 1 => Some(load.workspaces[0].name.clone()),
             _ => None,
@@ -2089,12 +2099,6 @@ impl App {
             return;
         }
 
-        if let Some(prompt) = self.selected_mut().publish_plan.as_mut() {
-            if let Some((_, input)) = &mut prompt.edit {
-                input.push_str(text.trim());
-            }
-            return;
-        }
         self.selected_mut().composer.insert_paste(text);
     }
 
@@ -2678,7 +2682,7 @@ impl App {
     fn run_workspace_command(&mut self, arguments: &str) {
         let parts = arguments.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
-            [] => self.open_workspace_picker(),
+            [] | ["list"] => self.open_workspace_picker(),
             ["update"] => self.update_selected_stack(None),
             ["update", name] => self.update_selected_stack(Some((*name).to_string())),
             ["use", name] => match self.selected_mut().select_workspace(name) {
@@ -2704,48 +2708,47 @@ impl App {
                     Ok(format!("Attached {repository} as workspace {name:?}."))
                 });
             }
-            ["branch", name, branch] => {
-                let name = (*name).to_string();
-                let branch = (*branch).to_string();
-                self.start_workspace_mutation("setting publication branch", move |transport, conversation| {
-                    let load = conversation_load(transport, conversation)?.ok_or("conversation disappeared")?;
-                    let mut config = load.workspaces.into_iter().find(|ws| ws.name == name).ok_or("workspace disappeared")?.config;
-                    config.publication = Some(conversation_protocol::v3::PublicationDestination {
-                        repository: Some(caos_cli::workspaces::repository_url(transport, &config)?),
-                        branch: branch.clone(),
-                        base: config.publication.as_ref().and_then(|p| p.base.clone()),
-                    });
-                    caos_cli::workspaces::configure(transport, conversation, &name, config)?;
-                    Ok(format!("Workspace {name:?} will publish to {branch}."))
+            ["rename", source, destination] => {
+                let source = (*source).to_string();
+                let destination = (*destination).to_string();
+                self.start_workspace_mutation("renaming reference", move |transport, conversation| {
+                    caos_cli::workspaces::rename_reference(transport, conversation, &source, &destination)?;
+                    Ok(format!("Renamed {source} to {destination}."))
                 });
             }
-            ["create", name] | ["stack", name] | ["copy", name] => {
+            ["seal", boundary] => {
+                let source = match self.selected().require_selected_workspace() {
+                    Ok(ws) => ws.name.clone(),
+                    Err(error) => { self.selected_mut().show_command_error(error); return; }
+                };
+                if source.rsplit('/').next() != Some("dirty")
+                    || !conversation_protocol::v3::workspaces::is_boundary(boundary) {
+                    self.selected_mut().show_command_error("select dirty, then /workspace seal 01-description");
+                    return;
+                }
+                let destination = source.rsplit_once('/').map(|(dir, _)| format!("{dir}/{boundary}")).unwrap_or_else(|| (*boundary).to_string());
+                self.start_workspace_mutation("sealing change", move |transport, conversation| {
+                    caos_cli::workspaces::rename_reference(transport, conversation, &source, &destination)?;
+                    Ok(format!("Ready for review: {destination}."))
+                });
+            }
+            ["create", name] | ["copy", name] => {
                 let source = match self.selected().require_selected_workspace() {
                     Ok(workspace) => workspace.name.clone(),
                     Err(error) => { self.selected_mut().show_command_error(error); return; }
                 };
                 let name = (*name).to_string();
-                let creation = match parts[0] {
-                    "stack" => caos_cli::workspaces::Creation::Stack,
-                    "copy" => caos_cli::workspaces::Creation::Copy,
-                    _ => caos_cli::workspaces::Creation::FromUpstream,
-                };
                 self.start_workspace_mutation("creating workspace", move |transport, conversation| {
-                    caos_cli::workspaces::create_from_workspace(transport, conversation, &name, &source, creation)?;
+                    caos_cli::workspaces::create_from_workspace(transport, conversation, &name, &source)?;
                     Ok(format!("Created workspace {name:?} from {source:?}."))
                 });
             }
             ["create", name, rev] => {
                 let name = (*name).to_string();
                 let rev = (*rev).to_string();
-                let config = self.selected().require_selected_workspace().ok().map(|workspace| workspace.config.clone());
                 self.start_workspace_mutation("creating workspace", move |transport, conversation| {
                     let commit = resolve_workspace_revision(transport, &rev)?;
-                    if let Some(config) = config {
-                        caos_cli::create_workspace_with_config(transport, conversation, &name, &commit, config)?;
-                    } else {
-                        create_workspace(transport, conversation, &name, &commit)?;
-                    }
+                    create_workspace(transport, conversation, &name, &commit)?;
                     Ok(format!("Created workspace {name:?} at {}.", short_hash(&commit)))
                 });
             }
@@ -2773,7 +2776,7 @@ impl App {
                 });
             }
             _ => self.selected_mut().show_command_error(
-                "usage: /workspace [use <name>|create <name> [<rev>]|attach <name> <repo> [<branch>|<sha>]|branch <name> <branch>|stack <name>|copy <name>|update [<name>|--all]|rollback <name> <rev>|remove <name>]",
+                "usage: /workspace [list|use <path>|create <path> [<rev>]|attach <directory> <repo> [<branch>|<sha>]|rename <from> <to>|seal <NN-description>|update [<directory>|--all]|rollback <path> <rev>|remove <path>]",
             ),
         }
     }
@@ -4282,7 +4285,11 @@ fn new_conversation_options(
                 &base,
             )?;
             *seeds = std::collections::BTreeMap::from([(
-                "main".into(),
+                seeds
+                    .keys()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "code/dirty".into()),
                 caos_cli::InitialWorkspace {
                     commit: base.clone(),
                     config,
@@ -4300,7 +4307,10 @@ fn new_conversation_options(
     }
     let base = match requested_base {
         Some(base) => base,
-        None => local_default_branch_tip(repo_dir)?.1,
+        None => {
+            options.base = None;
+            return Ok((options, String::new()));
+        }
     };
     options.base = Some(base.clone());
     Ok((options, base))
@@ -4366,8 +4376,7 @@ mod tests {
         TurnStatus,
     };
     use conversation_protocol::v3::refs;
-    use conversation_protocol::v3::view::Conversation;
-    use conversation_protocol::v3::{GitStore, ObjectStore, Oid, RefUpdate};
+    use conversation_protocol::v3::{GitStore, Oid, RefUpdate};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -4443,12 +4452,11 @@ mod tests {
     }
 
     fn mint_test_transition(store: &mut GitStore, parent: &Oid, transition: &Transition) -> Oid {
-        let parent_tree = store.read_commit(parent).unwrap().tree;
-        let applied = apply(store, Some(&parent_tree), transition).unwrap();
+        let applied = apply(store, Some(parent), transition).unwrap();
         mint(
             store,
             parent,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("CAOS test", "caos-test@example.invalid", 1_700_000_000),
         )
@@ -4472,10 +4480,10 @@ mod tests {
                 owner: None,
             },
             title: message.to_string(),
-            workspaces: BTreeMap::from([("main".to_string(), (base, None))]),
+            workspaces: BTreeMap::from([("main".to_string(), base)]),
             files_seed: None,
         };
-        let root_tree = apply(&mut store, None, &root_transition).unwrap().tree;
+        let root_tree = apply(&mut store, None, &root_transition).unwrap();
         let root = mint(
             &mut store,
             &genesis,
@@ -4506,15 +4514,12 @@ mod tests {
         let request = queued.then(|| "b".repeat(40));
         if let Some(request) = request.as_deref() {
             let request = Oid::parse(request, "test request").unwrap();
-            let request_workspaces = Conversation::open(&store, &head)
-                .unwrap()
-                .workspaces_tree()
-                .unwrap();
+
             let admission = Transition::TurnAdmit {
                 record: TurnRecord {
                     id: request,
                     request_head: head.clone(),
-                    request_workspaces,
+
                     model: "test-model".to_string(),
                     configuration: "test-configuration".to_string(),
                     round: 0,
@@ -5442,8 +5447,8 @@ mod tests {
     }
 
     #[test]
-    fn new_conversations_default_to_the_local_default_branch_tip() {
-        let (dir, remote, tip) = repo_with_default_branch("default-base", "release/next");
+    fn new_conversations_do_not_import_the_local_default_branch() {
+        let (dir, remote, _tip) = repo_with_default_branch("default-base", "release/next");
         let previous = TurnOptions {
             base: Some("old conversation base".to_string()),
             ..TurnOptions::default()
@@ -5451,8 +5456,8 @@ mod tests {
 
         let (options, base) = new_conversation_options(previous, None, &dir).unwrap();
 
-        assert_eq!(base, tip);
-        assert_eq!(options.base.as_deref(), Some(tip.as_str()));
+        assert!(base.is_empty());
+        assert_eq!(options.base, None);
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(remote).unwrap();
     }
@@ -7156,7 +7161,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_preview_preserves_drafts_and_edits_targets() {
+    fn publication_preview_preserves_drafts_and_selection() {
         use caos_cli::workspaces::PublicationTarget;
         let mut conversation = state("talk-1");
         conversation.composer.insert_str("preserve this draft");
@@ -7164,7 +7169,6 @@ mod tests {
             id: 1,
             loading: false,
             selected: 0,
-            edit: None,
             error: None,
             rows: vec![PlanRow {
                 included: true,
@@ -7181,16 +7185,6 @@ mod tests {
         });
         let (mut app, _) = app_with(vec![conversation]);
         assert!(rendered_screen(&app).contains("Publish workspaces"));
-        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        app.insert_paste("origin/release/next");
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            app.selected().publish_plan.as_ref().unwrap().rows[0]
-                .target
-                .base,
-            caos_cli::workspaces::PublicationBase::Branch("release/next".into())
-        );
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app
@@ -7312,7 +7306,7 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
-        let (dir, remote, tip) = repo_with_default_branch("palette-archive", "main");
+        let (dir, remote, _tip) = repo_with_default_branch("palette-archive", "main");
         app.repo_dir = dir.clone();
         app.selected = 1;
 
@@ -7333,10 +7327,7 @@ mod tests {
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().title, "talk-2");
         assert_ne!(app.selected().id, app.selected().title);
-        assert_eq!(
-            app.selected().turn_options.base.as_deref(),
-            Some(tip.as_str())
-        );
+        assert_eq!(app.selected().turn_options.base.as_deref(), None);
         assert!(app.selected().remote_head.is_none());
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(remote).unwrap();
@@ -7746,7 +7737,7 @@ mod tests {
 
     #[test]
     fn failed_last_conversation_fork_keeps_a_safe_app_state() {
-        let (repo, remote, tip) = repo_with_default_branch("last-fork-failure", "main");
+        let (repo, remote, _tip) = repo_with_default_branch("last-fork-failure", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut fork = state("forked");
         fork.forking = true;
@@ -7763,10 +7754,7 @@ mod tests {
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected, 0);
         assert!(!app.selected().forking);
-        assert_eq!(
-            app.selected().turn_options.base.as_deref(),
-            Some(tip.as_str())
-        );
+        assert_eq!(app.selected().turn_options.base.as_deref(), None);
         assert_eq!(app.selected().composer.text, "preserve this draft");
         assert!(app.selected().remote_title.is_none());
         assert!(app.selected().remote_head.is_none());
@@ -7782,7 +7770,7 @@ mod tests {
 
     #[test]
     fn failed_fork_preserves_its_draft_with_other_conversations_open() {
-        let (repo, remote, tip) = repo_with_default_branch("multi-fork-failure", "main");
+        let (repo, remote, _tip) = repo_with_default_branch("multi-fork-failure", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let mut fork = state("forked");
         fork.forking = true;
@@ -7800,10 +7788,7 @@ mod tests {
         assert_eq!(app.conversations.len(), 2);
         assert_eq!(app.selected().id, "forked");
         assert!(!app.selected().forking);
-        assert_eq!(
-            app.selected().turn_options.base.as_deref(),
-            Some(tip.as_str())
-        );
+        assert_eq!(app.selected().turn_options.base.as_deref(), None);
         assert_eq!(app.selected().composer.text, "preserve this draft");
 
         std::fs::remove_dir_all(repo).unwrap();

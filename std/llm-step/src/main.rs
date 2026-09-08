@@ -211,10 +211,6 @@ fn validate_admission(
             "request head {request_head} is not on the conversation spine"
         ));
     }
-    let at_request = state.conversation_at(request_head)?;
-    if at_request.workspaces_tree()? != record.request_workspaces {
-        return Err("request workspaces diverged".to_string());
-    }
     VALID_ADMISSIONS
         .get_or_init(Default::default)
         .lock()
@@ -706,10 +702,11 @@ fn render_tool_observation(
         return Ok(observation);
     }
     if tool.name == subagents::SPAWN_TOOL {
-        let parent = view.identity()?.id;
-        let child_id = ids::child_id(&parent, &tool.request, tool.round, &tool.id)?;
+        let child_id = observation["child"]
+            .as_str()
+            .ok_or("spawn observation has no child")?;
         let child = view
-            .child(&child_id)?
+            .child(child_id)?
             .ok_or_else(|| format!("spawn tool {} has no child record {child_id}", tool.id))?;
         return Ok(subagents::spawn_result(
             &tool.id,
@@ -1100,10 +1097,22 @@ fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    // An explicit workspace always owns its paths, including a directory
-    // named files. The files/ shorthand applies only without a workspace.
-    if requested.is_none() && inline_files_path(call).is_some() {
-        return Ok(Target::Files);
+    if requested.is_none() {
+        if matches!(call.name.as_str(), "read" | "ls") && call.input.get("root").is_some() {
+            return Ok(Target::Files);
+        }
+        if let Some((_, path)) = inline_files_path(call) {
+            for name in view.workspace_names()?.into_iter().rev() {
+                if path == name || path.starts_with(&format!("{name}/")) {
+                    let commit = view
+                        .workspace(&name)?
+                        .ok_or("reference disappeared")?
+                        .commit;
+                    return Ok(Target::Workspace { name, commit });
+                }
+            }
+            return Ok(Target::Files);
+        }
     }
     let (name, commit) = workspace_target(view, requested)?
         .ok_or_else(|| "this conversation has no workspace".to_string())?;
@@ -1140,7 +1149,7 @@ fn workspace_target(
 }
 
 fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
-    if !tools::is_inline(&call.name) || call.input.get("root").is_some() {
+    if !tools::is_inline(&call.name) {
         return None;
     }
     let key = if call.name == "ls" {
@@ -1150,12 +1159,12 @@ fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
     };
     let path = call
         .input
-        .get(key)?
-        .as_str()?
+        .get(key)
+        .and_then(Value::as_str)
+        .or_else(|| (call.name == "ls").then_some("."))?
         .trim()
         .trim_start_matches('/');
-    path.strip_prefix("files/")
-        .map(|relative| (key, relative.to_string()))
+    Some((key, path.to_string()))
 }
 
 fn materialize_workspace(
@@ -1802,7 +1811,16 @@ fn execute_inline(
     match target {
         Target::Workspace { name, commit } => {
             let (ws, _) = materialize_workspace(state, &commit)?;
-            let clean = call_without_workspace(call);
+            let mut clean = call_without_workspace(call);
+            if call.input.get("workspace").is_none() {
+                if let Some((key, path)) = inline_files_path(call) {
+                    if path == name {
+                        clean["input"][key] = json!(".");
+                    } else if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
+                        clean["input"][key] = json!(relative);
+                    }
+                }
+            }
             let (block, new_ws) = tools::execute(&clean, &ws)?;
             let (proposal, resolution) = match new_ws {
                 None => (None, None),
@@ -1824,11 +1842,21 @@ fn execute_inline(
             site.complete(state, block, Some((name, commit)), proposal, resolution)?;
         }
         Target::Files => {
-            let (key, relative) =
-                inline_files_path(call).ok_or("conversation-file call has no files/ path")?;
+            let file_path = inline_files_path(call);
+            let (key, relative) = file_path.clone().unwrap_or(("file-path", String::new()));
+            if matches!(call.name.as_str(), "write" | "edit")
+                && (relative == ".caos" || relative.starts_with(".caos/"))
+            {
+                return site.fail(
+                    state,
+                    ".caos is protocol metadata; use conversation commands to change it",
+                );
+            }
             let root = materialize_files(state)?;
             let mut clean = call_without_workspace(call);
-            clean["input"][key] = Value::String(relative.clone());
+            if file_path.is_some() {
+                clean["input"][key] = Value::String(relative.clone());
+            }
             let (block, new_root) = tools::execute(&clean, &root)?;
             let (files, outcome) = match new_root {
                 None => (Vec::new(), None),
@@ -1870,11 +1898,7 @@ fn execute_inline(
 }
 
 fn materialize_files(state: &mut progress::State) -> Result<String, String> {
-    let files = state
-        .conversation()?
-        .snapshot()
-        .entry(paths::FILES_DIR)?
-        .map(|entry| entry.oid);
+    let files = Some(state.conversation()?.tree().clone());
     let output = fresh("conversation-files");
     match files {
         Some(tree) => caos(["get-hash", tree.as_str(), &output])?,
@@ -1935,30 +1959,13 @@ fn spawn_agent_call(
     let parent_view = state.conversation()?;
     let parent_id = parent_view.identity()?.id;
     let actor = newest_user_actor(&parent_view)?;
-    let child_config = target
-        .as_ref()
-        .map(|(name, _)| parent_view.workspace_config(name))
-        .transpose()?
-        .map(|mut config| {
-            config.publication = None;
-            if matches!(
-                config.upstream,
-                Some(conversation_protocol::v3::WorkspaceBase::Workspace { .. })
-            ) {
-                config.upstream = None;
-            }
-            config
-        });
+
     let prompt_path = tool_arguments_path(&parent_view, request, site.round, &call.id)?;
     drop(parent_view);
     let child_id = ids::child_id(&parent_id, request, site.round, &call.id)?;
     let signature = inherited_signature(state.store(), &parent_head)?;
     let genesis = conversation_protocol::v3::oid::ensure_genesis(state.store_mut())?;
-    let workspaces = target
-        .clone()
-        .into_iter()
-        .map(|(name, commit)| (name, (commit, None)))
-        .collect::<BTreeMap<_, _>>();
+    let workspaces = target.clone().into_iter().collect::<BTreeMap<_, _>>();
     let root_transition = Transition::ConversationRoot {
         identity: Identity {
             id: child_id.clone(),
@@ -1975,7 +1982,7 @@ fn spawn_agent_call(
         workspaces,
         files_seed: None,
     };
-    let root_tree = apply(state.store_mut(), None, &root_transition)?.tree;
+    let root_tree = apply(state.store_mut(), None, &root_transition)?;
     let root = mint(
         state.store_mut(),
         &genesis,
@@ -1983,22 +1990,6 @@ fn spawn_agent_call(
         root_transition.kind(),
         &signature,
     )?;
-    let root = if let (Some((name, _)), Some(config)) = (
-        target.as_ref(),
-        child_config.filter(|config| config != &Default::default()),
-    ) {
-        mint_detached(
-            state,
-            &root,
-            &Transition::WorkspaceConfigure {
-                name: name.clone(),
-                config,
-            },
-            &signature,
-        )?
-    } else {
-        root
-    };
     let prompt_message = ids::protocol_id("subagent-prompt", &json!({"child": child_id.as_str()}))?;
     let prompt_transition = Transition::MessageAppend {
         entry: TranscriptEntry {
@@ -2021,12 +2012,12 @@ fn spawn_agent_call(
     state.push_code(&prompt_head)?;
     let (configuration, child_request) =
         subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
-    let request_workspaces = state.conversation_at(&prompt_head)?.workspaces_tree()?;
+
     let admit = Transition::TurnAdmit {
         record: TurnRecord {
             id: child_request.clone(),
             request_head: prompt_head.clone(),
-            request_workspaces,
+
             model: cfg.model.clone(),
             configuration: configuration.to_string(),
             round: 0,
@@ -2108,12 +2099,7 @@ fn mint_detached(
     transition: &Transition,
     signature: &conversation_protocol::v3::Signature,
 ) -> Result<Oid, String> {
-    let parent_tree = state
-        .store()
-        .read_commit(parent)
-        .map_err(String::from)?
-        .tree;
-    let tree = apply(state.store_mut(), Some(&parent_tree), transition)?.tree;
+    let tree = apply(state.store_mut(), Some(parent), transition)?;
     mint(
         state.store_mut(),
         parent,
@@ -2949,7 +2935,7 @@ fn with_workspace(mut declaration: Value) -> Value {
             "workspace".to_string(),
             json!({
                 "type":"string",
-                "description":"Target workspace name. Required when there are several workspaces. Without workspace, inline file tools use files/ for conversation-owned files; an explicit workspace makes every path workspace-relative."
+                "description":"Target workspace name. Required when there are several workspaces. Without workspace, inline file tools edit ordinary conversation paths. An explicit workspace is a commit-entry path and makes every path code-relative."
             }),
         );
     }
@@ -3287,7 +3273,7 @@ mod tests {
     use conversation_protocol::v3::apply::{apply as apply_transition, client_signature, mint};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::{
-        GitStore, Identity, IdentityKind, MemoryStore, RefUpdate, TreeBuilder, WorkspaceOrigin,
+        GitStore, Identity, IdentityKind, MemoryStore, RefUpdate, TreeBuilder,
     };
 
     use super::*;
@@ -3347,15 +3333,14 @@ mod tests {
         parent: &Oid,
         transition: Transition,
     ) -> Result<Oid, String> {
-        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
-        let applied = apply_transition(store, Some(&parent_tree), &transition)?;
+        let applied = apply_transition(store, Some(parent), &transition)?;
         let signature = inherited_signature(store, parent)?;
-        mint(store, parent, &applied.tree, transition.kind(), &signature)
+        mint(store, parent, &applied, transition.kind(), &signature)
     }
 
     fn root_with(
         store: &mut dyn ObjectStore,
-        workspaces: BTreeMap<String, (Oid, Option<WorkspaceOrigin>)>,
+        workspaces: BTreeMap<String, Oid>,
     ) -> Result<Oid, String> {
         let genesis = ensure_genesis(store)?;
         let transition = Transition::ConversationRoot {
@@ -3372,7 +3357,7 @@ mod tests {
         mint(
             store,
             &genesis,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("test", "test@example.invalid", 1),
         )
@@ -3493,7 +3478,7 @@ mod tests {
             },
         )?;
         let request = Oid::parse(&"a".repeat(40), "request")?;
-        let request_workspaces = Conversation::open(&store, &user)?.workspaces_tree()?;
+
         let admitted = append_memory(
             &mut store,
             &user,
@@ -3501,7 +3486,7 @@ mod tests {
                 record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
-                    request_workspaces,
+
                     model: "test-model".to_string(),
                     configuration: "test-config".to_string(),
                     round: 0,
@@ -3830,7 +3815,8 @@ mod tests {
     #[test]
     fn subagent_notice_is_idempotent_and_names_the_checkpoint() {
         let mut store = MemoryStore::new();
-        let head = conversation_protocol::v3::fixtures::golden(&mut store);
+        let fork = conversation_protocol::v3::fixtures::golden(&mut store);
+        let head = store.read_commit(&fork).unwrap().parents[0].clone();
         let view = Conversation::open(&store, &head).unwrap();
         let child = view.children().unwrap().into_iter().next().unwrap();
         let terminal = child.terminal_head.clone().unwrap();
@@ -3896,10 +3882,7 @@ mod tests {
         )
         .unwrap();
         let request = test_oid('d');
-        let request_workspaces = Conversation::open(&store, &user)
-            .unwrap()
-            .workspaces_tree()
-            .unwrap();
+
         let admitted = append_memory(
             &mut store,
             &user,
@@ -3907,7 +3890,7 @@ mod tests {
                 record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
-                    request_workspaces,
+
                     model: "test-model".to_string(),
                     configuration: "test-config".to_string(),
                     round: 0,
@@ -3939,12 +3922,26 @@ mod tests {
     #[test]
     fn explicit_workspace_files_path_targets_workspace() {
         let mut store = MemoryStore::default();
-        let head = root_with(
-            &mut store,
-            BTreeMap::from([("main".into(), (test_oid('a'), None))]),
-        )
-        .unwrap();
+        let head = root_with(&mut store, BTreeMap::from([("main".into(), test_oid('a'))])).unwrap();
         let view = Conversation::open(&store, &head).unwrap();
+        let browse = Call {
+            id: "browse".into(),
+            name: "ls".into(),
+            input: json!({}),
+        };
+        assert!(matches!(
+            resolve_target(&view, &browse).unwrap(),
+            Target::Files
+        ));
+        let read = Call {
+            id: "read".into(),
+            name: "read".into(),
+            input: json!({"file-path":"main/README.md"}),
+        };
+        assert!(matches!(
+            resolve_target(&view, &read).unwrap(),
+            Target::Workspace { .. }
+        ));
         for (name, path_arg) in [
             ("read", "file-path"),
             ("write", "file-path"),
@@ -3989,8 +3986,8 @@ mod tests {
             "this conversation has no workspace"
         );
         let workspaces = BTreeMap::from([
-            ("api".to_string(), (test_oid('a'), None)),
-            ("web".to_string(), (test_oid('b'), None)),
+            ("api".to_string(), test_oid('a')),
+            ("web".to_string(), test_oid('b')),
         ]);
         let two = root_with(&mut store, workspaces).unwrap();
         assert_eq!(
