@@ -203,6 +203,22 @@ case "$banner" in
         ;;
 esac
 echo "installed $PREFIX/bin/caos ($stamped)" >&2
+
+# The iroh tunnel, from the SAME release. Ours, not n0's: iroh compiles in a
+# copy of Mozilla's roots, and where egress is a TLS-intercepting proxy the
+# relay presents that proxy's certificate -- so n0's build reaches no relay at
+# all. See dev/claude-code/dumbpipe-system-certs.patch.
+#
+# Not fatal when absent: a build from before this existed has no such asset,
+# and a client that works without a tunnel is better than no client. The
+# session hook already says plainly when CAOS_IROH_TICKET is set and the tunnel
+# is missing.
+if curl -fsSL "${url%/*}/dumbpipe-x86_64-linux" -o "$tmp/dumbpipe" 2>/dev/null; then
+    install -m 0755 "$tmp/dumbpipe" "$PREFIX/bin/dumbpipe"
+    echo "installed $PREFIX/bin/dumbpipe" >&2
+else
+    echo "no tunnel in $VERSION; CAOS_IROH_TICKET will not work" >&2
+fi
 }
 
 # Already current? Then skip the DOWNLOAD -- not the repo files below. This now
@@ -213,7 +229,10 @@ echo "installed $PREFIX/bin/caos ($stamped)" >&2
 # The wrapper records the build it installed, which makes the question
 # answerable by reading three lines of shell. `--force` reinstalls regardless,
 # which is what to reach for when the binary itself is suspect.
-if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] \
+# The tunnel is part of "installed": a snapshot from before it existed has a
+# current client and no tunnel, and testing only the client would keep skipping
+# the download that would fix that.
+if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] && [ -x "$PREFIX/bin/dumbpipe" ] \
    && grep -qF "CAOS_REV:-$VERSION}" "$PREFIX/bin/caos" 2>/dev/null; then
     echo "$PREFIX/bin/caos is already $VERSION" >&2
 else

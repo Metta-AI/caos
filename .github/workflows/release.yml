@@ -1,12 +1,13 @@
 # Publish the caos Claude Code client.
 #
-# The release carries four assets, which together are everything a machine that
+# The release carries five assets, which together are everything a machine that
 # has never seen caos needs:
 #
 #   caos-x86_64-linux      the client, statically linked
+#   dumbpipe-x86_64-linux  the iroh tunnel, patched to use the OS trust store
 #   claude-settings.json   the hooks and the deny list
 #   mcp.json               the tool server declaration
-#   install.sh             fetches the three above and puts them in place
+#   install.sh             fetches the client and puts it in place
 #
 # WHY A RELEASE AND NOT A BUILD IN THE CONSUMER. A Claude Code cloud VM has a
 # five-minute setup budget and a filesystem snapshot; compiling there spends the
@@ -53,6 +54,18 @@ jobs:
       - name: Build the client
         run: nix build .#caos-cli
 
+      # The iroh tunnel, patched to use the OS trust store
+      # (dev/claude-code/dumbpipe-system-certs.patch). Built here rather than
+      # taken from n0's releases, because n0's compiles in Mozilla's roots and
+      # a cloud container's egress is a TLS-intercepting proxy -- the stock
+      # binary cannot reach any relay there.
+      #
+      # A separate `nix build` invocation on purpose: two installables with two
+      # `-o` flags do NOT produce two symlinks, and the one you read can be a
+      # previous build or missing entirely.
+      - name: Build the tunnel
+        run: nix build .#dumbpipe-caos -o result-dumbpipe
+
       # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
       # the real binary elsewhere in the store. The wrapper is not distributable
       # -- it names /nix/store paths that do not exist anywhere else -- so what
@@ -86,6 +99,19 @@ jobs:
 
           mkdir -p dist
           install -m 0755 "$inner" dist/caos-x86_64-linux
+          # The tunnel needs no unwrapping: pkgsStatic produces the executable
+          # itself, not a wrapper naming store paths.
+          install -m 0755 result-dumbpipe/bin/dumbpipe dist/dumbpipe-x86_64-linux
+          file dist/dumbpipe-x86_64-linux | grep -qE 'static-pie linked|statically linked' \
+            || { echo "the tunnel is not static:"; file dist/dumbpipe-x86_64-linux; exit 1; } >&2
+          # The patch is the whole reason we build our own, and a silently
+          # unpatched binary would look identical until it met an intercepting
+          # proxy months later. rustls-native-certs puts these in the binary;
+          # n0's build has none of them.
+          for marker in SSL_CERT_FILE SSL_CERT_DIR; do
+            grep -aq "$marker" dist/dumbpipe-x86_64-linux \
+              || { echo "the tunnel does not read the OS trust store ($marker absent)"; exit 1; } >&2
+          done
           cp dev/claude-code/settings.json dist/claude-settings.json
           cp dev/claude-code/mcp.json      dist/mcp.json
           # Copied, not stamped. install.sh resolves the build from its --base
@@ -108,6 +134,11 @@ jobs:
           case "$cc" in
             *"cc hook"*|*"cc serve"*) echo "cc subcommands present" ;;
             *) echo "the built client has no \`cc\` surface:"; printf '%s\n' "$cc"; exit 1 ;;
+          esac
+          dp="$(./dist/dumbpipe-x86_64-linux --help 2>&1 || true)"
+          case "$dp" in
+            *"dumb pipe"*) echo "tunnel runs" ;;
+            *) echo "the built tunnel does not run:"; printf '%s\n' "$dp" | head -3; exit 1 ;;
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
@@ -140,6 +171,7 @@ jobs:
           prerelease: ${{ github.ref_type != 'tag' }}
           files: |
             dist/caos-x86_64-linux
+            dist/dumbpipe-x86_64-linux
             dist/claude-settings.json
             dist/mcp.json
             dist/install.sh

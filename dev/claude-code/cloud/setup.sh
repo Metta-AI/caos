@@ -100,26 +100,11 @@ if ! command -v caos >/dev/null 2>&1; then
 fi
 caos --version >&2 2>/dev/null || true
 
-# ---------------------------------------------------------------------------
-# dumbpipe, when the caos server is reached over iroh
-# ---------------------------------------------------------------------------
-# Only needed if CAOS_IROH_TICKET is set at session time, but installed
-# unconditionally: this is the one place that can write to the snapshot, and a
-# 4 MB binary is cheaper than discovering later that it is missing.
-#
-# PINNED, and not asked of api.github.com. That query was anonymous, so it is
-# rate limited per IP and a cloud VM shares its address with every other cloud
-# VM -- the same 403 that killed the client install, except this one fell back
-# silently and would have gone on doing so until the pinned version rotted.
-# A version bump here is a one-line edit; a mystery 403 is not.
-dp_tag=v0.39.0
-curl -fsSL "https://github.com/n0-computer/dumbpipe/releases/download/$dp_tag/dumbpipe-$dp_tag-linux-x86_64.tar.gz" \
-    | tar xz -C /usr/local/bin ./dumbpipe || true
-chmod 0755 /usr/local/bin/dumbpipe 2>/dev/null || true
-# Not fatal -- CAOS_SERVER_URL alone is a valid arrangement -- but said out
-# loud, because the alternative is discovering it at session start.
-command -v dumbpipe >/dev/null 2>&1 \
-    || echo "WARNING: dumbpipe did not install; CAOS_IROH_TICKET will not work" >&2
+# The iroh tunnel arrives with the client, from the same release, so there is
+# nothing to install here. It used to be fetched from n0's releases and pinned
+# by hand; that binary compiles in a copy of Mozilla's roots and cannot reach a
+# relay through a TLS-intercepting proxy, which is what a cloud container's
+# egress is. Ours is patched to read the OS trust store.
 
 # The per-session work: the tunnel and the git remote. What goes in the
 # snapshot is a BOOTSTRAP that fetches the real script every session, not the
