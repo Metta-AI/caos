@@ -515,7 +515,7 @@ fn retarget_transcript_transition(
     let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
     match &mut transition {
         Transition::MessageAppend { entry, payloads }
-        | Transition::RequestInterject {
+        | Transition::TurnInterject {
             entry, payloads, ..
         }
         | Transition::ModelComplete {

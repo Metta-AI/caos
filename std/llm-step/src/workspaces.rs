@@ -116,7 +116,7 @@ fn plan(
             let child = view
                 .child(required(input, "child")?)?
                 .ok_or("unknown child")?;
-            if child.status != ChildStatus::Completed {
+            if child.status != TaskStatus::Complete {
                 return Err("wait for the subagent to finish before promoting its result".into());
             }
             let source = required(input, "source")?;

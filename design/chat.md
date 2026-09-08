@@ -310,3 +310,12 @@ Bash can read other workspaces through `inputs`, for example
 `$CAOS_INPUTS/api/schema`; these are immutable snapshots captured in the
 tool’s request. Only the target workspace is staged back. This permits
 integration builds without introducing live shared working directories.
+
+## Lifecycle names in the implementation
+
+A turn owns the model loop and its calls. A call records one tool invocation and
+may reference a background task. Computations and child conversations share
+`TaskStatus` and terminal-transition validation, with variant-specific result
+data. Recovery and completion notices use a combined task view derived from
+the existing records. The historical `requests`, `tools`, `async`, and
+`subagents` storage paths and encodings remain unchanged.

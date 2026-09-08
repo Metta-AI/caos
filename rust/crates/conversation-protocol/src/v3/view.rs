@@ -4,8 +4,8 @@ use super::kinds::Kind;
 use super::oid::Oid;
 use super::paths;
 use super::records::{
-    parse_active_request, parse_title, AsyncRecord, ChildRecord, Identity, PublicationRecord,
-    Record, RequestRecord, ToolRecord, TranscriptEntry, WorkspaceOrigin, WorkspaceRecord,
+    parse_active_turn, parse_title, AsyncRecord, CallRecord, ChildRecord, Identity,
+    PublicationRecord, Record, TranscriptEntry, TurnRecord, WorkspaceOrigin, WorkspaceRecord,
 };
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
@@ -151,27 +151,27 @@ impl<'s> Conversation<'s> {
         }
     }
 
-    pub fn active_request(&self) -> Result<Option<RequestRecord>, String> {
-        let Some(bytes) = self.optional_blob(paths::ACTIVE_REQUEST)? else {
+    pub fn active_turn(&self) -> Result<Option<TurnRecord>, String> {
+        let Some(bytes) = self.optional_blob(paths::ACTIVE_TURN)? else {
             return Ok(None);
         };
-        let id = parse_active_request(&bytes)?;
-        self.request(&id)?
+        let id = parse_active_turn(&bytes)?;
+        self.turn(&id)?
             .map(Some)
             .ok_or_else(|| format!("active request {id} has no request record"))
     }
 
-    pub fn request(&self, id: &Oid) -> Result<Option<RequestRecord>, String> {
-        self.keyed::<RequestRecord>(
-            &paths::request_record_path(id.as_str()),
+    pub fn turn(&self, id: &Oid) -> Result<Option<TurnRecord>, String> {
+        self.keyed::<TurnRecord>(
+            &paths::turn_record_path(id.as_str()),
             |record| record.id == *id,
             |record| format!("id {}", record.id),
         )
     }
 
-    pub fn request_ids(&self) -> Result<Vec<Oid>, String> {
+    pub fn turn_ids(&self) -> Result<Vec<Oid>, String> {
         let mut ids = Vec::new();
-        for entry in self.list_optional(paths::REQUESTS_DIR)? {
+        for entry in self.list_optional(paths::TURNS_DIR)? {
             if entry.name == "active" {
                 continue;
             }
@@ -188,9 +188,9 @@ impl<'s> Conversation<'s> {
         Ok(ids)
     }
 
-    pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<ToolRecord>, String> {
-        self.keyed::<ToolRecord>(
-            &paths::tool_record_path(request.as_str(), round, id),
+    pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<CallRecord>, String> {
+        self.keyed::<CallRecord>(
+            &paths::call_record_path(request.as_str(), round, id),
             |record| record.request == *request && record.round == round && record.id == id,
             |record| {
                 format!(
@@ -201,8 +201,8 @@ impl<'s> Conversation<'s> {
         )
     }
 
-    pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<ToolRecord>, String> {
-        let dir = format!("{}/{}/{round:04}", paths::TOOLS_DIR, request.as_str());
+    pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<CallRecord>, String> {
+        let dir = format!("{}/{}/{round:04}", paths::CALLS_DIR, request.as_str());
         let mut records = Vec::new();
         for entry in self.list_optional(&dir)? {
             if entry.mode == Mode::Tree {
@@ -212,10 +212,10 @@ impl<'s> Conversation<'s> {
             if !entry.name.ends_with(".json") {
                 return Err(format!("invalid tool record path {path:?}"));
             }
-            let record = ToolRecord::parse(&self.required_blob(&path)?)?;
+            let record = CallRecord::parse(&self.required_blob(&path)?)?;
             if record.request != *request
                 || record.round != round
-                || paths::tool_record_path(request.as_str(), round, &record.id) != path
+                || paths::call_record_path(request.as_str(), round, &record.id) != path
             {
                 return Err(format!("tool record {path:?} has mismatched identity"));
             }
@@ -348,7 +348,7 @@ impl<'s> Conversation<'s> {
 
     pub fn async_tasks(&self) -> Result<Vec<AsyncRecord>, String> {
         self.keyed_all::<AsyncRecord, _>(
-            paths::ASYNC_DIR,
+            paths::TASK_COMPUTATIONS_DIR,
             |stem| Oid::parse(stem, "async record task"),
             |record, task| record.task == *task,
             |record| format!("task {}", record.task),
@@ -366,7 +366,7 @@ impl<'s> Conversation<'s> {
 
     pub fn children(&self) -> Result<Vec<ChildRecord>, String> {
         self.keyed_all::<ChildRecord, _>(
-            paths::SUBAGENTS_DIR,
+            paths::TASK_CONVERSATIONS_DIR,
             |stem| {
                 paths::validate_protocol_id_component(stem)?;
                 Ok(stem.to_string())
@@ -374,6 +374,30 @@ impl<'s> Conversation<'s> {
             |record, id| record.id == *id,
             |record| format!("id {:?}", record.id),
         )
+    }
+
+    pub fn tasks(&self) -> Result<Vec<super::TaskRecord>, String> {
+        Ok(self
+            .async_tasks()?
+            .into_iter()
+            .map(super::TaskRecord::Computation)
+            .chain(
+                self.children()?
+                    .into_iter()
+                    .map(super::TaskRecord::Conversation),
+            )
+            .collect())
+    }
+
+    pub fn task(&self, computation: &Oid) -> Result<Option<super::TaskRecord>, String> {
+        if let Some(task) = self.async_task(computation)? {
+            return Ok(Some(super::TaskRecord::Computation(task)));
+        }
+        Ok(self
+            .children()?
+            .into_iter()
+            .find(|child| &child.relay == computation)
+            .map(super::TaskRecord::Conversation))
     }
 
     pub fn publication(&self, id: &str) -> Result<Option<PublicationRecord>, String> {
@@ -403,6 +427,12 @@ impl<'s> Conversation<'s> {
     }
 
     fn require_format(&self) -> Result<(), String> {
+        for path in [".caos/turns", ".caos/calls", ".caos/tasks"] {
+            if self.snapshot.exists(path)? {
+                return Err("conversation uses PR196's interim storage layout; open it with the preserved PR196 build".into());
+            }
+        }
+
         let bytes = self.required_blob(paths::FORMAT)?;
         if bytes != paths::FORMAT_BYTES.as_bytes() {
             return Err("unsupported conversation format".to_string());
@@ -615,7 +645,7 @@ mod tests {
         assert_eq!(view.transcript_len().unwrap(), 1);
         assert_eq!(view.transcript_entry(0).unwrap().unwrap().0, "message-0");
         assert!(view.transcript_entry(1).unwrap().is_none());
-        assert!(view.active_request().unwrap().is_none());
+        assert!(view.active_turn().unwrap().is_none());
         assert!(view.async_tasks().unwrap().is_empty());
         assert!(view.children().unwrap().is_empty());
         assert!(view.publications().unwrap().is_empty());
@@ -646,9 +676,9 @@ mod tests {
         let actual = oid('2');
         let mut builder = TreeBuilder::from(Some(tree));
         builder.put(
-            &paths::request_record_path(requested.as_str()),
+            &paths::turn_record_path(requested.as_str()),
             Mode::Blob,
-            RequestRecord {
+            TurnRecord {
                 id: actual.clone(),
                 request_head: oid('3'),
                 request_workspaces: None,
@@ -657,7 +687,7 @@ mod tests {
                 round: 0,
                 calls: Vec::new(),
                 interjections: Vec::new(),
-                status: super::super::records::RequestStatus::Queued,
+                status: super::super::records::TurnStatus::Queued,
                 latest_message: None,
                 escape_reason: None,
                 outcome: None,
@@ -667,9 +697,9 @@ mod tests {
         let tree = builder.build(&mut store).unwrap();
         let error = Conversation::open_tree(&store, &tree)
             .unwrap()
-            .request(&requested)
+            .turn(&requested)
             .unwrap_err();
-        assert!(error.contains(&paths::request_record_path(requested.as_str())));
+        assert!(error.contains(&paths::turn_record_path(requested.as_str())));
         assert!(error.contains(actual.as_str()));
     }
 
