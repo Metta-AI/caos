@@ -68,7 +68,7 @@ fn read_key(
         output,
         &format!(
             "No Anthropic API key is configured, so conversations cannot run.\n\
-             caos keeps the key in `{SECRETS_DIR}/` — a git-ignored, per-checkout store — as the\n\
+             caos keeps the key in `{SECRETS_DIR}/` — a git-ignored local store — as the\n\
              `{MODEL_API_SECRET}` secret granted only to the conversation workers (README, Secrets).\n\n\
              Paste an API key (sk-ant-…), or enter the path to a file that holds one.\n\
              Press Enter on an empty line to abort.\n"

@@ -7,8 +7,9 @@ dependencies out of the worker-side `caos` binary.
 The interface keeps independent virtual conversations in a left sidebar. Each
 entry has a stable task title and a second row reserved for live operation or
 attention status. Idle conversations do not show a stripped message preview.
-`Ctrl+N` only allocates local state; the first submitted message atomically
-publishes the conversation head, fallback title, and active membership. The
+`Ctrl+N` allocates local state; a workspace operation or the first submitted
+message publishes its conversation head and active membership. The launcher's
+initial conversation is created immediately so its attachments are visible. The
 first message also runs one separate, stateless `llm-call` title job concurrently
 with the agent turn. The result uses
 the existing durable title metadata, so reopening the TUI does not regenerate
@@ -26,8 +27,13 @@ their prompt title and appear beneath the parent conversation.
 
 ## Build and run
 
-Run the client from a Git working tree whose `caos` remote points at a running
-CAOS server:
+The packaged TUI can run anywhere. Inside a checkout, it seeds the conversation
+from HEAD and uses that checkout's `caos` remote. Outside a checkout, it starts
+without code and defaults to `http://localhost:9090`; `--server` overrides it.
+The harness and object database live under `$XDG_DATA_HOME/caos/clients`
+(default `~/.local/share/caos/clients`), independently of attached repositories.
+
+To build and launch from the caos checkout:
 
 ```bash
 git remote add caos http://localhost:9090
@@ -36,7 +42,7 @@ nix build
 ```
 
 During development, launch it with
-`cargo run -p caos-cli --bin caos-cli -- tui`.
+`cargo run -p caos-cli --bin caos-cli -- tui --harness <caos-checkout>`.
 The TUI checks the configured server before entering the alternate screen. If
 it cannot connect within five seconds, it exits with the server URL and asks
 you to check the running service and the `caos` git remote.
@@ -57,6 +63,8 @@ never overwritten.
 caos tui                  continue the most recent conversation
 caos tui --username alice use alice's active conversation list
 caos tui --new            start a fresh conversation
+caos tui --empty          start without a workspace; attach one later
+caos tui --server URL     use a specific server
 caos tui --from 5ec3751   branch from a completed turn
 caos tui --list-archived  list archived conversation IDs and titles
 caos tui --unarchive ID   restore one conversation to the active list
@@ -107,7 +115,7 @@ so it never leaves the conversation pane.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` | Check out the selected workspace in the working tree |
+| `Ctrl+L` | Check out the selected workspace in the original matching checkout |
 | `Ctrl+O` | Select, create, attach, or update workspaces |
 | `Ctrl+P` | Preview selected workspaces and their PR destinations; Enter confirms |
 | `/publish-branch` | Push the selected workspace to its configured repository and branch |
@@ -162,8 +170,9 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-Fresh conversations start from the local branch named by `origin/HEAD`,
-without fetching from `origin`. `--base` and `/from <turn-hash>` override that default.
+The launcher uses the original checkout's HEAD, with `--base` or
+`--from` as overrides. With no checkout or `--empty`, the conversation starts
+without code. `/from <turn-hash>` forks the selected conversation history.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
@@ -227,10 +236,14 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 Workspace code is referenced by ordinary commit hashes from the separate
 conversation history. Opening and running conversations never overwrite a
-checkout. Ctrl+L requires a clean working tree and detaches HEAD at the selected
-workspace head. /update-tree commits local edits there before submission.
+checkout. Ctrl+L requires a clean original checkout matching the selected
+workspace's repository; it imports the code objects and detaches that checkout
+at the workspace head. /update-tree commits local edits there and imports their
+closure into the client before submission. These commands never replace the
+internal harness.
 
 Publication preserves workspace history, uses leased branch updates, and
 rejects unresolved conflicts or reserved conversation state. It leaves the local
 checkout and index unchanged. Credentials remain in the local secret store;
-the client uses the checkout's git-ignored secret store.
+the launcher reuses an existing checkout store or its own persistent store under
+the data directory.

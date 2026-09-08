@@ -433,7 +433,8 @@ focus hint is frozen when admitted. `read`/`ls` accept a `root` hash to inspect
 another revision or conflict stage. Without an explicit workspace, inline
 `files/` paths refer to conversation-owned files.
 
-Repository attachments supply code, repository instructions and scoped tool schemas.
+The TUI can launch without a code checkout using its bundled harness. Repository
+attachments supply code, repository instructions and scoped tool schemas.
 Bash integration inputs capture other workspaces by content outside the writable
 output tree. Workspace base edges define stacks; explicit Update stack merges
 upstream changes and records incorporated base pins, stopping on conflicts.

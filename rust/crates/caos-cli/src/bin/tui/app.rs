@@ -2345,7 +2345,18 @@ impl App {
                     return;
                 }
             };
-            match commit_working_tree(arguments, &workspace, &self.repo_dir) {
+            let committed = self
+                .checkout_selected_workspace(&workspace)
+                .and_then(|checkout| {
+                    let (commit, base) = commit_working_tree(arguments, &workspace, &checkout)?;
+                    super::launcher::import_checkout_commit(
+                        &checkout,
+                        &self.repo_dir,
+                        &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
+                    )?;
+                    Ok((commit, base))
+                });
+            match committed {
                 Ok((tree, base)) => {
                     human_tree = Some(tree);
                     proposal_base = Some(base);
@@ -4160,6 +4171,11 @@ impl App {
         self.selected_mut().tool_set = Some(result);
     }
 
+    fn checkout_selected_workspace(&self, head: &str) -> Result<PathBuf, String> {
+        let config = &self.selected().require_selected_workspace()?.config;
+        super::launcher::checkout_for(&self.repo_dir, config, head)
+    }
+
     fn load_selected(&mut self) {
         if self.selected().is_busy() {
             self.selected_mut()
@@ -4167,7 +4183,10 @@ impl App {
             return;
         }
         match self.selected().require_selected_workspace().cloned() {
-            Ok(diff) => match load_conversation_workspace(&diff.head, &self.repo_dir) {
+            Ok(diff) => match self
+                .checkout_selected_workspace(&diff.head)
+                .and_then(|checkout| load_conversation_workspace(&diff.head, &checkout))
+            {
                 Ok(()) => {
                     self.selected_mut().status = format!(
                         "checked out {} at {} in detached HEAD",
