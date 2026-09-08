@@ -2,6 +2,7 @@
 use super::*;
 use conversation_protocol::v3::workspaces::{source_locator, validate_repository, validate_source};
 pub use conversation_protocol::v3::workspaces::{Creation, PublicationBase};
+use conversation_protocol::v3::PublicationDestination;
 use conversation_protocol::v3::WorkspaceConfig;
 
 /// Resolve checkout defaults once, when code is attached to a conversation.
@@ -143,6 +144,17 @@ pub fn create_from_workspace(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicationTarget {
+    pub workspace: String,
+    pub head: String,
+    pub repository: String,
+    pub branch: String,
+    pub base: PublicationBase,
+    pub previous_config: WorkspaceConfig,
+    pub diagnostic: Option<String>,
+}
+
 pub fn repository_url(t: &GitTransport, config: &WorkspaceConfig) -> Result<String, String> {
     let repository = match config
         .publication
@@ -219,6 +231,288 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
 }
 
 /// Read destinations without changing the conversation or any remote branch.
+pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTarget>, String> {
+    use conversation_protocol::v3::WorkspaceBase;
+    let store = open_store(t)?;
+    let (_, head) =
+        fetch_validated_head(t, &store, id)?.ok_or_else(|| format!("no conversation {id:?}"))?;
+    let view = Conversation::open(&store, &head)?;
+    view.workspace_configs()?
+        .into_iter()
+        .map(|(name, config)| {
+            // Legacy missing destinations remain editable rows. Remote availability
+            // and default branches are checked only for the selected execution plan.
+            let mut diagnostic = None;
+            let repository = repository_url(t, &config).unwrap_or_else(|error| {
+                diagnostic = Some(error);
+                String::new()
+            });
+            let branch = normalize_repository_identity(&repository)
+                .and_then(|identity| publication_branch(&view, id, &name, &identity))
+                .unwrap_or_else(|error| {
+                    diagnostic.get_or_insert(error);
+                    String::new()
+                });
+            let base = config
+                .publication
+                .as_ref()
+                .and_then(|p| p.base.clone())
+                .unwrap_or_else(|| match &config.upstream {
+                    Some(WorkspaceBase::Branch { name, .. }) => {
+                        PublicationBase::Branch(name.clone())
+                    }
+                    Some(WorkspaceBase::Workspace { name, .. }) => {
+                        PublicationBase::Workspace(name.clone())
+                    }
+                    None => PublicationBase::Default,
+                });
+            Ok(PublicationTarget {
+                head: view
+                    .workspace(&name)?
+                    .ok_or("workspace disappeared")?
+                    .commit
+                    .to_string(),
+                workspace: name,
+                repository,
+                branch,
+                base,
+                previous_config: config,
+                diagnostic,
+            })
+        })
+        .collect()
+}
+
+/// A reviewed destination with its PR base resolved once. Code tips are fetched
+/// at execution, after any included parent has finished publishing.
+#[derive(Clone, Debug)]
+pub struct ResolvedPublicationTarget {
+    pub target: PublicationTarget,
+    pub base_branch: String,
+}
+
+/// Order only the selected workspaces. An excluded parent may already be
+/// published; execution verifies that its published tip matches its code head.
+pub fn publication_order(plan: &[PublicationTarget]) -> Result<Vec<String>, String> {
+    fn visit(
+        name: &str,
+        targets: &BTreeMap<&str, &PublicationTarget>,
+        visiting: &mut HashSet<String>,
+        done: &mut HashSet<String>,
+        ordered: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if done.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name.into()) {
+            return Err(format!("workspace base cycle at {name:?}"));
+        }
+        if let Some(parent) = targets[name].base.parent() {
+            if targets.contains_key(parent) {
+                visit(parent, targets, visiting, done, ordered)?;
+            }
+        }
+        visiting.remove(name);
+        done.insert(name.into());
+        ordered.push(name.into());
+        Ok(())
+    }
+    let mut destinations = HashSet::new();
+    let mut targets = BTreeMap::new();
+    for target in plan {
+        if target.repository.is_empty() || target.branch.is_empty() {
+            return Err(format!(
+                "workspace {:?}: {}",
+                target.workspace,
+                target
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or("choose a repository and publication branch")
+            ));
+        }
+        conversation_protocol::v3::workspaces::validate_branch(&target.branch)?;
+        let identity = normalize_repository_identity(&target.repository)?;
+        if !destinations.insert((identity, &target.branch)) {
+            return Err(format!(
+                "several workspaces target branch {:?}; give each workspace its own branch",
+                target.branch
+            ));
+        }
+        if targets.insert(target.workspace.as_str(), target).is_some() {
+            return Err(format!("duplicate workspace {:?}", target.workspace));
+        }
+    }
+    let mut ordered = Vec::new();
+    let mut visiting = HashSet::new();
+    let mut done = HashSet::new();
+    for name in targets.keys() {
+        visit(name, &targets, &mut visiting, &mut done, &mut ordered)?;
+    }
+    Ok(ordered)
+}
+
+pub fn resolve_publication_plan(
+    t: &GitTransport,
+    all: &[PublicationTarget],
+    selected: &[PublicationTarget],
+) -> Result<Vec<ResolvedPublicationTarget>, String> {
+    let mut defaults = BTreeMap::new();
+    publication_order(selected)?
+        .into_iter()
+        .map(|name| {
+            let target = selected
+                .iter()
+                .find(|target| target.workspace == name)
+                .unwrap()
+                .clone();
+            let mut seen = HashSet::new();
+            let mut cursor = &target;
+            loop {
+                if !seen.insert(cursor.workspace.clone()) {
+                    return Err(format!("workspace base cycle at {:?}", cursor.workspace));
+                }
+                let Some(parent) = cursor.base.parent() else {
+                    break;
+                };
+                cursor = all
+                    .iter()
+                    .find(|candidate| candidate.workspace == parent)
+                    .ok_or_else(|| format!("unknown base workspace {parent:?}"))?;
+                if normalize_repository_identity(&cursor.repository)?
+                    != normalize_repository_identity(&target.repository)?
+                {
+                    return Err(format!(
+                        "workspace {name:?} and its base belong to different repositories"
+                    ));
+                }
+            }
+            let base_branch = match &target.base {
+                PublicationBase::Branch(name) => name.clone(),
+                PublicationBase::Workspace(parent) => {
+                    let parent = all
+                        .iter()
+                        .find(|target| &target.workspace == parent)
+                        .ok_or_else(|| format!("unknown base workspace {parent:?}"))?;
+                    if normalize_repository_identity(&parent.repository)?
+                        != normalize_repository_identity(&target.repository)?
+                    {
+                        return Err(format!(
+                            "workspace {name:?} and its base belong to different repositories"
+                        ));
+                    }
+                    parent.branch.clone()
+                }
+                PublicationBase::Default => {
+                    if !defaults.contains_key(&target.repository) {
+                        defaults.insert(
+                            target.repository.clone(),
+                            default_branch(t, &target.repository)?,
+                        );
+                    }
+                    defaults[&target.repository].clone()
+                }
+            };
+            conversation_protocol::v3::workspaces::validate_branch(&base_branch)?;
+            if base_branch == target.branch {
+                return Err(format!(
+                    "workspace {name:?} cannot publish onto its PR base"
+                ));
+            }
+            Ok(ResolvedPublicationTarget {
+                target,
+                base_branch,
+            })
+        })
+        .collect()
+}
+
+/// Persist exactly the reviewed destination, then publish the prepared code to it.
+/// Later UI focus or metadata changes cannot retarget this publication.
+pub fn publish_prepared_target(
+    t: &GitTransport,
+    id: &str,
+    resolved: &ResolvedPublicationTarget,
+    prepared_head: &str,
+    base_commit: &str,
+) -> Result<PublishedBranch, String> {
+    let target = &resolved.target;
+    let base_commit = oid(base_commit, "publication base")?;
+    let mut config = target.previous_config.clone();
+    config.publication = Some(PublicationDestination {
+        repository: Some(target.repository.clone()),
+        branch: target.branch.clone(),
+        base: Some(match &target.base {
+            PublicationBase::Default => PublicationBase::Branch(resolved.base_branch.clone()),
+            other => other.clone(),
+        }),
+    });
+    // Advance an existing matching integration checkpoint, never change upstream identity.
+    if let Some(upstream) = &config.upstream {
+        let matches = match (upstream, &target.base) {
+            (
+                conversation_protocol::v3::WorkspaceBase::Branch {
+                    repository, name, ..
+                },
+                PublicationBase::Branch(branch),
+            ) => {
+                repository
+                    .as_ref()
+                    .map(|repo| normalize_repository_identity(repo))
+                    .transpose()?
+                    .as_deref()
+                    == Some(normalize_repository_identity(&target.repository)?.as_str())
+                    && name == branch
+            }
+            (
+                conversation_protocol::v3::WorkspaceBase::Workspace { name, .. },
+                PublicationBase::Workspace(parent),
+            ) => name == parent,
+            _ => false,
+        };
+        if matches {
+            config.upstream = Some(upstream.with_commit(base_commit));
+        }
+    }
+    append_transition(
+        t,
+        id,
+        &refs::head_ref(id)?,
+        "saving the publication target",
+        |store, head| {
+            let view = Conversation::open(store, head)?;
+            if view
+                .workspace(&target.workspace)?
+                .is_none_or(|workspace| workspace.commit.as_str() != prepared_head)
+            {
+                return Err(format!(
+                    "workspace {:?} changed after preparation; review it again",
+                    target.workspace
+                ));
+            }
+            let current = view.workspace_config(&target.workspace)?;
+            if current == config {
+                return Ok(Step::Done(head.to_string()));
+            }
+            if current != target.previous_config {
+                return Err(format!("workspace {:?} settings changed after the publication preview; review them again", target.workspace));
+            }
+            Ok(Step::Mint(Transition::WorkspaceConfigure {
+                name: target.workspace.clone(),
+                config: config.clone(),
+            }))
+        },
+    )?;
+    publish_workspace_branch_inner(
+        t,
+        id,
+        Some(&target.workspace),
+        Some(prepared_head),
+        Some((&target.repository, &target.branch)),
+    )
+}
+
+// Update a connected stack, or every stack when selection is None. Each step
+// snapshots its upstream once; retries reconcile against that same code.
 pub fn update_stack(
     t: &GitTransport,
     id: &str,

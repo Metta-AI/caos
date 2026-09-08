@@ -384,6 +384,9 @@ the object machinery through a one-way dependency. Their difference is the
     host path;
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
+  - `tui` — interactive conversations. Ctrl+O opens workspaces: `n`
+    creates a change, `a` attaches a repository, `u` updates its stack.
+    Ctrl+P previews workspace PRs before publishing them;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form;

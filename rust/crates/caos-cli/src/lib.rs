@@ -1,5 +1,7 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
+pub mod host_git;
+pub mod publication;
 pub mod workspaces;
 
 #[cfg(test)]
@@ -3839,6 +3841,83 @@ mod tests {
             base
         );
         assert!(remove_workspace(&transport, "workspaces-talk", "side").is_err());
+        git(
+            transport.work_dir(),
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        git(
+            &root.join("origin.git"),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        let plan = workspaces::publication_plan(&transport, "workspaces-talk").unwrap();
+        let dependent = plan
+            .iter()
+            .find(|target| target.workspace == "dependent")
+            .unwrap();
+        assert_eq!(
+            dependent.base,
+            workspaces::PublicationBase::Workspace("side".into())
+        );
+        let resolved = workspaces::resolve_publication_plan(
+            &transport,
+            &plan,
+            std::slice::from_ref(dependent),
+        )
+        .unwrap();
+        assert_eq!(resolved[0].base_branch, "feature/side");
+        let order = workspaces::publication_order(&plan).unwrap();
+        assert!(
+            order.iter().position(|name| name == "side")
+                < order.iter().position(|name| name == "dependent")
+        );
+        let mut collision = plan.clone();
+        collision
+            .iter_mut()
+            .find(|target| target.workspace == "separate")
+            .unwrap()
+            .branch = "feature/side".into();
+        assert!(workspaces::publication_order(&collision)
+            .unwrap_err()
+            .contains("several workspaces"));
+        let target = plan
+            .iter()
+            .find(|target| target.workspace == "main")
+            .unwrap();
+        let published = workspaces::publish_prepared_target(
+            &transport,
+            "workspaces-talk",
+            &workspaces::resolve_publication_plan(&transport, &plan, std::slice::from_ref(target))
+                .unwrap()[0],
+            &base,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(published.status, PublicationStatus::Complete);
+        assert_eq!(published.branch, target.branch);
+        // An unrelated non-publishable repository stays visible without blocking main.
+        let mut unrelated = target.clone();
+        unrelated.workspace = "local-only".into();
+        unrelated.repository = root.join("missing.git").to_string_lossy().into_owned();
+        unrelated.branch = "local".into();
+        let mut all = plan.clone();
+        all.push(unrelated.clone());
+        assert!(workspaces::resolve_publication_plan(
+            &transport,
+            &all,
+            std::slice::from_ref(target)
+        )
+        .is_ok());
+        assert!(workspaces::resolve_publication_plan(&transport, &all, &[unrelated]).is_err());
+        let next_plan = workspaces::publication_plan(&transport, "workspaces-talk").unwrap();
+        assert_eq!(
+            next_plan
+                .iter()
+                .find(|target| target.workspace == "main")
+                .unwrap()
+                .branch,
+            target.branch
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

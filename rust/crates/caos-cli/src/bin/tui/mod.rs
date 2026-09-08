@@ -22,7 +22,7 @@ use ratatui_crossterm::CrosstermBackend;
 mod app;
 mod args;
 mod setup;
-mod workspace;
+use caos_cli::host_git as workspace;
 
 use app::{ui::render, App, MouseAction, View};
 use args::{usage, Args};
