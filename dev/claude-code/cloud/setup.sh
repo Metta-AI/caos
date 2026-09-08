@@ -101,26 +101,23 @@ fi
 caos --version >&2 2>/dev/null || true
 
 # The iroh tunnel arrives with the client, from the same release, so there is
-# nothing to install here. It used to be fetched from n0's releases and pinned
-# by hand; that binary compiles in a copy of Mozilla's roots and cannot reach a
-# relay through a TLS-intercepting proxy, which is what a cloud container's
-# egress is. Ours is patched to read the OS trust store.
+# nothing to install here. It has to be ours: n0's build compiles in a copy of
+# Mozilla's roots and cannot reach a relay through a TLS-intercepting proxy,
+# which is what a cloud container's egress is.
 
 # The per-session work: the tunnel and the git remote. What goes in the
 # snapshot is a BOOTSTRAP that fetches the real script every session, not the
 # script itself.
 #
 # Everything this file writes is frozen the moment the environment is
-# snapshotted, and later sessions skip this file entirely -- so a fix pushed to
-# git does NOT reach an existing environment, however many sessions are
-# started. That cost a whole round: a wrapper with the wrong shebang was fixed,
-# pushed, and a new session still ran the old one, because a new session is not
-# a new environment.
+# snapshotted, and later sessions skip this file entirely, so a fix pushed to
+# git does NOT reach an existing environment however many sessions are started.
+# A new session is not a new environment.
 #
-# Two lines in a settings form, one of them naming a ref, is a thing worth
-# keeping stable. The scripts behind it are not. So the only durable state here
-# is the base URL, and every session re-reads what that ref says today --
-# including the CLIENT, which the session script installs.
+# Two lines in a settings form, one of them naming a ref, is worth keeping
+# stable. The scripts behind it are not. So the only durable state here is the
+# base URL, and every session re-reads what that ref says today -- including
+# the CLIENT, which the session script installs.
 cat > /usr/local/bin/caos-cloud-session-start <<EOF
 #!/bin/bash
 base="$base"
@@ -151,11 +148,10 @@ for home in /root /home/claude /home/user; do
     # A denied name is removed from the model's context entirely, which is what
     # makes the caos tools the only tools and keeps work on the record.
     #
-    # Bash is denied again. It was let through while the container was being
-    # brought up, and leaving it would not merely be untidy: with the built-in
-    # and mcp__caos__bash both in context the model reaches for the built-in,
-    # so the caos tool never runs, nothing it did is in the conversation, and
-    # any test of the caos tools measures the wrong tool.
+    # Bash in particular: with the built-in and mcp__caos__bash both in the
+    # model's context the model reaches for the built-in, so the caos tool
+    # never runs, nothing it did is in the conversation, and any test of the
+    # caos tools measures the wrong tool.
     #
     # The hooks are the recording. `caos cc hook` reads the event as JSON on
     # stdin and names its own event, so one command serves all of them.
@@ -201,12 +197,11 @@ done
 # ---------------------------------------------------------------------------
 # When did this environment last get built?
 # ---------------------------------------------------------------------------
-# Because "did the rebuild happen?" has to be a FACT, not an inference. A setup
-# script runs once and is then frozen into a snapshot, and a session started
-# afterwards looks identical whether the environment was rebuilt or not -- so a
-# fix that was pushed but never picked up presents as a fix that did not work,
-# and the debugging goes to the code instead of to the snapshot. It cost two
-# rounds here before anyone thought to doubt the container.
+# "Did the rebuild happen?" has to be a FACT, not an inference. A setup script
+# runs once and is then frozen into a snapshot, and a session started afterwards
+# looks identical whether the environment was rebuilt or not -- so a fix that
+# was pushed but never picked up presents as a fix that did not work, and the
+# debugging goes to the code instead of to the snapshot.
 #
 # The session hook prints this, so every session says which environment it is.
 install -d /usr/local/share/caos

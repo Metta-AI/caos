@@ -104,9 +104,9 @@ jobs:
           install -m 0755 result-dumbpipe/bin/dumbpipe dist/dumbpipe-x86_64-linux
           file dist/dumbpipe-x86_64-linux | grep -qE 'static-pie linked|statically linked' \
             || { echo "the tunnel is not static:"; file dist/dumbpipe-x86_64-linux; exit 1; } >&2
-          # The patch is the whole reason we build our own, and a silently
-          # unpatched binary would look identical until it met an intercepting
-          # proxy months later. rustls-native-certs puts these in the binary;
+          # The patch is the whole reason we build our own, and an unpatched
+          # binary is indistinguishable from a patched one until it meets an
+          # intercepting proxy. rustls-native-certs puts these markers in;
           # n0's build has none of them.
           for marker in SSL_CERT_FILE SSL_CERT_DIR; do
             grep -aq "$marker" dist/dumbpipe-x86_64-linux \

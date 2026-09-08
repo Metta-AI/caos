@@ -159,10 +159,10 @@ fn cc_transport() -> Result<GitTransport, String> {
     // And then STAND there. Finding the repository is not enough on its own:
     // plenty below here resolves a relative path against the process's cwd
     // rather than against the transport, so a correct workspace reached from
-    // the wrong directory still fails -- `std/caos-test` came back ".: outside
-    // the git worktree", which reads as a broken entry rather than a wrong cwd.
+    // the wrong directory still fails -- and it fails as ".: outside the git
+    // worktree", which reads as a broken entry rather than a wrong directory.
     // One chdir fixes every such caller at once, and leaves this process where
-    // a person running caos by hand would have been standing anyway.
+    // a person running caos by hand would be standing anyway.
     std::env::set_current_dir(t.work_dir())
         .map_err(|error| format!("entering {}: {error}", t.work_dir().display()))?;
     Ok(t)

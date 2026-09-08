@@ -37,10 +37,9 @@ fi
 # ---------------------------------------------------------------------------
 # The client, refreshed
 # ---------------------------------------------------------------------------
-# The setup script installed one, into a filesystem that was then FROZEN. A
-# push does not reach an existing environment, so a client installed there is
-# as old as the environment is -- which is how a wrapper with a dash-only
-# `exec -a` survived being fixed and pushed.
+# The setup script installed one, into a filesystem that is then FROZEN. A push
+# does not reach an existing environment, so a client left where the setup put
+# it is as old as the environment is, no matter how many sessions start.
 #
 # Re-running the installer costs one `git ls-remote`, because it stops as soon
 # as it finds the build already installed. Not fatal on failure: a working

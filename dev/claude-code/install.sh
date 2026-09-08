@@ -78,17 +78,14 @@ case "$(uname -s)/$(uname -m)" in
 esac
 
 # A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
-# resolving one is a lookup rather than a parse. It was `<branch>-<sha>` once,
-# and since `-` is legal in a branch name, `cc` and `cc-conversations` made tags
-# no rule could separate; asking GitHub what is on a ref is the exact question
-# that name was a lossy encoding of.
-# Resolved with `git ls-remote`, NOT api.github.com. The API is anonymous here,
-# so it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares
-# its egress address with every other cloud VM, so the budget is spent by
-# strangers. It failed exactly that way in a Claude Code cloud session:
-# raw.githubusercontent.com served the script and then api.github.com answered
-# 403, which the setup reported as "a release has to EXIST" -- blaming the one
-# thing that was fine.
+# resolving one is a lookup rather than a parse. A name carrying the branch
+# cannot be taken apart again: `-` is legal in a branch name, so `cc` and
+# `cc-conversations` produce tags no rule can separate.
+#
+# Resolved with `git ls-remote`, NOT api.github.com. That API is anonymous
+# here, so it is rate limited to 60 requests an hour PER IP -- and a cloud VM
+# shares its egress address with every other cloud VM, so the budget is spent
+# by strangers and the 403 is nothing this side can fix.
 #
 # ls-remote has no such limit, needs no token, speaks to github.com like the
 # download does, and answers both halves of the question at once: the refs it
@@ -173,11 +170,8 @@ chmod +x "$tmp/caos"
 stamped="$VERSION"
 install -d "$PREFIX/bin" "$PREFIX/lib/caos"
 install -m 0755 "$tmp/caos" "$PREFIX/lib/caos/caos"
-# `#!/bin/bash`, NOT `#!/bin/sh`: `exec -a` is a bash builtin, and /bin/sh is
-# dash on Debian and Ubuntu. Written as sh, every invocation died with
-# `/usr/local/bin/caos: 3: exec: -a: not found` -- so in a cloud container the
-# client was never able to run AT ALL, and the visible symptom was the MCP tool
-# server reporting CONNECTION_CLOSED, which reads as a network problem.
+# `#!/bin/bash`, NOT `#!/bin/sh`: `exec -a` is a bash builtin and /bin/sh is
+# dash on Debian and Ubuntu, where it is `exec: -a: not found` on every call.
 cat > "$PREFIX/bin/caos" <<WRAPPER
 #!/bin/bash
 export CAOS_REV="\${CAOS_REV:-$stamped}"
@@ -186,9 +180,9 @@ WRAPPER
 chmod 0755 "$PREFIX/bin/caos"
 ln -sf "$PREFIX/bin/caos" "$PREFIX/bin/caos-cli"
 
-# RUN IT. A wrapper is three lines of shell written by another shell, and the
-# one thing never checked was whether it executes -- `exec -a` under dash left
-# a `caos` on PATH that failed on every call, and the install said "installed".
+# RUN IT. A wrapper is shell written by shell, and whether it executes is not
+# implied by having written it: a `caos` on PATH that fails on every call still
+# looks like a successful install.
 #
 # Assert the OUTPUT, not the exit code: `caos` with no arguments prints usage
 # and exits NON-ZERO, which is its contract, so testing the status would fail
@@ -221,17 +215,15 @@ else
 fi
 }
 
-# Already current? Then skip the DOWNLOAD -- not the repo files below. This now
+# Already current? Then skip the DOWNLOAD -- not the repo files below. This
 # runs at EVERY session start, because a client installed by the setup script
-# is frozen into the environment's snapshot and a push never reaches it. So the
-# ordinary case has to cost one `ls-remote` and no transfer.
+# is frozen into the environment's snapshot and a push never reaches it, so the
+# ordinary case has to cost one `ls-remote` and no transfer. The wrapper
+# records the build it installed, which makes that answerable without hashing
+# anything. `--force` reinstalls regardless, for when the binary is suspect.
 #
-# The wrapper records the build it installed, which makes the question
-# answerable by reading three lines of shell. `--force` reinstalls regardless,
-# which is what to reach for when the binary itself is suspect.
-# The tunnel is part of "installed": a snapshot from before it existed has a
-# current client and no tunnel, and testing only the client would keep skipping
-# the download that would fix that.
+# The tunnel counts as part of "installed": a prefix holding a current client
+# and no tunnel would otherwise skip the download that fixes it.
 if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] && [ -x "$PREFIX/bin/dumbpipe" ] \
    && grep -qF "CAOS_REV:-$VERSION}" "$PREFIX/bin/caos" 2>/dev/null; then
     echo "$PREFIX/bin/caos is already $VERSION" >&2

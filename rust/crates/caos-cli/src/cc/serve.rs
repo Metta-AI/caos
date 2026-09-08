@@ -34,12 +34,11 @@ const SESSION_ARG: &str = "caos_session";
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
 /// stop the server.
 ///
-/// Exiting here was worse than useless: Claude Code reports a tool server that
-/// dies before it speaks as `CONNECTION_CLOSED`, which says nothing about a
-/// repository, a directory, or caos -- and the message it would have printed
-/// goes wherever a dead child's stderr goes. Answering `initialize` and then
-/// naming the problem on the first tool call puts the reason in front of the
-/// person who can fix it.
+/// Claude Code reports a tool server that dies before it speaks as
+/// `CONNECTION_CLOSED`, which says nothing about a repository, a directory or
+/// caos, and whatever it printed goes wherever a dead child's stderr goes.
+/// Answering `initialize` and then naming the problem on the first tool call
+/// puts the reason in front of the person who can fix it.
 pub fn serve(workspace: Result<GitTransport, String>) -> Result<(), String> {
     let workspace = match workspace {
         Ok(t) => Ok(t),
@@ -291,19 +290,20 @@ fn declarations(t: Result<&GitTransport, &String>) -> Vec<Value> {
             let Some(entry) = tools::std_tool_entry(name) else {
                 continue;
             };
-            // PRESENT BEFORE DESCRIBED, and this ordering is the whole point.
-            // Describing one pushes the workspace tree to the caos server, and
-            // `std_tool_entry` is a static name map that says yes in any
-            // repository -- so an ordinary checkout with no `std/` was pushing
-            // itself to caos three times at every session start, to describe
-            // tools that cannot exist there.
+            // PRESENT BEFORE DESCRIBED, and the ordering is the whole point.
+            // Describing an entry PUSHES the workspace tree to the caos
+            // server, and `std_tool_entry` is a static name map that says yes
+            // in any repository -- so without this an ordinary checkout with
+            // no `std/` pushes itself to caos once per entry at every session
+            // start, to describe tools that cannot exist in it.
             //
-            // Worse than wasteful: it put a network round trip in front of the
-            // MCP handshake. A caos server that REFUSES is harmless (the error
-            // is caught and the tool skipped), but one reached through a tunnel
-            // whose far end is gone does not refuse -- it accepts and swallows,
-            // so the push hangs, `tools/list` never answers, and the session
-            // reports a tool server that closed rather than one still waiting.
+            // Worse than wasteful: it puts a network round trip in front of
+            // the MCP handshake. A caos server that REFUSES is harmless, since
+            // the error is caught and the tool skipped -- but one reached
+            // through a tunnel whose far end is gone does not refuse. It
+            // accepts and swallows, so the push hangs, `tools/list` never
+            // answers, and the session sees a tool server that closed rather
+            // than one still waiting.
             if !t.work_dir().join(entry).is_dir() {
                 continue;
             }
