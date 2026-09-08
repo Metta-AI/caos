@@ -6,8 +6,8 @@ use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transit
 use conversation_protocol::v3::refs as conversation_refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    validate_spine, AsyncStatus, ChildStatus, ChildWorkspace, CodeOps, GitStore, ObjectStore, Oid,
-    RefUpdate, RequestOutcome, RequestStatus,
+    validate_spine, ChildWorkspace, CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus,
+    TurnOutcome, TurnStatus,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -25,8 +25,8 @@ pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> R
     let task = Oid::parse(task, "task")?;
     let result = Oid::parse(result, "result")?;
     let status = match status {
-        "complete" => AsyncStatus::Complete,
-        "failed" => AsyncStatus::Failed,
+        "complete" => TaskStatus::Complete,
+        "failed" => TaskStatus::Failed,
         _ => return Err(format!("invalid async status {status:?}")),
     };
     let mut store = scratch_store()?;
@@ -66,25 +66,25 @@ fn terminal_facts(
     store: &dyn ObjectStore,
     terminal_head: &Oid,
     subrequest: &Oid,
-) -> Result<(ChildStatus, BTreeMap<String, ChildWorkspace>), String> {
+) -> Result<(TaskStatus, BTreeMap<String, ChildWorkspace>), String> {
     let conversation = Conversation::open(store, terminal_head)?;
     let request = conversation
-        .request(subrequest)?
+        .turn(subrequest)?
         .ok_or_else(|| format!("child request {subrequest} does not exist at {terminal_head}"))?;
     let status = match (request.status, request.outcome) {
         (
-            RequestStatus::Idle,
-            Some(RequestOutcome::Idle {
+            TurnStatus::Idle,
+            Some(TurnOutcome::Idle {
                 interrupted: false, ..
             }),
-        ) => ChildStatus::Completed,
+        ) => TaskStatus::Complete,
         (
-            RequestStatus::Idle,
-            Some(RequestOutcome::Idle {
+            TurnStatus::Idle,
+            Some(TurnOutcome::Idle {
                 interrupted: true, ..
             }),
-        ) => ChildStatus::Cancelled,
-        (RequestStatus::Failed, Some(RequestOutcome::Failed { .. })) => ChildStatus::Failed,
+        ) => TaskStatus::Cancelled,
+        (TurnStatus::Failed, Some(TurnOutcome::Failed { .. })) => TaskStatus::Failed,
         _ => return Err("child request not terminal".to_string()),
     };
     let child_workspaces = conversation
@@ -111,7 +111,7 @@ fn append_child_terminal_with<S: RefStore>(
     subrequest: &Oid,
     relay: &Oid,
     terminal_head: &Oid,
-    status: ChildStatus,
+    status: TaskStatus,
     child_workspaces: &BTreeMap<String, ChildWorkspace>,
 ) -> Result<(), String> {
     cas_append(store, refname, |store, head| {
@@ -134,7 +134,7 @@ fn append_child_terminal_with<S: RefStore>(
                 record.relay
             ));
         }
-        if record.status != ChildStatus::Running {
+        if record.status != TaskStatus::Pending {
             if record.terminal_head.as_ref() == Some(terminal_head) {
                 return Ok(None);
             }
@@ -160,7 +160,7 @@ fn append_status_with<S: RefStore>(
     store: &mut S,
     refname: &str,
     task: &Oid,
-    status: AsyncStatus,
+    status: TaskStatus,
     result: &Oid,
 ) -> Result<(), String> {
     cas_append(store, refname, |store, head| {
@@ -172,7 +172,7 @@ fn append_status_with<S: RefStore>(
             (conversation.tree().clone(), record)
         };
 
-        if record.status != AsyncStatus::Pending {
+        if record.status != TaskStatus::Pending {
             if record.status == status && record.result.as_ref() == Some(result) {
                 return Ok(None);
             }
@@ -278,8 +278,8 @@ mod tests {
     use conversation_protocol::v3::apply::client_signature;
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::{
-        AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, RequestRecord, Role,
-        TranscriptEntry, TreeBuilder,
+        AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, Role, TranscriptEntry,
+        TreeBuilder, TurnRecord,
     };
 
     use super::*;
@@ -421,7 +421,7 @@ mod tests {
                 &Transition::AsyncStart {
                     record: AsyncRecord {
                         task: task.clone(),
-                        status: AsyncStatus::Pending,
+                        status: TaskStatus::Pending,
                         target_ref: Some(refname.clone()),
                         result: None,
                         reason: None,
@@ -494,8 +494,8 @@ mod tests {
         head = commit_transition(
             &mut store,
             &head,
-            &Transition::RequestAdmit {
-                record: RequestRecord {
+            &Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: head.clone(),
                     request_workspaces,
@@ -504,7 +504,7 @@ mod tests {
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -514,7 +514,7 @@ mod tests {
         head = commit_transition(
             &mut store,
             &head,
-            &Transition::RequestClaim {
+            &Transition::TurnClaim {
                 request: request.clone(),
                 latest_message: "prompt".to_string(),
             },
@@ -523,9 +523,9 @@ mod tests {
             head = commit_transition(
                 &mut store,
                 &head,
-                &Transition::RequestTerminal {
+                &Transition::TurnTerminal {
                     request: request.clone(),
-                    outcome: RequestOutcome::Idle {
+                    outcome: TurnOutcome::Idle {
                         result: None,
                         interrupted,
                     },
@@ -545,10 +545,9 @@ mod tests {
 
     #[test]
     fn child_terminal_facts_derive_status_and_workspaces() {
-        for (interrupted, expected) in [
-            (false, ChildStatus::Completed),
-            (true, ChildStatus::Cancelled),
-        ] {
+        for (interrupted, expected) in
+            [(false, TaskStatus::Complete), (true, TaskStatus::Cancelled)]
+        {
             let (store, head, request) = child_request_history(Some(interrupted));
             let (status, workspaces) = terminal_facts(&store, &head, &request).unwrap();
             assert_eq!(status, expected);
@@ -571,10 +570,10 @@ mod tests {
         let (mut store, refname, task) = conversation(true);
         let result = stored_result(&mut store, b"complete");
 
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result).unwrap();
 
         let record = task_record(&store, &task);
-        assert_eq!(record.status, AsyncStatus::Complete);
+        assert_eq!(record.status, TaskStatus::Complete);
         assert_eq!(record.result, Some(result));
         assert_eq!(store.pushes.len(), 1);
     }
@@ -584,10 +583,10 @@ mod tests {
         let (mut store, refname, task) = conversation(true);
         let result = stored_failure_tree(&mut store);
 
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Failed, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Failed, &result).unwrap();
 
         let record = task_record(&store, &task);
-        assert_eq!(record.status, AsyncStatus::Failed);
+        assert_eq!(record.status, TaskStatus::Failed);
         assert_eq!(record.result, Some(result));
     }
 
@@ -595,11 +594,11 @@ mod tests {
     fn identical_terminal_replay_appends_nothing() {
         let (mut store, refname, task) = conversation(true);
         let result = stored_result(&mut store, b"complete");
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result).unwrap();
         let settled_head = store.head().clone();
         let push_count = store.pushes.len();
 
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result).unwrap();
 
         assert_eq!(store.head(), &settled_head);
         assert_eq!(store.pushes.len(), push_count);
@@ -610,18 +609,11 @@ mod tests {
         let (mut store, refname, task) = conversation(true);
         let complete = stored_result(&mut store, b"complete");
         let failed = stored_failure_tree(&mut store);
-        append_status_with(
-            &mut store,
-            &refname,
-            &task,
-            AsyncStatus::Complete,
-            &complete,
-        )
-        .unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &complete).unwrap();
         let settled_head = store.head().clone();
         let push_count = store.pushes.len();
 
-        let error = append_status_with(&mut store, &refname, &task, AsyncStatus::Failed, &failed)
+        let error = append_status_with(&mut store, &refname, &task, TaskStatus::Failed, &failed)
             .unwrap_err();
 
         assert!(error.contains("already settled"), "{error}");
@@ -635,7 +627,7 @@ mod tests {
         let result = stored_result(&mut store, b"complete");
 
         assert_eq!(
-            append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result,),
+            append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result,),
             Err(format!("task {task} was never recorded on {refname}"))
         );
         assert!(store.pushes.is_empty());
@@ -655,7 +647,7 @@ mod tests {
         store.first_push = FirstPush::MoveTo(concurrent.clone());
         let result = stored_result(&mut store, b"complete");
 
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result).unwrap();
 
         assert_eq!(store.pushes.len(), 2);
         assert_ne!(store.pushes[0], store.pushes[1]);
@@ -667,7 +659,7 @@ mod tests {
         assert_eq!(conversation.title().unwrap(), "Concurrent title");
         assert_eq!(
             conversation.async_task(&task).unwrap().unwrap().status,
-            AsyncStatus::Complete
+            TaskStatus::Complete
         );
     }
 
@@ -677,7 +669,7 @@ mod tests {
         store.first_push = FirstPush::AcceptThenAdvance;
         let result = stored_result(&mut store, b"complete");
 
-        append_status_with(&mut store, &refname, &task, AsyncStatus::Complete, &result).unwrap();
+        append_status_with(&mut store, &refname, &task, TaskStatus::Complete, &result).unwrap();
 
         assert_eq!(store.pushes.len(), 1);
         assert_eq!(
@@ -687,7 +679,7 @@ mod tests {
                 .unwrap(),
             "Advanced after accepted push"
         );
-        assert_eq!(task_record(&store, &task).status, AsyncStatus::Complete);
+        assert_eq!(task_record(&store, &task).status, TaskStatus::Complete);
     }
 
     #[test]

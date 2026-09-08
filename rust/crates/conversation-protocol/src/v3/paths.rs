@@ -6,11 +6,11 @@ pub const IDENTITY: &str = ".caos/identity.json";
 pub const TITLE: &str = ".caos/title";
 pub const WORKSPACES_DIR: &str = ".caos/workspaces";
 pub const TRANSCRIPT_DIR: &str = ".caos/transcript";
-pub const REQUESTS_DIR: &str = ".caos/requests";
-pub const ACTIVE_REQUEST: &str = ".caos/requests/active";
-pub const TOOLS_DIR: &str = ".caos/tools";
-pub const ASYNC_DIR: &str = ".caos/async";
-pub const SUBAGENTS_DIR: &str = ".caos/subagents";
+pub const TURNS_DIR: &str = ".caos/requests";
+pub const ACTIVE_TURN: &str = ".caos/requests/active";
+pub const CALLS_DIR: &str = ".caos/tools";
+pub const TASK_COMPUTATIONS_DIR: &str = ".caos/async";
+pub const TASK_CONVERSATIONS_DIR: &str = ".caos/subagents";
 pub const PUBLICATIONS_DIR: &str = ".caos/publications";
 pub const FILES_DIR: &str = "files";
 pub const CAOS_DIR: &str = ".caos";
@@ -142,30 +142,30 @@ pub fn transcript_payload_dir(ordinal: u64, message_id: &str) -> String {
     )
 }
 
-pub fn request_record_path(request: &str) -> String {
-    format!("{REQUESTS_DIR}/{request}.json")
+pub fn turn_record_path(request: &str) -> String {
+    format!("{TURNS_DIR}/{request}.json")
 }
 
-pub fn tool_record_path(request: &str, round: u64, tool_id: &str) -> String {
+pub fn call_record_path(request: &str, round: u64, tool_id: &str) -> String {
     format!(
-        "{TOOLS_DIR}/{request}/{round:04}/{}.json",
+        "{CALLS_DIR}/{request}/{round:04}/{}.json",
         admit_external_id(tool_id)
     )
 }
 
-pub fn tool_payload_dir(request: &str, round: u64, tool_id: &str) -> String {
+pub fn call_payload_dir(request: &str, round: u64, tool_id: &str) -> String {
     format!(
-        "{TOOLS_DIR}/{request}/{round:04}/{}",
+        "{CALLS_DIR}/{request}/{round:04}/{}",
         admit_external_id(tool_id)
     )
 }
 
 pub fn async_record_path(task: &str) -> String {
-    format!("{ASYNC_DIR}/{task}.json")
+    format!("{TASK_COMPUTATIONS_DIR}/{task}.json")
 }
 
 pub fn subagent_record_path(child: &str) -> String {
-    format!("{SUBAGENTS_DIR}/{child}.json")
+    format!("{TASK_CONVERSATIONS_DIR}/{child}.json")
 }
 
 pub fn publication_record_path(publication: &str) -> String {
@@ -245,18 +245,18 @@ mod tests {
             transcript_payload_dir(1234, message),
             ".caos/transcript/000000001/000000001234-0123456789abcdef0123456789abcdef"
         );
-        assert_eq!(request_record_path("r"), ".caos/requests/r.json");
-        assert_eq!(ACTIVE_REQUEST, ".caos/requests/active");
+        assert_eq!(turn_record_path("r"), ".caos/requests/r.json");
+        assert_eq!(ACTIVE_TURN, ".caos/requests/active");
         assert_eq!(
-            tool_record_path("r", 7, "toolu_01AB"),
+            call_record_path("r", 7, "toolu_01AB"),
             ".caos/tools/r/0007/toolu_01AB.json"
         );
         assert_eq!(
-            tool_payload_dir("r", 7, "toolu_01AB"),
+            call_payload_dir("r", 7, "toolu_01AB"),
             ".caos/tools/r/0007/toolu_01AB"
         );
         assert_eq!(
-            tool_record_path("r", 7, "weird id!"),
+            call_record_path("r", 7, "weird id!"),
             ".caos/tools/r/0007/776569726420696421.json"
         );
         assert_eq!(async_record_path("task"), ".caos/async/task.json");

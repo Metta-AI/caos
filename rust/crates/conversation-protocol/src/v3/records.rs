@@ -1,3 +1,4 @@
+pub use super::tasks::TaskStatus;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -390,7 +391,7 @@ impl_record!(DeclaredCall);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum RequestStatus {
+pub enum TurnStatus {
     Queued,
     Running,
     Cancelling,
@@ -400,7 +401,7 @@ pub enum RequestStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-pub enum RequestOutcome {
+pub enum TurnOutcome {
     Idle {
         result: Option<String>,
         interrupted: bool,
@@ -411,8 +412,8 @@ pub enum RequestOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawRequestRecord", into = "RawRequestRecord")]
-pub struct RequestRecord {
+#[serde(try_from = "RawTurnRecord", into = "RawTurnRecord")]
+pub struct TurnRecord {
     pub id: Oid,
     pub request_head: Oid,
     pub request_workspaces: Option<Oid>,
@@ -421,15 +422,15 @@ pub struct RequestRecord {
     pub round: u64,
     pub calls: Vec<DeclaredCall>,
     pub interjections: Vec<String>,
-    pub status: RequestStatus,
+    pub status: TurnStatus,
     pub latest_message: Option<String>,
     pub escape_reason: Option<String>,
-    pub outcome: Option<RequestOutcome>,
+    pub outcome: Option<TurnOutcome>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawRequestRecord {
+struct RawTurnRecord {
     id: Oid,
     request_head: Oid,
     #[serde(deserialize_with = "nullable")]
@@ -439,7 +440,7 @@ struct RawRequestRecord {
     round: u64,
     calls: Vec<DeclaredCall>,
     interjections: Vec<String>,
-    status: RequestStatus,
+    status: TurnStatus,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     latest_message: Option<String>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
@@ -456,16 +457,16 @@ struct RawRequestRecord {
     error: Option<String>,
 }
 
-impl TryFrom<RawRequestRecord> for RequestRecord {
+impl TryFrom<RawTurnRecord> for TurnRecord {
     type Error = String;
 
-    fn try_from(raw: RawRequestRecord) -> Result<Self, Self::Error> {
+    fn try_from(raw: RawTurnRecord) -> Result<Self, Self::Error> {
         let outcome = match raw.status {
-            RequestStatus::Idle => {
+            TurnStatus::Idle => {
                 if raw.error.is_some() {
                     return Err("request error is forbidden for idle status".to_string());
                 }
-                Some(RequestOutcome::Idle {
+                Some(TurnOutcome::Idle {
                     result: raw
                         .result
                         .ok_or_else(|| "request result is required for idle status".to_string())?,
@@ -474,11 +475,11 @@ impl TryFrom<RawRequestRecord> for RequestRecord {
                     })?,
                 })
             }
-            RequestStatus::Failed => {
+            TurnStatus::Failed => {
                 if raw.result.is_some() || raw.interrupted.is_some() {
                     return Err("request idle outcome is forbidden for failed status".to_string());
                 }
-                Some(RequestOutcome::Failed {
+                Some(TurnOutcome::Failed {
                     error: raw
                         .error
                         .ok_or_else(|| "request error is required for failed status".to_string())?,
@@ -491,7 +492,7 @@ impl TryFrom<RawRequestRecord> for RequestRecord {
                 None
             }
         };
-        let record = RequestRecord {
+        let record = TurnRecord {
             id: raw.id,
             request_head: raw.request_head,
             request_workspaces: raw.request_workspaces,
@@ -510,17 +511,17 @@ impl TryFrom<RawRequestRecord> for RequestRecord {
     }
 }
 
-impl From<RequestRecord> for RawRequestRecord {
-    fn from(record: RequestRecord) -> Self {
+impl From<TurnRecord> for RawTurnRecord {
+    fn from(record: TurnRecord) -> Self {
         let (result, interrupted, error) = match record.outcome {
-            Some(RequestOutcome::Idle {
+            Some(TurnOutcome::Idle {
                 result,
                 interrupted,
             }) => (Some(result), Some(interrupted), None),
-            Some(RequestOutcome::Failed { error }) => (None, None, Some(error)),
+            Some(TurnOutcome::Failed { error }) => (None, None, Some(error)),
             None => (None, None, None),
         };
-        RawRequestRecord {
+        RawTurnRecord {
             id: record.id,
             request_head: record.request_head,
             request_workspaces: record.request_workspaces,
@@ -539,7 +540,7 @@ impl From<RequestRecord> for RawRequestRecord {
     }
 }
 
-impl RequestRecord {
+impl TurnRecord {
     fn validate(&self) -> Result<(), String> {
         if self.round > MAX_JSON_INT {
             return Err("request round exceeds the maximum JSON integer".to_string());
@@ -547,10 +548,8 @@ impl RequestRecord {
         if self.configuration.is_empty() {
             return Err("request configuration must not be empty".to_string());
         }
-        if matches!(
-            self.status,
-            RequestStatus::Running | RequestStatus::Cancelling
-        ) != self.latest_message.is_some()
+        if matches!(self.status, TurnStatus::Running | TurnStatus::Cancelling)
+            != self.latest_message.is_some()
         {
             return Err(
                 "request latest_message is required only for running or cancelling status"
@@ -558,25 +557,25 @@ impl RequestRecord {
             );
         }
         if self.escape_reason.is_some()
-            && !matches!(self.status, RequestStatus::Cancelling | RequestStatus::Idle)
+            && !matches!(self.status, TurnStatus::Cancelling | TurnStatus::Idle)
         {
             return Err(
                 "request escape_reason is allowed only for cancelling or idle status".to_string(),
             );
         }
         match (&self.status, &self.outcome) {
-            (RequestStatus::Idle, Some(RequestOutcome::Idle { result, .. })) => {
+            (TurnStatus::Idle, Some(TurnOutcome::Idle { result, .. })) => {
                 if let Some(result) = result {
                     path(result, "request result path")?;
                 }
             }
-            (RequestStatus::Failed, Some(RequestOutcome::Failed { error })) => {
+            (TurnStatus::Failed, Some(TurnOutcome::Failed { error })) => {
                 path(error, "request error path")?;
             }
-            (RequestStatus::Idle, _) => {
+            (TurnStatus::Idle, _) => {
                 return Err("request idle status requires idle outcome".to_string())
             }
-            (RequestStatus::Failed, _) => {
+            (TurnStatus::Failed, _) => {
                 return Err("request failed status requires failed outcome".to_string())
             }
             (_, None) => {}
@@ -586,11 +585,11 @@ impl RequestRecord {
     }
 }
 
-impl_record!(RequestRecord);
+impl_record!(TurnRecord);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ToolStatus {
+pub enum CallStatus {
     Started,
     Complete,
     Failed,
@@ -635,8 +634,8 @@ pub struct FilesOutcome {
 impl_record!(FilesOutcome, validate);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawToolRecord", into = "RawToolRecord")]
-pub struct ToolRecord {
+#[serde(try_from = "RawCallRecord", into = "RawCallRecord")]
+pub struct CallRecord {
     pub request: Oid,
     pub round: u64,
     pub id: String,
@@ -644,7 +643,7 @@ pub struct ToolRecord {
     pub declaration_message: String,
     pub workspace_name: Option<String>,
     pub input_workspace: Option<Oid>,
-    pub status: ToolStatus,
+    pub status: CallStatus,
     pub task: Option<Oid>,
     pub result: Option<ToolResult>,
     pub workspace_resolution: Option<WorkspaceResolution>,
@@ -654,7 +653,7 @@ pub struct ToolRecord {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawToolRecord {
+struct RawCallRecord {
     request: Oid,
     round: u64,
     id: String,
@@ -664,7 +663,7 @@ struct RawToolRecord {
     workspace_name: Option<String>,
     #[serde(deserialize_with = "nullable")]
     input_workspace: Option<Oid>,
-    status: ToolStatus,
+    status: CallStatus,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     task: Option<Oid>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
@@ -681,11 +680,11 @@ struct RawToolRecord {
     files_outcome: Option<Option<FilesOutcome>>,
 }
 
-impl TryFrom<RawToolRecord> for ToolRecord {
+impl TryFrom<RawCallRecord> for CallRecord {
     type Error = String;
 
-    fn try_from(raw: RawToolRecord) -> Result<Self, Self::Error> {
-        let (files, files_outcome) = if raw.status == ToolStatus::Started {
+    fn try_from(raw: RawCallRecord) -> Result<Self, Self::Error> {
+        let (files, files_outcome) = if raw.status == CallStatus::Started {
             if raw.task.is_none()
                 || raw.result.is_some()
                 || raw.workspace_resolution.is_some()
@@ -706,7 +705,7 @@ impl TryFrom<RawToolRecord> for ToolRecord {
                     .ok_or_else(|| "terminal tool requires files_outcome".to_string())?,
             )
         };
-        let record = ToolRecord {
+        let record = CallRecord {
             request: raw.request,
             round: raw.round,
             id: raw.id,
@@ -726,10 +725,10 @@ impl TryFrom<RawToolRecord> for ToolRecord {
     }
 }
 
-impl From<ToolRecord> for RawToolRecord {
-    fn from(record: ToolRecord) -> Self {
-        let terminal = record.status != ToolStatus::Started;
-        RawToolRecord {
+impl From<CallRecord> for RawCallRecord {
+    fn from(record: CallRecord) -> Self {
+        let terminal = record.status != CallStatus::Started;
+        RawCallRecord {
             request: record.request,
             round: record.round,
             id: record.id,
@@ -747,7 +746,7 @@ impl From<ToolRecord> for RawToolRecord {
     }
 }
 
-impl ToolRecord {
+impl CallRecord {
     fn validate(&self) -> Result<(), String> {
         if self.round > MAX_JSON_INT {
             return Err("tool round exceeds the maximum JSON integer".to_string());
@@ -763,7 +762,7 @@ impl ToolRecord {
         if self.workspace_resolution.is_some() && self.workspace_name.is_none() {
             return Err("tool workspace_resolution requires workspace_name".to_string());
         }
-        if self.status == ToolStatus::Started {
+        if self.status == CallStatus::Started {
             if self.task.is_none()
                 || self.result.is_some()
                 || self.workspace_resolution.is_some()
@@ -814,43 +813,35 @@ impl ToolRecord {
     }
 }
 
-impl ToolRecord {
+impl CallRecord {
     pub fn is_terminal(&self) -> bool {
-        self.status != ToolStatus::Started
+        self.status != CallStatus::Started
     }
 
     pub fn expected_status(
         result: &ToolResult,
         resolution: Option<&WorkspaceResolution>,
-    ) -> ToolStatus {
+    ) -> CallStatus {
         match result {
             ToolResult::Complete { .. }
                 if matches!(resolution, Some(WorkspaceResolution::Conflict { .. })) =>
             {
-                ToolStatus::Conflict
+                CallStatus::Conflict
             }
-            ToolResult::Complete { .. } => ToolStatus::Complete,
-            ToolResult::Failed { .. } => ToolStatus::Failed,
-            ToolResult::Cancelled { .. } => ToolStatus::Cancelled,
+            ToolResult::Complete { .. } => CallStatus::Complete,
+            ToolResult::Failed { .. } => CallStatus::Failed,
+            ToolResult::Cancelled { .. } => CallStatus::Cancelled,
         }
     }
 }
 
-impl_record!(ToolRecord);
+impl_record!(CallRecord);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AsyncStatus {
-    Pending,
-    Complete,
-    Failed,
-    Cancelled,
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AsyncRecord {
     pub task: Oid,
-    pub status: AsyncStatus,
+    pub status: TaskStatus,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     pub target_ref: Option<String>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
@@ -878,14 +869,6 @@ pub struct SpawnIntent {
 }
 impl_record!(SpawnIntent, validate);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChildStatus {
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildWorkspace {
@@ -915,7 +898,8 @@ pub struct ChildRecord {
     pub request: Oid,
     pub relay: Oid,
     pub spawn_intent: SpawnIntent,
-    pub status: ChildStatus,
+    #[serde(with = "child_status")]
+    pub status: TaskStatus,
     pub applications: Vec<Application>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     pub terminal_head: Option<Oid>,
@@ -923,6 +907,30 @@ pub struct ChildRecord {
     pub child_workspaces: Option<BTreeMap<String, ChildWorkspace>>,
 }
 impl_record!(ChildRecord, validate);
+
+mod child_status {
+    use super::TaskStatus;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(status: &TaskStatus, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match status {
+            TaskStatus::Pending => "running",
+            TaskStatus::Complete => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
+        })
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TaskStatus, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "running" => Ok(TaskStatus::Pending),
+            "completed" => Ok(TaskStatus::Complete),
+            "failed" => Ok(TaskStatus::Failed),
+            "cancelled" => Ok(TaskStatus::Cancelled),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid child status {other:?}"
+            ))),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1175,11 +1183,11 @@ impl FilesOutcome {
 impl AsyncRecord {
     fn validate(&self) -> Result<(), String> {
         let valid = match self.status {
-            AsyncStatus::Pending => self.result.is_none() && self.reason.is_none(),
-            AsyncStatus::Complete | AsyncStatus::Failed => {
+            TaskStatus::Pending => self.result.is_none() && self.reason.is_none(),
+            TaskStatus::Complete | TaskStatus::Failed => {
                 self.result.is_some() && self.reason.is_none()
             }
-            AsyncStatus::Cancelled => self.result.is_none() && self.reason.is_some(),
+            TaskStatus::Cancelled => self.result.is_none() && self.reason.is_some(),
         };
         if !valid {
             return Err("async terminal fields do not match status".to_string());
@@ -1220,7 +1228,7 @@ impl Application {
 
 impl ChildRecord {
     fn validate(&self) -> Result<(), String> {
-        if self.status == ChildStatus::Running {
+        if self.status == TaskStatus::Pending {
             if self.terminal_head.is_some() || self.child_workspaces.is_some() {
                 return Err("running child forbids terminal fields".to_string());
             }
@@ -1266,7 +1274,7 @@ impl Evidence {
     }
 }
 
-pub fn parse_active_request(bytes: &[u8]) -> Result<Oid, String> {
+pub fn parse_active_turn(bytes: &[u8]) -> Result<Oid, String> {
     Oid::parse_line(bytes, "workspace sha")
         .map_err(|error| format!("invalid active request: {error}"))
 }
@@ -1300,8 +1308,8 @@ mod tests {
         }
     }
 
-    fn child(status: ChildStatus) -> ChildRecord {
-        let terminal = status != ChildStatus::Running;
+    fn child(status: TaskStatus) -> ChildRecord {
+        let terminal = status != TaskStatus::Pending;
         ChildRecord {
             id: "child-1".to_string(),
             initial_head: oid('2'),
@@ -1361,7 +1369,7 @@ mod tests {
             output: Some(oid('d')),
             conflict_paths: None,
         };
-        let request = RequestRecord {
+        let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1373,10 +1381,10 @@ mod tests {
                 name: "shell".to_string(),
             }],
             interjections: vec!["note".to_string()],
-            status: RequestStatus::Idle,
+            status: TurnStatus::Idle,
             latest_message: None,
             escape_reason: Some("stop".to_string()),
-            outcome: Some(RequestOutcome::Idle {
+            outcome: Some(TurnOutcome::Idle {
                 result: Some(".caos/requests/result".to_string()),
                 interrupted: true,
             }),
@@ -1389,7 +1397,7 @@ mod tests {
             applied: vec!["a.txt".to_string()],
             conflicted: vec!["b.txt".to_string()],
         };
-        let tool = ToolRecord {
+        let tool = CallRecord {
             request: oid('1'),
             round: 0,
             id: "tool-1".to_string(),
@@ -1397,7 +1405,7 @@ mod tests {
             declaration_message: "message-1".to_string(),
             workspace_name: Some("main".to_string()),
             input_workspace: Some(oid('a')),
-            status: ToolStatus::Complete,
+            status: CallStatus::Complete,
             task: None,
             result: Some(tool_result.clone()),
             workspace_resolution: Some(direct()),
@@ -1493,7 +1501,7 @@ mod tests {
             tool.encode(),
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Complete,
+                status: TaskStatus::Complete,
                 target_ref: Some("refs/heads/main".to_string()),
                 result: Some(oid('2')),
                 reason: None,
@@ -1506,7 +1514,7 @@ mod tests {
             }
             .encode(),
             application.encode(),
-            child(ChildStatus::Completed).encode(),
+            child(TaskStatus::Complete).encode(),
             descriptor().encode(),
             Evidence {
                 kind: "push-success".to_string(),
@@ -1774,7 +1782,7 @@ mod tests {
 
     #[test]
     fn request_status_variants_round_trip() {
-        let base = RequestRecord {
+        let base = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1783,35 +1791,35 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
         };
-        round_trip!(RequestRecord, base.clone());
+        round_trip!(TurnRecord, base.clone());
         round_trip!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Running,
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Running,
                 latest_message: Some("message-1".to_string()),
                 ..base.clone()
             }
         );
         round_trip!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Cancelling,
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Cancelling,
                 latest_message: Some("message-1".to_string()),
                 escape_reason: Some("stop".to_string()),
                 ..base.clone()
             }
         );
         round_trip!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Idle,
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Idle,
                 escape_reason: Some("stop".to_string()),
-                outcome: Some(RequestOutcome::Idle {
+                outcome: Some(TurnOutcome::Idle {
                     result: Some(".caos/requests/result".to_string()),
                     interrupted: true,
                 }),
@@ -1819,10 +1827,10 @@ mod tests {
             }
         );
         round_trip!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Failed,
-                outcome: Some(RequestOutcome::Failed {
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Failed,
+                outcome: Some(TurnOutcome::Failed {
                     error: ".caos/requests/error".to_string()
                 }),
                 ..base
@@ -1838,7 +1846,7 @@ mod tests {
         intent.configuration.clear();
         assert!(SpawnIntent::from_value(&intent.to_value()).is_err());
 
-        let mut request = RequestRecord {
+        let mut request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1847,19 +1855,19 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
         };
-        round_trip!(RequestRecord, request.clone());
+        round_trip!(TurnRecord, request.clone());
         request.configuration.clear();
-        assert!(RequestRecord::from_value(&request.to_value()).is_err());
+        assert!(TurnRecord::from_value(&request.to_value()).is_err());
     }
 
     #[test]
     fn failed_requests_forbid_escape_reason() {
-        let request = RequestRecord {
+        let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1868,14 +1876,14 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Failed,
+            status: TurnStatus::Failed,
             latest_message: None,
             escape_reason: Some("stop".to_string()),
-            outcome: Some(RequestOutcome::Failed {
+            outcome: Some(TurnOutcome::Failed {
                 error: ".caos/requests/error".to_string(),
             }),
         };
-        assert!(RequestRecord::from_value(&request.to_value()).is_err());
+        assert!(TurnRecord::from_value(&request.to_value()).is_err());
     }
 
     #[test]
@@ -1914,7 +1922,7 @@ mod tests {
             output: Some(oid('d')),
             conflict_paths: None,
         };
-        let request = RequestRecord {
+        let request = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -1923,12 +1931,12 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
         };
-        let tool = ToolRecord {
+        let tool = CallRecord {
             request: oid('1'),
             round: 0,
             id: "tool-1".to_string(),
@@ -1936,7 +1944,7 @@ mod tests {
             declaration_message: "message-1".to_string(),
             workspace_name: None,
             input_workspace: None,
-            status: ToolStatus::Started,
+            status: CallStatus::Started,
             task: Some(oid('2')),
             result: None,
             workspace_resolution: None,
@@ -2026,7 +2034,7 @@ mod tests {
                 name: "shell".to_string(),
             }
         );
-        rejects_unknown!(RequestRecord, request);
+        rejects_unknown!(TurnRecord, request);
         rejects_unknown!(
             ToolResult,
             ToolResult::Cancelled {
@@ -2040,12 +2048,12 @@ mod tests {
                 conflicted: Vec::new(),
             }
         );
-        rejects_unknown!(ToolRecord, tool);
+        rejects_unknown!(CallRecord, tool);
         rejects_unknown!(
             AsyncRecord,
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Pending,
+                status: TaskStatus::Pending,
                 target_ref: None,
                 result: None,
                 reason: None,
@@ -2060,7 +2068,7 @@ mod tests {
             }
         );
         rejects_unknown!(Application, application);
-        rejects_unknown!(ChildRecord, child(ChildStatus::Running));
+        rejects_unknown!(ChildRecord, child(TaskStatus::Pending));
         rejects_unknown!(Descriptor, descriptor());
         rejects_unknown!(
             Evidence,
@@ -2118,7 +2126,7 @@ mod tests {
         rejects_null!(TranscriptEntry, transcript.clone(), "round");
         rejects_null!(TranscriptEntry, transcript, "model");
 
-        let queued = RequestRecord {
+        let queued = TurnRecord {
             id: oid('1'),
             request_head: oid('2'),
             request_workspaces: None,
@@ -2127,25 +2135,25 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
         };
         rejects_null!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Running,
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Running,
                 latest_message: Some("message-1".to_string()),
                 ..queued.clone()
             },
             "latest_message"
         );
         rejects_null!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Idle,
-                outcome: Some(RequestOutcome::Idle {
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Idle,
+                outcome: Some(TurnOutcome::Idle {
                     result: None,
                     interrupted: false,
                 }),
@@ -2156,7 +2164,7 @@ mod tests {
         for key in ["target_ref", "result", "error", "reason"] {
             let mut value = AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Pending,
+                status: TaskStatus::Pending,
                 target_ref: None,
                 result: None,
                 reason: None,
@@ -2204,7 +2212,7 @@ mod tests {
             },
             "diagnostic"
         );
-        rejects_null!(ChildRecord, child(ChildStatus::Running), "terminal_head");
+        rejects_null!(ChildRecord, child(TaskStatus::Pending), "terminal_head");
 
         rejects_missing!(
             WorkspaceResolution,
@@ -2215,12 +2223,12 @@ mod tests {
             },
             "current"
         );
-        rejects_missing!(RequestRecord, queued.clone(), "request_workspaces");
+        rejects_missing!(TurnRecord, queued.clone(), "request_workspaces");
         rejects_missing!(
-            RequestRecord,
-            RequestRecord {
-                status: RequestStatus::Idle,
-                outcome: Some(RequestOutcome::Idle {
+            TurnRecord,
+            TurnRecord {
+                status: TurnStatus::Idle,
+                outcome: Some(TurnOutcome::Idle {
                     result: None,
                     interrupted: false,
                 }),
@@ -2228,7 +2236,7 @@ mod tests {
             },
             "result"
         );
-        let started_tool = ToolRecord {
+        let started_tool = CallRecord {
             request: oid('1'),
             round: 0,
             id: "tool-1".to_string(),
@@ -2236,15 +2244,15 @@ mod tests {
             declaration_message: "message-1".to_string(),
             workspace_name: None,
             input_workspace: None,
-            status: ToolStatus::Started,
+            status: CallStatus::Started,
             task: Some(oid('2')),
             result: None,
             workspace_resolution: None,
             files: Vec::new(),
             files_outcome: None,
         };
-        rejects_missing!(ToolRecord, started_tool.clone(), "workspace_name");
-        rejects_missing!(ToolRecord, started_tool, "input_workspace");
+        rejects_missing!(CallRecord, started_tool.clone(), "workspace_name");
+        rejects_missing!(CallRecord, started_tool, "input_workspace");
         let intent = SpawnIntent {
             workspace_name: None,
             input_workspace: None,
@@ -2268,11 +2276,11 @@ mod tests {
             ChildRecord,
             ChildRecord {
                 initial_workspace: None,
-                ..child(ChildStatus::Running)
+                ..child(TaskStatus::Pending)
             },
             "initial_workspace"
         );
-        let terminal_child = child(ChildStatus::Completed);
+        let terminal_child = child(TaskStatus::Complete);
         rejects_missing!(ChildRecord, terminal_child.clone(), "terminal_head");
         rejects_missing!(ChildRecord, terminal_child, "child_workspaces");
         let pending_publication = PublicationRecord {
@@ -2306,15 +2314,15 @@ mod tests {
             "observed"
         );
         rejects_missing!(
-            ToolRecord,
-            ToolRecord {
-                status: ToolStatus::Complete,
+            CallRecord,
+            CallRecord {
+                status: CallStatus::Complete,
                 task: None,
                 result: Some(ToolResult::Complete {
                     observation: ".caos/tools/observation".to_string(),
                     proposal: None,
                 }),
-                ..ToolRecord {
+                ..CallRecord {
                     request: oid('1'),
                     round: 0,
                     id: "tool-1".to_string(),
@@ -2322,7 +2330,7 @@ mod tests {
                     declaration_message: "message-1".to_string(),
                     workspace_name: None,
                     input_workspace: None,
-                    status: ToolStatus::Started,
+                    status: CallStatus::Started,
                     task: Some(oid('2')),
                     result: None,
                     workspace_resolution: None,
@@ -2336,7 +2344,7 @@ mod tests {
 
     #[test]
     fn tool_status_variants_round_trip() {
-        let base = ToolRecord {
+        let base = CallRecord {
             request: oid('1'),
             round: 0,
             id: "tool-1".to_string(),
@@ -2344,38 +2352,38 @@ mod tests {
             declaration_message: "message-1".to_string(),
             workspace_name: None,
             input_workspace: None,
-            status: ToolStatus::Started,
+            status: CallStatus::Started,
             task: Some(oid('2')),
             result: None,
             workspace_resolution: None,
             files: Vec::new(),
             files_outcome: None,
         };
-        round_trip!(ToolRecord, base.clone());
+        round_trip!(CallRecord, base.clone());
         for (status, result) in [
             (
-                ToolStatus::Complete,
+                CallStatus::Complete,
                 ToolResult::Complete {
                     observation: ".caos/tools/observation".to_string(),
                     proposal: None,
                 },
             ),
             (
-                ToolStatus::Failed,
+                CallStatus::Failed,
                 ToolResult::Failed {
                     error: ".caos/tools/error".to_string(),
                 },
             ),
             (
-                ToolStatus::Cancelled,
+                CallStatus::Cancelled,
                 ToolResult::Cancelled {
                     reason: "stop".to_string(),
                 },
             ),
         ] {
             round_trip!(
-                ToolRecord,
-                ToolRecord {
+                CallRecord,
+                CallRecord {
                     status,
                     result: Some(result),
                     ..base.clone()
@@ -2383,11 +2391,11 @@ mod tests {
             );
         }
         round_trip!(
-            ToolRecord,
-            ToolRecord {
+            CallRecord,
+            CallRecord {
                 workspace_name: Some("main".to_string()),
                 input_workspace: Some(oid('a')),
-                status: ToolStatus::Conflict,
+                status: CallStatus::Conflict,
                 result: Some(ToolResult::Complete {
                     observation: ".caos/tools/observation".to_string(),
                     proposal: Some(oid('b')),
@@ -2407,28 +2415,28 @@ mod tests {
         for record in [
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Pending,
+                status: TaskStatus::Pending,
                 target_ref: None,
                 result: None,
                 reason: None,
             },
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Complete,
+                status: TaskStatus::Complete,
                 target_ref: Some("refs/heads/main".to_string()),
                 result: Some(oid('2')),
                 reason: None,
             },
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Failed,
+                status: TaskStatus::Failed,
                 target_ref: None,
                 result: Some(oid('2')),
                 reason: None,
             },
             AsyncRecord {
                 task: oid('1'),
-                status: AsyncStatus::Cancelled,
+                status: TaskStatus::Cancelled,
                 target_ref: None,
                 result: None,
                 reason: Some("stop".to_string()),
@@ -2437,10 +2445,10 @@ mod tests {
             round_trip!(AsyncRecord, record);
         }
         for status in [
-            ChildStatus::Running,
-            ChildStatus::Completed,
-            ChildStatus::Failed,
-            ChildStatus::Cancelled,
+            TaskStatus::Pending,
+            TaskStatus::Complete,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
         ] {
             round_trip!(ChildRecord, child(status));
         }
@@ -2481,8 +2489,8 @@ mod tests {
         assert!(encode_title("").is_err());
         assert!(encode_title("bad\n").is_err());
         let hash = oid('a');
-        assert_eq!(parse_active_request(&hash.encode_line()), Ok(hash));
-        assert!(parse_active_request(b"aaaa\n").is_err());
+        assert_eq!(parse_active_turn(&hash.encode_line()), Ok(hash));
+        assert!(parse_active_turn(b"aaaa\n").is_err());
         assert!(Owner::from_value(&obj(&[("unknown", Value::Null)])).is_err());
         assert!(Evidence::from_value(&obj(&[("kind", value_str("push-success"))])).is_ok());
     }

@@ -26,11 +26,11 @@ use conversation_protocol::v3::apply::{
 use conversation_protocol::v3::ids;
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
-pub use conversation_protocol::v3::records::RequestStatus;
+pub use conversation_protocol::v3::records::TurnStatus;
 use conversation_protocol::v3::records::{
     Block, Descriptor, Evidence, Identity, IdentityKind, Proposal, PublicationRecord,
-    PublicationStatus, RequestOutcome, RequestRecord, Role, ToolResult as ProtocolToolResult,
-    TranscriptEntry, WorkspaceResolution,
+    PublicationStatus, Role, ToolResult as ProtocolToolResult, TranscriptEntry,
+    TurnOutcome as ProtocolTurnOutcome, TurnRecord, WorkspaceResolution,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -134,7 +134,7 @@ pub struct ConversationSnapshot {
     pub id: String,
     pub head: String,
     pub title: String,
-    pub status: RequestStatus,
+    pub status: TurnStatus,
     pub request: Option<String>,
     pub interrupted: bool,
     pub error: Option<String>,
@@ -933,7 +933,7 @@ where
     P: FnMut(),
 {
     let parent_view = Conversation::open(store, parent)?;
-    let active = parent_view.active_request()?;
+    let active = parent_view.active_turn()?;
     if active.is_none() && !admit_when_idle {
         return Err(format!(
             "conversation {id:?} is no longer active; submit again to start a new turn"
@@ -995,7 +995,7 @@ where
         resolution,
     );
     let transition = match &active {
-        Some(active) => Transition::RequestInterject {
+        Some(active) => Transition::TurnInterject {
             request: active.id.clone(),
             entry,
             payloads: Vec::new(),
@@ -1019,7 +1019,7 @@ where
     let prepared = prepare(t, options, id, message_commit.as_str())?;
     let request = oid(&prepared.request, "prepared request")?;
     let view = Conversation::open(store, &message_commit)?;
-    let record = RequestRecord {
+    let record = TurnRecord {
         id: request.clone(),
         request_head: message_commit.clone(),
         request_workspaces: view.workspaces_tree()?,
@@ -1031,7 +1031,7 @@ where
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,
@@ -1041,7 +1041,7 @@ where
     let admitted = mint_transition(
         store,
         &message_commit,
-        &Transition::RequestAdmit { record },
+        &Transition::TurnAdmit { record },
         &admission_signature,
     )?;
     Ok(MessageCandidate {
@@ -1084,25 +1084,19 @@ pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
     let refname = refs::head_ref(id)?;
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_request()? else {
+        let Some(request) = view.active_turn()? else {
             let newest = newest_request(store, &view)?;
             if newest.is_some_and(|record| {
-                matches!(
-                    record.status,
-                    RequestStatus::Cancelling | RequestStatus::Idle
-                )
+                matches!(record.status, TurnStatus::Cancelling | TurnStatus::Idle)
             }) {
                 return Ok(Step::Done(head.to_string()));
             }
             return Err(format!("conversation {id:?} has no active request"));
         };
-        if matches!(
-            request.status,
-            RequestStatus::Cancelling | RequestStatus::Idle
-        ) {
+        if matches!(request.status, TurnStatus::Cancelling | TurnStatus::Idle) {
             return Ok(Step::Done(head.to_string()));
         }
-        Ok(Step::Mint(Transition::RequestEscape {
+        Ok(Step::Mint(Transition::TurnEscape {
             request: request.id,
             reason: None,
         }))
@@ -1144,23 +1138,23 @@ fn text_blocks(blocks: &[Block]) -> String {
 fn newest_request(
     store: &GitStore,
     conversation: &Conversation<'_>,
-) -> Result<Option<RequestRecord>, String> {
+) -> Result<Option<TurnRecord>, String> {
     for ordinal in (0..conversation.transcript_len()?).rev() {
         let (_, entry) = conversation
             .transcript_entry(ordinal)?
             .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
         if matches!(entry.role, Role::Assistant | Role::System) {
             if let Some(request) = entry.request {
-                return conversation.request(&request);
+                return conversation.turn(&request);
             }
         }
     }
     let requests = conversation
-        .request_ids()?
+        .turn_ids()?
         .into_iter()
         .map(|id| {
             conversation
-                .request(&id)?
+                .turn(&id)?
                 .ok_or_else(|| format!("request {id} disappeared"))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1187,7 +1181,7 @@ fn newest_request(
 
 fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSnapshot, String> {
     let conversation = Conversation::open(store, head)?;
-    let active = conversation.active_request()?;
+    let active = conversation.active_turn()?;
     let newest = if active.is_none() {
         newest_request(store, &conversation)?
     } else {
@@ -1196,17 +1190,17 @@ fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSna
     let record = active.as_ref().or(newest.as_ref());
     let status = record
         .map(|record| record.status)
-        .unwrap_or(RequestStatus::Idle);
+        .unwrap_or(TurnStatus::Idle);
     let interrupted = active.is_none()
         && matches!(
             newest.as_ref().and_then(|record| record.outcome.as_ref()),
-            Some(RequestOutcome::Idle {
+            Some(ProtocolTurnOutcome::Idle {
                 interrupted: true,
                 ..
             })
         );
     let error = match record.and_then(|record| record.outcome.as_ref()) {
-        Some(RequestOutcome::Failed { error }) => {
+        Some(ProtocolTurnOutcome::Failed { error }) => {
             transcript_text_at_path(&conversation, error.as_str())?
         }
         _ => None,
@@ -1296,7 +1290,7 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
 
     let mut activity = Vec::new();
     for request in request_order {
-        let Some(record) = conversation.request(&request)? else {
+        let Some(record) = conversation.turn(&request)? else {
             return Err(format!("transcript names missing request {request}"));
         };
         for round in 0..record.round {
@@ -1529,11 +1523,11 @@ fn load_at(
 fn failure_reason(snapshot: &ConversationSnapshot) -> String {
     snapshot.error.clone().unwrap_or_else(|| {
         let status = match snapshot.status {
-            RequestStatus::Queued => "queued",
-            RequestStatus::Running => "running",
-            RequestStatus::Cancelling => "cancelling",
-            RequestStatus::Idle => "idle",
-            RequestStatus::Failed => "failed",
+            TurnStatus::Queued => "queued",
+            TurnStatus::Running => "running",
+            TurnStatus::Cancelling => "cancelling",
+            TurnStatus::Idle => "idle",
+            TurnStatus::Failed => "failed",
         };
         format!("conversation request ended {status}")
     })
@@ -2886,10 +2880,10 @@ pub fn ensure_conversation_secret(t: &GitTransport) -> Result<(), String> {
     conversation_secret_store(t).map(drop)
 }
 
-fn request_is_active(status: RequestStatus) -> bool {
+fn request_is_active(status: TurnStatus) -> bool {
     matches!(
         status,
-        RequestStatus::Queued | RequestStatus::Running | RequestStatus::Cancelling
+        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
     )
 }
 
@@ -2957,15 +2951,15 @@ pub fn run_chat_turn(
         if snapshot.head != last_head {
             last_head = snapshot.head.clone();
             emit(TurnEvent::Status(match snapshot.status {
-                RequestStatus::Queued => "queued".to_string(),
-                RequestStatus::Running => "agent running".to_string(),
-                RequestStatus::Cancelling => "cancelling".to_string(),
-                RequestStatus::Idle => "idle".to_string(),
-                RequestStatus::Failed => "failed".to_string(),
+                TurnStatus::Queued => "queued".to_string(),
+                TurnStatus::Running => "agent running".to_string(),
+                TurnStatus::Cancelling => "cancelling".to_string(),
+                TurnStatus::Idle => "idle".to_string(),
+                TurnStatus::Failed => "failed".to_string(),
             }));
         }
         match snapshot.status {
-            RequestStatus::Idle => {
+            TurnStatus::Idle => {
                 return Ok(TurnOutcome {
                     conversation: id.to_string(),
                     short_commit: short_hash(&snapshot.head).to_string(),
@@ -2973,7 +2967,7 @@ pub fn run_chat_turn(
                     interrupted: snapshot.interrupted,
                 })
             }
-            RequestStatus::Failed => return Err(failure_reason(&snapshot)),
+            TurnStatus::Failed => return Err(failure_reason(&snapshot)),
             _ => {}
         }
         if let Some(rx) = &request_result {
@@ -4534,7 +4528,7 @@ mod tests {
         std::fs::write(&ref_lock, "another reader").unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         std::fs::remove_file(ref_lock).unwrap();
-        assert_eq!(load.snapshot.status, RequestStatus::Queued);
+        assert_eq!(load.snapshot.status, TurnStatus::Queued);
         assert_eq!(load.replay.turns[0].message, "hello");
         assert_eq!(load.workspaces[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
@@ -4598,7 +4592,7 @@ mod tests {
         assert_eq!(
             Conversation::open(&store, &active_head)
                 .unwrap()
-                .active_request()
+                .active_turn()
                 .unwrap()
                 .unwrap()
                 .interjections

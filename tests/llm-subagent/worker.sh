@@ -88,8 +88,6 @@ spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
   || fail "spawn tool record has the wrong name"
 [ "$(jq -r '.status' <<<"$spawn_record")" = complete ] \
   || fail "spawn tool record is not complete"
-[ "$(jq -r '.task // "none"' <<<"$spawn_record")" = none ] \
-  || fail "spawn tool record is not startless"
 
 
 $TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
@@ -114,6 +112,9 @@ relay=$(jq -r '.relay' <<<"$child_record")
 assert_oid "$initial_head" "child initial head"
 assert_oid "$child_request" "child request"
 assert_oid "$relay" "child relay"
+[ "$(jq -r '.task' <<<"$spawn_record")" = "$relay" ] \
+  || fail "spawn call did not reference the child's task"
+
 wait_record=$(jq -c 'select(.id == "toolu_wait")' /tmp/parent-tools.jsonl)
 [ "$(jq -r '.status' <<<"$wait_record")" = complete ] \
   || fail "wait_agent did not complete"

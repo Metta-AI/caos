@@ -268,41 +268,41 @@ fn reconstruct(
             let (entry, payloads) = transcript_change(kind, child_snapshot, changes)?;
             Ok(Transition::MessageAppend { entry, payloads })
         }
-        Kind::RequestAdmit => Ok(Transition::RequestAdmit {
+        Kind::TurnAdmit => Ok(Transition::TurnAdmit {
             record: request_change(kind, child_snapshot, changes)?.1,
         }),
-        Kind::RequestClaim => {
+        Kind::TurnClaim => {
             let (request, record) = request_change(kind, child_snapshot, changes)?;
             let latest_message = record.latest_message.ok_or_else(|| {
                 format!("{}: changed request has no latest_message", kind.as_str())
             })?;
-            Ok(Transition::RequestClaim {
+            Ok(Transition::TurnClaim {
                 request,
                 latest_message,
             })
         }
-        Kind::RequestInterject => {
+        Kind::TurnInterject => {
             let (request, _) = request_change(kind, child_snapshot, changes)?;
             let (entry, payloads) = transcript_change(kind, child_snapshot, changes)?;
-            Ok(Transition::RequestInterject {
+            Ok(Transition::TurnInterject {
                 request,
                 entry,
                 payloads,
             })
         }
-        Kind::RequestEscape => {
+        Kind::TurnEscape => {
             let (request, record) = request_change(kind, child_snapshot, changes)?;
-            Ok(Transition::RequestEscape {
+            Ok(Transition::TurnEscape {
                 request,
                 reason: record.escape_reason,
             })
         }
-        Kind::RequestTerminal => {
+        Kind::TurnTerminal => {
             let (request, record) = request_change(kind, child_snapshot, changes)?;
             let outcome = record
                 .outcome
                 .ok_or_else(|| format!("{}: changed request has no outcome", kind.as_str()))?;
-            Ok(Transition::RequestTerminal { request, outcome })
+            Ok(Transition::TurnTerminal { request, outcome })
         }
         Kind::ModelComplete => {
             let (_, record) = request_change(kind, child_snapshot, changes)?;
@@ -324,7 +324,7 @@ fn reconstruct(
         Kind::ToolComplete => {
             let (_, record) = tool_change(kind, child_snapshot, changes)?;
             let payload_dir =
-                paths::tool_payload_dir(record.request.as_str(), record.round, &record.id);
+                paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
             Ok(Transition::ToolComplete {
                 payloads: payload_changes(kind, child_snapshot, changes, &payload_dir)?,
                 files: file_changes(child_snapshot, changes)?,
@@ -346,7 +346,7 @@ fn reconstruct(
         Kind::SubagentSpawn => {
             let (_, tool) = tool_change(kind, child_snapshot, changes)?;
             let (_, child) = child_change(kind, child_snapshot, changes)?;
-            let payload_dir = paths::tool_payload_dir(tool.request.as_str(), tool.round, &tool.id);
+            let payload_dir = paths::call_payload_dir(tool.request.as_str(), tool.round, &tool.id);
             Ok(Transition::SubagentSpawn {
                 payloads: payload_changes(kind, child_snapshot, changes, &payload_dir)?,
                 tool,
@@ -464,14 +464,14 @@ fn request_change(
     kind: Kind,
     child: &Conversation<'_>,
     changes: &[Change],
-) -> Result<(Oid, RequestRecord), String> {
+) -> Result<(Oid, TurnRecord), String> {
     let path = single_change(changes, kind, "request record", |path| {
         request_record_id(path).is_some()
     })?;
     let request = request_record_id(path)
         .ok_or_else(|| format!("{}: request record path is invalid", kind.as_str()))?;
     let record = child
-        .request(&request)?
+        .turn(&request)?
         .ok_or_else(|| format!("{}: changed request record is absent", kind.as_str()))?;
     Ok((request, record))
 }
@@ -480,15 +480,15 @@ fn tool_change(
     kind: Kind,
     child: &Conversation<'_>,
     changes: &[Change],
-) -> Result<(String, ToolRecord), String> {
+) -> Result<(String, CallRecord), String> {
     let path = single_change(changes, kind, "tool record", is_tool_record_path)?;
     let bytes = child
         .snapshot()
         .read(path)?
         .ok_or_else(|| format!("{}: changed tool record is absent", kind.as_str()))?;
-    let record = ToolRecord::parse(&bytes)
+    let record = CallRecord::parse(&bytes)
         .map_err(|error| format!("{}: tool record is invalid: {error}", kind.as_str()))?;
-    if paths::tool_record_path(record.request.as_str(), record.round, &record.id) != path {
+    if paths::call_record_path(record.request.as_str(), record.round, &record.id) != path {
         return Err(format!(
             "{}: tool record identity does not match its path",
             kind.as_str()
@@ -667,11 +667,11 @@ fn transcript_record_path(path: &str) -> bool {
 }
 
 fn request_record_id(path: &str) -> Option<Oid> {
-    oid_record_id(path, paths::REQUESTS_DIR)
+    oid_record_id(path, paths::TURNS_DIR)
 }
 
 fn is_tool_record_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix(&format!("{}/", paths::TOOLS_DIR)) else {
+    let Some(rest) = path.strip_prefix(&format!("{}/", paths::CALLS_DIR)) else {
         return false;
     };
     let components: Vec<&str> = rest.split('/').collect();
@@ -679,11 +679,11 @@ fn is_tool_record_path(path: &str) -> bool {
 }
 
 fn async_record_id(path: &str) -> Option<Oid> {
-    oid_record_id(path, paths::ASYNC_DIR)
+    oid_record_id(path, paths::TASK_COMPUTATIONS_DIR)
 }
 
 fn child_record_id(path: &str) -> Option<&str> {
-    component_record_id(path, paths::SUBAGENTS_DIR)
+    component_record_id(path, paths::TASK_CONVERSATIONS_DIR)
 }
 
 fn publication_record_id(path: &str) -> Option<&str> {
@@ -820,8 +820,8 @@ mod tests {
         })
     }
 
-    fn request_record(id: Oid, head: Oid) -> RequestRecord {
-        RequestRecord {
+    fn request_record(id: Oid, head: Oid) -> TurnRecord {
+        TurnRecord {
             id,
             request_head: head,
             request_workspaces: None,
@@ -830,7 +830,7 @@ mod tests {
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
@@ -1051,7 +1051,7 @@ mod tests {
         let (mut store, _, source) = setup();
         let bad = mutate(&mut store, &source, Kind::MetadataTitleSet, |builder| {
             builder.put(
-                &paths::request_record_path(oid('1').as_str()),
+                &paths::turn_record_path(oid('1').as_str()),
                 Mode::Blob,
                 b"{\"status\":\"idle\",\"id\":\"1111111111111111111111111111111111111111\"}\n"
                     .to_vec(),
@@ -1064,22 +1064,22 @@ mod tests {
     fn unknown_request_key_is_malformed() {
         let (mut store, fork, _) = setup();
         let parent = find_commit(&store, &fork, |view| {
-            view.kind() == Some(Kind::RequestClaim)
+            view.kind() == Some(Kind::TurnClaim)
                 && view
-                    .active_request()
+                    .active_turn()
                     .unwrap()
-                    .is_some_and(|request| request.status == RequestStatus::Running)
+                    .is_some_and(|request| request.status == TurnStatus::Running)
         });
         let view = Conversation::open(&store, &parent).unwrap();
-        let record = view.active_request().unwrap().unwrap();
+        let record = view.active_turn().unwrap().unwrap();
         let mut value = record.to_value();
         value
             .as_object_mut()
             .unwrap()
             .insert("unknown".to_string(), serde_json::Value::Null);
         let bytes = canonical_bytes(&value).unwrap();
-        let path = paths::request_record_path(record.id.as_str());
-        let bad = mutate(&mut store, &parent, Kind::RequestClaim, |builder| {
+        let path = paths::turn_record_path(record.id.as_str());
+        let bad = mutate(&mut store, &parent, Kind::TurnClaim, |builder| {
             builder.put(&path, Mode::Blob, bytes);
         });
         assert_reason(&store, &bad, "unknown field `unknown`");
@@ -1180,7 +1180,7 @@ mod tests {
     fn interjection_pointer_must_match_resolution() {
         let (mut store, fork, _) = setup();
         let valid = find_commit(&store, &fork, |view| {
-            view.kind() == Some(Kind::RequestInterject)
+            view.kind() == Some(Kind::TurnInterject)
                 && view.workspace("main").unwrap().unwrap().commit == oid('d')
         });
         let (parent, mut builder) = clone_delta(&mut store, &valid);
@@ -1194,7 +1194,7 @@ mod tests {
             &mut store,
             tree,
             vec![parent],
-            Kind::RequestInterject.message(),
+            Kind::TurnInterject.message(),
         );
         assert_reason(
             &store,
@@ -1260,17 +1260,17 @@ mod tests {
     fn request_claim_requires_queued_state() {
         let (mut store, fork, _) = setup();
         let parent = find_commit(&store, &fork, |view| {
-            view.kind() == Some(Kind::RequestClaim)
+            view.kind() == Some(Kind::TurnClaim)
                 && view
-                    .active_request()
+                    .active_turn()
                     .unwrap()
-                    .is_some_and(|request| request.status == RequestStatus::Running)
+                    .is_some_and(|request| request.status == TurnStatus::Running)
         });
         let view = Conversation::open(&store, &parent).unwrap();
-        let mut record = view.active_request().unwrap().unwrap();
+        let mut record = view.active_turn().unwrap().unwrap();
         record.latest_message = Some("another-message".to_string());
-        let path = paths::request_record_path(record.id.as_str());
-        let bad = mutate(&mut store, &parent, Kind::RequestClaim, |builder| {
+        let path = paths::turn_record_path(record.id.as_str());
+        let bad = mutate(&mut store, &parent, Kind::TurnClaim, |builder| {
             builder.put(&path, Mode::Blob, record.encode());
         });
         assert_reason(&store, &bad, "request claim requires queued status");
@@ -1280,17 +1280,17 @@ mod tests {
     fn request_admit_requires_no_active_request() {
         let (mut store, fork, _) = setup();
         let parent = find_commit(&store, &fork, |view| {
-            view.active_request().unwrap().is_some() && view.kind() == Some(Kind::RequestClaim)
+            view.active_turn().unwrap().is_some() && view.kind() == Some(Kind::TurnClaim)
         });
         let id = oid('9');
         let record = request_record(id.clone(), parent.clone());
-        let bad = mutate(&mut store, &parent, Kind::RequestAdmit, |builder| {
+        let bad = mutate(&mut store, &parent, Kind::TurnAdmit, |builder| {
             builder.put(
-                &paths::request_record_path(id.as_str()),
+                &paths::turn_record_path(id.as_str()),
                 Mode::Blob,
                 record.encode(),
             );
-            builder.put(paths::ACTIVE_REQUEST, Mode::Blob, id.encode_line());
+            builder.put(paths::ACTIVE_TURN, Mode::Blob, id.encode_line());
         });
         assert_reason(&store, &bad, "another request is active");
     }
@@ -1301,11 +1301,11 @@ mod tests {
         let parent = find_first_model(&store, &fork);
         let request = Conversation::open(&store, &parent)
             .unwrap()
-            .active_request()
+            .active_turn()
             .unwrap()
             .unwrap();
         let record = started_tool(&request, "bash-call", Some(oid('e')));
-        let path = paths::tool_record_path(request.id.as_str(), 0, "bash-call");
+        let path = paths::call_record_path(request.id.as_str(), 0, "bash-call");
         let bad = mutate(&mut store, &parent, Kind::ToolStart, |builder| {
             builder.put(&path, Mode::Blob, record.encode());
         });
@@ -1318,11 +1318,11 @@ mod tests {
         let parent = find_first_model(&store, &fork);
         let request = Conversation::open(&store, &parent)
             .unwrap()
-            .active_request()
+            .active_turn()
             .unwrap()
             .unwrap();
         let record = started_tool(&request, "undeclared", None);
-        let path = paths::tool_record_path(request.id.as_str(), 0, "undeclared");
+        let path = paths::call_record_path(request.id.as_str(), 0, "undeclared");
         let bad = mutate(&mut store, &parent, Kind::ToolStart, |builder| {
             builder.put(&path, Mode::Blob, record.encode());
         });
@@ -1335,7 +1335,7 @@ mod tests {
         let root = find_kind(&store, &fork, Kind::ConversationRoot);
         let root_tree = store.read_commit(&root).unwrap().tree;
         let mut builder = TreeBuilder::from(Some(root_tree));
-        builder.put(paths::ACTIVE_REQUEST, Mode::Blob, oid('9').encode_line());
+        builder.put(paths::ACTIVE_TURN, Mode::Blob, oid('9').encode_line());
         let tree = builder.build(&mut store).unwrap();
         let bad = write_commit(
             &mut store,
@@ -1372,7 +1372,7 @@ mod tests {
             .children()
             .unwrap()
             .into_iter()
-            .find(|child| child.status == ChildStatus::Completed)
+            .find(|child| child.status == TaskStatus::Complete)
             .unwrap();
         let identity = Identity {
             id: "bad-fork".to_string(),
@@ -1392,7 +1392,7 @@ mod tests {
     fn fork_rejects_active_or_cancelling_request() {
         let (mut store, fork, _) = setup();
         let source = find_commit(&store, &fork, |view| {
-            view.kind() == Some(Kind::RequestAdmit) && view.active_request().unwrap().is_some()
+            view.kind() == Some(Kind::TurnAdmit) && view.active_turn().unwrap().is_some()
         });
         let identity = Identity {
             id: "active-fork".to_string(),
@@ -1416,12 +1416,12 @@ mod tests {
         let (mut store, fork, source) = setup();
         let started = find_kind(&store, &fork, Kind::ToolStart);
         let view = Conversation::open(&store, &started).unwrap();
-        let request = view.active_request().unwrap().unwrap();
+        let request = view.active_turn().unwrap().unwrap();
         let tool = view
             .tools(&request.id, request.round - 1)
             .unwrap()
             .remove(0);
-        let path = paths::tool_record_path(tool.request.as_str(), tool.round, &tool.id);
+        let path = paths::call_record_path(tool.request.as_str(), tool.round, &tool.id);
         let source = source_with_record(&mut store, &source, &path, tool.encode());
         let bad = fork_without_apply(&mut store, &source, "started-tool-fork");
         assert_reason(&store, &bad, "started tool");
@@ -1598,14 +1598,14 @@ mod tests {
     fn find_first_model(store: &MemoryStore, head: &Oid) -> Oid {
         find_commit(store, head, |view| {
             view.kind() == Some(Kind::ModelComplete)
-                && view.active_request().unwrap().is_some_and(|request| {
+                && view.active_turn().unwrap().is_some_and(|request| {
                     request.round == 1 && request.calls.iter().any(|call| call.id == "bash-call")
                 })
         })
     }
 
-    fn started_tool(request: &RequestRecord, id: &str, input_workspace: Option<Oid>) -> ToolRecord {
-        ToolRecord {
+    fn started_tool(request: &TurnRecord, id: &str, input_workspace: Option<Oid>) -> CallRecord {
+        CallRecord {
             request: request.id.clone(),
             round: 0,
             id: id.to_string(),
@@ -1613,7 +1613,7 @@ mod tests {
             declaration_message: "assistant-1".to_string(),
             workspace_name: input_workspace.as_ref().map(|_| "main".to_string()),
             input_workspace,
-            status: ToolStatus::Started,
+            status: CallStatus::Started,
             task: Some(oid('9')),
             result: None,
             workspace_resolution: None,

@@ -15,7 +15,7 @@ use caos_cli::{
     publish_workspace_branch, remove_workspace, resume_request, rollback_workspace, run_chat_turn,
     set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
     ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, PublishedBranch,
-    RequestStatus, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
     UserConversationStatus, UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -1174,7 +1174,7 @@ impl ConversationState {
             && self.local_turn
             && matches!(
                 load.snapshot.status,
-                RequestStatus::Queued | RequestStatus::Running
+                TurnStatus::Queued | TurnStatus::Running
             )
             && self
                 .active_request
@@ -1302,27 +1302,24 @@ impl ConversationState {
     }
 
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
-        self.running = matches!(
-            snapshot.status,
-            RequestStatus::Queued | RequestStatus::Running
-        );
+        self.running = matches!(snapshot.status, TurnStatus::Queued | TurnStatus::Running);
         self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
         self.status = match snapshot.status {
-            RequestStatus::Queued => "queued".to_string(),
-            RequestStatus::Running => "agent running".to_string(),
-            RequestStatus::Idle if snapshot.interrupted => {
+            TurnStatus::Queued => "queued".to_string(),
+            TurnStatus::Running => "agent running".to_string(),
+            TurnStatus::Idle if snapshot.interrupted => {
                 format!("interrupted {}", short_hash(&snapshot.head))
             }
-            RequestStatus::Idle => format!("updated {}", short_hash(&snapshot.head)),
+            TurnStatus::Idle => format!("updated {}", short_hash(&snapshot.head)),
             // A follower never runs the turn, so this status line is the only
             // place it learns why one ended. Recomputed from the snapshot on
             // every poll, so it cannot accumulate the way a transcript row
             // would.
-            RequestStatus::Failed => match snapshot.error.as_deref() {
+            TurnStatus::Failed => match snapshot.error.as_deref() {
                 Some(error) => format!("failed: {}", Self::first_line(error)),
                 None => "failed".to_string(),
             },
-            RequestStatus::Cancelling => "cancelling".to_string(),
+            TurnStatus::Cancelling => "cancelling".to_string(),
         };
         if !self.running {
             self.interrupting = false;
@@ -4365,8 +4362,8 @@ mod tests {
     use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
-        Block, Identity, IdentityKind, RequestRecord, RequestStatus, Role,
-        TranscriptEntry as V3TranscriptEntry,
+        Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry, TurnRecord,
+        TurnStatus,
     };
     use conversation_protocol::v3::refs;
     use conversation_protocol::v3::view::Conversation;
@@ -4513,8 +4510,8 @@ mod tests {
                 .unwrap()
                 .workspaces_tree()
                 .unwrap();
-            let admission = Transition::RequestAdmit {
-                record: RequestRecord {
+            let admission = Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request,
                     request_head: head.clone(),
                     request_workspaces,
@@ -4523,7 +4520,7 @@ mod tests {
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -4655,7 +4652,7 @@ mod tests {
                 id: "talk-1".to_string(),
                 head: "f".repeat(40),
                 title: "talk-1".to_string(),
-                status: RequestStatus::Idle,
+                status: TurnStatus::Idle,
                 request: None,
                 interrupted: false,
                 error: None,
@@ -6932,7 +6929,7 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: head.clone(),
                     title: "talk-1".to_string(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     request: Some(request.clone()),
                     interrupted: false,
                     error: None,
@@ -7062,7 +7059,7 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: old_head.clone(),
                     title: "talk-1".to_string(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     request: Some("c".repeat(40)),
                     interrupted: false,
                     error: None,
