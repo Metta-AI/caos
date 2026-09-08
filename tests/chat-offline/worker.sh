@@ -1,58 +1,32 @@
 #!/usr/bin/env bash
-# End-to-end line-client test against a scripted LLM. Request preparation must
-# fail before admission, and an admitted request must keep advancing its
-# canonical conversation after the submitting client disappears. The completed
-# closure must then be readable by a completely fresh client.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 commit() { git add -A && git -c user.email=test@caos -c user.name=caos commit -qm "$1"; }
-mkcommit() { # <tree> <message> [parent]
+mkcommit() {
   local tree=$1 message=$2 parent=${3:-}
   local parents=()
   if [ -n "$parent" ]; then parents=(-p "$parent"); fi
   git -c user.email=test@caos -c user.name=caos \
     commit-tree "$tree" "${parents[@]}" -m "$message"
 }
-remote_tip() { # <ref>
+remote_tip() {
   local lines
   lines=$(git ls-remote --refs caos "$1") || return 1
   [ -n "$lines" ] || return 1
   [ "${lines#*$'\n'}" = "$lines" ] || fail "remote advertised $1 more than once"
   printf '%s\n' "${lines%%[[:space:]]*}"
 }
-capture_events() { # <head> <base> <output>
-  local current=$1 base_commit=$2 output=$3 count=0 message parent declared_base roots=0
-  : > "$output"
-  while [ "$current" != "$base_commit" ]; do
-    count=$((count + 1))
-    [ "$count" -le 64 ] || fail "event spine did not reach the conversation base"
-    message=$(git show -s --format=%B "$current" | tr -d '\n')
-    jq -e 'type == "object" and (has("v") | not)' <<<"$message" >/dev/null \
-      || fail "invalid event $current on the conversation spine: $message"
-    printf '%s\n' "$message" >> "$output"
-    parent=$(git rev-parse "$current^1")
-    declared_base=$(jq -r '.base // empty' <<<"$message")
-    if [ -n "$declared_base" ]; then
-      [ "$declared_base" = "$parent" ] \
-        || fail "root event $current does not name its first parent as base"
-      [ "$declared_base" = "$base_commit" ] \
-        || fail "root event $current names the wrong conversation base"
-      roots=$((roots + 1))
-    elif [ "$parent" = "$base_commit" ]; then
-      fail "oldest event $current has no explicit base"
-    fi
-    current=$parent
-  done
-  [ "$roots" -eq 1 ] || fail "event spine did not contain exactly one explicit base"
-  EVENT_COUNT=$count
-}
 
 echo "== stage fixture and scripted LLM ==" >&2
 "$CAOS_CLI" get DEEP-DEPS/llm-stub /tmp/llm-stub-entry \
   || fail "resolving std/llm-stub"
+"$CAOS_CLI" get DEEP-DEPS/llm-test-tool /tmp/llm-test-tool-entry \
+  || fail "resolving std/llm-test-tool"
 stub_bin=/tmp/llm-stub-bin
+TOOL=/tmp/llm-test-tool
 install -m 755 /tmp/llm-stub-entry/bin/llm-stub "$stub_bin"
+install -m 755 /tmp/llm-test-tool-entry/bin/llm-test-tool "$TOOL"
 
 mkdir -p ws/notes
 echo "hello notes" > ws/notes/todo.txt
@@ -95,10 +69,14 @@ done
 
 test_id="$(date +%s%N)-$$-$RANDOM"
 conv="${test_id}-talk"
-ref="refs/caos/v2/conversations/$conv/head"
+ref=$($TOOL ref --id "$conv")
+ref=${ref#ref }
 queued_conv="${test_id}-queued-chat"
-queued_ref="refs/caos/v2/conversations/$queued_conv/head"
+queued_ref=$($TOOL ref --id "$queued_conv")
+queued_ref=${queued_ref#ref }
 bad_conv="${test_id}-bad-chat"
+bad_ref=$($TOOL ref --id "$bad_conv")
+bad_ref=${bad_ref#ref }
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
 opts=(--model test-model --base-url "http://$stub_host:$port")
 
@@ -120,7 +98,7 @@ if remote_tip "$queued_ref" >/dev/null; then
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
-echo "== invalid bases publish no conversation ==" >&2
+echo "== a conversation-shaped base is refused ==" >&2
 mkdir -p .caos-secrets
 printf '.caos-secrets/\n' >> .git/info/exclude
 printf '%s\n' \
@@ -129,19 +107,16 @@ printf '%s\n' \
   'entropy=0123456789abcdef0123456789abcdef' \
   'reader=DEEP-DEPS/llm-step' \
   > .caos-secrets/anthropic-api-key
-mkdir -p bad/.caos
-echo reserved > bad/.caos/marker
-git add bad
-git -c user.email=test@caos -c user.name=caos commit -qm "reserved base"
-badbase=$(mkcommit "HEAD:bad" "bad base")
-if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$badbase" "${opts[@]}" 2>base.err; then
-  fail "chat accepted a base with top-level .caos"
+fake_output=$($TOOL root --repo "$PWD" --id "${test_id}-fake-base" --title fake)
+fake_base=${fake_output#head }
+if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$fake_base" "${opts[@]}" 2>base.err; then
+  fail "chat accepted a base descending from G3"
 fi
-grep -q "\.caos" base.err || fail "reserved-base error is unclear"
-if remote_tip "refs/caos/v2/conversations/$bad_conv/head" >/dev/null; then
-  fail "reserved-base failure created a conversation"
+grep -Eq 'G3|conversation' base.err || fail "conversation-base error is unclear"
+if remote_tip "$bad_ref" >/dev/null; then
+  fail "conversation-base failure created a conversation"
 fi
-[ ! -e stub/request-1.json ] || fail "reserved-base failure reached the LLM"
+[ ! -e stub/request-1.json ] || fail "conversation-base failure reached the LLM"
 
 echo "== remote work survives loss of its submitting client ==" >&2
 "$CAOS_CLI" talk --new -c "$conv" "fresh start" --base "$base" \
@@ -169,65 +144,65 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$TALK_TEXT" > stub/response-1.json
 
 recovered=0
+tip=""
+seen=""
 for _ in $(seq 1 150); do
-  if tip=$(remote_tip "$ref"); then
-    git fetch -q caos "$tip"
-    history=$(git log --first-parent --format=%B "$tip")
-    if [[ "$history" == *"$TALK_TEXT"* ]]; then
+  if remote=$(remote_tip "$ref") && [ "$remote" != "$seen" ]; then
+    seen=$remote
+    fetch_output=$($TOOL fetch --repo "$PWD" --ref "$ref") \
+      || fail "fetching the changed conversation ref"
+    tip=${fetch_output#head }
+    transcript=$($TOOL transcript --repo "$PWD" --head "$tip")
+    if grep -qF "$TALK_TEXT" <<<"$transcript"; then
       recovered=1
       break
     fi
   fi
-  sleep 0.2
+  sleep 0.25
 done
 [ "$recovered" -eq 1 ] || fail "worker did not finish after client disconnect"
 
-capture_events "$tip" "$base" talk.events
-[ "$EVENT_COUNT" -ge 4 ] || fail "terminal turn recorded only $EVENT_COUNT durable events"
-jq -s -e 'any(.[]; .author == "user" and .content == "fresh start")' \
-  talk.events >/dev/null || fail "user event is missing"
-grep -q '"request":"[0-9a-f]\{40\}"' talk.events || fail "exact request was not recorded"
-grep -qF "$TALK_TEXT" talk.events || fail "post-disconnect assistant event is missing"
-[ "$(git show "$tip:notes/todo.txt")" = "hello notes" ] \
+echo "== canonical refs, title, spine, workspace, and request isolation ==" >&2
+conversation_prefix=${ref%/head}
+git ls-remote --refs caos "$conversation_prefix/*" > conversation.refs
+[ "$(wc -l < conversation.refs)" -eq 1 ] \
+  || fail "conversation does not have exactly one canonical ref"
+conversation_key=$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')
+git ls-remote --refs caos \
+  "refs/caos/v3/users/*/conversations/active/$conversation_key" > membership.refs
+[ "$(wc -l < membership.refs)" -eq 1 ] \
+  || fail "conversation does not have exactly one active creator membership"
+[ "$($TOOL read --repo "$PWD" --head "$tip" --path .caos/title)" = "fresh start" ] \
+  || fail "conversation title is wrong"
+
+$TOOL parents --repo "$PWD" --head "$tip" --validate > talk.parents \
+  || fail "invalid conversation spine"
+last_kind=""
+while read -r _spine_commit spine_kind; do
+  last_kind=$spine_kind
+done < talk.parents
+[ "$last_kind" = conversation.root ] || fail "conversation spine did not end at its root"
+[ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
+  || fail "conversation spine did not end at G3"
+
+workspace_output=$($TOOL workspace --repo "$PWD" --head "$tip" --name main)
+workspace=${workspace_output%%$'\n'*}
+workspace=${workspace#commit }
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$workspace" \
+  || fail "fetching main workspace"
+[ "$(git show "$workspace:notes/todo.txt")" = "hello notes" ] \
   || fail "completed conversation lost its base workspace"
 
-admission=""
-current=$tip
-while [ "$current" != "$base" ]; do
-  event=$(git show -s --format=%B "$current" | tr -d '\n')
-  if jq -e '.status == "queued" and (.request | type == "string") and (.request_head | type == "string")' \
-      <<<"$event" >/dev/null; then
-    admission=$current
-    break
-  fi
-  current=$(git rev-parse "$current^1")
-done
-[ -n "$admission" ] || fail "atomic request admission event is missing"
-admission_event=$(git show -s --format=%B "$admission" | tr -d '\n')
-request=$(jq -r '.request' <<<"$admission_event")
+request_path=$(git ls-tree -r --name-only "$tip" .caos/requests | grep '\.json$' | tail -1)
+[ -n "$request_path" ] || fail "admission request record is missing"
+admission=$($TOOL read --repo "$PWD" --head "$tip" --path "$request_path")
+request=$(jq -r .id <<<"$admission")
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \
   || fail "conversation request is not isolated by its model secret"
 if grep -qx 'api-key' <<<"$request_args"; then
   fail "conversation request still contains a curried API key"
 fi
-
-title_ref="refs/caos/v2/conversations/$conv/title"
-title=$(remote_tip "$title_ref") || fail "conversation has no title ref"
-git fetch -q caos "$title"
-[ "$(git cat-file blob "$title")" = "fresh start" ] || fail "conversation title is wrong"
-git ls-remote --refs caos "refs/caos/v2/conversations/$conv/*" > conversation.refs
-[ "$(wc -l < conversation.refs)" -eq 2 ] \
-  || fail "conversation does not have exactly its head and title refs"
-
-conversation_key="c-$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')"
-git ls-remote --refs caos \
-  "refs/caos/v2/users/*/conversations/active/$conversation_key" > membership.refs
-[ "$(wc -l < membership.refs)" -eq 1 ] \
-  || fail "conversation does not have exactly one active creator membership"
-legacy_refs=$(git ls-remote --refs caos "refs/caos/v2/conversations/$conv/from-*") \
-  || fail "checking for legacy conversation refs"
-[ -z "$legacy_refs" ] || fail "conversation created legacy refs"
 
 echo "== a fresh client fetches and replays the conversation closure ==" >&2
 server_url=$(git remote get-url caos)

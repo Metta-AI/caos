@@ -1,0 +1,2 @@
+# std/llm-test-tool is a cargo-built test helper exposed as bin/llm-test-tool.
+run --base:@=DEEP-DEPS/cargo --cmd=build --tree:@=.

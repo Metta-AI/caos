@@ -10,4 +10,4 @@
 # dev/worker-test, not std/bash: reading and writing the conversation REF is the
 # one thing caos gives a worker no verb for, so this needs git — and nothing
 # else the client was providing.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

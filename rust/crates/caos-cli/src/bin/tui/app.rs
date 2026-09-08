@@ -7,14 +7,16 @@ use std::time::{Duration, Instant};
 use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
-    conversation_load_at, conversation_reference, conversation_snapshot, describe_tool_set,
-    first_available_conversation_name, fork_conversation, generate_conversation_title,
-    import_published_conversation, interrupt_request, invite_user_to_conversation,
-    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
-    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
-    ConversationRole, ConversationSnapshot, InviteOutcome, ToolSetDescription, TurnEvent,
-    TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
-    WorkspaceDiff, DEFAULT_MODEL,
+    conversation_load_at, conversation_ref, conversation_snapshot, create_workspace, default_title,
+    describe_tool_set, first_available_conversation_name, fork_conversation,
+    generate_conversation_title, interrupt_request, invite_user_to_conversation,
+    list_user_conversations, publication_diagnostic, publish_prepared_workspace_branch,
+    publish_user_conversation, publish_workspace_branch, remove_workspace, resume_request,
+    rollback_workspace, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, PublicationSummary, PublishedBranch, RequestStatus, ToolSetDescription,
+    TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    UserConversationSummary, WorkspaceDiff, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -24,10 +26,9 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::workspace::{
-    commit_working_tree, fetch_published_conversation, fetch_remote_branch_tip,
-    find_or_open_conversation_pr, load_conversation_workspace, local_default_branch_tip,
-    prepare_publish_workspace, publish_conversation_branch, remote_base_is_ancestor,
-    remote_default_branch, PublishedConversationSource,
+    commit_working_tree, fetch_remote_branch_tip, find_or_open_workspace_pr,
+    load_conversation_workspace, local_default_branch_tip, pr_base_branch, remote_base_is_ancestor,
+    remote_default_branch, validate_prepared_workspace,
 };
 
 #[path = "ui.rs"]
@@ -39,21 +40,6 @@ fn short_hash(hash: &str) -> &str {
 
 fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn automatic_title(prompt: &str) -> String {
-    const MAX_CHARS: usize = 60;
-
-    let title = collapse_whitespace(prompt);
-    if title.chars().count() <= MAX_CHARS {
-        return title;
-    }
-
-    title
-        .chars()
-        .take(MAX_CHARS - 1)
-        .chain(std::iter::once('…'))
-        .collect()
 }
 
 fn message_preview(text: &str, max_cells: u16) -> String {
@@ -286,28 +272,15 @@ struct TranscriptPoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TranscriptSelection {
+struct Selection {
     anchor: TranscriptPoint,
     head: TranscriptPoint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ScreenSelection {
-    anchor: TranscriptPoint,
-    head: TranscriptPoint,
-}
+type TranscriptSelection = Selection;
+type ScreenSelection = Selection;
 
-impl ScreenSelection {
-    fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
-        if self.anchor <= self.head {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-}
-
-impl TranscriptSelection {
+impl Selection {
     fn ordered(self) -> (TranscriptPoint, TranscriptPoint) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
@@ -756,6 +729,51 @@ impl Composer {
             .collect()
     }
 
+    fn workspace_completion(&self, names: &[String]) -> Option<Completion> {
+        const PREFIX: &str = "/workspace";
+        const SUBCOMMANDS: [&str; 4] = ["create", "use", "rollback", "remove"];
+
+        if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
+            return None;
+        }
+        let arguments = &self.text[PREFIX.len()..];
+        if !arguments.chars().next().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        let start = self.text[..self.cursor]
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(PREFIX.len());
+        let end = self.text[self.cursor..]
+            .find(char::is_whitespace)
+            .map(|offset| self.cursor + offset)
+            .unwrap_or(self.text.len());
+        if self.cursor < start || self.cursor > end {
+            return None;
+        }
+        let prior = self.text[PREFIX.len()..start]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let token = &self.text[start..end];
+        let values = match prior.as_slice() {
+            [] => SUBCOMMANDS
+                .iter()
+                .copied()
+                .filter(|subcommand| subcommand.starts_with(token))
+                .map(str::to_string)
+                .collect(),
+            ["use" | "rollback" | "remove"] => names
+                .iter()
+                .filter(|name| name.starts_with(token))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(Completion { start, end, values })
+    }
+
     fn model_token(&self) -> Option<(usize, usize, &str)> {
         const PREFIX: &str = "/model";
         if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
@@ -793,12 +811,16 @@ impl Composer {
             .collect()
     }
 
-    fn completion_count(&self) -> usize {
-        self.command_matches().len() + self.model_matches().len()
+    fn completion_count(&self, workspace_names: &[String]) -> usize {
+        self.command_matches().len()
+            + self.model_matches().len()
+            + self
+                .workspace_completion(workspace_names)
+                .map_or(0, |completion| completion.values.len())
     }
 
-    fn select_command(&mut self, amount: isize) -> bool {
-        let count = self.completion_count();
+    fn select_command(&mut self, amount: isize, workspace_names: &[String]) -> bool {
+        let count = self.completion_count(workspace_names);
         if count == 0 {
             return false;
         }
@@ -807,20 +829,34 @@ impl Composer {
         true
     }
 
-    fn complete_command(&mut self) -> bool {
-        if let Some(command) = self.command_matches().get(self.command_selection).copied() {
+    #[allow(unknown_lints, clippy::manual_option_zip)]
+    fn complete_command(&mut self, workspace_names: &[String]) -> bool {
+        let commands = self.command_matches();
+        let models = self.model_matches();
+        let workspace = self.workspace_completion(workspace_names);
+        if let Some(command) = commands.get(self.command_selection).copied() {
             let token_end = self
                 .text
                 .find(char::is_whitespace)
                 .unwrap_or(self.text.len());
             self.text.replace_range(..token_end, command.name);
             self.cursor = command.name.len();
-        } else if let (Some((start, end, _)), Some(model)) = (
-            self.model_token(),
-            self.model_matches().get(self.command_selection).copied(),
-        ) {
+        } else if let (Some((start, end, _)), Some(model)) = (self.model_token(), {
+            self.command_selection
+                .checked_sub(commands.len())
+                .and_then(|index| models.get(index).copied())
+        }) {
             self.text.replace_range(start..end, model);
             self.cursor = start + model.len();
+        } else if let Some((completion, value)) = workspace.and_then(|completion| {
+            self.command_selection
+                .checked_sub(commands.len() + models.len())
+                .and_then(|index| completion.values.get(index).cloned())
+                .map(|value| (completion, value))
+        }) {
+            self.text
+                .replace_range(completion.start..completion.end, &value);
+            self.cursor = completion.start + value.len();
         } else {
             return false;
         }
@@ -835,8 +871,8 @@ impl Composer {
         true
     }
 
-    fn dismiss_command_menu(&mut self) -> bool {
-        if self.completion_count() == 0 {
+    fn dismiss_command_menu(&mut self, workspace_names: &[String]) -> bool {
+        if self.completion_count(workspace_names) == 0 {
             return false;
         }
         self.command_menu_dismissed = true;
@@ -849,21 +885,28 @@ impl Composer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Completion {
+    start: usize,
+    end: usize,
+    values: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppAction {
     From,
     Help,
     Invite,
-    Load,
     Model,
     Commands,
+    Publish,
     PublishBranch,
     Reference,
     Title,
     UpdateTree,
+    Workspace,
     NewConversation,
     Checkout,
-    Publish,
     Activity,
     Changes,
     Tools,
@@ -910,13 +953,6 @@ const COMMANDS: [Command; 10] = [
         takes_argument: true,
     },
     Command {
-        name: "/load",
-        usage: "/load <PR URL|remote/caos/conversation-id>",
-        description: "load a published conversation branch",
-        action: AppAction::Load,
-        takes_argument: true,
-    },
-    Command {
         name: "/help",
         usage: "/help",
         description: "show keyboard shortcuts and slash commands",
@@ -938,6 +974,13 @@ const COMMANDS: [Command; 10] = [
         takes_argument: true,
     },
     Command {
+        name: "/workspace",
+        usage: "/workspace [use|create|rollback|remove] ...",
+        description: "list or manage named workspaces",
+        action: AppAction::Workspace,
+        takes_argument: true,
+    },
+    Command {
         name: "/commands",
         usage: "/commands",
         description: "open the searchable command palette",
@@ -947,7 +990,7 @@ const COMMANDS: [Command; 10] = [
     Command {
         name: "/publish-branch",
         usage: "/publish-branch",
-        description: "push the complete conversation branch without a PR",
+        description: "publish the selected workspace to its branch",
         action: AppAction::PublishBranch,
         takes_argument: false,
     },
@@ -1006,15 +1049,14 @@ struct ConversationState {
     pending_submissions: Vec<PendingSubmission>,
     next_pending_submission: u64,
     activities: Vec<Activity>,
-    diff: Option<WorkspaceDiff>,
+    workspaces: Vec<WorkspaceDiff>,
+    publications: Vec<PublicationSummary>,
+    selected_workspace: Option<String>,
     tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
     status: String,
     command_error: Option<String>,
     reference_notice: Option<ReferenceNotice>,
-    reference_loading: bool,
-    reference_generation: u64,
-    publish_prompt: bool,
     running: bool,
     interrupting: bool,
     local_turn: bool,
@@ -1023,8 +1065,9 @@ struct ConversationState {
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
+    publish_base: Option<PublishBasePrompt>,
     forking: bool,
-    loading_remote: bool,
+    workspace_operation: bool,
     scroll: ScrollState,
     unread_below: bool,
     transcript_selection: Option<TranscriptSelection>,
@@ -1052,15 +1095,14 @@ impl ConversationState {
             pending_submissions: Vec::new(),
             next_pending_submission: 0,
             activities: Vec::new(),
-            diff: None,
+            workspaces: Vec::new(),
+            publications: Vec::new(),
+            selected_workspace: None,
             tool_set: None,
             composer: Composer::default(),
             status,
             command_error: None,
             reference_notice: None,
-            reference_loading: false,
-            reference_generation: 0,
-            publish_prompt: false,
             running: false,
             interrupting: false,
             local_turn: false,
@@ -1069,8 +1111,9 @@ impl ConversationState {
             reconcile_after: None,
             turn_phase: TurnPhase::System,
             publishing: false,
+            publish_base: None,
             forking: false,
-            loading_remote: false,
+            workspace_operation: false,
             scroll: ScrollState::default(),
             unread_below: false,
             transcript_selection: None,
@@ -1089,6 +1132,28 @@ impl ConversationState {
     }
 
     fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
+        self.publications = load.publications.clone();
+        let previous_workspaces = std::mem::take(&mut self.workspaces);
+        let previous_selection = self.selected_workspace.clone();
+        let selection = match previous_selection.as_deref() {
+            Some(name)
+                if load
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.name == name) =>
+            {
+                previous_selection
+            }
+            _ if load.workspaces.len() == 1 => Some(load.workspaces[0].name.clone()),
+            _ => None,
+        };
+        let workspace_changed =
+            previous_workspaces != load.workspaces || self.selected_workspace != selection;
+        self.workspaces = load.workspaces;
+        self.selected_workspace = selection;
+        if workspace_changed {
+            self.tool_set = None;
+        }
         self.virtual_conversation = false;
         if self
             .reference_notice
@@ -1099,7 +1164,10 @@ impl ConversationState {
         }
         let preserve_local_lifecycle = self.running
             && self.local_turn
-            && matches!(load.snapshot.status.as_str(), "queued" | "running")
+            && matches!(
+                load.snapshot.status,
+                RequestStatus::Queued | RequestStatus::Running
+            )
             && self
                 .active_request
                 .as_ref()
@@ -1136,6 +1204,7 @@ impl ConversationState {
             .replay
             .turns
             .into_iter()
+            .filter(|turn| !turn.message.trim().is_empty())
             .map(|turn| TranscriptEntry {
                 role: match turn.role {
                     ConversationRole::Human if turn.author != current_user => {
@@ -1167,7 +1236,6 @@ impl ConversationState {
                 }),
         );
         self.transcript = transcript;
-        self.diff = Some(load.workspace_diff);
         self.remote_head = Some(load.snapshot.head);
         self.transcript_selection = None;
         if let Some((status, turn_phase, reconciling_request, reconcile_after)) = local_lifecycle {
@@ -1205,7 +1273,10 @@ impl ConversationState {
                 self.activities.clear();
                 self.activity_selection = None;
                 self.activity_detail_scroll = 0;
-                self.diff = None;
+                self.workspaces.clear();
+                self.publications.clear();
+                self.selected_workspace = None;
+                self.tool_set = None;
                 self.remote_head = None;
             }
             Err(error) => {
@@ -1223,24 +1294,27 @@ impl ConversationState {
     }
 
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
-        self.running = matches!(snapshot.status.as_str(), "queued" | "running");
+        self.running = matches!(
+            snapshot.status,
+            RequestStatus::Queued | RequestStatus::Running
+        );
         self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
-        self.status = match snapshot.status.as_str() {
-            "queued" => "queued".to_string(),
-            "running" => "agent running".to_string(),
-            "idle" if snapshot.interrupted => {
+        self.status = match snapshot.status {
+            RequestStatus::Queued => "queued".to_string(),
+            RequestStatus::Running => "agent running".to_string(),
+            RequestStatus::Idle if snapshot.interrupted => {
                 format!("interrupted {}", short_hash(&snapshot.head))
             }
-            "idle" => format!("updated {}", short_hash(&snapshot.head)),
+            RequestStatus::Idle => format!("updated {}", short_hash(&snapshot.head)),
             // A follower never runs the turn, so this status line is the only
             // place it learns why one ended. Recomputed from the snapshot on
             // every poll, so it cannot accumulate the way a transcript row
             // would.
-            "failed" => match snapshot.error.as_deref() {
+            RequestStatus::Failed => match snapshot.error.as_deref() {
                 Some(error) => format!("failed: {}", Self::first_line(error)),
                 None => "failed".to_string(),
             },
-            other => other.to_string(),
+            RequestStatus::Cancelling => "cancelling".to_string(),
         };
         if !self.running {
             self.interrupting = false;
@@ -1257,8 +1331,86 @@ impl ConversationState {
             .find_map(|entry| entry.commit.as_deref())
     }
 
+    fn workspace_names(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .map(|workspace| workspace.name.clone())
+            .collect()
+    }
+
+    fn workspace_names_text(&self) -> String {
+        let names = self.workspace_names();
+        if names.is_empty() {
+            "(none)".to_string()
+        } else {
+            names.join(", ")
+        }
+    }
+
+    fn complete_command(&mut self) -> bool {
+        let names = self.workspace_names();
+        self.composer.complete_command(&names)
+    }
+
+    fn select_command(&mut self, amount: isize) -> bool {
+        let names = self.workspace_names();
+        self.composer.select_command(amount, &names)
+    }
+
+    fn dismiss_command_menu(&mut self) -> bool {
+        let names = self.workspace_names();
+        self.composer.dismiss_command_menu(&names)
+    }
+
+    fn selected_workspace_diff(&self) -> Option<&WorkspaceDiff> {
+        let selected = self.selected_workspace.as_deref()?;
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.name == selected)
+    }
+
+    fn require_selected_workspace(&self) -> Result<&WorkspaceDiff, String> {
+        self.selected_workspace_diff().ok_or_else(|| {
+            format!(
+                "choose a workspace; available workspaces: {}",
+                self.workspace_names_text()
+            )
+        })
+    }
+
+    fn selected_workspace_is_published(&self) -> bool {
+        let Some(workspace) = self.selected_workspace_diff() else {
+            return false;
+        };
+        self.publications
+            .iter()
+            .find(|publication| publication.workspace == workspace.name)
+            .is_some_and(|publication| {
+                publication.status == conversation_protocol::v3::PublicationStatus::Complete
+                    && publication.planned_head == workspace.head
+            })
+    }
+
+    fn select_workspace(&mut self, name: &str) -> Result<(), String> {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.name == name)
+        {
+            return Err(format!(
+                "workspace {name:?} does not exist; available workspaces: {}",
+                self.workspace_names_text()
+            ));
+        }
+        if self.selected_workspace.as_deref() != Some(name) {
+            self.selected_workspace = Some(name.to_string());
+            self.tool_set = None;
+        }
+        Ok(())
+    }
+
     fn is_busy(&self) -> bool {
-        self.running || self.publishing || self.forking || self.loading_remote
+        self.running || self.publishing || self.forking || self.workspace_operation
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
@@ -1335,19 +1487,6 @@ impl ConversationState {
         {
             pending.commit = Some(commit);
         }
-        let durable_is_visible = self
-            .pending_submissions
-            .iter()
-            .find(|pending| pending.id == id)
-            .and_then(|pending| pending.commit.as_deref())
-            .is_some_and(|commit| {
-                self.transcript
-                    .iter()
-                    .any(|entry| entry.commit.as_deref() == Some(commit))
-            });
-        if durable_is_visible {
-            self.discard_pending_submission(id);
-        }
     }
 
     fn discard_pending_submission(&mut self, id: u64) {
@@ -1364,6 +1503,11 @@ impl ConversationState {
         else {
             return;
         };
+        // A follower failure does not undo a saved message. Keep its pending
+        // row until replay catches up, but never offer the same message to resend.
+        if pending.commit.is_some() {
+            return;
+        }
         self.discard_pending_submission(id);
         self.composer.restore_message(&pending.text);
     }
@@ -1375,7 +1519,7 @@ impl ConversationState {
 
     fn apply_automatic_title(&mut self, prompt: &str) {
         if !self.automatic_title_fallback_applied {
-            let fallback = automatic_title(prompt);
+            let fallback = default_title(prompt);
             if self.automatic_title {
                 self.title = fallback.clone();
             }
@@ -1393,8 +1537,6 @@ impl ConversationState {
                 .unwrap_or_else(|| self.status.clone())
         } else if self.generating_title {
             "Generating title…".to_string()
-        } else if self.reference_loading {
-            self.status.clone()
         } else if let Some(attention) = &self.sidebar_attention {
             attention.clone()
         } else {
@@ -1434,7 +1576,6 @@ impl ConversationState {
 enum UiMessage {
     Forked {
         conversation: String,
-        origin: String,
         source: String,
         result: Result<(String, Box<ConversationLoad>), String>,
     },
@@ -1480,42 +1621,40 @@ enum UiMessage {
     },
     BranchPublished {
         conversation: String,
-        result: Result<String, String>,
+        result: Result<(PublishedBranch, Option<String>), String>,
     },
-    ConversationImported {
-        origin: String,
-        source: String,
-        result: Result<
-            (
-                PublishedConversationSource,
-                UserConversationSummary,
-                Box<ConversationLoad>,
-            ),
-            String,
-        >,
+    WorkspaceUpdated {
+        conversation: String,
+        result: Result<(String, Box<ConversationLoad>), String>,
     },
     Reconciled {
         conversation: String,
         request: String,
         result: Result<(), String>,
     },
-    ReferenceLoaded {
-        conversation: String,
-        generation: u64,
-        observed_head: Option<String>,
-        result: Result<(String, Option<String>), String>,
-    },
     RemotePolled {
         result: Result<Vec<RemotePollEntry>, String>,
     },
 }
 
+fn spawn<T>(
+    repo_dir: PathBuf,
+    tx: Sender<UiMessage>,
+    job: impl FnOnce(&GitTransport) -> Result<T, String> + Send + 'static,
+    into_message: impl FnOnce(Result<T, String>) -> UiMessage + Send + 'static,
+) where
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        let result = GitTransport::discover(repo_dir).and_then(|transport| job(&transport));
+        let _ = tx.send(into_message(result));
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum ConfirmAction {
-    Publish {
-        default_base: String,
-        base_input: String,
-    },
+struct PublishBasePrompt {
+    default_base: String,
+    input: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1533,10 +1672,6 @@ impl Shortcut {
             shifted,
         }
     }
-
-    fn label(self) -> &'static str {
-        self.label
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1548,7 +1683,7 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 10] = [
+const PALETTE_COMMANDS: [PaletteCommand; 11] = [
     PaletteCommand {
         label: "New conversation",
         shortcut: Some(Shortcut::new("n", "Ctrl+N", false)),
@@ -1564,8 +1699,14 @@ const PALETTE_COMMANDS: [PaletteCommand; 10] = [
     PaletteCommand {
         label: "Publish pull request",
         shortcut: Some(Shortcut::new("p", "Ctrl+P twice", false)),
-        keywords: "push pr github branch",
+        keywords: "workspace push pr github origin",
         action: AppAction::Publish,
+    },
+    PaletteCommand {
+        label: "Publish branch",
+        shortcut: None,
+        keywords: "workspace push origin",
+        action: AppAction::PublishBranch,
     },
     PaletteCommand {
         label: "Show activity",
@@ -1663,7 +1804,6 @@ pub(crate) struct App {
     selected: usize,
     should_quit: bool,
     selection_locked: bool,
-    confirm_action: Option<ConfirmAction>,
     palette: Option<CommandPalette>,
     selecting_transcript: bool,
     screen_selection: Option<ScreenSelection>,
@@ -1794,7 +1934,6 @@ impl App {
             selected,
             should_quit: false,
             selection_locked: false,
-            confirm_action: None,
             palette: None,
             selecting_transcript: false,
             screen_selection: None,
@@ -1850,17 +1989,17 @@ impl App {
             state.reconciling_request = Some(request.clone());
             state.reconcile_after = None;
             let conversation = state.id.clone();
-            let repo_dir = repo_dir.clone();
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                let result = GitTransport::discover(repo_dir)
-                    .and_then(|transport| resume_request(&transport, &request));
-                let _ = tx.send(UiMessage::Reconciled {
+            let request_to_resume = request.clone();
+            spawn(
+                repo_dir.clone(),
+                tx.clone(),
+                move |transport| resume_request(transport, &request_to_resume),
+                move |result| UiMessage::Reconciled {
                     conversation,
                     request,
                     result,
-                });
-            });
+                },
+            );
             started = true;
         }
         started
@@ -1915,11 +2054,15 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
+        if let Some(prompt) = self.selected_mut().publish_base.as_mut() {
+            prompt.input.push_str(text.trim());
+            return;
+        }
         self.selected_mut().composer.insert_paste(text);
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
-        if self.palette.is_some() || self.confirm_action.is_some() {
+        if self.palette.is_some() {
             return MouseAction::Ignored;
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -2088,9 +2231,9 @@ impl App {
                 .show_command_error("wait for this conversation fork to finish");
             return;
         }
-        if self.selected().loading_remote {
+        if self.selected().workspace_operation {
             self.selected_mut()
-                .show_command_error("wait for the published conversation to finish loading");
+                .show_command_error("wait for the workspace operation to finish");
             return;
         }
         if self.selected().publishing {
@@ -2104,16 +2247,15 @@ impl App {
         };
         let state = self.selected_mut();
         state.reference_notice = None;
-        state.reference_loading = false;
-        if state.status == "loading conversation reference" {
-            state.status.clear();
-        }
         // Recognized local commands stop here as one class. Unrecognized slash
         // text and message-submitting commands continue through the ordinary
         // turn path.
         let mut human_tree = None;
+        let mut proposal_base = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
-            if command.takes_argument == arguments.is_empty() {
+            if command.action != AppAction::Workspace
+                && command.takes_argument == arguments.is_empty()
+            {
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
                 return;
@@ -2122,8 +2264,18 @@ impl App {
                 self.run_local_command(command, arguments);
                 return;
             }
-            match commit_working_tree(arguments, &self.repo_dir) {
-                Ok(tree) => human_tree = Some(tree),
+            let workspace = match self.selected().require_selected_workspace() {
+                Ok(workspace) => workspace.head.clone(),
+                Err(error) => {
+                    self.selected_mut().show_command_error(error);
+                    return;
+                }
+            };
+            match commit_working_tree(arguments, &workspace, &self.repo_dir) {
+                Ok((tree, base)) => {
+                    human_tree = Some(tree);
+                    proposal_base = Some(base);
+                }
                 Err(error) => {
                     self.selected_mut().show_command_error(error);
                     return;
@@ -2133,6 +2285,13 @@ impl App {
         } else {
             raw
         };
+        if !self.selected().virtual_conversation {
+            if let Err(error) = self.selected().require_selected_workspace() {
+                self.selected_mut().show_command_error(error);
+                self.selected_mut().composer.restore_message(&message);
+                return;
+            }
+        }
         let should_generate_title =
             !interjecting && self.selected().automatic_title && !self.selected().generating_title;
         let observed_head = self.selected().remote_head.clone();
@@ -2167,117 +2326,128 @@ impl App {
         }
 
         let tx = self.tx.clone();
-        let options = self.selected().turn_options.clone();
+        let mut options = self.selected().turn_options.clone();
+        options.workspace = self.selected().selected_workspace.clone();
         let conversation = self.selected().id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
-            let title_tx = tx.clone();
             let title_options = options.clone();
             let title_conversation = conversation.clone();
             let title_repo_dir = repo_dir.clone();
             let first_message = message.clone();
-            std::thread::spawn(move || {
-                let result = GitTransport::discover(title_repo_dir).and_then(|transport| {
-                    generate_conversation_title(&transport, &title_options, &first_message)
-                });
-                let _ = title_tx.send(UiMessage::TitleGenerated {
+            spawn(
+                title_repo_dir,
+                tx.clone(),
+                move |transport| {
+                    generate_conversation_title(transport, &title_options, &first_message)
+                },
+                move |result| UiMessage::TitleGenerated {
                     conversation: title_conversation,
                     result,
-                });
-            });
+                },
+            );
         }
         if interjecting {
-            std::thread::spawn(move || {
-                let transport = match GitTransport::discover(repo_dir) {
-                    Ok(transport) => transport,
-                    Err(error) => {
-                        let _ = tx.send(UiMessage::InterjectionFailed {
-                            conversation,
-                            pending_id,
-                            error,
-                        });
-                        return;
-                    }
-                };
-                match submit_interjection(
-                    &transport,
-                    &options,
-                    &conversation,
-                    &message,
-                    human_tree.as_deref(),
-                ) {
-                    Ok(commit) => {
-                        let _ = tx.send(UiMessage::SubmissionCommitted {
-                            conversation: conversation.clone(),
-                            pending_id,
-                            commit,
-                        });
-                        let load = conversation_load(&transport, &conversation)
-                            .and_then(|load| {
-                                load.ok_or_else(|| {
-                                    format!(
-                                        "conversation {conversation:?} disappeared after submit"
-                                    )
-                                })
+            let committed_tx = tx.clone();
+            let finished_conversation = conversation.clone();
+            spawn(
+                repo_dir,
+                tx,
+                move |transport| {
+                    let commit = submit_interjection(
+                        transport,
+                        &options,
+                        &conversation,
+                        &message,
+                        human_tree.as_deref(),
+                        proposal_base.as_deref(),
+                    )?;
+                    let _ = committed_tx.send(UiMessage::SubmissionCommitted {
+                        conversation: conversation.clone(),
+                        pending_id,
+                        commit,
+                    });
+                    Ok(conversation_load(transport, &conversation)
+                        .and_then(|load| {
+                            load.ok_or_else(|| {
+                                format!("conversation {conversation:?} disappeared after submit")
                             })
-                            .map(Box::new);
-                        let _ = tx.send(UiMessage::InterjectionRefreshed {
-                            conversation,
-                            observed_head,
-                            load,
-                        });
-                    }
-                    Err(error) => {
-                        let _ = tx.send(UiMessage::InterjectionFailed {
-                            conversation,
-                            pending_id,
-                            error,
-                        });
-                    }
-                }
-            });
+                        })
+                        .map(Box::new))
+                },
+                move |result| match result {
+                    Ok(load) => UiMessage::InterjectionRefreshed {
+                        conversation: finished_conversation,
+                        observed_head,
+                        load,
+                    },
+                    Err(error) => UiMessage::InterjectionFailed {
+                        conversation: finished_conversation,
+                        pending_id,
+                        error,
+                    },
+                },
+            );
             return;
         }
-        std::thread::spawn(move || {
-            let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                let outcome = run_chat_turn(
-                    &transport,
+        let event_tx = tx.clone();
+        let completed_conversation = conversation.clone();
+        spawn(
+            repo_dir,
+            tx,
+            move |transport| {
+                run_chat_turn(
+                    transport,
                     &options,
                     &conversation,
                     &message,
                     human_tree.as_deref(),
+                    proposal_base.as_deref(),
                     |commit| {
-                        let _ = tx.send(UiMessage::SubmissionCommitted {
+                        let _ = event_tx.send(UiMessage::SubmissionCommitted {
                             conversation: conversation.clone(),
                             pending_id,
                             commit: commit.to_string(),
                         });
                     },
                     |event| {
-                        let _ = tx.send(UiMessage::Turn {
+                        let _ = event_tx.send(UiMessage::Turn {
                             conversation: conversation.clone(),
                             event,
                         });
                     },
-                )?;
-                let _ = tx.send(UiMessage::Completed {
-                    conversation: conversation.clone(),
+                )
+            },
+            move |result| match result {
+                Ok(outcome) => UiMessage::Completed {
+                    conversation: completed_conversation,
                     outcome,
-                });
-                Ok(())
-            });
-            if let Err(error) = result {
-                let _ = tx.send(UiMessage::Failed {
-                    conversation,
+                },
+                Err(error) => UiMessage::Failed {
+                    conversation: completed_conversation,
                     pending_id,
                     error,
-                });
-            }
-        });
+                },
+            },
+        );
     }
 
     fn show_selected_ref(&mut self) {
-        self.start_reference_lookup(self.selected);
+        let id = self.selected().id.clone();
+        let Some(head) = self.selected().remote_head.clone() else {
+            self.selected_mut().reference_notice = None;
+            self.selected_mut()
+                .show_command_error("this conversation has no remote ref until its first message");
+            return;
+        };
+        match conversation_ref(&id) {
+            Ok(refname) => {
+                let state = self.selected_mut();
+                state.command_error = None;
+                state.reference_notice = Some(ReferenceNotice { refname, head });
+            }
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
     }
 
     fn run_local_command(&mut self, command: &Command, arguments: &str) {
@@ -2286,7 +2456,7 @@ impl App {
             AppAction::Help | AppAction::Commands => self.execute_action(command.action),
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
-            AppAction::Load => self.load_published(arguments),
+            AppAction::Workspace => self.run_workspace_command(arguments),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2305,12 +2475,12 @@ impl App {
                     .push_info(format!("Model for future turns: {model}"));
             }
             AppAction::From => self.start_from_hash(arguments),
+            AppAction::Publish => self.publish_selected(),
             AppAction::PublishBranch => self.publish_branch_selected(),
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
             AppAction::NewConversation
             | AppAction::Checkout
-            | AppAction::Publish
             | AppAction::Activity
             | AppAction::Changes
             | AppAction::Tools
@@ -2350,16 +2520,17 @@ impl App {
         }
         let wait_for_admission = self.selected().active_request.is_none();
         let conversation = self.selected().id.clone();
-        let repo_dir = self.repo_dir.clone();
-        let tx = self.tx.clone();
         self.selected_mut().interrupting = true;
         self.selected_mut().status = "stopping agent".to_string();
-        std::thread::spawn(move || {
-            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+        let interrupted_conversation = conversation.clone();
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
                 let attempts = if wait_for_admission { 40 } else { 1 };
                 let mut last_error = None;
                 for attempt in 0..attempts {
-                    match interrupt_request(&transport, &conversation) {
+                    match interrupt_request(transport, &conversation) {
                         Ok(commit) => return Ok(commit),
                         Err(error) => last_error = Some(error),
                     }
@@ -2368,39 +2539,12 @@ impl App {
                     }
                 }
                 Err(last_error.unwrap_or_else(|| "recording Escape failed".to_string()))
-            });
-            let _ = tx.send(UiMessage::Interrupted {
-                conversation,
+            },
+            move |result| UiMessage::Interrupted {
+                conversation: interrupted_conversation,
                 result,
-            });
-        });
-    }
-
-    fn start_reference_lookup(&mut self, index: usize) {
-        let state = &mut self.conversations[index];
-        if state.reference_loading {
-            return;
-        }
-        state.reference_loading = true;
-        state.reference_generation = state.reference_generation.wrapping_add(1);
-        state.reference_notice = None;
-        state.command_error = None;
-        state.status = "loading conversation reference".to_string();
-        let conversation = state.id.clone();
-        let generation = state.reference_generation;
-        let observed_head = state.remote_head.clone();
-        let repo_dir = self.repo_dir.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = GitTransport::discover(repo_dir)
-                .and_then(|transport| conversation_reference(&transport, &conversation));
-            let _ = tx.send(UiMessage::ReferenceLoaded {
-                conversation,
-                generation,
-                observed_head,
-                result,
-            });
-        });
+            },
+        );
     }
 
     fn invite_selected(&mut self, user: &str) {
@@ -2428,6 +2572,113 @@ impl App {
         }
     }
 
+    fn run_workspace_command(&mut self, arguments: &str) {
+        let parts = arguments.split_whitespace().collect::<Vec<_>>();
+        match parts.as_slice() {
+            [] => {
+                let listing = if self.selected().workspaces.is_empty() {
+                    "This conversation has no workspace.".to_string()
+                } else {
+                    self.selected()
+                        .workspaces
+                        .iter()
+                        .map(|workspace| {
+                            format!(
+                                "{} {} (base {})",
+                                workspace.name,
+                                short_hash(&workspace.head),
+                                short_hash(&workspace.base_commit)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.selected_mut().push_info(listing);
+            }
+            ["use", name] => match self.selected_mut().select_workspace(name) {
+                Ok(()) => {
+                    self.selected_mut()
+                        .push_info(format!("Using workspace {name:?}."));
+                    if self.view == View::Tools {
+                        self.load_selected_tool_set();
+                    }
+                }
+                Err(error) => self.selected_mut().show_command_error(error),
+            },
+            ["create", name, rest @ ..] if rest.len() <= 1 => {
+                self.start_workspace_mutation("creating workspace", {
+                    let name = (*name).to_string();
+                    let rev = rest.first().copied().unwrap_or("HEAD").to_string();
+                    move |transport, conversation| {
+                        let commit = resolve_workspace_revision(transport, &rev)?;
+                        create_workspace(transport, conversation, &name, &commit)?;
+                        Ok(format!(
+                            "Created workspace {name:?} at {}.",
+                            short_hash(&commit)
+                        ))
+                    }
+                });
+            }
+            ["rollback", name, rev] => {
+                self.start_workspace_mutation("rolling back workspace", {
+                    let name = (*name).to_string();
+                    let rev = (*rev).to_string();
+                    move |transport, conversation| {
+                        let commit = resolve_workspace_revision(transport, &rev)?;
+                        rollback_workspace(transport, conversation, &name, &commit)?;
+                        Ok(format!(
+                            "Rolled back workspace {name:?} to {}.",
+                            short_hash(&commit)
+                        ))
+                    }
+                });
+            }
+            ["remove", name] => {
+                self.start_workspace_mutation("removing workspace", {
+                    let name = (*name).to_string();
+                    move |transport, conversation| {
+                        remove_workspace(transport, conversation, &name)?;
+                        Ok(format!("Removed workspace {name:?}."))
+                    }
+                });
+            }
+            _ => self.selected_mut().show_command_error(
+                "usage: /workspace [use <name>|create <name> [<rev>]|rollback <name> <rev>|remove <name>]",
+            ),
+        }
+    }
+
+    fn start_workspace_mutation(
+        &mut self,
+        status: &str,
+        operation: impl FnOnce(&GitTransport, &str) -> Result<String, String> + Send + 'static,
+    ) {
+        if self.selected().is_busy() {
+            self.selected_mut().show_command_error(
+                "finish this conversation's operation before changing its workspaces",
+            );
+            return;
+        }
+        let conversation = self.selected().id.clone();
+        self.selected_mut().workspace_operation = true;
+        self.selected_mut().status = status.to_string();
+        let updated_conversation = conversation.clone();
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
+                let info = operation(transport, &conversation)?;
+                let load = conversation_load(transport, &conversation)?
+                    .ok_or_else(|| format!("conversation {conversation:?} disappeared"))?;
+                Ok((info, Box::new(load)))
+            },
+            move |result| UiMessage::WorkspaceUpdated {
+                conversation: updated_conversation,
+                result,
+            },
+        );
+    }
+
     pub(crate) fn drain_messages(&mut self) -> bool {
         let mut changed = false;
         while let Ok(message) = self.rx.try_recv() {
@@ -2435,10 +2686,9 @@ impl App {
             match message {
                 UiMessage::Forked {
                     conversation,
-                    origin,
                     source,
                     result,
-                } => self.finish_fork(&conversation, &origin, &source, result),
+                } => self.finish_fork(&conversation, &source, result),
                 UiMessage::Turn {
                     conversation,
                     event,
@@ -2566,15 +2816,29 @@ impl App {
                     conversation,
                     result,
                 } => {
+                    let transport = self.transport();
+                    let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
+                        state.local_turn = false;
+                        let refreshed = transport
+                            .as_ref()
+                            .ok()
+                            .and_then(|transport| state.reload(transport, &user));
+                        if refreshed.is_none() {
+                            state.running = false;
+                            state.active_request = None;
+                            state.remote_head = None;
+                        }
                         match result {
                             Ok(url) => state.push_info(format!("PR ready: {url}")),
                             Err(error) => {
                                 state.sidebar_attention =
                                     Some("PR failed — open for details".to_string());
-                                state.show_command_error(format!("PR failed: {error}"));
+                                state.show_command_error_preserving_status(format!(
+                                    "PR failed: {error}"
+                                ));
                             }
                         }
                     }
@@ -2583,27 +2847,79 @@ impl App {
                     conversation,
                     result,
                 } => {
+                    let transport = self.transport();
+                    let user = self.user.clone();
                     if let Some(index) = self.conversation_index(&conversation) {
                         let state = &mut self.conversations[index];
                         state.publishing = false;
                         match result {
-                            Ok(branch) => state
-                                .push_info(format!("Conversation branch ready: origin/{branch}")),
+                            Ok((published, diagnostic)) => {
+                                if let Ok(transport) = &transport {
+                                    let _ = state.reload(transport, &user);
+                                }
+                                match published.status {
+                                    conversation_protocol::v3::PublicationStatus::Complete => {
+                                        state.push_info(format!(
+                                            "Branch ready: origin/{} at {}",
+                                            published.branch,
+                                            short_hash(&published.head)
+                                        ));
+                                    }
+                                    conversation_protocol::v3::PublicationStatus::Conflict => {
+                                        let observed = published
+                                            .observed
+                                            .as_deref()
+                                            .map(short_hash)
+                                            .unwrap_or("deleted");
+                                        state.show_command_error(format!(
+                                            "branch {} moved on origin to {observed}; rollback or create a workspace from it before publishing again",
+                                            published.branch
+                                        ));
+                                    }
+                                    conversation_protocol::v3::PublicationStatus::Uncertain => {
+                                        state.show_command_error(format!(
+                                            "publishing {} is uncertain: {}",
+                                            published.branch,
+                                            diagnostic.as_deref().unwrap_or(
+                                                "the recorded diagnostic could not be loaded"
+                                            )
+                                        ));
+                                    }
+                                    conversation_protocol::v3::PublicationStatus::Pending => {
+                                        state.show_command_error(format!(
+                                            "publication {} is still pending",
+                                            published.publication
+                                        ));
+                                    }
+                                }
+                            }
                             Err(error) => {
                                 state.sidebar_attention =
                                     Some("Branch publish failed — open for details".to_string());
                                 state.show_command_error(format!(
-                                    "publishing conversation branch failed: {error}"
+                                    "publishing branch failed: {error}"
                                 ));
                             }
                         }
                     }
                 }
-                UiMessage::ConversationImported {
-                    origin,
-                    source,
+                UiMessage::WorkspaceUpdated {
+                    conversation,
                     result,
-                } => self.finish_published_load(&origin, &source, result),
+                } => {
+                    let user = self.user.clone();
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        let state = &mut self.conversations[index];
+                        state.workspace_operation = false;
+                        match result {
+                            Ok((info, load)) => {
+                                state.apply_load(*load, &user);
+                                state.push_info(info);
+                            }
+                            Err(error) => state.show_command_error(error),
+                        }
+                    }
+                }
                 UiMessage::Reconciled {
                     conversation,
                     request,
@@ -2619,56 +2935,6 @@ impl App {
                             state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
                             state.status = format!("recovery retry pending: {error}");
                         }
-                    }
-                }
-                UiMessage::ReferenceLoaded {
-                    conversation,
-                    generation,
-                    observed_head,
-                    result,
-                } => {
-                    let Some(index) = self.conversation_index(&conversation) else {
-                        continue;
-                    };
-                    if !self.conversations[index].reference_loading
-                        || self.conversations[index].reference_generation != generation
-                    {
-                        continue;
-                    }
-                    let retry = {
-                        let state = &mut self.conversations[index];
-                        state.reference_loading = false;
-                        if state.status == "loading conversation reference" {
-                            state.status.clear();
-                        }
-                        match result {
-                            Ok((_refname, Some(head)))
-                                if state.remote_head != observed_head
-                                    && state.remote_head.as_deref() != Some(head.as_str()) =>
-                            {
-                                true
-                            }
-                            Ok((refname, Some(head))) => {
-                                state.reference_notice = Some(ReferenceNotice { refname, head });
-                                false
-                            }
-                            Ok((_refname, None)) if state.remote_head != observed_head => true,
-                            Ok((_refname, None)) => {
-                                state.reference_notice = None;
-                                state.show_command_error(
-                                    "this conversation has no remote ref until its first message",
-                                );
-                                false
-                            }
-                            Err(error) => {
-                                state.reference_notice = None;
-                                state.show_command_error(error);
-                                false
-                            }
-                        }
-                    };
-                    if retry {
-                        self.start_reference_lookup(index);
                     }
                 }
                 UiMessage::RemotePolled { result } => {
@@ -2701,18 +2967,18 @@ impl App {
                     (
                         state.remote_head.clone(),
                         state.remote_title.clone(),
-                        state.forking || state.loading_remote,
+                        state.forking || state.workspace_operation,
                     ),
                 )
             })
             .collect();
-        let repo_dir = self.repo_dir.clone();
         let user = self.user.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = GitTransport::discover(repo_dir).and_then(|transport| {
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
                 let summaries =
-                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?;
+                    list_user_conversations(transport, &user, UserConversationStatus::Active)?;
                 Ok(summaries
                     .into_iter()
                     .map(|summary| {
@@ -2723,7 +2989,7 @@ impl App {
                         let load = (!forking
                             && observed_head.as_deref() != Some(summary.head.as_str()))
                         .then(|| {
-                            conversation_load(&transport, &summary.id)
+                            conversation_load(transport, &summary.id)
                                 .and_then(|load| {
                                     load.ok_or_else(|| {
                                         format!(
@@ -2742,9 +3008,9 @@ impl App {
                         }
                     })
                     .collect())
-            });
-            let _ = tx.send(UiMessage::RemotePolled { result });
-        });
+            },
+            |result| UiMessage::RemotePolled { result },
+        );
     }
 
     fn apply_remote_poll(&mut self, entries: Vec<RemotePollEntry>) -> bool {
@@ -2908,41 +3174,32 @@ impl App {
             format!("completed {}", outcome.short_commit)
         };
         match transport {
-            Ok(transport) => {
-                let published_title = state.title.clone();
-                let initial_title = state
-                    .automatic_title_fallback
-                    .as_deref()
-                    .unwrap_or(&published_title);
-                match publish_user_conversation(&transport, &user, &state.id, initial_title) {
-                    Ok(()) => {
-                        if let Some(fallback) = state.automatic_title_fallback.clone() {
-                            state.remote_title.get_or_insert_with(|| fallback.clone());
-                            if !state.automatic_title
-                                && state.title != fallback
-                                && compare_and_set_conversation_title(
-                                    &transport,
-                                    &state.id,
-                                    &fallback,
-                                    &state.title,
-                                )
-                                .unwrap_or(false)
-                            {
-                                state.remote_title = Some(state.title.clone());
-                                state.automatic_title_fallback = None;
-                            }
+            Ok(transport) => match publish_user_conversation(&transport, &user, &state.id) {
+                Ok(()) => {
+                    if let Some(fallback) = state.automatic_title_fallback.clone() {
+                        state.remote_title.get_or_insert_with(|| fallback.clone());
+                        if !state.automatic_title
+                            && state.title != fallback
+                            && compare_and_set_conversation_title(
+                                &transport,
+                                &state.id,
+                                &fallback,
+                                &state.title,
+                            )
+                            .unwrap_or(false)
+                        {
+                            state.remote_title = Some(state.title.clone());
+                            state.automatic_title_fallback = None;
                         }
-                        let _ = state.reload(&transport, &user);
-                        state.remote_head = Some(outcome.commit);
                     }
-                    Err(error) => {
-                        state.sidebar_attention = Some("Failed to save conversation".to_string());
-                        state.push_error(format!(
-                            "publishing completed conversation failed: {error}"
-                        ));
-                    }
+                    let _ = state.reload(&transport, &user);
+                    state.remote_head = Some(outcome.commit);
                 }
-            }
+                Err(error) => {
+                    state.sidebar_attention = Some("Failed to save conversation".to_string());
+                    state.push_error(format!("publishing completed conversation failed: {error}"));
+                }
+            },
             Err(error) => {
                 state.sidebar_attention = Some("Failed to reload conversation".to_string());
                 state.push_error(format!("reloading completed turn failed: {error}"));
@@ -2953,7 +3210,6 @@ impl App {
     fn finish_fork(
         &mut self,
         conversation: &str,
-        _origin: &str,
         source: &str,
         result: Result<(String, Box<ConversationLoad>), String>,
     ) {
@@ -3085,59 +3341,34 @@ impl App {
             return;
         }
         if shortcut == Some(AppAction::Publish) {
-            self.execute_action(AppAction::Publish);
+            self.publish_selected();
             return;
         }
-        if matches!(self.confirm_action, Some(ConfirmAction::Publish { .. })) {
+        if let Some(prompt) = self.selected_mut().publish_base.as_mut() {
             match key.code {
-                KeyCode::Esc => {
-                    self.confirm_action = None;
-                    self.selected_mut().status.clear();
-                    self.selected_mut().publish_prompt = false;
-                }
+                KeyCode::Esc => self.selected_mut().publish_base = None,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.confirm_action = None;
-                    self.selected_mut().status.clear();
-                    self.selected_mut().publish_prompt = false;
+                    self.selected_mut().publish_base = None;
                 }
                 KeyCode::Backspace => {
-                    if let Some(ConfirmAction::Publish { base_input, .. }) =
-                        self.confirm_action.as_mut()
-                    {
-                        base_input.pop();
-                    }
+                    prompt.input.pop();
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(ConfirmAction::Publish { base_input, .. }) =
-                        self.confirm_action.as_mut()
-                    {
-                        base_input.clear();
-                    }
+                    prompt.input.clear();
                 }
                 KeyCode::Char(ch)
                     if !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
                 {
-                    if let Some(ConfirmAction::Publish { base_input, .. }) =
-                        self.confirm_action.as_mut()
-                    {
-                        base_input.push(ch);
-                    }
+                    prompt.input.push(ch);
                 }
                 _ => {}
             }
             return;
         }
-        if key.code == KeyCode::Esc
-            && (self.selected().reference_notice.is_some() || self.selected().reference_loading)
-        {
-            let state = self.selected_mut();
-            state.reference_notice = None;
-            state.reference_loading = false;
-            if state.status == "loading conversation reference" {
-                state.status.clear();
-            }
+        if key.code == KeyCode::Esc && self.selected().reference_notice.is_some() {
+            self.selected_mut().reference_notice = None;
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -3273,20 +3504,20 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 let command_is_complete = parse_command(&self.selected().composer.text).is_some();
-                if command_is_complete || !self.selected_mut().composer.complete_command() {
+                if command_is_complete || !self.selected_mut().complete_command() {
                     self.start_turn();
                 }
             }
             KeyCode::Enter => {
-                if !self.selected_mut().composer.complete_command() {
+                if !self.selected_mut().complete_command() {
                     self.selected_mut().composer.insert_char('\n');
                 }
             }
             KeyCode::Tab => {
-                self.selected_mut().composer.complete_command();
+                self.selected_mut().complete_command();
             }
             KeyCode::Esc => {
-                self.selected_mut().composer.dismiss_command_menu();
+                self.selected_mut().dismiss_command_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
@@ -3324,12 +3555,12 @@ impl App {
             KeyCode::Left => self.selected_mut().composer.move_left(),
             KeyCode::Right => self.selected_mut().composer.move_right(),
             KeyCode::Up => {
-                if !self.selected_mut().composer.select_command(-1) {
+                if !self.selected_mut().select_command(-1) {
                     self.selected_mut().composer.move_vertical(true);
                 }
             }
             KeyCode::Down => {
-                if !self.selected_mut().composer.select_command(1) {
+                if !self.selected_mut().select_command(1) {
                     self.selected_mut().composer.move_vertical(false);
                 }
             }
@@ -3398,6 +3629,7 @@ impl App {
             }
             AppAction::Checkout => self.load_selected(),
             AppAction::Publish => self.publish_selected(),
+            AppAction::PublishBranch => self.publish_branch_selected(),
             AppAction::Activity => {
                 self.view = if self.view == View::Activity {
                     View::Chat
@@ -3437,18 +3669,16 @@ impl App {
             AppAction::Archive => self.close_selected(),
             AppAction::SelectionLock => self.selection_locked = !self.selection_locked,
             AppAction::Commands => {
-                self.confirm_action = None;
-                self.selected_mut().publish_prompt = false;
+                self.selected_mut().publish_base = None;
                 self.palette = self.palette.take().is_none().then(CommandPalette::default);
             }
             AppAction::From
             | AppAction::Invite
-            | AppAction::Load
             | AppAction::Model
-            | AppAction::PublishBranch
             | AppAction::Reference
             | AppAction::Title
-            | AppAction::UpdateTree => unreachable!("slash action needs arguments"),
+            | AppAction::UpdateTree
+            | AppAction::Workspace => unreachable!("slash action needs arguments"),
         }
     }
 
@@ -3553,7 +3783,6 @@ impl App {
                 return;
             }
         };
-        let origin = self.selected().id.clone();
         let previous_options = self.selected().turn_options.clone();
         let (state, fork_source) = match base {
             None => {
@@ -3595,24 +3824,24 @@ impl App {
         self.conversations.insert(0, state);
         self.selected = 0;
         self.view = View::Chat;
-        self.confirm_action = None;
         if let Some(source) = fork_source {
-            let tx = self.tx.clone();
-            let repo_dir = self.repo_dir.clone();
             let user = self.user.clone();
-            std::thread::spawn(move || {
-                let result = GitTransport::discover(repo_dir).and_then(|transport| {
-                    let fork = fork_conversation(&transport, &user, &id, &title, &source)?;
-                    let load = conversation_load_at(&transport, &id, &fork)?;
+            let forked_id = id.clone();
+            let forked_source = source.clone();
+            spawn(
+                self.repo_dir.clone(),
+                self.tx.clone(),
+                move |transport| {
+                    let fork = fork_conversation(transport, &user, &id, &title, &source)?;
+                    let load = conversation_load_at(transport, &id, &fork)?;
                     Ok((fork, Box::new(load)))
-                });
-                let _ = tx.send(UiMessage::Forked {
-                    conversation: id,
-                    origin,
-                    source,
+                },
+                move |result| UiMessage::Forked {
+                    conversation: forked_id,
+                    source: forked_source,
                     result,
-                });
-            });
+                },
+            );
         }
     }
 
@@ -3622,10 +3851,10 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
-        self.selected_mut().publish_prompt = false;
+        self.selected_mut().publish_base = None;
         self.selected = index;
-        self.confirm_action = None;
-        let needs_load = self.selected().diff.is_none() && self.selected().remote_head.is_some();
+        let needs_load =
+            self.selected().workspaces.is_empty() && self.selected().remote_head.is_some();
         if needs_load {
             self.selected_mut().remote_head = None;
             self.selected_mut().status = "loading conversation".to_string();
@@ -3696,7 +3925,6 @@ impl App {
             self.conversations.remove(self.selected);
             self.selected = self.selected.min(self.conversations.len() - 1);
         }
-        self.confirm_action = None;
         if self.view == View::Tools {
             self.load_selected_tool_set();
         }
@@ -3741,8 +3969,15 @@ impl App {
         if self.selected().tool_set.is_some() {
             return;
         }
+        if !self.selected().virtual_conversation {
+            if let Err(error) = self.selected().require_selected_workspace() {
+                self.selected_mut().show_command_error(error);
+                return;
+            }
+        }
         let name = self.selected().id.clone();
-        let options = self.selected().turn_options.clone();
+        let mut options = self.selected().turn_options.clone();
+        options.workspace = self.selected().selected_workspace.clone();
         let result = self
             .transport()
             .and_then(|transport| describe_tool_set(&transport, &name, &options));
@@ -3753,141 +3988,159 @@ impl App {
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before checking it out");
-        } else if let Some(diff) = self.selected().diff.clone() {
-            match load_conversation_workspace(&diff.head, &self.repo_dir) {
+            return;
+        }
+        match self.selected().require_selected_workspace().cloned() {
+            Ok(diff) => match load_conversation_workspace(&diff.head, &self.repo_dir) {
                 Ok(()) => {
-                    self.selected_mut().status =
-                        format!("checked out {} in detached HEAD", short_hash(&diff.head));
+                    self.selected_mut().status = format!(
+                        "checked out {} at {} in detached HEAD",
+                        diff.name,
+                        short_hash(&diff.head)
+                    );
+                }
+                Err(error) => self.selected_mut().show_command_error(error),
+            },
+            Err(error) => self.selected_mut().show_command_error(error),
+        }
+    }
+
+    fn publish_selected(&mut self) {
+        if self.selected().is_busy() {
+            self.selected_mut().publish_base = None;
+            self.selected_mut()
+                .show_command_error("finish this conversation's operation before publishing it");
+            return;
+        }
+        let workspace = match self.selected().require_selected_workspace() {
+            Ok(workspace) => workspace.name.clone(),
+            Err(error) => {
+                self.selected_mut().publish_base = None;
+                self.selected_mut().show_command_error(error);
+                return;
+            }
+        };
+        let Some(prompt) = self.selected_mut().publish_base.take() else {
+            match remote_default_branch(&self.repo_dir) {
+                Ok(default_base) => {
+                    self.selected_mut().command_error = None;
+                    self.selected_mut().publish_base = Some(PublishBasePrompt {
+                        default_base,
+                        input: String::new(),
+                    });
                 }
                 Err(error) => self.selected_mut().show_command_error(error),
             }
-        } else {
-            self.selected_mut()
-                .show_command_error("this conversation has no commit to check out");
-        }
-    }
-
-    fn load_published(&mut self, source: &str) {
-        if self.selected().is_busy() {
-            self.selected_mut().show_command_error(
-                "finish this conversation's operation before loading another conversation",
-            );
             return;
-        }
-        let source = source.trim().to_string();
-        let origin = self.selected().id.clone();
-        self.selected_mut().loading_remote = true;
-        self.selected_mut().status = format!("loading published conversation from {source}");
-        let repo_dir = self.repo_dir.clone();
-        let user = self.user.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = (|| {
-                let published = fetch_published_conversation(&source, &repo_dir)?;
-                let transport = GitTransport::discover(&repo_dir)?;
-                let load = import_published_conversation(
-                    &transport,
-                    &user,
-                    &published.id,
-                    published.title.as_deref(),
-                    &published.head,
+        };
+        let base = pr_base_branch(if prompt.input.trim().is_empty() {
+            &prompt.default_base
+        } else {
+            &prompt.input
+        })
+        .to_string();
+        let conversation = self.selected().id.clone();
+        let title = self.selected().title.clone();
+        let mut options = self.selected().turn_options.clone();
+        options.workspace = Some(workspace.clone());
+        let state = self.selected_mut();
+        state.publishing = true;
+        state.running = true;
+        state.local_turn = true;
+        state.command_error = None;
+        state.sidebar_attention = None;
+        state.status = format!("fetching origin/{base}");
+        let event_tx = self.tx.clone();
+        let finished_conversation = conversation.clone();
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
+                let status = |text: String| {
+                    let _ = event_tx.send(UiMessage::Turn {
+                        conversation: conversation.clone(),
+                        event: TurnEvent::Status(text),
+                    });
+                };
+                let target = fetch_remote_branch_tip(&base, transport.work_dir())?;
+                let load = conversation_load(transport, &conversation)?
+                    .ok_or_else(|| format!("conversation {conversation:?} disappeared"))?;
+                let head = load
+                    .workspaces
+                    .iter()
+                    .find(|value| value.name == workspace)
+                    .ok_or_else(|| format!("workspace {workspace:?} disappeared"))?;
+                let base_is_ancestor =
+                    remote_base_is_ancestor(&target, &head.head, transport.work_dir())?;
+                if !base_is_ancestor {
+                    status("sending the PR base to the conversation server".to_string());
+                    transport.ensure_pushed(&target)?;
+                }
+                let message = publish_turn_message(&workspace, &target, base_is_ancestor);
+                status("preparing the workspace for publication".to_string());
+                let outcome = run_chat_turn(
+                    transport,
+                    &options,
+                    &conversation,
+                    &message,
+                    None,
+                    None,
+                    |_| {},
+                    |event| {
+                        let _ = event_tx.send(UiMessage::Turn {
+                            conversation: conversation.clone(),
+                            event,
+                        });
+                    },
                 )?;
-                let summary =
-                    list_user_conversations(&transport, &user, UserConversationStatus::Active)?
-                        .into_iter()
-                        .find(|summary| summary.id == published.id)
-                        .ok_or_else(|| {
-                            format!(
-                                "imported conversation {:?} is missing from the active sidebar",
-                                published.id
-                            )
-                        })?;
-                Ok((published, summary, Box::new(load)))
-            })();
-            let _ = tx.send(UiMessage::ConversationImported {
-                origin,
-                source,
+                let prepared = conversation_load_at(transport, &conversation, &outcome.commit)?;
+                let _ = event_tx.send(UiMessage::Completed {
+                    conversation: conversation.clone(),
+                    outcome: outcome.clone(),
+                });
+                if outcome.interrupted {
+                    return Err("publication preparation was interrupted".to_string());
+                }
+                let prepared = prepared
+                    .workspaces
+                    .iter()
+                    .find(|value| value.name == workspace)
+                    .ok_or_else(|| {
+                        format!("workspace {workspace:?} disappeared during preparation")
+                    })?;
+                validate_prepared_workspace(&target, &prepared.head, transport.work_dir())?;
+                status(format!("publishing workspace {workspace:?}"));
+                let published = publish_prepared_workspace_branch(
+                    transport,
+                    &conversation,
+                    &workspace,
+                    &prepared.head,
+                )?;
+                if published.status != conversation_protocol::v3::PublicationStatus::Complete {
+                    let diagnostic =
+                        publication_diagnostic(transport, &conversation, &published.publication)?;
+                    return Err(format!(
+                        "branch publication is {:?}: {}",
+                        published.status,
+                        diagnostic
+                            .as_deref()
+                            .unwrap_or("inspect the publication record before retrying")
+                    ));
+                }
+                status("finding or opening the pull request".to_string());
+                find_or_open_workspace_pr(
+                    &conversation,
+                    &title,
+                    &published,
+                    &base,
+                    transport.work_dir(),
+                )
+            },
+            move |result| UiMessage::Published {
+                conversation: finished_conversation,
                 result,
-            });
-        });
-    }
-
-    fn finish_published_load(
-        &mut self,
-        origin: &str,
-        source: &str,
-        result: Result<
-            (
-                PublishedConversationSource,
-                UserConversationSummary,
-                Box<ConversationLoad>,
-            ),
-            String,
-        >,
-    ) {
-        let Some(origin_index) = self.conversation_index(origin) else {
-            return;
-        };
-        self.conversations[origin_index].loading_remote = false;
-        let (published, summary, load) = match result {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                self.conversations[origin_index]
-                    .show_command_error(format!("loading published conversation failed: {error}"));
-                return;
-            }
-        };
-        let options = self.conversations[origin_index].turn_options.clone();
-        let status = format!("loaded {} at {}", source, short_hash(&published.head));
-        let index = if let Some(index) = self.conversation_index(&summary.id) {
-            if self.conversations[index].is_busy() {
-                self.conversations[origin_index].show_command_error(format!(
-                    "conversation {:?} was imported but is busy locally; reload it when that operation finishes",
-                    summary.id
-                ));
-                return;
-            }
-            let state = &mut self.conversations[index];
-            state.title = summary.title;
-            state.remote_title = Some(state.title.clone());
-            state.parent = summary.parent;
-            state.apply_load(*load, &self.user);
-            state.status = status.clone();
-            index
-        } else {
-            let mut state = ConversationState::new(
-                summary.id.clone(),
-                summary.title,
-                options,
-                "loading imported conversation".to_string(),
-            );
-            state.parent = summary.parent;
-            state.remote_title = Some(state.title.clone());
-            state.apply_load(*load, &self.user);
-            state.status = status;
-            let insert_at = state
-                .parent
-                .as_deref()
-                .and_then(|parent| self.conversation_index(parent))
-                .map(|parent_index| {
-                    let mut index = parent_index + 1;
-                    while self
-                        .conversations
-                        .get(index)
-                        .is_some_and(|candidate| candidate.parent == state.parent)
-                    {
-                        index += 1;
-                    }
-                    index
-                })
-                .unwrap_or(0);
-            self.conversations.insert(insert_at, state);
-            insert_at
-        };
-        self.selected = index;
-        self.view = View::Chat;
-        self.focus = Focus::Conversation;
-        self.confirm_action = None;
+            },
+        );
     }
 
     fn publish_branch_selected(&mut self) {
@@ -3897,169 +4150,48 @@ impl App {
             );
             return;
         }
-        let Some(diff) = self.selected().diff.clone() else {
-            self.selected_mut()
-                .show_command_error("this conversation has no completed turn to publish");
-            return;
+        let workspace = match self.selected().require_selected_workspace() {
+            Ok(diff) => diff.name.clone(),
+            Err(error) => {
+                self.selected_mut().show_command_error(error);
+                return;
+            }
         };
         let conversation = self.selected().id.clone();
         self.selected_mut().publishing = true;
-        self.selected_mut().status = "validating the conversation tip".to_string();
-        let repo_dir = self.repo_dir.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let status = |text: String| {
-                let _ = tx.send(UiMessage::Turn {
-                    conversation: conversation.clone(),
-                    event: TurnEvent::Status(text),
-                });
-            };
-            let result = (|| {
-                let prepared = prepare_publish_workspace(&diff.head, &diff.base_commit, &repo_dir)?;
-                status(format!("pushing branch caos/{conversation}"));
-                publish_conversation_branch(&conversation, &prepared, &repo_dir)
-            })();
-            let _ = tx.send(UiMessage::BranchPublished {
-                conversation,
-                result,
-            });
-        });
-    }
-
-    fn publish_selected(&mut self) {
-        if self.selected().is_busy() {
-            self.selected_mut()
-                .show_command_error("finish this conversation's operation before publishing it");
-        } else if self.selected().diff.is_none() {
-            // An empty workspace diff is NOT a blocker: the conversation
-            // history itself is worth publishing (and its changes may already
-            // be in the base). Only a conversation with no completed turn has
-            // nothing to point a branch at.
-            self.selected_mut()
-                .show_command_error("this conversation has no completed turn to publish");
-        } else if self.confirm_action.is_none() {
-            let default_base = match remote_default_branch(&self.repo_dir) {
-                Ok(branch) => branch,
-                Err(error) => {
-                    self.selected_mut().show_command_error(error);
-                    return;
-                }
-            };
-            self.confirm_action = Some(ConfirmAction::Publish {
-                default_base,
-                base_input: String::new(),
-            });
-            self.selected_mut().publish_prompt = true;
-            self.selected_mut().status =
-                "enter a PR base branch or press Ctrl+P again for the default".to_string();
-        } else {
-            let pr_base = match self.confirm_action.take() {
-                Some(ConfirmAction::Publish {
-                    default_base,
-                    base_input,
-                }) => {
-                    let base_input = base_input.trim();
-                    if base_input.is_empty() {
-                        default_base
-                    } else {
-                        base_input.to_string()
-                    }
-                }
-                None => unreachable!("publication was confirmed"),
-            };
-            self.selected_mut().publish_prompt = false;
-            let name = self.selected().id.clone();
-            let title = self.selected().title.clone();
-            self.selected_mut().publishing = true;
-            self.selected_mut().status = format!("fetching the tip of {pr_base}");
-            let tx = self.tx.clone();
-            let head = self
-                .selected()
-                .diff
-                .as_ref()
-                .expect("publication requires a conversation diff")
-                .head
-                .clone();
-            let options = self.selected().turn_options.clone();
-            let repo_dir = self.repo_dir.clone();
-            std::thread::spawn(move || {
-                let status = |text: String| {
-                    let _ = tx.send(UiMessage::Turn {
-                        conversation: name.clone(),
-                        event: TurnEvent::Status(text),
-                    });
+        self.selected_mut().status = "publishing workspace branch".to_string();
+        let published_conversation = conversation.clone();
+        spawn(
+            self.repo_dir.clone(),
+            self.tx.clone(),
+            move |transport| {
+                let published =
+                    publish_workspace_branch(transport, &conversation, Some(&workspace))?;
+                let diagnostic = if published.status
+                    == conversation_protocol::v3::PublicationStatus::Uncertain
+                {
+                    publication_diagnostic(transport, &conversation, &published.publication)?
+                } else {
+                    None
                 };
-                let result = (|| {
-                    let base_commit = fetch_remote_branch_tip(&pr_base, &repo_dir)?;
-                    let target = base_commit;
-                    let base_is_ancestor = remote_base_is_ancestor(&target, &head, &repo_dir)?;
-                    let transport = GitTransport::discover(&repo_dir)?;
-                    if !base_is_ancestor {
-                        status(format!(
-                            "sending base {} to the caos server",
-                            short_hash(&target)
-                        ));
-                        transport.ensure_pushed(&target)?;
-                    }
-                    status("starting the publication preparation turn".to_string());
-                    let message = publish_turn_message(&target, base_is_ancestor);
-                    let outcome = run_chat_turn(
-                        &transport,
-                        &options,
-                        &name,
-                        &message,
-                        None,
-                        |_| {},
-                        |event| {
-                            let _ = tx.send(UiMessage::Turn {
-                                conversation: name.clone(),
-                                event,
-                            });
-                        },
-                    )?;
-                    status("validating the prepared workspace".to_string());
-                    let conversation =
-                        prepare_publish_workspace(&outcome.commit, &target, &repo_dir)?;
-                    let _ = tx.send(UiMessage::Completed {
-                        conversation: name.clone(),
-                        outcome,
-                    });
-                    status(format!("pushing branch caos/{name}"));
-                    let branch = publish_conversation_branch(&name, &conversation, &repo_dir)?;
-                    status("finding or opening the pull request".to_string());
-                    find_or_open_conversation_pr(
-                        &name,
-                        &title,
-                        &branch,
-                        &conversation,
-                        &pr_base,
-                        &repo_dir,
-                    )
-                })();
-                let _ = tx.send(UiMessage::Published {
-                    conversation: name,
-                    result,
-                });
-            });
-        }
+                Ok((published, diagnostic))
+            },
+            move |result| UiMessage::BranchPublished {
+                conversation: published_conversation,
+                result,
+            },
+        );
     }
 }
 
-fn publish_turn_message(target: &str, base_is_ancestor: bool) -> String {
-    if base_is_ancestor {
-        format!(
-            "Prepare this conversation for publication. The selected PR base `{target}` is \
-             already an ancestor of this conversation, so do not call `merge` for it again. \
-             Build and test, then finish only when the workspace is ready to publish."
-        )
+fn publish_turn_message(workspace: &str, target: &str, base_is_ancestor: bool) -> String {
+    let preparation = if base_is_ancestor {
+        format!("The selected PR base `{target}` is already an ancestor of this workspace; do not merge it again.")
     } else {
-        format!(
-            "Prepare this conversation for publication. First call the existing `merge` tool \
-             with `theirs` exactly `{target}`. Resolve every entry in `.caos/conflicts`, remove \
-             `.caos/conflicts`, then build and test. Finish only when the workspace is ready to \
-             publish."
-        )
-    }
+        let arguments = serde_json::json!({"workspace": workspace, "theirs": target});
+        format!("First call the existing `merge` tool with these arguments: {arguments}. Resolve every entry in `.caos/conflicts`, then remove `.caos/conflicts`.")
+    };
+    format!("Prepare workspace {workspace:?} for publication. {preparation} Build and test that workspace. Finish only when it is ready to publish.")
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4080,6 +4212,12 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
     );
     t.put_object("blob", descriptor.as_bytes())
         .map(|id| id.to_string())
+}
+
+fn resolve_workspace_revision(t: &GitTransport, rev: &str) -> Result<String, String> {
+    t.resolve_revspec(rev)?
+        .map(|commit| commit.to_string())
+        .ok_or_else(|| format!("cannot resolve workspace revision {rev:?}"))
 }
 
 fn new_conversation_options(
@@ -4144,8 +4282,19 @@ fn choose_conversation(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
+    use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
+    use conversation_protocol::v3::oid::ensure_genesis;
+    use conversation_protocol::v3::records::{
+        Block, Identity, IdentityKind, RequestRecord, RequestStatus, Role,
+        TranscriptEntry as V3TranscriptEntry,
+    };
+    use conversation_protocol::v3::refs;
+    use conversation_protocol::v3::view::Conversation;
+    use conversation_protocol::v3::{GitStore, ObjectStore, Oid, RefUpdate};
     use ratatui_core::backend::TestBackend;
     use ratatui_core::layout::Rect;
     use ratatui_core::style::{Color, Modifier};
@@ -4155,17 +4304,6 @@ mod tests {
     use super::ui::{
         content_contains, paragraph_scroll, render, scroll_offset, transcript_contains,
     };
-
-    #[test]
-    fn publish_prompt_only_requests_a_merge_when_the_base_is_not_an_ancestor() {
-        let already_merged = publish_turn_message("abc123", true);
-        assert!(already_merged.contains("do not call `merge`"));
-        assert!(!already_merged.contains("First call the existing `merge` tool"));
-
-        let needs_merge = publish_turn_message("abc123", false);
-        assert!(needs_merge.contains("First call the existing `merge` tool"));
-        assert!(needs_merge.contains("`theirs` exactly `abc123`"));
-    }
 
     fn summary(id: &str) -> UserConversationSummary {
         UserConversationSummary {
@@ -4231,32 +4369,104 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
-    fn push_test_conversation(repo: &Path, id: &str, head: &str) {
-        git_ok(
-            repo,
-            &[
-                "push",
-                "-q",
-                "caos",
-                &format!("{head}:refs/caos/v2/conversations/{id}/head"),
-            ],
-        );
+    fn mint_test_transition(store: &mut GitStore, parent: &Oid, transition: &Transition) -> Oid {
+        let parent_tree = store.read_commit(parent).unwrap().tree;
+        let applied = apply(store, Some(&parent_tree), transition).unwrap();
+        mint(
+            store,
+            parent,
+            &applied.tree,
+            transition.kind(),
+            &client_signature("CAOS test", "caos-test@example.invalid", 1_700_000_000),
+        )
+        .unwrap()
+    }
+
+    fn seed_conversation(
+        repo: &Path,
+        id: &str,
+        username: &str,
+        message: &str,
+        queued: bool,
+    ) -> (String, Option<String>) {
+        let base = Oid::parse(&git_output(repo, &["rev-parse", "HEAD"]), "test base").unwrap();
+        let mut store = GitStore::open(repo, Some("caos")).unwrap();
+        let genesis = ensure_genesis(&mut store).unwrap();
+        let root_transition = Transition::ConversationRoot {
+            identity: Identity {
+                id: id.to_string(),
+                kind: IdentityKind::Root,
+                owner: None,
+            },
+            title: message.to_string(),
+            workspaces: BTreeMap::from([("main".to_string(), (base, None))]),
+            files_seed: None,
+        };
+        let root_tree = apply(&mut store, None, &root_transition).unwrap().tree;
+        let root = mint(
+            &mut store,
+            &genesis,
+            &root_tree,
+            root_transition.kind(),
+            &client_signature("CAOS test", "caos-test@example.invalid", 1_700_000_000),
+        )
+        .unwrap();
+        let message_id = "message-0";
+        let message_transition = Transition::MessageAppend {
+            entry: V3TranscriptEntry {
+                message_id: message_id.to_string(),
+                conversation: id.to_string(),
+                role: Role::User,
+                actor: username.to_string(),
+                request: None,
+                round: None,
+                model: None,
+                blocks: vec![Block::Text {
+                    text: message.to_string(),
+                }],
+                proposal: None,
+                workspace_resolution: None,
+            },
+            payloads: Vec::new(),
+        };
+        let mut head = mint_test_transition(&mut store, &root, &message_transition);
+        let request = queued.then(|| "b".repeat(40));
+        if let Some(request) = request.as_deref() {
+            let request = Oid::parse(request, "test request").unwrap();
+            let request_workspaces = Conversation::open(&store, &head)
+                .unwrap()
+                .workspaces_tree()
+                .unwrap();
+            let admission = Transition::RequestAdmit {
+                record: RequestRecord {
+                    id: request,
+                    request_head: head.clone(),
+                    request_workspaces,
+                    model: "test-model".to_string(),
+                    configuration: "test-configuration".to_string(),
+                    round: 0,
+                    calls: Vec::new(),
+                    interjections: Vec::new(),
+                    status: RequestStatus::Queued,
+                    latest_message: None,
+                    escape_reason: None,
+                    outcome: None,
+                },
+            };
+            head = mint_test_transition(&mut store, &head, &admission);
+        }
+        store
+            .push(&[RefUpdate {
+                refname: refs::head_ref(id).unwrap(),
+                expected: None,
+                new: Some(head.clone()),
+            }])
+            .unwrap();
+        (head.to_string(), request)
     }
 
     fn seed_idle_conversation(repo: &Path, id: &str, username: &str, message: &str) -> String {
-        let base = git_output(repo, &["rev-parse", "HEAD"]);
-        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
-        let event = serde_json::to_string(&serde_json::json!({
-            "base": base,
-            "author": "user",
-            "username": username,
-            "content": message,
-            "status": "idle",
-        }))
-        .unwrap();
-        let head = git_output(repo, &["commit-tree", &tree, "-p", &base, "-m", &event]);
-        push_test_conversation(repo, id, &head);
-        head
+        seed_conversation(repo, id, username, message, false).0
     }
 
     fn seed_queued_conversation(
@@ -4265,29 +4475,8 @@ mod tests {
         username: &str,
         message: &str,
     ) -> (String, String) {
-        let base = git_output(repo, &["rev-parse", "HEAD"]);
-        let tree = git_output(repo, &["rev-parse", "HEAD^{tree}"]);
-        let user_event = serde_json::to_string(&serde_json::json!({
-            "base": base,
-            "author": "user",
-            "username": username,
-            "content": message,
-        }))
-        .unwrap();
-        let user = git_output(
-            repo,
-            &["commit-tree", &tree, "-p", &base, "-m", &user_event],
-        );
-        let request = "b".repeat(40);
-        let admission = serde_json::to_string(&serde_json::json!({
-            "status": "queued",
-            "request": request,
-            "request_head": user,
-        }))
-        .unwrap();
-        let head = git_output(repo, &["commit-tree", &tree, "-p", &user, "-m", &admission]);
-        push_test_conversation(repo, id, &head);
-        (head, request)
+        let (head, request) = seed_conversation(repo, id, username, message, true);
+        (head, request.expect("queued conversation has a request"))
     }
 
     fn repo_with_default_branch(name: &str, branch: &str) -> (PathBuf, PathBuf, String) {
@@ -4354,7 +4543,6 @@ mod tests {
                 selected: 0,
                 should_quit: false,
                 selection_locked: false,
-                confirm_action: None,
                 selecting_transcript: false,
                 screen_selection: None,
                 selecting_screen: false,
@@ -4372,6 +4560,208 @@ mod tests {
             },
             tx,
         )
+    }
+
+    fn workspace_diff(name: &str, base: char, head: char, patch: &str) -> WorkspaceDiff {
+        WorkspaceDiff {
+            name: name.to_string(),
+            base_commit: base.to_string().repeat(40),
+            head: head.to_string().repeat(40),
+            patch: patch.to_string(),
+        }
+    }
+
+    fn load_with_workspaces(workspaces: Vec<WorkspaceDiff>) -> ConversationLoad {
+        ConversationLoad {
+            snapshot: ConversationSnapshot {
+                id: "talk-1".to_string(),
+                head: "f".repeat(40),
+                title: "talk-1".to_string(),
+                status: RequestStatus::Idle,
+                request: None,
+                interrupted: false,
+                error: None,
+            },
+            replay: ConversationReplay {
+                turns: Vec::new(),
+                activity: Vec::new(),
+            },
+            workspaces,
+            publications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn workspace_selection_defaults_to_one_persists_and_clears_when_removed() {
+        let mut conversation = state("talk-1");
+        conversation.apply_load(
+            load_with_workspaces(vec![workspace_diff("main", 'a', 'b', "main")]),
+            "tester",
+        );
+        assert_eq!(conversation.selected_workspace.as_deref(), Some("main"));
+        assert_eq!(conversation.turn_options.workspace, None);
+
+        conversation.apply_load(
+            load_with_workspaces(vec![
+                workspace_diff("main", 'a', 'c', "main updated"),
+                workspace_diff("side", 'd', 'e', "side"),
+            ]),
+            "tester",
+        );
+        assert_eq!(conversation.selected_workspace.as_deref(), Some("main"));
+
+        conversation.apply_load(
+            load_with_workspaces(vec![
+                workspace_diff("side", 'd', 'e', "side"),
+                workspace_diff("other", 'f', '0', "other"),
+            ]),
+            "tester",
+        );
+        assert_eq!(conversation.selected_workspace, None);
+        assert_eq!(conversation.turn_options.workspace, None);
+
+        conversation.apply_load(
+            load_with_workspaces(vec![
+                workspace_diff("side", 'd', 'f', "side updated"),
+                workspace_diff("other", 'f', '0', "other"),
+            ]),
+            "tester",
+        );
+        assert_eq!(conversation.selected_workspace, None);
+
+        conversation.apply_load(
+            load_with_workspaces(vec![workspace_diff("side", 'd', 'e', "side")]),
+            "tester",
+        );
+        assert_eq!(conversation.selected_workspace.as_deref(), Some("side"));
+    }
+
+    #[test]
+    fn workspace_use_switches_the_diff_view() {
+        let mut conversation = state("talk-1");
+        conversation.workspaces = vec![
+            workspace_diff("main", 'a', 'b', "MAIN PATCH"),
+            workspace_diff("side", 'c', 'd', "SIDE PATCH"),
+        ];
+        conversation.selected_workspace = Some("main".to_string());
+        conversation.composer.insert_str("/workspace use side");
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(app.selected().selected_workspace.as_deref(), Some("side"));
+        assert_eq!(app.selected().turn_options.workspace, None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let rendered = rendered_main_pane(&terminal).join("\n");
+        assert!(rendered.contains("main [side]"));
+        assert!(rendered.contains("SIDE PATCH"));
+        assert!(!rendered.contains("MAIN PATCH"));
+    }
+
+    #[test]
+    fn selected_workspace_is_shown_in_the_header() {
+        let mut conversation = state("talk-1");
+        conversation.transcript.push(TranscriptEntry {
+            role: EntryRole::Agent(None),
+            commit: Some("f".repeat(40)),
+            text: "done".to_string(),
+            pending_id: None,
+        });
+        conversation.workspaces = vec![workspace_diff("main", 'a', 'b', "")];
+        conversation.selected_workspace = Some("main".to_string());
+        let (app, _) = app_with(vec![conversation]);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        let header = rendered_header(&terminal);
+        assert!(header.contains("ws main bbbbbbb"));
+        assert!(!header.contains("head fffffff"));
+    }
+
+    #[test]
+    fn changes_header_marks_a_completed_publication_of_the_selected_workspace() {
+        let mut conversation = state("talk-1");
+        conversation.workspaces = vec![workspace_diff("main", 'a', 'b', "")];
+        conversation.selected_workspace = Some("main".to_string());
+        conversation.publications = vec![PublicationSummary {
+            id: "publication".to_string(),
+            workspace: "main".to_string(),
+            planned_head: "b".repeat(40),
+            status: conversation_protocol::v3::PublicationStatus::Complete,
+        }];
+        let (mut app, _) = app_with(vec![conversation]);
+        app.view = View::Diff;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+
+        assert!(rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("Workspace diff · Published"));
+
+        app.selected_mut().publications.insert(
+            0,
+            PublicationSummary {
+                id: "newer-conflict".to_string(),
+                workspace: "main".to_string(),
+                planned_head: "b".repeat(40),
+                status: conversation_protocol::v3::PublicationStatus::Conflict,
+            },
+        );
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        assert!(!rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("Workspace diff · Published"));
+    }
+
+    #[test]
+    fn update_tree_refuses_an_ambiguous_workspace() {
+        let mut conversation = state("talk-1");
+        conversation.workspaces = vec![
+            workspace_diff("main", 'a', 'b', ""),
+            workspace_diff("side", 'c', 'd', ""),
+        ];
+        conversation
+            .composer
+            .insert_str("/update-tree include edits");
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("choose a workspace; available workspaces: main, side")
+        );
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn workspace_completion_only_offers_names_to_name_taking_subcommands() {
+        let names = vec!["main".to_string(), "side".to_string()];
+        let mut composer = Composer::default();
+        composer.insert_str("/workspace ");
+        assert_eq!(
+            composer.workspace_completion(&names).unwrap().values,
+            ["create", "use", "rollback", "remove"]
+        );
+
+        composer = Composer::default();
+        composer.insert_str("/workspace create ");
+        assert!(composer
+            .workspace_completion(&names)
+            .unwrap()
+            .values
+            .is_empty());
+
+        composer = Composer::default();
+        composer.insert_str("/workspace use ");
+        assert_eq!(composer.workspace_completion(&names).unwrap().values, names);
     }
 
     fn wait_for_fork(app: &mut App, id: &str) -> bool {
@@ -4416,18 +4806,6 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for pending submission {id}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    fn wait_for_reference_lookup(app: &mut App) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app.selected().reference_loading {
-            app.drain_messages();
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for conversation reference"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -4586,12 +4964,12 @@ mod tests {
     #[test]
     fn automatic_titles_collapse_whitespace_and_limit_unicode_scalars() {
         assert_eq!(
-            automatic_title("  Review\t the\nλ parser  "),
+            default_title("  Review\t the\nλ parser  "),
             "Review the λ parser"
         );
-        assert_eq!(automatic_title(&"界".repeat(60)), "界".repeat(60));
+        assert_eq!(default_title(&"界".repeat(60)), "界".repeat(60));
         assert_eq!(
-            automatic_title(&"界".repeat(61)),
+            default_title(&"界".repeat(61)),
             format!("{}…", "界".repeat(59))
         );
     }
@@ -4746,7 +5124,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let head = seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
         let transport = GitTransport::discover(&repo).unwrap();
-        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk").unwrap();
 
         let mut conversation = ConversationState::new_virtual(
             "new-talk".to_string(),
@@ -4789,7 +5167,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
         let transport = GitTransport::discover(&repo).unwrap();
-        publish_user_conversation(&transport, "tester", "new-talk", "fallback prompt").unwrap();
+        publish_user_conversation(&transport, "tester", "new-talk").unwrap();
 
         let mut conversation = ConversationState::new_virtual(
             "new-talk".to_string(),
@@ -4831,10 +5209,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "/from",
-                "/load",
                 "/help",
                 "/title",
                 "/update-tree",
+                "/workspace",
                 "/commands",
                 "/publish-branch",
                 "/ref",
@@ -4843,8 +5221,8 @@ mod tests {
             ]
         );
 
-        assert!(composer.select_command(3));
-        assert!(composer.complete_command());
+        assert!(composer.select_command(2, &[]));
+        assert!(composer.complete_command(&[]));
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
 
@@ -4857,7 +5235,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/title"]
         );
-        assert!(composer.dismiss_command_menu());
+        assert!(composer.dismiss_command_menu(&[]));
         assert!(composer.command_matches().is_empty());
         composer.insert_char('x');
         assert!(!composer.command_menu_dismissed);
@@ -4865,7 +5243,7 @@ mod tests {
         let mut composer = Composer::default();
         composer.insert_str("/model sonnet-5");
         assert_eq!(composer.model_matches(), ["claude-sonnet-5"]);
-        assert!(composer.complete_command());
+        assert!(composer.complete_command(&[]));
         assert_eq!(composer.text, "/model claude-sonnet-5 ");
     }
 
@@ -4888,10 +5266,11 @@ mod tests {
         assert_eq!(command.action, AppAction::From);
         assert_eq!(arguments, "abc123");
 
-        let (command, arguments) =
-            parse_command("/load https://github.com/Metta-AI/caos/pull/34").unwrap();
-        assert_eq!(command.action, AppAction::Load);
-        assert_eq!(arguments, "https://github.com/Metta-AI/caos/pull/34");
+        let (command, arguments) = parse_command("/workspace use main").unwrap();
+        assert_eq!(command.action, AppAction::Workspace);
+        assert_eq!(arguments, "use main");
+
+        assert!(parse_command("/load https://github.com/Metta-AI/caos/pull/34").is_none());
 
         let (command, arguments) = parse_command("/publish-branch").unwrap();
         assert_eq!(command.action, AppAction::PublishBranch);
@@ -4923,59 +5302,6 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
-    }
-
-    #[test]
-    fn completed_remote_load_selects_the_imported_conversation() {
-        let (mut app, _) = app_with(vec![state("origin")]);
-        app.selected_mut().loading_remote = true;
-        let head = "b".repeat(40);
-        let base = "a".repeat(40);
-        let published = PublishedConversationSource {
-            id: "shared/talk-1".to_string(),
-            title: Some("PR title".to_string()),
-            head: head.clone(),
-        };
-        let summary = UserConversationSummary {
-            id: published.id.clone(),
-            title: "Shared conversation".to_string(),
-            head: head.clone(),
-            updated_unix: 1,
-            parent: None,
-        };
-        let load = ConversationLoad {
-            snapshot: ConversationSnapshot {
-                id: published.id.clone(),
-                head: head.clone(),
-                title: published.title.clone().unwrap(),
-                status: "idle".to_string(),
-                request: None,
-                request_head: None,
-                interrupted: false,
-                error: None,
-                messages: Vec::new(),
-            },
-            replay: ConversationReplay {
-                turns: Vec::new(),
-                activity: Vec::new(),
-            },
-            workspace_diff: WorkspaceDiff {
-                base_commit: base,
-                head: head.clone(),
-                patch: String::new(),
-            },
-        };
-
-        app.finish_published_load(
-            "origin",
-            "origin/caos/shared/talk-1",
-            Ok((published, summary, Box::new(load))),
-        );
-
-        assert_eq!(app.selected().id, "shared/talk-1");
-        assert_eq!(app.selected().title, "Shared conversation");
-        assert_eq!(app.selected().remote_head.as_deref(), Some(head.as_str()));
-        assert!(!app.conversations[1].loading_remote);
     }
 
     #[test]
@@ -5054,7 +5380,6 @@ mod tests {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.selected_mut().composer.insert_str("/");
 
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -5169,10 +5494,10 @@ mod tests {
     #[test]
     fn command_palette_searches_keywords_and_wraps_selection() {
         let mut palette = CommandPalette {
-            query: "github branch".to_string(),
+            query: "archive remove".to_string(),
             ..CommandPalette::default()
         };
-        assert_eq!(palette.matches()[0].action, AppAction::Publish);
+        assert_eq!(palette.matches()[0].action, AppAction::Archive);
 
         palette.query.clear();
         palette.select(-1);
@@ -6108,7 +6433,7 @@ mod tests {
         assert!(rendered.contains("Enter/^J newline"));
         assert!(rendered.contains("^S send"));
         assert!(rendered.contains("^L checkout"));
-        assert!(rendered.contains("^P×2 publish"));
+        assert!(!rendered.contains("publish"));
         assert!(!rendered.contains("Alt+Enter"));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
@@ -6160,89 +6485,6 @@ mod tests {
         assert!(expanded.contains("ccccccc"));
         assert!(expanded.contains("$ cargo test"));
         assert!(expanded.contains("12 tests passed"));
-
-        app.selected_mut().running = false;
-        app.selected_mut().diff = Some(WorkspaceDiff {
-            base_commit: "a".repeat(40),
-            head: "b".repeat(40),
-            patch: "diff --git a/a b/a".to_string(),
-        });
-        let (publish_repo, publish_remote, _) = repo_with_default_branch("publish-prompt", "trunk");
-        app.repo_dir = publish_repo.clone();
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(
-            app.confirm_action,
-            Some(ConfirmAction::Publish {
-                default_base: "trunk".to_string(),
-                base_input: String::new(),
-            })
-        );
-        assert!(app.selected().status.contains("enter a PR base branch"));
-        assert!(!app.selected().publishing);
-
-        for ch in "release/next".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        assert_eq!(
-            app.confirm_action,
-            Some(ConfirmAction::Publish {
-                default_base: "trunk".to_string(),
-                base_input: "release/next".to_string(),
-            })
-        );
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let publish_prompt = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(publish_prompt.contains("Base branch: release/next"));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.confirm_action.is_none());
-        assert!(!app.selected().publish_prompt);
-        std::fs::remove_dir_all(publish_repo).unwrap();
-        std::fs::remove_dir_all(publish_remote).unwrap();
-    }
-
-    #[test]
-    fn publish_opens_the_base_prompt_for_an_empty_workspace_diff() {
-        let mut conversation = state("talk-1");
-        conversation.diff = Some(WorkspaceDiff {
-            base_commit: "a".repeat(40),
-            head: "b".repeat(40),
-            patch: String::new(),
-        });
-        let (mut app, _) = app_with(vec![conversation]);
-        let (repo, remote, _) = repo_with_default_branch("publish-empty-diff", "main");
-        app.repo_dir = repo.clone();
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-
-        assert_eq!(
-            app.confirm_action,
-            Some(ConfirmAction::Publish {
-                default_base: "main".to_string(),
-                base_input: String::new(),
-            })
-        );
-        assert!(app.selected().command_error.is_none());
-        std::fs::remove_dir_all(repo).unwrap();
-        std::fs::remove_dir_all(remote).unwrap();
-    }
-
-    #[test]
-    fn publish_requires_a_completed_turn() {
-        let (mut app, _) = app_with(vec![state("talk-1")]);
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-
-        assert!(app.confirm_action.is_none());
-        assert_eq!(
-            app.selected().command_error.as_deref(),
-            Some("this conversation has no completed turn to publish")
-        );
     }
 
     #[test]
@@ -6299,18 +6541,23 @@ mod tests {
         git(&["checkout", "--detach", "-q", &base]);
 
         let mut selected = state("talk-1");
-        selected.diff = Some(WorkspaceDiff {
+        selected.workspaces = vec![WorkspaceDiff {
+            name: "main".to_string(),
             base_commit: base,
             head: head.clone(),
             patch: "changed".to_string(),
-        });
+        }];
+        selected.selected_workspace = Some("main".to_string());
         let (mut app, _) = app_with(vec![selected]);
         app.repo_dir = dir.clone();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
 
         assert_eq!(git(&["rev-parse", "HEAD"]), head);
-        assert!(app.selected().status.contains("checked out"));
+        assert_eq!(
+            app.selected().status,
+            format!("checked out main at {} in detached HEAD", short_hash(&head))
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6467,44 +6714,330 @@ mod tests {
     }
 
     #[test]
-    fn publish_errors_use_the_command_panel_without_changing_the_transcript() {
+    fn active_turn_accepts_an_interjection() {
+        let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         let mut conversation = state("talk-1");
-        conversation.status = "completed abc1234".to_string();
-        conversation.publishing = true;
-        conversation.scroll.offset = Some(12);
+        conversation.workspaces = load.workspaces;
+        conversation.selected_workspace = Some("main".to_string());
+        conversation.running = true;
+        conversation.local_turn = true;
+        conversation.remote_head = Some(head);
+        conversation.active_request = Some(request);
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        conversation.activities.push(activity(1));
+        conversation.activity_selection = Some(0);
+        conversation.composer.insert_str("another prompt");
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.selected().transcript.len(), 1);
+        assert_eq!(app.selected().transcript[0].role, EntryRole::Human);
+        assert_eq!(app.selected().transcript[0].text, "another prompt");
+        assert_eq!(app.selected().pending_submissions.len(), 1);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert_eq!(app.selected().activities, vec![activity(1)]);
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
+        assert!(app.selected().command_error.is_none());
+
+        wait_for_pending_submission(&mut app, 0);
+        assert_eq!(app.selected().status, "running a tool");
+        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
+        assert!(app.selected().activities.is_empty());
+        assert!(app.selected().running);
+        assert!(app.selected().local_turn);
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(
+            app.selected()
+                .transcript
+                .iter()
+                .filter(|entry| entry.text == "another prompt")
+                .count(),
+            1
+        );
+        assert!(app
+            .selected()
+            .transcript
+            .iter()
+            .find(|entry| entry.text == "another prompt")
+            .unwrap()
+            .commit
+            .is_some());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn pending_interjection_survives_a_stale_reload_until_its_commit_is_visible() {
+        let (repo, remote, _) = repo_with_default_branch("pending-interjection", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
+        // Admission has already advanced the head past the message's own commit.
+        let durable_commit = transport
+            .git_capture(&["rev-parse", &format!("{head}^")], None)
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("another prompt".to_string());
+
+        conversation.apply_load(load.clone(), "Alice");
+        assert_eq!(conversation.pending_submissions.len(), 1);
+        assert_eq!(
+            conversation.transcript.last().unwrap().text,
+            "another prompt"
+        );
+        assert_eq!(
+            conversation.transcript.last().unwrap().pending_id,
+            Some(pending_id)
+        );
+
+        conversation.mark_pending_submission(pending_id, durable_commit);
+        conversation.apply_load(load, "Alice");
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
+        let head = "a".repeat(40);
+        let request = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.running = true;
+        conversation.local_turn = true;
+        conversation.status = "running a tool".to_string();
+        conversation.turn_phase = TurnPhase::Model;
+        assert!(conversation.active_request.is_none());
+
+        conversation.apply_load(
+            ConversationLoad {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: head.clone(),
+                    title: "talk-1".to_string(),
+                    status: RequestStatus::Queued,
+                    request: Some(request.clone()),
+                    interrupted: false,
+                    error: None,
+                },
+                replay: ConversationReplay {
+                    turns: vec![caos_cli::ConversationTurn {
+                        commit: "e".repeat(40),
+                        author: "assistant".to_string(),
+                        role: ConversationRole::Agent,
+                        model: Some("test-model".to_string()),
+                        message: String::new(),
+                    }],
+                    activity: vec![TurnEvent::ToolCall {
+                        step_commit: "e".repeat(40),
+                        request: request.clone(),
+                        round: 2,
+                        tool_use_id: "sleep".to_string(),
+                        name: "bash".to_string(),
+                        summary: "$ sleep 120; echo done".to_string(),
+                    }],
+                },
+                workspaces: vec![WorkspaceDiff {
+                    name: "main".to_string(),
+                    base_commit: "d".repeat(40),
+                    head: head.clone(),
+                    patch: String::new(),
+                }],
+                publications: Vec::new(),
+            },
+            "tester",
+        );
+
+        assert_eq!(conversation.status, "running a tool");
+        assert_eq!(conversation.turn_phase, TurnPhase::Model);
+        assert_eq!(conversation.activities.len(), 1);
+        assert!(
+            conversation.transcript.is_empty(),
+            "tool-only replies have no text row"
+        );
+        assert_eq!(conversation.activities[0].id, "sleep");
+        assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
+        assert_eq!(conversation.activity_selection, Some(0));
+        assert_eq!(
+            conversation.active_request.as_deref(),
+            Some(request.as_str())
+        );
+        assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
+    }
+
+    #[test]
+    fn learning_a_commit_retires_an_already_visible_optimistic_row() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("hello".to_string());
+        let commit = "a".repeat(40);
+        conversation.transcript.insert(
+            0,
+            TranscriptEntry {
+                role: EntryRole::Human,
+                commit: Some(commit.clone()),
+                text: "hello".to_string(),
+                pending_id: None,
+            },
+        );
+
+        conversation.mark_pending_submission(pending_id, commit);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert_eq!(conversation.transcript.len(), 1);
+        assert!(conversation.transcript[0].pending_id.is_none());
+    }
+
+    #[test]
+    fn first_committed_submission_materializes_virtual_state() {
+        let mut conversation = ConversationState::new_virtual(
+            "new-talk".to_string(),
+            "talk-1".to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let pending_id = conversation.queue_pending_submission("hello".to_string());
         let (mut app, tx) = app_with(vec![conversation]);
 
-        tx.send(UiMessage::Published {
-            conversation: "talk-1".to_string(),
-            result: Err("gh could not open the PR".to_string()),
+        tx.send(UiMessage::SubmissionCommitted {
+            conversation: "new-talk".to_string(),
+            pending_id,
+            commit: "a".repeat(40),
         })
         .unwrap();
+
         assert!(app.drain_messages());
+        assert!(!app.selected().virtual_conversation);
+    }
 
-        let state = app.selected();
-        assert!(!state.publishing);
-        assert!(state.status.is_empty());
-        assert_eq!(state.scroll.offset, Some(12));
+    #[test]
+    fn failed_submission_restores_text_without_replacing_a_newer_draft() {
+        let mut conversation = state("talk-1");
+        let pending_id = conversation.queue_pending_submission("failed message".to_string());
+        conversation.composer.insert_str("newer draft");
+
+        conversation.restore_pending_submission(pending_id);
+
+        assert!(conversation.pending_submissions.is_empty());
+        assert!(conversation.transcript.is_empty());
+        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+
+        let committed_id = conversation.queue_pending_submission("already saved".to_string());
+        conversation.mark_pending_submission(committed_id, "a".repeat(40));
+        conversation.restore_pending_submission(committed_id);
+        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
+        assert_eq!(conversation.pending_submissions.len(), 1);
+    }
+
+    #[test]
+    fn stale_interjection_refresh_cannot_roll_back_a_newer_head() {
+        let old_head = "a".repeat(40);
+        let new_head = "b".repeat(40);
+        let mut conversation = state("talk-1");
+        conversation.remote_head = Some(new_head.clone());
+        conversation.status = "completed bbbbbbbb".to_string();
+        let (mut app, tx) = app_with(vec![conversation]);
+        tx.send(UiMessage::InterjectionRefreshed {
+            conversation: "talk-1".to_string(),
+            observed_head: Some(old_head.clone()),
+            load: Ok(Box::new(ConversationLoad {
+                snapshot: ConversationSnapshot {
+                    id: "talk-1".to_string(),
+                    head: old_head.clone(),
+                    title: "talk-1".to_string(),
+                    status: RequestStatus::Queued,
+                    request: Some("c".repeat(40)),
+                    interrupted: false,
+                    error: None,
+                },
+                replay: ConversationReplay {
+                    turns: Vec::new(),
+                    activity: Vec::new(),
+                },
+                workspaces: vec![WorkspaceDiff {
+                    name: "main".to_string(),
+                    base_commit: "e".repeat(40),
+                    head: old_head,
+                    patch: String::new(),
+                }],
+                publications: Vec::new(),
+            })),
+        })
+        .unwrap();
+
+        assert!(app.drain_messages());
         assert_eq!(
-            state.command_error.as_deref(),
-            Some("PR failed: gh could not open the PR")
+            app.selected().remote_head.as_deref(),
+            Some(new_head.as_str())
         );
-        assert!(state.transcript.is_empty());
+        assert_eq!(app.selected().status, "completed bbbbbbbb");
+        assert!(!app.selected().running);
+    }
 
+    #[test]
+    fn stale_remote_poll_result_does_not_overwrite_newer_local_state() {
+        let mut conversation = state("local title");
+        conversation.id = "shared".to_string();
+        conversation.remote_head = Some("b".repeat(40));
+        let (mut app, _) = app_with(vec![conversation]);
+
+        assert!(!app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "shared".to_string(),
+                title: "stale title".to_string(),
+                head: "a".repeat(40),
+                updated_unix: 1,
+                parent: None,
+            },
+            observed_head: Some("a".repeat(40)),
+            observed_title: Some("old local title".to_string()),
+            load: None,
+        }]));
+
+        assert_eq!(app.selected().title, "local title");
+        assert_eq!(
+            app.selected().remote_head.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn publishing_gate_keeps_the_draft_and_shows_the_command_error_panel() {
+        let mut conversation = state("talk-1");
+        conversation.publishing = true;
+        conversation.status = "publishing".to_string();
+        conversation.composer.insert_str("do not send yet");
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert!(app.selected().publishing);
+        assert_eq!(app.selected().composer.text, "do not send yet");
+        assert!(app.selected().transcript.is_empty());
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("finish publishing before sending another message")
+        );
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
-        let rows: Vec<String> = terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect();
-        assert!(!rows[0].contains("PR failed"));
-        let rendered = rows.join("\n");
-        assert!(rendered.contains("PR failed: gh could not open the PR"));
-        assert!(!rendered.contains("Status"));
+        assert!(rendered_main_pane(&terminal)
+            .join("\n")
+            .contains("finish publishing before sending another message"));
     }
 
     fn rendered_screen(app: &App) -> String {
@@ -6519,6 +7052,82 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn publish_base_prompt_preserves_the_draft_and_recovers_from_a_bad_base() {
+        let (repo, remote, tip) = repo_with_default_branch("pr-prompt", "release/next");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let mut conversation = state("talk-1");
+        conversation.workspaces = vec![WorkspaceDiff {
+            name: "docs".to_string(),
+            base_commit: tip.clone(),
+            head: tip,
+            patch: String::new(),
+        }];
+        conversation.selected_workspace = Some("docs".to_string());
+        conversation.composer.insert_str("preserve this draft");
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+        let publish = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(publish);
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().default_base,
+            "release/next"
+        );
+        assert!(rendered_screen(&app).contains("origin/release/next (default)"));
+        app.insert_paste(
+            "origin/another
+",
+        );
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().input,
+            "origin/another"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().publish_base.as_ref().unwrap().input,
+            "origin/anothe"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().publish_base.is_none());
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        app.handle_key(publish);
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(app.palette.is_some());
+        assert!(app.selected().publish_base.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(publish);
+        app.insert_paste("origin/missing");
+        app.handle_key(publish);
+        assert!(app.selected().publishing);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.selected().publishing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_messages();
+        }
+        assert!(!app.selected().publishing);
+        assert!(!app.selected().running);
+        assert!(app.selected().publish_base.is_none());
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("no branch"));
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        assert!(app.selected().transcript.is_empty());
+        let prompt = publish_turn_message("docs", &"a".repeat(40), false);
+        assert!(prompt.contains("\"workspace\":\"docs\""));
+        assert!(prompt.contains(".caos/conflicts"));
+        assert!(
+            publish_turn_message("docs", &"a".repeat(40), true).contains("do not merge it again")
+        );
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -6594,308 +7203,6 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_accepts_an_interjection() {
-        let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
-        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
-        let mut conversation = state("talk-1");
-        conversation.running = true;
-        conversation.local_turn = true;
-        conversation.remote_head = Some(head);
-        conversation.active_request = Some(request);
-        conversation.status = "running a tool".to_string();
-        conversation.turn_phase = TurnPhase::Model;
-        conversation.activities.push(activity(1));
-        conversation.activity_selection = Some(0);
-        conversation.composer.insert_str("another prompt");
-        let (mut app, _) = app_with(vec![conversation]);
-        app.repo_dir = repo.clone();
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-
-        assert_eq!(app.selected().transcript.len(), 1);
-        assert_eq!(app.selected().transcript[0].role, EntryRole::Human);
-        assert_eq!(app.selected().transcript[0].text, "another prompt");
-        assert_eq!(app.selected().pending_submissions.len(), 1);
-        assert_eq!(app.selected().status, "running a tool");
-        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
-        assert_eq!(app.selected().activities, vec![activity(1)]);
-        assert!(app.selected().running);
-        assert!(app.selected().local_turn);
-        assert!(app.selected().command_error.is_none());
-
-        wait_for_pending_submission(&mut app, 0);
-        assert_eq!(app.selected().status, "running a tool");
-        assert_eq!(app.selected().turn_phase, TurnPhase::Model);
-        assert!(app.selected().activities.is_empty());
-        assert!(app.selected().running);
-        assert!(app.selected().local_turn);
-        assert!(app.selected().command_error.is_none());
-        assert_eq!(
-            app.selected()
-                .transcript
-                .iter()
-                .filter(|entry| entry.text == "another prompt")
-                .count(),
-            1
-        );
-        assert!(app
-            .selected()
-            .transcript
-            .iter()
-            .find(|entry| entry.text == "another prompt")
-            .unwrap()
-            .commit
-            .is_some());
-
-        std::fs::remove_dir_all(&repo).unwrap();
-        std::fs::remove_dir_all(&remote).unwrap();
-    }
-
-    #[test]
-    fn pending_interjection_survives_a_stale_reload_until_its_commit_is_visible() {
-        let (repo, remote, _) = repo_with_default_branch("pending-interjection", "main");
-        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
-        let transport = GitTransport::discover(&repo).unwrap();
-        let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
-        let durable_commit = load.replay.turns[0].commit.clone();
-        let mut conversation = state("talk-1");
-        let pending_id = conversation.queue_pending_submission("another prompt".to_string());
-
-        conversation.apply_load(load.clone(), "Alice");
-        assert_eq!(conversation.pending_submissions.len(), 1);
-        assert_eq!(
-            conversation.transcript.last().unwrap().text,
-            "another prompt"
-        );
-        assert_eq!(
-            conversation.transcript.last().unwrap().pending_id,
-            Some(pending_id)
-        );
-
-        conversation.mark_pending_submission(pending_id, durable_commit);
-        conversation.apply_load(load, "Alice");
-        assert!(conversation.pending_submissions.is_empty());
-        assert_eq!(conversation.transcript.len(), 1);
-        assert!(conversation.transcript[0].pending_id.is_none());
-
-        std::fs::remove_dir_all(&repo).unwrap();
-        std::fs::remove_dir_all(&remote).unwrap();
-    }
-
-    #[test]
-    fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
-        let head = "a".repeat(40);
-        let request = "b".repeat(40);
-        let mut conversation = state("talk-1");
-        conversation.running = true;
-        conversation.local_turn = true;
-        conversation.status = "running a tool".to_string();
-        conversation.turn_phase = TurnPhase::Model;
-        assert!(conversation.active_request.is_none());
-
-        conversation.apply_load(
-            ConversationLoad {
-                snapshot: ConversationSnapshot {
-                    id: "talk-1".to_string(),
-                    head: head.clone(),
-                    title: "talk-1".to_string(),
-                    status: "queued".to_string(),
-                    request: Some(request.clone()),
-                    request_head: Some("c".repeat(40)),
-                    interrupted: false,
-                    error: None,
-                    messages: Vec::new(),
-                },
-                replay: ConversationReplay {
-                    turns: Vec::new(),
-                    activity: vec![TurnEvent::ToolCall {
-                        step_commit: "e".repeat(40),
-                        request: request.clone(),
-                        round: 2,
-                        tool_use_id: "sleep".to_string(),
-                        name: "bash".to_string(),
-                        summary: "$ sleep 120; echo done".to_string(),
-                    }],
-                },
-                workspace_diff: WorkspaceDiff {
-                    base_commit: "d".repeat(40),
-                    head: head.clone(),
-                    patch: String::new(),
-                },
-            },
-            "tester",
-        );
-
-        assert_eq!(conversation.status, "running a tool");
-        assert_eq!(conversation.turn_phase, TurnPhase::Model);
-        assert_eq!(conversation.activities.len(), 1);
-        assert_eq!(conversation.activities[0].id, "sleep");
-        assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
-        assert_eq!(conversation.activity_selection, Some(0));
-        assert_eq!(
-            conversation.active_request.as_deref(),
-            Some(request.as_str())
-        );
-        assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
-    }
-
-    #[test]
-    fn learning_a_commit_retires_an_already_visible_optimistic_row() {
-        let mut conversation = state("talk-1");
-        let pending_id = conversation.queue_pending_submission("hello".to_string());
-        let commit = "a".repeat(40);
-        conversation.transcript.insert(
-            0,
-            TranscriptEntry {
-                role: EntryRole::Human,
-                commit: Some(commit.clone()),
-                text: "hello".to_string(),
-                pending_id: None,
-            },
-        );
-
-        conversation.mark_pending_submission(pending_id, commit);
-
-        assert!(conversation.pending_submissions.is_empty());
-        assert_eq!(conversation.transcript.len(), 1);
-        assert!(conversation.transcript[0].pending_id.is_none());
-    }
-
-    #[test]
-    fn first_committed_submission_materializes_virtual_state() {
-        let mut conversation = ConversationState::new_virtual(
-            "new-talk".to_string(),
-            "talk-1".to_string(),
-            TurnOptions::default(),
-            "ready".to_string(),
-        );
-        let pending_id = conversation.queue_pending_submission("hello".to_string());
-        let (mut app, tx) = app_with(vec![conversation]);
-
-        tx.send(UiMessage::SubmissionCommitted {
-            conversation: "new-talk".to_string(),
-            pending_id,
-            commit: "a".repeat(40),
-        })
-        .unwrap();
-
-        assert!(app.drain_messages());
-        assert!(!app.selected().virtual_conversation);
-    }
-
-    #[test]
-    fn failed_submission_restores_text_without_replacing_a_newer_draft() {
-        let mut conversation = state("talk-1");
-        let pending_id = conversation.queue_pending_submission("failed message".to_string());
-        conversation.composer.insert_str("newer draft");
-
-        conversation.restore_pending_submission(pending_id);
-
-        assert!(conversation.pending_submissions.is_empty());
-        assert!(conversation.transcript.is_empty());
-        assert_eq!(conversation.composer.text, "newer draft\n\nfailed message");
-    }
-
-    #[test]
-    fn stale_interjection_refresh_cannot_roll_back_a_newer_head() {
-        let old_head = "a".repeat(40);
-        let new_head = "b".repeat(40);
-        let mut conversation = state("talk-1");
-        conversation.remote_head = Some(new_head.clone());
-        conversation.status = "completed bbbbbbbb".to_string();
-        let (mut app, tx) = app_with(vec![conversation]);
-        tx.send(UiMessage::InterjectionRefreshed {
-            conversation: "talk-1".to_string(),
-            observed_head: Some(old_head.clone()),
-            load: Ok(Box::new(ConversationLoad {
-                snapshot: ConversationSnapshot {
-                    id: "talk-1".to_string(),
-                    head: old_head.clone(),
-                    title: "talk-1".to_string(),
-                    status: "queued".to_string(),
-                    request: Some("c".repeat(40)),
-                    request_head: Some("d".repeat(40)),
-                    interrupted: false,
-                    error: None,
-                    messages: Vec::new(),
-                },
-                replay: ConversationReplay {
-                    turns: Vec::new(),
-                    activity: Vec::new(),
-                },
-                workspace_diff: WorkspaceDiff {
-                    base_commit: "e".repeat(40),
-                    head: old_head,
-                    patch: String::new(),
-                },
-            })),
-        })
-        .unwrap();
-
-        assert!(app.drain_messages());
-        assert_eq!(
-            app.selected().remote_head.as_deref(),
-            Some(new_head.as_str())
-        );
-        assert_eq!(app.selected().status, "completed bbbbbbbb");
-        assert!(!app.selected().running);
-    }
-
-    #[test]
-    fn stale_remote_poll_result_does_not_overwrite_newer_local_state() {
-        let mut conversation = state("local title");
-        conversation.id = "shared".to_string();
-        conversation.remote_head = Some("b".repeat(40));
-        let (mut app, _) = app_with(vec![conversation]);
-
-        assert!(!app.apply_remote_poll(vec![RemotePollEntry {
-            summary: UserConversationSummary {
-                id: "shared".to_string(),
-                title: "stale title".to_string(),
-                head: "a".repeat(40),
-                updated_unix: 1,
-                parent: None,
-            },
-            observed_head: Some("a".repeat(40)),
-            observed_title: Some("old local title".to_string()),
-            load: None,
-        }]));
-
-        assert_eq!(app.selected().title, "local title");
-        assert_eq!(
-            app.selected().remote_head.as_deref(),
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        );
-    }
-
-    #[test]
-    fn publishing_gate_keeps_the_draft_and_shows_the_command_error_panel() {
-        let mut conversation = state("talk-1");
-        conversation.publishing = true;
-        conversation.status = "publishing".to_string();
-        conversation.composer.insert_str("do not send yet");
-        let (mut app, _) = app_with(vec![conversation]);
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-
-        assert!(app.selected().publishing);
-        assert_eq!(app.selected().composer.text, "do not send yet");
-        assert!(app.selected().transcript.is_empty());
-        assert_eq!(
-            app.selected().command_error.as_deref(),
-            Some("finish publishing before sending another message")
-        );
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        assert!(rendered_main_pane(&terminal)
-            .join("\n")
-            .contains("finish publishing before sending another message"));
-    }
-
-    #[test]
     fn routine_idle_status_is_not_rendered() {
         let mut conversation = state("talk-1");
         conversation.status = "ready".to_string();
@@ -6908,34 +7215,6 @@ mod tests {
         let rendered = rendered_main_pane(&terminal).join("\n");
         assert!(!rendered.contains("Status"));
         assert!(!rendered.contains("ready"));
-    }
-
-    #[test]
-    fn successful_publish_adds_a_caos_transcript_entry() {
-        let mut conversation = state("talk-1");
-        conversation.publishing = true;
-        conversation.status = "publishing".to_string();
-        let (mut app, tx) = app_with(vec![conversation]);
-
-        tx.send(UiMessage::Published {
-            conversation: "talk-1".to_string(),
-            result: Ok("https://github.com/Metta-AI/caos/pull/54".to_string()),
-        })
-        .unwrap();
-        assert!(app.drain_messages());
-
-        let state = app.selected();
-        assert!(!state.publishing);
-        assert!(state.status.is_empty());
-        assert_eq!(state.transcript.last().unwrap().role, EntryRole::Info);
-
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let rendered = rendered_main_pane(&terminal).join("\n");
-        assert!(rendered.contains("CAOS"));
-        assert!(rendered.contains("PR ready: https://github.com/Metta-AI/caos/pull/54"));
-        assert!(!rendered.contains("Status"));
     }
 
     // Archiving has no key binding; it runs through the command palette.
@@ -7167,7 +7446,7 @@ mod tests {
         conversation.scroll.scroll_up(5);
         let transport = GitTransport::discover(&dir).unwrap();
         let _ = conversation.reload(&transport, "alice");
-        assert!(conversation.diff.is_none());
+        assert!(conversation.workspaces.is_empty());
         assert!(conversation.status.is_empty());
         let error = conversation.transcript.last().unwrap();
         assert_eq!(error.role, EntryRole::Notice);
@@ -7246,11 +7525,11 @@ mod tests {
         let id = "_shared_name_";
         let head = seed_idle_conversation(&repo, id, "Alice", "hello");
 
-        let (mut app, _) = app_with(vec![state(id)]);
+        let mut conversation = state(id);
+        conversation.remote_head = Some(head.clone());
+        let (mut app, _) = app_with(vec![conversation]);
         app.repo_dir = repo.clone();
         app.show_selected_ref();
-        assert!(app.selected().reference_loading);
-        wait_for_reference_lookup(&mut app);
 
         let refname = conversation_ref(id).unwrap();
         assert!(app.selected().transcript.is_empty());
@@ -7328,7 +7607,7 @@ mod tests {
 
         let mut advanced = load;
         advanced.snapshot.head = "b".repeat(40);
-        advanced.workspace_diff.head = advanced.snapshot.head.clone();
+        advanced.workspaces[0].head = advanced.snapshot.head.clone();
         app.selected_mut().apply_load(advanced, "Alice");
         assert!(app.selected().reference_notice.is_none());
 
@@ -7400,7 +7679,6 @@ mod tests {
 
         app.finish_fork(
             "forked",
-            "closed-origin",
             &"a".repeat(40),
             Err("remote rejected the fork".to_string()),
         );
@@ -7438,7 +7716,6 @@ mod tests {
 
         app.finish_fork(
             "forked",
-            "origin",
             &"a".repeat(40),
             Err("remote rejected the fork".to_string()),
         );
@@ -7462,6 +7739,12 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let transport = GitTransport::discover(&repo).unwrap();
         let source = seed_idle_conversation(&repo, "original", "Alice", "inherited message");
+        let source_base = conversation_load(&transport, "original")
+            .unwrap()
+            .unwrap()
+            .workspaces[0]
+            .base_commit
+            .clone();
 
         let (mut app, _) = app_with(vec![state("original")]);
         app.repo_dir = repo.clone();
@@ -7476,8 +7759,8 @@ mod tests {
         assert!(wait_for_fork(&mut app, &fork_id));
         assert_eq!(app.selected().transcript[0].text, "inherited message");
         assert!(conversation_head(&transport, &fork_id).unwrap().is_some());
-        assert_eq!(app.selected().diff.as_ref().unwrap().base_commit, source);
-        assert!(app.selected().diff.as_ref().unwrap().patch.is_empty());
+        assert_eq!(app.selected().workspaces[0].base_commit, source_base);
+        assert!(app.selected().workspaces[0].patch.is_empty());
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
@@ -7578,7 +7861,7 @@ mod tests {
             .command_error
             .as_deref()
             .unwrap()
-            .contains("not a JSON event"));
+            .contains("exactly one parent required"));
         assert!(conversation_head(&transport, &pending_id)
             .unwrap()
             .is_none());
@@ -7607,7 +7890,7 @@ mod tests {
     fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
-            source: "refs/caos/v2/conversations/talk-1/head:caos-tools".to_string(),
+            source: "main:caos-tools".to_string(),
             tools: vec![caos_cli::ToolDescription {
                 name: "build".to_string(),
                 docs: "Build everything the tree defines.".to_string(),
@@ -7637,7 +7920,7 @@ mod tests {
             .collect();
         assert!(rendered.contains("Always available"));
         assert!(rendered.contains("read, ls, write, edit"));
-        assert!(rendered.contains("talk-1/head:caos-tools"));
+        assert!(rendered.contains("main:caos-tools"));
         assert!(rendered.contains("build"));
         assert!(rendered.contains("Build everything the tree defines."));
         assert!(rendered.contains("[docker://caos-std-bash]"));

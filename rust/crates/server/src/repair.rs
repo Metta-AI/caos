@@ -88,7 +88,7 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
         let Some(reason) = breakage(repo, &path, depth, &mut memo) else {
             continue;
         };
-        if recover_ref(repo, git_dir, &name, &path, depth, &mut memo) {
+        if reflog_recoverable(&name) && recover_ref(repo, git_dir, &name, &path, depth, &mut memo) {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -154,12 +154,25 @@ enum IntegrityDepth {
     WorkspaceClosure,
 }
 
+const V3_PREFIX: &str = "refs/caos/v3/";
+
 fn integrity_depth(refname: &str) -> IntegrityDepth {
-    if refname.starts_with("refs/caos/req/") || refname.starts_with("refs/caos/res/") {
+    if refname.starts_with("refs/caos/req/")
+        || refname.starts_with("refs/caos/res/")
+        || refname.starts_with(V3_PREFIX)
+    {
         IntegrityDepth::TargetOnly
     } else {
         IntegrityDepth::WorkspaceClosure
     }
+}
+
+// A v3 conversation head is never rewound: an older reflog value can name a
+// state whose write-ahead effects (a landed publication push, half of an atomic
+// spawn) already happened. The loose ref is dropped and the reflog kept for a
+// human to restore from.
+fn reflog_recoverable(refname: &str) -> bool {
+    !refname.starts_with(V3_PREFIX)
 }
 
 #[derive(Default)]
@@ -670,6 +683,62 @@ mod tests {
             std::fs::read_to_string(head).unwrap(),
             format!("{intact}\n")
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_head_over_a_damaged_transcript_blob_is_left_alone() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let blob = git_stdin(&dir, &["hash-object", "-w", "--stdin"], b"lost entry");
+        let tree = git_stdin(
+            &dir,
+            &["mktree"],
+            format!("100644 blob {blob}\tentry.json\n").as_bytes(),
+        );
+        let head_commit = git_stdin(&dir, &["commit-tree", &tree, "-m", "message.append"], b"");
+        let head = plant_ref(
+            &dir,
+            "refs/caos/v3/conversations/74616c6b/head",
+            &format!("{head_commit}\n"),
+        );
+        let membership = plant_ref(
+            &dir,
+            "refs/caos/v3/users/616c696365/conversations/active/74616c6b",
+            &format!("{head_commit}\n"),
+        );
+        let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
+        std::fs::remove_file(blob_path).unwrap();
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 0);
+        assert!(head.exists());
+        assert!(membership.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_head_with_an_unreadable_target_is_dropped_never_rewound() {
+        let (repo, dir) = temp_repo();
+        let git_dir = dir.to_string_lossy().into_owned();
+        let intact = empty_commit(&dir, "conversation.root");
+        let missing = "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a";
+        let name = "refs/caos/v3/conversations/74616c6b/head";
+        let head = plant_ref(&dir, name, &format!("{missing}\n"));
+        let reflog = plant_ref(
+            &dir,
+            &format!("logs/{name}"),
+            &format!(
+                "0000000000000000000000000000000000000000 {intact} caos <caos@caos> 0 +0000\tcreated\n\
+                 {intact} {missing} caos <caos@caos> 1 +0000\tcrashed append\n"
+            ),
+        );
+        let reflog_bytes = std::fs::read(&reflog).unwrap();
+
+        assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
+        assert!(!head.exists());
+        assert_eq!(std::fs::read(&reflog).unwrap(), reflog_bytes);
 
         std::fs::remove_dir_all(&dir).ok();
     }

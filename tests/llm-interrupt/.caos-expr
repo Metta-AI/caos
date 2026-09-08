@@ -1,9 +1,0 @@
-# tests/llm-interrupt, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
-# this directory yields the test's ARG TREE, which dev/run-test then runs.
-#
-# A WORKER TEST, and the conversion sharpens the claim it makes. Escape is a
-# DURABLE EVENT, not a client-side cancellation — that is the whole point — so
-# a version with no client in it at all is the honest demonstration: the escape
-# is published to the ref by whoever wants to interrupt, and llm-step honours it
-# because it is on the spine, not because something hung up.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh

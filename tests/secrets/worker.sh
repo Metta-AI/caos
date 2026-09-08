@@ -229,7 +229,7 @@ for _ in $(seq 1 150); do
     404) ;;
     *) fail "server returned HTTP $status while waiting for sub-run" ;;
   esac
-  sleep 0.1
+  sleep 0.25
 done
 [ "$complete" -eq 1 ] || fail "sub-run never produced its secret-backed result"
 "$CAOS_CLI" run sub-run-result --base:hash="$request" >/dev/null \

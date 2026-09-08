@@ -15,10 +15,11 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::{json, Value};
 use worker_common::{caos, entries, file_name, link, path, scratch};
+
+use crate::{fresh, fresh_name, result_block};
 
 /// The reserved workspace entry (step transcripts); refused in tool paths.
 const STEP_DIR: &str = ".caos";
@@ -65,16 +66,19 @@ const GREP_HELP: &str = "Search the workspace with a regular expression (Rust re
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
-/// tool takes. `git` is always false: a built-in that needs history context
-/// (log/show/diff) lives in `githist.rs` and asks for it there.
-fn builtin_declaration(name: &str, help: &str) -> Value {
-    let (doc, args, _git) = parse_help(&format!("built-in {name}"), help);
-    tree_tool_declaration(&TreeTool {
+/// tool takes. History tools in `githist.rs` use the same builder with `@git`.
+pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
+    let (doc, args, git) = parse_help(&format!("built-in {name}"), help);
+    TreeTool {
         name: name.to_string(),
         doc,
         args,
-        git: false,
-    })
+        git,
+    }
+}
+
+fn builtin_declaration(name: &str, help: &str) -> Value {
+    tree_tool_declaration(&builtin_tool(name, help))
 }
 
 /// The inline tools' registry entries, alongside `bash`'s.
@@ -119,6 +123,8 @@ const RESERVED_TOOLS: &[&str] = &[
     "caos-test",
     "caos-test-result",
     "spawn_agent",
+    "wait_agent",
+    "harvest_agent",
     "run_async",
 ];
 
@@ -440,7 +446,7 @@ pub fn tree_tool(ws: &str, name: &str) -> Result<Option<TreeTool>, String> {
 /// error — the same contract `grep_precheck` uses.
 pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>, Value> {
     let id = call["id"].as_str().unwrap_or("");
-    let fail = |msg: String| Err(block(id, &msg, true));
+    let fail = |msg: String| Err(result_block(id, &msg, true));
     let empty = serde_json::Map::new();
     let input = call["input"].as_object().unwrap_or(&empty);
     for key in input.keys() {
@@ -513,7 +519,7 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
         }
         text = format!("[... truncated ...]\n{}", &text[cut..]);
     }
-    Ok(block(id, text.trim_end(), is_err))
+    Ok(result_block(id, text.trim_end(), is_err))
 }
 
 /// Validate a grep call before its sub-run launches: the pattern must compile
@@ -522,7 +528,7 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
 /// ready-made `is_error` tool_result.
 pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> {
     let id = call["id"].as_str().unwrap_or("");
-    let fail = |msg: String| Err(block(id, &msg, true));
+    let fail = |msg: String| Err(result_block(id, &msg, true));
     let Some(pattern) = call["input"]["pattern"].as_str() else {
         return fail("grep needs a string `pattern`".to_string());
     };
@@ -555,10 +561,10 @@ pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, S
     if p.is_file() {
         let text = fs::read_to_string(p).map_err(|e| format!("reading {result}: {e}"))?;
         if text.is_empty() {
-            return Ok(block(id, "no matches", false));
+            return Ok(result_block(id, "no matches", false));
         }
         let rendered: String = text.lines().map(|l| format!("{scope}:{l}\n")).collect();
-        return Ok(block(id, rendered.trim_end(), false));
+        return Ok(result_block(id, rendered.trim_end(), false));
     }
 
     let mut render = GrepRender {
@@ -572,7 +578,7 @@ pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, S
     };
     render.walk(p, &prefix)?;
     if render.out.is_empty() && render.overflow_files == 0 {
-        return Ok(block(id, "no matches", false));
+        return Ok(result_block(id, "no matches", false));
     }
     let mut text = render.out;
     if render.overflow_files > 0 {
@@ -582,7 +588,7 @@ pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, S
             render.overflow_files
         );
     }
-    Ok(block(id, text.trim_end(), false))
+    Ok(result_block(id, text.trim_end(), false))
 }
 
 struct GrepRender {
@@ -646,22 +652,10 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
-        Ok((text, new_ws)) => Ok((block(id, &text, false), new_ws)),
-        Err(User(msg)) => Ok((block(id, &msg, true), None)),
+        Ok((text, new_ws)) => Ok((result_block(id, &text, false), new_ws)),
+        Err(User(msg)) => Ok((result_block(id, &msg, true), None)),
         Err(Infra(e)) => Err(e),
     }
-}
-
-fn block(id: &str, text: &str, is_error: bool) -> Value {
-    let mut b = json!({
-        "type": "tool_result",
-        "tool_use_id": id,
-        "content": [{"type": "text", "text": text}],
-    });
-    if is_error {
-        b["is_error"] = Value::Bool(true);
-    }
-    b
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +981,7 @@ fn materialize(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 /// links by recorded hash — nothing else materializes) and the target
 /// component is descended into or written. Returns the new workspace CAS path.
 fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
-    let dir = scratch(&format!("inline-{}", counter())).map_err(Fail::from_infra)?;
+    let dir = scratch(&fresh_name("inline")).map_err(Fail::from_infra)?;
     build_level(Some(Path::new(ws)), &dir, comps, content, mode)?;
     let out = fresh("ws-inline");
     caos(["put", path(&dir), &out]).map_err(Fail::from_infra)?;
@@ -1035,16 +1029,6 @@ fn build_level(
         _ => None,
     };
     build_level(src_sub.as_deref(), &target, &comps[1..], content, mode)
-}
-
-/// Fresh single-assignment CAS paths, distinct from `main.rs`'s prefixes.
-fn fresh(prefix: &str) -> String {
-    format!("/cas/{prefix}-{}", counter())
-}
-
-fn counter() -> u32 {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1114,6 +1098,7 @@ mod tests {
         // A `$VAR` naming no here-string is not help either.
         assert_eq!(expr_help("curry --base:@=x --help=$NOPE\n"), None);
     }
+    #[test]
     fn oid_shape() {
         assert!(valid_oid(&"a".repeat(40))); // sha1
         assert!(valid_oid(&"0".repeat(64))); // sha256
