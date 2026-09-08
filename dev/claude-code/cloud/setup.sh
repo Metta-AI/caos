@@ -151,10 +151,11 @@ for home in /root /home/claude /home/user; do
     # A denied name is removed from the model's context entirely, which is what
     # makes the caos tools the only tools and keeps work on the record.
     #
-    # Bash is NOT denied while this is being brought up. It is a real hole:
-    # with the built-in and mcp__caos__bash both in context the model often
-    # reaches for the built-in, and that work is absent from the conversation
-    # caos records. Put it back once the container is known to work.
+    # Bash is denied again. It was let through while the container was being
+    # brought up, and leaving it would not merely be untidy: with the built-in
+    # and mcp__caos__bash both in context the model reaches for the built-in,
+    # so the caos tool never runs, nothing it did is in the conversation, and
+    # any test of the caos tools measures the wrong tool.
     #
     # The hooks are the recording. `caos cc hook` reads the event as JSON on
     # stdin and names its own event, so one command serves all of them.
@@ -166,7 +167,7 @@ for home in /root /home/claude /home/user; do
     cat > "$home/.claude/settings.json" <<EOF
 {
   "permissions": {
-    "deny": ["Read", "Write", "Edit", "NotebookEdit", "Glob", "Grep"],
+    "deny": ["Read", "Write", "Edit", "NotebookEdit", "Bash", "Glob", "Grep"],
     "allow": ["mcp__caos"]
   },
   "hooks": {
