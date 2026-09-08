@@ -364,6 +364,20 @@ pub trait Transport {
         Ok(())
     }
 
+    /// Push a COMMIT and its closure, skipping the `ensure_pushed` probe.
+    ///
+    /// A commit needs its own path because holding a commit does not imply
+    /// holding its parents: it arrives as a gitlink child of an ArgTree, and
+    /// git reachability does not traverse gitlinks. Anything that walks
+    /// history — the `log`/`show`/`diff` tools — reads those parents by hash
+    /// and fails on the server that never received them.
+    ///
+    /// Default: the same no-op as [`Transport::ensure_pushed`], since a worker
+    /// pushes nothing.
+    fn push_commit_closure(&self, _hash: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Ingest the filesystem path named by a `:@=` arg `value`, returning its
     /// `(mode, oid)` — or `Ok(None)` if this transport doesn't read host paths.
     /// The default is `None`: the worker has no host filesystem (only `/cas`), so
@@ -660,13 +674,19 @@ impl Transport for GitTransport {
         // expression dispatches lands here, so a resolution that is nothing but
         // cache hits was paying that advertisement a dozen times over.
         //
-        // Sound because the server holding `hash` means it holds everything
-        // under it. An object reaches it in exactly two ways, and both establish
-        // the closure: a `git push`, which packs and connectivity-checks the
-        // whole reachable graph, or `hand_over_graph`, which posts a tree's
-        // children before the tree itself. And the failure mode if that were
-        // ever false is loud, not silent — `/run` names the object it cannot
-        // read.
+        // Sound for a TREE or a BLOB, because the server holding one means it
+        // holds everything under it: it arrived either by `git push`, which
+        // packs and connectivity-checks the whole reachable graph, or by
+        // `hand_over_graph`, which posts a tree's children before the tree.
+        //
+        // NOT SOUND FOR A COMMIT, which is why `:commit=` args go through
+        // [`Transport::push_commit_closure`] instead. A commit reaches the
+        // server as a GITLINK child of an ArgTree, and git reachability does
+        // not traverse gitlinks (design/commits.md) — so the server can hold
+        // the commit while holding none of its parents, and this probe would
+        // skip the push that would have sent them. The failure is loud rather
+        // than silent — `/run` names the object it cannot read — but it lands
+        // in a worker, far from here.
         //
         // What is given up is the REF, which `hand_over_graph`'s raw posts do
         // not create either: an object the server got that way stops being a
@@ -675,62 +695,17 @@ impl Transport for GitTransport {
         if self.server_holds(hash) {
             return Ok(());
         }
+        self.push_closure(hash)
+    }
 
-        // Content-addressed ref: clobber-free across clients, idempotent (a
-        // re-push of the same content is a no-op), and it persists as the
-        // negotiation base for the next push, so an edited tree ships only its
-        // delta. The push carries the whole object graph reachable from `hash`.
-        let push = || self.push_req_ref(hash);
-
-        // RETRIED, for the create race between clients pushing the same object.
-        // They all read an advertisement without the ref, so they all plan a
-        // CREATE, and every one that locks after the first dies with "cannot
-        // lock ref …: reference already exists". `--force` does not help — the
-        // create precondition comes from the advertised state, not from the
-        // refspec.
-        //
-        // A retry usually succeeds because the winner has landed both the
-        // objects and the ref (receive-pack updates the ref last), so the next
-        // advertisement HAS it and the push becomes a no-op update — the ref
-        // can only be at `hash`, the name is the content.
-        //
-        // MORE THAN ONE RETRY, because under load that is not guaranteed: two
-        // losers can both re-read the advertisement before the winner's update
-        // lands, both plan a create again, and one loses again. Measured with
-        // six concurrent clients inside a loaded suite — a single retry left
-        // five of six failing (tests/push-race).
-        //
-        // Retried on ANY error rather than by matching git's wording, which
-        // varies by version: a few extra pushes on the failure path are cheaper
-        // than a fragile string test, and a genuine failure just fails N times.
-        let mut last = String::new();
-        let mut probed = false;
-        for attempt in 0..4 {
-            match push() {
-                Ok(_) => return Ok(()),
-                Err(e) => last = e,
-            }
-            // A graph we cannot READ is not the create race, and no retry will
-            // fix it — see `hand_over_graph`. Decided by asking git to walk the
-            // graph rather than by matching its wording, for the same reason the
-            // retry above is unconditional: the message varies by version.
-            // Probed once, and only after a failure, so a healthy push pays
-            // nothing.
-            if !probed {
-                probed = true;
-                if !self.graph_readable(hash) {
-                    return self.hand_over_graph(hash);
-                }
-            }
-            // Widening pause: the thing we are waiting for is another client's
-            // ref update landing, which is brief but not instant.
-            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
-        }
-        // The LAST error, not the first: reporting attempt one's message hides
-        // whatever actually defeated the retries, which is the only interesting
-        // one (it cost a debugging session — the visible error said "reference
-        // already exists" while the real failure was unknown).
-        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+    /// Always pushes: see the trait method, and the probe's note above.
+    ///
+    /// The cost is one `git push` per DISTINCT commit argument, not per call —
+    /// the ref is `refs/caos/req/<oid>`, so a re-push of the same commit is a
+    /// no-op update, and the ref it leaves behind is the negotiation base that
+    /// makes a descendant's push a delta.
+    fn push_commit_closure(&self, hash: &str) -> Result<(), String> {
+        self.push_closure(hash)
     }
 
     fn ingest_path(
@@ -994,6 +969,73 @@ impl GitTransport {
     /// Push `hash` under its content-addressed request ref. The single network
     /// step of [`Transport::ensure_pushed`], split out so the fallback below can
     /// reuse it per-child.
+    /// Push `hash` and everything reachable from it, WITHOUT the
+    /// `server_holds` probe.
+    ///
+    /// Separated from [`Transport::ensure_pushed`] because the probe is
+    /// sound only when holding an object implies holding its closure, and
+    /// for a COMMIT it does not: a commit reaches the server as a gitlink
+    /// child of an ArgTree, and git reachability does not traverse
+    /// gitlinks, so its parents come with it only if something else sent
+    /// them.
+    fn push_closure(&self, hash: &str) -> Result<(), String> {
+        // Content-addressed ref: clobber-free across clients, idempotent (a
+        // re-push of the same content is a no-op), and it persists as the
+        // negotiation base for the next push, so an edited tree ships only its
+        // delta. The push carries the whole object graph reachable from `hash`.
+        let push = || self.push_req_ref(hash);
+
+        // RETRIED, for the create race between clients pushing the same object.
+        // They all read an advertisement without the ref, so they all plan a
+        // CREATE, and every one that locks after the first dies with "cannot
+        // lock ref …: reference already exists". `--force` does not help — the
+        // create precondition comes from the advertised state, not from the
+        // refspec.
+        //
+        // A retry usually succeeds because the winner has landed both the
+        // objects and the ref (receive-pack updates the ref last), so the next
+        // advertisement HAS it and the push becomes a no-op update — the ref
+        // can only be at `hash`, the name is the content.
+        //
+        // MORE THAN ONE RETRY, because under load that is not guaranteed: two
+        // losers can both re-read the advertisement before the winner's update
+        // lands, both plan a create again, and one loses again. Measured with
+        // six concurrent clients inside a loaded suite — a single retry left
+        // five of six failing (tests/push-race).
+        //
+        // Retried on ANY error rather than by matching git's wording, which
+        // varies by version: a few extra pushes on the failure path are cheaper
+        // than a fragile string test, and a genuine failure just fails N times.
+        let mut last = String::new();
+        let mut probed = false;
+        for attempt in 0..4 {
+            match push() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e,
+            }
+            // A graph we cannot READ is not the create race, and no retry will
+            // fix it — see `hand_over_graph`. Decided by asking git to walk the
+            // graph rather than by matching its wording, for the same reason the
+            // retry above is unconditional: the message varies by version.
+            // Probed once, and only after a failure, so a healthy push pays
+            // nothing.
+            if !probed {
+                probed = true;
+                if !self.graph_readable(hash) {
+                    return self.hand_over_graph(hash);
+                }
+            }
+            // Widening pause: the thing we are waiting for is another client's
+            // ref update landing, which is brief but not instant.
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+        }
+        // The LAST error, not the first: reporting attempt one's message hides
+        // whatever actually defeated the retries, which is the only interesting
+        // one (it cost a debugging session — the visible error said "reference
+        // already exists" while the real failure was unknown).
+        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+    }
+
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
         let refspec = format!("{hash}:refs/caos/req/{hash}");
         self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
@@ -2616,7 +2658,9 @@ fn resolve_commit_arg(
         })?
     };
     // Gitlinks aren't reachability-traversed, so push the commit's own closure.
-    t.ensure_pushed(&oid.to_string())?;
+    // NOT `ensure_pushed`: its probe would skip the push whenever the server
+    // already holds this commit as a gitlink, leaving the parents behind.
+    t.push_commit_closure(&oid.to_string())?;
     Ok(oid)
 }
 
