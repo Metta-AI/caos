@@ -1,0 +1,7 @@
+# githist-lib's dependencies (format `<path> <name>`, path relative to this
+# dir): the script-worker image its library runs on. std/bash is bash,
+# coreutils, diffutils, gnugrep, findutils and jq -- no git, which is why the
+# library walks the commit graph by hash rather than shelling out to one.
+# LOCAL deps (mounted under DEEP-DEPS/ by deepening) rather than /std, so std
+# has no ambient self-reference.
+../bash bash

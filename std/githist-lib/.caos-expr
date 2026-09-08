@@ -1,0 +1,7 @@
+# The shared library behind the `log`, `show` and `diff` tools: std/bash with
+# `lib.sh` bound as an arg, which each of those entries curries its own command
+# body onto.
+#
+# It is an ENTRY rather than a file each tool copies because there is one
+# library and three callers. A tool's worker sources it from /cas/args/lib.
+curry --base:@=DEEP-DEPS/bash --lib:@=lib.sh

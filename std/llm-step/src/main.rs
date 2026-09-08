@@ -11,7 +11,6 @@
 //! head; pending queues and results are always reconstructed from the ref.
 
 mod async_work;
-mod githist;
 mod progress;
 mod subagents;
 mod tools;
@@ -55,10 +54,6 @@ struct Config {
     /// The rgrep TOOL's image; the `grep` tool is registered only when
     /// present (older curries without it keep working).
     grep_image: Option<String>,
-    /// The script-worker image (std/bash) the BUILT-IN HISTORY TOOLS run on
-    /// (log/show/diff). A tree tool names its own image in its `.caos-expr`
-    /// (SPEC, "Tools"), so it needs nothing from here. Registered when present.
-    tools_image: Option<String>,
     /// The git-bearing merge worker (std/merge). The `merge` tool is registered
     /// only when present.
     merge_image: Option<String>,
@@ -72,6 +67,12 @@ struct Config {
     /// std/caos-test-result — reads one test's record BY HASH, so it touches no
     /// workspace and applies on any tree; moved alongside caos-test.
     caos_test_result_image: Option<String>,
+    /// std/log-tool, std/show-tool and std/diff-tool -- the history tools. They
+    /// declare `@git` in their help, which is what binds `wc` and `refs` into
+    /// the launch. Registered when present.
+    log_image: Option<String>,
+    show_image: Option<String>,
+    diff_image: Option<String>,
     run_and_update_ref_image: Option<String>,
     /// The turn-start ref snapshot: `name <hash>` lines the `merge` tool
     /// resolves `--theirs` against (SPEC "Resolving `--theirs`"). Absent = the
@@ -110,11 +111,13 @@ impl Config {
             system: read_arg("system")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
-            tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
             caos_build_image: image_arg("caos-build-image")?,
             caos_test_image: image_arg("caos-test-image")?,
             caos_test_result_image: image_arg("caos-test-result-image")?,
+            log_image: image_arg("log-image")?,
+            show_image: image_arg("show-image")?,
+            diff_image: image_arg("diff-image")?,
             run_and_update_ref_image,
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg("model")?,
@@ -463,26 +466,6 @@ fn drive(
                 Ok(bound) => {
                     return launch_std_tool(
                         &call, name, image, &bound, &ws, &wc, run, round, &base_head,
-                    )
-                }
-            }
-        }
-        // A built-in history tool (log/show/diff)? Like a tree tool, but the
-        // script ships with the harness and it always gets the `@git` context.
-        if githist::is_builtin(name) && cfg.tools_image.is_some() {
-            let tool = githist::tool(name).expect("is_builtin implies tool");
-            match tools::tree_tool_args(&call, &tool) {
-                Err(block) => {
-                    append_tool_result(cfg, run, round, &base_head, &block, &cas_hash(&ws)?, None)?;
-                    let log = progress::conversation_log(conversation(cfg)?)?;
-                    (ws, wc) = canonical_workspace(&log)?;
-                    base_head = log.head;
-                    queue.remove(0);
-                    continue;
-                }
-                Ok(bound) => {
-                    return launch_githist(
-                        cfg, &call, name, &bound, &ws, &wc, run, round, &base_head,
                     )
                 }
             }
@@ -875,6 +858,9 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
             .caos_test_result_image
             .as_deref()
             .map(|i| (i, "caos-test-result-image")),
+        "log" => cfg.log_image.as_deref().map(|i| (i, "log-image")),
+        "show" => cfg.show_image.as_deref().map(|i| (i, "show-image")),
+        "diff" => cfg.diff_image.as_deref().map(|i| (i, "diff-image")),
         _ => None,
     }
 }
@@ -1025,63 +1011,6 @@ fn launch_evaluated_tool(
         }
     }
     let curried = caos_curry(Arg::Hash(&tool_tree), &kvs)?;
-    let me = self_curry(
-        wc,
-        run,
-        round,
-        base_head,
-        id,
-        &[("current-tool", Arg::Lit(name)), ("ws", Arg::Path(ws))],
-    )?;
-    run_then_catching(ws, Arg::Hash(&curried), Arg::Hash(&me))
-}
-
-/// Launch a built-in history tool (`log`/`show`/`diff`): assemble its embedded
-/// script (`githist::script`), `caos put` it into CAS, and curry it onto the
-/// tools image with the `@git` context. Its result is rendered by the same
-/// callback arm a project tool's is.
-///
-/// It does NOT go through [`launch_tree_tool`], and the difference is real: a
-/// project tool is a directory in the workspace whose `.caos-expr` says what it
-/// runs on, so reaching it means evaluating. This script ships with the harness
-/// and has no expression — the image is `tools_image`, handed in as config —
-/// so there is nothing to evaluate and no reason to spend a continuation.
-#[allow(clippy::too_many_arguments)]
-fn launch_githist(
-    cfg: &Config,
-    call: &Value,
-    name: &str,
-    bound: &[(String, String)],
-    ws: &str,
-    wc: &str,
-    run: &str,
-    round: u64,
-    base_head: &str,
-) -> Result<(), String> {
-    let id = call["id"]
-        .as_str()
-        .ok_or("tool_use block has no string id")?;
-    let image = cfg
-        .tools_image
-        .as_ref()
-        .ok_or("launch_githist without a tools_image (drive guards this)")?;
-    let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
-    let dir = scratch(&format!("githist-{name}"))?;
-    let file = dir.join("worker.sh");
-    fs::write(&file, body).map_err(|e| format!("writing {name} script: {e}"))?;
-    let script = fresh("githist-script");
-    caos(["put", path(&file), &script])?;
-
-    let mut kvs: Vec<(&str, Arg)> = vec![("worker1", Arg::Path(&script))];
-    kvs.extend(bound.iter().map(|(k, v)| (k.as_str(), Arg::Lit(v))));
-    // History context: `wc` is commit-kinded, so it curries as a gitlink
-    // (`:commit=`) and the tool reads it as the raw commit object — exactly how
-    // the merge tool receives `ours`.
-    kvs.push(("wc", Arg::Path(wc)));
-    if let Some(refs) = cfg.merge_refs.as_deref() {
-        kvs.push(("refs", Arg::Lit(refs)));
-    }
-    let curried = caos_curry(Arg::Hash(image), &kvs)?;
     let me = self_curry(
         wc,
         run,
@@ -2145,11 +2074,6 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
     if cfg.merge_image.is_some() {
         tools.push(merge_tool());
     }
-    // The built-in history tools (log/show/diff) ship with the harness and run
-    // on the handed-in tools image, so they keep its gate.
-    if cfg.tools_image.is_some() {
-        tools.extend(githist::declarations());
-    }
     // The harness-provided std tools (grep, caos-build/caos-test): DEPs of the
     // harness, so offered ALWAYS when curried — described by the `help` their
     // images carry, the same shape a tree tool is described by.
@@ -2168,6 +2092,9 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
             "caos-test-result-image",
             &cfg.caos_test_result_image,
         ),
+        ("log", "log-image", &cfg.log_image),
+        ("show", "show-image", &cfg.show_image),
+        ("diff", "diff-image", &cfg.diff_image),
     ] {
         if image.is_some() {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {

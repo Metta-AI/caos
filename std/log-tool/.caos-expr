@@ -1,0 +1,20 @@
+# The `log` tool: std/githist-lib (std/bash with the shared history library
+# bound) with this directory's command body curried onto it, plus the `help` an
+# agent registers it by.
+#
+# The docs are a HERE-STRING, like std/caos-test's, so they live here rather
+# than in the worker -- and a `.caos-expr` is STRIPPED from the tree it is
+# evaluated against, so rewording them re-keys this tool's arg tree and nothing
+# it builds.
+#
+# `@git` is what asks the launch for the workspace commit (`wc`) and the turn's
+# ref snapshot (`refs`). Only `@git` tools get them: `wc` moves every step, so
+# binding it into a build or test tool would sink that tool's cache.
+HELP=<<END
+Show the workspace's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
+@param [rev] Where to start (default HEAD, the current workspace). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^.
+@param [path] Only show commits that changed this workspace-relative path.
+@param [count] Maximum number of commits to show (default 20).
+@git
+END
+curry --base:@=DEEP-DEPS/githist-lib --worker1:@=worker.sh --help=$HELP

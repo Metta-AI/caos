@@ -1,0 +1,5 @@
+# log-tool's dependencies (format `<path> <name>`, path relative to this dir):
+# the shared history library, which is itself std/bash with lib.sh bound. LOCAL
+# deps (mounted under DEEP-DEPS/ by deepening) rather than /std, so std has no
+# ambient self-reference.
+../githist-lib githist-lib

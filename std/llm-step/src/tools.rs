@@ -61,7 +61,7 @@ const EDIT_HELP: &str = "Replace text in a workspace file. `old-string` must mat
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
 /// tool takes. `git` is always false: a built-in that needs history context
-/// (log/show/diff) lives in `githist.rs` and asks for it there.
+/// (log/show/diff) declares `@git` in its help and is bound it there.
 fn builtin_declaration(name: &str, help: &str) -> Value {
     let (doc, args, _git) = parse_help(&format!("built-in {name}"), help);
     tree_tool_declaration(&TreeTool {
@@ -89,7 +89,7 @@ pub fn declarations() -> Vec<Value> {
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
 /// the file tools) must stay stable whatever the tree carries, the built-in
-/// history tools (`log`/`show`/`diff` — see `githist.rs`) are standard, not
+/// history tools (`log`/`show`/`diff`, std entries of their own) are standard, not
 /// project-defined, and the harness's own std tools (`grep`, the caos-*
 /// family) are offered from its version rather than the tree's.
 const RESERVED_TOOLS: &[&str] = &[

@@ -1,8 +1,7 @@
 # std/llm-step's image (design/caos-expr.md, Phase 3): build this directory as a
 # Rust project with rustc, then bind the tools it drives.
 #
-# `--src:@=.` hands rustc the tool (Cargo.toml + src/, including the
-# src/githist/*.sh embeds; rustc skips the caos metadata — .caos-expr, DEPS,
+# `--src:@=.` hands rustc the tool (Cargo.toml + src/; rustc skips the caos metadata — .caos-expr, DEPS,
 # DEEP-DEPS/); `--dep0:@=…` and `--dep1:@=…` hand it the llm-client and shared
 # conversation-protocol crates. `--output-runner` selects the opt-in Git
 # runtime for the finished binary without changing rustc's own seeded runner.
@@ -11,16 +10,18 @@
 # resolves that mount through its own `.caos-expr` to the image it builds (a
 # curry with no args is the ready-to-run ArgTree), and `--k=$VAR` binds that
 # object BY REFERENCE. So a caller resolves llm-step and gets a step that
-# already knows its tools — it never has to name bash-tool, rgrep-tool, bash, merge,
+# already knows its tools — it never has to name bash-tool, rgrep-tool, merge,
 # caos-build, caos-test or caos-test-result, which are llm-step's dependencies
 # and not the caller's business.
 BASH_TOOL=curry --base:@=DEEP-DEPS/bash-tool
 GREP=curry --base:@=DEEP-DEPS/rgrep-tool
-TOOLS=curry --base:@=DEEP-DEPS/bash
 MERGE=curry --base:@=DEEP-DEPS/merge
 CAOS_BUILD=curry --base:@=DEEP-DEPS/caos-build
 CAOS_TEST=curry --base:@=DEEP-DEPS/caos-test
 CAOS_TEST_RESULT=curry --base:@=DEEP-DEPS/caos-test-result
+LOG=curry --base:@=DEEP-DEPS/log-tool
+SHOW=curry --base:@=DEEP-DEPS/show-tool
+DIFF=curry --base:@=DEEP-DEPS/diff-tool
 ASYNC_WORKER=curry --base:@=DEEP-DEPS/run-and-update-ref
 STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --output-runner:@=DEEP-DEPS/git-runner
-curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --caos-build-image=$CAOS_BUILD --caos-test-image=$CAOS_TEST --caos-test-result-image=$CAOS_TEST_RESULT --run-and-update-ref-image=$ASYNC_WORKER
+curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --merge-image=$MERGE --caos-build-image=$CAOS_BUILD --caos-test-image=$CAOS_TEST --caos-test-result-image=$CAOS_TEST_RESULT --log-image=$LOG --show-image=$SHOW --diff-image=$DIFF --run-and-update-ref-image=$ASYNC_WORKER

@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# Embedded git-history library for the built-in `log`/`show`/`diff` tools
-# (crates/worker-llm-step/src/githist.rs prepends this to each command body and
-# `caos put`s the result as the worker script). NOT read from the workspace —
-# these tools ship with the harness.
+# The git-history library behind the `log`, `show` and `diff` tools. Bound as
+# `lib` by this entry's `.caos-expr`; each tool's worker sources it from
+# /cas/args/lib and adds its own command body.
 #
-# A `@git`-style launch gives the worker `/cas/args/wc` (the workspace commit,
-# materialized as the raw commit object) and `/cas/args/refs` (the turn's
-# `name <hash>` snapshot). From those two entry points every reachable object is
-# one `caos get-hash` away — a commit checks out as its raw bytes, a tree as a
-# directory of placeholders (expand with `caos get -r`), a blob as its content.
-# So history needs no git binary: the std/bash image (bash, coreutils,
-# diffutils, gnugrep, findutils, jq — NO git, NO sed/awk) is enough.
+# A `@git` launch gives the worker /cas/args/wc (the workspace commit,
+# materialized as the raw commit object) and /cas/args/refs (the turn's
+# `name <hash>` snapshot). From those two entry points every reachable object
+# is one `caos get-hash` away -- a commit checks out as its raw bytes, a tree
+# as a directory of placeholders (expand with `caos get -r`), a blob as its
+# content. So history needs no git binary: std/bash (bash, coreutils,
+# diffutils, gnugrep, findutils, jq -- NO git, NO sed/awk) is enough.
 #
-# Written for `set -euo pipefail`: no `[ … ] && …` tails, grep no-match guarded.
+# Written for `set -euo pipefail`: no `[ ... ] && ...` tails, grep no-match
+# guarded.
 set -euo pipefail
 
-_gh_n=0
-_fresh() { _gh_n=$((_gh_n + 1)); printf '/cas/gh-%s' "$_gh_n"; }
-
-declare -A _OBJ
+# A CAS path DERIVED FROM THE OID, never from a counter, and existence as the
+# only memo.
+#
+# Both of those are forced by subshells. Every reader here is called as
+# `p=$(obj "$h")`, so a counter incremented inside one is lost when it returns,
+# and so is any associative-array memo — the next call for the same object
+# would ask for the same fresh-looking path and get `already exists; a CAS path
+# is recorded once`. Two commits was enough to hit it.
+_at() { printf '/cas/gh-%s' "$1"; }
 
 githist_init() {
   if ! caos get /cas/args/wc >/dev/null 2>&1; then
@@ -26,22 +31,26 @@ githist_init() {
     return 1
   fi
   WC=$(caos hash /cas/args/wc)
-  _OBJ[$WC]=/cas/args/wc
+  # The workspace commit is already materialized as an arg, so give `obj` its
+  # path rather than making it fetch what is in hand. A symlink because the
+  # lookup is by derived path and this is the one object whose path is fixed.
+  ln -sfn /cas/args/wc "$(_at "$WC")" 2>/dev/null || true
   REFS=""
   if caos get /cas/args/refs >/dev/null 2>&1; then REFS=$(cat /cas/args/refs); fi
 }
 
 obj() {
-  local h=$1
-  if [ -z "${_OBJ[$h]:-}" ]; then
-    local p; p=$(_fresh)
-    if ! caos get-hash "$h" "$p" >/dev/null 2>&1; then
-      echo "object not found on this server: $h" >&2
+  local h=$1 p; p=$(_at "$h")
+  if [ ! -e "$p" ]; then
+    # RELAY THE REAL ERROR. Swallowing it and reporting "not found" made every
+    # fetch failure look like a missing object, which sends the reader to the
+    # server for a fault that may be anywhere else.
+    if ! caos get-hash "$h" "$p" >/dev/null 2>/tmp/gh-fetch.err; then
+      echo "cannot fetch $h: $(cat /tmp/gh-fetch.err)" >&2
       return 1
     fi
-    _OBJ[$h]=$p
   fi
-  printf '%s' "${_OBJ[$h]}"
+  printf '%s' "$p"
 }
 
 obj_commit() {
@@ -137,8 +146,10 @@ resolve_rev() {
 checkout_tree() {
   local commit=$1 sub=${2:-} th dst
   th=$(commit_tree "$commit") || return 1
-  dst=$(_fresh)
-  caos get-hash "$th" "$dst" >/dev/null 2>&1 || { echo "tree not found: $th" >&2; return 1; }
+  dst=$(_at "$th")
+  if [ ! -e "$dst" ]; then
+    caos get-hash "$th" "$dst" >/dev/null 2>&1 || { echo "tree not found: $th" >&2; return 1; }
+  fi
   local target=$dst comp
   if [ -n "$sub" ]; then
     local IFS=/
@@ -157,8 +168,10 @@ checkout_tree() {
 path_oid() {
   local commit=$1 path=$2 th dst target comp
   th=$(commit_tree "$commit") || return 1
-  dst=$(_fresh)
-  caos get-hash "$th" "$dst" >/dev/null 2>&1 || return 1
+  dst=$(_at "$th")
+  if [ ! -e "$dst" ]; then
+    caos get-hash "$th" "$dst" >/dev/null 2>&1 || return 1
+  fi
   target=$dst
   local IFS=/
   for comp in $path; do
