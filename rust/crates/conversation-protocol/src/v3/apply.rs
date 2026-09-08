@@ -91,6 +91,18 @@ pub enum Transition {
         commit: Oid,
         origin: Option<WorkspaceOrigin>,
     },
+    LegacyWorkspaceConfigure {
+        name: String,
+        encoded: Vec<u8>,
+    },
+    WorkspaceConfigure {
+        name: String,
+        config: super::WorkspaceConfig,
+    },
+    WorkspaceAdvance {
+        name: String,
+        commit: Oid,
+    },
     WorkspaceRollback {
         name: String,
         commit: Oid,
@@ -133,6 +145,10 @@ impl Transition {
             Transition::SubagentTerminal { .. } => Kind::SubagentTerminal,
             Transition::SubagentApply { .. } => Kind::SubagentApply,
             Transition::WorkspaceCreate { .. } => Kind::WorkspaceCreate,
+            Transition::WorkspaceConfigure { .. } | Transition::LegacyWorkspaceConfigure { .. } => {
+                Kind::WorkspaceConfigure
+            }
+            Transition::WorkspaceAdvance { .. } => Kind::WorkspaceAdvance,
             Transition::WorkspaceRollback { .. } => Kind::WorkspaceRollback,
             Transition::WorkspaceRemove { .. } => Kind::WorkspaceRemove,
             Transition::PublicationPending { .. } => Kind::PublicationPending,
@@ -604,7 +620,41 @@ pub fn apply(
             }
             put_workspace(&mut builder, name, commit, commit, origin.as_ref());
         }
-        Transition::WorkspaceRollback { name, commit } => {
+        Transition::LegacyWorkspaceConfigure { name, encoded } => {
+            let conversation = parent(store, parent_tree)?;
+            let workspace = conversation
+                .workspace(name)?
+                .ok_or("workspace does not exist")?;
+            let config = super::workspaces::legacy_config(encoded, &workspace.initial)?;
+            let mut configs = conversation.workspace_configs()?;
+            configs.insert(name.clone(), config);
+            super::workspace_order(&configs)?;
+            builder.put(
+                &paths::workspace_config_path(name),
+                Mode::Blob,
+                encoded.clone(),
+            );
+        }
+        Transition::WorkspaceConfigure { name, config } => {
+            let conversation = parent(store, parent_tree)?;
+            let mut configs = conversation.workspace_configs()?;
+            if !configs.contains_key(name) {
+                return Err(format!("workspace {name:?} does not exist"));
+            }
+            configs.insert(name.clone(), config.clone());
+            super::workspace_order(&configs)?;
+            if config == &super::WorkspaceConfig::default() {
+                builder.delete(&paths::workspace_config_path(name));
+            } else {
+                builder.put(
+                    &paths::workspace_config_path(name),
+                    Mode::Blob,
+                    config.encode(),
+                );
+            }
+        }
+        Transition::WorkspaceAdvance { name, commit }
+        | Transition::WorkspaceRollback { name, commit } => {
             let conversation = parent(store, parent_tree)?;
             let workspace = conversation
                 .workspace(name)?
@@ -614,7 +664,7 @@ pub fn apply(
                 name,
                 &workspace.commit,
                 Some(commit),
-                "workspace rollback",
+                "workspace pointer update",
             )?;
         }
         Transition::WorkspaceRemove { name } => {
@@ -622,6 +672,9 @@ pub fn apply(
             if conversation.workspace(name)?.is_none() {
                 return Err(format!("workspace {name:?} does not exist"));
             }
+            let mut configs = conversation.workspace_configs()?;
+            configs.remove(name);
+            super::workspace_order(&configs)?;
             builder.delete(&paths::workspace_dir(name));
         }
         Transition::PublicationPending { record } => {

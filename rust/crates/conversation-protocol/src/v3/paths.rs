@@ -28,6 +28,7 @@ pub enum WorkspaceFile {
     Commit,
     Initial,
     Origin,
+    Config,
 }
 
 pub fn validate_component(name: &str) -> Result<(), String> {
@@ -119,6 +120,10 @@ pub fn workspace_origin_path(name: &str) -> String {
     format!("{}/{name}/origin", WORKSPACES_DIR)
 }
 
+pub fn workspace_config_path(name: &str) -> String {
+    format!("{WORKSPACES_DIR}/{name}/config.json")
+}
+
 pub fn transcript_shard(ordinal: u64) -> String {
     format!("{:09}", ordinal / 1000)
 }
@@ -205,6 +210,7 @@ pub fn parse_workspace_path(path: &str) -> Option<(String, WorkspaceFile)> {
         "commit" => WorkspaceFile::Commit,
         "initial" => WorkspaceFile::Initial,
         "origin" => WorkspaceFile::Origin,
+        "config.json" => WorkspaceFile::Config,
         _ => return None,
     };
     Some((name.to_string(), kind))
