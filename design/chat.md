@@ -255,16 +255,33 @@ credentials are never copied into conversation or workspace trees.
 # Identity and metadata
 .caos/format                                          "caos-conversation-v3"
 .caos/identity.json                                   ID, root/fork origin, and subagent parent/spawning call
+# NOTE: Is fork info redundant? since can see in C_n history
 .caos/title                                           displayed title
 
 # Transcript
 .caos/transcript/<shard>/<ordinal>-<message-id>.json  speaker, model, content blocks
 .caos/transcript/<shard>/<ordinal>-<message-id>/      message payload files
+# NOTE: Do away with shards; to access a history from a conversation branch pre-merge, use a tool
 
 # Workspaces
 .caos/workspaces/<name>/commit                        current code commit hash
 .caos/workspaces/<name>/initial                       starting commit; fallback diff baseline and rollback limit
 .caos/workspaces/<name>/config.json                   source locator, upstream/checkpoint, publication destination/base
+# NOTE: no default workspace. We support at tui flag to load in a git tree from a location on-disk, and insert a system message by default indicating that it's there
+# Usage note/clarification: can imagine that a common way of using workspaces is to have the agent use one as its working area (akin to disk for humans), and another workspace that moves less frequently and tracks clean commits ready for integration into the target repo
+# TODO: The tui doesn't have a special index of workspaces; instead, we encourage agents to make per-feature/group subdirs (where the dirs are named to reflect the group). Outside of .caos. And the tui lets you select a dir
+###
+
+paintbot-feature/.base-url           # repo url:base branch
+paintbot-feature/0-base              # commit sha corresponding to .base-url
+paintbot-feature/1-add-targeting     # commit sha
+paintbot-feature/2-improve-targeting # commit sha
+
+paintbot-feature/dirty               # current work. it can add paintbot-feature/3-... when it wants to virtual-commit
+# Also TODO: support https://gitcommit/<hash> that we, by virtue of controlling the runner, resolve
+# Also TODO: for PR publishing, tui infers branch names from folder structure.
+###
+
 
 # Conversation-owned files
 files/                                                files separate from workspace code
@@ -274,6 +291,7 @@ files/                                                files separate from worksp
 .caos/requests/active                                 active turn hash; absent when none
 .caos/tools/<turn>/<round>/<call-id>.json             input workspace, optional task, status, result, applied changes
 .caos/tools/<turn>/<round>/<call-id>/                 tool arguments and output files
+## TODO: move these back to commit messages; only show latest. The goal is that anything that things in files need to get canonicalized/merged during a conversation merge
 
 # Background work
 .caos/async/<hash>.json                               computation task status and result
@@ -281,6 +299,8 @@ files/                                                files separate from worksp
 
 # Publication
 .caos/publications/                                   destinations, planned commits, expected remote tips, outcomes
+# TODO: remove this, ideally we can do it from our stack
+
 ```
 
 ### Compatibility
