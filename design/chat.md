@@ -1,315 +1,293 @@
-# Chat v3: conversation and code as separate histories
+# Conversations, code stacks, and publication
 
-| What | Where | Referenced by |
+This is the target design from the September 8 discussion. The current
+implementation still uses flat workspace records and tree-based execution
+bookkeeping; the changes below are not implemented yet.
+
+| What | Where | How it is referenced |
 | --- | --- | --- |
-| `C` conversation commit | `caos` remote | `refs/caos/v3/conversations/<hex(id)>/head` |
-| `W` workspace commit | `caos` remote | sha in a conversation commit's tree |
-| `P` publication branch | destination repository | `refs/heads/<branch>` points to a workspace commit |
+| `C`: conversation commit | CAOS Git | A conversation branch points to its latest `C`. |
+| `W`: code commit | CAOS Git | A commit-valued entry anywhere in a conversation tree points to `W`. |
+| `P`: publication branch | Destination Git repository | A branch inferred from a stack entry's path points to the published `W`. |
 
-The chain of C_n records conversation. W_n records code changes.
-
-Each conversation transition creates a new `C`, including model responses and
-tool bookkeeping. Its tree holds the full conversation state so far. Many `C`
-commits point to the same `W`; accepting a code change advances that pointer.
-For example, a turn with one dispatched editing tool:
+The chain of `C` commits records the conversation. Each `W` has its own code
+tree and ordinary Git ancestry. Many consecutive `C` commits can refer to the
+same `W`: a model response or tool-start event need not change any code.
 
 ```mermaid
 flowchart TB
     subgraph caos["CAOS Git"]
-        message["C_0: save user message"]
-        request(["Build computation request using C_0<br/>No new conversation commit"])
-        before["C_1: record request hash and settings; queue run<br/>C_2: worker starts agent run<br/>C_3: model requests tool<br/>C_4: tool starts"]
-        after["C_5: tool completes edit<br/>C_6: model replies<br/>C_7: turn finishes"]
-        message --> request --> before -->|conversation continues| after
-        message -.->|records| W0["W_0: original code"]
-        before -.->|each records| W0
-        after -.->|each records| W1["W_1: edited code"]
+        before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests tool<br/>C_4: tool starts"]
+        after["C_5: tool completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
+        before -->|conversation continues| after
+        before -.->|feature/dirty points to| W0["W_0: original code"]
+        after -.->|feature/dirty points to| W1["W_1: edited code"]
         W1 -->|Git parent| W0
+        after --> ready["C_8: rename dirty to 01-feature"]
+        ready -.->|feature/01-feature points to| W1
     end
     subgraph destination["Destination Git, after publishing"]
-        P["P: refs/heads/branch"] -->|points to| published1["W_1"]
+        P["P: feature/01-feature"] -->|points to| published1["W_1"]
         published1 -->|Git parent| published0["W_0"]
     end
-    W1 -.->|publish same commits and history| published1
+    W1 -.->|publish same commits and ancestry| published1
 ```
 
-The flow follows execution order. Each listed `C` is a separate commit whose
-Git parent is the previous `C`; building the computation request creates no `C`.
-Grouped commits reference the same `W`. The model/tool loop can repeat within a
-turn, and read-only tools leave `W` unchanged. Publication preserves commit hashes.
+Each listed `C` is a separate commit; grouped commits happen to reference the
+same code. The numbered entry marks a PR boundary. Naming it does not create
+another `W`, and a PR may contain many code commits between boundaries.
 
 ## Conversation commits
 
-`C` commits contain:
+A conversation separates **canonical content** from **execution history**:
 
-- `tree`: complete conversation state, below.
-- `parent`: exactly one. The fixed genesis commit `G3` for a new root, otherwise
-  the previous `C` (or the source `C` when forking another conversation).
-- `message`: transition kind, such as `message.append` or `tool.complete`.
-- `author` and `committer`.
+- The tree contains the current transcript, title, ordinary files, and code
+  references. These are the things we edit, compact, or reconcile when merging
+  conversations.
+- Structured commit messages record events: run requests, worker claims,
+  tool calls and results, background computations, and subagent lifecycle.
+  They do not need duplicate mutable records in the tree.
 
-Conversation commits never have workspace commits as parents. They reference
-workspace commit hashes through files in their trees.
+A normal `C` parents the previous `C`. A new conversation starts from the fixed
+genesis commit `G3`; a fork starts from its source conversation commit.
+Conversation merges retain both parent histories and reconcile canonical tree
+content. Fork provenance comes from history rather than a second copy in
+`.caos/identity.json`.
 
-### Transitions and turns
+Conversation parent edges never point to `W`. Code references live in the tree.
 
-Each transition creates a new `C`. Its kind determines which changes are
-allowed; validation rejects unrelated changes and no-op transitions.
+### Starting and running an agent
 
-Starting an agent run has three steps:
+Starting a run still has three steps:
 
 1. Commit the user message as `C_0`.
-2. Build a computation request using `C_0` as its input snapshot. This computes
-   the request's hash without creating another conversation commit.
-3. Create `C_1` recording that request hash, its input snapshot, model and
-   configuration, and queued status. This marks the run as active.
+2. Build a computation request using `C_0` as its input snapshot. Computing
+   the request hash does not create a conversation commit.
+3. Create `C_1` whose commit message records the request hash, input snapshot,
+   model/configuration, and queued status.
 
-Step 3 is called **turn admission**. It needs a separate commit because the
-request hash depends on `C_0`: storing it inside `C_0` would make the two hashes
-depend on each other. The queued record identifies the concrete run to execute;
-it is more than a status flag.
+Step 3 is **turn admission**. The request hash depends on `C_0`, so putting that
+hash inside `C_0` would make the two hashes depend on each other. The admission
+event identifies the concrete run to execute.
 
-When a worker takes responsibility for the queued run, it records **turn claim**
-as another `C`, changing the run's status to running. It then calls the model,
-records its response, and executes its tools, repeating until the turn finishes
-or fails. Interruptions are handled at worker boundaries.
+When a worker takes responsibility for that run, another `C` records the
+claim. Model responses, dispatched tool starts, tool completions, and run
+completion likewise create conversation commits. An event-only commit may
+reuse its parent's tree; validation must not reject it merely for that reason.
 
-Dispatched tools record `tool.start` before execution and `tool.complete`
-afterward. Immediate tools can complete without a start record. Results record
-both what the tool returned and how its changes were applied.
+Turns identify agent runs; calls identify individual invocations; tasks identify
+background computations or child conversations. Their status is derived from
+events. The TUI shows the latest relevant state for each, without exposing the
+entire execution log by default. Local indexes are disposable accelerators,
+not another authoritative store.
 
-### Background work and subagents
+Dispatched tools record a start and completion; immediate tools may complete
+without a start. Results record both the returned value and any applied code
+change. Calls can share cached computation but still need separate responses.
 
-`run_async` returns a task handle while computation continues. A subagent is a
-separate conversation rooted at `G3`; its identity names the parent conversation,
-parent commit, and spawning call. It receives the selected workspace, if any,
-but does not inherit the parent's transcript or files.
+### Transcript, forks, and background work
 
-Completion is recorded in the parent. Harvesting applies child changes to an
-existing workspace; promotion creates a separate workspace for review.
+The tree holds one canonical, unsharded transcript and its payloads. It need
+not preserve a separate transcript shard for every pre-merge branch. A history
+tool can inspect any earlier conversation commit when that context is needed.
 
-Bookkeeping has three concepts:
+Subagents have their own conversations and receive the requested code snapshots.
+Spawn and completion events preserve the connection to the parent. The parent
+can apply a child's changes to a working entry, or expose its result as a named
+review boundary. Starting work, finishing it, and applying it remain separate.
 
-- **Turns:** model loop, interruption, and outstanding calls. These records
-  are distinct from CAOS computation requests.
-- **Calls:** arguments, responses, applied changes, and an optional task reference.
-- **Tasks:** shared pending/terminal status, results, cancellation, and recovery.
-  Computations and child conversations are explicit variants. Conversation
-  tasks retain their spawn inputs, terminal checkpoint, and application history.
+Moving lifecycle records into commit messages avoids merging mutable status
+files. It does not by itself settle which event wins after divergent histories
+merge. Event identity, causal replay, and treatment of in-flight work at a
+fork or merge still need a precise protocol.
 
-Launching, finishing, and applying work are separate events. Calls identify
-occurrences; computation hashes identify content, so calls can share cached
-work but still need separate responses. Immediate tools need no extra task
-record. Recovery polls pending tasks through one path; terminal notifications
-share idempotence checks. Variant-specific data and validation remain separate.
+### Canonical tree content
 
-### Forks, titles, and archiving
+```text
+.caos/
+  format
+  identity.json             # conversation ID
+  title
+  transcript/               # canonical, unsharded context and payloads
 
-A fork starts a new identity from an existing `C`. The source must have no
-active turn, unfinished tool execution, or pending async task or publication.
-Completed records are allowed. Running child records are dropped from the
-inherited state. Renaming changes `.caos/title`.
-
-Archiving moves a conversation out of the active list without deleting its
-history.
-
-### Validation
-
-JSON records use canonical bytes so hashing is stable. Readers check the commit
-and reconstruct its declared transition; the resulting tree must match. See
-[record formats](../rust/crates/conversation-protocol/src/v3/records.rs) and
-[validation](../rust/crates/conversation-protocol/src/v3/validate.rs) for exact rules.
-
-## Workspace commits
-
-A conversation has zero or more named workspaces. Each points to a `W`: a Git
-commit containing a code tree, parents, message, author, and committer. Edits
-create descendant commits; merges can have two parents. The pointer in `C`
-tracks the current head without requiring a separate named workspace branch.
-Each workspace also records its immutable starting commit as `initial`.
-
-### Sources and upstreams
-
-Attaching code imports existing commits and ancestry without rewriting them or
-changing the local checkout. A branch attachment remembers its upstream; an
-attachment by commit stays pinned. Workspace inputs cannot contain reserved
-`.caos` entries other than `.caos/conflicts`.
-
-`config.json` keeps three independent fields:
-
-- **Source:** an optional pinned locator, such as
-  `git+https://github.com/team/repo.git?rev=<full-commit-sha>`. It uses the
-  same parser as `:@@=`, but workspace attachment imports the commit and its
-  ancestry, not an evaluated tree. Mutable refs, `path:`, and `dir=` are
-  not workspace sources.
-- **Upstream:** a repository branch or another workspace, plus the exact
-  commit already integrated. This is a moving integration relationship;
-  the source locator remains pinned.
-- **Publication:** a repository, destination branch, and optional PR base
-  (repository default, named branch, or parent workspace). The host derives
-  defaults until the destination is chosen or published, then remembers it.
-  Choosing a PR base does not change which upstream future updates integrate.
-
-Workspace upstream dependencies must stay within a repository and cannot form
-cycles. A workspace with dependents cannot be removed. For a stacked PR, the
-parent's publication destination supplies the child's PR base.
-
-### Selecting and creating workspaces
-
-`Ctrl+O` or `/workspace` opens the picker. From the selected workspace:
-
-- **Create** starts at its incorporated upstream commit, or `initial` if it has
-  no upstream. It starts a separate change without the selected workspace's edits.
-- **Copy** starts at its current commit and retains its upstream relationship.
-- **Stack** starts at its current commit and makes the selected workspace its
-  upstream.
-
-All three inherit the pinned source and clear the publication destination.
-`/workspace create <name> <revision>` starts at an explicit revision.
-`/workspace attach <name> <repository> [<branch>|<commit>]` attaches a repository;
-a pinned locator can replace the repository and revision arguments:
-`/workspace attach <name> <locator>`.
-
-The changes view compares the current commit with its incorporated upstream
-commit, falling back to `initial`. Rollback can return to a previously recorded
-workspace commit that descends from `initial`; it restores that commit's upstream
-checkpoint while retaining the publication destination.
-
-Selection is local UI state. A submitted turn captures its focus; with multiple
-workspaces, tool calls name their target. Switching selection cannot redirect
-an in-flight call. Navigation and informational commands do not send messages.
-
-Each workspace supplies its own AGENTS.md and repository tools. Cross-workspace
-bash inputs are immutable snapshots; only the target workspace's output is
-adopted. Named repository refs are captured at turn start.
-
-### Applying changes and updating stacks
-
-Tools, subagents, and `/update-tree` use the same reconciliation rules. A
-proposal must descend from its declared base. Already-applied proposals do
-nothing; compatible descendants advance directly; otherwise try a three-way
-merge. A conflict records the candidate and leaves the workspace pointer alone.
-Equal trees are not enough to discard a commit: its ancestry may matter.
-
-`/update-tree` includes local committed and uncommitted changes, using the merge
-base with the workspace. Unrelated histories or multiple merge bases are errors.
-
-`/workspace update [<name>|--all]` integrates upstream changes in dependency
-order. Each workspace head and incorporated upstream commit update together.
-An upstream rewrite or conflict stops the batch; earlier successful updates
-remain. Resolve conflicts with the merge tool, then retry.
-
-A hash written in `C` does not keep `W` reachable to Git's garbage collector.
-CAOS currently disables automatic Git GC; retention and erasure policy remain
-undesigned.
-
-## Publication branches
-
-Publishing points a destination branch at a workspace's existing commit.
-The current `preserve` policy keeps its ancestry and creates no extra code
-commits. It records outcomes in `C`, leaving workspace pointers unchanged.
-
-Destinations can be configured. Default names are `caos/<id>` for a single
-workspace and `caos-workspaces/<id>/<workspace>` for multiple workspaces;
-existing publication destinations are retained.
-
-### Preparing PRs
-
-`Ctrl+P` previews workspaces, destination branches, and PR bases. Select which
-to publish; parents publish before dependents. Each selected workspace gets a
-preparation turn to merge its PR base if needed, then build and test.
-Preparation can advance `W`.
-
-Publication requires the base's ancestry, no conflicts or `.caos` entries, and
-an unchanged prepared workspace. A dependent's parent must be published at its
-current head. The host pushes and uses `gh` to open or reuse the PR. Cancellation
-stops further work; completed publications remain.
-
-`/publish-branch` skips preparation and PR creation. Squashing and publishing
-conversation content are not implemented.
-
-### Pushes and recovery
-
-Publishing must preserve the destination branch's existing history. If someone
-updates that branch while the push is being prepared, the push is refused.
-If a push is interrupted, the host checks where the branch actually points
-before retrying. The publication record says whether the push completed,
-conflicted, or remains uncertain.
-
-## Host and launcher inputs
-
-The TUI starts `main` from the launching checkout's HEAD or `--base`/`--from`.
-Without a checkout, or with `--empty`, it starts with no workspace. Line clients
-use their caller's checkout and HEAD/`--base` defaults.
-
-The TUI keeps its bundled harness in a separate client store. Attaching or
-editing code never overwrites it. Checkout commands act on the original matching
-checkout. Server and secret-store choices belong to the local client;
-credentials are never copied into conversation or workspace trees.
-
-## Storage reference
-
-`C`'s tree contains:
-
-```
-# Identity and metadata
-.caos/format                                          "caos-conversation-v3"
-.caos/identity.json                                   ID, root/fork origin, and subagent parent/spawning call
-# NOTE: Is fork info redundant? since can see in C_n history
-.caos/title                                           displayed title
-
-# Transcript
-.caos/transcript/<shard>/<ordinal>-<message-id>.json  speaker, model, content blocks
-.caos/transcript/<shard>/<ordinal>-<message-id>/      message payload files
-# NOTE: Do away with shards; to access a history from a conversation branch pre-merge, use a tool
-
-# Workspaces
-.caos/workspaces/<name>/commit                        current code commit hash
-.caos/workspaces/<name>/initial                       starting commit; fallback diff baseline and rollback limit
-.caos/workspaces/<name>/config.json                   source locator, upstream/checkpoint, publication destination/base
-# NOTE: no default workspace. We support at tui flag to load in a git tree from a location on-disk, and insert a system message by default indicating that it's there
-# Usage note/clarification: can imagine that a common way of using workspaces is to have the agent use one as its working area (akin to disk for humans), and another workspace that moves less frequently and tracks clean commits ready for integration into the target repo
-# TODO: The tui doesn't have a special index of workspaces; instead, we encourage agents to make per-feature/group subdirs (where the dirs are named to reflect the group). Outside of .caos. And the tui lets you select a dir
-###
-
-paintbot-feature/.base-url           # repo url:base branch
-paintbot-feature/0-base              # commit sha corresponding to .base-url
-paintbot-feature/1-add-targeting     # commit sha
-paintbot-feature/2-improve-targeting # commit sha
-
-paintbot-feature/dirty               # current work. it can add paintbot-feature/3-... when it wants to virtual-commit
-# Also TODO: support https://gitcommit/<hash> that we, by virtue of controlling the runner, resolve
-# Also TODO: for PR publishing, tui infers branch names from folder structure.
-###
-
-
-# Conversation-owned files
-files/                                                files separate from workspace code
-
-# Turns and calls
-.caos/requests/<id>.json                              starting snapshot, model settings, calls, status, outcome
-.caos/requests/active                                 active turn hash; absent when none
-.caos/tools/<turn>/<round>/<call-id>.json             input workspace, optional task, status, result, applied changes
-.caos/tools/<turn>/<round>/<call-id>/                 tool arguments and output files
-## TODO: move these back to commit messages; only show latest. The goal is that anything that things in files need to get canonicalized/merged during a conversation merge
-
-# Background work
-.caos/async/<hash>.json                               computation task status and result
-.caos/subagents/<child-id>.json                       conversation task, spawn inputs, result, application history
-
-# Publication
-.caos/publications/                                   destinations, planned commits, expected remote tips, outcomes
-# TODO: remove this, ideally we can do it from our stack
-
+notes.md                    # ordinary conversation content
+skills/                     # optional ordinary files
+paintbot-feature/           # code references, described below
 ```
 
-### Compatibility
+There is no required `files/` wrapper for ordinary content, and no
+`.caos/workspaces/` registry. Turn, call, async-task, and subagent bookkeeping
+move out of `.caos/requests`, `.caos/tools`, `.caos/async`, and
+`.caos/subagents`. Publication has no canonical directory either.
 
-Turns and calls are stored under `requests` and `tools`; transition labels and
-record field names retain those names. Computation and child records have
-separate encodings but share lifecycle code. The combined task view is derived,
-not stored alongside them.
+## Code references and stacks
 
-Readers accept historical `origin` and repository/branch/base fields. An old
-record without a repository uses the checkout's origin; new attachments bind
-the repository explicitly.
+A code reference uses the existing Git commit-valued tree entry (gitlink, mode
+`160000`). Its value is a `W`, not a live branch name or a text file containing
+a hash. Its repository of origin is not part of the commit's identity.
+
+References may appear anywhere. One task may need only `paintbot`; another may
+organize several features and repositories into directories. Turning a single
+reference into a stack means moving it into a directory and adding entries,
+not creating a second kind of workspace object.
+
+The TUI walks the conversation tree and displays its references in their
+existing directory structure. It can filter for commit entries and let the
+user select a directory or a particular entry. It needs neither a special flat
+index nor an agent or worker to organize the tree before it can be browsed.
+
+### A stack is a directory convention
+
+Encourage meaningful feature names and zero-padded numeric prefixes:
+
+```text
+paintbot-feature/
+  .base-url                 # repository URL + base branch/ref
+  00-base          -> W_0   # exact base commit incorporated
+  01-add-targeting -> W_1   # first PR boundary
+  02-improve-it    -> W_2   # second PR boundary
+  dirty            -> W_d   # current work, when present
+```
+
+- `.base-url` names the external repository and ref used for updates and, by
+  default, publication. It changes infrequently.
+- `00-base` records the exact base snapshot. Fetching a newer remote tip does
+  not mean that snapshot has been incorporated.
+- Numbered entries name review boundaries. Each may include many commits since
+  the preceding boundary; their Git ancestry preserves those intermediate edits.
+- `dirty` is the moving working entry. Every accepted edit still creates a real
+  code commit; the entry itself is overwritten, not multiplied into
+  `dirty-1`, `dirty-2`, and so on. Prior values remain in conversation history.
+
+When a change is ready, rename `dirty` to the next numbered, descriptive entry.
+Create a fresh `dirty` at that same commit when starting more work. There is no
+need for separate working and publishing workspaces.
+
+The TUI compares neighboring commit entries in name order: `01` against
+`00-base`, `02` against `01`, and `dirty` against the last numbered entry.
+Ordering and PR boundaries come from paths; actual ancestry comes from Git.
+There is no per-entry `initial` field or stored upstream graph.
+
+A standalone reference remains useful without a repository URL. Add a stack's
+base and destination context when updates, comparison, or publication require it.
+A directory convention must not become a requirement for browsing arbitrary
+commit references.
+
+### Edits, updates, and subagents
+
+Tools receive explicit code snapshots and a target entry. Selection is local
+UI state; a submitted operation captures its target and input commits so later
+navigation cannot redirect it. Repository instructions and tools come from the
+selected code, with conversation-owned context available separately.
+
+Applying a proposal preserves its code ancestry and reconciles against the
+captured base. Equal trees do not make ancestry redundant. A concurrent edit or
+conflict must not silently overwrite the target.
+
+Fetching resolves `.base-url` to a new candidate base. Incorporating it means
+merging or rebasing the stack and updating `00-base`, the numbered boundaries,
+and any working entry consistently. The TUI can report the last fetched tip;
+it must not imply that it knows the current remote tip without fetching.
+
+Subagents can work from the same boundary in parallel. Their results may be
+combined into `dirty`, or retained as separate numbered boundaries when they
+deserve separate PRs. The parent arranges and validates the resulting ancestry;
+directory names alone do not integrate code.
+
+### Multiple repositories
+
+Keep coordinated stacks together, with a base for each repository:
+
+```text
+add-feature/
+  library/
+    .base-url
+    00-base
+    01-api
+    dirty
+  application/
+    .base-url
+    00-base
+    01-use-api
+    dirty
+```
+
+Making both code trees available to a tool is useful, but does not automatically
+make the application's package manager consume the modified library.
+
+The next step is a Git endpoint such as `https://gitcommit/<hash>`, reachable
+from runners, that serves a commit and its history from CAOS. A consumer that
+accepts Git dependencies can pin that URL instead of requiring an intermediate
+push to GitHub. The agent can first update the library, then put its resulting
+commit URL into the application's dependency configuration and build it.
+
+Later, DEPS could refer to a sibling commit entry in the conversation tree and
+project its pinned Git URL into a build input. That would avoid manually copying
+hashes after each edit. Endpoint routing/access and package-manager or lockfile
+integration need specification; DEPS automation follows the basic endpoint.
+
+## Client startup
+
+Start from the CAOS client/harness, independently of the code being edited.
+There is no implicit `main` workspace or automatic import of the launching
+checkout.
+
+Provide an explicit TUI option to import a local Git tree/snapshot into the
+conversation. Preserve its commit when one exists, choose a visible content
+path, and insert a system message explaining what was made available. The exact
+flag and handling of uncommitted files remain to be specified.
+
+The same separation applies to cloud clients: boot from a stable CAOS client
+repository/environment and attach target code afterward. The initial cloud
+checkout must not accidentally become the conversation's code repository.
+Reusing that bootstrap environment also permits caching independently of the
+target repositories.
+
+Credentials, server selection, and client caches stay local. They are not
+conversation content.
+
+## Publication
+
+Publication derives its plan from a selected stack directory:
+
+1. Use `.base-url` to identify the repository and base ref, and `00-base` as
+   the incorporated snapshot.
+2. Derive branch names from entry paths, such as
+   `paintbot-feature/01-add-targeting` and `paintbot-feature/02-improve-it`.
+3. Publish numbered boundaries in order. The first PR targets the external
+   base branch; each later PR targets the preceding boundary's branch.
+
+`00-base` is not a PR. `dirty` is excluded until explicitly made into a review
+boundary. Publication preserves the existing `W` commits and their ancestry;
+it does not squash or invent an extra code commit at each boundary.
+
+The TUI previews the inferred destinations and diffs before publishing. Preparing
+a boundary can integrate its base and run the appropriate checks. Publishing
+requires coherent ancestry, resolved conflicts, and entries that still point
+to the prepared commits. Concurrent remote updates must not be overwritten.
+
+There is no `.caos/publications/` tree or per-reference publication config.
+Find existing PRs from their repository and inferred branch names. After an
+interrupted push, inspect the destination refs before retrying; any execution
+events needed for recovery belong in commit history, not canonical files.
+
+Path-based naming still needs rules for invalid Git ref characters, collisions
+between conversations, and renamed entries with existing PRs. Destination
+overrides, if needed, should be explicit rather than reviving hidden defaults.
+
+## Implementation work still to specify
+
+- Editing and materializing commit references through ordinary tools.
+- Event-message schema, replay across conversation merges, and active-work
+  behavior at forks and merges.
+- Exact `.base-url` syntax, import flags, stack-update conflict recovery, and
+  branch-name collision/rename handling.
+- Format version and migration from existing transcripts, workspace configs,
+  lifecycle records, and publication receipts. Historical commits stay intact;
+  do not silently reinterpret old histories as the new format.
+- Object retention: references in a conversation tree are not Git parent edges.
+  Define how code commits remain available through transport and GC.
+- The Git-by-commit endpoint, followed by optional DEPS integration.
+
+The existing workspace commands and demos describe the current implementation;
+they must be revised when this model is implemented.
