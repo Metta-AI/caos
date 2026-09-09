@@ -45,10 +45,12 @@ jobs:
 
       # `nix build .#caos-cli` is the same build a developer runs; nothing about
       # the artifact is release-specific.
-      # No magic-nix-cache: it now requires a FlakeHub account and failed with
-      # "Unable to authenticate to FlakeHub", caching nothing. The build takes
-      # about four minutes without it, which is fine for now; a real cache is
-      # worth revisiting if that grows.
+      #
+      # No general nix cache. magic-nix-cache now requires a FlakeHub account
+      # and failed with "Unable to authenticate to FlakeHub", caching nothing;
+      # cache.nixos.org already serves everything the client build needs, since
+      # those derivations are stock nixpkgs. The TUNNEL is the exception and is
+      # cached on its own below.
       - uses: DeterminateSystems/nix-installer-action@main
 
       - name: Build the client
@@ -63,8 +65,34 @@ jobs:
       # A separate `nix build` invocation on purpose: two installables with two
       # `-o` flags do NOT produce two symlinks, and the one you read can be a
       # previous build or missing entirely.
+      #
+      # CACHED BY ITS DERIVATION PATH, because nothing else can cache it. It is
+      # a PATCHED, STATIC build, so it exists in no upstream cache and gets
+      # compiled from source -- iroh and its whole dependency tree -- which cost
+      # about seven minutes of every run. The drv path is a complete identity
+      # for the build (sources, patch, toolchain, nixpkgs), it costs a second to
+      # compute, and the artifact is one 8 MB file, so caching the OUTPUT is
+      # both smaller and more precise than caching /nix/store.
+      - name: Identify the tunnel build
+        id: tunnel
+        run: |
+          set -euo pipefail
+          drv="$(nix eval --raw .#dumbpipe-caos.drvPath)"
+          echo "key=tunnel-${drv##*/}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        id: tunnel-cache
+        with:
+          path: tunnel/dumbpipe
+          key: ${{ steps.tunnel.outputs.key }}
+
       - name: Build the tunnel
-        run: nix build .#dumbpipe-caos -o result-dumbpipe
+        if: steps.tunnel-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          nix build .#dumbpipe-caos -o result-dumbpipe
+          mkdir -p tunnel
+          install -m 0755 result-dumbpipe/bin/dumbpipe tunnel/dumbpipe
 
       # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
       # the real binary elsewhere in the store. The wrapper is not distributable
@@ -99,9 +127,10 @@ jobs:
 
           mkdir -p dist
           install -m 0755 "$inner" dist/caos-x86_64-linux
-          # The tunnel needs no unwrapping: pkgsStatic produces the executable
-          # itself, not a wrapper naming store paths.
-          install -m 0755 result-dumbpipe/bin/dumbpipe dist/dumbpipe-x86_64-linux
+          # From `tunnel/`, which is either this run's build or the cache hit
+          # that replaced it. pkgsStatic produces the executable itself, so
+          # there is no wrapper to unwrap as there is for the client.
+          install -m 0755 tunnel/dumbpipe dist/dumbpipe-x86_64-linux
           file dist/dumbpipe-x86_64-linux | grep -qE 'static-pie linked|statically linked' \
             || { echo "the tunnel is not static:"; file dist/dumbpipe-x86_64-linux; exit 1; } >&2
           # The patch is the whole reason we build our own, and an unpatched
