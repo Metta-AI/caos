@@ -67,6 +67,17 @@ struct Config {
     grep_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
+    /// Drain this request's declared calls and STOP -- do not call the model,
+    /// do not terminate the request.
+    ///
+    /// For a harness that drives the model ITSELF and wants only the tools:
+    /// `caos cc` records the call Claude Code is about to make, runs this to
+    /// execute it, and hands the observation back. Without it the step would
+    /// answer a model that already answered.
+    ///
+    /// Distinct from `Cancelling`/`drain`, which CANCELS pending calls rather
+    /// than running them, and ends the request.
+    tools_only: bool,
     merge_refs: Option<String>,
     model: String,
     base_url: String,
@@ -99,6 +110,7 @@ impl Config {
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
                 .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
+            tools_only: read_arg_opt("tools-only")?.is_some(),
             merge_refs: read_arg_opt("merge-refs")?,
             model: read_arg("model")?,
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -349,6 +361,13 @@ fn resume(
             if drive_call(cfg, state, request, &round, call)? {
                 continue;
             }
+            return Ok(());
+        }
+
+        // The queue is empty. A step would answer the model here; a tools-only
+        // run is finished, and leaves the request RUNNING for the next call.
+        if cfg.tools_only {
+            reconcile_background_tasks(state)?;
             return Ok(());
         }
 

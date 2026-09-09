@@ -31,7 +31,7 @@ use conversation_protocol::v3::paths;
 //
 // Re-enable by porting `cc/mod.rs` to v3 and restoring the `cc` arm in
 // `bin/caos-cli.rs`.
-// mod cc;
+// mod cc;  (mid-port; re-enabled below)
 // pub use cc::cli_cc;
 
 pub use conversation_protocol::v3::records::RequestStatus;
