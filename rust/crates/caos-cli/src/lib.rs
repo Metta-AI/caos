@@ -2426,7 +2426,7 @@ pub(crate) fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<St
         .ok_or_else(|| format!("cannot resolve conversation base {rev:?}"))
 }
 
-fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
+pub(crate) fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
     let mut lines = String::new();
     for spec in MERGE_REF_CANDIDATES {
         // These are optional conveniences for the merge tool. A repository

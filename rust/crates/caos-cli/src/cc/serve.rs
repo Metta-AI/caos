@@ -286,7 +286,14 @@ fn declarations(t: Result<&GitTransport, &String>) -> Vec<Value> {
     // built-ins above are still worth declaring: a tools/list that answers is
     // what lets the session start and say why, rather than dying unexplained.
     if let Ok(t) = t {
-        for name in ["caos-build", "caos-test", "caos-test-result"] {
+        for name in [
+            "caos-build",
+            "caos-test",
+            "caos-test-result",
+            "log",
+            "show",
+            "diff",
+        ] {
             let Some(entry) = tools::std_tool_entry(name) else {
                 continue;
             };

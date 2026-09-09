@@ -71,9 +71,15 @@ impl Outcome {
 
 /// Run one tool against `tree`. `args` is the tool's arguments exactly as the
 /// model supplied them.
+///
+/// `wc` is the conversation's head COMMIT, of which `tree` is the tree. Only a
+/// `@git` tool uses it — history is not readable from a tree — and it is passed
+/// rather than re-derived because the caller has already resolved the head it
+/// is appending to, and a second lookup could see a different one.
 pub fn execute(
     t: &GitTransport,
     tree: &str,
+    wc: &str,
     name: &str,
     args: &Value,
 ) -> Result<Outcome, ToolError> {
@@ -84,7 +90,7 @@ pub fn execute(
         "edit" => edit(t, tree, args),
         "grep" => grep(t, tree, args),
         "bash" => bash(t, tree, args),
-        name if std_tool_entry(name).is_some() => std_tool(t, tree, name, args),
+        name if std_tool_entry(name).is_some() => std_tool(t, tree, wc, name, args),
         other => Err(User(format!("unknown tool {other:?}"))),
     }
 }
@@ -315,6 +321,11 @@ pub fn std_tool_entry(name: &str) -> Option<&'static str> {
         "caos-build" => Some("std/caos-build"),
         "caos-test" => Some("std/caos-test"),
         "caos-test-result" => Some("std/caos-test-result"),
+        // The history tools. `@git` in their help is what makes the launch
+        // hand them the conversation's commit; nothing else here differs.
+        "log" => Some("std/log-tool"),
+        "show" => Some("std/show-tool"),
+        "diff" => Some("std/diff-tool"),
         _ => None,
     }
 }
@@ -324,7 +335,13 @@ pub fn std_tool_entry(name: &str) -> Option<&'static str> {
 /// The arguments are whatever the tool's own `help` declares, so nothing here
 /// knows what `caos-test` takes — adding a std tool to the list above is the
 /// whole change.
-fn std_tool(t: &GitTransport, tree: &str, name: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn std_tool(
+    t: &GitTransport,
+    tree: &str,
+    wc: &str,
+    name: &str,
+    args: &Value,
+) -> Result<Outcome, ToolError> {
     let entry = std_tool_entry(name).ok_or_else(|| User(format!("unknown tool {name:?}")))?;
     // The same check `declarations` makes, for the same reason: the name map
     // says yes in any repository, and describing the entry would push this
@@ -352,6 +369,20 @@ fn std_tool(t: &GitTransport, tree: &str, name: &str, args: &Value) -> Result<Ou
             Some(_) => return Err(User(format!("{name}'s `{}` must be a string", param.name))),
         }
     }
+    // The `@git` context, for a tool whose help asked for it. `:commit=` is
+    // what passes the commit UNPEELED -- the default forms peel a commit to its
+    // tree, and a tree has no parents to walk.
+    if declared.git {
+        kvs.push(format!("--wc:commit={wc}"));
+        // The same snapshot `llm-step` binds, so a revision can be named
+        // (`main`) and not only hashed. Absent is not an error: without it the
+        // tools still take HEAD, HEAD~N and a hash.
+        match crate::snapshot_merge_refs(t) {
+            Ok(refs) if !refs.is_empty() => kvs.push(format!("--refs={refs}")),
+            Ok(_) => {}
+            Err(error) => return Err(Infra(error)),
+        }
+    }
     run_std_tool(t, tree, entry, &kvs).map(Outcome::read)
 }
 
@@ -364,6 +395,9 @@ fn std_tool(t: &GitTransport, tree: &str, name: &str, args: &Value) -> Result<Ou
 pub struct StdToolHelp {
     pub doc: String,
     pub params: Vec<StdToolParam>,
+    /// The tool declared `@git`: it reads history, so the launch owes it the
+    /// workspace commit (`wc`) and the turn's ref snapshot (`refs`).
+    pub git: bool,
 }
 
 pub struct StdToolParam {
@@ -392,8 +426,14 @@ fn parse_help(text: &str) -> StdToolHelp {
     let mut doc: Vec<&str> = Vec::new();
     let mut params = Vec::new();
     let mut in_tags = false;
+    let mut git = false;
     for line in text.lines() {
         let trimmed = line.trim();
+        if trimmed == "@git" {
+            in_tags = true;
+            git = true;
+            continue;
+        }
         match trimmed.strip_prefix("@param") {
             Some(rest) => {
                 in_tags = true;
@@ -401,8 +441,7 @@ fn parse_help(text: &str) -> StdToolHelp {
                     params.push(param);
                 }
             }
-            // `@git` and any other block tag end the description without
-            // becoming one: a std tool reached from here gets no git context.
+            // Any other block tag ends the description without becoming one.
             None if trimmed.starts_with('@') => in_tags = true,
             None if !in_tags => doc.push(trimmed),
             None => {}
@@ -411,6 +450,7 @@ fn parse_help(text: &str) -> StdToolHelp {
     StdToolHelp {
         doc: doc.join(" ").trim().to_string(),
         params,
+        git,
     }
 }
 
@@ -728,6 +768,24 @@ fn normalize(raw: &str) -> Result<Option<String>, ToolError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `@git` is a FLAG, not a parameter. Dropped, a history tool launches
+    /// without `wc` and fails inside its container with no workspace commit;
+    /// treated as a param, the model is offered an argument it must not pass.
+    #[test]
+    fn a_git_tag_is_a_flag_and_not_a_parameter() {
+        let help = parse_help("Reads history.\n@param [rev] Where to start.\n@git");
+        assert!(help.git, "@git did not set the flag");
+        assert_eq!(help.doc, "Reads history.");
+        let names: Vec<&str> = help.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["rev"], "@git leaked into the parameters");
+    }
+
+    #[test]
+    fn a_tool_without_a_git_tag_gets_no_git_context() {
+        let help = parse_help("Builds.\n@param [only] Which.");
+        assert!(!help.git);
+    }
 
     #[test]
     fn paths_are_reduced_to_workspace_relative() {

@@ -117,8 +117,8 @@ fn run_tool(
         t,
         &refname,
         &id,
-        Some(&mut |workspace: &str| {
-            let run = match tools::execute(t, workspace, name, args) {
+        Some(&mut |workspace: &str, wc: &str| {
+            let run = match tools::execute(t, workspace, wc, name, args) {
                 Ok(produced) => Ok(produced),
                 Err(ToolError::User(message)) => Err(message),
                 Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error)),
@@ -206,7 +206,7 @@ fn append_tool_event(
     t: &GitTransport,
     refname: &str,
     id: &str,
-    mut produce: Option<&mut dyn FnMut(&str) -> Result<(String, Value), ToolError>>,
+    mut produce: Option<&mut dyn FnMut(&str, &str) -> Result<(String, Value), ToolError>>,
     event: Value,
 ) -> Result<String, ToolError> {
     for _ in 0..MAX_APPEND_ATTEMPTS {
@@ -225,7 +225,7 @@ fn append_tool_event(
             .trim()
             .to_string();
         let (tree, event) = match produce.as_mut() {
-            Some(produce) => produce(&workspace)?,
+            Some(produce) => produce(&workspace, &head)?,
             None => (workspace, event.clone()),
         };
         let commit = create_event_commit(t, &tree, &head, &event).map_err(ToolError::Infra)?;
