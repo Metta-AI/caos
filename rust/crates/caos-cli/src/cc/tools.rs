@@ -49,24 +49,87 @@ impl ToolError {
     }
 }
 
-/// What a tool produced: text for the model, and — for a mutation — the
-/// workspace tree that replaces the one it was given.
-pub struct Outcome {
+/// What a tool BODY produced: text, and the new workspace tree for a mutation.
+///
+/// Separate from [`Outcome`] because a tool body naturally computes a tree —
+/// it rewrites one path in one tree — while the CONTRACT is stated in commits.
+/// `execute` mints the commit once, in one place, rather than in every tool.
+pub struct TreeOutcome {
     pub text: String,
     pub tree: Option<String>,
 }
 
-impl Outcome {
-    fn read(text: String) -> Outcome {
-        Outcome { text, tree: None }
+impl TreeOutcome {
+    fn read(text: String) -> TreeOutcome {
+        TreeOutcome { text, tree: None }
     }
 
-    fn wrote(text: String, tree: String) -> Outcome {
-        Outcome {
+    fn wrote(text: String, tree: String) -> TreeOutcome {
+        TreeOutcome {
             text,
             tree: Some(tree),
         }
     }
+}
+
+/// What a tool produced: text for the model, and — for a mutation — the
+/// workspace COMMIT that replaces the one it was given.
+///
+/// A COMMIT, not a tree, because that is the contract (SPEC, "Tools thread a
+/// commit, not a tree"): a read returns the input commit unchanged, a mutation
+/// returns `commit(new tree, parent = input commit)`, and `merge` returns a
+/// two-parent commit. Threading a tree instead loses `theirs` — the merged
+/// content survives and the ancestry does not, which is the one thing the
+/// commit threading exists to carry.
+pub struct Outcome {
+    pub text: String,
+    pub commit: Option<String>,
+}
+
+impl Outcome {
+    fn read(text: String) -> Outcome {
+        Outcome { text, commit: None }
+    }
+
+    fn wrote(text: String, commit: String) -> Outcome {
+        Outcome {
+            text,
+            commit: Some(commit),
+        }
+    }
+}
+
+/// `commit(tree, parents)` with `what` as its message — a workspace commit,
+/// not a conversation event.
+///
+/// The object is BUILT and stored rather than shelled out to `git
+/// commit-tree`, so it is a pure function of its inputs: `commit-tree` stamps
+/// the current time, which would give a retry of the same call a different
+/// object every attempt. The parent's own author line is reused for the same
+/// reason `llm-step`'s `advance_wc` reuses its timestamp.
+fn mint_workspace_commit(
+    t: &GitTransport,
+    tree: &str,
+    parents: &[&str],
+    what: &str,
+) -> Result<String, ToolError> {
+    let (kind, parent_bytes) = t.get_object(parents[0]).map_err(ToolError::infra)?;
+    if kind != "commit" {
+        return Err(Infra(format!("{} is a {kind}, not a commit", parents[0])));
+    }
+    let parent_text = String::from_utf8_lossy(&parent_bytes);
+    let ident = parent_text
+        .lines()
+        .find_map(|line| line.strip_prefix("author "))
+        .ok_or_else(|| Infra(format!("commit {} has no author line", parents[0])))?;
+    let mut body = format!("tree {tree}\n");
+    for parent in parents {
+        body.push_str(&format!("parent {parent}\n"));
+    }
+    body.push_str(&format!("author {ident}\ncommitter {ident}\n\n{what}\n"));
+    t.put_object("commit", body.as_bytes())
+        .map(|oid| oid.to_string())
+        .map_err(ToolError::infra)
 }
 
 /// Run one tool against `tree`. `args` is the tool's arguments exactly as the
@@ -76,26 +139,50 @@ impl Outcome {
 /// `@git` tool uses it — history is not readable from a tree — and it is passed
 /// rather than re-derived because the caller has already resolved the head it
 /// is appending to, and a second lookup could see a different one.
-pub fn execute(
-    t: &GitTransport,
-    tree: &str,
-    wc: &str,
-    name: &str,
-    args: &Value,
-) -> Result<Outcome, ToolError> {
+pub fn execute(t: &GitTransport, wc: &str, name: &str, args: &Value) -> Result<Outcome, ToolError> {
+    // The tree is DERIVED, not passed: a tool's unit of work is the commit, and
+    // deriving the tree from it here is what keeps the two from disagreeing.
+    let tree = &rev_parse(t, &format!("{wc}^{{tree}}"))
+        .ok_or_else(|| Infra(format!("workspace commit {wc} has no tree")))?;
     match name {
-        "read" => read(t, tree, args),
-        "ls" => ls(t, tree, args),
-        "write" => write(t, tree, args),
-        "edit" => edit(t, tree, args),
-        "grep" => grep(t, tree, args),
-        "bash" => bash(t, tree, args),
-        name if std_tool_entry(name).is_some() => std_tool(t, tree, wc, name, args),
+        "read" => wrote(t, wc, "read", read(t, tree, args)?),
+        "ls" => wrote(t, wc, "ls", ls(t, tree, args)?),
+        "write" => wrote(t, wc, "write", write(t, tree, args)?),
+        "edit" => wrote(t, wc, "edit", edit(t, tree, args)?),
+        "grep" => wrote(t, wc, "grep", grep(t, tree, args)?),
+        // BEFORE the std-tool arm: `merge` is described from its help like a
+        // std tool, but it is launched with `ours`/`theirs` rather than
+        // declared params, and its result is a COMMIT that advances the
+        // workspace rather than a report to read.
+        "merge" => merge(t, wc, args),
+        "bash" => wrote(t, wc, "bash", bash(t, tree, args)?),
+        name if std_tool_entry(name).is_some() => {
+            wrote(t, wc, name, std_tool(t, tree, name, args)?)
+        }
         other => Err(User(format!("unknown tool {other:?}"))),
     }
 }
 
-fn read(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+/// Turn a mutation's new TREE into the commit the contract says it returns:
+/// `commit(new tree, parent = input commit)`. A tool that changed nothing
+/// passes through untouched -- SPEC is explicit that a read mints no no-op
+/// commit.
+fn wrote(
+    t: &GitTransport,
+    wc: &str,
+    what: &str,
+    outcome: TreeOutcome,
+) -> Result<Outcome, ToolError> {
+    match outcome.tree {
+        None => Ok(Outcome::read(outcome.text)),
+        Some(tree) => {
+            let commit = mint_workspace_commit(t, &tree, &[wc], what)?;
+            Ok(Outcome::wrote(outcome.text, commit))
+        }
+    }
+}
+
+fn read(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let path = path_arg(args, "file_path")?;
     let (kind, bytes) = object_at(t, tree, &path)?;
     if kind != "blob" {
@@ -103,7 +190,7 @@ fn read(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| User(format!("{path} is not valid UTF-8; it is a binary file")))?;
-    Ok(Outcome::read(window(&text, args)))
+    Ok(TreeOutcome::read(window(&text, args)))
 }
 
 /// Apply the `offset`/`limit` window, then the byte cap. A truncated read says
@@ -133,7 +220,7 @@ fn window(text: &str, args: &Value) -> String {
     }
 }
 
-fn ls(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn ls(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let path = optional_path_arg(args, "path")?;
     let spec = match path.as_deref() {
         None | Some("") => tree.to_string(),
@@ -162,23 +249,23 @@ fn ls(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> 
             _ => name.to_string(),
         });
     }
-    Ok(Outcome::read(match entries.is_empty() {
+    Ok(TreeOutcome::read(match entries.is_empty() {
         true => "(empty directory)".to_string(),
         false => entries.join("\n"),
     }))
 }
 
-fn write(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn write(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let path = path_arg(args, "file_path")?;
     let content = string_arg(args, "content")?;
     let tree = put_file(t, tree, &path, content.as_bytes())?;
-    Ok(Outcome::wrote(
+    Ok(TreeOutcome::wrote(
         format!("wrote {} bytes to {path}", content.len()),
         tree,
     ))
 }
 
-fn edit(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn edit(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let path = path_arg(args, "file_path")?;
     let old = string_arg(args, "old_string")?;
     let new = string_arg(args, "new_string")?;
@@ -212,7 +299,10 @@ fn edit(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
         1 => "1 occurrence".to_string(),
         n => format!("{n} occurrences"),
     };
-    Ok(Outcome::wrote(format!("replaced {times} in {path}"), tree))
+    Ok(TreeOutcome::wrote(
+        format!("replaced {times} in {path}"),
+        tree,
+    ))
 }
 
 /// Search the workspace by running the `grep` std tool.
@@ -223,13 +313,13 @@ fn edit(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
 /// scope, drives the `std/rgrep` fold, and renders the result itself, returning
 /// the ordinary `{report}` tree. That is what lets `bash` and every
 /// `caos-tools/<name>` entry reuse `run_std_tool` unchanged.
-fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let pattern = string_arg(args, "pattern")?;
     let mut kvs = vec![format!("--pattern={pattern}")];
     if let Some(path) = optional_path_arg(args, "path")? {
         kvs.push(format!("--path={path}"));
     }
-    run_std_tool(t, tree, "std/rgrep-tool", &kvs).map(Outcome::read)
+    run_std_tool(t, tree, "std/rgrep-tool", &kvs).map(TreeOutcome::read)
 }
 
 /// Run a shell command through `std/bash-tool`.
@@ -239,7 +329,7 @@ fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
 /// conversation's new workspace. `exit` decides whether the model sees an
 /// error. Both are data the caller consumes; the text it shows comes from the
 /// tool's own `report`, so bash reads identically here and in `llm-step`.
-fn bash(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError> {
+fn bash(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolError> {
     let cmd = string_arg(args, "cmd")?;
     let paths = match args.get("paths") {
         None | Some(Value::Null) => String::new(),
@@ -263,7 +353,7 @@ fn bash(t: &GitTransport, tree: &str, args: &Value) -> Result<Outcome, ToolError
     let exit = result.leaf("exit").unwrap_or_default();
     let text = result.report()?;
     match exit.trim() {
-        "0" => Ok(Outcome::wrote(text, workspace)),
+        "0" => Ok(TreeOutcome::wrote(text, workspace)),
         // A non-zero exit is a value, not a failure: the model must read stderr
         // and react. The workspace still advances — the command may have written
         // files before it failed, exactly as `llm-step` treats it.
@@ -321,6 +411,7 @@ pub fn std_tool_entry(name: &str) -> Option<&'static str> {
         "caos-build" => Some("std/caos-build"),
         "caos-test" => Some("std/caos-test"),
         "caos-test-result" => Some("std/caos-test-result"),
+        "merge" => Some("std/merge"),
         // The history tools. `@git` in their help is what makes the launch
         // hand them the conversation's commit; nothing else here differs.
         "log" => Some("std/log-tool"),
@@ -338,10 +429,9 @@ pub fn std_tool_entry(name: &str) -> Option<&'static str> {
 fn std_tool(
     t: &GitTransport,
     tree: &str,
-    wc: &str,
     name: &str,
     args: &Value,
-) -> Result<Outcome, ToolError> {
+) -> Result<TreeOutcome, ToolError> {
     let entry = std_tool_entry(name).ok_or_else(|| User(format!("unknown tool {name:?}")))?;
     // The same check `declarations` makes, for the same reason: the name map
     // says yes in any repository, and describing the entry would push this
@@ -373,6 +463,10 @@ fn std_tool(
     // what passes the commit UNPEELED -- the default forms peel a commit to its
     // tree, and a tree has no parents to walk.
     if declared.git {
+        // The workspace commit this tree belongs to. Derived rather than
+        // threaded: `execute` already turned the commit into this tree, and
+        // asking git for the commit again would be a second source of truth.
+        let wc = rev_parse(t, &format!("{tree}^{{commit}}")).unwrap_or_default();
         kvs.push(format!("--wc:commit={wc}"));
         // The same snapshot `llm-step` binds, so a revision can be named
         // (`main`) and not only hashed. Absent is not an error: without it the
@@ -383,7 +477,107 @@ fn std_tool(
             Err(error) => return Err(Infra(error)),
         }
     }
-    run_std_tool(t, tree, entry, &kvs).map(Outcome::read)
+    run_std_tool(t, tree, entry, &kvs).map(TreeOutcome::read)
+}
+
+/// Three-way merge another commit into the conversation's workspace.
+///
+/// Unlike every other tool here the ANCESTRY advances: the result is a merge
+/// commit with two parents, and the workspace this returns is that commit's
+/// tree. The conversation's own event commit is then built on it by the caller,
+/// so the merge is recorded as the step it was.
+fn merge(t: &GitTransport, wc: &str, args: &Value) -> Result<Outcome, ToolError> {
+    let entry = std_tool_entry("merge").expect("merge is a std tool entry");
+    if !t.work_dir().join(entry).is_dir() {
+        return Err(User(format!(
+            "merge needs {entry}, which is not in this workspace"
+        )));
+    }
+    let theirs = string_arg(args, "theirs")?.trim().to_string();
+    if theirs.is_empty() {
+        return Err(User("merge needs `theirs`".to_string()));
+    }
+    let refs = crate::snapshot_merge_refs(t).map_err(Infra)?;
+    let resolved = resolve_theirs(&refs, &theirs)?;
+
+    // `:commit=` on both sides: the default arg forms peel a commit to its
+    // tree, and a merge needs the commits themselves to find a merge base.
+    let image = std_tool_image(t, entry)?;
+    let curried = caos::curry_client_object(
+        t,
+        &image,
+        &[
+            format!("--ours:commit={wc}"),
+            format!("--theirs:commit={resolved}"),
+        ],
+    )
+    .map_err(ToolError::infra)?
+    .to_string();
+    let (kind, result) =
+        run_client_request_with_store(t, &curried, &[], &[]).map_err(ToolError::infra)?;
+    if kind != "commit" {
+        return Err(Infra(format!("merge returned a {kind}, not a commit")));
+    }
+    // The merged TREE, only to read the conflict list out of. What the tool
+    // RETURNS is the commit: it carries `theirs` as a second parent, and a
+    // tree does not.
+    let merged = commit_tree_of(t, &result)?;
+
+    // The conflict list is the whole difference between a clean merge and one
+    // the model has to finish, so it is read from the merged tree rather than
+    // inferred from an exit status.
+    let conflicts = match object_at(t, &merged, ".caos/conflicts") {
+        Ok((_, bytes)) => Some(String::from_utf8_lossy(&bytes).trim_end().to_string()),
+        Err(_) => None,
+    };
+    let text = match conflicts {
+        Some(body) => format!(
+            "merge produced conflicts. The workspace now carries git's inline conflict markers \
+             in the affected files, plus .caos/conflicts (git's unmerged notation, richer than \
+             markers). Resolve each path — edit the file, reading a stage's content with `read` \
+             (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. \
+             Build and test when done.\n\n.caos/conflicts:\n{body}"
+        ),
+        None => "merge completed cleanly; the workspace is the merged result.".to_string(),
+    };
+    Ok(Outcome::wrote(text, result))
+}
+
+/// `theirs` against the turn's ref snapshot (SPEC "Resolving `--theirs`"): a
+/// known name becomes its hash, a bare hash is itself, and anything else is a
+/// user error listing what the snapshot does offer.
+fn resolve_theirs(refs: &str, theirs: &str) -> Result<String, ToolError> {
+    if theirs.len() == 40 && theirs.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(theirs.to_string());
+    }
+    for line in refs.lines() {
+        if let Some((name, hash)) = line.rsplit_once(char::is_whitespace) {
+            if name.trim() == theirs {
+                return Ok(hash.trim().to_string());
+            }
+        }
+    }
+    let names: Vec<&str> = refs
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    Err(User(match names.is_empty() {
+        true => format!("cannot resolve {theirs:?}: this turn has no ref snapshot, so `theirs` must be a full commit hash"),
+        false => format!("cannot resolve {theirs:?}: give a full commit hash or one of {}", names.join(", ")),
+    }))
+}
+
+/// The `tree` line of a commit the server holds.
+pub fn commit_tree_of(t: &GitTransport, commit: &str) -> Result<String, ToolError> {
+    let (kind, bytes) = t.get_object(commit).map_err(ToolError::infra)?;
+    if kind != "commit" {
+        return Err(Infra(format!("{commit} is a {kind}, not a commit")));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .find_map(|line| line.strip_prefix("tree "))
+        .map(str::to_string)
+        .ok_or_else(|| Infra(format!("commit {commit} has no tree line")))
 }
 
 /// A std tool's docs and parameters, read from the `help` its image carries.

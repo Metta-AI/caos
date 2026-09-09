@@ -858,6 +858,7 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
             .caos_test_result_image
             .as_deref()
             .map(|i| (i, "caos-test-result-image")),
+        "merge" => cfg.merge_image.as_deref().map(|i| (i, "merge-image")),
         "log" => cfg.log_image.as_deref().map(|i| (i, "log-image")),
         "show" => cfg.show_image.as_deref().map(|i| (i, "show-image")),
         "diff" => cfg.diff_image.as_deref().map(|i| (i, "diff-image")),
@@ -2071,9 +2072,6 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
         tools.extend(subagents::declarations());
         tools.push(async_work::declaration());
     }
-    if cfg.merge_image.is_some() {
-        tools.push(merge_tool());
-    }
     // The harness-provided std tools (grep, caos-build/caos-test): DEPs of the
     // harness, so offered ALWAYS when curried — described by the `help` their
     // images carry, the same shape a tree tool is described by.
@@ -2092,6 +2090,10 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
             "caos-test-result-image",
             &cfg.caos_test_result_image,
         ),
+        // `merge` is described from its help like the rest, though it is
+        // LAUNCHED specially: it binds `ours`/`theirs` rather than the params a
+        // caller declares, and its result is a commit, not a report.
+        ("merge", "merge-image", &cfg.merge_image),
         ("log", "log-image", &cfg.log_image),
         ("show", "show-image", &cfg.show_image),
         ("diff", "diff-image", &cfg.diff_image),
@@ -2110,28 +2112,6 @@ fn registry(cfg: &Config, ws: &str) -> Result<Vec<Value>, String> {
         tools.push(tools::tree_tool_declaration(&tool));
     }
     Ok(tools)
-}
-
-/// The `merge` tool's registry entry.
-fn merge_tool() -> Value {
-    json!({
-        "name": "merge",
-        "description": "Three-way merge another commit into the current workspace. `theirs` is \
-    a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current \
-    side is the workspace as it is now. A clean merge advances the workspace to the merged \
-    result. A conflict advances it too, with git's inline conflict markers in the files and a \
-    reserved `.caos/conflicts` file listing every unresolved path — including structural \
-    conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file \
-    (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows \
-    from `.caos/conflicts`. Then build and test.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "theirs": {"type": "string", "description": "The commit to merge in: a ref name from the snapshot, or a commit hash."}
-            },
-            "required": ["theirs"]
-        }
-    })
 }
 
 /// Resolve a `merge` call's `--theirs` against the turn-start ref snapshot

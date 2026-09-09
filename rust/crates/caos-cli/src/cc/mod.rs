@@ -32,9 +32,10 @@ use caos::{GitTransport, Transport};
 use conversation_protocol::ConversationId;
 
 use crate::{
-    conversation_ref, create_event_commit, default_title, fetch_conversation_commit, push_head_cas,
-    reject_reserved_caos, remote_ref, resolve_base, resolve_username,
-    try_push_initial_conversation, update_local_cache, TurnOptions, MAX_APPEND_ATTEMPTS,
+    conversation_ref, create_event_commit, create_event_commit_with_parents, default_title,
+    fetch_conversation_commit, push_head_cas, reject_reserved_caos, remote_ref, resolve_base,
+    resolve_username, try_push_initial_conversation, update_local_cache, TurnOptions,
+    MAX_APPEND_ATTEMPTS,
 };
 use tools::ToolError;
 
@@ -118,25 +119,32 @@ fn run_tool(
         &refname,
         &id,
         Some(&mut |workspace: &str, wc: &str| {
-            let run = match tools::execute(t, workspace, wc, name, args) {
+            let run = match tools::execute(t, wc, name, args) {
                 Ok(produced) => Ok(produced),
                 Err(ToolError::User(message)) => Err(message),
                 Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error)),
             };
-            let (text, tree) = match &run {
-                Ok(produced) => (
-                    produced.text.clone(),
-                    produced
-                        .tree
-                        .clone()
-                        .unwrap_or_else(|| workspace.to_string()),
-                ),
-                Err(message) => (message.clone(), workspace.to_string()),
+            // A tool returns the workspace COMMIT it produced (SPEC, "Tools
+            // thread a commit"). The event this appends takes that commit's
+            // TREE as its own, and the commit itself as a SECOND PARENT -- which
+            // is what carries a merge's `theirs` into the conversation's
+            // history. The first-parent spine is untouched, so the transcript
+            // walk is unaffected.
+            let (text, tree, workspace_commit) = match &run {
+                Ok(produced) => match &produced.commit {
+                    Some(commit) => {
+                        let tree = tools::commit_tree_of(t, commit)?;
+                        (produced.text.clone(), tree, Some(commit.clone()))
+                    }
+                    None => (produced.text.clone(), workspace.to_string(), None),
+                },
+                Err(message) => (message.clone(), workspace.to_string(), None),
             };
             let is_error = run.is_err();
             outcome = Some(run.map(|_| text.clone()).map_err(ToolError::User));
             Ok((
                 tree,
+                workspace_commit,
                 json!({
                     "request": request,
                     "round": ROUND,
@@ -206,7 +214,9 @@ fn append_tool_event(
     t: &GitTransport,
     refname: &str,
     id: &str,
-    mut produce: Option<&mut dyn FnMut(&str, &str) -> Result<(String, Value), ToolError>>,
+    mut produce: Option<
+        &mut dyn FnMut(&str, &str) -> Result<(String, Option<String>, Value), ToolError>,
+    >,
     event: Value,
 ) -> Result<String, ToolError> {
     for _ in 0..MAX_APPEND_ATTEMPTS {
@@ -224,11 +234,21 @@ fn append_tool_event(
             .map_err(ToolError::Infra)?
             .trim()
             .to_string();
-        let (tree, event) = match produce.as_mut() {
+        let (tree, workspace_commit, event) = match produce.as_mut() {
             Some(produce) => produce(&workspace, &head)?,
-            None => (workspace, event.clone()),
+            None => (workspace, None, event.clone()),
         };
-        let commit = create_event_commit(t, &tree, &head, &event).map_err(ToolError::Infra)?;
+        // The workspace commit rides as a SECOND parent when a tool produced
+        // one, which is how a merge's `theirs` becomes reachable from the
+        // conversation head (SPEC, "Tools thread a commit"). Parent ORDER is
+        // load-bearing: the first parent is the event spine every transcript
+        // walk follows.
+        let parents: Vec<&str> = match workspace_commit.as_deref() {
+            Some(workspace_commit) => vec![&head, workspace_commit],
+            None => vec![&head],
+        };
+        let commit = create_event_commit_with_parents(t, &tree, &parents, &event)
+            .map_err(ToolError::Infra)?;
         if push_head_cas(t, refname, Some(&head), &commit).map_err(ToolError::Infra)? {
             let _ = update_local_cache(t, refname, &commit);
             return Ok(tree);

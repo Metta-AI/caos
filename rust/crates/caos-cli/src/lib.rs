@@ -2468,7 +2468,7 @@ pub(crate) fn create_event_commit(
     create_event_commit_with_parents(t, tree, &[parent], event)
 }
 
-fn create_event_commit_with_parents(
+pub(crate) fn create_event_commit_with_parents(
     t: &GitTransport,
     tree: &str,
     parents: &[&str],

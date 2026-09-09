@@ -290,6 +290,7 @@ fn declarations(t: Result<&GitTransport, &String>) -> Vec<Value> {
             "caos-build",
             "caos-test",
             "caos-test-result",
+            "merge",
             "log",
             "show",
             "diff",
