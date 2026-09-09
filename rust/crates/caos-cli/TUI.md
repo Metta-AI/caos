@@ -30,11 +30,21 @@ CAOS server:
 ```bash
 git remote add caos http://localhost:9090
 nix build
-./result/bin/caos tui
+./result/bin/caos tui --llm-step:@=std/llm-step --llm-call:@=std/llm-call
 ```
 
+A session NAMES the two workers it runs — the durable turn (`llm-step`) and the
+one-shot call that titles a conversation (`llm-call`) — as ordinary image args.
+Both are required; the TUI looks in no path of its own. The paths above are
+this repository's; a repo that mounted caos through
+`std/flake-input-loader` writes `--llm-step:@=caos-std/llm-step`, and one that
+only pinned it writes
+`--llm-step:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step`.
+`:hash=<oid>` and `:docker=<ref>` work too — it is the same arg vocabulary
+`caos run` and `caos curry` take.
+
 During development, launch it with
-`cargo run -p caos-cli --bin caos-cli -- tui`.
+`cargo run -p caos-cli --bin caos-cli -- tui --llm-step:@=std/llm-step --llm-call:@=std/llm-call`.
 The TUI checks the configured server before entering the alternate screen. If
 it cannot connect within five seconds, it exits with the server URL and asks
 you to check the running service and the `caos` git remote.
@@ -43,7 +53,10 @@ The Anthropic API key is checked next, still at the shell prompt. When the
 git-ignored `.caos-secrets` store has no `anthropic-api-key` secret, the TUI
 asks for one — paste the key, or enter the path to a file that holds it — and
 writes the canonical secret entry, trimmed, with fresh cache-isolation entropy
-already included (what `caos secrets` would add). It ensures git ignores
+already included (what `caos secrets` would add). Its `reader=` lines are the
+paths `--llm-step`/`--llm-call` named, so the grant matches the run; an arg
+with no reader spelling (`:@@=`, `:docker=`) is reported instead of silently
+left ungranted. It ensures git ignores
 `.caos-secrets/` (adding the rule to `.git/info/exclude` when nothing else
 covers it), re-loads the store through the normal loader, and continues
 straight into the UI — no relaunch. A pasted key is erased from the screen the
@@ -51,13 +64,17 @@ moment it is submitted. A store that exists but fails to load is reported as
 the error it is rather than prompting, so an existing broken configuration is
 never overwritten.
 
+Below, `$W` stands for the two required image args
+(`--llm-step:@=std/llm-step --llm-call:@=std/llm-call`). The last two run no
+worker, so they take neither.
+
 ```text
-caos tui                  continue the most recent conversation
-caos tui --username alice use alice's active conversation list
-caos tui --new            start a fresh conversation
-caos tui --from 5ec3751   branch from a completed turn
-caos tui --list-archived  list archived conversation IDs and titles
-caos tui --unarchive ID   restore one conversation to the active list
+caos tui $W                  continue the most recent conversation
+caos tui $W --username alice use alice's active conversation list
+caos tui $W --new            start a fresh conversation
+caos tui $W --from 5ec3751   branch from a completed turn
+caos tui --list-archived     list archived conversation IDs and titles
+caos tui --unarchive ID      restore one conversation to the active list
 ```
 
 `--username` defaults to `$USER`. If `$USER` is a shared container account such

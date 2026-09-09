@@ -32,7 +32,7 @@ use gix::objs::WriteTo;
 
 mod eval;
 mod watch;
-pub use eval::{cli_eval_path, eval_workspace_dep, eval_workspace_dep_with_store};
+pub use eval::cli_eval_path;
 
 /// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool as a caos job over this repo's tree, exactly what an agent's tool
@@ -2675,6 +2675,20 @@ fn resolve_base(
     ty: ArgType,
     value: &str,
 ) -> Result<String, String> {
+    resolve_base_with_store(t, cas, ty, value, &[])
+}
+
+/// [`resolve_base`] carrying the caller's secret store through evaluation, so a
+/// tool the resolved expression embeds keeps its secret-dependent identity —
+/// see [`resolve_cli_image_arg`]. Only the two evaluating types read the store;
+/// `:hash=` and `:docker=` name an object outright and evaluate nothing.
+fn resolve_base_with_store(
+    t: &dyn Transport,
+    cas: Option<&Path>,
+    ty: ArgType,
+    value: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
     match ty {
         // `:docker=<ref>` — a registry image, carried as the `docker://` ref the
         // server and `base_arg_entry` expect. The scheme is added here, so the
@@ -2692,7 +2706,7 @@ fn resolve_base(
         // `:@=<path>` — a `/cas` node in a worker, a host directory on the CLI.
         ArgType::Path => match cas {
             Some(cas) => resolve_cas_image(t, cas, value),
-            None => resolve_cli_image(t, value),
+            None => resolve_cli_image_with_store(t, value, store),
         },
         // `:@@=<ref>` — the worker lives in ANOTHER repo: fetch it, then treat
         // the result exactly as a `:@=` directory, evaluating it if it carries a
@@ -2700,7 +2714,7 @@ fn resolve_base(
         // names caos' `std/<x>` by locator and gets a runnable image, with only
         // the oid entering its cache key (design/flake-inputs.md).
         ArgType::Remote => {
-            let (mode, oid) = resolve_remote_arg(t, value, &[])?;
+            let (mode, oid) = resolve_remote_arg(t, value, store)?;
             if !mode.is_tree() {
                 return Err(format!("git ref {value:?} names a file, not an image tree"));
             }
@@ -3855,6 +3869,40 @@ fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// a `:@=` image deepens the whole tree first — a cached run, and exactly what
 /// `eval-path` and `run-tool` already do.
 pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
+    resolve_cli_image_with_store(t, image, &[])
+}
+
+/// Resolve one `--<name>:<type>=<value>` image argument as a CLIENT reads it —
+/// the same four spellings `run` and `curry` take (`:@=` a workspace path,
+/// `:@@=` a git locator, `:hash=` an oid, `:docker=` a registry ref), against
+/// the caller's secret store.
+///
+/// This is how a client command names a TOOL it needs — `caos tui
+/// --llm-step:@=caos-std/llm-step` — instead of descending a path it decided
+/// on. The convention was `DEEP-DEPS/<name>`, expanded from a root `DEPS`,
+/// which obliged every repo driving this client to declare caos' entry points
+/// under the names the client happened to use. Naming the image in the
+/// invocation moves that choice to the caller, and `:@@=` lets a repo that
+/// never mounted caos reach a tool at all.
+pub fn resolve_cli_image_arg(
+    t: &dyn Transport,
+    argument: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let (_, ty, value) = parse_arg(argument)?;
+    resolve_base_with_store(t, None, ty, value, store)
+}
+
+/// [`resolve_cli_image`] carrying the caller's secret store into the walk, so a
+/// `run` the expression dispatches and any `curry` it returns are marked with
+/// the caller's identity (design/secrets.md). Conversation setup uses this
+/// form: the step it resolves embeds tools whose arg trees have to match the
+/// readers granting the model key, and an unmarked resolution would not.
+pub fn resolve_cli_image_with_store(
+    t: &dyn Transport,
+    image: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
     // The tracked workspace (dirty edits included), exactly as `eval-path` with
     // no `--tree` starts. A flake dir is NOT special-cased here or on the
     // server — it carries a `.caos-expr` naming its builder, and the evaluation
@@ -3867,7 +3915,7 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
     // applied, and `image` is looked up in what the one above it produced. A
     // tree with no `.caos-expr` (a plain flake dir, a git-docker image)
     // evaluates to itself and nothing changes.
-    eval::eval_path(t, &ws.to_string(), image, &[])
+    eval::eval_path(t, &ws.to_string(), image, store)
         .map(|(_kind, hash)| hash)
         .map_err(|e| format!("resolving {image:?}: {e}"))
 }

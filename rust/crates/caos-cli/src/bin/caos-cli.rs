@@ -156,9 +156,11 @@ fn usage(args: &[String]) -> String {
          (an image is --base:@=<dir>, --base:docker=<ref> or --base:hash=<oid>)\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} import-image [--base docker://<ref>] <docker-archive>\n  \
-         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [options]\n  \
-         {prog} tui [-c <name>] [--new] [--username <name>] [options]\n  \
-         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [options]\n  \
+         {prog} talk [<prompt>] [-c <name>] [--new] [--log] [--username <name>] [conversation options]\n  \
+         {prog} tui [-c <name>] [--new] [--username <name>] [conversation options]\n  \
+         {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [conversation options]\n    \
+         (a conversation names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
+         typed like any image arg — caos-std/<name> in a repo that mounted caos)\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \

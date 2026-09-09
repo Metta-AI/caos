@@ -82,13 +82,19 @@ fallback. The selected code commit is adopted without rewriting it.
 ## Host and launcher inputs
 
 Separate histories do not yet make launching independent of the checkout.
-The host resolves `DEEP-DEPS/llm-step` and `DEEP-DEPS/llm-call` by evaluating
-its local tracked working tree. In this repository the root `.caos-expr`
-expands the root `DEPS` declarations into those mounts. The checkout's
-`.caos-secrets/` store grants the model key to those paths; absent readers
-grant nothing. The host also
+The host is TOLD which harness to run: `--llm-step` and `--llm-call` are
+ordinary image args (`:@=` a path in the evaluated working tree, `:@@=` a git
+locator, `:hash=` an oid), required, with no default. There is no
+`DEEP-DEPS/<name>` convention and no root `DEPS` — those made every repo
+driving this client expand caos' entry points under the names the client
+happened to use. The checkout's `.caos-secrets/` store grants the model key to
+the same paths those args name; absent readers grant nothing. The host also
 snapshots local `main`/`master` refs for the merge tool and publishes through
 the checkout's `origin` remote.
+
+What is still checkout-bound is the RESOLUTION, not the naming: a `:@=` path is
+looked up in the ingested working tree, and the secret store is read from it.
+A locator (`:@@=`) already sidesteps the first.
 
 These inputs come from the host checkout, which may differ from the selected
 workspace commit. An independent launcher supplying harness, secret, and

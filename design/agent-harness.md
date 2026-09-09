@@ -284,7 +284,13 @@ conversation content). Same best-effort contract as the progress ref.
 Two verbs and a full-screen client over one turn engine (implemented —
 `crates/caos-cli/src/lib.rs`, tested end-to-end against the stub in
 `tests/chat-offline` for `chat` and `talk`, and the `tests/chat-tools*`
-suites for the tool set):
+suites for the tool set).
+
+All three name the workers they run — `--llm-step:@=<path>` and, where titles
+are generated, `--llm-call:@=<path>` — as ordinary image args, resolved by
+`resolve_cli_image_arg`. There is no default: which path holds caos' entry
+points is the caller's tree's business, not this client's (`design/chat.md`,
+"Host and launcher inputs").
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one

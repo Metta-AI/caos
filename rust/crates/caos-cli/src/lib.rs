@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    eval_workspace_dep_with_store, prepare_client_request_with_store,
-    run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
+    prepare_client_request_with_store, resolve_cli_image_arg, run_client_request_with_store,
+    ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
     apply, client_signature, inherited_signature, mint, Transition,
@@ -39,7 +39,15 @@ const MAX_REQUEST_SPINE_WALK: usize = 4096;
 const MAX_FETCH_REFS: usize = 200;
 pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
-pub const MODEL_API_SECRET_READERS: [&str; 2] = ["DEEP-DEPS/llm-step", "DEEP-DEPS/llm-call"];
+/// The durable turn, named on the command line as an image arg
+/// (`--llm-step:@=caos-std/llm-step`). There is no default: the client has no
+/// business deciding where a caller's tree keeps caos' entry points, and the
+/// former `DEEP-DEPS/<name>` convention obliged every repo driving it to
+/// expand a root `DEPS` under exactly these names.
+/// See [`TurnOptions::take_image_arg`].
+pub const LLM_STEP_ARG: &str = "llm-step";
+/// The one-shot call that titles a conversation, named the same way.
+pub const LLM_CALL_ARG: &str = "llm-call";
 const AUTO_NAME_PREFIX: &str = "talk-";
 const MERGE_REF_CANDIDATES: &[&str] = &["main", "master"];
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
@@ -60,6 +68,61 @@ pub struct TurnOptions {
     pub base_url: Option<String>,
     pub username: Option<String>,
     pub workspace: Option<String>,
+    /// The `--llm-step:<type>=<value>` argument, verbatim — resolved lazily by
+    /// [`resolve_cli_image_arg`], so a broken locator is reported where it is
+    /// used rather than at parse time.
+    pub llm_step: Option<String>,
+    /// The `--llm-call:<type>=<value>` argument, verbatim (title generation).
+    pub llm_call: Option<String>,
+}
+
+impl TurnOptions {
+    /// Consume `argument` if it is one of the image args this client takes,
+    /// returning whether it was. Shared by every surface — `tui`, `chat`,
+    /// `talk` — because an image arg is spelled `--name:<type>=value` in one
+    /// token, which their `match argument.as_str()` loops cannot express.
+    ///
+    /// Matching is on the NAME alone, so `--llm-step=x` (a literal, no type)
+    /// lands here too and fails later with the arg vocabulary's own error
+    /// rather than "unknown option".
+    pub fn take_image_arg(&mut self, argument: &str) -> bool {
+        match image_arg_name(argument) {
+            Some(LLM_STEP_ARG) => self.llm_step = Some(argument.to_string()),
+            Some(LLM_CALL_ARG) => self.llm_call = Some(argument.to_string()),
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// The `<name>` of a `--<name>[:<type>]=<value>` argument, or `None` when the
+/// token is not of that shape at all (`--model`, a positional prompt).
+fn image_arg_name(argument: &str) -> Option<&str> {
+    let (key, _) = argument.strip_prefix("--")?.split_once('=')?;
+    Some(key.split_once(':').map_or(key, |(name, _)| name))
+}
+
+/// Resolve one of the required image args, or say what to pass.
+fn resolve_image_arg(
+    t: &GitTransport,
+    argument: Option<&str>,
+    name: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let argument = argument.ok_or_else(|| missing_image_arg(name))?;
+    resolve_cli_image_arg(t, argument, store).map_err(|error| format!("--{name}: {error}"))
+}
+
+/// What to tell someone who did not pass `--<name>`. Both spellings, because
+/// which one is right depends on how their repo reaches caos, and this client
+/// has no way to tell.
+pub fn missing_image_arg(name: &str) -> String {
+    format!(
+        "--{name}:@=<path> is required — it names the {name} image this conversation runs.\n  \
+         --{name}:@=caos-std/{name}   a repo that mounted caos (design/flake-inputs.md)\n  \
+         --{name}:@=std/{name}        caos itself\n  \
+         --{name}:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/{name}   by locator"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2613,7 +2676,7 @@ fn resolve_llm(
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = eval_workspace_dep_with_store(t, "llm-step", store)?;
+    let llm_base = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
 }
 
@@ -2638,11 +2701,23 @@ fn invoked_as() -> String {
 
 pub fn model_secret_manual_setup() -> String {
     format!(
-        "create the git-ignored file `.caos-secrets/{MODEL_API_SECRET}` with:\n\nname={MODEL_API_SECRET}\nvalue:@={MODEL_API_SECRET_VALUE_FILE}\nreader={}\nreader={}\n\nStore the key in `.caos-secrets/{MODEL_API_SECRET_VALUE_FILE}` (no trailing newline — the value is used verbatim).\n\nThen run `{} secrets` to add cache-isolation entropy. See the README's Secrets section for details.",
-        MODEL_API_SECRET_READERS[0],
-        MODEL_API_SECRET_READERS[1],
+        "create the git-ignored file `.caos-secrets/{MODEL_API_SECRET}` with:\n\nname={MODEL_API_SECRET}\nvalue:@={MODEL_API_SECRET_VALUE_FILE}\nreader=<the path you pass as --{LLM_STEP_ARG}:@=>\nreader=<the path you pass as --{LLM_CALL_ARG}:@=>\n\nA reader names the expression that may read the key, so those two lines are the paths those two args name — `std/{LLM_STEP_ARG}` and `std/{LLM_CALL_ARG}` in caos itself, `caos-std/…` in a repo that mounted it. Store the key in `.caos-secrets/{MODEL_API_SECRET_VALUE_FILE}` (no trailing newline — the value is used verbatim).\n\nThen run `{} secrets` to add cache-isolation entropy. See the README's Secrets section for details.",
         invoked_as(),
     )
+}
+
+/// The `reader=` line an image argument stands for, for the store `caos tui`
+/// writes on first run. A reader is resolved by [`caos::build_secret_store`] as
+/// a tree path or a bare oid, which is exactly the two arg types that name one:
+/// `:@@=` and `:docker=` have no reader spelling, so those are `None` and the
+/// caller is told to write the line by hand rather than handed a grant that
+/// silently matches nothing.
+pub fn image_arg_reader(argument: &str) -> Option<&str> {
+    let (key, value) = argument.strip_prefix("--")?.split_once('=')?;
+    match key.split_once(':')?.1 {
+        "@" | "hash" => Some(value),
+        _ => None,
+    }
 }
 
 pub fn model_secret_missing(t: &GitTransport) -> Result<bool, String> {
@@ -2783,7 +2858,7 @@ pub fn generate_conversation_title(
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = eval_workspace_dep_with_store(t, "llm-call", &store)?;
+    let llm_base = resolve_image_arg(t, options.llm_call.as_deref(), LLM_CALL_ARG, &store)?;
     let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;
@@ -3121,6 +3196,7 @@ fn parse_cli_args(args: &[String], positional_message: bool) -> Result<LineArgs,
                 parsed.message = Some(other.to_string());
                 message_from_position = true;
             }
+            other if parsed.options.take_image_arg(other) => {}
             other => return Err(format!("unknown chat option {other:?}")),
         }
         index += 1;

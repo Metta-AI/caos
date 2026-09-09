@@ -5847,14 +5847,14 @@ mod tests {
     fn cli_options_match_the_line_client_surface() {
         // --username rides along so the test never depends on ambient $USER
         // (the cargo worker's environment has none).
-        let args = Args::parse(&[
-            "--username".into(),
-            "tester".into(),
-            "--from".into(),
-            "5ec3751".into(),
-            "--model".into(),
-            "test-model".into(),
-        ])
+        let args = Args::parse(&crate::tui::args::tests::with_images(&[
+            "--username",
+            "tester",
+            "--from",
+            "5ec3751",
+            "--model",
+            "test-model",
+        ]))
         .unwrap();
         assert_eq!(args.user, "tester");
         assert!(args.new_conversation);

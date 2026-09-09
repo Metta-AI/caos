@@ -78,7 +78,14 @@ bad_conv="${test_id}-bad-chat"
 bad_ref=$($TOOL ref --id "$bad_conv")
 bad_ref=${bad_ref#ref }
 stub_host=${CAOS_STUB_HOST:-host.containers.internal}
-opts=(--model test-model --base-url "http://$stub_host:$port")
+# The step this conversation runs, named in the invocation rather than looked
+# up under a path this client decided on. dev/cli-test stages the test's DEPS
+# at ./DEEP-DEPS, so that is where this repo keeps it; `caos-std/llm-step` in a
+# repo that mounted caos, `std/llm-step` in caos itself. `--llm-call` is not
+# passed: only the tui generates titles, and an unused image arg is never
+# resolved.
+opts=(--model test-model --base-url "http://$stub_host:$port"
+      --llm-step:@=DEEP-DEPS/llm-step)
 
 echo "== request preparation fails before admission ==" >&2
 if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.err; then
@@ -87,9 +94,9 @@ fi
 grep -q "anthropic-api-key" key.err || fail "missing-key error is unclear"
 grep -qF '.caos-secrets/anthropic-api-key' key.err \
   || fail "missing-key error does not name the setup file"
-grep -qF 'reader=DEEP-DEPS/llm-step' key.err \
+grep -qF -- '--llm-step:@=' key.err \
   || fail "missing-key error does not explain the llm-step grant"
-grep -qF 'reader=DEEP-DEPS/llm-call' key.err \
+grep -qF -- '--llm-call:@=' key.err \
   || fail "missing-key error does not explain the title grant"
 grep -qF "$CAOS_CLI secrets" key.err \
   || fail "missing-key error does not explain entropy setup"
