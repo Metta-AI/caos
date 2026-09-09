@@ -1,7 +1,6 @@
 //! The agent turn driver for the v3 conversation protocol.
 
 mod async_work;
-mod githist;
 mod progress;
 mod subagents;
 mod timing;
@@ -38,10 +37,16 @@ const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
 const MAX_SPINE_WALK: usize = 4096;
 static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
-const STD_TOOLS: [(&str, &str); 3] = [
+const STD_TOOLS: [(&str, &str); 6] = [
     ("caos-build", "caos-build-image"),
     ("caos-test", "caos-test-image"),
     ("caos-test-result", "caos-test-result-image"),
+    // The history tools. Ordinary std entries: each is a directory whose
+    // `.caos-expr` carries its own help, `@git` included, so nothing here
+    // knows what `log` takes or that it reads history at all.
+    ("log", "log-image"),
+    ("show", "show-image"),
+    ("diff", "diff-image"),
 ];
 
 fn main() -> std::process::ExitCode {
@@ -56,7 +61,6 @@ struct Config {
     system: String,
     bash_image: String,
     grep_image: Option<String>,
-    tools_image: Option<String>,
     merge_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
@@ -87,7 +91,6 @@ impl Config {
             system: read_arg("system")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
-            tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
             std_tool_images: STD_TOOLS
                 .iter()
@@ -1165,9 +1168,6 @@ fn prepare_compute(
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
-        name if githist::is_builtin(name) && cfg.tools_image.is_some() => {
-            prepare_githist(cfg, &clean, name, ws, wc)
-        }
         name if !tools::is_inline(name) => {
             let Some(tool) = tools::tree_tool(ws, name)? else {
                 return Err(format!(
@@ -1270,39 +1270,6 @@ fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<
         .iter()
         .map(|(name, value)| (name.as_str(), Arg::Lit(value)))
         .collect();
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    prepared_request(&curried, &[], ws)
-}
-
-fn prepare_githist(
-    cfg: &Config,
-    call: &Value,
-    name: &str,
-    ws: &str,
-    wc: &str,
-) -> Result<Prepared, String> {
-    let tool = githist::tool(name).ok_or_else(|| format!("no built-in tool {name}"))?;
-    let bound = match tools::tree_tool_args(call, &tool) {
-        Ok(bound) => bound,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
-    let dir = scratch(&format!("githist-{name}"))?;
-    let file = dir.join("worker.sh");
-    fs::write(&file, body).map_err(|error| format!("writing {name} script: {error}"))?;
-    let script = fresh("githist-script");
-    caos(["put", path(&file), &script])?;
-    let image = cfg.tools_image.as_deref().ok_or("tools image is absent")?;
-    let mut args: Vec<(&str, Arg<'_>)> = vec![("worker1", Arg::Path(&script))];
-    args.extend(
-        bound
-            .iter()
-            .map(|(name, value)| (name.as_str(), Arg::Lit(value))),
-    );
-    args.push(("wc", Arg::Path(wc)));
-    if let Some(refs) = cfg.merge_refs.as_deref() {
-        args.push(("refs", Arg::Lit(refs)));
-    }
     let curried = caos_curry(Arg::Hash(image), &args)?;
     prepared_request(&curried, &[], ws)
 }
@@ -2847,9 +2814,6 @@ fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
     }
     if cfg.merge_image.is_some() {
         registry.push(with_workspace(merge_tool()));
-    }
-    if cfg.tools_image.is_some() {
-        registry.extend(githist::declarations().into_iter().map(with_workspace));
     }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
