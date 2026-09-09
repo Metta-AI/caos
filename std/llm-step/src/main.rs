@@ -37,10 +37,14 @@ const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
 const MAX_SPINE_WALK: usize = 4096;
 static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
-const STD_TOOLS: [(&str, &str); 6] = [
+const STD_TOOLS: [(&str, &str); 7] = [
     ("caos-build", "caos-build-image"),
     ("caos-test", "caos-test-image"),
     ("caos-test-result", "caos-test-result-image"),
+    // DESCRIBED from its help like the rest, though it is LAUNCHED specially
+    // below: it binds `ours`/`theirs` rather than the params a caller
+    // declares, and its result is a commit, not a report.
+    ("merge", "merge-image"),
     // The history tools. Ordinary std entries: each is a directory whose
     // `.caos-expr` carries its own help, `@git` included, so nothing here
     // knows what `log` takes or that it reads history at all.
@@ -61,7 +65,6 @@ struct Config {
     system: String,
     bash_image: String,
     grep_image: Option<String>,
-    merge_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     merge_refs: Option<String>,
@@ -91,7 +94,6 @@ impl Config {
             system: read_arg("system")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
-            merge_image: image_arg("merge-image")?,
             std_tool_images: STD_TOOLS
                 .iter()
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
@@ -1165,7 +1167,9 @@ fn prepare_compute(
     let clean = call_without_workspace(call);
     match call.name.as_str() {
         "bash" => prepare_bash(cfg, &clean, ws),
-        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
+        "merge" if std_tool_image(cfg, "merge").is_some() => {
+            prepare_merge(cfg, &clean, ws, wc)
+        }
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
         name if !tools::is_inline(name) => {
@@ -1237,7 +1241,7 @@ fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepa
     };
     let theirs_path = fresh("theirs");
     caos(["get-hash", &theirs, &theirs_path])?;
-    let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
+    let (image, _) = std_tool_image(cfg, "merge").ok_or("merge image is absent")?;
     let curried = caos_curry(
         Arg::Hash(image),
         &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
@@ -2812,9 +2816,6 @@ fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(with_workspace(tools::grep_declaration()));
     }
-    if cfg.merge_image.is_some() {
-        registry.push(with_workspace(merge_tool()));
-    }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
@@ -2870,18 +2871,6 @@ fn bash_tool() -> Value {
                 "paths": {"type":"array", "items":{"type":"string"}, "description":"Workspace-relative paths the command reads or modifies; only these are materialized into the sandbox."}
             },
             "required": ["cmd"]
-        }
-    })
-}
-
-fn merge_tool() -> Value {
-    json!({
-        "name": "merge",
-        "description": "Three-way merge another commit into the current workspace. `theirs` is a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current side is the workspace as it is now. A clean merge advances the workspace to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
-        "input_schema": {
-            "type":"object",
-            "properties":{"theirs":{"type":"string","description":"The commit to merge in: a ref name from the snapshot, or a commit hash."}},
-            "required":["theirs"]
         }
     })
 }
