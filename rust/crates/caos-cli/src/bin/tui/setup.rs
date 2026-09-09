@@ -15,8 +15,8 @@ use std::process::{Command, Stdio};
 
 use caos::{fresh_entropy, GitTransport, SECRETS_DIR};
 use caos_cli::{
-    ensure_conversation_secret, model_secret_manual_setup, model_secret_missing, MODEL_API_SECRET,
-    MODEL_API_SECRET_READERS, MODEL_API_SECRET_VALUE_FILE,
+    ensure_conversation_secret, image_arg_reader, model_secret_manual_setup, model_secret_missing,
+    TurnOptions, MODEL_API_SECRET, MODEL_API_SECRET_VALUE_FILE,
 };
 use ratatui_crossterm::crossterm::terminal::size as terminal_size;
 
@@ -29,7 +29,10 @@ const MIN_KEY_CHARS: usize = 12;
 /// when none is configured, ask for one and install it instead of exiting
 /// with instructions. The caller has already verified stdin/stdout are a
 /// terminal and the server is reachable.
-pub(crate) fn ensure_model_secret(transport: &GitTransport) -> Result<(), String> {
+pub(crate) fn ensure_model_secret(
+    transport: &GitTransport,
+    turn: &TurnOptions,
+) -> Result<(), String> {
     if !model_secret_missing(transport)? {
         return Ok(());
     }
@@ -44,7 +47,15 @@ pub(crate) fn ensure_model_secret(transport: &GitTransport) -> Result<(), String
     // directory, so that is where the entry is written.
     let root = std::env::current_dir()
         .map_err(|error| format!("reading the current directory: {error}"))?;
-    for line in install_model_secret(&root, &key)? {
+    // The grant is written from the images this invocation named, so the store
+    // it produces matches the run it is for. Args::parse has already required
+    // both, so `flatten` drops nothing here.
+    let images: Vec<&str> = [&turn.llm_step, &turn.llm_call]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    for line in install_model_secret(&root, &key, &images)? {
         println!("{line}");
     }
     // Prove the new entry through the loader every turn uses — value read,
@@ -160,7 +171,13 @@ fn expand_home(entry: &str, home: Option<&Path>) -> PathBuf {
 /// complete in one write with entropy included, so there is no window where a
 /// loadable entry lacks its cache isolation. Returns the lines to show for
 /// what was done.
-fn install_model_secret(root: &Path, key: &str) -> Result<Vec<String>, String> {
+///
+/// `images` are this invocation's image args, verbatim; each becomes the
+/// `reader=` line granting it the key. One that has no reader spelling
+/// ([`image_arg_reader`]) is REPORTED rather than dropped silently — a secret
+/// whose readers do not cover the step it is for loads fine and then denies
+/// the run, which is a much worse place to find out.
+fn install_model_secret(root: &Path, key: &str, images: &[&str]) -> Result<Vec<String>, String> {
     let dir = root.join(SECRETS_DIR);
     let spec_path = dir.join(MODEL_API_SECRET);
     if spec_path.exists() {
@@ -180,13 +197,21 @@ fn install_model_secret(root: &Path, key: &str) -> Result<Vec<String>, String> {
     // newline would ride into the `x-api-key` header.
     write_private(&dir.join(MODEL_API_SECRET_VALUE_FILE), key.as_bytes())
         .map_err(|error| format!("writing {SECRETS_DIR}/{MODEL_API_SECRET_VALUE_FILE}: {error}"))?;
-    let spec = format!(
-        "name={MODEL_API_SECRET}\nvalue:@={MODEL_API_SECRET_VALUE_FILE}\n\
-         entropy={}\nreader={}\nreader={}\n",
+    let mut spec = format!(
+        "name={MODEL_API_SECRET}\nvalue:@={MODEL_API_SECRET_VALUE_FILE}\nentropy={}\n",
         fresh_entropy()?,
-        MODEL_API_SECRET_READERS[0],
-        MODEL_API_SECRET_READERS[1],
     );
+    for image in images {
+        match image_arg_reader(image) {
+            Some(reader) => spec.push_str(&format!("reader={reader}\n")),
+            None => done.push(format!(
+                "no reader written for `{image}`: only :@= and :hash= name something a \
+                 reader can resolve. Add the `reader=` line for it to \
+                 {SECRETS_DIR}/{MODEL_API_SECRET} by hand, or that image will not \
+                 be granted the key"
+            )),
+        }
+    }
     write_private(&spec_path, spec.as_bytes())
         .map_err(|error| format!("writing {SECRETS_DIR}/{MODEL_API_SECRET}: {error}"))?;
     done.push(format!(
@@ -409,7 +434,15 @@ mod tests {
     fn installs_the_key_and_ignores_the_store() {
         let repo = throwaway_repo("install");
         assert!(!check_ignored(&repo));
-        let done = install_model_secret(&repo, "sk-ant-pasted-key-123").unwrap();
+        let done = install_model_secret(
+            &repo,
+            "sk-ant-pasted-key-123",
+            &[
+                "--llm-step:@=caos-std/llm-step",
+                "--llm-call:@=std/llm-call",
+            ],
+        )
+        .unwrap();
 
         let value = repo.join(SECRETS_DIR).join(MODEL_API_SECRET_VALUE_FILE);
         assert_eq!(
@@ -424,8 +457,9 @@ mod tests {
         let entropy = lines[2].strip_prefix("entropy=").unwrap();
         assert_eq!(entropy.len(), 32);
         assert!(entropy.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(lines[3], format!("reader={}", MODEL_API_SECRET_READERS[0]));
-        assert_eq!(lines[4], format!("reader={}", MODEL_API_SECRET_READERS[1]));
+        // The grant is the images this run named, not a convention.
+        assert_eq!(lines[3], "reader=caos-std/llm-step");
+        assert_eq!(lines[4], "reader=std/llm-call");
 
         assert!(check_ignored(&repo), "the store is git-ignored afterwards");
         let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
@@ -441,7 +475,7 @@ mod tests {
         }
 
         // A second run never overwrites the person's configuration.
-        let error = install_model_secret(&repo, "sk-ant-other-key-456").unwrap_err();
+        let error = install_model_secret(&repo, "sk-ant-other-key-456", &[]).unwrap_err();
         assert!(error.contains("already exists"), "{error}");
     }
 
@@ -450,7 +484,7 @@ mod tests {
         let repo = throwaway_repo("install-ignored");
         std::fs::write(repo.join(".gitignore"), format!("{SECRETS_DIR}/\n")).unwrap();
 
-        let done = install_model_secret(&repo, "sk-ant-covered-key-123").unwrap();
+        let done = install_model_secret(&repo, "sk-ant-covered-key-123", &[]).unwrap();
 
         // `.gitignore` already covered the store: nothing to add.
         assert!(

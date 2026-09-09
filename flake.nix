@@ -1128,6 +1128,9 @@ sandbox = false''
                 || docker network create "$NET" >/dev/null
               docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+              # Docker creates a missing bind source as root. Create it as the
+              # invoking user before repack_repos mounts it and tree staging writes it.
+              mkdir -p "$CAOS_DATA/stack"
               repack_repos
 
               # THE TREE, copied rather than mounted: a bind's source is
@@ -1139,7 +1142,6 @@ sandbox = false''
               # contents puts on disk is a SYMLINK").
               echo "==> staging the tree into $CAOS_DATA/stack/tree" >&2
               rm -rf "$CAOS_DATA/stack/tree.new"
-              mkdir -p "$CAOS_DATA/stack"
               cp -RL ${self} "$CAOS_DATA/stack/tree.new"
               chmod -R u+w "$CAOS_DATA/stack/tree.new"
               rm -rf "$CAOS_DATA/stack/tree"
@@ -1156,7 +1158,10 @@ sandbox = false''
               # loopback with the stack, so the address the server uses
               # (127.0.0.1) is meaningless to it.
               #
-              # SYS_ADMIN and the store volume are for the bind in bootstrap:
+              # SYS_ADMIN and the store volume are for the bind in bootstrap
+              # (and apparmor=unconfined with it: Ubuntu's docker-default
+              # profile denies the mount regardless of the capability, as
+              # runnerd notes for the worker's bind):
               # a volume cannot be mounted AT /nix, because this image's own
               # userland lives there and would be shadowed. Not a widening —
               # this container already holds the engine socket, which is
@@ -1167,6 +1172,7 @@ sandbox = false''
                 --network-alias caos-registry \
                 --network-alias caos-redis \
                 --cap-add SYS_ADMIN \
+                --security-opt apparmor=unconfined \
                 -p 9090:80 -p "$REGISTRY_PORT:5000" \
                 -v "$CAOS_DATA/stack:/state" \
                 -v caos-vol-mounted-nix:/mounted-nix \

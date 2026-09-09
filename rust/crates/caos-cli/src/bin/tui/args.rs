@@ -1,6 +1,6 @@
 //! TUI command-line arguments.
 
-use caos_cli::{normalized_username, TurnOptions};
+use caos_cli::{missing_image_arg, normalized_username, TurnOptions, LLM_CALL_ARG, LLM_STEP_ARG};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Args {
@@ -56,6 +56,7 @@ impl Args {
                 "--model" => parsed.turn.model = Some(value(&mut args, arg)?),
                 "--base-url" => parsed.turn.base_url = Some(value(&mut args, arg)?),
                 "-h" | "--help" => return Err(usage()),
+                other if parsed.turn.take_image_arg(other) => {}
                 other => return Err(format!("unknown option {other:?}\n{}", usage())),
             }
         }
@@ -101,29 +102,56 @@ impl Args {
                     .to_string(),
             );
         }
+        // A session that only lists or restores archives touches no worker, and
+        // the check above already forbids combining those with turn options —
+        // so the images are required for everything else, and required HERE so
+        // the message reaches the shell rather than the alternate screen.
+        if !parsed.list_archived && parsed.unarchive.is_none() {
+            for (argument, name) in [
+                (&parsed.turn.llm_step, LLM_STEP_ARG),
+                (&parsed.turn.llm_call, LLM_CALL_ARG),
+            ] {
+                if argument.is_none() {
+                    return Err(format!("{}\n{}", missing_image_arg(name), usage()));
+                }
+            }
+        }
         parsed.turn.username = Some(parsed.user.clone());
         Ok(parsed)
     }
 }
 
 pub(crate) fn usage() -> String {
-    "usage: caos tui [--username <name>] [--list-archived | --unarchive <conversation-id>] \
+    "usage: caos tui --llm-step:@=<path> --llm-call:@=<path> [--username <name>] \
+     [--list-archived | --unarchive <conversation-id>] \
      [--new | --from <commit>] [--base <revspec>] \
-     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]"
+     [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]\n\
+     \x20 the two image args also take :@@=<git ref>, :hash=<oid> and :docker=<ref>"
         .to_string()
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Args;
+
+    /// A conversation session names its two workers, so every parse that is
+    /// meant to SUCCEED carries them. `app.rs` uses this too.
+    pub(crate) fn with_images(raw: &[&str]) -> Vec<String> {
+        ["--llm-step:@=std/llm-step", "--llm-call:@=std/llm-call"]
+            .iter()
+            .chain(raw)
+            .map(|argument| (*argument).to_string())
+            .collect()
+    }
 
     #[test]
     fn username_is_the_one_user_identity() {
-        let default = Args::parse_with_default_user(&[], Some("alice".to_string())).unwrap();
+        let default =
+            Args::parse_with_default_user(&with_images(&[]), Some("alice".to_string())).unwrap();
         assert_eq!(default.user, "alice");
 
         let explicit = Args::parse_with_default_user(
-            &["--username".to_string(), "Bob".to_string()],
+            &with_images(&["--username", "Bob"]),
             Some("alice".to_string()),
         )
         .unwrap();
@@ -131,7 +159,7 @@ mod tests {
         assert_eq!(explicit.turn.username.as_deref(), Some("Bob"));
 
         let normalized = Args::parse_with_default_user(
-            &["--username".to_string(), "  Alice Smith  ".to_string()],
+            &with_images(&["--username", "  Alice Smith  "]),
             Some("alice".to_string()),
         )
         .unwrap();
@@ -139,31 +167,85 @@ mod tests {
         assert_eq!(normalized.turn.username.as_deref(), Some("Alice Smith"));
 
         let no_ambient =
-            Args::parse_with_default_user(&["--username".to_string(), "bob".to_string()], None)
-                .unwrap();
+            Args::parse_with_default_user(&with_images(&["--username", "bob"]), None).unwrap();
         assert_eq!(no_ambient.user, "bob");
 
-        assert!(Args::parse_with_default_user(&[], None).is_err());
+        assert!(Args::parse_with_default_user(&with_images(&[]), None).is_err());
         assert!(Args::parse_with_default_user(
-            &["--username".to_string(), " \t ".to_string()],
+            &with_images(&["--username", " \t "]),
             Some("alice".to_string()),
         )
         .is_err());
         assert!(Args::parse_with_default_user(
-            &["--username".to_string(), "alice\nbob".to_string()],
+            &with_images(&["--username", "alice\nbob"]),
             Some("alice".to_string()),
         )
         .is_err());
         assert!(Args::parse_with_default_user(
-            &["--username".to_string(), "ali\u{200b}ce".to_string()],
+            &with_images(&["--username", "ali\u{200b}ce"]),
             Some("alice".to_string()),
         )
         .is_err());
 
-        let ambient_error = Args::parse_with_default_user(&[], Some(" \t ".to_string()))
-            .expect_err("an unusable ambient identity was accepted");
+        let ambient_error =
+            Args::parse_with_default_user(&with_images(&[]), Some(" \t ".to_string()))
+                .expect_err("an unusable ambient identity was accepted");
         assert!(ambient_error.contains("$USER"), "{ambient_error}");
         assert!(ambient_error.contains("--username"), "{ambient_error}");
+    }
+
+    #[test]
+    fn a_conversation_names_its_workers_and_an_archive_listing_does_not() {
+        let named = Args::parse_with_default_user(
+            &with_images(&["--username", "alice"]),
+            Some("alice".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            named.turn.llm_step.as_deref(),
+            Some("--llm-step:@=std/llm-step")
+        );
+        assert_eq!(
+            named.turn.llm_call.as_deref(),
+            Some("--llm-call:@=std/llm-call")
+        );
+
+        // Every arg type the vocabulary has, not just `:@=`.
+        let pinned = Args::parse_with_default_user(
+            &[
+                "--llm-step:@@=git+https://example.invalid/caos?rev=abc&dir=std/llm-step"
+                    .to_string(),
+                "--llm-call:hash=0123456789abcdef".to_string(),
+            ],
+            Some("alice".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.turn.llm_call.as_deref(),
+            Some("--llm-call:hash=0123456789abcdef")
+        );
+
+        // Absent, the message names the flag and both spellings.
+        let missing = Args::parse_with_default_user(
+            &["--llm-step:@=std/llm-step".to_string()],
+            Some("alice".to_string()),
+        )
+        .expect_err("a conversation ran without its llm-call image");
+        assert!(missing.contains("--llm-call:@="), "{missing}");
+        assert!(missing.contains("caos-std/llm-call"), "{missing}");
+
+        // An archive listing runs no worker, so it needs neither — and
+        // combining the two is already refused as a turn option.
+        assert!(Args::parse_with_default_user(
+            &["--list-archived".to_string()],
+            Some("alice".to_string()),
+        )
+        .is_ok());
+        assert!(Args::parse_with_default_user(
+            &with_images(&["--list-archived"]),
+            Some("alice".to_string()),
+        )
+        .is_err());
     }
 
     #[test]

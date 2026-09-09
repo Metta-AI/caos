@@ -548,14 +548,22 @@ Seeded core is now **flake-builder, cargo, rustc, deep-deps, runner**.
 No `refs/caos/std`, no `/cas/std/<name>`, no `std` arg. Each piece, and the rule
 it turned on:
 
-- **Clients resolve by descent.** A workspace declares its entry points in
-  `./DEPS` (`./std/llm-step llm-step`), the root `.caos-expr` expands that into
-  `DEEP-DEPS/`, and `eval_workspace_dep` descends it. A repo that mounted caos
-  writes the same lines pointing at `./flake-inputs/caos/std/...`; the
-  declaration moves, the code does not, because relative paths are stable under
-  mounting. Evaluating is not optional — a std entry's expression names its deps
-  by mount (`run --base:@=DEEP-DEPS/rustc`), which exist only in the DEEPENED tree, so
+- **Clients resolve by descent.** An image is a PATH IN THE EVALUATED TREE, and
+  `resolve_cli_image` walks it from the root — so `--base:@=std/hello` works
+  from this checkout with nothing declared, and a directory that needs another
+  one reaches it through its own `DEPS`/`DEEP-DEPS/<name>`. Evaluating is not
+  optional: a std entry's expression names its deps by mount (`run
+  --base:@=DEEP-DEPS/rustc`), which exist only in the DEEPENED tree, so
   resolving the raw directory could never work.
+
+  A CLIENT COMMAND, though, does not descend a path of its own choosing — it is
+  handed one. `caos tui --llm-step:@=caos-std/llm-step` names the worker in the
+  invocation, typed like any image arg, so `:@@=` a locator serves a repo that
+  never mounted caos. The interim design had a root `DEPS` expanded into
+  `DEEP-DEPS/<name>` and an `eval_workspace_dep` that descended it, which meant
+  every repo driving the client had to declare caos' entry points under the
+  names the client happened to use — an ambient library with extra steps. Both
+  it and this repository's root `DEPS` are gone.
 - **`std` is not an arg.** It rode in every arg tree (so every cache key) and was
   materialized at `/cas/std` in every container. No worker reads it; the client
   no longer merges it; the in-image runner no longer creates `/cas/std`.

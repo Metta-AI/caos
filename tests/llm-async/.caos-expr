@@ -5,4 +5,4 @@
 # becomes idle, and a later turn is handed a deterministic completion notice.
 # The client curried two turns and blocked on each; worker-common.sh curries
 # them and polls the conversation ref, which is where the evidence lives anyway.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --async:@=async.sh --common:@=DEEP-DEPS/llm-test/worker-common.sh
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --async:@=async.sh --common:@=DEEP-DEPS/llm-test/worker-common.sh

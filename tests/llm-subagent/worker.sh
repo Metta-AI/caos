@@ -1,120 +1,265 @@
 #!/bin/bash
-# tests/llm-subagent — a WORKER test, in dev/worker-test (it needs git).
-#
-# Subagents are ordinary durable conversations: spawning returns stable
-# identifiers, and the child inherits a clean workspace and human owner.
-# Everything asserted here lives in refs on the server, which is the point —
-# the client was only currying the parent turn and blocking on it.
+# shellcheck disable=SC1090,SC1091,SC2034,SC2154
 set -euo pipefail
 
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
-# shellcheck disable=SC1090
 source /cas/args/common
 
 stage "workspace and scripted parent/child model"
 llm_test_setup
 
-rm -rf /tmp/ws && mkdir -p /tmp/ws/notes
+rm -rf /tmp/ws
+mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
-caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
-ws=$(caos hash /cas/ws)
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
 
-SUBAGENT_PROMPT="inspect the snapshot and report the notes file"
-SUBAGENT_DONE_TEXT="subagent round complete"
-rm -rf /tmp/stub && mkdir -p /tmp/stub
+SUBAGENT_PROMPT="write child-output.txt with the delegated result"
+TERMINAL_TEXT="subagent test round complete"
+rm -rf /tmp/stub
+mkdir -p /tmp/stub
 printf '{"content":[{"id":"toolu_spawn","input":{"prompt":"%s"},"name":"spawn_agent","type":"tool_use"}],"stop_reason":"tool_use"}' \
   "$SUBAGENT_PROMPT" > /tmp/stub/response-1.json
-# Parent and child race for the next two API slots. Both responses are terminal
-# and equivalent, so FIFO release order does not couple the test to scheduling.
-mkfifo /tmp/stub/response-2.json /tmp/stub/response-3.json
-stub_pid=""
-port=""
-start_stub /tmp/stub stub_pid port
+mkfifo /tmp/stub/response-2.json /tmp/stub/response-3.json \
+  /tmp/stub/response-4.json /tmp/stub/response-5.json
+start_stub /tmp/stub
 
-new_llm_conversation llm-subagent "$port" "$ws" \
+new_llm_conversation llm-subagent "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git workspace."
 
-stage "spawn a durable child conversation"
+stage "atomic spawn and independent child work"
 LLM_TEST_USERNAME=Alice
-dispatch_turn "$ws" "delegate a focused check"
-user1=$human
+admit_turn "delegate a focused edit"
 request1=$request
+start_turn
 
-for request_number in 2 3; do
-  request_seen=0
-  for _ in $(seq 1 300); do
-    if [ -e "/tmp/stub/request-$request_number.json" ]; then request_seen=1; break; fi
-    sleep 0.2
-  done
-  [ "$request_seen" -eq 1 ] || fail "subagent API request $request_number never arrived"
-  printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
-    "$SUBAGENT_DONE_TEXT" > "/tmp/stub/response-$request_number.json"
+# The parent and child race for the next model slot. The stub is sequential, so
+# inspect each blocked request and release its FIFO with the response belonging
+# to that conversation. Both conversations receive identical terminal text.
+child_write_sent=0
+parent_wait_sent=0
+parent_terminal_sent=0
+child_terminal_sent=0
+for request_number in 2 3 4 5; do
+  if ! wait_for_file "/tmp/stub/request-$request_number.json"; then
+    dump_conversation "$conversation_ref" "$request1"
+    fail "parent/child API request $request_number never arrived"
+  fi
+  if jq -e '.system | contains("You are a focused subagent")' \
+    "/tmp/stub/request-$request_number.json" >/dev/null; then
+    if [ "$child_write_sent" -eq 0 ]; then
+      printf '%s\n' \
+        '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","file-path":"child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+        > "/tmp/stub/response-$request_number.json"
+      child_write_sent=1
+    else
+      printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}\n' \
+        "$TERMINAL_TEXT" > "/tmp/stub/response-$request_number.json"
+      child_terminal_sent=1
+    fi
+  else
+    if grep -qF '"tool_use_id":"toolu_wait"' "/tmp/stub/request-$request_number.json"; then
+      printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}\n' \
+        "$TERMINAL_TEXT" > "/tmp/stub/response-$request_number.json"
+      parent_terminal_sent=1
+    else
+      wait_head=$(remote_tip "$conversation_ref") \
+        || fail "parent wait response could not read the conversation head"
+      wait_child=$($TOOL children --repo /tmp/repo --head "$wait_head" \
+        | jq -r '.id')
+      wait_child=${wait_child%%$'\n'*}
+      [ -n "$wait_child" ] || fail "parent wait response could not find the child"
+      printf '{"content":[{"id":"toolu_wait","input":{"child":"%s"},"name":"wait_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+        "$wait_child" > "/tmp/stub/response-$request_number.json"
+      parent_wait_sent=1
+    fi
+  fi
 done
+[ "$child_write_sent" -eq 1 ] || fail "the child never received its write call"
+[ "$child_terminal_sent" -eq 1 ] || fail "the child never received its terminal response"
+[ "$parent_wait_sent" -eq 1 ] || fail "the parent never joined the child relay"
+[ "$parent_terminal_sent" -eq 1 ] || fail "the parent never received its terminal response"
 
-head1=$(wait_turn) || {
-  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
-  fail "the parent turn never reached a terminal event"
-}
-events1=$(git log --first-parent --format=%B "$user1..$head1")
-spawn_detail=$(jq -r \
-  'select(.result.tool_use_id == "toolu_spawn") | .result.content[0].text' \
-  <<<"$events1")
-[ -n "$spawn_detail" ] || fail "spawn_agent result was not recorded"
-agent=$(jq -r '.agent // empty' <<<"$spawn_detail")
-agent_task=$(jq -r '.task // empty' <<<"$spawn_detail")
-agent_request=$(jq -r '.request // empty' <<<"$spawn_detail")
-[[ "$agent" = agent-* ]] || fail "spawn_agent returned invalid child id: $agent"
-assert_oid "$agent_task" "subagent task"
-assert_oid "$agent_request" "subagent request"
+wait_turn || fail "the parent spawn turn never reached a terminal event"
+head1=$head
+$TOOL tools --repo /tmp/repo --head "$head1" --request "$request1" > /tmp/parent-tools.jsonl
+spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
+[ -n "$spawn_record" ] || fail "spawn_agent has no tool record"
+[ "$(jq -r '.name' <<<"$spawn_record")" = spawn_agent ] \
+  || fail "spawn tool record has the wrong name"
+[ "$(jq -r '.status' <<<"$spawn_record")" = complete ] \
+  || fail "spawn tool record is not complete"
+[ "$(jq -r '.task // "none"' <<<"$spawn_record")" = none ] \
+  || fail "spawn tool record is not startless"
 
-# The child is INDEPENDENT of the parent turn, so its completion appends after
-# it — polled on the parent's spine, exactly as the async task does.
-agent_result=""
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
+  --round 0 --id toolu_spawn > /tmp/spawn-observation.json
+child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
+child_hex=${child#subagent-}
+if [ "$child" = "$child_hex" ] || [ "${#child_hex}" -ne 64 ]; then
+  fail "spawn returned invalid child id: $child"
+fi
+case "$child_hex" in *[!0-9a-f]*) fail "spawn returned invalid child id: $child" ;; esac
+expected_child=$($TOOL child-id --parent "$conv" --request "$request1" --round 0 \
+  --tool toolu_spawn) || fail "recomputing child id"
+expected_child=${expected_child#child }
+[ "$child" = "$expected_child" ] || fail "child id is not derived from the durable call"
+
+$TOOL children --repo /tmp/repo --head "$head1" > /tmp/children.initial.jsonl
+child_record=$(jq -c --arg child "$child" 'select(.id == $child)' /tmp/children.initial.jsonl)
+[ -n "$child_record" ] || fail "parent has no child record"
+initial_head=$(jq -r '.initial_head' <<<"$child_record")
+child_request=$(jq -r '.request' <<<"$child_record")
+relay=$(jq -r '.relay' <<<"$child_record")
+assert_oid "$initial_head" "child initial head"
+assert_oid "$child_request" "child request"
+assert_oid "$relay" "child relay"
+wait_record=$(jq -c 'select(.id == "toolu_wait")' /tmp/parent-tools.jsonl)
+[ "$(jq -r '.status' <<<"$wait_record")" = complete ] \
+  || fail "wait_agent did not complete"
+[ "$(jq -r '.task' <<<"$wait_record")" = "$relay" ] \
+  || fail "wait_agent did not join the child's relay"
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
+  --round 1 --id toolu_wait > /tmp/wait-observation.json
+[ "$(jq -r '.child' /tmp/wait-observation.json)" = "$child" ] \
+  || fail "wait_agent observation names the wrong child"
+[ "$(jq -r '.status' /tmp/wait-observation.json)" = completed ] \
+  || fail "wait_agent observation is not completed"
+[ "$(jq -r '.child' /tmp/spawn-observation.json)" = "$child" ] \
+  || fail "spawn observation child disagrees"
+[ "$(jq -r '.initial_head' /tmp/spawn-observation.json)" = "$initial_head" ] \
+  || fail "spawn observation initial head disagrees"
+[ "$(jq -r '.request' /tmp/spawn-observation.json)" = "$child_request" ] \
+  || fail "spawn observation request disagrees"
+
+stage "child root, ownership, workspace, and absence of membership"
+spawn_commit=$($TOOL parents --repo /tmp/repo --head "$head1" \
+  | while read -r oid kind; do if [ "$kind" = subagent.spawn ]; then printf '%s\n' "$oid"; fi; done)
+assert_oid "$spawn_commit" "parent spawn commit"
+pre_spawn=$(git rev-parse "$spawn_commit^1")
+parent_main=$(jq -r '.input_workspace' <<<"$spawn_record")
+[ "$(jq -r '.workspace_name' <<<"$spawn_record")" = main ] \
+  || fail "spawn tool did not target main"
+[ "$(jq -r '.initial_workspace' <<<"$child_record")" = "$parent_main" ] \
+  || fail "child record did not pin main at spawn"
+
+child_ref=$($TOOL ref --id "$child") || fail "forming child ref"
+child_ref=${child_ref#ref }
+child_tip_output=$($TOOL fetch --repo /tmp/repo --ref "$child_ref") \
+  || fail "child has no canonical ref"
+child_tip=${child_tip_output#head }
+assert_oid "$child_tip" "child ref head"
+git merge-base --is-ancestor "$initial_head" "$child_tip" \
+  || fail "child ref does not descend from its recorded initial head"
+initial_kinds=$($TOOL parents --repo /tmp/repo --head "$initial_head" --validate \
+  | while read -r _ kind; do printf '%s\n' "$kind"; done | paste -sd,)
+[ "$initial_kinds" = request.admit,message.append,conversation.root ] \
+  || fail "child initial chain is not admit -> prompt -> root: $initial_kinds"
+record "$initial_head" .caos/identity.json > /tmp/child-identity.json
+[ "$(jq -r '.id' /tmp/child-identity.json)" = "$child" ] \
+  || fail "child root identity id is wrong"
+[ "$(jq -r '.owner.parent' /tmp/child-identity.json)" = "$conv" ] \
+  || fail "child root owner parent is wrong"
+[ "$(jq -r '.owner.parent_head' /tmp/child-identity.json)" = "$pre_spawn" ] \
+  || fail "child root owner parent_head is not the pre-spawn head"
+[ "$(workspace_commit "$initial_head")" = "$parent_main" ] \
+  || fail "child initial main does not equal parent main at spawn"
+
+child_key=$(printf '%s' "$child" | od -An -tx1 | tr -d ' \n')
+membership=$(git ls-remote --refs caos \
+  "refs/caos/v3/users/*/conversations/*/$child_key") \
+  || fail "checking child membership refs"
+[ -z "$membership" ] || fail "child unexpectedly has a user membership ref"
+
+stage "relay terminal checkpoint"
+terminal_record=""
+seen=""
 for _ in $(seq 1 300); do
-  head1=$(current_head)
-  events1=$(git log --first-parent --format=%B "$user1..$head1")
-  agent_result=$(jq -r --arg task "$agent_task" \
-    'select(.async.task == $task and (.async.status == "complete" or .async.status == "failed")) | .async.result // empty' \
-    <<<"$events1")
-  if [ -n "$agent_result" ]; then break; fi
+  if remote=$(remote_tip "$conversation_ref") && [ "$remote" != "$seen" ]; then
+    seen=$remote
+    candidate=$remote
+    terminal_record=$($TOOL children --repo /tmp/repo --head "$candidate" \
+      | jq -c --arg child "$child" 'select(.id == $child and .status != "running")')
+    if [ -n "$terminal_record" ]; then
+      head1=$candidate
+      break
+    fi
+  fi
   sleep 0.2
 done
-assert_oid "$agent_result" "subagent result"
-agent_ref="refs/caos/v2/conversations/$agent/head"
-agent_head=$(remote_tip "$agent_ref") || fail "subagent has no canonical head"
-[ "$agent_head" = "$agent_result" ] || fail "subagent result is not its canonical head"
-git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$agent_head" \
-  || fail "fetching subagent head"
+[ -n "$terminal_record" ] || fail "child terminal checkpoint never reached the parent"
+[ "$(jq -r '.status' <<<"$terminal_record")" = completed ] \
+  || fail "child terminal status is not completed"
+terminal_head=$(jq -r '.terminal_head' <<<"$terminal_record")
+assert_oid "$terminal_head" "child terminal head"
+child_tip_output=$($TOOL fetch --repo /tmp/repo --ref "$child_ref") \
+  || fail "fetching terminal child ref"
+[ "${child_tip_output#head }" = "$terminal_head" ] \
+  || fail "parent terminal checkpoint is not the child ref head"
+child_main=$(jq -r '.child_workspaces.main.commit // empty' <<<"$terminal_record")
+child_base=$(jq -r '.child_workspaces.main.initial // empty' <<<"$terminal_record")
+assert_oid "$child_main" "terminal child main"
+[ "$child_base" = "$parent_main" ] || fail "terminal child main lost its initial commit"
+terminal_count=$($TOOL parents --repo /tmp/repo --head "$head1" \
+  | while read -r _ kind; do if [ "$kind" = subagent.terminal ]; then echo x; fi; done \
+  | wc -l | tr -d ' ')
+[ "$terminal_count" -eq 1 ] || fail "parent has $terminal_count subagent.terminal commits"
+fetch_code "$child_main" "fetching terminal child workspace"
+[ "$(git show "$child_main:child-output.txt")" = "written by child" ] \
+  || fail "child did not write child-output.txt"
 
-stage "child identity, ownership, and inherited workspace"
-agent_key=$(printf '%s' "$agent" | od -An -tx1 | tr -d ' \n')
-active_ref="refs/caos/v2/users/u-416c696365/conversations/active/c-$agent_key"
-[ -n "$(remote_tip "$active_ref")" ] \
-  || fail "subagent is absent from its human owner's active index"
-title_ref="refs/caos/v2/conversations/$agent/title"
-title=$(remote_tip "$title_ref")
-[ -n "$title" ] || fail "subagent has no title ref"
-git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$title" \
-  || fail "fetching subagent title"
-[ "$(git cat-file blob "$title")" = "$SUBAGENT_PROMPT" ] || fail "subagent title is wrong"
-grep -qF "$SUBAGENT_DONE_TEXT" <<<"$(git show -s --format=%B "$agent_head")" \
-  || fail "subagent terminal report is missing"
-[ "$(git show "$agent_head:notes/todo.txt")" = "hello notes" ] \
-  || fail "subagent did not inherit the clean workspace snapshot"
-if git cat-file -e "$agent_head:.caos" 2>/dev/null; then
-  fail "subagent inherited parent harness state"
-fi
-agent_events=$(git log --first-parent --format=%B "$agent_head")
-grep -qF "\"conversation\":\"$conv\"" <<<"$agent_events" \
-  || fail "subagent root lacks its durable parent conversation"
-grep -qF "\"request\":\"$request1\"" <<<"$agent_events" \
-  || fail "subagent root lacks its durable parent request"
-grep -qF '"call":"toolu_spawn"' <<<"$agent_events" \
-  || fail "subagent root lacks its durable parent call"
-grep -qF '"username":"Alice"' <<<"$agent_events" \
-  || fail "subagent root lacks its human owner"
+stage "next parent turn harvests child code"
+head=$head1
+mkfifo /tmp/stub/response-6.json
+printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}\n' \
+  "$TERMINAL_TEXT" > /tmp/stub/response-7.json
+admit_turn "apply the child result"
+request2=$request
+start_turn
+wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
+printf '{"content":[{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+  "$child" > /tmp/stub/response-6.json
+wait_turn || fail "the harvest turn never reached a terminal event"
+head2=$head
+parent_after=$(workspace_commit "$head2")
+[ "$parent_after" != "$parent_main" ] || fail "harvest did not move parent main"
+fetch_code "$parent_after" "fetching harvested parent workspace"
+[ "$(git show "$parent_after:child-output.txt")" = "written by child" ] \
+  || fail "harvested parent tree lacks the child's file"
+$TOOL tool-observation --repo /tmp/repo --head "$head2" --request "$request2" \
+  --round 0 --id toolu_harvest > /tmp/harvest-observation.json
+resolution=$(jq -r '.kind // empty' /tmp/harvest-observation.json)
+case "$resolution" in direct|merged) ;; *) fail "harvest resolution is $resolution" ;; esac
 
-stage "done"
-printf 'llm-subagent: ALL PASS\n' > /tmp/report
-cat /tmp/report >&2
-caos put /tmp/report /cas/out
+stage "spines and parent-only cost"
+assert_spine "$head2"
+assert_spine "$terminal_head"
+spawn_count=0
+terminal_count=0
+apply_count=0
+harvest_complete_count=0
+while read -r _ kind harvest_present; do
+  case "$kind" in
+    subagent.spawn) spawn_count=$((spawn_count + 1)) ;;
+    subagent.terminal) terminal_count=$((terminal_count + 1)) ;;
+    subagent.apply) apply_count=$((apply_count + 1)) ;;
+    tool.complete)
+      if [ "$harvest_present" = true ]; then
+        harvest_complete_count=$((harvest_complete_count + 1))
+      fi
+      ;;
+    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start) ;;
+    *) fail "unexpected parent event $kind while child ran" ;;
+  esac
+done < <($TOOL parents --repo /tmp/repo --head "$head2" \
+    --present-path ".caos/tools/$request2/0000/toolu_harvest.json" \
+  | while read -r oid kind harvest_present; do
+      if [ "$oid" = "$pre_spawn" ]; then break; fi
+      printf '%s %s %s\n' "$oid" "$kind" "$harvest_present"
+    done)
+[ "$spawn_count" -eq 1 ] || fail "parent has $spawn_count spawn commits"
+[ "$terminal_count" -eq 1 ] || fail "parent has $terminal_count terminal commits"
+[ "$apply_count" -eq 1 ] || fail "parent has $apply_count apply commits"
+[ "$harvest_complete_count" -eq 1 ] \
+  || fail "parent has $harvest_complete_count harvest completion commits"
+
+pass llm-subagent

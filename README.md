@@ -92,12 +92,13 @@ caos's own internal pushes:
 
 ```bash
 if [ "${1:-}" != caos ]; then
-  time CAOS_SALT=$(date +%s) result/bin/caos-cli run-tool caos-test
+  time result/bin/caos-cli run-tool caos-test --test-salt=$(date +%s)
 fi
 ```
 
 Check the elapsed time too: a passing suite can still reveal a test timing
-regression.
+regression. Use the same `--test-salt` command on main and your branch, on the
+same machine, and compare runs with similar cache warmth.
 
 > Nix flakes only see files **tracked by git** (uncommitted edits to tracked
 > files are included, but new files are not). After adding a new source file,
@@ -384,8 +385,12 @@ the object machinery through a one-way dependency. Their difference is the
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `talk` / `chat` — agent conversations over the current protocol
-    (`design/chat.md`; `design/agent-harness.md` records historical rationale);
-    `caos talk "<prompt>"` is the everyday form;
+    (`design/chat.md`);
+    `caos talk "<prompt>"` is the everyday form. A conversation NAMES the two
+    workers it runs, as ordinary image args — `--llm-step:@=std/llm-step`,
+    `--llm-call:@=std/llm-call` here, `--llm-step:@=caos-std/llm-step` in a repo
+    that mounted caos, or `:@@=<git ref>` in one that only pinned it. There is
+    no default and no path this client goes looking in;
   - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
     non-zero, for CI). Offline — no server (design/secrets.md).
@@ -403,9 +408,14 @@ ignore rule (rust/crates/caos-cli/TUI.md). The same setup by hand is:
 # .caos-secrets/anthropic-api-key
 name=anthropic-api-key
 value:@=.anthropic-api-key-value
-reader=DEEP-DEPS/llm-step
-reader=DEEP-DEPS/llm-call
+reader=std/llm-step
+reader=std/llm-call
 ```
+
+The two `reader=` lines are the paths the conversation's `--llm-step:@=` and
+`--llm-call:@=` args name, since a reader is the expression it grants to — so
+they move together, and a repo that mounted caos writes `caos-std/…` in both
+places. `caos tui` derives them from the args it was given.
 
 Run `caos-cli secrets` once to add the random `entropy=` used for cache
 isolation. The value file must hold the key verbatim — no trailing newline,
@@ -664,7 +674,7 @@ whose `.caos-expr` says how it is built, and a caller reaches one by DESCENT —
 `DEPS` line naming a path, expanded by a root `.caos-expr` into a
 `DEEP-DEPS/<name>` mount (`design/caos-expr.md`).
 
-A workspace declares what it reaches for in its own `DEPS`:
+A directory declares what it reaches for in its own `DEPS`:
 
 ```
 ./std/bash bash
@@ -674,6 +684,15 @@ A workspace declares what it reaches for in its own `DEPS`:
 and a repo that mounted caos writes the same lines against
 `./flake-inputs/caos/std/...`. Relative paths are stable under mounting, so the
 declaration moves and the code does not.
+
+**A `DEPS` is how one directory in a tree reaches another; it is not how a
+CLIENT reaches a tool.** This repository has no root `DEPS`, and a client
+command that needs a worker names it in the invocation instead —
+`caos tui --llm-step:@=std/llm-step` — typed like any image arg, so `:@@=` a
+git ref works as well as a path. A root `DEPS` would have meant every repo
+driving `caos tui` had to declare caos' entry points under the names this
+client happened to use, which is exactly the ambient library the rest of this
+section removes.
 
 The five entries that cannot be built by the machinery they ARE — `flake-builder`
 (a flake built by the flake-builder), `cargo`, `runner`, `rustc` and `deep-deps`
@@ -690,8 +709,12 @@ overwrite. Bringing a stack up IS publishing; there is no separate command.
 
 ```bash
 ./stack/build-builtins.sh                 # bootstrap the seeded core, by hand
-./stack/build-builtins.sh bash cargo      # a subset
 ```
+
+It takes no arguments. The five entries it seeds are interdependent — cargo's
+record is keyed on flake-builder's delta, rustc's on runner's and cargo's — so
+a subset would not be a smaller bootstrap but a seed tree missing records,
+whose jobs park until a 503 that blames capacity.
 
 ## Local testing
 
@@ -702,7 +725,9 @@ overwrite. Bringing a stack up IS publishing; there is no separate command.
   can be far older than the `flake.lock` that names it — and the symptom is an
   error that reads like a caos bug. `caos-cli`'s usage banner carries the same
   revision.
-- Test with `caos-cli run-tool caos-test`. This builds and tests. Each test gets a stack, built from source. No need to rebuild or restart caosd
+- Use `caos-cli run-tool caos-test` for a cached run, or add a fresh
+  `--test-salt` to rerun every test. The suite builds one shared dev stack from
+  the source under test; no need to rebuild or restart the host stack.
 
 ```bash
 caosd up      # bring the stack up + publish all of std, then return. Updates it if already running
@@ -719,22 +744,32 @@ runner starts a container, a worker reads `/cas/args`, a result comes back — a
 puts the answer on stdout in one command:
 
 ```bash
-caos-cli run --base:@=DEEP-DEPS/hello --greeting=hi --who=world
+caos-cli run --base:@=std/hello --greeting=hi --who=world
 # hello: 2 arguments
 #   greeting = hi
 #   who = world
 ```
 
-Declare it first (`./std/hello hello` in your `DEPS`, or reach it by locator:
-`--base:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello`).
+A `:@=` image is a path in the EVALUATED workspace tree, so `std/hello` works
+from this checkout with nothing declared. From elsewhere, reach it by locator —
+`--base:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello` — or
+mount it and name the mount.
 
 ```bash
 caos-cli run-tool caos-build      # the worker images, from the deployed binaries
 caos-cli run-tool caos-test       # images + the whole test suite
 caos-cli run-tool caos-test --only="unit-test rgrep" # just these tests (cache shared
                                     # with full runs, both directions)
-CAOS_SALT=$(date +%s) caos-cli run-tool caos-test   # force a re-run (retry a flake)
+time result/bin/caos-cli run-tool caos-test --test-salt=$(date +%s) # rerun all tests
 ```
+
+For routine test timing and retrying a flaky test, use `--test-salt`: it gives
+the test jobs fresh cache keys while allowing build and stack-setup work to
+reuse cached results. Combine it with `--only` to rerun selected tests.
+`CAOS_SALT` is broader: it re-keys all worker jobs, though flake builds retain
+their separate cache keys. Use it when intentionally exercising that wider
+path, such as push-path validation, rather than for the normal test benchmark.
+See [the performance section of SPEC.md](SPEC.md#principles-of-performance).
 
 nix builds only the *host* stack — the server, the runner daemon, the seeder,
 and the seeded core images. Everything the suite tests is compiled from the

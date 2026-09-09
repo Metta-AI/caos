@@ -1,13 +1,5 @@
 #!/bin/bash
-# tests/llm-async — a WORKER test, in dev/worker-test (it needs git).
-#
-# Durable independent work through llm-step: the primary turn queues a request
-# and becomes idle, completion appends later, and the following turn receives a
-# deterministic completion notice.
-#
-# THE BARRIER IS A SECOND STUB WITH A FIFO RESPONSE. async.sh POSTs to it and
-# blocks reading the reply, so "the conversation went idle while the work was
-# still running" is a fact this test controls rather than races against.
+# shellcheck disable=SC1091,SC2034,SC2154
 set -euo pipefail
 
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
@@ -16,16 +8,15 @@ source /cas/args/common
 
 stage "workspace, worker barrier, and scripted model"
 llm_test_setup
-caos get -r /cas/args/bash || fail "reading the bash image"
-caos get /cas/args/async  || fail "reading async.sh"
+caos get /cas/args/async || fail "reading async.sh"
 
-rm -rf /tmp/ws && mkdir -p /tmp/ws/notes
+rm -rf /tmp/ws
+mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
-caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the workspace"
-ws=$(caos hash /cas/ws)
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
 
-# The independent worker reaches this server and blocks on its response FIFO.
-rm -rf /tmp/async-gate && mkdir -p /tmp/async-gate
+rm -rf /tmp/async-gate
+mkdir -p /tmp/async-gate
 mkfifo /tmp/async-gate/response-1.json
 gate_pid=""
 gate_port=""
@@ -44,32 +35,21 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$ASYNC_QUEUED_TEXT" > /tmp/stub/response-2.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
   "$ASYNC_OBSERVED_TEXT" > /tmp/stub/response-3.json
-stub_pid=""
-port=""
-start_stub /tmp/stub stub_pid port
+start_stub /tmp/stub
 
-new_llm_conversation llm-async "$port" "$ws" \
+new_llm_conversation llm-async "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git workspace."
 
-stage "primary turn queues work and becomes idle"
-dispatch_turn "$ws" "queue the independent request"
-user1=$human
-head1=$(wait_turn) || {
-  echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
-  fail "the primary turn never reached a terminal event"
-}
-terminal1=$(git show -s --format=%B "$head1")
-grep -qF '"status":"idle"' <<<"$terminal1" \
-  || fail "primary turn did not become idle after run_async"
-grep -qF "$ASYNC_QUEUED_TEXT" <<<"$terminal1" \
-  || fail "primary turn did not finish with its scripted response"
-events1=$(git log --first-parent --format=%B "$user1..$head1")
-mapfile -t pending_tasks < <(
-  jq -r 'select(.async.status == "pending") | .async.task' <<<"$events1"
-)
-[ "${#pending_tasks[@]}" -eq 1 ] || fail "run_async did not record exactly one task"
-task=${pending_tasks[0]}
+stage "primary turn records pending work and becomes idle"
+dispatch_turn "queue the independent request"
+wait_turn || fail "the primary turn never reached a terminal head"
+head1=$head
+workspace1=$(workspace_commit "$head1")
+$TOOL async --repo /tmp/repo --head "$head1" > /tmp/async.pending
+task=$(jq -r 'select(.status == "pending") | .task' /tmp/async.pending)
 assert_oid "$task" "pending task"
+[ "$(grep -c '"status":"pending"' /tmp/async.pending)" -eq 1 ] \
+  || fail "run_async did not record exactly one pending task"
 grep -qF '"name":"run_async"' /tmp/stub/request-1.json \
   || fail "run_async was not registered for the model"
 grep -qF '"tool_use_id":"toolu_async"' /tmp/stub/request-2.json \
@@ -77,24 +57,21 @@ grep -qF '"tool_use_id":"toolu_async"' /tmp/stub/request-2.json \
 grep -qF "$task" /tmp/stub/request-2.json \
   || fail "run_async's immediate result omitted the task"
 
-gate_reached=0
-for _ in $(seq 1 300); do
-  if [ -e /tmp/async-gate/request-1.json ]; then gate_reached=1; break; fi
-  sleep 0.2
-done
-[ "$gate_reached" -eq 1 ] || fail "independent worker never reached its barrier"
+wait_for_file /tmp/async-gate/request-1.json \
+  || fail "independent worker never reached its barrier"
 [ "$(remote_tip "$conversation_ref")" = "$head1" ] \
   || fail "conversation advanced while independent work was blocked"
 
-stage "completion appends and is observed next turn"
+stage "completion changes only the async record"
 printf '%s\n' '{"content":[],"stop_reason":"end_turn"}' > /tmp/async-gate/response-1.json
 completion_head=""
+seen=$head1
 for _ in $(seq 1 300); do
   candidate=$(remote_tip "$conversation_ref")
-  if [ "$candidate" != "$head1" ]; then
-    git -c fetch.negotiationAlgorithm=noop fetch --quiet caos "$candidate" \
-      || fail "fetching independent completion"
-    if [ "$(git show -s --format=%B "$candidate" | jq -r '.async.status // empty')" = complete ]; then
+  if [ "$candidate" != "$seen" ]; then
+    seen=$candidate
+    if $TOOL async --repo /tmp/repo --head "$candidate" --task "$task" \
+      | jq -e '.status == "complete"' >/dev/null 2>&1; then
       completion_head=$candidate
       break
     fi
@@ -103,28 +80,33 @@ for _ in $(seq 1 300); do
 done
 [ -n "$completion_head" ] || fail "independent completion was not appended"
 [ "$(git rev-parse "$completion_head^1")" = "$head1" ] \
-  || fail "completion did not append after the primary turn"
-[ "$(git rev-parse "$completion_head^{tree}")" = "$(git rev-parse "$head1^{tree}")" ] \
-  || fail "completion changed the workspace"
-
-completion_event=$(git show -s --format=%B "$completion_head")
-task_result=$(jq -r --arg task "$task" \
-  'select(.async.task == $task and .async.status == "complete") | .async.result // empty' \
-  <<<"$completion_event")
+  || fail "completion did not append to the idle head"
+changed=$(git diff-tree --no-commit-id --name-only -r "$head1" "$completion_head")
+[ "$changed" = ".caos/async/$task.json" ] \
+  || fail "completion changed more than its async record: $changed"
+[ "$(workspace_commit "$completion_head")" = "$workspace1" ] \
+  || fail "completion changed main"
+$TOOL async --repo /tmp/repo --head "$completion_head" --task "$task" > /tmp/async.complete
+task_result=$(jq -r 'select(.status == "complete") | .result' /tmp/async.complete)
 assert_oid "$task_result" "independent task result"
 
-tree1=$(git rev-parse "$completion_head^{tree}")
-dispatch_turn "$tree1" "what completed?" "$completion_head"
-head2=$(wait_turn) || fail "the post-completion turn never reached a terminal event"
-grep -qF "$ASYNC_OBSERVED_TEXT" <<<"$(git show -s --format=%B "$head2")" \
-  || fail "post-completion turn did not finish"
+stage "the next turn receives a durable system notice"
+head=$completion_head
+dispatch_turn "what completed?"
+wait_turn || fail "the post-completion turn never reached a terminal head"
+head2=$head
 notice="Independent task $task is complete. Its result is $task_result."
 grep -qF "$notice" /tmp/stub/request-3.json \
   || fail "later model step did not observe independent completion"
-[ "$(git rev-parse "$head2^{tree}")" = "$tree1" ] \
-  || fail "post-completion observation changed the workspace"
+$TOOL transcript --repo /tmp/repo --head "$head2" > /tmp/async.transcript
+system_notice=0
+while read -r _ role _ _ encoded; do
+  if [ "$role" = system ] && [ "$(printf '%s' "$encoded" | jq -r .)" = "$notice" ]; then
+    system_notice=1
+  fi
+done < /tmp/async.transcript
+[ "$system_notice" -eq 1 ] || fail "completion notice is not a system transcript entry"
+[ "$(workspace_commit "$head2")" = "$workspace1" ] \
+  || fail "post-completion observation changed main"
 
-stage "done"
-printf 'llm-async: ALL PASS\n' > /tmp/report
-cat /tmp/report >&2
-caos put /tmp/report /cas/out
+pass llm-async

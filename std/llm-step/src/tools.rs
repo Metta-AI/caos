@@ -15,10 +15,11 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde_json::{json, Value};
 use worker_common::{caos, entries, file_name, link, path, scratch};
+
+use crate::{fresh, fresh_name, result_block};
 
 /// The reserved workspace entry (step transcripts); refused in tool paths.
 const STEP_DIR: &str = ".caos";
@@ -58,18 +59,26 @@ const EDIT_HELP: &str = "Replace text in a workspace file. `old-string` must mat
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
+const GREP_HELP: &str = "Search the workspace with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
+@param pattern The regular expression to search for.
+@param [path] Directory or file to search (relative to `root`, or to the workspace root); omit for everything.
+@param [root] Optional commit or tree hash to search as of another revision. Omit for the current workspace.";
+
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
-/// tool takes. `git` is always false: a built-in that needs history context
-/// (log/show/diff) declares `@git` in its help and is bound it there.
-fn builtin_declaration(name: &str, help: &str) -> Value {
-    let (doc, args, _git) = parse_help(&format!("built-in {name}"), help);
-    tree_tool_declaration(&TreeTool {
+/// tool takes. History tools in `githist.rs` use the same builder with `@git`.
+pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
+    let (doc, args, git) = parse_help(&format!("built-in {name}"), help);
+    TreeTool {
         name: name.to_string(),
         doc,
         args,
-        git: false,
-    })
+        git,
+    }
+}
+
+fn builtin_declaration(name: &str, help: &str) -> Value {
+    tree_tool_declaration(&builtin_tool(name, help))
 }
 
 /// The inline tools' registry entries, alongside `bash`'s.
@@ -84,14 +93,22 @@ pub fn declarations() -> Vec<Value> {
     .map(|(name, help)| builtin_declaration(name, help))
     .collect()
 }
+
+/// The grep tool's registry entry (present only when a `grep-image` is
+/// curried — see `Config`). It runs as the rgrep fold sub-run; this module
+/// contributes the declaration, the pre-launch validation, and the
+/// transcript-boundary rendering of its sparse result tree.
+pub fn grep_declaration() -> Value {
+    builtin_declaration("grep", GREP_HELP)
+}
+
 // ---- Tree tools (caos-tools/<name>/, SPEC "Tools") -------------------------
 
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
-/// the file tools) must stay stable whatever the tree carries, the built-in
-/// history tools (`log`/`show`/`diff`, std entries of their own) are standard, not
-/// project-defined, and the harness's own std tools (`grep`, the caos-*
-/// family) are offered from its version rather than the tree's.
+/// the file tools) must stay stable whatever the tree carries, and the
+/// built-in history tools (`log`/`show`/`diff` — see `githist.rs`) are
+/// standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
     "bash",
     "grep",
@@ -106,9 +123,10 @@ const RESERVED_TOOLS: &[&str] = &[
     "caos-test",
     "caos-test-result",
     "spawn_agent",
+    "wait_agent",
+    "harvest_agent",
     "run_async",
 ];
-
 
 /// The tree's tool directory (`caos-tools/` in the workspace), expanded one
 /// level; `None` when the tree defines no tools.
@@ -194,7 +212,7 @@ fn parse_arg(payload: &str) -> Option<TreeArg> {
 /// for the caller to placeholder. A malformed `@param` is skipped with a
 /// message. This is the DURABLE parser: Phase 4 feeds it the isolated `--help`
 /// here-string; today it is fed text lifted from the script header (below).
-pub fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
+fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
     let mut git = false;
@@ -355,21 +373,9 @@ pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
 /// the caller, since the harness itself curried the image.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
-    // `help` sits at the top level of a tool curried onto a plain IMAGE
-    // (caos-build/caos-test curry onto test-stack), and under `args/` when the
-    // base is itself a curry node — which is what a rustc-built worker is, since
-    // rustc curries the compiled binary onto the runner pool. `grep` is the
-    // first std tool that is both compiled and self-describing, so it is the
-    // first to land in the nested shape. Look in both rather than making a
-    // tool's structure depend on how its image happened to be produced.
-    let mut help_path = format!("{dir}/help");
+    let help_path = format!("{dir}/help");
     if !Path::new(&help_path).exists() {
-        let nested = format!("{dir}/args/help");
-        caos(["get", &format!("{dir}/args")]).ok();
-        if !Path::new(&nested).exists() {
-            return Ok(None);
-        }
-        help_path = nested;
+        return Ok(None);
     }
     caos(["get", &help_path])?;
     let help = fs::read_to_string(&help_path).map_err(|e| format!("reading {help_path}: {e}"))?;
@@ -437,11 +443,10 @@ pub fn tree_tool(ws: &str, name: &str) -> Result<Option<TreeTool>, String> {
 /// returning the `--<name>=<value>` pairs for the curry. A missing required
 /// arg, an undeclared one, or a non-scalar value is the model's mistake, so it
 /// comes back as a ready-made `is_error` tool_result rather than a worker
-/// error — a bad call is something the model reads and retries, not a
-/// worker failure.
+/// error — the same contract `grep_precheck` uses.
 pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>, Value> {
     let id = call["id"].as_str().unwrap_or("");
-    let fail = |msg: String| Err(block(id, &msg, true));
+    let fail = |msg: String| Err(result_block(id, &msg, true));
     let empty = serde_json::Map::new();
     let input = call["input"].as_object().unwrap_or(&empty);
     for key in input.keys() {
@@ -514,7 +519,109 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
         }
         text = format!("[... truncated ...]\n{}", &text[cut..]);
     }
-    Ok(block(id, text.trim_end(), is_err))
+    Ok(result_block(id, text.trim_end(), is_err))
+}
+
+/// Validate a grep call before its sub-run launches: the pattern must compile
+/// and the scope must exist. Returns the scope's CAS path and its
+/// workspace-relative prefix (`""` for the root) — or, on a user mistake, the
+/// ready-made `is_error` tool_result.
+pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> {
+    let id = call["id"].as_str().unwrap_or("");
+    let fail = |msg: String| Err(result_block(id, &msg, true));
+    let Some(pattern) = call["input"]["pattern"].as_str() else {
+        return fail("grep needs a string `pattern`".to_string());
+    };
+    if let Err(e) = regex::Regex::new(pattern) {
+        return fail(format!("invalid pattern: {e}"));
+    }
+    let root = opt_hash(call, "root");
+    let comps = match components_opt(call, "path") {
+        Ok(c) => c,
+        Err(User(msg)) => return fail(msg),
+        Err(Infra(e)) => return fail(e),
+    };
+    // `resolve` handles all four cases: no root + no path is the workspace
+    // root; a `root` hash roots the search at another revision's tree.
+    match resolve(root.as_deref(), ws, &comps) {
+        Ok(p) => Ok((p.to_string_lossy().into_owned(), comps.join("/"))),
+        Err(User(msg)) => fail(msg),
+        Err(Infra(e)) => fail(e),
+    }
+}
+
+/// The tool_result block for a finished grep: walk the sparse result tree and
+/// render classic `path:linenum:line` lines while they fit the transcript
+/// budget; past it, count the remaining matching files and say how to narrow.
+pub fn grep_result_block(id: &str, result: &str, scope: &str) -> Result<Value, String> {
+    let _ = caos(["get", result]);
+    let p = Path::new(result);
+
+    // A file-scoped grep's result is the match blob itself.
+    if p.is_file() {
+        let text = fs::read_to_string(p).map_err(|e| format!("reading {result}: {e}"))?;
+        if text.is_empty() {
+            return Ok(result_block(id, "no matches", false));
+        }
+        let rendered: String = text.lines().map(|l| format!("{scope}:{l}\n")).collect();
+        return Ok(result_block(id, rendered.trim_end(), false));
+    }
+
+    let mut render = GrepRender {
+        out: String::new(),
+        overflow_files: 0,
+    };
+    let prefix = if scope.is_empty() {
+        String::new()
+    } else {
+        format!("{scope}/")
+    };
+    render.walk(p, &prefix)?;
+    if render.out.is_empty() && render.overflow_files == 0 {
+        return Ok(result_block(id, "no matches", false));
+    }
+    let mut text = render.out;
+    if render.overflow_files > 0 {
+        text += &format!(
+            "\n[truncated — {} more matching file(s); narrow the pattern or grep a \
+             subdirectory]",
+            render.overflow_files
+        );
+    }
+    Ok(result_block(id, text.trim_end(), false))
+}
+
+struct GrepRender {
+    out: String,
+    /// Matching files not rendered once the budget was hit.
+    overflow_files: usize,
+}
+
+impl GrepRender {
+    /// Depth-first over the sparse tree: files are match blobs (`linenum:line`
+    /// per line), subtrees recurse. Past [`MAX_READ_BYTES`] of output, stop
+    /// reading contents and just count matching files.
+    fn walk(&mut self, dir: &Path, prefix: &str) -> Result<(), String> {
+        let _ = caos(["get", path(dir)]);
+        for child in entries(path(dir))? {
+            let name = file_name(&child);
+            if child.is_dir() {
+                self.walk(&child, &format!("{prefix}{name}/"))?;
+                continue;
+            }
+            if self.out.len() >= MAX_READ_BYTES {
+                self.overflow_files += 1;
+                continue;
+            }
+            let _ = caos(["get", path(&child)]);
+            let text = fs::read_to_string(&child)
+                .map_err(|e| format!("reading {}: {e}", child.display()))?;
+            for line in text.lines() {
+                self.out.push_str(&format!("{prefix}{name}:{line}\n"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A tool call's failure mode: `User` becomes an `is_error` tool_result the
@@ -545,22 +652,10 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
-        Ok((text, new_ws)) => Ok((block(id, &text, false), new_ws)),
-        Err(User(msg)) => Ok((block(id, &msg, true), None)),
+        Ok((text, new_ws)) => Ok((result_block(id, &text, false), new_ws)),
+        Err(User(msg)) => Ok((result_block(id, &msg, true), None)),
         Err(Infra(e)) => Err(e),
     }
-}
-
-fn block(id: &str, text: &str, is_error: bool) -> Value {
-    let mut b = json!({
-        "type": "tool_result",
-        "tool_use_id": id,
-        "content": [{"type": "text", "text": text}],
-    });
-    if is_error {
-        b["is_error"] = Value::Bool(true);
-    }
-    b
 }
 
 // ---------------------------------------------------------------------------
@@ -886,7 +981,7 @@ fn materialize(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 /// links by recorded hash — nothing else materializes) and the target
 /// component is descended into or written. Returns the new workspace CAS path.
 fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
-    let dir = scratch(&format!("inline-{}", counter())).map_err(Fail::from_infra)?;
+    let dir = scratch(&fresh_name("inline")).map_err(Fail::from_infra)?;
     build_level(Some(Path::new(ws)), &dir, comps, content, mode)?;
     let out = fresh("ws-inline");
     caos(["put", path(&dir), &out]).map_err(Fail::from_infra)?;
@@ -934,16 +1029,6 @@ fn build_level(
         _ => None,
     };
     build_level(src_sub.as_deref(), &target, &comps[1..], content, mode)
-}
-
-/// Fresh single-assignment CAS paths, distinct from `main.rs`'s prefixes.
-fn fresh(prefix: &str) -> String {
-    format!("/cas/{prefix}-{}", counter())
-}
-
-fn counter() -> u32 {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1013,6 +1098,7 @@ mod tests {
         // A `$VAR` naming no here-string is not help either.
         assert_eq!(expr_help("curry --base:@=x --help=$NOPE\n"), None);
     }
+    #[test]
     fn oid_shape() {
         assert!(valid_oid(&"a".repeat(40))); // sha1
         assert!(valid_oid(&"0".repeat(64))); // sha256

@@ -331,7 +331,7 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
     transport.ensure_server_reachable()?;
     // Missing model credential? Ask for one and install it right here, while
     // the shell still has the terminal (setup::ensure_model_secret).
-    setup::ensure_model_secret(&transport)?;
+    setup::ensure_model_secret(&transport, &args.turn)?;
     let mut app = App::new(args)?;
 
     // From here until the terminal is restored, stderr must not reach the

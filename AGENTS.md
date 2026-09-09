@@ -7,9 +7,11 @@ Every script here runs with it, and two constructs quietly break under it.
 - **`[ cond ] && action` exits the script when the condition is false**, if that
   list is the last command in its scope (a function, a loop body, a `{ }` block,
   the script). Write `if`. This is not hypothetical: it is the single largest
-  source of bugs in this tree's shell — `stack/build-builtins.sh` still carries three
-  latent instances, one of which makes `./stack/build-builtins.sh <name>` exit 1
-  before doing anything.
+  source of bugs in this tree's shell. `stack/build-builtins.sh` shows the
+  shape: the `printf` that emits an entry's own /worker is guarded by an `if`,
+  because as the last command in a `$( { ... } | mktree )` block a false
+  `[ ... ] &&` would fail the whole substitution for every entry that has no
+  /worker of its own.
 - **`pipefail` makes a pipeline fail on its LEFTMOST failure**, not its last
   command. `curl -f ... | awk` returns curl's 22 on a 404, so a lookup whose
   "absent" answer is a 404 dies instead of returning empty. Distinguish absent

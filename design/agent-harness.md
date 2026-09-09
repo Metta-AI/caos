@@ -1,15 +1,15 @@
 # Agent harness: conversations as commit chains — design note
 
 > **Historical context only.** The authoritative chat design is
-> [`chat.md`](chat.md). The schemas and ref layouts described below document
-> the superseded prototype; the current design does not read or migrate them.
-> Current chat is isolated below `refs/caos/v2/`; the old unversioned refs may
-> remain in place and are invisible to the v2 clients.
+> [`chat.md`](chat.md) (v3). The schemas and ref layouts described below
+> document the superseded prototype; the current design does not read or
+> migrate them. Current chat is isolated below `refs/caos/v3/`; the old
+> refs may remain in place and are invisible to the v3 clients.
 
 **Status:** historical for conversation storage and turn lifecycle. The
 run-then, tool, and model-loop background remains useful, but the commit shapes,
 multi-ref protocol, progress/status refs, and client ownership described below
-were superseded by the single append-only event log in `chat.md`. Treat that
+were superseded by the conversation spine in `chat.md`. Treat that
 document and the current code as normative; this note is retained as the
 implementation history that led to them. The implemented background includes
 run-then and first-class commits, the bounded bash tool
@@ -297,7 +297,13 @@ conversation content). Same best-effort contract as the progress ref.
 Two verbs and a full-screen client over one turn engine (implemented —
 `crates/caos-cli/src/lib.rs`, tested end-to-end against the stub in
 `tests/chat-offline` for `chat` and `talk`, and the `tests/chat-tools*`
-suites for the tool set):
+suites for the tool set).
+
+All three name the workers they run — `--llm-step:@=<path>` and, where titles
+are generated, `--llm-call:@=<path>` — as ordinary image args, resolved by
+`resolve_cli_image_arg`. There is no default: which path holds caos' entry
+points is the caller's tree's business, not this client's (`design/chat.md`,
+"Host and launcher inputs").
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
   is the prompt; the conversation is the repo's most recently advanced one
@@ -450,4 +456,4 @@ deadlines are comfortable; the top-level pending timeout
 8. **Talk while thinking** — interjections as a second commit branch that the
    turn merge reconciles: steer a running turn at round boundaries via a
    client→worker `-inject` ref, mirror of the progress ref. **Design**
-   (`talk-while-thinking.md`).
+   (historical `talk-while-thinking.md`, since removed).

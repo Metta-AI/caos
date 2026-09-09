@@ -179,41 +179,6 @@ pub(crate) fn eval_path(
     caos_eval::eval_path(&host, start_tree, path)
 }
 
-/// Resolve one of the workspace's entry points: evaluate the tracked tree and
-/// descend to `path`.
-///
-/// This is how a client reaches a tool without an ambient library, and the
-/// descent is the whole mechanism: `eval_path` walks down `path`, and wherever
-/// it meets a `.caos-expr` it evaluates it and keeps walking inside the result.
-/// So the root expression runs first and deepens the tree, and by the time the
-/// walk reaches `std/<name>` that entry's own `DEEP-DEPS/` mounts exist — which
-/// is why naming the raw worktree directory works even though the expression
-/// there names dependencies that are nowhere on disk.
-///
-/// `path` is an ordinary path in the tree and nothing more. This used to have a
-/// sibling that built `DEEP-DEPS/<name>` instead, which made a CLIENT depend on
-/// the callee having been deepened by a `DEPS` file in the ROOT — `DEEP-DEPS` is
-/// created by `std/deep-deps` for the directory that declared the deps, and is
-/// that directory's business, not a namespace for anyone else to address. When
-/// the root `DEPS` was removed, every conversation turn stopped resolving.
-pub fn eval_workspace_path(
-    t: &dyn Transport,
-    path: &str,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    let (_, oid) = t
-        .ingest_path(".")?
-        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
-    let (kind, hash) = eval_path(t, &oid.to_string(), path, store)
-        .map_err(|error| format!("resolving {path:?} from the workspace: {error}"))?;
-    if kind != "tree" {
-        return Err(format!(
-            "{path}/.caos-expr evaluates to a {kind}, not an ArgTree"
-        ));
-    }
-    Ok(hash)
-}
-
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
 /// root of the tree down to `<path>` and print the resulting object's
 /// `"<kind> <hash>"`. With no `--tree`, the tracked workspace tree is the start

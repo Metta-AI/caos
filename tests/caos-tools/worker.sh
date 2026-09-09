@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC1091,SC2016,SC2034,SC2154
 # tests/caos-tools — a WORKER test, in dev/worker-test (it needs git).
 #
 # Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
@@ -33,7 +34,6 @@ llm_test_setup
 # `.caos-expr` (SPEC, "Tools"), and that expression names the image it runs on
 # — here by `:hash=`, because this fixture workspace holds no std to name by
 # path. `--bash` is this TEST's mount, already evaluated to an image.
-caos get -r /cas/args/bash || fail "reading the bash image"
 bash_img=$(caos hash /cas/args/bash)
 
 # Write tool `$1` from the script on stdin, with `$2` as its javadoc help.
@@ -81,8 +81,7 @@ cp /tmp/ws/caos-tools/hello/worker.sh /tmp/ws/caos-tools/undocumented/worker.sh
 printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
   > /tmp/ws/caos-tools/undocumented/.caos-expr
 
-caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the tooled workspace"
-ws=$(caos hash /cas/ws)
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled workspace")
 
 stage "script the stub LLM (edit; bad call; dead sub-run; good call; end)"
 # All calls share one response and run in order. The missing arg must be
@@ -93,20 +92,19 @@ mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
   > /tmp/stub/response-2.json
-stub_pid=""
-port=""
-start_stub /tmp/stub stub_pid port
+start_stub /tmp/stub
 
-new_llm_conversation ct "$port" "$ws"
+new_llm_conversation ct "$STUB_PORT" "$ws"
 
 stage "run the turn"
-dispatch_turn "$ws" "run the hello tool"
-turn=$(wait_turn) || {
+dispatch_turn "run the hello tool"
+wait_turn || {
   echo "--- stub log" >&2; cat /tmp/stub/log >&2 || true
   fail "the turn never reached a terminal event"
 }
-echo "  turn $turn" >&2
-git show -s --format=%B "$turn" | grep -qF '"content":"tools done"' \
+echo "  turn $head" >&2
+assistant_transcript=$(transcript_text "$head")
+grep -qF 'tools done' <<<"$assistant_transcript" \
   || fail "terminal assistant event"
 
 stage "registration: hello advertised with its description; bash not shadowed"
@@ -133,10 +131,12 @@ grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' \
   /tmp/stub/request-1.json || fail "@param [suffix] not declared"
 grep -qF '"required":["word"]' /tmp/stub/request-1.json \
   || fail "required args wrong: [name] must be optional, a bare name required"
-# A tool with no @param tags still advertises an empty object schema — and no
-# `required` key, which the API rejects as an empty array.
-grep -qF '"description":"A tool that dies without producing a result.","input_schema":{"properties":{},"type":"object"},"name":"boom"' \
-  /tmp/stub/request-1.json || fail "an argument-less tool's schema changed shape"
+# A tool with no @param tags advertises only the optional workspace selector
+# and no `required` key, which the API rejects as an empty array.
+jq -e '.tools[] | select(.name == "boom") | .input_schema |
+  .type == "object" and (.properties | keys) == ["workspace"] and
+  .properties.workspace.type == "string" and (has("required") | not)' \
+  /tmp/stub/request-1.json >/dev/null || fail "an argument-less tool's schema changed shape"
 echo "  ok: word required, suffix optional, boom unchanged" >&2
 
 stage "@param: a bad call is an is_error result, not a worker error"
@@ -160,17 +160,20 @@ grep -qF 'the `boom` tool failed to run' /tmp/stub/request-2.json \
 # declared args reached the script at /cas/args/<name>.
 grep -qF 'hello-from-tree-v2 word=banana-split' /tmp/stub/request-2.json \
   || fail "the queued tool lost its args or the edited workspace"
-# The workspace must be the pre-call one: a tool that never produced a result
-# cannot have advanced it. Asserted on the TURN TREE, not on the request — the
-# request proves the queued tool's input; this separately proves the terminal
-# turn tree stayed on that workspace.
-case "$(git show "$turn:caos-tools/hello/worker.sh")" in
+$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/caos-tools.records
+bash_workspace=$(jq -r 'select(.id == "toolu_01") | .workspace_resolution.output' \
+  /tmp/caos-tools.records)
+assert_oid "$bash_workspace" "bash-adopted workspace"
+jq -e --arg workspace "$bash_workspace" \
+  'select(.id == "toolu_04") | .task != null and .input_workspace == $workspace' \
+  /tmp/caos-tools.records >/dev/null \
+  || fail "later hello call did not start from the bash edit"
+final_workspace=$(workspace_commit "$head")
+fetch_code "$final_workspace" "fetching final workspace"
+case "$(git show "$final_workspace:caos-tools/hello/worker.sh")" in
   *hello-from-tree-v2*) ;;
   *) fail "the failed sub-run lost the earlier workspace edit" ;;
 esac
 echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
 
-stage "done"
-printf 'caos-tools: ALL PASS\n' > /tmp/report
-cat /tmp/report >&2
-caos put /tmp/report /cas/out
+pass caos-tools

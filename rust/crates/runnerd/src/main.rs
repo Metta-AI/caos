@@ -597,6 +597,12 @@ fn run_container(config: &Config, slot: u32, job: &Job) {
         // container starts. Unconfined is the standard answer for a container
         // that runs its own engine — and this grant already implies that trust.
         command.args(["--security-opt", "seccomp=unconfined"]);
+        // Same story one layer up: on hosts with AppArmor (Ubuntu's docker
+        // ships the `docker-default` profile) `mount` is denied regardless of
+        // the capability, so the bind over /nix fails with EPERM. Docker
+        // Desktop and OrbStack have no AppArmor, which is why this only bites
+        // on a Linux box.
+        command.args(["--security-opt", "apparmor=unconfined"]);
     }
     for dev in &grants.devices {
         command.args(["--device", dev]);

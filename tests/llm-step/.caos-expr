@@ -2,11 +2,11 @@
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A WORKER TEST. Durable event recording, ordered tool replay, workspace
-# mutation and interjections on both sides of dispatch are all llm-step's, and
-# all observable on the conversation ref. The client curried two turns and
-# blocked on them; worker-common.sh curries them and polls.
+# mutation, interjections on both sides of dispatch, and running or queued
+# request interruption are all llm-step's, and all observable on the
+# conversation ref. worker-common.sh curries the turns and polls.
 #
 # `admit_turn`/`start_turn` rather than `dispatch_turn` for the first turn: the
 # pre-start interjection has to land between the admission and the dispatch,
 # which is the case being tested.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --common:@=DEEP-DEPS/llm-test/worker-common.sh
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

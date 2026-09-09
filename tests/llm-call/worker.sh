@@ -115,7 +115,7 @@ echo "== the call returns the reply's text blocks as a plain blob ==" >&2
 found=0
 for _ in $(seq 1 300); do
   if caos get-hash "$oid" /cas/response 2>/dev/null; then found=1; break; fi
-  sleep 0.1
+  sleep 0.25
 done
 if [ "$found" -ne 1 ]; then
   echo "--- stub log"; cat /tmp/stub.log >&2 || true
