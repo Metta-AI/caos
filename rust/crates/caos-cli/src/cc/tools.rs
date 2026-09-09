@@ -319,7 +319,9 @@ fn grep(t: &GitTransport, tree: &str, args: &Value) -> Result<TreeOutcome, ToolE
     if let Some(path) = optional_path_arg(args, "path")? {
         kvs.push(format!("--path={path}"));
     }
-    run_std_tool(t, tree, "std/rgrep-tool", &kvs).map(TreeOutcome::read)
+    run_tool(t, tree, "std/rgrep-tool", &kvs)?
+        .report()
+        .map(TreeOutcome::read)
 }
 
 /// Run a shell command through `std/bash-tool`.
@@ -477,7 +479,18 @@ fn std_tool(
             Err(error) => return Err(Infra(error)),
         }
     }
-    run_std_tool(t, tree, entry, &kvs).map(TreeOutcome::read)
+    // A `tree` entry in the result is the workspace the tool produced, and
+    // taking it is what makes a MUTATING std tool work -- `llm-step`'s generic
+    // arm reads `result/tree` and advances the workspace for a tree tool
+    // exactly as it does for bash. None of caos-build/caos-test/caos-test-result
+    // returns one, so this is currently inert; without it the first std tool
+    // that edits the workspace would report success and change nothing.
+    let result = run_tool(t, tree, entry, &kvs)?;
+    let text = result.report()?;
+    Ok(match result.entry("tree") {
+        Some(workspace) => TreeOutcome::wrote(text, workspace),
+        None => TreeOutcome::read(text),
+    })
 }
 
 /// Three-way merge another commit into the conversation's workspace.
@@ -670,15 +683,6 @@ fn parse_param(payload: &str) -> Option<StdToolParam> {
 }
 
 /// Run a std tool over `tree` and return its report.
-fn run_std_tool(
-    t: &GitTransport,
-    input: &str,
-    entry: &str,
-    kvs: &[String],
-) -> Result<String, ToolError> {
-    run_tool(t, input, entry, kvs)?.report()
-}
-
 /// A finished tool result, checked out so its parts can be read.
 ///
 /// Checking out is what makes the result readable at all: it lives on the
