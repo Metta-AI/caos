@@ -58,7 +58,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     };
     let have_workspace = workspace.is_ok();
     let t = workspace.as_ref();
-    let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+    let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
     let stdin = std::io::stdin();
@@ -82,9 +82,59 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     Ok(())
 }
 
-/// The tools this server has managed to find so far. Empty until the
-/// resolution below finishes, which is the entire point: see `declarations`.
-type Registry = Arc<Mutex<Vec<Value>>>;
+/// The tools this server has managed to find so far, and what it would say
+/// about them. Empty until the resolution below finishes, which is the entire
+/// point: see `resolve_in_background`.
+type Registry = Arc<Mutex<Found>>;
+
+#[derive(Default)]
+struct Found {
+    tools: Vec<Value>,
+    /// What happened while looking, in the words the reader needs. Read out by
+    /// [`STATUS_TOOL`] and by nothing else.
+    status: Option<String>,
+}
+
+/// The one tool this server implements itself, offered ONLY while it has no
+/// others -- and it exists because of how the alternative failed.
+///
+/// A model that is handed zero tools does not report "my tool server has no
+/// tools". It reports that caos is not there, because from inside the session
+/// those are the same observation: a connected server with an empty list is
+/// indistinguishable from an absent one through anything the model can see.
+/// That cost a day of relaying container output by hand.
+///
+/// So an empty registry is not silence. It is one tool whose description says
+/// the tools are still coming and whose result says how it is going.
+const STATUS_TOOL: &str = "caos_status";
+
+fn status_declaration() -> Value {
+    json!({
+        "name": STATUS_TOOL,
+        "description": "Report why the caos workspace tools are not available yet. \
+                        The caos tool server is connected but still resolving the step \
+                        that implements its tools, or failed to. This is the only caos \
+                        tool right now; call it and report what it says, rather than \
+                        concluding that caos is absent.",
+        "inputSchema": with_injected(json!({
+            "type": "object", "properties": {}, "required": [],
+        })),
+    })
+}
+
+fn status_result(registry: &Registry) -> Value {
+    let text = match registry.lock() {
+        Err(_) => "the caos tool registry lock is poisoned; this server is broken".to_string(),
+        Ok(found) => match (&found.status, found.tools.is_empty()) {
+            (_, false) => format!("{} caos tools are available.", found.tools.len()),
+            (Some(status), true) => status.clone(),
+            (None, true) => "still resolving the caos tools; nothing has failed yet. \
+                             They arrive with a tools/list_changed notification."
+                .to_string(),
+        },
+    };
+    json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+}
 
 /// Stdout, shared with the resolver thread. Its own lock, not stdout's: the
 /// protocol is one message per line, and two writers interleaving mid-message
@@ -128,7 +178,7 @@ fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
         // Only "not ready yet" is worth retrying, and there is no way to tell
         // that from any other failure, so everything is: the cost of a wrong
         // guess is a few sleeping seconds in a thread nothing waits on.
-        let mut found = Vec::new();
+        let mut last = "the caos tools have not resolved yet".to_string();
         for attempt in 0..RESOLVE_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(RESOLVE_INTERVAL);
@@ -137,39 +187,60 @@ fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
             // to the main thread, and a transport opened before the remote
             // existed would not have it. This process already stands in the
             // work directory (`cc_transport`).
-            found = match GitTransport::from_cwd() {
-                Ok(t) => declarations(Ok(&t), &options),
-                Err(error) => {
-                    eprintln!("caos cc serve: cannot open the caos workspace: {error}");
-                    Vec::new()
-                }
+            let found = match GitTransport::from_cwd() {
+                Ok(t) => declarations(&t, &options),
+                Err(error) => Err(format!("cannot open the caos workspace: {error}")),
             };
-            if !found.is_empty() {
-                break;
+            match found {
+                Ok(found) if found.is_empty() => {
+                    last = "the step answered with no tools at all".to_string();
+                }
+                // Recorded as it happens, not at the end: five minutes of
+                // retrying is five minutes in which the only honest answer to
+                // "why are there no tools" already exists.
+                Ok(found) => {
+                    publish(&registry, found);
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed",
+                    });
+                    if let Err(error) = write_message(&out, &notification) {
+                        eprintln!("caos cc serve: could not announce the tools: {error}");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("caos cc serve: attempt {}: {error}", attempt + 1);
+                    last = error;
+                }
+            }
+            if let Ok(mut state) = registry.lock() {
+                state.status = Some(format!(
+                    "attempt {} of {RESOLVE_ATTEMPTS} failed and it is still trying: {last}",
+                    attempt + 1
+                ));
             }
         }
-        if found.is_empty() {
-            eprintln!(
-                "caos cc serve: no tools after {RESOLVE_ATTEMPTS} attempts; \
-                 this session has none. The reasons are above."
-            );
-            return;
-        }
-        match registry.lock() {
-            Ok(mut registry) => *registry = found,
-            Err(_) => {
-                eprintln!("caos cc serve: the tool registry lock is poisoned");
-                return;
-            }
-        }
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/tools/list_changed",
-        });
-        if let Err(error) = write_message(&out, &notification) {
-            eprintln!("caos cc serve: could not announce the tools: {error}");
+        // GIVING UP IS SAID OUT LOUD, twice: on stderr for whoever reads the
+        // server's log, and into the status this server's one remaining tool
+        // reports, for the model that has nothing else to go on.
+        let text = format!("after {RESOLVE_ATTEMPTS} attempts: {last}");
+        eprintln!("caos cc serve: no tools; {text}");
+        if let Ok(mut found) = registry.lock() {
+            found.status = Some(text);
         }
     });
+}
+
+/// Publish what was found, and stop describing the search.
+fn publish(registry: &Registry, tools: Vec<Value>) {
+    match registry.lock() {
+        Ok(mut found) => {
+            found.tools = tools;
+            found.status = None;
+        }
+        Err(_) => eprintln!("caos cc serve: the tool registry lock is poisoned"),
+    }
 }
 
 /// The `method` of one request line, for a caller that has already had it
@@ -208,9 +279,16 @@ fn handle(
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
         // Whatever has been found so far, which early on is nothing. The
-        // client is told when that changes.
+        // client is told when that changes -- and until it does, the one tool
+        // that can explain the emptiness stands in for the rest.
         "tools/list" => Some(match registry.lock() {
-            Ok(registry) => reply(id, json!({ "tools": registry.clone() })),
+            Ok(found) => {
+                let tools = match found.tools.is_empty() {
+                    true => vec![status_declaration()],
+                    false => found.tools.clone(),
+                };
+                reply(id, json!({ "tools": tools }))
+            }
             Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
         }),
         // A workspace we could not open is the model's problem to report, not
@@ -229,7 +307,7 @@ fn handle(
                     "isError": true,
                 }),
             ),
-            Ok(t) => match call(t, options, &params) {
+            Ok(t) => match call(t, options, registry, &params) {
                 Ok(result) => reply(id, result),
                 // A tool that could not run at all is a JSON-RPC error; a tool
                 // that ran and failed is a result with `isError`, which the
@@ -262,11 +340,21 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value, String> {
+fn call(
+    t: &GitTransport,
+    options: &TurnOptions,
+    registry: &Registry,
+    params: &Value,
+) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call has no tool name".to_string())?;
+    // This server's own tool, and the one call that belongs to no conversation:
+    // it reports on the server, so it takes no session and records nothing.
+    if name == STATUS_TOOL {
+        return Ok(status_result(registry));
+    }
     let args = params
         .get("arguments")
         .cloned()
@@ -299,22 +387,16 @@ fn fail(id: Value, code: i64, message: &str) -> Value {
 ///
 /// A LISTING IS A WORKER RUN. It resolves `--llm-step`, runs it, and reads the
 /// declarations back, which is the point -- the tools are the step's, so a
-/// session in any repository offers exactly what the tui offers there. A
-/// failure leaves the session with no caos tools and the reason on stderr:
-/// `tools/list` has nowhere to put an explanation, and a server that answers
-/// with nothing is still a server that answers.
-fn declarations(t: Result<&GitTransport, &String>, options: &TurnOptions) -> Vec<Value> {
-    let registry = match t {
-        Err(error) => Err(format!("no caos workspace: {error}")),
-        Ok(t) => super::declarations(t, options),
-    };
-    match registry {
-        Ok(registry) => registry.iter().map(mcp_declaration).collect(),
-        Err(error) => {
-            eprintln!("caos cc serve: cannot describe the caos tools: {error}");
-            Vec::new()
-        }
-    }
+/// session in any repository offers exactly what the tui offers there.
+///
+/// The error is RETURNED rather than logged, because the caller has somewhere
+/// to put it: the status this server reports when it has no tools. A reason
+/// that reaches only stderr reaches nobody who is asking.
+fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
+    Ok(super::declarations(t, options)?
+        .iter()
+        .map(mcp_declaration)
+        .collect())
 }
 
 /// One of the step's declarations, as MCP spells it: `inputSchema` rather than
@@ -322,10 +404,26 @@ fn declarations(t: Result<&GitTransport, &String>, options: &TurnOptions) -> Vec
 /// fills in. Those are DECLARED rather than smuggled, so the model's own call
 /// stays schema-valid and the hook only supplies values the tool accepted.
 fn mcp_declaration(declaration: &Value) -> Value {
-    let mut schema = declaration
+    let schema = declaration
         .get("input_schema")
         .cloned()
         .unwrap_or_else(|| json!({ "type": "object", "properties": {}, "required": [] }));
+    json!({
+        "name": declaration.get("name").cloned().unwrap_or(Value::Null),
+        "description": declaration.get("description").cloned().unwrap_or(Value::Null),
+        "inputSchema": with_injected(schema),
+    })
+}
+
+/// A schema that also accepts what the `PreToolUse` hook fills in.
+///
+/// EVERY tool this server offers goes through here, `caos_status` included.
+/// The hook matches on the `mcp__caos__` prefix, so it injects into any call to
+/// this server -- and a tool whose schema does not declare those arguments gets
+/// an `updatedInput` that fails validation, which reads as the model calling
+/// the tool wrongly. Declaring them keeps the model's own call valid with or
+/// without them.
+fn with_injected(mut schema: Value) -> Value {
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
             properties.insert(
@@ -337,11 +435,7 @@ fn mcp_declaration(declaration: &Value) -> Value {
             );
         }
     }
-    json!({
-        "name": declaration.get("name").cloned().unwrap_or(Value::Null),
-        "description": declaration.get("description").cloned().unwrap_or(Value::Null),
-        "inputSchema": schema,
-    })
+    schema
 }
 
 #[cfg(test)]
@@ -355,7 +449,7 @@ mod tests {
     fn notifications_are_never_answered() {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let workspace = "no workspace".to_string();
-        let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+        let registry: Registry = Arc::new(Mutex::new(Found::default()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
@@ -368,7 +462,7 @@ mod tests {
     #[test]
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
-        let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+        let registry: Registry = Arc::new(Mutex::new(Found::default()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
@@ -408,5 +502,20 @@ mod tests {
         assert!(properties.get("file_path").is_some());
         assert_eq!(declared["inputSchema"]["required"], json!(["file_path"]));
         assert!(declared.get("input_schema").is_none());
+    }
+
+    /// Including this server's OWN tool. The `PreToolUse` hook matches on the
+    /// `mcp__caos__` prefix, so it injects into a `caos_status` call too, and a
+    /// schema that did not declare those arguments would fail validation on the
+    /// one call whose whole job is to explain why the others are missing.
+    #[test]
+    fn the_status_tool_carries_the_injected_args_too() {
+        let properties = &status_declaration()["inputSchema"]["properties"];
+        for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
+            assert!(
+                properties.get(injected).is_some(),
+                "{STATUS_TOOL} does not declare {injected}"
+            );
+        }
     }
 }
