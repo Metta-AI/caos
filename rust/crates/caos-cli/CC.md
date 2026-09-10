@@ -54,9 +54,25 @@ tool, a second bash-input shape (and so a second cache key for an identical
 command), a second rendering of a grep result. What is offered here now is
 whatever the named step offers, in whatever repository it is pointed at.
 
-The cost is that `tools/list` is a worker run rather than a constant, so a
-session start needs the caos server up. It is memoized on the step and the
-workspace tree, so it is a cache hit for every session after the first.
+The cost is that `tools/list` is a worker run rather than a constant — so it
+does not happen inside `tools/list`. The listing answers immediately with what
+is known, a background thread resolves the step (retrying, because a cloud
+session establishes its `caos` remote and its tunnel *after* spawning this
+server), and `notifications/tools/list_changed` announces the real list when it
+lands. Nothing in front of the handshake.
+
+Until it lands there is exactly one tool, **`caos_status`**, and it exists
+because of how the alternative failed: a model handed zero tools does not
+report "my tool server has no tools", it reports that caos is absent — which is
+what every session said while its server sat connected and working. `caos_status`
+answers with the actual reason, including which resolution attempt failed and
+why.
+
+The tree the session's own `caos-tools/` come from is named ONLY if that
+directory exists, because naming it pushes the whole working tree to the caos
+server. For a repository that defines no tools that is a push of everything to
+be told "none" — and through a tunnel whose far end is gone it does not fail,
+it waits.
 
 **The workspace is the conversation's tree, not your checkout.** A `write`
 never touches a file on disk; it produces a new tree and the step appends a
@@ -232,5 +248,8 @@ the tui against the same conversation.
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   entries say `claude-code` rather than naming a model. Better than a
   plausible-looking string nothing verified.
-- **A cheaper listing.** `tools/list` is a worker run, so a cold session start
-  waits for one. It is memoized, but the first one in a new tree is not free.
+- **A cold first listing.** The resolution is off the handshake now, but the
+  first session against a tree whose step has never been built still waits for
+  a rustc compile before its tools appear — with `caos_status` explaining the
+  wait. Caching the registry on disk, keyed by the step argument, would make
+  every later session instant; nothing does that yet.
