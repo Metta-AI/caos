@@ -358,7 +358,7 @@ fn caos_capture(args: &[&str]) -> Result<String, String> {
 /// A parsed git commit, as a worker sees one: the tree it snapshots, its
 /// parents, its author's name, and its message. In caos a commit is a
 /// first-class value — e.g. an agent conversation head, where the message is a
-/// turn's text, the tree the workspace state, and the parent the previous
+/// turn's text, the tree the source tree state, and the parent the previous
 /// turn. The author name is how the agent harness tells its own turn commits
 /// (author `caos-agent`) apart from everything else when walking a
 /// conversation (see `design/agent-harness.md`).

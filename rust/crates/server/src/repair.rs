@@ -16,7 +16,7 @@
 //! So we sweep at startup, in the same spirit as the repo config `main` reasserts
 //! on every boot: expected damage, fixed each time we start. Before removing a
 //! broken ref, we restore its newest readable reflog value when one exists.
-//! Mutable workspace refs validate the commit's tree closure; immutable
+//! Mutable source tree refs validate the commit's tree closure; immutable
 //! request/result refs validate only their named object.
 
 use std::collections::HashSet;
@@ -78,7 +78,7 @@ pub(crate) fn drop_broken_refs(repo: &gix::Repository, git_dir: &str) -> usize {
     let mut paths = Vec::new();
     collect_files(&Path::new(git_dir).join("refs"), &mut paths);
     let mut removed = 0;
-    // Mutable refs commonly share most of their workspace closure.
+    // Mutable refs commonly share most of their source tree closure.
     // Validate each reachable object once per startup, not once per ref; failed
     // subtrees are deliberately not memoized.
     let mut memo = IntegrityMemo::default();
@@ -151,7 +151,7 @@ enum ClosureKind {
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 enum IntegrityDepth {
     TargetOnly,
-    WorkspaceClosure,
+    SourceTreeClosure,
 }
 
 const V3_PREFIX: &str = "refs/caos/v3/";
@@ -163,7 +163,7 @@ fn integrity_depth(refname: &str) -> IntegrityDepth {
     {
         IntegrityDepth::TargetOnly
     } else {
-        IntegrityDepth::WorkspaceClosure
+        IntegrityDepth::SourceTreeClosure
     }
 }
 
@@ -181,10 +181,10 @@ struct IntegrityMemo {
     closure: HashSet<(gix::ObjectId, ClosureKind)>,
 }
 
-/// Validate a ref target. Mutable commit refs include the commit's workspace
+/// Validate a ref target. Mutable commit refs include the commit's source tree
 /// tree, but not its parents. This keeps startup repair from scanning unrelated
 /// ordinary history. Content-addressed request/result refs only need their named
-/// object to be readable; traversing every request workspace would turn startup
+/// object to be readable; traversing every request source tree would turn startup
 /// repair into a scan of unrelated immutable history.
 fn intact_ref_target(
     repo: &gix::Repository,
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn integrity_memo_reuses_a_workspace_closure_across_ref_targets() {
+    fn integrity_memo_reuses_a_source_tree_closure_across_ref_targets() {
         let (repo, dir) = temp_repo();
         let repo = repo.to_thread_local();
         let first = empty_commit(&dir, "first");
@@ -527,10 +527,10 @@ mod tests {
         let second = gix::ObjectId::from_hex(second.as_bytes()).unwrap();
         let mut memo = IntegrityMemo::default();
 
-        intact_ref_target(&repo, first, IntegrityDepth::WorkspaceClosure, &mut memo).unwrap();
+        intact_ref_target(&repo, first, IntegrityDepth::SourceTreeClosure, &mut memo).unwrap();
         let closure_objects = memo.closure.len();
         assert!(closure_objects > 0);
-        intact_ref_target(&repo, second, IntegrityDepth::WorkspaceClosure, &mut memo).unwrap();
+        intact_ref_target(&repo, second, IntegrityDepth::SourceTreeClosure, &mut memo).unwrap();
 
         assert_eq!(memo.targets.len(), 2);
         assert_eq!(memo.closure.len(), closure_objects);
@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn request_and_result_refs_do_not_scan_workspace_closures() {
+    fn request_and_result_refs_do_not_scan_source_tree_closures() {
         let (repo, dir) = temp_repo();
         let git_dir = dir.to_string_lossy().into_owned();
         let blob = git_stdin(&dir, &["hash-object", "-w", "--stdin"], b"lost");
@@ -551,14 +551,14 @@ mod tests {
         let damaged = git_stdin(&dir, &["commit-tree", &tree, "-m", "request"], b"");
         let request = plant_ref(&dir, "refs/caos/req/request", &format!("{damaged}\n"));
         let result = plant_ref(&dir, "refs/caos/res/result", &format!("{damaged}\n"));
-        let workspace = plant_ref(&dir, "refs/heads/work", &format!("{damaged}\n"));
+        let source_tree = plant_ref(&dir, "refs/heads/work", &format!("{damaged}\n"));
         let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
         std::fs::remove_file(blob_path).unwrap();
 
         assert_eq!(drop_broken_refs(&repo.to_thread_local(), &git_dir), 1);
         assert!(request.exists());
         assert!(result.exists());
-        assert!(!workspace.exists());
+        assert!(!source_tree.exists());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_skips_a_commit_with_a_missing_workspace_blob() {
+    fn recovery_skips_a_commit_with_a_missing_source_tree_blob() {
         let (repo, dir) = temp_repo();
         let git_dir = dir.to_string_lossy().into_owned();
         let intact = empty_commit(&dir, "intact");

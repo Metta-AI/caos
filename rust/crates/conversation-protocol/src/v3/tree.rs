@@ -9,7 +9,9 @@ use super::paths::validate_tree_path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Blob,
+    Link,
     Executable,
+    Commit,
     Tree,
 }
 
@@ -17,15 +19,19 @@ impl Mode {
     pub fn octal(self) -> &'static str {
         match self {
             Mode::Blob => "100644",
+            Mode::Link => "120000",
             Mode::Executable => "100755",
             Mode::Tree => "40000",
+            Mode::Commit => "160000",
         }
     }
 
     pub fn parse(octal: &str) -> Result<Mode, String> {
         match octal {
             "100644" => Ok(Mode::Blob),
+            "120000" => Ok(Mode::Link),
             "100755" => Ok(Mode::Executable),
+            "160000" => Ok(Mode::Commit),
             "40000" | "040000" => Ok(Mode::Tree),
             _ => Err(format!("unsupported git tree mode {octal:?}")),
         }
@@ -1009,8 +1015,8 @@ mod tests {
     fn modes_and_tree_order_are_git_canonical() {
         assert_eq!(Mode::parse("040000"), Ok(Mode::Tree));
         assert_eq!(Mode::parse("40000"), Ok(Mode::Tree));
-        assert!(Mode::parse("120000").is_err());
-        assert!(Mode::parse("160000").is_err());
+        assert_eq!(Mode::parse("120000").unwrap(), Mode::Link);
+        assert_eq!(Mode::parse("160000").unwrap(), Mode::Commit);
         let mut entries = vec![
             TreeEntry {
                 name: "a".to_string(),
