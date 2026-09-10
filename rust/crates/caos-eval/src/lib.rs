@@ -270,6 +270,11 @@ fn eval_path_uncached(
     let mut node_oid = start_tree.to_string();
     let mut i = 0usize;
     loop {
+        // A gitlink stays a commit value unless the path enters its tree.
+        if node_kind == "commit" && i < comps.len() {
+            node_oid = commit_tree(host, &node_oid)?;
+            node_kind = "tree".into();
+        }
         // A `.caos-expr` at the root of this tree node transforms the node — from
         // the node's contents WITHOUT the directive (see `strip_caos_expr`).
         if node_kind == "tree" {
@@ -788,12 +793,24 @@ pub fn lookup_in_tree(
         if idx == comps.len() - 1 {
             return Ok(Some((e.mode, e.oid)));
         }
-        if !e.mode.is_tree() {
-            return Ok(None);
-        }
-        current = e.oid.to_string();
+        current = match e.mode.kind() {
+            EntryKind::Tree => e.oid.to_string(),
+            EntryKind::Commit => commit_tree(host, &e.oid.to_string())?,
+            _ => return Ok(None),
+        };
     }
     unreachable!("loop returns on the last component")
+}
+
+/// Peel a typed commit entry; blob contents never imply traversal.
+fn commit_tree(host: &dyn EvalHost, oid: &str) -> Result<String, String> {
+    let (kind, bytes) = host.get_object(oid)?;
+    if kind != "commit" {
+        return Err(format!("expected commit {oid}, got {kind}"));
+    }
+    let commit = gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
+        .map_err(|e| format!("invalid commit {oid}: {e}"))?;
+    Ok(commit.tree().to_string())
 }
 
 // ---- Curry assembly (byte-identical to crates/caos's `curry_from_entries`) ---

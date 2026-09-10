@@ -323,7 +323,7 @@ fn str_refs(args: &[String]) -> Vec<&str> {
 }
 
 /// Run `caos`, inheriting stdio; error on failure. Slice form behind [`caos`].
-fn caos_argv(args: &[&str]) -> Result<(), String> {
+pub fn caos_argv(args: &[&str]) -> Result<(), String> {
     let status = Command::new("caos")
         .args(args)
         .status()
@@ -371,6 +371,10 @@ pub struct Commit {
 
 /// The git hash recorded on a CAS path (`caos hash`) — e.g. a commit-valued
 /// arg's own id, which becomes the `parent` of the commit minted from it.
+pub fn cas_kind(cas_path: &str) -> Result<String, String> {
+    caos_capture(&["kind", cas_path])
+}
+
 pub fn cas_hash(cas_path: &str) -> Result<String, String> {
     caos_capture(&["hash", cas_path])
 }
