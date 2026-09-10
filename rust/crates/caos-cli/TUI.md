@@ -27,8 +27,8 @@ their prompt title and appear beneath the parent conversation.
 
 ## Build and run
 
-The packaged TUI can run anywhere. Inside a checkout, it seeds the conversation
-from HEAD and uses that checkout's `caos` remote. Outside a checkout, it starts
+The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
+`--import <path>` explicitly seeds a source tree from HEAD. Outside a checkout, it starts
 without code and defaults to `http://localhost:9090`; `--server` overrides it.
 The harness and object database live under `$XDG_DATA_HOME/caos/clients`
 (default `~/.local/share/caos/clients`), independently of attached repositories.
@@ -131,7 +131,7 @@ so it never leaves the conversation pane.
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected source tree in the original matching checkout |
-| `Ctrl+O` | Browse the conversation filesystem and compare snapshots |
+| `Ctrl+O` | Browse conversation files and source-tree diffs |
 | `Ctrl+P` | Preview selected source trees and their PR destinations; Enter confirms |
 | `/publish-branch` | Push a review boundary to the repository in .base-url, using its path as the branch |
 | `Ctrl+R` | Reload completed conversation history |
@@ -154,26 +154,21 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+O` to browse a pinned conversation snapshot, including ordinary
-files, memories, read-only `.caos` metadata, and source trees. Enter opens an
-entry; Backspace returns to its parent. Gitlinks open as directories and show
-their commit hashes. `/` searches text across the snapshot; `d` switches
-between files and changes. The header names both compared snapshots: `b`
-chooses the baseline, `h` chooses a historical snapshot, and `r` refreshes to
-the latest conversation head. Initially the baseline is the previous commit.
-Text viewing is limited to 256 KiB per file; binary files and symlink targets
-are shown without being executed or followed.
+Press `Ctrl+O` to open the read-only conversation filesystem. Up/Down select
+entries and immediately preview them. Right/Enter opens a directory or gitlink;
+Left/Backspace returns to its parent, preserving the selection. Escape closes
+the browser. Click to select; scroll over the file list to move the selection,
+or over the preview to scroll its text. PageUp/PageDown scroll the preview.
 
-Press `s` to run a real shell command over that filesystem using the selected
-harness's shell worker. Each command starts at the conversation root, is
-noninteractive, and has a 30-second execution limit. Shell edits persist in a
-pending proposal between commands; the shell process and its working directory
-do not. Inspect the resulting files or diff, then press `a` and Enter to apply,
-or `x` and Enter to discard. Apply reconciles against the current conversation
-head: unrelated agent edits survive, and conflicts apply nothing. Edits to
-`.caos` reject the entire proposal. No message is sent to the agent.
-Escape hides the browser while retaining pending edits for this TUI session;
-quitting the TUI does not apply or restore pending proposals automatically.
+Ordinary files show their contents, including memories and `.caos` metadata.
+A folder containing sibling gitlinks previews its newest two entries in
+descending filename order. Each gitlink compares against the next gitlink below
+it; entering one shows file diffs, including deleted files. The oldest gitlink
+shows contents because it has no earlier boundary. The preview names the
+compared boundaries and hashes. No publishing destination is required.
+
+The browser pins the conversation head when opened. `r` refreshes it. There
+are no shell commands or controls that apply edits.
 
 On a source-tree entry in the current snapshot, `o` selects the target for
 local checkout and publication. Selection preserves the draft and never

@@ -3397,72 +3397,67 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_proposals_preserve_concurrent_edits_and_reject_conflicts_atomically() {
-        use conversation_protocol::v3::tree::{Mode, Snapshot, TreeBuilder};
+    fn filesystem_previews_adjacent_boundaries_and_ordinary_content() {
+        use conversation_protocol::v3::tree::{Mode, TreeBuilder};
         let (root, t, base) = fixture("filesystem");
-        let id = "filesystem-review";
-        create_idle_conversation(&t, id, &base);
-        let pinned = filesystem::snapshot(&t, id, None).unwrap();
-        let rows = filesystem::list(&t, &pinned.tree, &pinned.tree, "", false).unwrap();
-        assert!(rows.iter().any(|e| e.name == ".caos" && e.directory));
-        assert!(rows
-            .iter()
-            .any(|e| e.name == "main" && e.commit.as_deref() == Some(&base)));
+        let repo = t.work_dir();
+        std::fs::write(repo.join("source_tree"), "first change\n").unwrap();
+        std::fs::write(repo.join("deleted"), "remove me\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "first"]);
+        let first = git(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("source_tree"), "second change\n").unwrap();
+        std::fs::remove_file(repo.join("deleted")).unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "second"]);
+        let second = git(repo, &["rev-parse", "HEAD"]);
+        let mut store = open_store(&t).unwrap();
+        let mut content = TreeBuilder::from(None);
+        for (path, commit) in [
+            ("feature/00-base", &base),
+            ("feature/01-first", &first),
+            ("feature/dirty", &second),
+        ] {
+            content.put_oid(path, Mode::Commit, oid(commit, "commit").unwrap());
+        }
+        content.put_oid(
+            "memories/note",
+            Mode::Blob,
+            store.write_blob(b"remember this").unwrap(),
+        );
+        let tree = content.build(&mut store).unwrap().to_string();
+        let rows = filesystem::list(&t, &tree, "feature").unwrap();
         assert_eq!(
-            filesystem::read(&t, &pinned.tree, &pinned.tree, "main/source_tree", false).unwrap(),
+            rows.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["dirty", "01-first", "00-base"]
+        );
+        let preview = filesystem::preview(&t, &tree, "feature").unwrap();
+        assert!(preview.title.contains("01-first"));
+        assert!(preview.text.contains("-first change"));
+        assert!(preview.text.contains("+second change"));
+        let file = filesystem::preview(&t, &tree, "feature/dirty/source_tree").unwrap();
+        assert!(file.text.contains("+second change"));
+        assert!(!file.text.contains("-base"));
+        let deleted = filesystem::list(&t, &tree, "feature/dirty").unwrap();
+        assert!(deleted
+            .iter()
+            .any(|e| e.name == "deleted" && e.change == '-'));
+        assert!(filesystem::preview(&t, &tree, "feature/dirty/deleted")
+            .unwrap()
+            .text
+            .contains("-remove me"));
+        assert_eq!(
+            filesystem::preview(&t, &tree, "feature/00-base/source_tree")
+                .unwrap()
+                .text,
             "base\n"
         );
-        let matches = filesystem::search(&t, &pinned.tree, &pinned.tree, "base", false).unwrap();
-        assert!(matches.entries.iter().any(|e| e.path == "main/source_tree"));
-
-        let mut store = open_store(&t).unwrap();
-        let proposal = |store: &mut GitStore, values: &[(&str, &str)]| {
-            let mut tree = TreeBuilder::from(Some(oid(&pinned.tree, "tree").unwrap()));
-            for (path, text) in values {
-                tree.put_oid(path, Mode::Blob, store.write_blob(text.as_bytes()).unwrap());
-            }
-            tree.build(store).unwrap().to_string()
-        };
-        let proposed = proposal(&mut store, &[("memories/note", "shell edit")]);
-        let concurrent = proposal(&mut store, &[("unrelated", "agent edit")]);
-        filesystem::apply_shell(&t, id, &pinned.head, &concurrent).unwrap();
-        let applied = filesystem::apply_shell(&t, id, &pinned.head, &proposed).unwrap();
-        let current = filesystem::snapshot(&t, id, None).unwrap();
-        let view = Snapshot::new(&store, oid(&current.tree, "tree").unwrap());
-        assert_eq!(view.read("unrelated").unwrap().unwrap(), b"agent edit");
-        assert_eq!(view.read("memories/note").unwrap().unwrap(), b"shell edit");
         assert_eq!(
-            filesystem::apply_shell(&t, id, &pinned.head, &proposed).unwrap(),
-            applied
+            filesystem::preview(&t, &tree, "memories/note")
+                .unwrap()
+                .text,
+            "remember this"
         );
-
-        let conflict = proposal(
-            &mut store,
-            &[
-                ("memories/note", "different"),
-                ("must-not-appear", "atomic"),
-            ],
-        );
-        assert!(filesystem::apply_shell(&t, id, &pinned.head, &conflict)
-            .unwrap_err()
-            .contains("Nothing applied"));
-        let metadata = proposal(
-            &mut store,
-            &[(".caos/title", "forbidden"), ("must-not-appear", "atomic")],
-        );
-        assert!(filesystem::apply_shell(&t, id, &pinned.head, &metadata)
-            .unwrap_err()
-            .contains("read-only"));
-        assert_eq!(filesystem::snapshot(&t, id, None).unwrap().head, applied);
-        assert!(Snapshot::new(&store, oid(&current.tree, "tree").unwrap())
-            .entry("must-not-appear")
-            .unwrap()
-            .is_none());
-        assert!(filesystem::history(&t, &applied)
-            .unwrap()
-            .iter()
-            .any(|s| s.head == pinned.head));
-        assert!(filesystem::snapshot(&t, id, Some(&base)).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

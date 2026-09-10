@@ -844,7 +844,6 @@ enum AppAction {
     NewConversation,
     Checkout,
     Activity,
-    Changes,
     Tools,
     Reload,
     Archive,
@@ -1617,11 +1616,11 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 12] = [
+const PALETTE_COMMANDS: [PaletteCommand; 11] = [
     PaletteCommand {
         label: "Browse conversation files",
         shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
-        keywords: "inspect browse code paths filesystem memories",
+        keywords: "inspect browse code paths filesystem memories diff changes",
         action: AppAction::BrowseFiles,
     },
     PaletteCommand {
@@ -1653,12 +1652,6 @@ const PALETTE_COMMANDS: [PaletteCommand; 12] = [
         shortcut: None,
         keywords: "tools progress browser",
         action: AppAction::Activity,
-    },
-    PaletteCommand {
-        label: "Compare conversation snapshots",
-        shortcut: None,
-        keywords: "diff files",
-        action: AppAction::Changes,
     },
     PaletteCommand {
         label: "Show available tools",
@@ -2005,7 +1998,6 @@ impl App {
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
         if self.browser_visible() {
-            self.browser_paste(text);
             return;
         }
         self.selected_mut().composer.insert_paste(text);
@@ -2013,7 +2005,7 @@ impl App {
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
         if self.browser_visible() {
-            return MouseAction::Ignored;
+            return self.browser_mouse(mouse, area);
         }
         if self.selected().publish_plan.is_some() {
             if mouse.kind == MouseEventKind::ScrollUp {
@@ -2438,7 +2430,7 @@ impl App {
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
-            AppAction::BrowseFiles => self.open_browser(false),
+            AppAction::BrowseFiles => self.open_browser(),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2464,7 +2456,6 @@ impl App {
             AppAction::NewConversation
             | AppAction::Checkout
             | AppAction::Activity
-            | AppAction::Changes
             | AppAction::Tools
             | AppAction::Reload
             | AppAction::Archive
@@ -3599,7 +3590,7 @@ impl App {
 
     fn execute_action(&mut self, action: AppAction) {
         match action {
-            AppAction::BrowseFiles => self.open_browser(false),
+            AppAction::BrowseFiles => self.open_browser(),
             AppAction::NewConversation => {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
@@ -3615,7 +3606,6 @@ impl App {
                     View::Activity
                 };
             }
-            AppAction::Changes => self.open_browser(true),
             AppAction::Tools => {
                 self.view = if self.view == View::Tools {
                     View::Chat
@@ -5218,12 +5208,12 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
         assert!(app.palette.is_some());
-        for ch in "compare snapshots".chars() {
+        for ch in "browse files".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         let matches = app.palette.as_ref().unwrap().matches();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].action, AppAction::Changes);
+        assert_eq!(matches[0].action, AppAction::BrowseFiles);
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -5236,7 +5226,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Command palette"));
-        assert!(rendered.contains("Compare conversation snapshots"));
+        assert!(rendered.contains("Browse conversation files"));
         assert!(!rendered.contains("New conversation"));
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
