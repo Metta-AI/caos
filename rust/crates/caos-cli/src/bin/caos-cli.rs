@@ -85,7 +85,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),
         // `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files
         // from the tree root down to <path> and print the result's
-        // "<kind> <hash>". With no --tree, the tracked workspace tree is the
+        // "<kind> <hash>". With no --tree, the tracked source tree is the
         // start. See design/caos-expr.md.
         Some("eval-path") => {
             let (tree, path) = match &args[2..] {
