@@ -1481,7 +1481,7 @@ mod tests {
         let lazy_commit = write_commit(
             &mut first_store,
             &lazy_tree,
-            &[fetched_commit.clone()],
+            std::slice::from_ref(&fetched_commit),
             "lazy\n",
         );
         let fetched_ref = "refs/caos/test/fetched";

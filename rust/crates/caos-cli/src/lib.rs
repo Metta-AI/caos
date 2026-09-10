@@ -1,5 +1,6 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
+pub mod filesystem;
 pub mod host_git;
 pub mod publication;
 pub mod source_trees;
@@ -3396,6 +3397,76 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_proposals_preserve_concurrent_edits_and_reject_conflicts_atomically() {
+        use conversation_protocol::v3::tree::{Mode, Snapshot, TreeBuilder};
+        let (root, t, base) = fixture("filesystem");
+        let id = "filesystem-review";
+        create_idle_conversation(&t, id, &base);
+        let pinned = filesystem::snapshot(&t, id, None).unwrap();
+        let rows = filesystem::list(&t, &pinned.tree, &pinned.tree, "", false).unwrap();
+        assert!(rows.iter().any(|e| e.name == ".caos" && e.directory));
+        assert!(rows
+            .iter()
+            .any(|e| e.name == "main" && e.commit.as_deref() == Some(&base)));
+        assert_eq!(
+            filesystem::read(&t, &pinned.tree, &pinned.tree, "main/source_tree", false).unwrap(),
+            "base\n"
+        );
+        let matches = filesystem::search(&t, &pinned.tree, &pinned.tree, "base", false).unwrap();
+        assert!(matches.entries.iter().any(|e| e.path == "main/source_tree"));
+
+        let mut store = open_store(&t).unwrap();
+        let proposal = |store: &mut GitStore, values: &[(&str, &str)]| {
+            let mut tree = TreeBuilder::from(Some(oid(&pinned.tree, "tree").unwrap()));
+            for (path, text) in values {
+                tree.put_oid(path, Mode::Blob, store.write_blob(text.as_bytes()).unwrap());
+            }
+            tree.build(store).unwrap().to_string()
+        };
+        let proposed = proposal(&mut store, &[("memories/note", "shell edit")]);
+        let concurrent = proposal(&mut store, &[("unrelated", "agent edit")]);
+        filesystem::apply_shell(&t, id, &pinned.head, &concurrent).unwrap();
+        let applied = filesystem::apply_shell(&t, id, &pinned.head, &proposed).unwrap();
+        let current = filesystem::snapshot(&t, id, None).unwrap();
+        let view = Snapshot::new(&store, oid(&current.tree, "tree").unwrap());
+        assert_eq!(view.read("unrelated").unwrap().unwrap(), b"agent edit");
+        assert_eq!(view.read("memories/note").unwrap().unwrap(), b"shell edit");
+        assert_eq!(
+            filesystem::apply_shell(&t, id, &pinned.head, &proposed).unwrap(),
+            applied
+        );
+
+        let conflict = proposal(
+            &mut store,
+            &[
+                ("memories/note", "different"),
+                ("must-not-appear", "atomic"),
+            ],
+        );
+        assert!(filesystem::apply_shell(&t, id, &pinned.head, &conflict)
+            .unwrap_err()
+            .contains("Nothing applied"));
+        let metadata = proposal(
+            &mut store,
+            &[(".caos/title", "forbidden"), ("must-not-appear", "atomic")],
+        );
+        assert!(filesystem::apply_shell(&t, id, &pinned.head, &metadata)
+            .unwrap_err()
+            .contains("read-only"));
+        assert_eq!(filesystem::snapshot(&t, id, None).unwrap().head, applied);
+        assert!(Snapshot::new(&store, oid(&current.tree, "tree").unwrap())
+            .entry("must-not-appear")
+            .unwrap()
+            .is_none());
+        assert!(filesystem::history(&t, &applied)
+            .unwrap()
+            .iter()
+            .any(|s| s.head == pinned.head));
+        assert!(filesystem::snapshot(&t, id, Some(&base)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn generated_title_parser_is_strict() {
         assert_eq!(
             parse_generated_title("  `Fix parser race`\n").unwrap(),
@@ -3603,6 +3674,17 @@ mod tests {
         fixture_reference(&transport, "stack", "feature/00-base", Some(&base)).unwrap();
         fixture_reference(&transport, "stack", "feature/01-first", Some(&one)).unwrap();
         fixture_reference(&transport, "stack", "feature/02-second", Some(&two)).unwrap();
+        // Review boundaries are complete and inspectable before a destination
+        // is chosen. Only publication needs that policy.
+        let unconfigured = source_trees::publication_plan(&transport, "stack").unwrap();
+        assert_eq!(unconfigured.len(), 2);
+        assert!(unconfigured.iter().all(|target| target.base_url.is_none()));
+        assert_eq!(unconfigured[0].head, one);
+        assert_eq!(unconfigured[1].head, two);
+        assert!(source_trees::publication_order(&unconfigured)
+            .unwrap_err()
+            .contains("before publishing"));
+
         append_transition(
             &transport,
             "stack",

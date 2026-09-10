@@ -22,6 +22,10 @@ use caos_cli::TurnPhase;
 pub(super) const ACTIVITY_INDICATORS: [&str; 4] = ["·", "✦", "✽", "✦"];
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
+    if app.browser_visible() {
+        super::filesystem::render(app, frame);
+        return;
+    }
     let state = app.selected();
     let areas = layout(state, app.view == View::Chat, frame.area());
 
@@ -36,7 +40,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
             areas.content,
         ),
         View::Activity => render_activity_browser(state, frame, areas.content),
-        View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
         View::Help => render_help(app, frame, areas.content),
     }
@@ -48,7 +51,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         app.view,
         !app.selection_locked
             && app.palette.is_none()
-            && app.source_tree_picker.is_none()
             && state.publish_plan.is_none()
             && app.focus() == Focus::Conversation,
         frame,
@@ -56,7 +58,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     );
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
-    render_source_tree_picker(app, frame);
     render_publication_plan(app, frame);
     render_screen_selection(app, frame);
 }
@@ -357,7 +358,6 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         push_metadata(
             match app.view {
                 View::Activity => "activity",
-                View::Diff => "changes",
                 View::Tools => "tools",
                 View::Help => "help",
                 View::Chat => unreachable!("chat is omitted from the header"),
@@ -546,7 +546,7 @@ fn render_live_activity(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
-            Span::styled("  Ctrl+T expands", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Palette: activity", Style::default().fg(Color::DarkGray)),
         ]))
         .block(Block::default().title(" Activity ").borders(Borders::ALL)),
         area,
@@ -1261,69 +1261,6 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
     }
 }
 
-fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let mut lines = Vec::new();
-    if state.source_trees.len() > 1 {
-        lines.push(Line::from(
-            state
-                .source_trees
-                .iter()
-                .enumerate()
-                .flat_map(|(index, source_tree)| {
-                    let separator = (index > 0).then(|| Span::raw(" "));
-                    let name = if state.selected_source_tree.as_deref()
-                        == Some(source_tree.name.as_str())
-                    {
-                        Span::styled(
-                            format!("[{}]", source_tree.name),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Span::raw(source_tree.name.clone())
-                    };
-                    separator.into_iter().chain(std::iter::once(name))
-                })
-                .collect::<Vec<_>>(),
-        ));
-    }
-    let text = if state.source_trees.is_empty() {
-        "This conversation has no source tree."
-    } else {
-        match state.selected_source_tree_diff() {
-            Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
-            Some(_) => "No source tree changes in this conversation.",
-            None => "Choose a commit entry in the source tree browser.",
-        }
-    };
-    lines.extend(text.lines().map(|line| {
-        let color = if line.starts_with('+') && !line.starts_with("+++") {
-            Color::Green
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            Color::Red
-        } else if line.starts_with("@@") {
-            Color::Cyan
-        } else {
-            Color::Reset
-        };
-        Line::styled(line, Style::default().fg(color))
-    }));
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
-    let title = if state.selected_source_tree_is_published() {
-        " Source tree diff · Published "
-    } else {
-        " Source tree diff "
-    };
-    frame.render_widget(
-        paragraph
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .scroll((scroll, 0)),
-        area,
-    );
-}
-
 fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![
         Line::styled(
@@ -1391,7 +1328,7 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         paragraph
             .block(
                 Block::default()
-                    .title(" Tools (Ctrl+T returns) ")
+                    .title(" Tools (Esc returns) ")
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0)),
@@ -1663,7 +1600,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             "^S"
         };
         Line::raw(format!(
-            " Agent running: {send_shortcut} interject  Esc stop  ^T activity  ^Up/Dn switch  ^C quit"
+            " Agent running: {send_shortcut} interject  Esc stop  ^O files  ^Up/Dn switch  ^C quit"
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
@@ -1677,7 +1614,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         )
     } else if app.view == View::Activity {
         Line::raw(
-            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
+            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  Esc return  ^Up/Dn chat  ^C quit",
         )
     } else if app.view == View::Help {
         Line::raw(" Help: Ctrl+H/Esc returns  ^C quit")
@@ -1693,15 +1630,15 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P PR  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P PR  ^O files  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
-    if let Some(chars) = app.copied_chars {
+    if let Some(chars) = app.copy_requested_chars {
         let noun = if chars == 1 { "char" } else { "chars" };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {chars} {noun} copied "),
+                format!(" Copy requested: {chars} {noun} (Ctrl+Y: manual) "),
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1721,91 +1658,6 @@ pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &S
 pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
     scroll.resolve(line_count.saturating_sub(visible))
-}
-
-pub(super) fn source_tree_picker_area(terminal: Rect) -> Rect {
-    terminal.centered(
-        Constraint::Length(terminal.width.saturating_sub(4).min(100)),
-        Constraint::Length(terminal.height.saturating_sub(2).min(18)),
-    )
-}
-
-fn render_source_tree_picker(app: &App, frame: &mut Frame<'_>) {
-    let Some(picker) = &app.source_tree_picker else {
-        return;
-    };
-    let state = app.selected();
-    let area = source_tree_picker_area(frame.area());
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Source trees ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    let items = state
-        .source_trees
-        .iter()
-        .map(|ws| {
-            let selected = if Some(&ws.name) == state.selected_source_tree.as_ref() {
-                "*"
-            } else {
-                " "
-            };
-            let additions = ws
-                .patch
-                .lines()
-                .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-                .count();
-            let deletions = ws
-                .patch
-                .lines()
-                .filter(|line| line.starts_with('-') && !line.starts_with("---"))
-                .count();
-            let repository = ws.repository.clone().unwrap_or_default();
-            let publication = state
-                .publications
-                .iter()
-                .find(|item| item.source_tree == ws.name)
-                .map(|item| format!("{:?}", item.status))
-                .unwrap_or_else(|| "unpublished".into());
-            let base = ws
-                .base_name
-                .as_ref()
-                .map(|name| format!("base {name}"))
-                .unwrap_or_default();
-            ListItem::new(vec![
-                Line::from(format!(
-                    "{selected} {}   +{additions} -{deletions}   {publication}{}",
-                    ws.name, ""
-                )),
-                Line::styled(
-                    format!("  {repository}  {base}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])
-        })
-        .collect::<Vec<_>>();
-    if items.is_empty() {
-        frame.render_widget(Paragraph::new("No source tree attached yet."), rows[0]);
-    } else {
-        let mut selection = ListState::default().with_selected(Some(picker.selected));
-        frame.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rows[0],
-            &mut selection,
-        );
-    }
-    frame.render_widget(
-        Paragraph::new("Up/Down selects   Enter inspects   Esc closes")
-            .style(Style::default().fg(Color::DarkGray)),
-        rows[1],
-    );
 }
 
 fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
