@@ -94,7 +94,8 @@ fn run_app(
                     changed |= selection_lock_allows_redraw(was_locked, app.selection_locked());
                 }
                 TerminalEvent::Paste(text)
-                    if app.view() == View::Chat && !app.selection_locked() =>
+                    if (app.view() == View::Chat || app.browser_visible())
+                        && !app.selection_locked() =>
                 {
                     app.clear_copy_notice();
                     app.insert_paste(&text);

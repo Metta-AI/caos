@@ -27,11 +27,11 @@ use ratatui_crossterm::crossterm::event::{
 use super::args::Args;
 use super::source_tree::{commit_working_tree, load_conversation_source_tree};
 
-#[path = "source_tree_picker.rs"]
-mod source_tree_picker;
+#[path = "filesystem.rs"]
+mod filesystem;
 #[path = "ui.rs"]
 pub(crate) mod ui;
-use source_tree_picker::SourceTreePicker;
+use filesystem::Browser;
 #[path = "publication.rs"]
 mod publication;
 use publication::{PlanRow, PublishPlanPrompt};
@@ -71,7 +71,6 @@ fn message_preview(text: &str, max_cells: u16) -> String {
 pub(crate) enum View {
     Chat,
     Activity,
-    Diff,
     Tools,
     Help,
 }
@@ -841,7 +840,7 @@ enum AppAction {
     Title,
     UpdateTree,
     Import,
-    SourceTrees,
+    BrowseFiles,
     NewConversation,
     Checkout,
     Activity,
@@ -1323,19 +1322,6 @@ impl ConversationState {
         })
     }
 
-    fn selected_source_tree_is_published(&self) -> bool {
-        let Some(source_tree) = self.selected_source_tree_diff() else {
-            return false;
-        };
-        self.publications
-            .iter()
-            .find(|publication| publication.source_tree == source_tree.name)
-            .is_some_and(|publication| {
-                publication.status == conversation_protocol::v3::PublicationStatus::Complete
-                    && publication.planned_head == source_tree.head
-            })
-    }
-
     fn select_source_tree(&mut self, name: &str) -> Result<(), String> {
         if !self
             .source_trees
@@ -1519,6 +1505,10 @@ impl ConversationState {
 }
 
 enum UiMessage {
+    Filesystem {
+        request: u64,
+        result: Result<filesystem::Update, String>,
+    },
     Forked {
         conversation: String,
         source: String,
@@ -1629,10 +1619,10 @@ struct PaletteCommand {
 
 const PALETTE_COMMANDS: [PaletteCommand; 12] = [
     PaletteCommand {
-        label: "Source trees",
+        label: "Browse conversation files",
         shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
-        keywords: "inspect browse code paths",
-        action: AppAction::SourceTrees,
+        keywords: "inspect browse code paths filesystem memories",
+        action: AppAction::BrowseFiles,
     },
     PaletteCommand {
         label: "New conversation",
@@ -1660,13 +1650,13 @@ const PALETTE_COMMANDS: [PaletteCommand; 12] = [
     },
     PaletteCommand {
         label: "Show activity",
-        shortcut: Some(Shortcut::new("t", "Ctrl+T", false)),
+        shortcut: None,
         keywords: "tools progress browser",
         action: AppAction::Activity,
     },
     PaletteCommand {
-        label: "Show source tree changes",
-        shortcut: Some(Shortcut::new("q", "Ctrl+Q", false)),
+        label: "Compare conversation snapshots",
+        shortcut: None,
         keywords: "diff files",
         action: AppAction::Changes,
     },
@@ -1755,13 +1745,13 @@ pub(crate) struct App {
     should_quit: bool,
     selection_locked: bool,
     palette: Option<CommandPalette>,
-    source_tree_picker: Option<SourceTreePicker>,
+    browser: Option<Browser>,
     selecting_transcript: bool,
     screen_selection: Option<ScreenSelection>,
     selecting_screen: bool,
     pending_conversation_click: Option<usize>,
     rendered_screen: Option<Buffer>,
-    copied_chars: Option<usize>,
+    copy_requested_chars: Option<usize>,
     animation_frame: usize,
     enhanced_keyboard: bool,
     remote_polling: bool,
@@ -1894,13 +1884,13 @@ impl App {
             should_quit: false,
             selection_locked: false,
             palette: None,
-            source_tree_picker: None,
+            browser: None,
             selecting_transcript: false,
             screen_selection: None,
             selecting_screen: false,
             pending_conversation_click: None,
             rendered_screen: None,
-            copied_chars: None,
+            copy_requested_chars: None,
             animation_frame: 0,
             enhanced_keyboard: false,
             remote_polling: false,
@@ -1982,11 +1972,11 @@ impl App {
     }
 
     pub(crate) fn clear_copy_notice(&mut self) {
-        self.copied_chars = None;
+        self.copy_requested_chars = None;
     }
 
     pub(crate) fn note_copy(&mut self, text: &str) {
-        self.copied_chars = Some(text.chars().count());
+        self.copy_requested_chars = Some(text.chars().count());
     }
 
     pub(crate) fn capture_screen(&mut self, buffer: &Buffer) {
@@ -2014,31 +2004,23 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        if self.source_tree_picker.is_none() {
-            self.selected_mut().composer.insert_paste(text);
+        if self.browser_visible() {
+            self.browser_paste(text);
+            return;
         }
+        self.selected_mut().composer.insert_paste(text);
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
+        if self.browser_visible() {
+            return MouseAction::Ignored;
+        }
         if self.selected().publish_plan.is_some() {
             if mouse.kind == MouseEventKind::ScrollUp {
                 self.handle_publication_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
             }
             if mouse.kind == MouseEventKind::ScrollDown {
                 self.handle_publication_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-            }
-            return MouseAction::Redraw;
-        }
-
-        if self.source_tree_picker.is_some() {
-            if mouse.kind == MouseEventKind::ScrollUp {
-                self.handle_source_tree_picker_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-            }
-            if mouse.kind == MouseEventKind::ScrollDown {
-                self.handle_source_tree_picker_key(KeyEvent::new(
-                    KeyCode::Down,
-                    KeyModifiers::NONE,
-                ));
             }
             return MouseAction::Redraw;
         }
@@ -2456,7 +2438,7 @@ impl App {
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
-            AppAction::SourceTrees => self.open_source_tree_picker(),
+            AppAction::BrowseFiles => self.open_browser(false),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2642,6 +2624,7 @@ impl App {
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
             match message {
+                UiMessage::Filesystem { request, result } => self.browser_update(request, result),
                 UiMessage::Forked {
                     conversation,
                     source,
@@ -3324,8 +3307,8 @@ impl App {
             }
             return;
         }
-        if self.source_tree_picker.is_some() {
-            self.handle_source_tree_picker_key(key);
+        if self.browser_visible() {
+            self.handle_browser_key(key);
             return;
         }
         if self.selected().publish_plan.is_some() {
@@ -3616,7 +3599,7 @@ impl App {
 
     fn execute_action(&mut self, action: AppAction) {
         match action {
-            AppAction::SourceTrees => self.open_source_tree_picker(),
+            AppAction::BrowseFiles => self.open_browser(false),
             AppAction::NewConversation => {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
@@ -3632,14 +3615,7 @@ impl App {
                     View::Activity
                 };
             }
-            AppAction::Changes => {
-                self.view = if self.view == View::Diff {
-                    View::Chat
-                } else {
-                    View::Diff
-                };
-                self.selected_mut().follow_tail();
-            }
+            AppAction::Changes => self.open_browser(true),
             AppAction::Tools => {
                 self.view = if self.view == View::Tools {
                     View::Chat
@@ -4407,7 +4383,7 @@ mod tests {
                 selecting_screen: false,
                 pending_conversation_click: None,
                 rendered_screen: None,
-                copied_chars: None,
+                copy_requested_chars: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
                 remote_polling: false,
@@ -4416,7 +4392,7 @@ mod tests {
                 tx: tx.clone(),
                 rx,
                 palette: None,
-                source_tree_picker: None,
+                browser: None,
             },
             tx,
         )
@@ -4499,49 +4475,6 @@ mod tests {
     }
 
     #[test]
-    fn source_tree_picker_switches_the_diff_view() {
-        let mut conversation = state("talk-1");
-        conversation.source_trees = vec![
-            source_tree_diff("main", 'a', 'b', "MAIN PATCH"),
-            source_tree_diff("side", 'c', 'd', "SIDE PATCH"),
-        ];
-        conversation.selected_source_tree = Some("main".to_string());
-
-        let (mut app, _) = app_with(vec![conversation]);
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.selected().selected_source_tree.as_deref(), Some("side"));
-        assert_eq!(app.selected().turn_options.source_tree, None);
-        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let rendered = rendered_main_pane(&terminal).join("\n");
-        assert!(rendered.contains("main [side]"));
-        assert!(rendered.contains("SIDE PATCH"));
-        assert!(!rendered.contains("MAIN PATCH"));
-
-        app.selected_mut().composer.insert_str("keep this draft");
-        app.selected_mut().running = true;
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        assert!(rendered_screen(&app).contains("Source trees"));
-        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.selected().selected_source_tree.as_deref(), Some("main"));
-        assert_eq!(app.selected().composer.expanded_text(), "keep this draft");
-        assert_eq!(app.selected().turn_options.source_tree, None);
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.selected().running);
-        assert!(app.source_tree_picker.is_none());
-        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-    }
-
-    #[test]
     fn selected_source_tree_is_shown_in_the_header() {
         let mut conversation = state("talk-1");
         conversation.transcript.push(TranscriptEntry {
@@ -4561,43 +4494,6 @@ mod tests {
         let header = rendered_header(&terminal);
         assert!(header.contains("source main bbbbbbb"));
         assert!(!header.contains("head fffffff"));
-    }
-
-    #[test]
-    fn changes_header_marks_a_completed_publication_of_the_selected_source_tree() {
-        let mut conversation = state("talk-1");
-        conversation.source_trees = vec![source_tree_diff("main", 'a', 'b', "")];
-        conversation.selected_source_tree = Some("main".to_string());
-        conversation.publications = vec![PublicationSummary {
-            id: "publication".to_string(),
-            source_tree: "main".to_string(),
-            planned_head: "b".repeat(40),
-            status: conversation_protocol::v3::PublicationStatus::Complete,
-        }];
-        let (mut app, _) = app_with(vec![conversation]);
-        app.view = View::Diff;
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-
-        assert!(rendered_main_pane(&terminal)
-            .join("\n")
-            .contains("Source tree diff · Published"));
-
-        app.selected_mut().publications.insert(
-            0,
-            PublicationSummary {
-                id: "newer-conflict".to_string(),
-                source_tree: "main".to_string(),
-                planned_head: "b".repeat(40),
-                status: conversation_protocol::v3::PublicationStatus::Conflict,
-            },
-        );
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        assert!(!rendered_main_pane(&terminal)
-            .join("\n")
-            .contains("Source tree diff · Published"));
     }
 
     #[test]
@@ -5322,7 +5218,7 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
         assert!(app.palette.is_some());
-        for ch in "source tree changes".chars() {
+        for ch in "compare snapshots".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         let matches = app.palette.as_ref().unwrap().matches();
@@ -5340,12 +5236,12 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Command palette"));
-        assert!(rendered.contains("Show source tree changes"));
+        assert!(rendered.contains("Compare conversation snapshots"));
         assert!(!rendered.contains("New conversation"));
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.palette.is_none());
-        assert_eq!(app.view, View::Diff);
+        assert!(app.browser_visible());
         assert_eq!(app.selected().composer.text, "keep this draft");
     }
 
@@ -5824,7 +5720,7 @@ mod tests {
         conversation.activities = vec![activity(1), activity(2), activity(3)];
         let (mut app, _) = app_with(vec![conversation]);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.execute_action(AppAction::Activity);
         assert_eq!(app.view, View::Activity);
         assert_eq!(app.selected().activity_selection, Some(2));
 
@@ -6201,7 +6097,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(footer.ends_with(" 3 chars copied "));
+        assert!(footer.ends_with(" Copy requested: 3 chars (Ctrl+Y: manual) "));
     }
 
     #[test]
@@ -6286,7 +6182,7 @@ mod tests {
         assert!(rendered.contains("Agent (sonnet-5)"));
         assert!(rendered.contains("Running…"));
         assert!(rendered.contains("$ cargo test"));
-        assert!(rendered.contains("Ctrl+T expands"));
+        assert!(rendered.contains("Palette: activity"));
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("Enter/^J newline"));
         assert!(rendered.contains("^S send"));
@@ -6329,7 +6225,7 @@ mod tests {
         assert!(enhanced_help.contains("Ctrl+Enter      send the prompt"));
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        app.execute_action(AppAction::Activity);
         assert_eq!(app.view, View::Activity);
         assert_eq!(app.selected().activity_selection, Some(0));
         terminal.draw(|frame| render(&app, frame)).unwrap();
@@ -7694,10 +7590,10 @@ mod tests {
     }
 
     #[test]
-    fn selection_lock_blocks_edits_and_ctrl_q_toggles_changes() {
+    fn selection_lock_blocks_edits_and_ctrl_q_is_unbound() {
         let (mut app, _) = app_with(vec![state("talk-1")]);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert_eq!(app.view, View::Diff);
+        assert_eq!(app.view, View::Chat);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Chat);
 
@@ -7710,7 +7606,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_t_toggles_activity_and_ctrl_shift_t_shows_tools() {
+    fn ctrl_t_is_unbound_and_ctrl_shift_t_shows_tools() {
         let mut conversation = state("talk-1");
         conversation.tool_set = Some(Ok(ToolSetDescription {
             source: "main:caos-tools".to_string(),
@@ -7722,7 +7618,10 @@ mod tests {
         }));
         let (mut app, _) = app_with(vec![conversation]);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Chat);
+        app.execute_action(AppAction::Activity);
         assert_eq!(app.view, View::Activity);
+        app.execute_action(AppAction::Activity);
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Chat);
         app.handle_key(KeyEvent::new(

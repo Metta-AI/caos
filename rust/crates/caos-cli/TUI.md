@@ -121,8 +121,6 @@ so it never leaves the conversation pane.
 | `Ctrl+N` | Start a new virtual conversation and select it |
 | `Ctrl+H` | Enter or leave keyboard help |
 | `Ctrl+Shift+P` | Open or close the searchable command palette |
-| `Ctrl+Q` | Switch between conversation and source tree changes |
-| `Ctrl+T` | Enter or leave the Activity browser |
 | `Ctrl+Shift+T` | Show the tools available to the selected conversation |
 | `Up` / `Down` in Activity | Select the previous or next activity entry |
 | `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
@@ -133,7 +131,7 @@ so it never leaves the conversation pane.
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `Ctrl+L` | Check out the selected source tree in the original matching checkout |
-| `Ctrl+O` | Select, create, attach, or update source trees |
+| `Ctrl+O` | Browse the conversation filesystem and compare snapshots |
 | `Ctrl+P` | Preview selected source trees and their PR destinations; Enter confirms |
 | `/publish-branch` | Push a review boundary to the repository in .base-url, using its path as the branch |
 | `Ctrl+R` | Reload completed conversation history |
@@ -156,11 +154,32 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+O` to browse commit-entry paths. Enter selects a snapshot for
-inspection and local checkout; selection preserves the draft and never changes
-agent execution. Use `/import <path> <repository> [revision]` to import a commit
-at an unused path. The agent creates, copies, renames, and removes entries with
-ordinary file operations.
+Press `Ctrl+O` to browse a pinned conversation snapshot, including ordinary
+files, memories, read-only `.caos` metadata, and source trees. Enter opens an
+entry; Backspace returns to its parent. Gitlinks open as directories and show
+their commit hashes. `/` searches text across the snapshot; `d` switches
+between files and changes. The header names both compared snapshots: `b`
+chooses the baseline, `h` chooses a historical snapshot, and `r` refreshes to
+the latest conversation head. Initially the baseline is the previous commit.
+Text viewing is limited to 256 KiB per file; binary files and symlink targets
+are shown without being executed or followed.
+
+Press `s` to run a real shell command over that filesystem using the selected
+harness's shell worker. Each command starts at the conversation root, is
+noninteractive, and has a 30-second execution limit. Shell edits persist in a
+pending proposal between commands; the shell process and its working directory
+do not. Inspect the resulting files or diff, then press `a` and Enter to apply,
+or `x` and Enter to discard. Apply reconciles against the current conversation
+head: unrelated agent edits survive, and conflicts apply nothing. Edits to
+`.caos` reject the entire proposal. No message is sent to the agent.
+Escape hides the browser while retaining pending edits for this TUI session;
+quitting the TUI does not apply or restore pending proposals automatically.
+
+On a source-tree entry in the current snapshot, `o` selects the target for
+local checkout and publication. Selection preserves the draft and never
+changes agent execution. Use `/import <path> <repository> [revision]` to import
+a commit at an unused path. The agent creates, copies, renames, and removes
+entries with ordinary file operations.
 
 `Ctrl+P` previews the selected directory's numbered boundaries. Branch names
 are their full paths; the first PR targets the branch in `.base-url` and later
@@ -208,10 +227,10 @@ to exit.
 
 While a turn is running, a compact Activity row beneath the transcript shows a
 verb such as `Thinking…`, `Reading…`, or `Running…` and the current operation.
-`Ctrl+T` opens a focused Activity browser in all space above the composer;
-`Ctrl+A` remains an alias. Up and Down select durable harness steps, and the
+Choose Activity in the command palette to open its browser in all space
+above the composer. Up and Down select durable harness steps, and the
 pane beside the list shows the selected step's complete result. Scroll long
-results with PageUp, PageDown, or the mouse wheel. Escape or `Ctrl+T` returns
+results with PageUp, PageDown, or the mouse wheel. Escape returns
 to the conversation. Completed activity is reconstructed from the durable
 step chain when the TUI restarts. If the selection is already on the newest
 step, new activity remains selected. Moving to an older step pauses that
@@ -259,3 +278,11 @@ rejects unresolved conflicts or reserved conversation state. It leaves the local
 checkout and index unchanged. Credentials remain in the local secret store;
 the launcher reuses an existing checkout store or its own persistent store under
 the data directory.
+
+
+Over SSH, clipboard copying uses a terminal escape sequence. “Copy requested”
+means the sequence was sent; terminals can ignore it without acknowledging.
+For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
+Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
+require Settings > General > Selection > Applications in terminal may access
+clipboard.

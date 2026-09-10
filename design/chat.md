@@ -164,10 +164,10 @@ actually incorporated; fetching a newer remote tip does not integrate it.
 
 Review boundaries use exactly two digits from `01` through `99`, a hyphen,
 and a nonempty description, such as `01-parser`. They are not individual edits.
-The TUI lists entries in descending filename order and compares each with the
-preceding gitlink in the same directory, regardless of its name. A lone entry
-is compared with its first recorded value. Intermediate code commits remain
-in ordinary Git ancestry.
+The browser lists entries in descending filename order. Publication derives
+each boundary's base from the preceding gitlink in the same directory;
+the browser compares the explicit conversation snapshots shown in its header.
+Intermediate code commits remain in ordinary Git ancestry.
 
 Keep **one moving `dirty` reference**. Each accepted edit produces a real code
 commit and updates its value; previous values remain in conversation history.
@@ -248,7 +248,8 @@ the proposed destination, which appears in the preview.
 
 ## Client interactions
 
-- `Ctrl+O`: browse source trees; selection changes inspection only.
+- `Ctrl+O`: browse the pinned conversation filesystem, search files, and compare
+  explicit snapshots. Gitlinks open as directories; `.caos` is read-only.
 - `/import <path> <repository> [revision]`: fetch a commit from a local repository
   or remote URL and add a gitlink at that exact, unused conversation path.
 - `Ctrl+L`: check the selected code snapshot out locally.
@@ -256,6 +257,13 @@ the proposed destination, which appears in the preview.
   with a user message.
 - `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
 - `/publish-branch`: push the selected boundary without creating a PR.
+
+The browser can run a noninteractive shell command using the same filesystem
+projection as agent tools. Commands start at the conversation root. Resulting
+edits remain a proposal until the user reviews and applies them; they do not
+send an agent message. Apply reconciles the proposal with the latest conversation
+head, preserving unrelated edits and rejecting conflicts atomically. A proposal
+that changes `.caos` is rejected. Browsing stays pinned until explicitly refreshed.
 
 The client handles host-side imports, checkout, and publication. The agent
 organizes conversation content using files and folders. There is no active
