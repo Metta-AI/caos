@@ -519,7 +519,7 @@ The tree now carries `/.caos-expr` = `run --base:@=std/deep-deps --in:@=.` — t
 top-level expression this design always called for ("Most repos will have a
 top-level `.caos-expr` that invokes `std/deep-deps` on the tree"). The suite no
 longer assembles a look-alike tree out of build outputs and invoke the transform
-imperatively; `caos-tools/test.sh` runs the transform over the WORKSPACE, and
+imperatively; `caos-tools/test.sh` runs the transform over the SOURCE TREE, and
 `tests/<name>/DEPS` paths like `../../std/rgrep` resolve against the real repo.
 
 Two things had to land first, and both were real, not incidental:

@@ -1,218 +1,267 @@
-# Chat v3: conversation and code as separate histories
+# Conversations, code stacks, and publication
 
-**Status:** implemented through subagents and workspace PR publication.
-Selected solely by the `refs/caos/v3/` namespace; v2 refs stay untouched
-and invisible. The binding definition is the code:
-`rust/crates/conversation-protocol/src/v3/` (records, kinds, paths,
-validation) and its golden fixture (`fixtures.rs`), which pins the bytes.
+Conversations record content and execution in Git. They reference ordinary
+code commits, organized into directories that define review boundaries and
+publication destinations.
 
-## Conversation, workspace, and publication roles
-
-| Plane | Meaning | Where |
+| Thing | Where | Meaning |
 | --- | --- | --- |
-| `C` | conversation | commits under `refs/caos/v3/conversations/<key>/head` |
-| `W` | workspace code | ordinary git history, named by sha from `C` |
-| `P` | publication | the selected `W` commit at `refs/heads/caos/<conversation-id>` under the current `preserve` policy |
+| `C` | CAOS Git | Conversation content in its tree; execution events in its commit message. |
+| `W` | CAOS Git | An ordinary code commit, referenced by an entry in a conversation tree. |
+| `P` | Destination Git | A publication branch pointing to an existing `W`. |
 
-A `C` commit is `tree` = the complete conversation state, `parent` = the
-previous `C` (the source `C` for a fork, the fixed v3 genesis commit
-`G3` for a `conversation.root`),
-`message` = the transition kind, one word. No `C` parents a code commit:
-the two DAGs are joined only by shas written inside `C`'s tree.
+Many `C` commits can reference the same `W`. Execution bookkeeping does not
+create a code change. A named PR boundary can span many `W` commits.
 
-Invariants:
-
-1. Every `C` has exactly one parent; its tree holds `.caos/` and, when
-   nonempty, `files/`; `git log` never enters code history.
-2. Every change is explained: the kind fixes the delta; a no-op is invalid.
-3. Code is named by sha in `C`'s records and fetched by oid. Nothing is
-   kept alive by a parent edge; gc protection is not built (the server
-   collects nothing yet).
-4. `W` and `P` are code roles: no `G3` ancestry, never parsed as
-   conversation trees. Ordinary code commits need no format conversion;
-   their extra Git headers (including signatures) are preserved. Conversation
-   commits have only tree, parent, author, and committer headers.
-   The host currently rejects workspace inputs containing reserved `.caos`
-   entries other than `.caos/conflicts`; publication rejects any `.caos`
-   entry. These are host restrictions in addition to the protocol's records.
-5. Refs only name heads: a conversation or subagent head, a membership,
-   a published branch. Everything else is an exact sha, resolved before
-   it enters a content-addressed key.
-6. Publication leaves workspace pointers unchanged. It appends publication
-   records to `C` and updates the remote published branch; it rewrites no
-   conversation history. `preserve` creates no additional code commits.
-7. The transcript is append-only.
-
-## Refs and keys
-
-```
-refs/caos/v3/conversations/<hex(id)>/head
-refs/caos/v3/users/<hex(user)>/conversations/{active,archived}/<hex(id)>
-refs/heads/caos/<id>                       (publication, on origin)
+```mermaid
+flowchart TB
+    subgraph caos["CAOS Git"]
+        before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests bash<br/>C_4: bash starts"]
+        after["C_5: bash completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
+        before -->|conversation continues| after
+        before -.->|feature/dirty| W0["W_0: original code"]
+        after -.->|feature/dirty| W1["W_1: edited code"]
+        W1 -->|Git parent| W0
+        after --> ready["C_8: rename dirty to 01-feature"]
+        ready -.->|feature/01-feature| W1
+    end
+    subgraph destination["Destination Git"]
+        P["P: feature/01-feature"] --> published1["W_1"]
+        published1 -->|Git parent| published0["W_0"]
+    end
+    W1 -.->|publish same commits and ancestry| published1
 ```
 
-Heads advance only by exact-oid leased CAS (concurrency control, not
-validation). A membership ref's existence is the fact; its value is a
-stale-tolerant hint. The server is conversation-agnostic
-(`client-owned-conversation-refs.md`); repair treats `refs/caos/v3/` as
-target-only and never rewinds it through the reflog.
+This example dispatches bash to a worker; each listed `C` is a separate commit.
+Naming the review boundary creates a new `C`, but no new `W`. Publishing
+pushes that exact code commit.
 
-## The tree
+## Conversation commits
 
+**Trees hold canonical content; commit messages hold execution history.**
+
+The tree contains the title, canonical transcript, ordinary conversation files,
+and code references. Protocol metadata lives under `.caos/`; ordinary content
+and code references live directly at paths outside it. The format marker in
+`.caos/format` is `caos-conversation-v5`.
+
+Structured commit messages record run requests, worker claims, tool calls and
+results, and background/subagent activity. The TUI derives the latest relevant
+state for each operation by replaying those events.
+
+A normal `C` parents the previous `C`; a new root starts from a fixed genesis
+commit. Forks retain their source history through a Git parent, which identifies
+their origin. Conversation parent edges never point to code commits.
+
+One canonical, **unsharded** transcript lives under `.caos/transcript`.
+Earlier versions are available through conversation history.
+
+### Why recording a run is a separate commit
+
+1. Commit the user message as `C_0`.
+2. Build a computation request using `C_0` as its input snapshot. Computing
+   its hash creates no conversation commit.
+3. Create `C_1` with an event recording that request's hash, input snapshot,
+   model/settings, and queued status.
+
+The request hash depends on `C_0`; including it inside `C_0` would make the
+hashes depend on each other. Step 3 identifies the concrete run to execute.
+
+The worker subsequently records that it has started the run. Model responses
+and run completion also create `C` commits. Dispatched tools, such as bash,
+record separate start and completion commits. Inline tools, such as `read`
+and `edit`, record completion without a separate start commit. An event-only
+commit can reuse its parent's tree.
+
+Events are replayed in first-parent order, never by timestamp. A fork starts a
+new execution context while retaining ancestral tool results needed by its
+canonical transcript. Forking requires a quiescent request; it does not resume
+the source's background work.
+
+## The agent's filesystem
+
+The harness supplies source-tree organization and publication conventions to
+every model call, including subagents. Agents preserve bases, organize review
+boundaries, and integrate delegated changes using ordinary file operations;
+users specify the desired work and review structure. A launch-time `--import`
+supplies the commit, path, selected revision, and available credential-free origin.
+Publication destinations are chosen from that context or existing metadata,
+with clarification only when ambiguous.
+
+Commands start at the conversation root. Memories, skills, notes, and source
+trees share one path space. A commit-valued entry appears as a directory whose
+contents are that commit's tree; a regular file containing a SHA remains a file.
+Nested commit entries follow the same rule.
+
+The file tools and grep use conversation-relative paths, such as
+`memories/project.md` or `feature/dirty/README.md`. Grep traverses source trees.
+Bash runs from this root, with an optional relative `cwd` for a single call.
+Its `paths` list is always relative to the conversation root: declared
+directories include their descendants; undeclared contents remain lazy.
+
+Use ordinary filesystem operations to organize content:
+
+```sh
+mkdir -p feature
+mv feature/dirty feature/01-parser
+cp -a feature/01-parser feature/dirty
 ```
-.caos/format                  "3"
-.caos/identity.json           id, kind, optional owner (parent/head/request/round/tool for a child)
-.caos/title
-.caos/workspaces/<name>/{commit,initial[,origin]}   bare shas
-.caos/transcript/<shard>/<ordinal>-<message-id>.json  + payload dir
-.caos/requests/<id>.json      .caos/requests/active
-.caos/tools/<request>/<round>/<call-id>.json  + payload dir
-.caos/async/  .caos/subagents/  .caos/publications/
-files/                        conversation-owned files
+
+A writable projection records each source directory's original commit in an
+extended attribute. `mv` and `cp -a` preserve it. On storage, an unchanged
+directory retains the exact commit, including signatures; edited content
+becomes a child commit. Ordinary directories remain Git trees. Copying without
+preserving extended attributes copies files but loses the commit boundary.
+This metadata is local to the projection, not another conversation registry.
+
+Inside bash, `caos checkout <commit> <destination> <paths...>` adds a commit
+already available in CAOS; `.` loads its whole tree. Local or remote repository
+imports happen through the client. No host filesystem path is implicitly
+available inside a worker.
+
+Call a repository tool with `run_tool` and a conversation-relative path, such
+as `feature/dirty/caos-tools/test`, plus its arguments. The harness resolves
+the tool against the captured snapshot and dispatches its content-addressed
+request. Its input is the outermost source tree on that path: the first
+commit-valued entry reached from the conversation root, even if the tool lies
+inside another gitlink. A tool outside source trees receives the conversation
+tree. Repository tool schemas and instructions are shown with their owning paths.
+
+A shell result may change conversation files and several source trees together.
+Apply it atomically against the captured input: retain concurrent unrelated
+edits, reconcile concurrently edited source commits, and retain a conflicting
+proposal without installing half the operation. Agent tools cannot change
+conversation protocol metadata under `.caos/`.
+
+## Code references and stack directories
+
+Code references are Git commit-valued tree entries (gitlinks, mode `160000`).
+A reference's value is a `W`; that commit's
+identity does not depend on the repository from which it was fetched.
+
+References may occur anywhere outside `.caos`. The TUI walks ordinary
+directories and lists each commit-valued entry it reaches, stopping at that
+entry. Nested gitlinks remain traversable by file tools but are not separate
+TUI source-tree targets.
+
+A single reference such as `paintbot` is enough for simple work. When useful,
+move it into a feature directory and follow this convention:
+
+```text
+paintbot-feature/
+  .base-url                 # two lines: repository URL, then base branch
+  00-base          -> W_0   # exact incorporated base
+  01-add-targeting -> W_1   # first PR boundary
+  02-improve-it    -> W_2   # second PR boundary
+  dirty            -> W_d   # current work, when present
 ```
 
-Records are canonical JSON (sorted keys, integers only, LF); protocol
-ids are `SHA-256("caos-v3-id\0" || tag || 0 || canonical)`.
+`.base-url` says where to fetch and publish. `00-base` says which commit has
+actually been incorporated. They are distinct: fetching a newer remote tip
+does not integrate it.
 
-The protocol accepts an explicit workspace map, including zero or multiple
-workspaces. The host currently creates one: the TUI defaults to `main` at
-the local default branch tip; the CLI defaults to `HEAD`, or uses `--base`.
-With an explicit base its workspace is named `main`; otherwise the CLI
-uses the default branch name, the current branch name, or `main` as a
-fallback. The selected code commit is adopted without rewriting it.
+Review boundaries use exactly two digits from `01` through `99`, a hyphen,
+and a nonempty description, such as `01-parser`. They are not individual edits.
+The TUI lists entries in descending filename order and compares each with the
+preceding gitlink in the same directory, regardless of its name. A lone entry
+is compared with its first recorded value. Intermediate code commits remain
+in ordinary Git ancestry.
 
-## Host and launcher inputs
+Keep **one moving `dirty` reference**. Each accepted edit produces a real code
+commit and updates its value; previous values remain in conversation history.
+When ready, rename it to the next numbered boundary. Start another `dirty`
+from that commit when needed.
 
-Separate histories do not yet make launching independent of the checkout.
-The host is TOLD which harness to run: `--llm-step` and `--llm-call` are
-ordinary image args (`:@=` a path in the evaluated working tree, `:@@=` a git
-locator, `:hash=` an oid), required, with no default. There is no
-`DEEP-DEPS/<name>` convention and no root `DEPS` — those made every repo
-driving this client expand caos' entry points under the names the client
-happened to use. The checkout's `.caos-secrets/` store grants the model key to
-the same paths those args name; absent readers grant nothing. The host also
-snapshots local `main`/`master` refs for the merge tool and publishes through
-the checkout's `origin` remote.
+Creating, copying, renaming, or removing references is ordinary tree editing.
 
-What is still checkout-bound is the RESOLUTION, not the naming: a `:@=` path is
-looked up in the ingested working tree, and the secret store is read from it.
-A locator (`:@@=`) already sidesteps the first.
+### Editing, updating, and delegating
 
-These inputs come from the host checkout, which may differ from the selected
-workspace commit. An independent launcher supplying harness, secret, and
-repository inputs remains a followup.
+Tools receive immutable input snapshots. Capture these when work starts so
+changing UI selection cannot redirect an in-flight operation. Git operations
+such as merge name the source tree they operate on; filesystem tools share
+the conversation root.
 
-## Transitions
+The agent updates a stack using ordinary tools: import the remote commit,
+merge it into the chosen entries, and move or copy directories as needed.
+There is no stack-update operation or background refresh of remote branches.
+Directory ordering does not replace integrating Git histories.
 
-Twenty-three kinds, each a one-word commit message:
+Subagents start from one content tree with fresh protocol metadata. By default
+they receive all conversation content; optional `paths` selects files,
+directories, or gitlinks to copy at the same paths. Select a gitlink as a whole
+source tree; use ordinary file edits for finer changes inside it.
 
-```
-conversation.root  conversation.fork  metadata.title.set
-message.append     request.admit  request.claim  request.interject
-request.escape     request.terminal   model.complete
-tool.start         tool.complete      files.apply
-workspace.create   workspace.rollback workspace.remove
-async.start        async.terminal
-subagent.spawn     subagent.terminal  subagent.apply
-publication.pending  publication.terminal
-```
+`harvest_agent` applies the child's changes since its initial snapshot, optionally
+restricted by `paths`. It uses the same atomic application as file tools:
+ordinary files and multiple source trees can arrive together, unrelated parent
+edits survive, and conflicts retain the proposal without partial application.
+Child identity, initial conversation head, run request, and terminal head are
+recorded in events; content is read from those commits.
 
-A turn: the client appends the user entry and admits a request in one
-leased push (creation also writes the active membership ref, with the
-archived one proven absent). The worker claims it, calls the model from
-the exact head, records `model.complete`, handles the tool calls, then
-records `request.terminal`. Dispatched workspace tools first append
-`tool.start` pinning their task and input workspace, then `tool.complete` with
-the result. Inline tools and immediate errors complete directly without a
-`tool.start`. Conversation-file calls have no workspace target. For inline
-file tools, an explicit workspace makes every path workspace-relative;
-without one, the `files/` prefix selects conversation-owned files.
+### Starting a client
 
-Interjections and escapes are records the worker drains at its next
-boundary. Async tasks and subagents have start/spawn records on the
-parent's spine and a relay appends their terminal records. A subagent has
-its own `conversation.root` parenting `G3`, with owner metadata naming the
-parent's exact head. It receives the selected workspace, if any, rather
-than inheriting the parent's transcript or files. Its workspace result
-reaches the parent only through `subagent.apply`.
+The client starts from a CAOS harness independently of target code. A
+conversation begins from an optional content tree; without one it starts empty.
 
-**Reconciliation.** A missing workspace pointer produces a conflict.
-Otherwise the proposal must descend from its declared base, and the
-following cases are tried in order:
+The invocation names the workers with typed image arguments, for example
+`caos tui --llm-step:@=std/llm-step --llm-call:@=std/llm-call`.
+Paths resolve in the harness, not an attached source tree. Hash and Git-locator
+image arguments also work; no root DEPS entry is required.
 
-- Already applied: the proposal equals its base or the current commit,
-  or is an ancestor of the current commit.
-- Direct: current equals the base, or current descends from the base and
-  the proposal descends from current.
-- Merged: a three-way merge using the declared base succeeds; mint a
-  commit with current and proposal as its two parents.
-- Conflict: record the candidate and any conflicting paths, leaving the
-  workspace pointer unchanged.
+Add `--import feature/dirty` to load the committed HEAD of the launching checkout
+at that exact path (or choose a commit with `--base`). A system message states what
+was provided. Local uncommitted edits are not included. Cloud
+sessions likewise start from a stable CAOS client repository/environment and
+attach target code afterward. This also makes bootstrap caching independent
+of the target repositories.
 
-Tree equality alone does not mean already applied: a commit can add merge
-ancestry without changing any files. Such proposals still advance or merge
-according to the table. Readers continue to accept older already-applied
-records with a retained candidate.
+Credentials, server choice, and client caches remain local.
 
-The same table serves dispatched tool proposals, subagent application,
-and the host's manual tree update. `/update-tree` commits outstanding local
-edits, includes already-committed edits, and uses the merge base of local
-`HEAD` and the selected workspace as the proposal base. It refuses unrelated
-histories or multiple merge bases before staging files.
+## Publication
 
-**Publication.** `preserve` policy only: push the named workspace's
-commit to `refs/heads/caos/<id>` on the host checkout's `origin`. Selection
-is required when there is more than one workspace; they currently share
-that one destination branch. The existing remote tip must be an ancestor
-of the selected commit. A leased push then protects against subsequent
-remote changes, bracketed by `publication.pending` and
-`publication.terminal` (complete, conflict, or uncertain).
+Select a stack directory and derive the plan:
 
-Before retrying, the host reconciles pending records for the same repository
-and ref using the observed remote tip: the planned head means complete;
-an unchanged expected tip means uncertain; another tip means conflict.
-It records these outcomes without replaying the old pushes.
+- Repository and external base: `.base-url`.
+- Branch names: entry paths, such as `paintbot-feature/01-add-targeting`.
+- PR bases: the external branch for the first boundary, then the preceding
+  boundary's branch for each subsequent PR.
 
-The TUI also supports PR publication through `Ctrl+P` (or **Publish pull
-request** in its command palette). The user confirms a base, defaulting to
-`origin`'s advertised default branch. The host fetches its current commit and
-runs an ordinary conversation turn to merge it into the selected workspace
-when necessary, then build and test. This preparation can advance `W`; the
-subsequent publication operation still leaves workspace pointers unchanged.
-Before publishing, the host rejects interruption, missing base ancestry,
-remaining conflict markers, reserved `.caos` state, or a workspace changed
-since preparation. It uses the same leased branch publisher, then `gh` to
-find an open PR for that repository, head, and base or create one.
-`/publish-branch` skips preparation and PR creation. Squash, per-workspace
-destinations, multi-workspace PR stacks, and conversation publication remain
-deferred.
+Exclude `00-base` and `dirty`. Naming a boundary does not squash the
+intervening commits.
 
-**Forks, title, membership.** `conversation.fork` creates a new identity
-with the source `C` as its parent; it is not a `conversation.root`.
-The source must be quiescent (no active or cancelling request, no started
-tool, no pending async task or publication). The fork inherits its state
-with every running child record dropped. A title update changes only the
-title file and commits through CAS on the conversation head; conditional
-title updates also compare the expected title. Archiving moves the
-membership ref.
+The preview captures the code commits, destination branches, PR bases, and
+current remote tips. After confirmation, push those exact commits and ancestry,
+then open or reuse the PRs. Reject changed content, changed destinations, remote
+drift, unresolved conflicts, and a PR base not incorporated into the code.
+Preparation, builds, and tests happen before previewing; publishing never runs
+an agent or changes code.
 
-## Validation
+Find existing PRs by repository and inferred branch. Inspect destination refs
+after an interrupted push before retrying. Any recovery events belong in commit
+history.
 
-A reader accepts a `C` by structural checks (one parent, registered
-kind, root-parents-`G3` and only-root-parents-`G3`, no-op, tree escapes,
-non-blob modes, `format`, `title`, canonical bytes of every changed
-record) and then by reconstruction: the transition is rebuilt from the
-changed records, re-applied to the parent tree in memory, and the
-resulting tree oid must equal the child's. `validate_spine` walks a head
-back to its root at `G3` or an already-validated boundary. It adds newly
-validated commits to the cache only after the whole walk succeeds, so a
-failed validation cannot certify a descendant. Workers validate on load
-and when adopting remote advances; ordinary appends use the shared
-transition application without re-validating the resulting spine.
+Reject invalid or colliding derived branch names visibly. A renamed path changes
+the proposed destination, which appears in the preview.
 
-## Known shortcomings
+## Client interactions
 
-- No gc protection for code shas named only from `C` (invariant 3).
-- No retention or erasure policy; reflogs are kept forever.
-- Publication uses one branch per conversation; no squash policy or multi-workspace PR stacks.
-- Stacks and surfaces above one conversation are not designed.
+- `Ctrl+O`: browse source trees; selection changes inspection only.
+- `/import <path> <repository> [revision]`: fetch a commit from a local repository
+  or remote URL and add a gitlink at that exact, unused conversation path.
+- `Ctrl+L`: check the selected code snapshot out locally.
+- `/update-tree <message>`: submit local edits to the selected code snapshot
+  with a user message.
+- `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
+- `/publish-branch`: push the selected boundary without creating a PR.
+
+The client handles host-side imports, checkout, and publication. The agent
+organizes conversation content using files and folders. There is no active
+source tree in execution: file tools use conversation-relative paths, and Git
+operations explicitly name their target. UI selection cannot retarget a run.
+
+## Scope
+
+Separate stack directories can attach separate repositories. Consuming
+unpublished code across them requires explicit dependency configuration.
+Git-by-hash endpoints, automatic DEPS projection, conversation merging, and
+transcript compaction commands are not currently implemented.
