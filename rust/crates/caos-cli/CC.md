@@ -15,8 +15,23 @@ caos cc serve    the workspace tool server (JSON-RPC on stdio)
 ```
 
 Both take `--llm-step:<type>=<value>`, exactly as `caos tui` and `caos chat`
-do — the step that runs the tools, named as a path into whatever tree you are
-in (`std/llm-step` here, `caos-std/llm-step` in a repo that mounted caos).
+do: the step that runs the tools, and NOTHING KNOWS WHERE IT LIVES. There is no
+default and no convention — the caller says, in any of the image arg types, and
+which one is right depends on where the caller is standing:
+
+```text
+--llm-step:@=std/llm-step                              a path in this tree
+--llm-step:@@=github:<owner>/<repo>?rev=<40 hex>&dir=std/llm-step
+                                                       another repo, pinned
+```
+
+`dev/claude-code/`'s configuration uses the first, because it is caos' own
+checkout — that file is the caller, playing the part a person plays when they
+type `caos tui --llm-step:@=…`. A session in somebody else's repository uses
+the second, and that is the whole answer to "how does a session in an arbitrary
+repo find the step": the client fetches the pinned tree and evaluates it
+exactly as it would a local directory (design/flake-inputs.md). Nothing is
+added to that repository, and only the resolved oid enters the cache key.
 
 ## What the model sees
 
@@ -77,9 +92,13 @@ absolute path from its own location and has no such constraint.
 `settings.json` denies Claude Code's built-in file and shell tools, which
 removes them from the model's context rather than merely refusing their calls,
 and points every hook at `caos cc hook`. `mcp.json` declares the tool server.
-Both pass `--llm-step:@=std/llm-step`, caos' own path to the step; a repository
-that mounts caos elsewhere edits that path in those two files, as it would for
-`caos tui --llm-step:@=…`.
+Both pass `--llm-step:@=std/llm-step`, which is a statement about THIS
+checkout and nothing more: these two files are the caller. Elsewhere they say
+something else — `dev/claude-code/cloud/configure.sh` rewrites that argument
+into a locator pinned to the commit the installed client was built from, so a
+session in an unrelated repository runs the step from the same tree as its
+client. It runs at setup AND at every session start, because the client is
+refreshed per session and the two must not drift apart.
 
 **`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
 Claude Code sets that variable in the environment *of* a spawned stdio server;

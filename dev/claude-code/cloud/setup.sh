@@ -140,63 +140,16 @@ bash -n /usr/local/bin/caos-cloud-session-start || {
 # ---------------------------------------------------------------------------
 # Hooks and the tool server, user-level
 # ---------------------------------------------------------------------------
-
-# The deny list, the hooks and the tool server are the SAME configuration a
-# repository gets from install.sh, so they are fetched rather than restated
-# here. Written out twice they agree only as long as someone remembers both,
-# and the two forms do not even look alike to a reader comparing them.
-#
-# Two transformations, and only two:
-#
-#   * `${CAOS_BIN:-caos}` becomes `caos`. That indirection exists so a dev
-#     checkout can point at a binary it just built; a container has one caos,
-#     on PATH, and an unexpanded variable in an argv[0] is a file that does not
-#     exist.
-#   * a SessionStart hook is added. It is what makes this repo-independent: the
-#     client finds caos through the `caos` git remote and an arbitrary checkout
-#     has none, so the remote is added per session from user-level settings.
-#     A repository that carries its own settings does not need it.
-if ! repo_settings="$(curl -fsSL "$base/settings.json")" \
-   || ! repo_mcp="$(curl -fsSL "$base/mcp.json")"; then
-    echo "FATAL: could not fetch settings.json and mcp.json from $base" >&2
+# Written by cloud/configure.sh, which the session hook also runs -- see the
+# note at the top of that file for why it is not inline here. It must succeed:
+# an environment snapshotted without a tool server declaration gives every
+# session a model with no caos tools and no way to say so.
+echo "writing the user-level configuration" >&2
+if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
+    echo "FATAL: could not write the session configuration from $base" >&2
+    echo "  Its own error is above this line; read that, not this." >&2
     exit 1
 fi
-
-unbin='def plain: split("\"${CAOS_BIN:-caos}\"") | join("caos")
-                | split("${CAOS_BIN:-caos}") | join("caos");
-       def unbin: if type == "object" and (.command? | type) == "string"
-                  then .command |= plain else . end;
-       walk(unbin)'
-
-if ! settings="$(printf '%s' "$repo_settings" | jq "$unbin"' | .hooks.SessionStart =
-        [ { hooks: [ { type: "command", command: "caos-cloud-session-start" } ] } ]')"; then
-    echo "FATAL: $base/settings.json is not the JSON this expects" >&2
-    exit 1
-fi
-if ! servers="$(printf '%s' "$repo_mcp" | jq "$unbin"' | .mcpServers')"; then
-    echo "FATAL: $base/mcp.json is not the JSON this expects" >&2
-    exit 1
-fi
-
-for home in /root /home/claude /home/user; do
-    [ -d "$home" ] || continue
-    mkdir -p "$home/.claude"
-
-    printf '%s\n' "$settings" > "$home/.claude/settings.json"
-    chmod 0644 "$home/.claude/settings.json"
-
-    # settings.json cannot declare an MCP server -- that lives in the user
-    # config beside it. Merged rather than overwritten: the file also holds
-    # account state a cloud session put there.
-    cfg="$home/.claude.json"
-    [ -s "$cfg" ] || echo '{}' > "$cfg"
-    tmp="$cfg.caos.$$"
-    if jq --argjson servers "$servers" \
-         '.mcpServers = ((.mcpServers // {}) + $servers)' "$cfg" > "$tmp" 2>/dev/null; then
-        cat "$tmp" > "$cfg"
-    fi
-    rm -f "$tmp"
-done
 
 # ---------------------------------------------------------------------------
 # When did this environment last get built?

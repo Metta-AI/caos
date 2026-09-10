@@ -48,6 +48,13 @@ if [ -n "$base" ]; then
     if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
+    # AND THE CONFIGURATION, because it pins the commit the client was built
+    # from. A refreshed client left with the old configuration would drive a
+    # step from a different tree than itself, which is the one pairing that
+    # cannot be allowed to go quiet. Writes nothing when nothing moved.
+    if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
+        log "could not refresh the session configuration; carrying on"
+    fi
 fi
 
 # Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
