@@ -241,6 +241,36 @@ longer classifies an unguarded `set -e` abort as infrastructure.
 Infrastructure failures are still uncached, and a request whose resolution
 caught one is not memoized either, so a retry really retries.
 
+### Running the tools without the model
+
+Two arguments cut the model out of the step, for a harness that owns the model
+itself. `caos cc` is that harness: Claude Code chooses the calls and reads the
+results, and caos keeps the durable record.
+
+- `--list-tools` (optionally `--workspace:hash=<tree>`) describes the registry
+  as JSON and stops. Nothing about a conversation is read: a tool server is
+  asked for its tools before there is a conversation to run them in.
+- `--tools-only=<call id>` drains the request's declared calls and stops,
+  leaving the request RUNNING for the next one, with the conversation as it
+  now stands as its result. The named call must have completed by the time the
+  queue empties, which is what makes a dispatch prove it did its own work.
+
+Neither reaches the model, so neither requires `--system`, `--model` or the
+API key — a Claude Code session may have no Anthropic key at all.
+
+The caller declares the call itself (one `model.complete` naming it, which is
+what `validate_current_call` demands of any tool), then runs the step once per
+call. Each dispatch is a FRESH ArgTree naming the admitted request through
+`--run`: the request is itself an ArgTree, so a second call that reused it
+would be answered from the first's memo. `--tools-only`'s value carries the
+call id for that reason as much as for the check.
+
+The point is that there is exactly one implementation of `edit`. A harness
+that reimplemented the tools client-side would give a model a second
+description and a second behaviour for every one of them, and `caos cc` used
+to. `tests/llm-tools-only` covers the mode, with an EMPTY stub fixture so a
+run that reaches the model fails rather than passing.
+
 ## LLM API
 
 Raw `POST /v1/messages` (no SDK — none exists for Rust, and the Agent SDK's

@@ -27,18 +27,25 @@ fi
 export CAOS_BIN
 
 # Prove the server actually answers before handing it to a session, so a broken
-# or stale binary is an error here rather than a toolless model later.
+# binary or an unreachable server is an error here rather than a toolless model
+# later. `tools/list` is a WORKER RUN -- the tools are `std/llm-step`'s and it
+# is asked to describe them -- so this probe needs the caos server up, and the
+# same `--llm-step` mcp.json passes.
+#
+# Stderr is kept: a listing that fails says why there, and "no tools" without
+# the reason is the failure this whole script exists to prevent.
 #
 # The output is captured rather than piped into `grep -q`: grep exits at its
 # first match and closes the pipe, the server takes SIGPIPE, and under
 # `pipefail` that pipeline reports failure for a probe that in fact SUCCEEDED.
 probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-    | "$CAOS_BIN" cc serve 2>/dev/null || true)"
+    | "$CAOS_BIN" cc serve --llm-step:@=std/llm-step || true)"
 case "$probe" in
     *caos_session*) ;;
     *)
-        echo "$CAOS_BIN cc serve did not list its tools;" >&2
-        echo "it is probably older than \`caos cc\`. Rebuild it." >&2
+        echo "$CAOS_BIN cc serve listed no tools (see the error above)." >&2
+        echo "The tools come from std/llm-step through the caos server, so" >&2
+        echo "check that the server is up and the binary is current." >&2
         exit 1
         ;;
 esac

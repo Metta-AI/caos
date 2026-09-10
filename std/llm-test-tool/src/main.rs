@@ -6,11 +6,12 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
+use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    AsyncRecord, AsyncStatus, Block, Identity, IdentityKind, RequestOutcome, RequestRecord,
-    RequestStatus, Role, ToolStatus, TranscriptEntry,
+    AsyncRecord, AsyncStatus, Block, DeclaredCall, Identity, IdentityKind, RequestOutcome,
+    RequestRecord, RequestStatus, Role, ToolStatus, TranscriptEntry,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -54,6 +55,20 @@ enum ToolCommand {
         request: Oid,
         actor: String,
         text: String,
+        refname: Option<String>,
+    },
+    /// Declare a tool call on a request WITHOUT running it -- what a harness
+    /// that drives the model itself records before handing the call to a
+    /// tools-only step (`caos cc`). Claims a queued request first, because a
+    /// declaration needs a running one.
+    Declare {
+        repo: PathBuf,
+        head: Option<Oid>,
+        request: Oid,
+        actor: String,
+        id: String,
+        tool: String,
+        input: String,
         refname: Option<String>,
     },
     Escape {
@@ -238,6 +253,19 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             request: args.oid("--request", "request")?,
             actor: args.required("--actor")?,
             text: args.required("--text")?,
+            refname: args.take("--ref")?,
+        },
+        "declare" => ToolCommand::Declare {
+            repo: args.repo()?,
+            head: args
+                .take("--head")?
+                .map(|value| parse_oid(&value, "conversation head"))
+                .transpose()?,
+            request: args.oid("--request", "request")?,
+            actor: args.required("--actor")?,
+            id: args.required("--id")?,
+            tool: args.required("--tool")?,
+            input: args.required("--input")?,
             refname: args.take("--ref")?,
         },
         "escape" => ToolCommand::Escape {
@@ -539,6 +567,25 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             println!("status {status}");
             println!("message {message_id}");
         }
+        ToolCommand::Declare {
+            repo,
+            head,
+            request,
+            actor,
+            id,
+            tool,
+            input,
+            refname,
+        } => declare(DeclareInput {
+            repo,
+            head,
+            request,
+            actor,
+            id,
+            tool,
+            input,
+            refname,
+        })?,
         ToolCommand::Escape {
             repo,
             head,
@@ -795,6 +842,135 @@ struct TurnInput {
     secret_hash: Oid,
     model: String,
     configuration: Oid,
+}
+
+struct DeclareInput {
+    repo: PathBuf,
+    head: Option<Oid>,
+    request: Oid,
+    actor: String,
+    id: String,
+    tool: String,
+    input: String,
+    refname: Option<String>,
+}
+
+/// Record a tool call the way a harness that drives the model itself does:
+/// claim the request if it is still queued, then one `model.complete` naming
+/// the call and carrying its arguments. Nothing runs -- the call is left
+/// PENDING, for a tools-only step to drain.
+fn declare(input: DeclareInput) -> Result<(), ToolError> {
+    let mut store = open(&input.repo)?;
+    let head = match input.head {
+        Some(head) => {
+            store.ensure_local(&head)?;
+            head
+        }
+        None => {
+            let refname = input
+                .refname
+                .as_ref()
+                .ok_or_else(|| ToolError::new("declare needs either --head or --ref"))?;
+            store
+                .fetch_ref(refname)?
+                .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))?
+        }
+    };
+    let arguments: serde_json::Value = serde_json::from_str(&input.input)
+        .map_err(|error| ToolError::new(format!("parsing --input as JSON: {error}")))?;
+
+    let view = Conversation::open(&store, &head)?;
+    let conversation = view.identity()?.id;
+    let record = view
+        .request(&input.request)?
+        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?;
+    let latest_message = newest_user_message(&view)?;
+    drop(view);
+
+    let mut at = head.clone();
+    if record.status == RequestStatus::Queued {
+        at = append(
+            &mut store,
+            &at,
+            Transition::RequestClaim {
+                request: input.request.clone(),
+                latest_message,
+            },
+        )?;
+    }
+
+    let view = Conversation::open(&store, &at)?;
+    let round = view
+        .request(&input.request)?
+        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?
+        .round;
+    let ordinal = view.transcript_len()?;
+    drop(view);
+
+    let message_id = client_key()?;
+    let dir = paths::transcript_payload_dir(ordinal, &message_id);
+    let payload_name = format!("args-{}.json", paths::admit_external_id(&input.id));
+    let entry = TranscriptEntry {
+        message_id: message_id.clone(),
+        conversation,
+        role: Role::Assistant,
+        actor: input.actor,
+        request: Some(input.request.clone()),
+        round: Some(round),
+        model: Some("test-model".to_string()),
+        blocks: vec![Block::ToolUse {
+            id: input.id.clone(),
+            name: input.tool.clone(),
+            arguments: format!("{dir}/{payload_name}"),
+        }],
+        proposal: None,
+        workspace_resolution: None,
+    };
+    let new = append(
+        &mut store,
+        &at,
+        Transition::ModelComplete {
+            request: input.request.clone(),
+            entry,
+            payloads: vec![(payload_name, canonical_payload_bytes(&arguments)?)],
+            calls: vec![DeclaredCall {
+                id: input.id,
+                name: input.tool,
+            }],
+        },
+    )?;
+    if let Some(refname) = input.refname {
+        push_with_lease(&store, refname, &head, &new)?;
+    }
+    println!("head {new}");
+    println!("round {round}");
+    println!("message {message_id}");
+    Ok(())
+}
+
+/// A payload as the protocol frames one: the canonical encoding of
+/// `{"payload": <value>}` with the wrapper stripped back off.
+fn canonical_payload_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ToolError> {
+    const PREFIX: &[u8] = b"{\"payload\":";
+    let wrapped = canonical_bytes(&serde_json::json!({ "payload": value }))?;
+    if !wrapped.starts_with(PREFIX) || !wrapped.ends_with(b"}\n") {
+        return Err(ToolError::new(
+            "canonical payload wrapper had an unexpected shape",
+        ));
+    }
+    Ok(wrapped[PREFIX.len()..wrapped.len() - 2].to_vec())
+}
+
+fn newest_user_message(view: &Conversation<'_>) -> Result<String, ToolError> {
+    for ordinal in (0..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| ToolError::new(format!("missing transcript ordinal {ordinal}")))?;
+        if entry.role == Role::User {
+            return Ok(entry.message_id);
+        }
+    }
+    Err(ToolError::new("the request has no user message"))
 }
 
 struct RequestTreeEntry {

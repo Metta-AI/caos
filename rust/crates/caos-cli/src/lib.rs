@@ -1,5 +1,8 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
+mod cc;
+pub use cc::cli_cc;
+
 #[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,17 +25,6 @@ use conversation_protocol::v3::apply::{
 use conversation_protocol::v3::ids;
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
-// `caos cc` is NOT BUILT: it records through the chat v2 primitives
-// (`create_event_commit`, `push_head_cas`, `fetch_conversation_commit`,
-// `try_push_initial_conversation`), which v3 replaced wholesale with the
-// conversation-protocol crate. The module is left in the tree to be ported,
-// not deleted -- it is ~700 lines of working behaviour against the old
-// protocol, and the port is a change worth reviewing on its own.
-//
-// Re-enable by porting `cc/mod.rs` to v3 and restoring the `cc` arm in
-// `bin/caos-cli.rs`.
-// mod cc;  (mid-port; re-enabled below)
-// pub use cc::cli_cc;
 
 pub use conversation_protocol::v3::records::RequestStatus;
 use conversation_protocol::v3::records::{

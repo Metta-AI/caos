@@ -73,12 +73,10 @@ fn run(args: &[String]) -> Result<(), String> {
         // `--new` starts another); with no prompt on a terminal it loops, one
         // turn per line. Flag parsing and usage live in the conversation client.
         Some("talk") => caos_cli::cli_talk(&transport()?, &args[2..]),
-        // `cc` is disabled while its module is ported to chat v3 (see the note
-        // in lib.rs). It answers rather than falling through to `usage`, so a
-        // Claude Code hook that fires against this build says why.
-        Some("cc") => Err("`caos cc` is being ported to the v3 conversation \
-                          protocol and is not available in this build"
-            .to_string()),
+        // `cc hook` / `cc serve` — record a Claude Code session as an ordinary
+        // conversation. Its transport is not this one: the process is started
+        // by Claude Code, not by a person standing in the repository.
+        Some("cc") => caos_cli::cli_cc(cc_transport(), &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation on its shared canonical head. Flag parsing (and the
@@ -151,7 +149,6 @@ fn transport() -> Result<GitTransport, String> {
 /// Code reports `CONNECTION_CLOSED`, which names neither the directory nor the
 /// repository it wanted. `$CLAUDE_PROJECT_DIR` is what Claude Code sets for
 /// exactly this, so ask it before falling back to where we happen to stand.
-#[allow(dead_code)] // used by `cc`, which is disabled pending its v3 port
 fn cc_transport() -> Result<GitTransport, String> {
     let t = match std::env::var("CLAUDE_PROJECT_DIR") {
         Ok(dir) if !dir.is_empty() => GitTransport::discover(&dir)
@@ -196,6 +193,8 @@ fn usage(args: &[String]) -> String {
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [conversation options]\n    \
          (a conversation names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
          typed like any image arg — caos-std/<name> in a repo that mounted caos)\n  \
+         {prog} cc <hook | serve> [--llm-step:@=<path>]\n    \
+         (Claude Code: the hook that records a session, and the tool server it spawns)\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \

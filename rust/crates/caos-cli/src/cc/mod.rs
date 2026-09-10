@@ -7,22 +7,24 @@
 //! this tree's most reliable source of bugs. The payload names its own event
 //! (`hook_event_name`), so one command serves every hook.
 //!
-//! The conversation these events build is an ordinary one: the same
-//! `refs/caos/v2/conversations/<id>/head` ref, the same append-only spine, the
-//! same events `caos tui` already replays (design/chat.md). Its id is derived
-//! from the Claude Code session id rather than stored in a side table, so there
-//! is no local state to lose or corrupt: the ref is the whole record.
+//! The conversation these events build is an ordinary one: the same head ref,
+//! the same append-only spine, the same transitions `caos tui` already replays
+//! (design/chat.md). Its id is derived from the Claude Code session id rather
+//! than stored in a side table, so there is no local state to lose or corrupt:
+//! the ref is the whole record.
 //!
-//! What this module deliberately does NOT write is lifecycle state. The
-//! protocol's `queued`/`running` admission exists so a worker can claim a
-//! request, and nothing here is ever claimed by a worker — Claude Code already
-//! ran the turn. `fold_events` defaults an unspecified status to `idle`, so
-//! omitting admission entirely is both honest and exactly what keeps
-//! `caos talk` and the TUI's `reconcile_active_requests` from trying to resume
-//! a request that was never dispatched.
+//! AND THE TOOLS ARE ORDINARY TOOLS. Nothing here implements one. A call is
+//! recorded as the model's own declaration and then handed to `llm-step` in its
+//! tools-only mode, which runs it exactly as it runs a call in a turn it drives
+//! itself — so `caos cc` offers whatever that step offers, in whatever
+//! repository it is pointed at, and a tool reads one way wherever a model meets
+//! it. The step is named by `--llm-step`, as `tui` and `chat` name it.
+//!
+//! What Claude Code keeps is the MODEL. It chose the call and will read the
+//! result; the request a prompt admits is claimed here rather than by a worker,
+//! because the turn is already running by the time the hook fires.
 
 mod serve;
-mod tools;
 
 use std::io::Read;
 
@@ -32,25 +34,25 @@ use std::collections::BTreeMap;
 
 use caos::{GitTransport, Transport};
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
+use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::oid::{Oid, G3};
-use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::paths;
-use conversation_protocol::v3::refs;
-use conversation_protocol::v3::tree::Signature;
 use conversation_protocol::v3::records::{
     Block, DeclaredCall, Identity, IdentityKind, RequestOutcome, RequestRecord, RequestStatus,
-    Role, ToolRecord, ToolResult as ProtocolToolResult, ToolStatus, TranscriptEntry,
+    Role, TranscriptEntry,
 };
+use conversation_protocol::v3::refs;
+use conversation_protocol::v3::tree::Signature;
 use conversation_protocol::v3::view::Conversation;
+use conversation_protocol::v3::{CodeOps, ObjectStore};
 
 use crate::{
     conversation_ref, default_title, default_workspace_name, ensure_code_commit,
-    fetch_validated_head, mint_transition, oid, open_store, push_cas,
-    reject_reserved_caos, resolve_base, resolve_username, signature, update_local_cache,
-    TurnOptions, MAX_APPEND_ATTEMPTS,
+    fetch_validated_head, mint_transition, oid, open_store, push_cas, reject_reserved_caos,
+    resolve_base, resolve_username, signature, update_local_cache, TurnOptions, LLM_STEP_ARG,
+    MAX_APPEND_ATTEMPTS,
 };
-use tools::ToolError;
 
 /// Conversation ids for recorded sessions live under one component so they are
 /// obvious in the sidebar and cannot collide with a hand-named conversation.
@@ -67,18 +69,26 @@ const TOOL_PREFIX: &str = "mcp__caos__";
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
-/// The configuration a request was admitted under. There is none to record:
-/// nothing here curries a worker.
-const CLAUDE_CODE_CONFIGURATION: &str = "claude-code";
 
 /// The workspace arrives UNRESOLVED because only `serve` can carry on without
 /// one. A hook that cannot find the repository has nothing to record into and
 /// should say so; a tool server that cannot find it still has to answer, or
 /// the session sees `CONNECTION_CLOSED` and no reason at all.
+///
+/// `--llm-step:<type>=<value>` names the step that runs the tools, exactly as
+/// `tui` and `chat` take it: a session in another repository points it at
+/// wherever that repository mounted caos.
 pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("hook") => hook(&workspace?),
-        Some("serve") => serve::serve(workspace),
+    let mut options = TurnOptions::default();
+    let mut rest = Vec::new();
+    for argument in args {
+        if !options.take_image_arg(argument) {
+            rest.push(argument.as_str());
+        }
+    }
+    match rest.first().copied() {
+        Some("hook") => hook(&workspace?, &options),
+        Some("serve") => serve::serve(workspace, options),
         _ => Err(usage()),
     }
 }
@@ -86,40 +96,50 @@ pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Resul
 fn usage() -> String {
     "usage:\n  \
      caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
-     caos cc serve   (workspace tool server; JSON-RPC on stdio)"
+     caos cc serve   (workspace tool server; JSON-RPC on stdio)\n    \
+     (both take --llm-step:@=<path>, the step whose tools this session offers)"
         .to_string()
 }
 
-/// Run one workspace tool and record it the way `llm-step` records one.
+/// What one tool call answers with: the observation the transcript kept, and
+/// whether the tool itself failed. A failed tool is a RESULT, not an error --
+/// the model is meant to read it and react.
+struct ToolOutcome {
+    text: String,
+    is_error: bool,
+}
+
+/// Run one workspace tool, by declaring the call and handing it to `llm-step`.
 ///
-/// FOUR TRANSITIONS, in two compare-and-swaps: the model's declaration of the
-/// call and the tool's start, then the tool's completion. v3 will not accept a
-/// tool that no message declared (`validate_current_call`), so the declaration
-/// is not bookkeeping -- it is what makes the call legible as the model's.
-///
-/// Recording the start BEFORE running is the protocol's first invariant
-/// ("record an action before launching it", design/chat.md): a long tool is
-/// visible in the tui while it runs, and a session that dies mid-call leaves a
-/// record that it was attempted.
+/// TWO STEPS, and the second is the whole design: cc records the call as the
+/// model's own declaration -- v3 accepts no tool that no message declared
+/// (`validate_current_call`) -- and then runs the step in its tools-only mode,
+/// which starts the tool, executes it and completes it exactly as it does for a
+/// turn it drives itself. Nothing here knows what `edit` is. That is why a
+/// session in another repository gets the same tools as the tui: they are the
+/// step's, reached through `--llm-step`, not a copy of them compiled in here.
 fn run_tool(
     t: &GitTransport,
+    options: &TurnOptions,
     session: &str,
     name: &str,
     args: &Value,
-) -> Result<String, ToolError> {
-    let id = conversation_id_for(session).map_err(ToolError::Infra)?;
-    let tool_use_id = args
+) -> Result<ToolOutcome, String> {
+    let id = conversation_id_for(session)?;
+    let call = args
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
         .unwrap_or(name)
         .to_string();
     let declared = declared_args(args);
-    let username = resolve_username(t, None).map_err(ToolError::Infra)?;
+    let username = resolve_username(t, None)?;
 
-    // The record this call will be completed against, captured from the
-    // attempt that won the compare-and-swap.
-    let mut started: Option<ToolRecord> = None;
-    let start = append(t, &id, |store, head| {
+    // The request this call belongs to, captured from the attempt that won the
+    // compare-and-swap. Its round is the one BEFORE the declaration: a
+    // `model.complete` opens the next round, and the call belongs to the round
+    // that declared it.
+    let mut declaration: Option<(Oid, Oid, u64)> = None;
+    append(t, &id, |store, head| {
         let view = Conversation::open(store, head)?;
         let Some(request) = view.active_request()? else {
             return Err(format!(
@@ -127,22 +147,16 @@ fn run_tool(
             ));
         };
         let ordinal = view.transcript_len()?;
-        let workspaces = view.workspace_names()?;
-        let workspace = workspaces.first().cloned();
-        let input = match &workspace {
-            Some(name) => view.workspace(name)?.map(|record| record.commit),
-            None => None,
-        };
         drop(view);
 
         let round = request.round;
         let signature = inherited_signature(store, head)?;
         let message_id = caos::fresh_entropy()?;
         let dir = paths::transcript_payload_dir(ordinal, &message_id);
-        let admitted = paths::admit_external_id(&tool_use_id);
+        let admitted = paths::admit_external_id(&call);
         let payload_name = format!("args-{admitted}.json");
         let entry = TranscriptEntry {
-            message_id: message_id.clone(),
+            message_id,
             conversation: id.to_string(),
             role: Role::Assistant,
             actor: username.clone(),
@@ -150,14 +164,15 @@ fn run_tool(
             round: Some(round),
             model: Some(CLAUDE_CODE_MODEL.to_string()),
             blocks: vec![Block::ToolUse {
-                id: tool_use_id.clone(),
+                id: call.clone(),
                 name: name.to_string(),
                 arguments: format!("{dir}/{payload_name}"),
             }],
             proposal: None,
             workspace_resolution: None,
         };
-        let declaration = mint_transition(
+        declaration = Some((request.id.clone(), request.request_head.clone(), round));
+        Ok(Some(mint_transition(
             store,
             head,
             &Transition::ModelComplete {
@@ -165,127 +180,120 @@ fn run_tool(
                 entry,
                 payloads: vec![(payload_name, payload_bytes(&declared)?)],
                 calls: vec![DeclaredCall {
-                    id: tool_use_id.clone(),
+                    id: call.clone(),
                     name: name.to_string(),
                 }],
             },
             &signature,
-        )?;
-
-        let record = ToolRecord {
-            request: request.id.clone(),
-            round,
-            id: tool_use_id.clone(),
-            name: name.to_string(),
-            declaration_message: message_id,
-            workspace_name: workspace,
-            input_workspace: input,
-            status: ToolStatus::Started,
-            // NOT A DISPATCHED TASK. Every other harness points this at the
-            // sub-run it launched; cc runs its tools in-process, so there is
-            // nothing to point at. The field is required, so it carries a
-            // content-derived oid: an object that exists, is stable for a
-            // retry of the same call, and claims nothing false.
-            task: Some(call_oid(t, &id, &tool_use_id)?),
-            result: None,
-            workspace_resolution: None,
-            files: Vec::new(),
-            files_outcome: None,
-        };
-        started = Some(record.clone());
-        Ok(Some(mint_transition(
-            store,
-            &declaration,
-            &Transition::ToolStart { record },
-            &signature,
         )?))
-    });
-    start.map_err(ToolError::Infra)?;
-    let started = started.ok_or_else(|| ToolError::Infra("the tool never started".to_string()))?;
+    })?;
+    let (request, request_head, round) =
+        declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    // Run it against the workspace commit the start recorded.
-    let input = started
-        .input_workspace
-        .as_ref()
-        .ok_or_else(|| ToolError::Infra("the conversation has no workspace".to_string()))?;
-    let run = tools::execute(t, input.as_str(), name, args);
-    let (text, is_error, produced) = match &run {
-        Ok(outcome) => (outcome.text.clone(), false, outcome.commit.clone()),
-        Err(ToolError::User(message)) => (message.clone(), true, None),
-        Err(ToolError::Infra(error)) => return Err(ToolError::Infra(error.clone())),
-    };
-
-    let observation = paths::tool_payload_dir(started.request.as_str(), started.round, &started.id);
-    let completed = ToolRecord {
-        status: match is_error {
-            false => ToolStatus::Complete,
-            true => ToolStatus::Failed,
-        },
-        result: Some(match is_error {
-            false => ProtocolToolResult::Complete {
-                observation: format!("{observation}/observation.json"),
-                proposal: produced.as_deref().map(str::to_string).and_then(|commit| {
-                    Oid::parse(&commit, "tool workspace commit").ok()
-                }),
-            },
-            true => ProtocolToolResult::Failed {
-                error: text.clone(),
-            },
-        }),
-        ..started.clone()
-    };
-    let payloads = match is_error {
-        false => vec![(
-            "observation.json".to_string(),
-            payload_bytes(&json!({ "text": text }))
-                .map_err(ToolError::Infra)?,
-        )],
-        true => Vec::new(),
-    };
-    append(t, &id, |store, head| {
-        let signature = inherited_signature(store, head)?;
-        Ok(Some(mint_transition(
-            store,
-            head,
-            &Transition::ToolComplete {
-                record: completed.clone(),
-                payloads: payloads.clone(),
-                files: Vec::new(),
-            },
-            &signature,
-        )?))
-    })
-    .map_err(ToolError::Infra)?;
-
-    run.map(|_| text)
+    dispatch_call(t, options, &id, &request, &request_head, &call)?;
+    read_outcome(t, &id, &request, round, &call)
 }
 
-/// A stable oid for one tool call, standing in for a task cc never dispatched.
-fn call_oid(t: &GitTransport, id: &str, tool_use_id: &str) -> Result<Oid, String> {
-    let seed = format!("{id}\0{tool_use_id}");
-    let hash = t.put_object("blob", seed.as_bytes())?;
-    oid(&hash.to_string(), "tool task id")
-}
-
-
-/// A stable 40-hex request id for the turn this call belongs to.
+/// Run the declared call, as `llm-step` in its tools-only mode.
 ///
-/// The protocol requires `request` to be a canonical object id and the fold
-/// validates it, so this hashes the prompt id into a git blob — deterministic,
-/// dependency-free, and the resulting object actually resolves. It names a turn,
-/// exactly as `llm-step`'s `run` does; nothing dispatches it, because nothing
-/// here ever writes `queued` or `running`.
-fn turn_request(t: &GitTransport, session: &str, args: &Value) -> Result<String, ToolError> {
-    let seed = match args.get("caos_prompt_id").and_then(Value::as_str) {
-        Some(prompt) => format!("{session}\0{prompt}"),
-        // No prompt id means the PreToolUse hook is older than this field.
-        // Falling back to the session keeps every call in one turn-shaped scope
-        // rather than failing a tool over a presentation detail.
-        None => session.to_string(),
-    };
-    t.put_object("blob", seed.as_bytes())
-        .map(|oid| oid.to_string())
-        .map_err(ToolError::Infra)
+/// The request is the one the prompt admitted, named by `--run` rather than
+/// implied: this ArgTree is not that one, and must not be, or a second call
+/// would be answered from the first's memo. `--tools-only` carries the call id
+/// for exactly that reason, and the step checks it ran before returning.
+fn dispatch_call(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    request: &Oid,
+    request_head: &Oid,
+    call: &str,
+) -> Result<(), String> {
+    let store = caos::build_secret_store(t)?;
+    let configuration = tools_configuration(t, options, id, &store)?;
+    let dispatch = caos::prepare_client_request_with_store(
+        t,
+        &configuration,
+        &[
+            format!("--head:commit={request_head}"),
+            format!("--run={request}"),
+            format!("--tools-only={call}"),
+        ],
+        &store,
+    )?;
+    let server = t.server_url()?;
+    caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
+}
+
+/// The step a call runs on: `llm-step`, curried with everything that is the
+/// same for every call of this conversation.
+///
+/// It is the request's recorded `configuration` too, so a conversation says
+/// which worker ran its tools -- and the tui can pick the turn up, because what
+/// it names is an ordinary step.
+fn tools_configuration(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    store: &[caos::ClientSecret],
+) -> Result<String, String> {
+    let mut config = vec![format!("--conversation={id}")];
+    let merge_refs = crate::snapshot_merge_refs(t)?;
+    if !merge_refs.is_empty() {
+        config.push(format!("--merge-refs={merge_refs}"));
+    }
+    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
+    crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
+}
+
+/// The observation the step recorded, read back from the conversation.
+///
+/// Read rather than returned: the run's own result names the conversation
+/// commit, but what Claude Code needs is one call's text, and the transcript is
+/// where that lives. A tool the model can act on and a tool the tui replays are
+/// then the same bytes.
+fn read_outcome(
+    t: &GitTransport,
+    id: &str,
+    request: &Oid,
+    round: u64,
+    call: &str,
+) -> Result<ToolOutcome, String> {
+    let store = open_store(t)?;
+    let (_, head) = fetch_validated_head(t, &store, id)?
+        .ok_or_else(|| format!("conversation {id:?} disappeared while its tool ran"))?;
+    let view = Conversation::open(&store, &head)?;
+    let tool = view
+        .tool(request, round, call)?
+        .ok_or_else(|| format!("the step recorded no call {call} in round {round}"))?;
+    let (is_error, text) = crate::protocol_tool_result(&view, tool.result.as_ref())?;
+    Ok(ToolOutcome { text, is_error })
+}
+
+/// The tools this session offers, as MCP declarations.
+///
+/// Asked of the step that implements them, so there is one description of
+/// `edit` wherever a model meets it, and a tool a repository defines under
+/// `caos-tools/` is offered here exactly as it is in the tui.
+fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
+    let store = caos::build_secret_store(t)?;
+    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
+    let mut kvs = vec!["--list-tools=1".to_string()];
+    // The tree whose `caos-tools/` entries are offered. This is the base a
+    // first prompt would root the conversation on, resolved the same way, so
+    // the listing describes the workspace the session is about to get.
+    if let Ok(workspace) = resolve_base(t, options) {
+        let mut objects = open_store(t)?;
+        let workspace = oid(&workspace, "conversation base")?;
+        ensure_code_commit(t, &mut objects, &workspace)?;
+        let tree = objects.tree_of(&workspace)?;
+        kvs.push(format!("--workspace:hash={tree}"));
+    }
+    let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
+    let objects = open_store(t)?;
+    let result = oid(&result, "tool registry")?;
+    objects.ensure_local(&result)?;
+    let bytes = objects.read_blob(&result).map_err(String::from)?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("parsing the tool registry: {error}"))
 }
 
 /// The model's own arguments, without the values the hook injected: those are
@@ -301,11 +309,10 @@ fn declared_args(args: &Value) -> Value {
     declared
 }
 
-
 /// Dispatch one hook payload. An event we do not record is not an error: Claude
 /// Code fires many, and a settings file that routes extra ones here should keep
 /// working rather than failing a turn.
-fn hook(t: &GitTransport) -> Result<(), String> {
+fn hook(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -314,7 +321,7 @@ fn hook(t: &GitTransport) -> Result<(), String> {
         serde_json::from_str(&input).map_err(|error| format!("parsing hook payload: {error}"))?;
     let event = string_field(&payload, "hook_event_name")?;
     match event {
-        "UserPromptSubmit" => on_user_prompt(t, &payload),
+        "UserPromptSubmit" => on_user_prompt(t, options, &payload),
         "PreToolUse" => on_pre_tool_use(&payload),
         "Stop" => on_stop(t, &payload),
         "StopFailure" => on_stop_failure(t, &payload),
@@ -325,13 +332,13 @@ fn hook(t: &GitTransport) -> Result<(), String> {
 /// The user's prompt, and the only event allowed to create the conversation:
 /// the first prompt of a session establishes its base and fallback title
 /// exactly as the TUI's first message does.
-fn on_user_prompt(t: &GitTransport, payload: &Value) -> Result<(), String> {
+fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
     let id = conversation_id(payload)?;
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    record_prompt(t, &id, prompt)
+    record_prompt(t, options, &id, prompt)
 }
 
 /// Record a user's prompt, creating the conversation on the session's first one.
@@ -340,20 +347,31 @@ fn on_user_prompt(t: &GitTransport, payload: &Value) -> Result<(), String> {
 /// it opens, and the claim that puts the request in `running`. v3 requires the
 /// last of those before any tool may be recorded (`require_request_running_or_-
 /// cancelling`), and Claude Code has already begun the turn by the time this
-/// hook fires -- so admitting and claiming in one step is not a shortcut, it is
-/// the truth: nothing is ever going to poll for this request.
-fn record_prompt(t: &GitTransport, id: &str, prompt: &str) -> Result<(), String> {
-    let options = TurnOptions::default();
+/// hook fires -- so admitting and claiming together is not a shortcut, it is
+/// the truth: no runner is going to pick this request up.
+///
+/// The request is a REAL ONE all the same -- an ArgTree over the step, prepared
+/// exactly as the tui prepares a turn -- because each of the turn's tool calls
+/// runs it. A request id that named nothing would leave the calls nothing to
+/// run and the record claiming a configuration that never existed.
+fn record_prompt(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    prompt: &str,
+) -> Result<(), String> {
     let username = resolve_username(t, None)?;
     let signature = signature(&username)?;
     let refname = conversation_ref(id)?;
+    let secrets = caos::build_secret_store(t)?;
+    let configuration = tools_configuration(t, options, id, &secrets)?;
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
         let observed = fetch_validated_head(t, &store, id)?.map(|(_, head)| head);
         let head = match &observed {
             Some(head) => head.clone(),
-            None => root_commit(t, &mut store, id, prompt, &options, &signature)?,
+            None => root_commit(t, &mut store, id, prompt, options, &signature)?,
         };
 
         // The message. Its id is fresh entropy, as the client's own is: a
@@ -384,10 +402,20 @@ fn record_prompt(t: &GitTransport, id: &str, prompt: &str) -> Result<(), String>
             &signature,
         )?;
 
-        // The request. Its id is CONTENT, not a name: the session and the
-        // message together, hashed, so re-running this hook for the same prompt
-        // names the same request rather than opening a second one.
-        let request = request_oid(t, id, &message_id)?;
+        // The request, prepared exactly as a turn the tui dispatches is: an
+        // ArgTree over the step, pinned to the head the prompt left. A tool
+        // call runs THIS request rather than one of its own, so what the step
+        // is handed -- the conversation, the head it was admitted at -- is what
+        // the record says it was.
+        let request = oid(
+            &caos::prepare_client_request_with_store(
+                t,
+                &configuration,
+                &[format!("--head:commit={message}")],
+                &secrets,
+            )?,
+            "request",
+        )?;
         let view = Conversation::open(&store, &message)?;
         let workspaces = view.workspaces_tree()?;
         drop(view);
@@ -396,7 +424,7 @@ fn record_prompt(t: &GitTransport, id: &str, prompt: &str) -> Result<(), String>
             request_head: message.clone(),
             request_workspaces: workspaces,
             model: CLAUDE_CODE_MODEL.to_string(),
-            configuration: CLAUDE_CODE_CONFIGURATION.to_string(),
+            configuration: configuration.clone(),
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
@@ -460,18 +488,6 @@ fn root_commit(
     mint(store, &genesis, &tree, root.kind(), signature)
 }
 
-/// A request id derived from the session and message rather than dispatched.
-///
-/// The protocol wants an Oid that resolves, and nothing here prepares a worker
-/// request to supply one -- Claude Code ran the turn. Hashing the pair into a
-/// blob gives an object that exists, is stable for a retry of the same prompt,
-/// and cannot collide with another session's.
-fn request_oid(t: &GitTransport, id: &str, message_id: &str) -> Result<Oid, String> {
-    let seed = format!("{id}\0{message_id}");
-    let hash = t.put_object("blob", seed.as_bytes())?;
-    oid(&hash.to_string(), "request id")
-}
-
 /// Tell a caos workspace tool which conversation it is working in.
 ///
 /// The tool server is spawned once per session and is otherwise stateless, so
@@ -520,19 +536,6 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
-
-
-/// Whether this event may bring a conversation into existence. Only the user's
-/// prompt may: an assistant or lifecycle event arriving for an unknown
-/// conversation means hooks were installed mid-session or the ref was deleted
-/// under us, and inventing a root from it would silently produce a conversation
-/// whose transcript begins in the middle.
-enum Creation {
-    Allowed { title: String },
-    Refused,
-}
-
-
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
 fn conversation_id(payload: &Value) -> Result<String, String> {
@@ -553,40 +556,6 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("hook payload has no string {key}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn session_ids_become_valid_conversation_ids() {
-        let payload = json!({"session_id": "88888abc-9ae5-4d07-a44d-54b366776bdc"});
-        assert_eq!(
-            conversation_id(&payload).unwrap(),
-            "cc/88888abc-9ae5-4d07-a44d-54b366776bdc"
-        );
-    }
-
-    /// A session id is the one part of the ref path we do not author, so it is
-    /// validated rather than trusted: the protocol's own parser is what decides
-    /// whether it can name a ref.
-    #[test]
-    fn hostile_session_ids_are_refused_before_naming_a_ref() {
-        for hostile in ["../../etc", "a/../b", "with space", "", "head", "a.lock"] {
-            let payload = json!({ "session_id": hostile });
-            assert!(
-                conversation_id(&payload).is_err(),
-                "accepted session id {hostile:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_payload_without_its_event_name_is_an_error() {
-        assert!(string_field(&json!({}), "hook_event_name").is_err());
-        assert!(string_field(&json!({"hook_event_name": 2}), "hook_event_name").is_err());
-    }
 }
 
 /// Append whatever `step` mints, compare-and-swapping the conversation head.
@@ -656,11 +625,11 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
 
         let signature = inherited_signature(store, head)?;
         let mut at = head.clone();
+        let mut result = None;
         if !message.trim().is_empty() {
             let message_id = caos::fresh_entropy()?;
-            let dir = paths::transcript_payload_dir(ordinal, &message_id);
             let entry = TranscriptEntry {
-                message_id,
+                message_id: message_id.clone(),
                 conversation: conversation.clone(),
                 role: Role::Assistant,
                 actor: username.clone(),
@@ -673,7 +642,6 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
                 proposal: None,
                 workspace_resolution: None,
             };
-            let _ = &dir;
             at = mint_transition(
                 store,
                 &at,
@@ -685,6 +653,9 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
                 },
                 &signature,
             )?;
+            // The turn's result is that message, by path -- what a reader
+            // shows for the turn, and the same thing `llm-step` names.
+            result = Some(paths::transcript_entry_path(ordinal, &message_id));
         }
         let terminal = mint_transition(
             store,
@@ -692,7 +663,7 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
             &Transition::RequestTerminal {
                 request: request.id.clone(),
                 outcome: RequestOutcome::Idle {
-                    result: None,
+                    result,
                     interrupted: false,
                 },
             },
@@ -717,24 +688,93 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
         true => kind.to_string(),
         false => format!("{kind}: {detail}"),
     };
+    let username = resolve_username(t, None)?;
+    let conversation = id.clone();
     append(t, &id, move |store, head| {
         let view = Conversation::open(store, head)?;
         let Some(request) = view.active_request()? else {
             return Ok(None);
         };
+        let ordinal = view.transcript_len()?;
+        let round = request.round;
         drop(view);
+
+        // The outcome names a TRANSCRIPT ENTRY, not the text: `apply` validates
+        // it as a path, and the tui reads the failure by following it. So the
+        // message is recorded first and the terminal points at it.
         let signature = inherited_signature(store, head)?;
-        let terminal = mint_transition(
+        let message_id = caos::fresh_entropy()?;
+        let recorded = mint_transition(
             store,
             head,
+            &Transition::MessageAppend {
+                entry: TranscriptEntry {
+                    message_id: message_id.clone(),
+                    conversation: conversation.clone(),
+                    role: Role::System,
+                    actor: username.clone(),
+                    request: Some(request.id.clone()),
+                    round: Some(round),
+                    model: None,
+                    blocks: vec![Block::Text {
+                        text: error.clone(),
+                    }],
+                    proposal: None,
+                    workspace_resolution: None,
+                },
+                payloads: Vec::new(),
+            },
+            &signature,
+        )?;
+        let terminal = mint_transition(
+            store,
+            &recorded,
             &Transition::RequestTerminal {
                 request: request.id,
                 outcome: RequestOutcome::Failed {
-                    error: error.clone(),
+                    error: paths::transcript_entry_path(ordinal, &message_id),
                 },
             },
             &signature,
         )?;
         Ok(Some(terminal))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ids_become_valid_conversation_ids() {
+        let payload = json!({"session_id": "88888abc-9ae5-4d07-a44d-54b366776bdc"});
+        assert_eq!(
+            conversation_id(&payload).unwrap(),
+            "cc/88888abc-9ae5-4d07-a44d-54b366776bdc"
+        );
+    }
+
+    /// A session id is the one part of a conversation id we do not author.
+    /// v3 puts the id in its ref path HEX-ENCODED, so a hostile one cannot
+    /// escape the namespace or name a directory -- which is what this pins,
+    /// rather than a rejection the protocol deliberately does not perform.
+    #[test]
+    fn hostile_session_ids_cannot_escape_the_ref_namespace() {
+        for hostile in ["../../etc", "a/../b", "with space", "head", "a.lock"] {
+            let payload = json!({ "session_id": hostile });
+            let id = conversation_id(&payload).unwrap();
+            let refname = conversation_ref(&id).unwrap();
+            assert!(
+                refname.starts_with("refs/caos/v3/conversations/"),
+                "session id {hostile:?} named {refname}"
+            );
+            assert_eq!(refs::parse_head_ref(&refname).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn a_payload_without_its_event_name_is_an_error() {
+        assert!(string_field(&json!({}), "hook_event_name").is_err());
+        assert!(string_field(&json!({"hook_event_name": 2}), "hook_event_name").is_err());
+    }
 }

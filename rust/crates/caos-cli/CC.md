@@ -2,9 +2,10 @@
 
 `caos cc` lets Claude Code drive a caos conversation. Claude Code runs the
 model; caos keeps the durable log and owns the workspace. The result is an
-ordinary conversation under `refs/caos/v2/conversations/cc/<session-id>/head`
-— the same ref layout, the same append-only event spine, and the same replay
-`caos tui` performs for a conversation it started itself (design/chat.md).
+ordinary conversation — the same head ref (its id is `cc/<session-id>`, which
+v3 hex-encodes into the ref path), the same append-only spine, and the same
+replay `caos tui` performs for a conversation it started itself
+(design/chat.md).
 
 Two commands make that work:
 
@@ -13,74 +14,40 @@ caos cc hook     record one Claude Code hook payload (JSON on stdin)
 caos cc serve    the workspace tool server (JSON-RPC on stdio)
 ```
 
+Both take `--llm-step:<type>=<value>`, exactly as `caos tui` and `caos chat`
+do — the step that runs the tools, named as a path into whatever tree you are
+in (`std/llm-step` here, `caos-std/llm-step` in a repo that mounted caos).
+
 ## What the model sees
 
 Claude Code's built-in file and shell tools are denied, which removes them from
 the model's context entirely rather than merely refusing their calls. In their
-place the tool server registers four tools over the conversation's workspace:
+place the tool server offers **`llm-step`'s tools** — read, ls, grep, bash,
+write, edit, the history tools, the caos build/test tools, `merge`, and
+whatever the workspace defines under `caos-tools/`.
 
-| Tool | Arguments |
-|---|---|
-| `read` | `file_path`, optional `offset`/`limit` (line-based) |
-| `ls` | optional `path` |
-| `grep` | `pattern`, optional `path` |
-| `bash` | `cmd`, optional `paths` |
-| `caos-build` | — |
-| `caos-test` | optional `only`, `test-salt` |
-| `caos-test-result` | `hash`, optional `log` |
-| `write` | `file_path`, `content` |
-| `edit` | `file_path`, `old_string`, `new_string`, optional `replace_all` |
+Not a copy of them: THE SAME ONES. `tools/list` runs the step with
+`--list-tools` and hands back the registry it answers with, and a call runs the
+step with `--tools-only`, which executes it exactly as it does for a turn the
+step drives itself. So this client knows what `edit` is only in the sense that
+it passes the name along, and a tool reads and behaves one way whether a model
+meets it here or in the tui.
 
-`read`, `ls`, `write` and `edit` are the host-side counterparts of the worker's
-inline tools (`std/llm-step/src/tools.rs`) and behave the same way, including the
-read truncation cap and `edit`'s must-match-exactly-once rule.
+That also settles what used to be a standing hazard: the tools were once
+implemented twice, and the two copies drifted — a second description of every
+tool, a second bash-input shape (and so a second cache key for an identical
+command), a second rendering of a grep result. What is offered here now is
+whatever the named step offers, in whatever repository it is pointed at.
 
-`caos-build`, `caos-test` and `caos-test-result` are the harness's own std
-tools, offered here exactly as `llm-step` offers them. Their parameters are not
-written down in this client at all: they are read from the `help` each image
-carries and parsed by the same rules `parse_help` uses, so adding a std tool is
-a one-line change and rewording one needs no change here.
+The cost is that `tools/list` is a worker run rather than a constant, so a
+session start needs the caos server up. It is memoized on the step and the
+workspace tree, so it is a cache hit for every session after the first.
 
-`grep` is different in kind: it is the first DISPATCHED tool, running the
-`std/rgrep-tool` std tool as an ordinary caos job rather than computing an
-answer locally. That tool drives the `std/rgrep` fold and renders the result
-itself, so nothing here is grep-specific — it goes through `run_std_tool`, the
-same path `bash` and every `caos-tools/<name>` entry will use. Every level of
-the fold caches on exactly (subtree hash, pattern). Two consequences worth
-knowing at the prompt:
-
-- Repeating a grep is nearly free (0.14s here against 9s cold), and so is
-  re-running one after editing an unrelated part of the tree.
-- A NEW pattern over the whole repo re-folds from scratch — about 8 seconds.
-  Scoping with `path` is what makes it cheap, which is why the tool description
-  says so.
-
-`bash` runs a command through `std/bash-tool` — the same sandbox the tui uses,
-where only the workspace paths listed in `paths` are materialized and touching
-any other existing path fails with EACCES and a retry hint naming it. It is the
-one tool here whose result advances the workspace: the command's output tree
-becomes the conversation's new one. A non-zero exit is a value, not a failure —
-the model reads stderr and reacts — and the workspace still advances, since the
-command may have written files before it failed.
-
-The `{tree, cmd, paths}` input is built byte for byte the way `llm-step` builds
-it, which matters because the ArgTree is the cache key: the same command run
-from the tui and from Claude Code is ONE cached job. Passing `bash-tool`'s
-direct `--cmd`/`--tree` arguments instead would work and would silently fork
-the cache.
-
-`grep`'s output is `path:linenum:line`. Past a budget the rendering stops reading
-contents but keeps counting, closing with `[truncated — N more matching
-file(s)]`, so a too-broad pattern says so instead of silently returning a
-prefix. That rendering lives in the tool, once: `llm-step`, this server, and
-`run-tool rgrep-tool` all show the same thing because they all read the same
-`report`.
-
-**The workspace is the conversation's tree, not your checkout.** A `write` never
-touches a file on disk; it produces a new tree and appends an event carrying it.
-Your working copy is untouched for the whole session, exactly as it is when the
-TUI runs a turn. To bring the result into your checkout, use the conversation
-like any other — `caos tui`, then `Ctrl+L`.
+**The workspace is the conversation's tree, not your checkout.** A `write`
+never touches a file on disk; it produces a new tree and the step appends a
+transition carrying it. Your working copy is untouched for the whole session,
+exactly as it is when the TUI runs a turn. To bring the result into your
+checkout, use the conversation like any other — `caos tui`, then `Ctrl+L`.
 
 ## Configuration
 
@@ -110,6 +77,9 @@ absolute path from its own location and has no such constraint.
 `settings.json` denies Claude Code's built-in file and shell tools, which
 removes them from the model's context rather than merely refusing their calls,
 and points every hook at `caos cc hook`. `mcp.json` declares the tool server.
+Both pass `--llm-step:@=std/llm-step`, caos' own path to the step; a repository
+that mounts caos elsewhere edits that path in those two files, as it would for
+`caos tui --llm-step:@=…`.
 
 **`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
 Claude Code sets that variable in the environment *of* a spawned stdio server;
@@ -123,8 +93,9 @@ variable in `mcp.json` is not an error: Claude Code warns, uses the literal
 The session then runs with **no caos tools at all** — and a model with no tools
 does not say so. Asked to write a file, it will emit a plausible `bash` block
 and report success, having written nothing. `dev/claude-code/run` therefore
-probes `tools/list` before launching, so a missing or stale binary is an error
-at startup instead of a fabricated result later.
+probes `tools/list` before launching, so a missing binary — or a caos server
+that is not up, since the listing comes from the step — is an error at startup
+instead of a fabricated result later.
 
 ## Remote Control
 
@@ -190,12 +161,12 @@ nowhere else.
 
 ## What gets recorded
 
-| Hook | Event |
+| Hook | Transitions |
 |---|---|
-| `UserPromptSubmit` | `{author: "user", username, content}` |
-| `Stop` | `{author: "assistant", content}` |
-| tool call | `{request, round, author: "assistant", content: "", calls: [...]}` then `{request, round, result: {...}}` |
-| `StopFailure` | `{status: "failed", error}` |
+| `UserPromptSubmit` | `message.append` (the prompt), `request.admit`, `request.claim` |
+| tool call | `model.complete` declaring the call — then the step's own `tool.start` and `tool.complete` |
+| `Stop` | `model.complete` (the closing message), `request.terminal` idle |
+| `StopFailure` | `message.append` (the error), `request.terminal` failed |
 
 A session's first prompt creates the conversation, taking its `base` from the
 current `HEAD` and its fallback title from that prompt. Only a prompt may create
@@ -207,22 +178,24 @@ The conversation id is derived from the session id rather than stored in a map,
 so the ref is the whole record. `claude --resume` keeps its session id, so a
 resumed session extends the same conversation.
 
-A tool call is recorded as **two events, the call before the tool runs and the
-result after** — the protocol's first invariant ("record an action before
-launching it and a result before consuming it") and exactly what `llm-step`
-does. So a long tool is visible in the tui while it runs rather than appearing
-only once it finishes, and a session that dies mid-call leaves a record that it
-was attempted. The call event is tree-neutral; the result event carries the
-workspace the tool produced.
+**The prompt admits a REAL request** — an ArgTree over the step, prepared the
+way the tui prepares a turn, and claimed in the same compare-and-swap. Claimed
+here rather than by a runner because the turn is already running by the time the
+hook fires; and real rather than a synthetic id because every tool call of that
+turn RUNS it (`--run=<request> --tools-only=<call id>`, one fresh ArgTree per
+call, since the request is itself an ArgTree and a reused one would be answered
+from the first call's memo).
 
-Both carry the same `(request, round)`, which is how the fold pairs them
-(`durable_tool_scope`). `request` is the turn, derived by hashing Claude Code's
-`prompt_id` into a git blob so it is a canonical object id like `llm-step`'s
-`run`. Claude Code does not expose the model's round number and does not need
-to: a `tool_use_id` is unique for the whole session, so one round per turn pairs
-exactly as `llm-step`'s calls do within a round, which is the only place the
-number does any work. Nothing dispatches that request, because nothing here ever
-writes `queued` or `running`.
+So the two halves of a call have different authors, and that is the design: cc
+declares the call as the model's own (v3 accepts no tool that no message
+declared) and the step records starting it, running it and completing it. The
+protocol's first invariant — record an action before launching it — is the
+step's to keep here as everywhere, so a long tool is visible in the tui while it
+runs and a session that dies mid-call leaves a record that it was attempted.
+
+Claude Code does not expose the model's round number and does not need to: the
+declaration opens a round, the call belongs to the round that declared it, and a
+`tool_use_id` is unique for the whole session.
 
 **Tool execution is serial**, matching `llm-step`'s single queue. The tool server
 reads and handles one JSON-RPC request at a time, so a batch of parallel calls
@@ -231,37 +204,14 @@ previous one left. The compare-and-swap retries are therefore not a concurrency
 model — they protect against another writer, such as an interjection typed into
 the tui against the same conversation.
 
-Nothing here writes lifecycle state. The protocol's `queued`/`running` admission
-exists so a worker can claim a request, and nothing recorded this way is ever
-claimed — Claude Code already ran the turn. `fold_events` defaults an
-unspecified status to `idle`, so omitting admission is both honest and what
-keeps `caos talk` and the TUI's `reconcile_active_requests` from trying to
-resume a request that was never dispatched.
-
 ## Not yet done
 
-- **Subagents.** `SubagentStart`/`SubagentStop` are not wired, so an `Agent`
-  call records nothing. They carry `agent_id`/`agent_type` and map onto the
-  existing `spawned_by` child-conversation shape.
+- **Subagents.** `SubagentStart`/`SubagentStop` are not wired, so Claude Code's
+  own `Agent` call records nothing. (`spawn_agent` and `run_async` are a
+  different thing and ARE offered — they are the step's tools, so they arrive
+  with everything else — but nothing here has exercised them yet.)
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
-  events have no `model` field and the TUI shows a blank where it would name
-  one.
-- **Project tools.** `caos-tools/<name>` entries are not offered yet; they are
-  discovered from the workspace rather than resolved from a fixed path, which is
-  the one piece `run_tool` does not do. This repo has no `caos-tools/` of its
-  own, so today they would register nothing here anyway.
-- **The history tools** — `log`, `show`, `diff`. Their docs are now data
-  (`std/llm-step/src/githist/*.help`, read by the same `parse_help`), so the
-  descriptions are ready to share; what is not solved is handing the worker the
-  workspace COMMIT. `llm-step` binds it from a `/cas` path, where the object is
-  already present. From the host it has to be a gitlink, and git does not carry
-  a gitlink's target in a tree's push closure — the worker then fails with
-  `object not found on this server` for a commit the server demonstrably holds
-  (`HEAD /object/<oid>` is 200, and a worker can `caos get-hash` it). Neither
-  `ensure_pushed` (which short-circuits, since the server does hold it) nor an
-  explicit `refs/caos/req/<oid>` push changed that.
-- **`merge`.** Its result is a COMMIT, not a value, and it is the one tool that
-  advances the conversation's ancestry — `llm-step` has a dedicated callback arm
-  for it, so it is not a copy of the `grep` path.
-- **`spawn_agent` / `run_async`.** The independent-work pair. `run_async` is the
-  answer to a long build outliving its turn.
+  entries say `claude-code` rather than naming a model. Better than a
+  plausible-looking string nothing verified.
+- **A cheaper listing.** `tools/list` is a worker run, so a cold session start
+  waits for one. It is memoized, but the first one in a new tree is not free.

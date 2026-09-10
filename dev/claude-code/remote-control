@@ -110,16 +110,22 @@ fi
 # shell expands from the export above, so the file needs no rewriting.
 cp "$here/settings.json" "$cfg/settings.json"
 
-# The tool server, declared only when it is absent or points somewhere else --
-# `claude mcp add` refuses to overwrite an existing entry ("already exists"), so
-# a changed CAOS_BIN needs the removal first. Re-declaring unconditionally would
-# be a no-op at best and a lost binding at worst.
-declared="$(jq -r '.mcpServers.caos.command // ""' "$cfg/.claude.json")"
-if [ "$declared" != "$CAOS_BIN" ]; then
+# The tool server, declared only when it is absent or differs -- `claude mcp
+# add` refuses to overwrite an existing entry ("already exists"), so a change
+# needs the removal first. Re-declaring unconditionally would be a no-op at
+# best and a lost binding at worst.
+#
+# The ARGUMENTS are compared too, not just the binary: this dir persists across
+# launches, so an entry declared by an older version of this script would
+# otherwise keep whatever arguments it was given.
+command=("$CAOS_BIN" cc serve --llm-step:@=std/llm-step)
+declared="$(jq -r '[.mcpServers.caos.command // ""]
+                   + (.mcpServers.caos.args // []) | join(" ")' "$cfg/.claude.json")"
+if [ "$declared" != "${command[*]}" ]; then
     env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
         claude mcp remove caos --scope user >/dev/null 2>&1 || true
     env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
-        claude mcp add caos --scope user -- "$CAOS_BIN" cc serve >/dev/null \
+        claude mcp add caos --scope user -- "${command[@]}" >/dev/null \
         || { echo "could not declare the caos tool server" >&2; exit 1; }
 fi
 

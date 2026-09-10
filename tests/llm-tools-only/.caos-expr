@@ -1,0 +1,9 @@
+# tests/llm-tools-only, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# `--tools-only` is what `caos cc` runs: a step that executes the calls a
+# request already declares and stops, leaving the request running for the next
+# one. Nothing here scripts a model, and the stub's fixture directory is EMPTY
+# on purpose -- a run that reaches the model finds no response and fails, which
+# is the property being tested.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

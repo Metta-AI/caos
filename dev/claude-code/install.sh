@@ -259,7 +259,11 @@ Done. Point the client at a caos server, then start a session:
   claude
 
 `caos cc serve` is spawned by Claude Code from .mcp.json; the hooks in
-.claude/settings.json record the conversation. Neither needs a path.
+.claude/settings.json record the conversation.
+
+Both name the step whose tools the session offers, as `--llm-step:@=std/llm-step`
+-- caos' own path. A repository that mounts caos elsewhere edits that path in
+those two files, exactly as it would for `caos tui --llm-step:@=...`.
 DONE
 else
     echo "installed the client only; no repository files were written" >&2

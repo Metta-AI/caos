@@ -3,7 +3,7 @@
     "caos": {
       "type": "stdio",
       "command": "${CAOS_BIN:-caos}",
-      "args": ["cc", "serve"]
+      "args": ["cc", "serve", "--llm-step:@=std/llm-step"]
     }
   }
 }
