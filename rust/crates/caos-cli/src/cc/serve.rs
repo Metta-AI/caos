@@ -14,6 +14,7 @@
 //! to stderr, which Claude Code surfaces without reading it as a message.
 
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -48,32 +49,116 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
             Err(error)
         }
     };
+    let have_workspace = workspace.is_ok();
     let t = workspace.as_ref();
+    let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+    let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("reading request: {error}"))?;
         if line.trim().is_empty() {
             continue;
         }
-        let Some(response) = handle(t, &options, &line) else {
+        let method = method_of(&line);
+        let Some(response) = handle(t, &options, &registry, &line) else {
             continue;
         };
-        let encoded = serde_json::to_string(&response)
-            .map_err(|error| format!("encoding response: {error}"))?;
-        writeln!(stdout, "{encoded}").map_err(|error| format!("writing response: {error}"))?;
-        stdout
-            .flush()
-            .map_err(|error| format!("flushing response: {error}"))?;
+        write_message(&out, &response)?;
+        // The handshake is answered; NOW go and find out what the tools are.
+        // Started here rather than before the loop so the notification it ends
+        // with cannot precede `initialize`, and only once.
+        if method.as_deref() == Some("initialize") && have_workspace {
+            resolve_in_background(options.clone(), Arc::clone(&registry), Arc::clone(&out));
+        }
     }
     Ok(())
+}
+
+/// The tools this server has managed to find so far. Empty until the
+/// resolution below finishes, which is the entire point: see `declarations`.
+type Registry = Arc<Mutex<Vec<Value>>>;
+
+/// Stdout, shared with the resolver thread. Its own lock, not stdout's: the
+/// protocol is one message per line, and two writers interleaving mid-message
+/// would corrupt the stream that `std::io::Stdout`'s internal lock protects
+/// only per write call.
+type Out = Arc<Mutex<std::io::Stdout>>;
+
+fn write_message(out: &Out, message: &Value) -> Result<(), String> {
+    let encoded =
+        serde_json::to_string(message).map_err(|error| format!("encoding response: {error}"))?;
+    let mut out = out
+        .lock()
+        .map_err(|_| "the output lock is poisoned".to_string())?;
+    writeln!(out, "{encoded}").map_err(|error| format!("writing response: {error}"))?;
+    out.flush()
+        .map_err(|error| format!("flushing response: {error}"))
+}
+
+/// Find the tools, off the hot path, and say so when they arrive.
+///
+/// THIS IS WHY THE SERVER CONNECTS AT ALL. Asking the step what it offers
+/// means fetching it (a pinned locator is another repo), evaluating it against
+/// the caos server, and — the first time in a tree — BUILDING it, which is a
+/// rustc compile measured in minutes. Done inside `tools/list`, that outlasts
+/// the client's startup budget by two orders of magnitude, and the session sees
+/// a tool server that never answered rather than one still working.
+///
+/// So `tools/list` answers immediately with whatever is known (nothing, at
+/// first) and this thread does the work. `notifications/tools/list_changed` is
+/// the protocol's own answer to exactly this: the client re-lists when it
+/// arrives, and the tools appear when they are ready.
+fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
+    std::thread::spawn(move || {
+        // Its OWN transport: the one in `serve` belongs to the main thread, and
+        // this process already stands in the work directory (`cc_transport`).
+        let found = match GitTransport::from_cwd() {
+            Ok(t) => declarations(Ok(&t), &options),
+            Err(error) => {
+                eprintln!("caos cc serve: cannot open the caos workspace: {error}");
+                Vec::new()
+            }
+        };
+        if found.is_empty() {
+            return;
+        }
+        match registry.lock() {
+            Ok(mut registry) => *registry = found,
+            Err(_) => {
+                eprintln!("caos cc serve: the tool registry lock is poisoned");
+                return;
+            }
+        }
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+        });
+        if let Err(error) = write_message(&out, &notification) {
+            eprintln!("caos cc serve: could not announce the tools: {error}");
+        }
+    });
+}
+
+/// The `method` of one request line, for a caller that has already had it
+/// handled and needs to know what it was.
+fn method_of(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("method")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Handle one message. `None` means "say nothing", which is required rather
 /// than merely polite: a JSON-RPC notification has no `id`, and answering one
 /// is a protocol violation.
-fn handle(t: Result<&GitTransport, &String>, options: &TurnOptions, line: &str) -> Option<Value> {
+fn handle(
+    t: Result<&GitTransport, &String>,
+    options: &TurnOptions,
+    registry: &Registry,
+    line: &str,
+) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // A malformed line has no id to answer against, so the only correct
@@ -90,7 +175,12 @@ fn handle(t: Result<&GitTransport, &String>, options: &TurnOptions, line: &str) 
     let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
-        "tools/list" => Some(reply(id, json!({ "tools": declarations(t, options) }))),
+        // Whatever has been found so far, which early on is nothing. The
+        // client is told when that changes.
+        "tools/list" => Some(match registry.lock() {
+            Ok(registry) => reply(id, json!({ "tools": registry.clone() })),
+            Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
+        }),
         // A workspace we could not open is the model's problem to report, not
         // a protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
@@ -132,7 +222,10 @@ fn initialize(params: &Value) -> Value {
     };
     json!({
         "protocolVersion": version,
-        "capabilities": { "tools": {} },
+        // `listChanged` is not decoration: this server answers `tools/list`
+        // before it knows the answer, and the notification is how the real one
+        // arrives. A client that ignores it sees the tools on its next listing.
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": { "name": "caos", "version": env!("CARGO_PKG_VERSION") },
     })
 }
@@ -230,13 +323,27 @@ mod tests {
     fn notifications_are_never_answered() {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let workspace = "no workspace".to_string();
-        assert!(handle(Err(&workspace), &TurnOptions::default(), notification).is_none());
+        let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+        assert!(handle(
+            Err(&workspace),
+            &TurnOptions::default(),
+            &registry,
+            notification
+        )
+        .is_none());
     }
 
     #[test]
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
-        assert!(handle(Err(&workspace), &TurnOptions::default(), "{not json").is_none());
+        let registry: Registry = Arc::new(Mutex::new(Vec::new()));
+        assert!(handle(
+            Err(&workspace),
+            &TurnOptions::default(),
+            &registry,
+            "{not json"
+        )
+        .is_none());
     }
 
     #[test]
