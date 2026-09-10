@@ -193,9 +193,19 @@ jobs:
       # resolves through `latest` any more -- install.sh asks for a build by
       # commit -- so this costs nothing and stops one branch's push from
       # silently becoming everyone's default.
+      # `target_commitish` IS NOT OPTIONAL, whatever the name suggests. The
+      # Releases API creates a missing tag at the DEFAULT BRANCH's head unless
+      # told otherwise, so without it `build-<commit>` named one commit and
+      # pointed at another -- every tag published before this landed on
+      # whatever main's head happened to be (build-897eebb571ff points at a
+      # main merge from four days earlier, and three other tags share one
+      # commit). Nothing read the target, so nothing broke; the moment anything
+      # resolves a build tag to a commit, it gets the wrong tree. install.sh
+      # checks the name against the target for exactly that reason.
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.stage.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: ${{ steps.stage.outputs.tag }}
           prerelease: ${{ github.ref_type != 'tag' }}
           files: |

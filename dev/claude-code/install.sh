@@ -145,6 +145,47 @@ else
 fi
 echo "$REPO $REF -> $VERSION" >&2
 
+# The FULL commit this build came from, which a build tag's twelve hex digits
+# are not. Whoever configures a session has to name the step that runs its
+# tools, and outside the caos checkout that name is a pinned locator
+# (`--llm-step:@@=github:<repo>?rev=<40 hex>&dir=std/llm-step`) whose rev is
+# mandatory and unabbreviated. Taken from the ref listing already in hand.
+#
+# AND CHECKED AGAINST THE TAG'S OWN NAME, because the tag has been wrong. The
+# Releases API creates a missing tag at the default branch's head unless the
+# workflow passes `target_commitish`, and it did not until 2026-09-09 -- so
+# every build tag published before that names one commit and points at another
+# (whatever main's head was). Nothing read the target then; this does, and a
+# silently wrong pin would hand a session a step built from an unrelated tree.
+COMMIT=""
+while IFS=$'\t' read -r s r; do
+    case "$r" in
+        # Peeled first: an annotated tag's own object is not what was built.
+        "refs/tags/$VERSION^{}") COMMIT="$s"; break ;;
+        "refs/tags/$VERSION") COMMIT="$s" ;;
+    esac
+done <<< "$refs"
+if [ -z "$COMMIT" ]; then
+    echo "$REPO has no tag $VERSION to take a commit from" >&2
+    exit 1
+fi
+# A mismatch drops the commit rather than failing: installing the CLIENT does
+# not need it, and refusing over it would take out the whole install for a
+# build that is otherwise perfectly good. What cannot proceed is naming the
+# step by locator, and that is where the refusal belongs -- in the caller that
+# reads this record and finds no commit in it.
+case "$VERSION" in
+    build-*)
+        if [ "${VERSION#build-}" != "${COMMIT:0:12}" ]; then
+            echo "$REPO tag $VERSION points at $COMMIT, a different commit," >&2
+            echo "  so this build cannot say which tree it came from. It predates" >&2
+            echo "  the workflow fix that puts a build tag on the commit it names;" >&2
+            echo "  a session that has to name the step needs a newer build." >&2
+            COMMIT=""
+        fi
+        ;;
+esac
+
 # Always a named release by this point -- there is no `/releases/latest/`
 # route here on purpose. GitHub's "latest" is the newest release of ANY kind,
 # and with a release per push that is whichever branch pushed last, which is
@@ -231,6 +272,20 @@ else
     install_client
 fi
 
+# WHAT THIS CLIENT IS, for whoever has to name the step it drives. Written on
+# every run, including the skipped-download path: it describes the resolution,
+# not the transfer, and a prefix that has the binary but not this record would
+# leave the reader with the twelve digits in the wrapper and no way to expand
+# them. `dev/claude-code/cloud/configure.sh` reads it to build the locator it
+# writes into a session's configuration.
+install -d "$PREFIX/share/caos"
+cat > "$PREFIX/share/caos/build" <<RECORD
+repo=$REPO
+commit=$COMMIT
+version=$VERSION
+RECORD
+chmod 0644 "$PREFIX/share/caos/build"
+
 # The repository files. NOT overwritten without --force: a checkout that already
 # has `.claude/settings.json` has someone's configuration in it, and replacing
 # that silently is how a deny list nobody asked for disarms their session.
@@ -261,10 +316,22 @@ Done. Point the client at a caos server, then start a session:
 `caos cc serve` is spawned by Claude Code from .mcp.json; the hooks in
 .claude/settings.json record the conversation.
 
-Both name the step whose tools the session offers, as `--llm-step:@=std/llm-step`
--- caos' own path. A repository that mounts caos elsewhere edits that path in
-those two files, exactly as it would for `caos tui --llm-step:@=...`.
+Both name the step whose tools the session offers. Nothing defaults it, so the
+files you were just given say `--llm-step:@=std/llm-step`, which is caos' own
+path and is wrong for this repository unless it IS caos. Either point it at
+wherever this tree reaches caos (`--llm-step:@=caos-std/llm-step`), or name no
+path at all and let the client fetch the tree:
 DONE
+    # Outside the heredoc because that one is quoted -- it has to be, it is full
+    # of backticks -- and this line is the only part with anything to expand.
+    if [ -n "$COMMIT" ]; then
+        echo "  --llm-step:@@=github:$REPO?rev=$COMMIT&dir=std/llm-step" >&2
+        echo >&2
+        echo "That pins the commit this client was built from, so the two agree." >&2
+    else
+        echo "  (this build cannot say which commit it came from -- see above --" >&2
+        echo "   so it cannot offer you that spelling; use a newer one.)" >&2
+    fi
 else
     echo "installed the client only; no repository files were written" >&2
 fi
