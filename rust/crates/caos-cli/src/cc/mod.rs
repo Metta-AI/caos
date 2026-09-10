@@ -94,11 +94,14 @@ pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Resul
 }
 
 fn usage() -> String {
-    "usage:\n  \
-     caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
-     caos cc serve   (workspace tool server; JSON-RPC on stdio)\n    \
-     (both take --llm-step:@=<path>, the step whose tools this session offers)"
-        .to_string()
+    format!(
+        "usage:\n  \
+         caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
+         caos cc serve   (workspace tool server; JSON-RPC on stdio)\n\n\
+         Both name the step whose tools this session offers:\n  \
+         {}",
+        crate::missing_image_arg(LLM_STEP_ARG)
+    )
 }
 
 /// What one tool call answers with: the observation the transcript kept, and
