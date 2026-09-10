@@ -16,8 +16,8 @@ create a code change. A named PR boundary can span many `W` commits.
 ```mermaid
 flowchart TB
     subgraph caos["CAOS Git"]
-        before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests tool<br/>C_4: tool starts"]
-        after["C_5: tool completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
+        before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests bash<br/>C_4: bash starts"]
+        after["C_5: bash completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
         before -->|conversation continues| after
         before -.->|feature/dirty| W0["W_0: original code"]
         after -.->|feature/dirty| W1["W_1: edited code"]
@@ -32,8 +32,9 @@ flowchart TB
     W1 -.->|publish same commits and ancestry| published1
 ```
 
-Each listed `C` is a separate commit. Naming the review boundary creates a
-new `C`, but no new `W`.
+This example dispatches bash to a worker; each listed `C` is a separate commit.
+Naming the review boundary creates a new `C`, but no new `W`. This example
+assumes publication preparation makes no further code changes.
 
 ## Conversation commits
 
@@ -66,9 +67,11 @@ Earlier versions are available through conversation history.
 The request hash depends on `C_0`; including it inside `C_0` would make the
 hashes depend on each other. Step 3 identifies the concrete run to execute.
 
-The worker subsequently records that it has started the run. Model responses,
-tool starts/completions, and run completion also create `C` commits. An
-event-only commit can reuse its parent's tree.
+The worker subsequently records that it has started the run. Model responses
+and run completion also create `C` commits. Dispatched tools, such as bash,
+record separate start and completion commits. Inline tools, such as `read`
+and `edit`, record completion without a separate start commit. An event-only
+commit can reuse its parent's tree.
 
 Events are replayed in first-parent order, never by timestamp. A fork starts a
 new execution context while retaining ancestral tool results needed by its
@@ -111,9 +114,10 @@ available inside a worker.
 Call a repository tool with `run_tool` and a conversation-relative path, such
 as `feature/dirty/caos-tools/test`, plus its arguments. The harness resolves
 the tool against the captured snapshot and dispatches its content-addressed
-request. Its input is the containing source tree; a tool outside source trees
-receives the conversation tree. Repository tool schemas and instructions are
-shown with their owning paths.
+request. Its input is the outermost source tree on that path: the first
+commit-valued entry reached from the conversation root, even if the tool lies
+inside another gitlink. A tool outside source trees receives the conversation
+tree. Repository tool schemas and instructions are shown with their owning paths.
 
 A shell result may change conversation files and several source trees together.
 Apply it atomically against the captured input: retain concurrent unrelated
@@ -127,8 +131,10 @@ Code references are Git commit-valued tree entries (gitlinks, mode `160000`).
 A reference's value is a `W`; that commit's
 identity does not depend on the repository from which it was fetched.
 
-References may occur anywhere outside `.caos`. The TUI discovers them by
-walking the conversation tree and lists their paths.
+References may occur anywhere outside `.caos`. The TUI walks ordinary
+directories and lists each commit-valued entry it reaches, stopping at that
+entry. Nested gitlinks remain traversable by file tools but are not separate
+TUI source-tree targets.
 
 A single reference such as `paintbot` is enough for simple work. When useful,
 move it into a feature directory and follow this convention:
@@ -146,10 +152,10 @@ paintbot-feature/
 actually been incorporated. They are distinct: fetching a newer remote tip
 does not integrate it.
 
-Numbered entries are review boundaries, not individual edits. Use descriptive
-names and zero-padded numbers so lexical order is useful. The TUI compares each
-boundary with its predecessor, and `dirty` with the last boundary. Intermediate
-code commits remain in ordinary Git ancestry.
+Review boundaries use exactly two digits from `01` through `99`, a hyphen,
+and a nonempty description, such as `01-parser`. They are not individual edits.
+The TUI compares each boundary with its predecessor, and `dirty` with the last
+boundary. Intermediate code commits remain in ordinary Git ancestry.
 
 Keep **one moving `dirty` reference**. Each accepted edit produces a real code
 commit and updates its value; previous values remain in conversation history.
@@ -172,11 +178,14 @@ fetched tip; remote updates become visible when fetched.
 
 Subagents have separate conversations, seeded with ordinary conversation
 files and source trees but fresh protocol metadata. An explicit source-tree
-selection narrows which code is copied. Record their relationship and
-completion in events. Combine their results into
-`dirty`, or expose them as separate numbered boundaries when they deserve
-separate PRs. Directory ordering does not replace actually integrating their
-Git histories.
+selection narrows which code is copied. Their relationship and completion are
+recorded in events.
+
+`harvest_agent` reconciles one child source tree into one parent source tree
+per call; it does not bring back edits to ordinary conversation files such as
+memories. Harvest code into `dirty`, or copy a child's code commit into a
+numbered boundary when it deserves a separate PR. Directory ordering does not
+replace actually integrating Git histories.
 
 ### Starting a client
 
@@ -206,13 +215,15 @@ Select a stack directory and derive the plan:
 - PR bases: the external branch for the first boundary, then the preceding
   boundary's branch for each subsequent PR.
 
-Exclude `00-base` and `dirty`. A numbered boundary points at an existing code
-commit; publication preserves it and its ancestry. Naming a boundary does not
-squash the intervening commits.
+Exclude `00-base` and `dirty`. Naming a boundary does not squash the
+intervening commits.
 
-Preview destinations and diffs, prepare and check the selected code, and publish
-in order. Verify that references still match the prepared commits and that
-remote branches have not moved unexpectedly.
+After the preview is confirmed, publication runs an agent to prepare each
+selected boundary in order. Preparation can merge the PR base and edit the
+code while building and testing it, advancing that boundary beyond the commit
+shown in the preview. Publication pushes the exact prepared commit and its
+ancestry. Before pushing, verify that references still match the prepared
+commits and that remote branches have not moved unexpectedly.
 
 Find existing PRs by repository and inferred branch. Inspect destination refs
 after an interrupted push before retrying. Any recovery events belong in commit
