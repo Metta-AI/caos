@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Embedded git-history library for the built-in `log`/`show`/`diff` tools
 # (crates/worker-llm-step/src/githist.rs prepends this to each command body and
-# `caos put`s the result as the worker script). NOT read from the workspace —
+# `caos put`s the result as the worker script). NOT read from the source tree —
 # these tools ship with the harness.
 #
-# A `@git`-style launch gives the worker `/cas/args/wc` (the workspace commit,
+# A `@git`-style launch gives the worker `/cas/args/wc` (the source tree commit,
 # materialized as the raw commit object) and `/cas/args/refs` (the turn's
 # `name <hash>` snapshot). From those two entry points every reachable object is
 # one `caos get-hash` away — a commit checks out as its raw bytes, a tree as a
@@ -22,7 +22,7 @@ declare -A _OBJ
 
 githist_init() {
   if ! caos get /cas/args/wc >/dev/null 2>&1; then
-    echo "githist: no workspace commit available" >&2
+    echo "githist: no source tree commit available" >&2
     return 1
   fi
   WC=$(caos hash /cas/args/wc)
@@ -110,7 +110,7 @@ _resolve_base() {
   if [ -n "$line" ]; then printf '%s' "${line##* }"; return 0; fi
   {
     echo "cannot resolve revision: $b"
-    echo "give the workspace commit (HEAD / wc), a full commit hash, or a snapshot ref:"
+    echo "give the source tree commit (HEAD / wc), a full commit hash, or a snapshot ref:"
     if [ -n "$REFS" ]; then printf '%s\n' "$REFS" | while read -r n _; do [ -n "$n" ] && echo "  $n"; done
     else echo "  (no refs in this turn's snapshot)"; fi
   } >&2

@@ -52,30 +52,30 @@ assert_oid() {
 }
 
 only_status_event() {
-  local before=$1 after=$2 task=$3 status=$4 result=$5 workspace=$6
-  local changed record workspace_output current_workspace
+  local before=$1 after=$2 task=$3 status=$4 result=$5 source_tree=$6
+  local changed record source_tree_output current_source_tree
   git -c fetch.negotiationAlgorithm=noop fetch -q caos "$after" \
     || fail "fetching terminal async head $after"
   [ "$(git rev-parse "$after^1")" = "$before" ] \
     || fail "the $status event did not append to the prior head"
   changed=$(git diff-tree --no-commit-id --name-only -r "$before" "$after")
-  [ "$changed" = ".caos/async/$task.json" ] \
-    || fail "the $status event changed paths other than its async record: $changed"
+  [ -z "$changed" ] \
+    || fail "the $status event changed content: $changed"
   record=$($TOOL async --repo /tmp/repo --head "$after" --task "$task") \
     || fail "reading terminal async record"
   [ "$(jq -r .status <<<"$record")" = "$status" ] \
     || fail "the async record has the wrong status"
   [ "$(jq -r .result <<<"$record")" = "$result" ] \
     || fail "the async record has the wrong result"
-  workspace_output=$($TOOL workspace --repo /tmp/repo --head "$after" --name main) \
+  source_tree_output=$($TOOL source-tree --repo /tmp/repo --head "$after" --name main) \
     || fail "reading main pointer"
-  current_workspace=${workspace_output%%$'\n'*}
-  current_workspace=${current_workspace#commit }
-  [ "$current_workspace" = "$workspace" ] || fail "the status event changed main"
-  git -c fetch.negotiationAlgorithm=noop fetch -q caos "$current_workspace" \
-    || fail "fetching main workspace"
-  [ "$(git show "$current_workspace:workspace.txt")" = "workspace survives" ] \
-    || fail "workspace.txt changed"
+  current_source_tree=${source_tree_output%%$'\n'*}
+  current_source_tree=${current_source_tree#commit }
+  [ "$current_source_tree" = "$source_tree" ] || fail "the status event changed main"
+  git -c fetch.negotiationAlgorithm=noop fetch -q caos "$current_source_tree" \
+    || fail "fetching main source_tree"
+  [ "$(git show "$current_source_tree:source_tree.txt")" = "source tree survives" ] \
+    || fail "source_tree.txt changed"
 }
 
 case "$stage" in
@@ -100,16 +100,16 @@ case "$stage" in
 start)
   echo "== initialize v3 conversation roots ==" >&2
   mkdir -p /tmp/ws
-  printf 'workspace survives\n' > /tmp/ws/workspace.txt
-  caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the conversation workspace"
+  printf 'source tree survives\n' > /tmp/ws/source_tree.txt
+  caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the conversation source_tree"
   ws_tree=$(caos hash /cas/ws)
   { printf 'tree %s\n' "$ws_tree"
     printf 'author caos <test@caos> %s +0000\n' "$TS"
     printf 'committer caos <test@caos> %s +0000\n' "$TS"
-    printf '\nworkspace base (%s)\n' "$SALT"
+    printf '\nsource_tree base (%s)\n' "$SALT"
   } > /tmp/base.commit
-  workspace=$(caos put-commit /tmp/base.commit /cas/workspace-base) \
-    || fail "minting workspace commit"
+  source_tree=$(caos put-commit /tmp/base.commit /cas/source_tree-base) \
+    || fail "minting source_tree commit"
   test_run_id="$(date +%s%N)-$$-$RANDOM"
   success_id="${test_run_id}-run-update-success"
   failure_id="${test_run_id}-run-update-failure"
@@ -118,10 +118,10 @@ start)
   failure_ref=$($TOOL ref --id "$failure_id")
   failure_ref=${failure_ref#ref }
   success_root=$($TOOL root --repo /tmp/repo --id "$success_id" --title "$success_id" \
-    --workspace "main=$workspace")
+    --source-tree "main=$source_tree")
   success_root=${success_root#head }
   failure_root=$($TOOL root --repo /tmp/repo --id "$failure_id" --title "$failure_id" \
-    --workspace "main=$workspace")
+    --source-tree "main=$source_tree")
   failure_root=${failure_root#head }
   $TOOL create --repo /tmp/repo --ref "$success_ref" --user tester \
     --id "$success_id" --new "$success_root" >/dev/null || fail "creating success conversation"
@@ -138,24 +138,24 @@ start)
   success_pending=${success_pending#head }
   caos run-request-then "$success_task" \
     --then:hash="$(next succeeded --success-before="$success_pending" \
-      --failure-root="$failure_root" --workspace="$workspace" \
+      --failure-root="$failure_root" --source-tree="$source_tree" \
       --success-ref="$success_ref" --failure-ref="$failure_ref" \
       --success-task="$success_task")"
   ;;
 
 succeeded)
-  for arg_name in success-before failure-root workspace success-ref failure-ref success-task; do
+  for arg_name in success-before failure-root source-tree success-ref failure-ref success-task; do
     caos get "/cas/args/$arg_name" || fail "reading --$arg_name"
   done
   success_before=$(cat /cas/args/success-before)
   failure_root=$(cat /cas/args/failure-root)
-  workspace=$(cat /cas/args/workspace)
+  source_tree=$(cat /cas/args/source-tree)
   success_ref=$(cat /cas/args/success-ref)
   failure_ref=$(cat /cas/args/failure-ref)
   success_task=$(cat /cas/args/success-task)
   success_head=$(remote_head "$success_ref") || fail "successful Q appended no event"
   only_status_event "$success_before" "$success_head" "$success_task" complete \
-    "$success_result" "$workspace"
+    "$success_result" "$source_tree"
   caos get-hash "$success_result" /cas/actual || fail "result is not fetchable"
   caos get -r /cas/actual || fail "materializing the result"
   diff -r /tmp/expected /cas/actual >/dev/null || fail "Q changed R's result"
@@ -170,16 +170,16 @@ succeeded)
   failure_pending=${failure_pending#head }
   caos run-request-then "$failure_task" \
     --then:hash="$(next failed --failure-before="$failure_pending" \
-      --workspace="$workspace" --failure-ref="$failure_ref" \
+      --source-tree="$source_tree" --failure-ref="$failure_ref" \
       --failure-task="$failure_task")"
   ;;
 
 failed)
-  for arg_name in failure-before workspace failure-ref failure-task; do
+  for arg_name in failure-before source-tree failure-ref failure-task; do
     caos get "/cas/args/$arg_name" || fail "reading --$arg_name"
   done
   failure_before=$(cat /cas/args/failure-before)
-  workspace=$(cat /cas/args/workspace)
+  source_tree=$(cat /cas/args/source-tree)
   failure_ref=$(cat /cas/args/failure-ref)
   failure_task=$(cat /cas/args/failure-task)
   failure_head=$(remote_head "$failure_ref") || fail "failing Q appended no event"
@@ -189,7 +189,7 @@ failed)
   failure_identity=$(jq -r .result <<<"$failure_record")
   assert_oid "$failure_identity" "failure result"
   only_status_event "$failure_before" "$failure_head" "$failure_task" failed \
-    "$failure_identity" "$workspace"
+    "$failure_identity" "$source_tree"
   caos get-hash "$failure_identity" /cas/failed || fail "failure result is not fetchable"
   caos get -r /cas/failed || fail "materializing failure result"
   [ -d /cas/failed ] || fail "failed Q did not return a result tree"

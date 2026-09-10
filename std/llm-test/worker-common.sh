@@ -168,7 +168,7 @@ admit_turn() {
     --model test-model --configuration "$llm")
   if [ "$LLM_TEST_NEW_CONVERSATION" -eq 1 ]; then
     if [ -n "$LLM_TEST_ROOT_WORKSPACE" ]; then
-      turn_args+=(--workspace "main=$LLM_TEST_ROOT_WORKSPACE")
+      turn_args+=(--source-tree "main=$LLM_TEST_ROOT_WORKSPACE")
     fi
   else
     turn_args+=(--head "$head")
@@ -252,14 +252,14 @@ record() {
   $TOOL read --repo /tmp/repo --head "$1" --path "$2"
 }
 
-workspace_commit() {
+source_tree_commit() {
   local conversation_head=$1 name=${2:-main} output key value commit=""
-  output=$($TOOL workspace --repo /tmp/repo --head "$conversation_head" --name "$name") \
-    || fail "reading workspace $name"
+  output=$($TOOL source-tree --repo /tmp/repo --head "$conversation_head" --name "$name") \
+    || fail "reading source_tree $name"
   while read -r key value; do
     if [ "$key" = commit ]; then commit=$value; fi
   done <<<"$output"
-  assert_oid "$commit" "workspace $name"
+  assert_oid "$commit" "source_tree $name"
   printf '%s\n' "$commit"
 }
 

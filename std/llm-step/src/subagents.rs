@@ -12,18 +12,18 @@ pub const SPAWN_TOOL: &str = "spawn_agent";
 pub const WAIT_TOOL: &str = "wait_agent";
 pub const HARVEST_TOOL: &str = "harvest_agent";
 
-const FOCUSED_SYSTEM: &str = "You are a focused subagent. Work only on the user's delegated task in this isolated snapshot. Use the available tools, make any requested workspace edits, and finish with a concise report. You cannot spawn further agents.";
+const FOCUSED_SYSTEM: &str = "You are a focused subagent. Work only on the user's delegated task in this isolated snapshot. Use the available tools, make any requested source tree edits, and finish with a concise report. You cannot spawn further agents.";
 
 pub fn declarations() -> [Value; 3] {
     [
         json!({
             "name": SPAWN_TOOL,
-            "description": "Start a focused coding agent in a durable child conversation. The child receives the selected workspace snapshot and can be joined with wait_agent, then its code can be applied with harvest_agent.",
+            "description": "Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with wait_agent, then selected content can be applied with harvest_agent.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "A self-contained task with the desired output and constraints."},
-                    "workspace": {"type": "string", "description": "Workspace to seed. Required when the conversation has several workspaces; omit when it has none."}
+                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional conversation-relative paths to copy. Omit for all content. Select gitlinks as whole source trees. Protocol metadata is always excluded."}
                 },
                 "required": ["prompt"]
             }
@@ -41,13 +41,12 @@ pub fn declarations() -> [Value; 3] {
         }),
         json!({
             "name": HARVEST_TOOL,
-            "description": "Apply a terminal child agent's named workspace to a parent workspace with the ordinary three-way reconciliation rules.",
+            "description": "Apply selected content changes from a terminal child using the same atomic reconciliation as file tools. Code, memories, and notes keep their conversation-relative paths; protocol metadata is excluded.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "child": {"type": "string", "description": "The terminal child id returned by spawn_agent."},
-                    "child_workspace": {"type": "string", "description": "Child workspace to apply; defaults to the workspace seeded at spawn."},
-                    "workspace": {"type": "string", "description": "Parent workspace to update; defaults when the parent has exactly one workspace."}
+                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional paths to apply, including descendants. Omit for all changed content. Select gitlinks as whole source trees."}
                 },
                 "required": ["child"]
             }
@@ -62,14 +61,6 @@ pub fn required_string<'a>(call: &'a Value, name: &str, tool: &str) -> Result<&'
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{tool} needs a non-empty string `{name}`"))
-}
-
-pub fn optional_string<'a>(call: &'a Value, name: &str) -> Option<&'a str> {
-    call.get("input")
-        .and_then(|input| input.get(name))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 pub fn agent_title(prompt: &str) -> String {

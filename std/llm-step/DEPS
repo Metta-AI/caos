@@ -23,3 +23,4 @@
 ../caos-test caos-test
 ../caos-test-result caos-test-result
 ../run-and-update-ref run-and-update-ref
+../../rust/crates/git-locator git-locator
