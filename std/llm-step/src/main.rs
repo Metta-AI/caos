@@ -3,6 +3,7 @@
 mod async_work;
 mod githist;
 mod progress;
+mod source_trees;
 mod subagents;
 mod timing;
 mod tools;
@@ -10,7 +11,6 @@ mod tools;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -21,10 +21,10 @@ use conversation_protocol::v3::ids;
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    reconcile, validate_spine, Application, AsyncRecord, AsyncStatus, Block, ChildRecord,
-    ChildStatus, CodeOps, DeclaredCall, FilesOutcome, Identity, IdentityKind, Kind, Mode,
-    ObjectStore, Oid, Owner, RequestOutcome, RequestRecord, RequestStatus, Role, SpawnIntent,
-    ToolRecord, ToolResult, ToolStatus, TranscriptEntry, WorkspaceResolution,
+    reconcile, validate_spine, Application, AsyncRecord, Block, CallRecord, CallStatus,
+    ChildRecord, CodeOps, DeclaredCall, FilesOutcome, Identity, IdentityKind, Kind, Mode,
+    ObjectStore, Oid, Owner, Role, SourceTreeResolution, SpawnIntent, TaskStatus, ToolResult,
+    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
 };
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
@@ -51,6 +51,7 @@ fn main() -> std::process::ExitCode {
     exit
 }
 
+#[derive(Clone)]
 struct Config {
     api_key: String,
     system: String,
@@ -61,9 +62,11 @@ struct Config {
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     merge_refs: Option<String>,
+    repository_refs: BTreeMap<String, String>,
     model: String,
     base_url: String,
     conversation: String,
+    focus_source_tree: Option<String>,
 }
 
 fn image_arg(name: &str) -> Result<Option<String>, String> {
@@ -76,6 +79,17 @@ fn image_arg(name: &str) -> Result<Option<String>, String> {
 }
 
 impl Config {
+    fn for_source_tree(&self, view: &Conversation<'_>, name: &str) -> Result<Self, String> {
+        let mut scoped = self.clone();
+        if let Some(repository) = view.source_tree_config(name)?.repository() {
+            let identity = conversation_protocol::v3::source_trees::normalize_repository_identity(
+                &repository,
+            )?;
+            scoped.merge_refs = self.repository_refs.get(&identity).cloned();
+        }
+        Ok(scoped)
+    }
+
     fn read() -> Result<Self, String> {
         let run_and_update_ref_image = if read_arg_opt("subagent")?.is_some() {
             None
@@ -85,6 +99,7 @@ impl Config {
         Ok(Self {
             api_key: secret("anthropic-api-key")?,
             system: read_arg("system")?,
+            focus_source_tree: read_arg_opt("focus-source-tree")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             tools_image: image_arg("tools-image")?,
@@ -95,6 +110,10 @@ impl Config {
                 .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
             merge_refs: read_arg_opt("merge-refs")?,
+            repository_refs: serde_json::from_str(
+                &read_arg_opt("repository-refs")?.unwrap_or_else(|| "{}".into()),
+            )
+            .map_err(|e| format!("repository refs: {e}"))?,
             model: read_arg("model")?,
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             conversation: read_arg_opt("conversation")?
@@ -133,12 +152,12 @@ fn start(
         validate_admission(state, request, request_head)?;
         let record = require_request(&state.conversation()?, request)?;
         match record.status {
-            RequestStatus::Queued => {
+            TurnStatus::Queued => {
                 let latest_message = newest_user_message(&state.conversation()?)?;
                 let expected = state.head().clone();
                 match state.try_append_at(
                     &expected,
-                    Transition::RequestClaim {
+                    Transition::TurnClaim {
                         request: request.clone(),
                         latest_message,
                     },
@@ -147,11 +166,9 @@ fn start(
                     progress::TryAppend::HeadChanged(_) => continue,
                 }
             }
-            RequestStatus::Running => break,
-            RequestStatus::Cancelling => return drain(state, request),
-            RequestStatus::Idle | RequestStatus::Failed => {
-                return finish_from_terminal(state, request)
-            }
+            TurnStatus::Running => break,
+            TurnStatus::Cancelling => return drain(state, request),
+            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
         }
     }
     reconcile_background_tasks(state)?;
@@ -194,10 +211,6 @@ fn validate_admission(
             "request head {request_head} is not on the conversation spine"
         ));
     }
-    let at_request = state.conversation_at(request_head)?;
-    if at_request.workspaces_tree()? != record.request_workspaces {
-        return Err("request workspaces diverged".to_string());
-    }
     VALID_ADMISSIONS
         .get_or_init(Default::default)
         .lock()
@@ -210,8 +223,8 @@ fn state_conversation_id(state: &progress::State) -> Result<String, String> {
     conversation_protocol::v3::refs::parse_head_ref(state.refname())
 }
 
-fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<RequestRecord, String> {
-    view.request(request)?
+fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
+    view.turn(request)?
         .ok_or_else(|| format!("conversation has no request record for {request}"))
 }
 
@@ -245,7 +258,7 @@ fn callback(
 ) -> Result<(), String> {
     validate_admission(state, request, request_head)?;
     let status = require_request(&state.conversation()?, request)?.status;
-    if matches!(status, RequestStatus::Idle | RequestStatus::Failed) {
+    if matches!(status, TurnStatus::Idle | TurnStatus::Failed) {
         return finish_from_terminal(state, request);
     }
     let round = read_arg("round")?
@@ -269,7 +282,7 @@ fn callback(
             CallSite::at(request, round, &call, &declaration).failed(state, &block, target)?;
             return resume(cfg, state, request, request_head);
         }
-        return launch_evaluated_tool(cfg, state, request, request_head, round, &id, &tool);
+        return launch_evaluated_tool(cfg, state, request, request_head, round, &id);
     }
 
     let record = state
@@ -313,7 +326,7 @@ fn pending_call_target(
         return Ok(None);
     };
     Ok(match resolve_target(&view, call)? {
-        Target::Workspace { name, commit } => Some((name, commit)),
+        Target::SourceTree { name, commit } => Some((name, commit)),
         Target::Files => None,
     })
 }
@@ -331,12 +344,10 @@ fn resume(
         validate_admission(state, request, request_head)?;
         let record = require_request(&state.conversation()?, request)?;
         match record.status {
-            RequestStatus::Cancelling => return drain(state, request),
-            RequestStatus::Idle | RequestStatus::Failed => {
-                return finish_from_terminal(state, request)
-            }
-            RequestStatus::Queued => return start(cfg, state, request, request_head),
-            RequestStatus::Running => {}
+            TurnStatus::Cancelling => return drain(state, request),
+            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
+            TurnStatus::Queued => return start(cfg, state, request, request_head),
+            TurnStatus::Running => {}
         }
 
         let round = round_state(&state.conversation()?, &record)?;
@@ -351,7 +362,7 @@ fn resume(
         announce_background_tasks(&cfg.conversation, state)?;
         state.reload()?;
         let current = require_request(&state.conversation()?, request)?;
-        if current.status != RequestStatus::Running {
+        if current.status != TurnStatus::Running {
             continue;
         }
         let round = round_state(&state.conversation()?, &current)?;
@@ -359,7 +370,7 @@ fn resume(
             continue;
         }
         let messages = context_messages(&state.conversation()?)?;
-        let workspaces = workspace_paths(state)?;
+        let source_trees = source_tree_paths(state)?;
         let previous = state.head().clone();
         return llm_round(
             cfg,
@@ -367,7 +378,7 @@ fn resume(
             request,
             request_head,
             messages,
-            &workspaces,
+            &source_trees,
             &previous,
             current.round,
         );
@@ -419,23 +430,23 @@ impl<'a> CallSite<'a> {
         }
     }
 
-    fn stub(&self, target: Option<(String, Oid)>) -> ToolRecord {
-        let (workspace_name, input_workspace) = match target {
+    fn stub(&self, target: Option<(String, Oid)>) -> CallRecord {
+        let (source_tree_name, input_commit) = match target {
             Some((name, commit)) => (Some(name), Some(commit)),
             None => (None, None),
         };
-        ToolRecord {
+        CallRecord {
             request: self.request.clone(),
             round: self.round,
             id: self.call.id.clone(),
             name: self.call.name.clone(),
             declaration_message: self.declaration.to_string(),
-            workspace_name,
-            input_workspace,
-            status: ToolStatus::Complete,
+            source_tree_name,
+            input_commit,
+            status: CallStatus::Complete,
             task: None,
             result: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
             files: Vec::new(),
             files_outcome: None,
         }
@@ -446,10 +457,12 @@ impl<'a> CallSite<'a> {
         state: &mut progress::State,
         block: &Value,
         target: Option<(String, Oid)>,
-        resolution: Option<WorkspaceResolution>,
-        result: impl FnOnce(&ToolRecord) -> ToolResult,
+        resolution: Option<SourceTreeResolution>,
+        task: Option<Oid>,
+        result: impl FnOnce(&CallRecord) -> ToolResult,
     ) -> Result<(), String> {
-        let stub = self.stub(target);
+        let mut stub = self.stub(target);
+        stub.task = task;
         let record = completed_record(&stub, result(&stub), resolution);
         let expected = state.head().clone();
         let _ = state.try_append_at(
@@ -465,9 +478,9 @@ impl<'a> CallSite<'a> {
         block: Value,
         target: Option<(String, Oid)>,
         proposal: Option<Oid>,
-        resolution: Option<WorkspaceResolution>,
+        resolution: Option<SourceTreeResolution>,
     ) -> Result<(), String> {
-        self.finish(state, &block, target, resolution, |stub| {
+        self.finish(state, &block, target, resolution, None, |stub| {
             ToolResult::Complete {
                 observation: observation_path(stub),
                 proposal,
@@ -485,8 +498,10 @@ impl<'a> CallSite<'a> {
         block: &Value,
         target: Option<(String, Oid)>,
     ) -> Result<(), String> {
-        self.finish(state, block, target, None, |stub| ToolResult::Failed {
-            error: observation_path(stub),
+        self.finish(state, block, target, None, None, |stub| {
+            ToolResult::Failed {
+                error: observation_path(stub),
+            }
         })
     }
 }
@@ -497,7 +512,7 @@ fn close_pending_call(
     round: &RoundState,
     call: &Call,
     block: &Value,
-    result: impl FnOnce(&ToolRecord) -> ToolResult,
+    result: impl FnOnce(&CallRecord) -> ToolResult,
 ) -> Result<(), String> {
     let existing = state
         .conversation()?
@@ -506,13 +521,13 @@ fn close_pending_call(
         .as_ref()
         .and_then(|record| {
             record
-                .workspace_name
+                .source_tree_name
                 .clone()
-                .zip(record.input_workspace.clone())
+                .zip(record.input_commit.clone())
         })
         .or_else(
             || match resolve_target(&state.conversation().ok()?, call).ok()? {
-                Target::Workspace { name, commit } => Some((name, commit)),
+                Target::SourceTree { name, commit } => Some((name, commit)),
                 Target::Files => None,
             },
         );
@@ -526,7 +541,7 @@ fn close_pending_call(
     Ok(())
 }
 
-fn round_state(view: &Conversation<'_>, record: &RequestRecord) -> Result<RoundState, String> {
+fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundState, String> {
     if record.round == 0 {
         if !record.calls.is_empty() {
             return Err("round-zero request carries declared calls".to_string());
@@ -664,7 +679,7 @@ fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
                     }
                     let observation = format!(
                         "{}/observation.json",
-                        paths::tool_payload_dir(request.as_str(), round, id)
+                        paths::call_payload_dir(request.as_str(), round, id)
                     );
                     let observation: Value =
                         serde_json::from_slice(&view.payload(&observation)?)
@@ -680,17 +695,18 @@ fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
 
 fn render_tool_observation(
     view: &Conversation<'_>,
-    tool: &ToolRecord,
+    tool: &CallRecord,
     observation: Value,
 ) -> Result<Value, String> {
     if observation.get("type").and_then(Value::as_str) == Some("tool_result") {
         return Ok(observation);
     }
     if tool.name == subagents::SPAWN_TOOL {
-        let parent = view.identity()?.id;
-        let child_id = ids::child_id(&parent, &tool.request, tool.round, &tool.id)?;
+        let child_id = observation["child"]
+            .as_str()
+            .ok_or("spawn observation has no child")?;
         let child = view
-            .child(&child_id)?
+            .child(child_id)?
             .ok_or_else(|| format!("spawn tool {} has no child record {child_id}", tool.id))?;
         return Ok(subagents::spawn_result(
             &tool.id,
@@ -702,7 +718,7 @@ fn render_tool_observation(
     Ok(result_block(
         &tool.id,
         &observation.to_string(),
-        tool.status == ToolStatus::Conflict,
+        tool.status == CallStatus::Conflict,
     ))
 }
 
@@ -713,7 +729,7 @@ fn llm_round(
     request: &Oid,
     request_head: &Oid,
     messages: Vec<Value>,
-    workspaces: &[String],
+    source_trees: &[String],
     previous: &Oid,
     round: u64,
 ) -> Result<(), String> {
@@ -722,8 +738,8 @@ fn llm_round(
         "max_tokens": MAX_TOKENS,
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
-        "system": cfg.system,
-        "tools": registry(cfg, workspaces)?,
+        "system": format!("{}{}", cfg.system, format!("{}{}", source_trees::context(&state.conversation()?, cfg.focus_source_tree.as_deref())?, source_trees::repository_context(&state.conversation()?, source_trees)?)),
+        "tools": registry(cfg, source_trees)?,
         "messages": messages,
     });
     let status = |text: &str| eprintln!("llm-step: {text}");
@@ -843,18 +859,18 @@ fn terminate_end_turn(
         return record_response_after_escape(cfg, state, request, request_head, round);
     }
     match require_request(&state.conversation()?, request)?.status {
-        RequestStatus::Cancelling => return drain(state, request),
-        RequestStatus::Idle | RequestStatus::Failed => return finish_from_terminal(state, request),
-        RequestStatus::Queued => {
+        TurnStatus::Cancelling => return drain(state, request),
+        TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
+        TurnStatus::Queued => {
             return Err(format!(
                 "request {request} returned to queued after model completion"
             ))
         }
-        RequestStatus::Running => {}
+        TurnStatus::Running => {}
     }
-    let terminal = Transition::RequestTerminal {
+    let terminal = Transition::TurnTerminal {
         request: request.clone(),
-        outcome: RequestOutcome::Idle {
+        outcome: TurnOutcome::Idle {
             result: Some(result),
             interrupted: false,
         },
@@ -927,7 +943,7 @@ fn model_transition(
         model: Some(cfg.model.clone()),
         blocks: entry_blocks,
         proposal: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
     };
     Ok((
         Transition::ModelComplete {
@@ -948,7 +964,7 @@ fn record_response_after_escape(
     round: u64,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
-    if record.status == RequestStatus::Cancelling && record.round == round {
+    if record.status == TurnStatus::Cancelling && record.round == round {
         // The shared v3 transition contract currently admits model.complete
         // only while a request is Running. Once request.escape has changed the
         // status to Cancelling there is no legal transition that can retain an
@@ -960,7 +976,7 @@ fn record_response_after_escape(
 
 #[derive(Clone, Debug)]
 enum Target {
-    Workspace { name: String, commit: Oid },
+    SourceTree { name: String, commit: Oid },
     Files,
 }
 
@@ -976,7 +992,7 @@ fn drive_call(
         .conversation()?
         .tool(request, round.declaring_round, &call.id)?
     {
-        if existing.status == ToolStatus::Started {
+        if existing.status == CallStatus::Started {
             if existing.name == subagents::WAIT_TOOL {
                 dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
             } else {
@@ -1015,29 +1031,44 @@ fn drive_call(
         execute_inline(state, &site, target)?;
         return Ok(true);
     }
-    let Target::Workspace { name, commit } = target else {
-        unreachable!("non-inline code tools cannot target conversation files")
+    let (name, commit, scoped) = match target {
+        Target::SourceTree { name, commit } => {
+            let scoped = cfg.for_source_tree(&state.conversation()?, &name)?;
+            (Some(name), commit, scoped)
+        }
+        Target::Files => (None, state.head().clone(), cfg.clone()),
     };
-    let (ws, wc) = materialize_workspace(state, &commit)?;
-    match prepare_compute(cfg, call, &ws, &wc, request, round)? {
+    let (ws, wc) = materialize_source_tree(state, &commit)?;
+    let mut scoped_call = call.clone();
+    if call.name == "run_tool" {
+        if let Some(name) = &name {
+            let path = call.input["path"]
+                .as_str()
+                .ok_or("run_tool requires path")?;
+            scoped_call.input["path"] = json!(path
+                .strip_prefix(&format!("{name}/"))
+                .ok_or("tool path is outside its source tree")?);
+        }
+    }
+    match prepare_compute(&scoped, &scoped_call, &ws, &wc, request, round)? {
         Prepared::Result(block) => {
-            site.complete(state, block, Some((name, commit)), None, None)?;
+            site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
             Ok(true)
         }
         Prepared::Evaluation => Ok(false),
         Prepared::Task(task) => {
-            let record = ToolRecord {
+            let record = CallRecord {
                 request: request.clone(),
                 round: round.declaring_round,
                 id: call.id.clone(),
                 name: call.name.clone(),
                 declaration_message: round.declaration_message.clone(),
-                workspace_name: Some(name),
-                input_workspace: Some(commit),
-                status: ToolStatus::Started,
+                source_tree_name: name,
+                input_commit: Some(commit),
+                status: CallStatus::Started,
                 task: Some(task.clone()),
                 result: None,
-                workspace_resolution: None,
+                source_tree_resolution: None,
                 files: Vec::new(),
                 files_outcome: None,
             };
@@ -1061,51 +1092,73 @@ fn drive_call(
 fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String> {
     let requested = call
         .input
-        .get("workspace")
+        .get("source_tree")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    // An explicit workspace always owns its paths, including a directory
-    // named files. The files/ shorthand applies only without a workspace.
-    if requested.is_none() && inline_files_path(call).is_some() {
-        return Ok(Target::Files);
+    if requested.is_none() {
+        if matches!(call.name.as_str(), "bash" | "grep") {
+            return Ok(Target::Files);
+        }
+        if matches!(call.name.as_str(), "read" | "ls") && call.input.get("root").is_some() {
+            return Ok(Target::Files);
+        }
+        if tools::is_inline(&call.name) {
+            return Ok(Target::Files);
+        }
+        if call.name == "run_tool" {
+            let path = call.input["path"]
+                .as_str()
+                .ok_or("run_tool requires path")?;
+            paths::validate_tree_path(path)?;
+            for name in view.source_tree_names()?.into_iter().rev() {
+                if path.starts_with(&format!("{name}/")) {
+                    let commit = view
+                        .source_tree(&name)?
+                        .ok_or("reference disappeared")?
+                        .commit;
+                    return Ok(Target::SourceTree { name, commit });
+                }
+            }
+            return Ok(Target::Files);
+        }
     }
-    let (name, commit) = workspace_target(view, requested)?
-        .ok_or_else(|| "this conversation has no workspace".to_string())?;
-    Ok(Target::Workspace { name, commit })
+    let (name, commit) = source_tree_target(view, requested)?
+        .ok_or_else(|| "this conversation has no source tree".to_string())?;
+    Ok(Target::SourceTree { name, commit })
 }
 
-fn workspace_target(
+fn source_tree_target(
     view: &Conversation<'_>,
     requested: Option<&str>,
 ) -> Result<Option<(String, Oid)>, String> {
-    let workspaces = view.workspaces()?;
+    let source_trees = view.source_trees()?;
     let name = match requested {
         Some(name) => name.to_string(),
-        None if workspaces.len() == 1 => workspaces.keys().next().unwrap().clone(),
-        None if workspaces.is_empty() => return Ok(None),
+        None if source_trees.len() == 1 => source_trees.keys().next().unwrap().clone(),
+        None if source_trees.is_empty() => return Ok(None),
         None => {
             return Err(format!(
-                "several workspaces: {}; pass workspace=<name>",
-                workspaces.keys().cloned().collect::<Vec<_>>().join(", ")
+                "several source trees: {}; pass source_tree=<name>",
+                source_trees.keys().cloned().collect::<Vec<_>>().join(", ")
             ))
         }
     };
-    let Some(workspace) = workspaces.get(&name) else {
+    let Some(source_tree) = source_trees.get(&name) else {
         return Err(format!(
-            "unknown workspace {name:?}; available workspaces: {}",
-            if workspaces.is_empty() {
+            "unknown source tree {name:?}; available source trees: {}",
+            if source_trees.is_empty() {
                 "(none)".to_string()
             } else {
-                workspaces.keys().cloned().collect::<Vec<_>>().join(", ")
+                source_trees.keys().cloned().collect::<Vec<_>>().join(", ")
             }
         ));
     };
-    Ok(Some((name, workspace.commit.clone())))
+    Ok(Some((name, source_tree.commit.clone())))
 }
 
 fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
-    if !tools::is_inline(&call.name) || call.input.get("root").is_some() {
+    if !tools::is_inline(&call.name) {
         return None;
     }
     let key = if call.name == "ls" {
@@ -1115,15 +1168,15 @@ fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
     };
     let path = call
         .input
-        .get(key)?
-        .as_str()?
+        .get(key)
+        .and_then(Value::as_str)
+        .or_else(|| (call.name == "ls").then_some("."))?
         .trim()
         .trim_start_matches('/');
-    path.strip_prefix("files/")
-        .map(|relative| (key, relative.to_string()))
+    Some((key, path.to_string()))
 }
 
-fn materialize_workspace(
+fn materialize_source_tree(
     state: &mut progress::State,
     commit: &Oid,
 ) -> Result<(String, String), String> {
@@ -1131,15 +1184,15 @@ fn materialize_workspace(
     let mut memo = MATERIALIZED
         .get_or_init(Default::default)
         .lock()
-        .map_err(|_| "workspace materialization cache is poisoned".to_string())?;
+        .map_err(|_| "source tree materialization cache is poisoned".to_string())?;
     if let Some(paths) = memo.get(commit).cloned() {
         return Ok(paths);
     }
     state.fetch_object(commit)?;
     let tree = state.store().tree_of(commit)?;
-    let ws = fresh("workspace");
+    let ws = fresh("source_tree");
     caos(["get-hash", tree.as_str(), &ws])?;
-    let wc = fresh("workspace-commit");
+    let wc = fresh("source-tree-commit");
     caos(["get-hash", commit.as_str(), &wc])?;
     memo.insert(commit.clone(), (ws.clone(), wc.clone()));
     Ok((ws, wc))
@@ -1151,6 +1204,7 @@ enum Prepared {
     Task(Oid),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_compute(
     cfg: &Config,
     call: &Call,
@@ -1159,27 +1213,34 @@ fn prepare_compute(
     request: &Oid,
     round: &RoundState,
 ) -> Result<Prepared, String> {
-    let clean = call_without_workspace(call);
+    let clean = call_without_source_tree(call);
     match call.name.as_str() {
         "bash" => prepare_bash(cfg, &clean, ws),
-        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
-        "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
-        name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
-        name if githist::is_builtin(name) && cfg.tools_image.is_some() => {
-            prepare_githist(cfg, &clean, name, ws, wc)
-        }
-        name if !tools::is_inline(name) => {
-            let Some(tool) = tools::tree_tool(ws, name)? else {
-                return Err(format!(
-                    "model called unknown tool {name:?} (built-ins: bash, grep, read, ls, write, edit, merge, caos-build, caos-test, caos-test-result, spawn_agent, wait_agent, harvest_agent; plus this workspace's caos-tools/<name>/ tools)"
-                ));
+        "run_tool" => {
+            let Some(relative) = clean["input"]["path"].as_str() else {
+                return Ok(Prepared::Result(error_block(
+                    &call.id,
+                    "run_tool requires path",
+                )));
             };
-            match tools::tree_tool_args(&clean, &tool) {
+            let tool = match tools::tool_at(ws, relative) {
+                Ok(Some(tool)) => tool,
+                Ok(None) => {
+                    return Ok(Prepared::Result(error_block(
+                        &call.id,
+                        "path is not a tool",
+                    )))
+                }
+                Err(error) => return Ok(Prepared::Result(error_block(&call.id, &error))),
+            };
+            let nested = json!({"id":call.id, "input":clean["input"].get("arguments")
+                .cloned().unwrap_or_else(|| json!({}))});
+            match tools::tree_tool_args(&nested, &tool) {
                 Err(block) => Ok(Prepared::Result(block)),
                 Ok(bound) => {
                     launch_tree_evaluation(
-                        &clean,
-                        name,
+                        &nested,
+                        relative,
                         &bound,
                         tool.git,
                         ws,
@@ -1191,7 +1252,16 @@ fn prepare_compute(
                 }
             }
         }
-        name => Err(format!("model called unavailable tool {name:?}")),
+        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
+        "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
+        name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
+        name if githist::is_builtin(name) && cfg.tools_image.is_some() => {
+            prepare_githist(cfg, &clean, name, ws, wc)
+        }
+        name => Ok(Prepared::Result(error_block(
+            &call.id,
+            &format!("unavailable tool {name:?}; use run_tool with its conversation-relative path"),
+        ))),
     }
 }
 
@@ -1222,6 +1292,9 @@ fn prepare_bash(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     };
     let dir = scratch("toolin")?;
     link(ws, dir.join("tree"))?;
+    if let Some(cwd) = call["input"].get("cwd").and_then(Value::as_str) {
+        fs::write(dir.join("cwd"), cwd).map_err(|error| format!("writing cwd: {error}"))?;
+    }
     fs::write(dir.join("cmd"), cmd).map_err(|error| format!("writing cmd: {error}"))?;
     fs::write(dir.join("paths"), paths.join("\n"))
         .map_err(|error| format!("writing paths: {error}"))?;
@@ -1346,14 +1419,17 @@ fn launch_tree_evaluation(
         round,
         id,
         &[
-            ("current-tool", Arg::Lit(name)),
+            (
+                "current-tool",
+                Arg::Lit(call["name"].as_str().unwrap_or(name)),
+            ),
             ("ws", Arg::Path(ws)),
             ("tool-eval", Arg::Lit(name)),
             ("tool-args", Arg::Lit(&serialized)),
             ("tool-git", Arg::Lit(if git { "1" } else { "" })),
         ],
     )?;
-    let dispatched = eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me));
+    let dispatched = eval_then_catching(ws, name, Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {name}"));
     dispatched
 }
@@ -1365,7 +1441,6 @@ fn launch_evaluated_tool(
     request_head: &Oid,
     round: u64,
     id: &str,
-    name: &str,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
     let current = round_state(&state.conversation()?, &record)?;
@@ -1379,14 +1454,29 @@ fn launch_evaluated_tool(
         .cloned()
         .ok_or_else(|| format!("evaluated tool {id} is no longer pending"))?;
     let target = resolve_target(&state.conversation()?, &call)?;
-    let Target::Workspace {
-        name: workspace_name,
-        commit,
-    } = target
-    else {
-        return Err("tree tool unexpectedly targeted conversation files".to_string());
+    let source_tree_name = match target {
+        Target::SourceTree { name, .. } => Some(name),
+        Target::Files => None,
     };
-    let (ws, wc) = materialize_workspace(state, &commit)?;
+    let commit = Oid::parse(&cas_hash(&arg("wc"))?, "evaluated tool input commit")?;
+    let scoped = match &source_tree_name {
+        Some(name) => cfg.for_source_tree(&state.conversation()?, name)?,
+        None => cfg.clone(),
+    };
+    let (ws, wc) = materialize_source_tree(state, &commit)?;
+    let current_input = match &source_tree_name {
+        Some(name) => {
+            state
+                .conversation()?
+                .source_tree(name)?
+                .ok_or("tool source tree disappeared")?
+                .commit
+        }
+        None => state.head().clone(),
+    };
+    if current_input != commit {
+        return resume(cfg, state, request, request_head);
+    }
     let tool_tree = cas_hash(&arg("result"))?;
     let raw = read_arg("tool-args")?;
     let parsed: Value = serde_json::from_str(&raw)
@@ -1404,25 +1494,25 @@ fn launch_evaluated_tool(
         .collect();
     if git {
         args.push(("wc", Arg::Path(&wc)));
-        if let Some(refs) = cfg.merge_refs.as_deref() {
+        if let Some(refs) = scoped.merge_refs.as_deref() {
             args.push(("refs", Arg::Lit(refs)));
         }
     }
     let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
     let task_text = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(&ws))])?;
     let task = Oid::parse(&task_text, "tree tool task")?;
-    let started = ToolRecord {
+    let started = CallRecord {
         request: request.clone(),
         round,
         id: id.to_string(),
-        name: name.to_string(),
+        name: call.name.clone(),
         declaration_message: current.declaration_message,
-        workspace_name: Some(workspace_name),
-        input_workspace: Some(commit),
-        status: ToolStatus::Started,
+        source_tree_name,
+        input_commit: Some(commit),
+        status: CallStatus::Started,
         task: Some(task),
         result: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
         files: Vec::new(),
         files_outcome: None,
     };
@@ -1445,18 +1535,18 @@ fn dispatch_started(
     request: &Oid,
     round: u64,
     call: &Call,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(), String> {
     let commit = record
-        .input_workspace
+        .input_commit
         .as_ref()
-        .ok_or("compute tool.start has no input workspace")?;
-    let (ws, wc) = materialize_workspace(state, commit)?;
+        .ok_or("compute tool.start has no input source tree")?;
+    let (ws, wc) = materialize_source_tree(state, commit)?;
     let mut extras = vec![
         ("current-tool", Arg::Lit(call.name.as_str())),
         ("ws", Arg::Path(ws.as_str())),
     ];
-    let clean = call_without_workspace(call);
+    let clean = call_without_source_tree(call);
     let scope_storage;
     if call.name == "grep" {
         let (_, prefix) = tools::grep_precheck(&clean, &ws)
@@ -1478,10 +1568,10 @@ fn dispatch_wait_started(
     request: &Oid,
     round: u64,
     call: &Call,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(), String> {
-    if record.workspace_name.is_some() || record.input_workspace.is_some() {
-        return Err("wait_agent tool.start unexpectedly names a workspace".to_string());
+    if record.source_tree_name.is_some() || record.input_commit.is_some() {
+        return Err("wait_agent tool.start unexpectedly names a source tree".to_string());
     }
     let value = call.value();
     let child_id = subagents::required_string(&value, "child", subagents::WAIT_TOOL)?;
@@ -1509,7 +1599,7 @@ fn dispatch_wait_started(
 
 fn callback_result(
     state: &mut progress::State,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
         subagents::WAIT_TOOL => wait_callback_block(state, record),
@@ -1524,7 +1614,7 @@ fn callback_result(
             let proposal = Oid::parse(&cas_hash(&arg("result"))?, "merge result commit")?;
             state.fetch_object(&proposal)?;
             let tree = state.store().tree_of(&proposal)?;
-            let ws = fresh("merge-workspace");
+            let ws = fresh("merge-source-tree");
             caos(["get-hash", tree.as_str(), &ws])?;
             Ok((merge_result_block(&record.id, &ws)?, Some(proposal)))
         }
@@ -1537,10 +1627,10 @@ fn callback_result(
             caos(["get", &ws])?;
             let tree = Oid::parse(&cas_hash(&ws)?, "bash result tree")?;
             let base = record
-                .input_workspace
+                .input_commit
                 .as_ref()
-                .ok_or("bash record has no input workspace")?;
-            let proposal = mint_workspace_commit(state, &tree, base, "bash")?;
+                .ok_or("bash record has no input source tree")?;
+            let proposal = mint_source_tree_commit(state, &tree, base, "bash")?;
             Ok((block, Some(proposal)))
         }
         _ => Ok((
@@ -1550,7 +1640,7 @@ fn callback_result(
     }
 }
 
-fn mint_workspace_commit(
+fn mint_source_tree_commit(
     state: &mut progress::State,
     tree: &Oid,
     parent: &Oid,
@@ -1569,7 +1659,7 @@ fn mint_workspace_commit(
 
 fn complete_compute(
     state: &mut progress::State,
-    started: &ToolRecord,
+    started: &CallRecord,
     base_block: Value,
     proposal: Option<Oid>,
 ) -> Result<(), String> {
@@ -1586,6 +1676,9 @@ fn complete_compute(
         return Ok(());
     };
     state.publish_commit(&proposal)?;
+    if started.source_tree_name.is_none() {
+        return complete_files_compute(state, started, base_block, &proposal);
+    }
     for _ in 0..32 {
         state.reload()?;
         if state
@@ -1596,16 +1689,16 @@ fn complete_compute(
             return Ok(());
         }
         let current = started
-            .workspace_name
+            .source_tree_name
             .as_ref()
-            .map(|name| state.conversation()?.workspace(name))
+            .map(|name| state.conversation()?.source_tree(name))
             .transpose()?
             .flatten()
-            .map(|workspace| workspace.commit);
+            .map(|source_tree| source_tree.commit);
         let base = started
-            .input_workspace
+            .input_commit
             .as_ref()
-            .ok_or("proposal tool has no input workspace")?;
+            .ok_or("proposal tool has no input source tree")?;
         let signature = inherited_signature(state.store(), base)?;
         let resolution = reconcile(
             state.store_mut(),
@@ -1614,14 +1707,14 @@ fn complete_compute(
             current.as_ref(),
             &signature,
         )?;
-        if let WorkspaceResolution::Merged { output, .. } = &resolution {
+        if let SourceTreeResolution::Merged { output, .. } = &resolution {
             state.push_code(output)?;
         }
-        let block = if matches!(resolution, WorkspaceResolution::Conflict { .. }) {
+        let block = if matches!(resolution, SourceTreeResolution::Conflict { .. }) {
             error_block(
                 &started.id,
                 &format!(
-                    "workspace proposal for call {} conflicted with concurrent changes; the workspace is unchanged and proposal {} was retained",
+                    "source tree proposal for call {} conflicted with concurrent changes; the source tree is unchanged and proposal {} was retained",
                     started.id, proposal
                 ),
             )
@@ -1651,15 +1744,170 @@ fn complete_compute(
     ))
 }
 
+type FileEdits = Vec<(String, Option<(Mode, Vec<u8>)>)>;
+
+fn plan_file_changes<S: ObjectStore + CodeOps>(
+    store: &mut S,
+    changes: &[conversation_protocol::v3::tree::Change],
+    current_tree: &Oid,
+) -> Result<(FileEdits, Vec<String>), String> {
+    use conversation_protocol::v3::tree::Snapshot;
+    let mut files = Vec::new();
+    let mut conflicts = Vec::new();
+    for change in changes {
+        let current = Snapshot::new(store, current_tree.clone())
+            .entry(&change.path)
+            .map(|entry| entry.map(|e| (e.mode, e.oid)));
+        let current = match current {
+            Ok(current) => current,
+            Err(error) if error.starts_with("path ") && error.ends_with(" is a file") => {
+                conflicts.push(change.path.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if current == change.after {
+            continue;
+        }
+        let mut after = change.after.clone();
+        if current != change.before {
+            if let (
+                Some((Mode::Commit, before)),
+                Some((Mode::Commit, proposed)),
+                Some((Mode::Commit, current)),
+            ) = (&change.before, &after, &current)
+            {
+                let signature = inherited_signature(store, before)?;
+                let resolution = reconcile(store, before, proposed, Some(current), &signature)?;
+                match resolution.new_pointer() {
+                    Some(output) => {
+                        let output = output.clone();
+                        after = Some((Mode::Commit, output));
+                    }
+                    None if matches!(resolution, SourceTreeResolution::Conflict { .. }) => {
+                        conflicts.push(change.path.clone());
+                        continue;
+                    }
+                    None => continue,
+                }
+            } else {
+                conflicts.push(change.path.clone());
+                continue;
+            }
+        }
+        let value = after
+            .map(|(mode, oid)| {
+                let bytes = if matches!(mode, Mode::Commit | Mode::Tree) {
+                    oid.encode_line()
+                } else {
+                    store.read_blob(&oid).map_err(String::from)?
+                };
+                Ok::<_, String>((mode, bytes))
+            })
+            .transpose()?;
+        files.push((change.path.clone(), value));
+    }
+    // Apply the command atomically: a conflicting rename or edit must not
+    // leave half the shell operation installed.
+    if !conflicts.is_empty() {
+        files.clear();
+    }
+    Ok((files, conflicts))
+}
+
+fn complete_files_compute(
+    state: &mut progress::State,
+    started: &CallRecord,
+    block: Value,
+    proposal: &Oid,
+) -> Result<(), String> {
+    use conversation_protocol::v3::tree::diff;
+    let base = started
+        .input_commit
+        .as_ref()
+        .ok_or("tool has no input commit")?;
+    let base_tree = state.store().tree_of(base)?;
+    let proposed_tree = state.store().tree_of(proposal)?;
+    let changes = diff(state.store(), Some(&base_tree), &proposed_tree)?;
+    if changes
+        .iter()
+        .any(|c| c.path == ".caos" || c.path.starts_with(".caos/"))
+    {
+        return complete_started_failed(
+            state,
+            started,
+            &error_block(
+                &started.id,
+                ".caos is protocol metadata; the shell changes were not applied",
+            ),
+        );
+    }
+    for _ in 0..32 {
+        state.reload()?;
+        if state
+            .conversation()?
+            .tool(&started.request, started.round, &started.id)?
+            .is_some_and(|record| record.is_terminal())
+        {
+            return Ok(());
+        }
+        let current_tree = state.conversation()?.tree().clone();
+        let (files, conflicts) = plan_file_changes(state.store_mut(), &changes, &current_tree)?;
+        for (name, value) in &files {
+            if let Some((Mode::Commit, bytes)) = value {
+                let output = Oid::parse_line(bytes, "reconciled source tree")?;
+                if !changes
+                    .iter()
+                    .any(|c| c.path == *name && c.after == Some((Mode::Commit, output.clone())))
+                {
+                    state.push_code(&output)?;
+                }
+            }
+        }
+        let mut record = completed_record(
+            started,
+            ToolResult::Complete {
+                observation: observation_path(started),
+                proposal: Some(proposal.clone()),
+            },
+            None,
+        );
+        if started.task.is_none() {
+            record.input_commit = None;
+        }
+        record.files = files.iter().map(|(path, _)| path.clone()).collect();
+        record.files_outcome = Some(FilesOutcome {
+            applied: record.files.clone(),
+            conflicted: conflicts.clone(),
+        });
+        let observation = if conflicts.is_empty() {
+            block.clone()
+        } else {
+            error_block(&started.id, &format!(
+                "Concurrent changes conflict at {}. No shell changes were applied; proposal {proposal} was retained.",
+                conflicts.join(", ")))
+        };
+        let expected = state.head().clone();
+        match state.try_append_at(
+            &expected,
+            tool_complete_transition(record, &observation, files)?,
+        )? {
+            progress::TryAppend::Appended(_) => return Ok(()),
+            progress::TryAppend::HeadChanged(_) => continue,
+        }
+    }
+    Err("conversation kept changing while applying shell result".into())
+}
+
 fn completed_record(
-    started: &ToolRecord,
+    started: &CallRecord,
     result: ToolResult,
-    resolution: Option<WorkspaceResolution>,
-) -> ToolRecord {
-    ToolRecord {
-        status: ToolRecord::expected_status(&result, resolution.as_ref()),
+    resolution: Option<SourceTreeResolution>,
+) -> CallRecord {
+    CallRecord {
+        status: CallRecord::expected_status(&result, resolution.as_ref()),
         result: Some(result),
-        workspace_resolution: resolution,
+        source_tree_resolution: resolution,
         files: Vec::new(),
         files_outcome: None,
         ..started.clone()
@@ -1668,7 +1916,7 @@ fn completed_record(
 
 fn complete_started_failed(
     state: &mut progress::State,
-    started: &ToolRecord,
+    started: &CallRecord,
     block: &Value,
 ) -> Result<(), String> {
     let record = completed_record(
@@ -1697,16 +1945,16 @@ fn declaration_message(
     Ok(state.declaration_message)
 }
 
-fn observation_path(record: &ToolRecord) -> String {
+fn observation_path(record: &CallRecord) -> String {
     format!(
         "{}/observation.json",
-        paths::tool_payload_dir(record.request.as_str(), record.round, &record.id)
+        paths::call_payload_dir(record.request.as_str(), record.round, &record.id)
     )
 }
 
 #[allow(clippy::type_complexity)]
 fn tool_complete_transition(
-    record: ToolRecord,
+    record: CallRecord,
     block: &Value,
     files: Vec<(String, Option<(Mode, Vec<u8>)>)>,
 ) -> Result<Transition, String> {
@@ -1727,21 +1975,30 @@ fn execute_inline(
 ) -> Result<(), String> {
     let call = site.call;
     match target {
-        Target::Workspace { name, commit } => {
-            let (ws, _) = materialize_workspace(state, &commit)?;
-            let clean = call_without_workspace(call);
+        Target::SourceTree { name, commit } => {
+            let (ws, _) = materialize_source_tree(state, &commit)?;
+            let mut clean = call_without_source_tree(call);
+            if call.input.get("source_tree").is_none() {
+                if let Some((key, path)) = inline_files_path(call) {
+                    if path == name {
+                        clean["input"][key] = json!(".");
+                    } else if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
+                        clean["input"][key] = json!(relative);
+                    }
+                }
+            }
             let (block, new_ws) = tools::execute(&clean, &ws)?;
             let (proposal, resolution) = match new_ws {
                 None => (None, None),
                 Some(new_ws) => {
                     let tree = Oid::parse(&cas_hash(&new_ws)?, "inline result tree")?;
-                    let proposal = mint_workspace_commit(state, &tree, &commit, &call.name)?;
+                    let proposal = mint_source_tree_commit(state, &tree, &commit, &call.name)?;
                     // Inline mutation already published this tree through the
                     // `caos put` in tools::rebuild.
                     state.publish_commit(&proposal)?;
                     (
                         Some(proposal.clone()),
-                        Some(WorkspaceResolution::Direct {
+                        Some(SourceTreeResolution::Direct {
                             current: commit.clone(),
                             output: proposal,
                         }),
@@ -1751,57 +2008,48 @@ fn execute_inline(
             site.complete(state, block, Some((name, commit)), proposal, resolution)?;
         }
         Target::Files => {
-            let (key, relative) =
-                inline_files_path(call).ok_or("conversation-file call has no files/ path")?;
+            let file_path = inline_files_path(call);
+            let (key, relative) = file_path.clone().unwrap_or(("file-path", String::new()));
+            if matches!(call.name.as_str(), "write" | "edit")
+                && (relative == ".caos" || relative.starts_with(".caos/"))
+            {
+                return site.fail(
+                    state,
+                    ".caos is protocol metadata; use conversation commands to change it",
+                );
+            }
             let root = materialize_files(state)?;
-            let mut clean = call_without_workspace(call);
-            clean["input"][key] = Value::String(relative.clone());
+            let mut clean = call_without_source_tree(call);
+            if file_path.is_some() {
+                clean["input"][key] = Value::String(relative.clone());
+            }
             let (block, new_root) = tools::execute(&clean, &root)?;
-            let (files, outcome) = match new_root {
-                None => (Vec::new(), None),
-                Some(root) => {
-                    let file = materialize_relative(&root, &relative)?;
-                    let bytes = fs::read(&file)
-                        .map_err(|error| format!("reading {}: {error}", file.display()))?;
-                    let mode = fs::metadata(&file)
-                        .map_err(|error| format!("stat {}: {error}", file.display()))?
-                        .permissions()
-                        .mode();
-                    let mode = if mode & 0o111 != 0 {
-                        Mode::Executable
-                    } else {
-                        Mode::Blob
-                    };
-                    (
-                        vec![(relative.clone(), Some((mode, bytes)))],
-                        Some(FilesOutcome {
-                            applied: vec![relative.clone()],
-                            conflicted: Vec::new(),
-                        }),
-                    )
-                }
-            };
-            let stub = site.stub(None);
-            let result = ToolResult::Complete {
-                observation: observation_path(&stub),
-                proposal: None,
-            };
-            let mut record = completed_record(&stub, result, None);
-            record.files = files.iter().map(|(path, _)| path.clone()).collect();
-            record.files_outcome = outcome;
-            let transition = tool_complete_transition(record, &block, files)?;
-            state.append(transition)?;
+            let mut stub = site.stub(None);
+            if let Some(root) = new_root {
+                let base = state.head().clone();
+                stub.input_commit = Some(base.clone());
+                let tree = Oid::parse(&cas_hash(&root)?, "inline result tree")?;
+                let proposal = mint_source_tree_commit(state, &tree, &base, &call.name)?;
+                state.publish_commit(&proposal)?;
+                complete_files_compute(state, &stub, block, &proposal)?;
+            } else {
+                let record = completed_record(
+                    &stub,
+                    ToolResult::Complete {
+                        observation: observation_path(&stub),
+                        proposal: None,
+                    },
+                    None,
+                );
+                state.append(tool_complete_transition(record, &block, Vec::new())?)?;
+            }
         }
     }
     Ok(())
 }
 
 fn materialize_files(state: &mut progress::State) -> Result<String, String> {
-    let files = state
-        .conversation()?
-        .snapshot()
-        .entry(paths::FILES_DIR)?
-        .map(|entry| entry.oid);
+    let files = Some(state.conversation()?.tree().clone());
     let output = fresh("conversation-files");
     match files {
         Some(tree) => caos(["get-hash", tree.as_str(), &output])?,
@@ -1813,20 +2061,10 @@ fn materialize_files(state: &mut progress::State) -> Result<String, String> {
     Ok(output)
 }
 
-fn materialize_relative(root: &str, relative: &str) -> Result<std::path::PathBuf, String> {
-    let mut current = std::path::PathBuf::from(root);
-    for component in relative.split('/') {
-        let _ = caos(["get", path(&current)]);
-        current.push(component);
-    }
-    caos(["get", path(&current)])?;
-    Ok(current)
-}
-
-fn call_without_workspace(call: &Call) -> Value {
+fn call_without_source_tree(call: &Call) -> Value {
     let mut input = call.input.clone();
     if let Some(object) = input.as_object_mut() {
-        object.remove("workspace");
+        object.remove("source_tree");
     }
     json!({"type":"tool_use", "id":call.id, "name":call.name, "input":input})
 }
@@ -1846,8 +2084,14 @@ fn spawn_agent_call(
         }
     };
     let value = call.value();
-    let requested_workspace = subagents::optional_string(&value, "workspace");
-    let target = match workspace_target(&state.conversation()?, requested_workspace) {
+    let requested_source_tree = subagents::optional_string(&value, "source_tree");
+    let target = match if requested_source_tree.is_none()
+        && state.conversation()?.source_tree_names()?.len() > 1
+    {
+        Ok(None)
+    } else {
+        source_tree_target(&state.conversation()?, requested_source_tree)
+    } {
         Ok(target) => target,
         Err(error) => {
             site.fail(state, &error)?;
@@ -1862,16 +2106,24 @@ fn spawn_agent_call(
     let parent_view = state.conversation()?;
     let parent_id = parent_view.identity()?.id;
     let actor = newest_user_actor(&parent_view)?;
+
     let prompt_path = tool_arguments_path(&parent_view, request, site.round, &call.id)?;
     drop(parent_view);
     let child_id = ids::child_id(&parent_id, request, site.round, &call.id)?;
     let signature = inherited_signature(state.store(), &parent_head)?;
     let genesis = conversation_protocol::v3::oid::ensure_genesis(state.store_mut())?;
-    let workspaces = target
-        .clone()
-        .into_iter()
-        .map(|(name, commit)| (name, (commit, None)))
-        .collect::<BTreeMap<_, _>>();
+    let mut seed = conversation_protocol::v3::tree::TreeBuilder::from(Some(
+        state.conversation()?.tree().clone(),
+    ));
+    seed.delete(".caos");
+    if let Some(selected) = requested_source_tree {
+        for name in state.conversation()?.source_tree_names()? {
+            if name != selected {
+                seed.delete(&name);
+            }
+        }
+    }
+    let files_seed = seed.build(state.store_mut())?;
     let root_transition = Transition::ConversationRoot {
         identity: Identity {
             id: child_id.clone(),
@@ -1885,10 +2137,10 @@ fn spawn_agent_call(
             }),
         },
         title: subagents::agent_title(&prompt),
-        workspaces,
-        files_seed: None,
+        source_trees: BTreeMap::new(),
+        files_seed: Some(files_seed.clone()),
     };
-    let root_tree = apply(state.store_mut(), None, &root_transition)?.tree;
+    let root_tree = apply(state.store_mut(), None, &root_transition)?;
     let root = mint(
         state.store_mut(),
         &genesis,
@@ -1910,7 +2162,7 @@ fn spawn_agent_call(
                 text: prompt.clone(),
             }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         },
         payloads: Vec::new(),
     };
@@ -1918,18 +2170,18 @@ fn spawn_agent_call(
     state.push_code(&prompt_head)?;
     let (configuration, child_request) =
         subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
-    let request_workspaces = state.conversation_at(&prompt_head)?.workspaces_tree()?;
-    let admit = Transition::RequestAdmit {
-        record: RequestRecord {
+
+    let admit = Transition::TurnAdmit {
+        record: TurnRecord {
             id: child_request.clone(),
             request_head: prompt_head.clone(),
-            request_workspaces,
+
             model: cfg.model.clone(),
             configuration: configuration.to_string(),
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
@@ -1944,7 +2196,8 @@ fn spawn_agent_call(
         run_and_update_ref_image,
     )?;
     let observation = subagents::spawn_observation(&child_id, &initial_head, &child_request);
-    let stub = site.stub(target.clone());
+    let mut stub = site.stub(target.clone());
+    stub.task = Some(relay.clone());
     let tool = completed_record(
         &stub,
         ToolResult::Complete {
@@ -1956,24 +2209,24 @@ fn spawn_agent_call(
     let child = ChildRecord {
         id: child_id.clone(),
         initial_head: initial_head.clone(),
-        initial_workspace: target.as_ref().map(|(_, commit)| commit.clone()),
+        initial_source_tree: target.as_ref().map(|(_, commit)| commit.clone()),
         request: child_request.clone(),
         relay: relay.clone(),
         spawn_intent: SpawnIntent {
             request: request.clone(),
             round: site.round,
             tool: call.id.clone(),
-            workspace_name: target.as_ref().map(|(name, _)| name.clone()),
-            input_workspace: target.as_ref().map(|(_, commit)| commit.clone()),
+            source_tree_name: target.as_ref().map(|(name, _)| name.clone()),
+            input_commit: target.as_ref().map(|(_, commit)| commit.clone()),
             prompt: prompt_path,
             model: cfg.model.clone(),
             configuration: configuration.to_string(),
-            files_seed: None,
+            files_seed: Some(files_seed),
         },
-        status: ChildStatus::Running,
+        status: TaskStatus::Pending,
         applications: Vec::new(),
         terminal_head: None,
-        child_workspaces: None,
+        child_source_trees: None,
     };
     let transition = Transition::SubagentSpawn {
         tool,
@@ -2004,12 +2257,7 @@ fn mint_detached(
     transition: &Transition,
     signature: &conversation_protocol::v3::Signature,
 ) -> Result<Oid, String> {
-    let parent_tree = state
-        .store()
-        .read_commit(parent)
-        .map_err(String::from)?
-        .tree;
-    let tree = apply(state.store_mut(), Some(&parent_tree), transition)?.tree;
+    let tree = apply(state.store_mut(), Some(parent), transition)?;
     mint(
         state.store_mut(),
         parent,
@@ -2065,18 +2313,18 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
         return Ok(true);
     };
     validate_child_relay(state, &child)?;
-    let started = ToolRecord {
+    let started = CallRecord {
         request: site.request.clone(),
         round: site.round,
         id: call.id.clone(),
         name: call.name.clone(),
         declaration_message: site.declaration.to_string(),
-        workspace_name: None,
-        input_workspace: None,
-        status: ToolStatus::Started,
+        source_tree_name: None,
+        input_commit: None,
+        status: CallStatus::Started,
         task: Some(child.relay.clone()),
         result: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
         files: Vec::new(),
         files_outcome: None,
     };
@@ -2108,7 +2356,7 @@ fn validate_child_relay(state: &progress::State, child: &ChildRecord) -> Result<
 
 fn wait_callback_block(
     state: &mut progress::State,
-    record: &ToolRecord,
+    record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     let relay = record
         .task
@@ -2125,7 +2373,7 @@ fn wait_callback_block(
         .conversation()?
         .child(&child_id)?
         .ok_or_else(|| format!("subagent {child_id} disappeared"))?;
-    if child.status == ChildStatus::Running {
+    if child.status == TaskStatus::Pending {
         return Ok((
             error_block(
                 &record.id,
@@ -2138,19 +2386,19 @@ fn wait_callback_block(
         .terminal_head
         .as_ref()
         .ok_or_else(|| format!("terminal subagent {child_id} has no terminal_head"))?;
-    let workspaces = child
-        .child_workspaces
+    let source_trees = child
+        .child_source_trees
         .as_ref()
-        .ok_or_else(|| format!("terminal subagent {child_id} has no child_workspaces"))?
+        .ok_or_else(|| format!("terminal subagent {child_id} has no child_source_trees"))?
         .iter()
-        .map(|(name, workspace)| (name.clone(), Value::String(workspace.commit.to_string())))
+        .map(|(name, source_tree)| (name.clone(), Value::String(source_tree.commit.to_string())))
         .collect::<serde_json::Map<_, _>>();
     Ok((
         json!({
             "child": child_id,
             "status": child_status_text(child.status),
             "terminal_head": terminal_head.as_str(),
-            "workspaces": Value::Object(workspaces),
+            "source_trees": Value::Object(source_trees),
         }),
         None,
     ))
@@ -2176,42 +2424,42 @@ fn harvest_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         let Some(child) = state.conversation()?.child(&child_id)? else {
             return site.fail(state, &format!("unknown subagent {child_id}"));
         };
-        if child.status == ChildStatus::Running {
+        if child.status == TaskStatus::Pending {
             return site.fail(state, &format!("subagent {child_id} is still running"));
         }
-        let child_workspace = subagents::optional_string(&call.value(), "child_workspace")
+        let child_source_tree = subagents::optional_string(&call.value(), "child_source_tree")
             .map(str::to_string)
-            .or_else(|| child.spawn_intent.workspace_name.clone());
-        let Some(child_workspace) = child_workspace else {
+            .or_else(|| child.spawn_intent.source_tree_name.clone());
+        let Some(child_source_tree) = child_source_tree else {
             return site.fail(
                 state,
-                "harvest_agent needs `child_workspace` because this child was seeded without one",
+                "harvest_agent needs `child_source_tree` because this child was seeded without one",
             );
         };
         let child_state = child
-            .child_workspaces
+            .child_source_trees
             .as_ref()
-            .and_then(|workspaces| workspaces.get(&child_workspace))
+            .and_then(|source_trees| source_trees.get(&child_source_tree))
             .cloned();
         let Some(child_state) = child_state else {
             return site.fail(
                 state,
-                &format!("subagent {child_id} has no workspace {child_workspace:?}"),
+                &format!("subagent {child_id} has no source tree {child_source_tree:?}"),
             );
         };
-        let parent_workspace = match workspace_target(
+        let parent_source_tree = match source_tree_target(
             &state.conversation()?,
-            subagents::optional_string(&call.value(), "workspace"),
+            subagents::optional_string(&call.value(), "source_tree"),
         ) {
-            Ok(Some(workspace)) => workspace,
-            Ok(None) => return site.fail(state, "this conversation has no workspace"),
+            Ok(Some(source_tree)) => source_tree,
+            Ok(None) => return site.fail(state, "this conversation has no source tree"),
             Err(error) => return site.fail(state, &error),
         };
         if let Some(application) = recover_harvest_application(
             state,
             &child_id,
-            &child_workspace,
-            &parent_workspace.0,
+            &child_source_tree,
+            &parent_source_tree.0,
             site.declaration,
         )? {
             return complete_harvest(state, site, &child_state.commit, &application);
@@ -2220,26 +2468,26 @@ fn harvest_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         for oid in [
             &child_state.initial,
             &child_state.commit,
-            &parent_workspace.1,
+            &parent_source_tree.1,
         ] {
             state.fetch_object(oid)?;
         }
-        let signature = inherited_signature(state.store(), &parent_workspace.1)?;
+        let signature = inherited_signature(state.store(), &parent_source_tree.1)?;
         let resolution = reconcile(
             state.store_mut(),
             &child_state.initial,
             &child_state.commit,
-            Some(&parent_workspace.1),
+            Some(&parent_source_tree.1),
             &signature,
         )?;
-        if let WorkspaceResolution::Merged { output, .. } = &resolution {
+        if let SourceTreeResolution::Merged { output, .. } = &resolution {
             state.push_code(output)?;
         }
         let application = Application {
-            parent_workspace_name: parent_workspace.0,
-            parent_workspace: Some(parent_workspace.1),
-            child_workspace,
-            workspace_resolution: resolution,
+            parent_source_tree_name: parent_source_tree.0,
+            parent_source_tree: Some(parent_source_tree.1),
+            child_source_tree,
+            source_tree_resolution: resolution,
         };
         let expected = state.head().clone();
         match state.try_append_at(
@@ -2255,48 +2503,48 @@ fn harvest_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             }
         }
     }
-    Err("conversation kept changing while applying a subagent workspace".to_string())
+    Err("conversation kept changing while applying a subagent source tree".to_string())
 }
 
 fn complete_harvest(
     state: &mut progress::State,
     site: &CallSite<'_>,
-    child_workspace: &Oid,
+    child_source_tree: &Oid,
     application: &Application,
 ) -> Result<(), String> {
     let conflict = matches!(
-        application.workspace_resolution,
-        WorkspaceResolution::Conflict { .. }
+        application.source_tree_resolution,
+        SourceTreeResolution::Conflict { .. }
     );
     let target = conflict.then(|| {
         (
-            application.parent_workspace_name.clone(),
+            application.parent_source_tree_name.clone(),
             application
-                .parent_workspace
+                .parent_source_tree
                 .clone()
-                .expect("subagent applications always name a parent workspace"),
+                .expect("subagent applications always name a parent source tree"),
         )
     });
     site.complete(
         state,
-        application.workspace_resolution.to_value(),
+        application.source_tree_resolution.to_value(),
         target,
-        conflict.then(|| child_workspace.clone()),
-        conflict.then(|| application.workspace_resolution.clone()),
+        conflict.then(|| child_source_tree.clone()),
+        conflict.then(|| application.source_tree_resolution.clone()),
     )
 }
 
 fn recover_harvest_application(
     state: &progress::State,
     child: &str,
-    child_workspace: &str,
-    parent_workspace: &str,
+    child_source_tree: &str,
+    parent_source_tree: &str,
     declaration_message: &str,
 ) -> Result<Option<Application>, String> {
     let current_pointer = state
         .conversation()?
-        .workspace(parent_workspace)?
-        .ok_or_else(|| format!("workspace {parent_workspace:?} disappeared"))?
+        .source_tree(parent_source_tree)?
+        .ok_or_else(|| format!("source tree {parent_source_tree:?} disappeared"))?
         .commit;
     let mut current = state.head().clone();
     for _ in 0..MAX_SPINE_WALK {
@@ -2317,12 +2565,15 @@ fn recover_harvest_application(
                         .starts_with(&before_record.applications)
                 {
                     let application = after_record.applications.last().unwrap();
-                    let visible = application.workspace_resolution.new_pointer().map_or_else(
-                        || application.parent_workspace.as_ref() == Some(&current_pointer),
-                        |output| output == &current_pointer,
-                    );
-                    if application.child_workspace == child_workspace
-                        && application.parent_workspace_name == parent_workspace
+                    let visible = application
+                        .source_tree_resolution
+                        .new_pointer()
+                        .map_or_else(
+                            || application.parent_source_tree.as_ref() == Some(&current_pointer),
+                            |output| output == &current_pointer,
+                        );
+                    if application.child_source_tree == child_source_tree
+                        && application.parent_source_tree_name == parent_source_tree
                         && visible
                     {
                         return Ok(Some(application.clone()));
@@ -2382,7 +2633,7 @@ fn run_async_call(
         state.append(Transition::AsyncStart {
             record: AsyncRecord {
                 task: task.clone(),
-                status: AsyncStatus::Pending,
+                status: TaskStatus::Pending,
                 target_ref: Some(state.refname().to_string()),
                 result: None,
                 reason: None,
@@ -2400,7 +2651,7 @@ fn run_async_call(
             state.refname()
         ));
     }
-    if record.status == AsyncStatus::Pending {
+    if record.status == TaskStatus::Pending {
         let dispatched = async_work::dispatch(&task);
         timing::phase("tool dispatch run_async");
         if let Err(error) = dispatched {
@@ -2411,7 +2662,12 @@ fn run_async_call(
     }
     let (status, result) = async_status(&record);
     let block = async_work::result_block(&call.id, &task, status, result.as_deref());
-    site.complete(state, block, None, None, None)
+    site.finish(state, &block, None, None, Some(task), |stub| {
+        ToolResult::Complete {
+            observation: observation_path(stub),
+            proposal: None,
+        }
+    })
 }
 
 fn async_request_error(request: &str) -> Result<Option<String>, String> {
@@ -2443,80 +2699,57 @@ fn async_request_error(request: &str) -> Result<Option<String>, String> {
 
 fn async_status(record: &AsyncRecord) -> (&'static str, Option<String>) {
     match record.status {
-        AsyncStatus::Pending => ("pending", None),
-        AsyncStatus::Complete => ("complete", record.result.as_ref().map(ToString::to_string)),
-        AsyncStatus::Failed => ("failed", record.result.as_ref().map(ToString::to_string)),
-        AsyncStatus::Cancelled => ("cancelled", None),
+        TaskStatus::Pending => ("pending", None),
+        TaskStatus::Complete => ("complete", record.result.as_ref().map(ToString::to_string)),
+        TaskStatus::Failed => ("failed", record.result.as_ref().map(ToString::to_string)),
+        TaskStatus::Cancelled => ("cancelled", None),
     }
-}
-
-fn reconcile_async_tasks(state: &mut progress::State) -> Result<(), String> {
-    let tasks = state.conversation()?.async_tasks()?;
-    for task in tasks {
-        if task.status != AsyncStatus::Pending
-            || task.target_ref.as_deref() != Some(state.refname())
-        {
-            continue;
-        }
-        let (_, target) = async_work::task_request(&task.task)?;
-        if target != state.refname() {
-            return Err(format!(
-                "async task {} targets {target}, not {}",
-                task.task,
-                state.refname()
-            ));
-        }
-        let dispatched = async_work::dispatch(&task.task);
-        timing::phase("tool dispatch run_async recovery");
-        if let Err(error) = dispatched {
-            eprintln!(
-                "llm-step: could not re-admit async task {} (pending): {error}",
-                task.task
-            );
-        }
-    }
-    Ok(())
-}
-
-fn reconcile_subagents(state: &mut progress::State) -> Result<(), String> {
-    for child in state.conversation()?.children()? {
-        if child.status != ChildStatus::Running {
-            continue;
-        }
-        validate_child_relay(state, &child)?;
-        let dispatched = subagents::dispatch(&child.relay);
-        timing::phase("tool dispatch spawn_agent recovery");
-        if let Err(error) = dispatched {
-            eprintln!(
-                "llm-step: could not re-admit subagent {} relay {} (running): {error}",
-                child.id, child.relay
-            );
-        }
-    }
-    Ok(())
 }
 
 fn reconcile_background_tasks(state: &mut progress::State) -> Result<(), String> {
-    reconcile_async_tasks(state)?;
-    reconcile_subagents(state)
+    use conversation_protocol::v3::TaskRecord;
+    for task in state
+        .conversation()?
+        .tasks()?
+        .into_iter()
+        .filter(|task| task.is_pending())
+    {
+        match &task {
+            TaskRecord::Computation(task) => {
+                if task.target_ref.as_deref() != Some(state.refname()) {
+                    continue;
+                }
+                let (_, target) = async_work::task_request(&task.task)?;
+                if target != state.refname() {
+                    return Err(format!(
+                        "task {} targets {target}, not {}",
+                        task.task,
+                        state.refname()
+                    ));
+                }
+            }
+            TaskRecord::Conversation(child) => validate_child_relay(state, child)?,
+        }
+        if let Err(error) = async_work::dispatch(task.computation()) {
+            eprintln!(
+                "llm-step: could not re-admit task {} (pending): {error}",
+                task.computation()
+            );
+        }
+        timing::phase("background task recovery");
+    }
+    Ok(())
 }
 
 fn announce_background_tasks(
     conversation_id: &str,
     state: &mut progress::State,
 ) -> Result<(), String> {
-    announce(conversation_id, state, pending_async_notices)?;
-    announce(conversation_id, state, pending_subagent_notices)
-}
-
-fn announce(
-    conversation_id: &str,
-    state: &mut progress::State,
-    pending: impl Fn(&str, &Conversation<'_>) -> Result<Vec<TranscriptEntry>, String>,
-) -> Result<(), String> {
     loop {
         let view = state.conversation()?;
-        let notice = pending(conversation_id, &view)?.into_iter().next();
+        let notice = pending_task_notices(conversation_id, &view)?
+            .into_iter()
+            .next();
         drop(view);
         let Some(entry) = notice else {
             return Ok(());
@@ -2539,18 +2772,19 @@ fn background_notice(conversation_id: &str, message_id: String, text: String) ->
         model: None,
         blocks: vec![Block::Text { text }],
         proposal: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
     }
 }
 
-fn pending_async_notices(
+fn pending_task_notices(
     conversation_id: &str,
     view: &Conversation<'_>,
 ) -> Result<Vec<TranscriptEntry>, String> {
+    use conversation_protocol::v3::TaskRecord;
     let tasks = view
-        .async_tasks()?
+        .tasks()?
         .into_iter()
-        .filter(|task| matches!(task.status, AsyncStatus::Complete | AsyncStatus::Failed))
+        .filter(|task| !task.is_pending())
         .collect::<Vec<_>>();
     if tasks.is_empty() {
         return Ok(Vec::new());
@@ -2562,76 +2796,52 @@ fn pending_async_notices(
         .collect();
     let mut notices = Vec::new();
     for task in tasks {
-        let message_id = ids::protocol_id("async-notice", &json!({"task":task.task.as_str()}))?;
-        if existing.contains(&message_id) {
-            continue;
+        // Keep notice identities stable when reading historical records.
+        let (message_id, text) = match task {
+            TaskRecord::Computation(task) => {
+                let id = ids::protocol_id("async-notice", &json!({"task":task.task.as_str()}))?;
+                let (status, result) = async_status(&task);
+                (
+                    id,
+                    format!(
+                        "Independent task {} is {status}. Its result is {}.",
+                        task.task,
+                        result.unwrap_or_else(|| "null".into())
+                    ),
+                )
+            }
+            TaskRecord::Conversation(child) => {
+                let terminal = child
+                    .terminal_head
+                    .as_ref()
+                    .ok_or("terminal child has no head")?;
+                let id = ids::protocol_id(
+                    "subagent-notice",
+                    &json!({"child":child.id.as_str(),"terminal_head":terminal.as_str()}),
+                )?;
+                (
+                    id,
+                    format!(
+                        "Subagent {} is {}. Its result is {terminal}.",
+                        child.id,
+                        child_status_text(child.status)
+                    ),
+                )
+            }
+        };
+        if !existing.contains(&message_id) {
+            notices.push(background_notice(conversation_id, message_id, text));
         }
-        let (status, result) = async_status(&task);
-        let result = result.unwrap_or_else(|| "null".to_string());
-        notices.push(background_notice(
-            conversation_id,
-            message_id,
-            format!(
-                "Independent task {} is {status}. Its result is {result}.",
-                task.task
-            ),
-        ));
     }
     Ok(notices)
 }
 
-fn pending_subagent_notices(
-    conversation_id: &str,
-    view: &Conversation<'_>,
-) -> Result<Vec<TranscriptEntry>, String> {
-    let children = view
-        .children()?
-        .into_iter()
-        .filter(|child| child.status != ChildStatus::Running)
-        .collect::<Vec<_>>();
-    if children.is_empty() {
-        return Ok(Vec::new());
-    }
-    let existing: HashSet<String> = view
-        .transcript(0, view.transcript_len()?)?
-        .into_iter()
-        .map(|(_, _, entry)| entry.message_id)
-        .collect();
-    let mut notices = Vec::new();
-    for child in children {
-        let terminal_head = child
-            .terminal_head
-            .as_ref()
-            .ok_or_else(|| format!("terminal subagent {} has no terminal head", child.id))?;
-        let message_id = ids::protocol_id(
-            "subagent-notice",
-            &json!({
-                "child": child.id.as_str(),
-                "terminal_head": terminal_head.as_str(),
-            }),
-        )?;
-        if existing.contains(&message_id) {
-            continue;
-        }
-        notices.push(background_notice(
-            conversation_id,
-            message_id,
-            format!(
-                "Subagent {} is {}. Its result is {terminal_head}.",
-                child.id,
-                child_status_text(child.status)
-            ),
-        ));
-    }
-    Ok(notices)
-}
-
-fn child_status_text(status: ChildStatus) -> &'static str {
+fn child_status_text(status: TaskStatus) -> &'static str {
     match status {
-        ChildStatus::Running => "running",
-        ChildStatus::Completed => "completed",
-        ChildStatus::Failed => "failed",
-        ChildStatus::Cancelled => "cancelled",
+        TaskStatus::Pending => "running",
+        TaskStatus::Complete => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
     }
 }
 
@@ -2639,15 +2849,15 @@ fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
     loop {
         state.reload()?;
         let record = require_request(&state.conversation()?, request)?;
-        if matches!(record.status, RequestStatus::Idle | RequestStatus::Failed) {
+        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
             return finish_from_terminal(state, request);
         }
         let round = round_state(&state.conversation()?, &record)?;
         let Some(call) = round.pending.first() else {
             let result = newest_assistant_path(&state.conversation()?, request)?;
-            let terminal = state.append(Transition::RequestTerminal {
+            let terminal = state.append(Transition::TurnTerminal {
                 request: request.clone(),
-                outcome: RequestOutcome::Idle {
+                outcome: TurnOutcome::Idle {
                     result,
                     interrupted: true,
                 },
@@ -2680,17 +2890,14 @@ fn record_failure(
 ) -> Result<(), String> {
     loop {
         state.reload()?;
-        let Some(record) = state.conversation()?.request(request)? else {
+        let Some(record) = state.conversation()?.turn(request)? else {
             return Ok(());
         };
-        if matches!(record.status, RequestStatus::Idle | RequestStatus::Failed) {
+        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
             reconcile_background_tasks(state)?;
             return Ok(());
         }
-        if !matches!(
-            record.status,
-            RequestStatus::Running | RequestStatus::Cancelling
-        ) {
+        if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
             return Ok(());
         }
         let round = round_state(&state.conversation()?, &record)?;
@@ -2718,16 +2925,16 @@ fn record_failure(
                     text: error.to_string(),
                 }],
                 proposal: None,
-                workspace_resolution: None,
+                source_tree_resolution: None,
             },
             payloads: Vec::new(),
         })?;
         let ordinal = appended
             .ordinal
             .ok_or("failure message did not append a transcript entry")?;
-        state.append(Transition::RequestTerminal {
+        state.append(Transition::TurnTerminal {
             request: request.clone(),
-            outcome: RequestOutcome::Failed {
+            outcome: TurnOutcome::Failed {
                 error: paths::transcript_entry_path(ordinal, &message_id),
             },
         })?;
@@ -2740,8 +2947,8 @@ fn finish_from_terminal(state: &mut progress::State, request: &Oid) -> Result<()
     let terminal = terminal_head(state, request)?;
     let outcome = require_request(&state.conversation_at(&terminal)?, request)?.outcome;
     let failure = match outcome {
-        Some(RequestOutcome::Idle { .. }) => None,
-        Some(RequestOutcome::Failed { error }) => {
+        Some(TurnOutcome::Idle { .. }) => None,
+        Some(TurnOutcome::Failed { error }) => {
             let view = state.conversation_at(&terminal)?;
             let (ordinal, message_id) = paths::parse_transcript_entry_path(&error)?;
             let (_, entry) = view
@@ -2785,17 +2992,17 @@ fn terminal_head(state: &progress::State, request: &Oid) -> Result<Oid, String> 
 
 fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Result<Oid, String> {
     let mut current = head.clone();
-    let mut child = Conversation::open(store, &current)?.request(request)?;
+    let mut child = Conversation::open(store, &current)?.turn(request)?;
     for _ in 0..MAX_SPINE_WALK {
         let info = store.read_commit(&current).map_err(String::from)?;
         let Some(parent) = info.parents.first() else {
             break;
         };
-        let parent_record = Conversation::open(store, parent)?.request(request)?;
+        let parent_record = Conversation::open(store, parent)?.turn(request)?;
         let became_terminal = child.as_ref().is_some_and(|record| {
-            matches!(record.status, RequestStatus::Idle | RequestStatus::Failed)
+            matches!(record.status, TurnStatus::Idle | TurnStatus::Failed)
                 && !parent_record.as_ref().is_some_and(|parent| {
-                    matches!(parent.status, RequestStatus::Idle | RequestStatus::Failed)
+                    matches!(parent.status, TurnStatus::Idle | TurnStatus::Failed)
                 })
         });
         if became_terminal {
@@ -2808,77 +3015,76 @@ fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Resul
 }
 
 fn forward_result(state: &mut progress::State, terminal: &Oid) -> Result<(), String> {
-    let workspaces = state.conversation_at(terminal)?.workspaces()?;
+    let source_trees = state.conversation_at(terminal)?.source_trees()?;
     let dir = scratch("llm-step-result")?;
     let conversation_path = fresh("terminal-conversation");
     caos(["get-hash", terminal.as_str(), &conversation_path])?;
     link(&conversation_path, dir.join("conversation"))?;
-    if !workspaces.is_empty() {
-        let workspace_dir = dir.join("workspaces");
-        fs::create_dir(&workspace_dir)
-            .map_err(|error| format!("creating {}: {error}", workspace_dir.display()))?;
-        for (name, workspace) in workspaces {
-            let commit_path = fresh("terminal-workspace");
-            caos(["get-hash", workspace.commit.as_str(), &commit_path])?;
-            link(&commit_path, workspace_dir.join(name))?;
+    if !source_trees.is_empty() {
+        let source_tree_dir = dir.join("source_trees");
+        fs::create_dir(&source_tree_dir)
+            .map_err(|error| format!("creating {}: {error}", source_tree_dir.display()))?;
+        for (name, source_tree) in source_trees {
+            let commit_path = fresh("terminal-source-tree");
+            caos(["get-hash", source_tree.commit.as_str(), &commit_path])?;
+            link(&commit_path, source_tree_dir.join(name))?;
         }
     }
     caos(["put", path(&dir), "/cas/out"])
 }
 
-fn workspace_paths(state: &mut progress::State) -> Result<Vec<String>, String> {
-    let workspaces = state.conversation()?.workspaces()?;
-    let mut paths = Vec::with_capacity(workspaces.len());
-    for workspace in workspaces.values() {
-        paths.push(materialize_workspace(state, &workspace.commit)?.0);
+fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String> {
+    let source_trees = state.conversation()?.source_trees()?;
+    let mut paths = Vec::with_capacity(source_trees.len());
+    for source_tree in source_trees.values() {
+        paths.push(materialize_source_tree(state, &source_tree.commit)?.0);
     }
     Ok(paths)
 }
 
-fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
-    let mut registry = vec![with_workspace(bash_tool())];
-    registry.extend(tools::declarations().into_iter().map(with_workspace));
+fn registry(cfg: &Config, _source_trees: &[String]) -> Result<Vec<Value>, String> {
+    let mut registry = vec![bash_tool()];
+    registry.extend(tools::declarations());
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
     }
     if cfg.grep_image.is_some() {
-        registry.push(with_workspace(tools::grep_declaration()));
+        registry.push(tools::grep_declaration());
     }
     if cfg.merge_image.is_some() {
-        registry.push(with_workspace(merge_tool()));
+        registry.push(with_source_tree(merge_tool()));
     }
     if cfg.tools_image.is_some() {
-        registry.extend(githist::declarations().into_iter().map(with_workspace));
+        registry.extend(githist::declarations().into_iter().map(with_source_tree));
     }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
-                registry.push(with_workspace(tools::tree_tool_declaration(&tool)));
+                registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
             }
         }
     }
-    let mut dynamic_names = HashSet::new();
-    for workspace in workspaces {
-        for tool in tools::tree_tools(workspace)? {
-            if dynamic_names.insert(tool.name.clone()) {
-                registry.push(with_workspace(tools::tree_tool_declaration(&tool)));
-            }
-        }
-    }
+    registry.push(json!({
+        "name":"run_tool",
+        "description":"Run a repository tool by conversation-relative path, e.g. feature/dirty/caos-tools/test. The tool runs with the containing source tree as its input; its schema is listed in repository context.",
+        "input_schema":{"type":"object","properties":{
+            "path":{"type":"string"}, "arguments":{"type":"object"}
+        },"required":["path"]}
+    }));
     Ok(registry)
 }
 
-fn with_workspace(mut declaration: Value) -> Value {
+fn with_source_tree(mut declaration: Value) -> Value {
     if let Some(properties) = declaration
         .pointer_mut("/input_schema/properties")
         .and_then(Value::as_object_mut)
     {
         properties.insert(
-            "workspace".to_string(),
+            "source_tree".to_string(),
             json!({
                 "type":"string",
-                "description":"Target workspace name. Required when there are several workspaces. Without workspace, inline file tools use files/ for conversation-owned files; an explicit workspace makes every path workspace-relative."
+                "description":"Target source tree name. Required when there are several source trees. Without source tree, inline file tools edit ordinary conversation paths. An explicit source tree is a commit-entry path and makes every path code-relative."
             }),
         );
     }
@@ -2897,23 +3103,20 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
 
 fn bash_tool() -> Value {
     json!({
-        "name": "bash",
-        "description": "Run a shell command in the workspace (executed with `sh -c` from the workspace root). Use this for COMMANDS (builds, tests, scripts); for plain file access prefer the read/ls/write/edit tools, which are immediate. The workspace is materialized lazily: ONLY the files and directories you list in `paths` are readable — a command touching any other existing path fails with 'Permission denied' (EACCES), and the result names the unmaterialized paths it touched. When that happens, retry the same command with those paths added to `paths`. Creating new files or directories needs no declaration. The result reports the exit code, stdout and stderr (tails), and the workspace carries all changes forward. A non-zero exit is reported back to you, not an error — read stderr and react.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "cmd": {"type":"string", "description":"The shell command to run."},
-                "paths": {"type":"array", "items":{"type":"string"}, "description":"Workspace-relative paths the command reads or modifies; only these are materialized into the sandbox."}
-            },
-            "required": ["cmd"]
-        }
+        "name":"bash",
+        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. To add an existing commit use caos checkout <full-hash> <destination> . . Protected .caos metadata cannot be changed.",
+        "input_schema":{"type":"object","properties":{
+            "cmd":{"type":"string"},
+            "cwd":{"type":"string","description":"Optional conversation-relative working directory; defaults to the conversation root."},
+            "paths":{"type":"array","items":{"type":"string"},"description":"Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees."}
+        },"required":["cmd"]}
     })
 }
 
 fn merge_tool() -> Value {
     json!({
         "name": "merge",
-        "description": "Three-way merge another commit into the current workspace. `theirs` is a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current side is the workspace as it is now. A clean merge advances the workspace to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
+        "description": "Three-way merge another commit into the current source tree. `theirs` is a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
         "input_schema": {
             "type":"object",
             "properties":{"theirs":{"type":"string","description":"The commit to merge in: a ref name from the snapshot, or a commit hash."}},
@@ -2980,10 +3183,10 @@ fn merge_result_block(id: &str, ws: &str) -> Result<Value, String> {
     }
     let text = match conflicts {
         Some(body) => format!(
-            "merge produced conflicts. The workspace now carries git's inline conflict markers in the affected files, plus .caos/conflicts (git's unmerged notation, richer than markers). Resolve each path — edit the file, reading a stage's content with `read` (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. Build and test when done.\n\n.caos/conflicts:\n{}",
+            "merge produced conflicts. The source tree now carries git's inline conflict markers in the affected files, plus .caos/conflicts (git's unmerged notation, richer than markers). Resolve each path — edit the file, reading a stage's content with `read` (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. Build and test when done.\n\n.caos/conflicts:\n{}",
             body.trim_end()
         ),
-        None => "merge completed cleanly; the workspace is the merged result.".to_string(),
+        None => "merge completed cleanly; the source tree is the merged result.".to_string(),
     };
     Ok(result_block(id, &text, false))
 }
@@ -3018,7 +3221,7 @@ fn failed_run_block(id: &str, tool: &str, error: &str) -> Value {
     error_block(
         id,
         &format!(
-            "the `{tool}` tool failed to run: {}\n\nThe workspace is unchanged. This is the tool itself failing, not a non-zero exit from your command.",
+            "the `{tool}` tool failed to run: {}\n\nThe source tree is unchanged. This is the tool itself failing, not a non-zero exit from your command.",
             error.trim_end()
         ),
     )
@@ -3215,7 +3418,7 @@ mod tests {
     use conversation_protocol::v3::apply::{apply as apply_transition, client_signature, mint};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::{
-        GitStore, Identity, IdentityKind, MemoryStore, RefUpdate, TreeBuilder, WorkspaceOrigin,
+        GitStore, Identity, IdentityKind, MemoryStore, RefUpdate, TreeBuilder,
     };
 
     use super::*;
@@ -3275,15 +3478,14 @@ mod tests {
         parent: &Oid,
         transition: Transition,
     ) -> Result<Oid, String> {
-        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
-        let applied = apply_transition(store, Some(&parent_tree), &transition)?;
+        let applied = apply_transition(store, Some(parent), &transition)?;
         let signature = inherited_signature(store, parent)?;
-        mint(store, parent, &applied.tree, transition.kind(), &signature)
+        mint(store, parent, &applied, transition.kind(), &signature)
     }
 
     fn root_with(
         store: &mut dyn ObjectStore,
-        workspaces: BTreeMap<String, (Oid, Option<WorkspaceOrigin>)>,
+        source_trees: BTreeMap<String, Oid>,
     ) -> Result<Oid, String> {
         let genesis = ensure_genesis(store)?;
         let transition = Transition::ConversationRoot {
@@ -3293,14 +3495,14 @@ mod tests {
                 owner: None,
             },
             title: "test conversation".to_string(),
-            workspaces,
+            source_trees,
             files_seed: None,
         };
         let applied = apply_transition(store, None, &transition)?;
         mint(
             store,
             &genesis,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("test", "test@example.invalid", 1),
         )
@@ -3375,7 +3577,7 @@ mod tests {
         client_store.fetch_object(&current).unwrap();
         assert!(!client_store.has_local(&proposal_tree).unwrap());
         let mut state = progress::State::from_store(client_store, conversation_ref, root).unwrap();
-        let proposal = mint_workspace_commit(&mut state, &proposal_tree, &base, "bash").unwrap();
+        let proposal = mint_source_tree_commit(&mut state, &proposal_tree, &base, "bash").unwrap();
         assert!(state.store().has_local(&proposal_tree).unwrap());
         let resolution = reconcile(
             state.store_mut(),
@@ -3385,7 +3587,45 @@ mod tests {
             &signature,
         )
         .unwrap();
-        assert!(matches!(resolution, WorkspaceResolution::Merged { .. }));
+        assert!(matches!(resolution, SourceTreeResolution::Merged { .. }));
+
+        let mut before = TreeBuilder::from(None);
+        before.put_oid("code", Mode::Commit, base.clone());
+        before.put("memory", Mode::Blob, b"before".to_vec());
+        let before = before.build(state.store_mut()).unwrap();
+        let mut proposed = TreeBuilder::from(Some(before.clone()));
+        proposed.put_oid("code", Mode::Commit, proposal.clone());
+        proposed.put("memory", Mode::Blob, b"after".to_vec());
+        let proposed = proposed.build(state.store_mut()).unwrap();
+        let mut current_files = TreeBuilder::from(Some(before.clone()));
+        current_files.put_oid("code", Mode::Commit, current.clone());
+        current_files.put("unrelated", Mode::Blob, b"keep".to_vec());
+        let current_files = current_files.build(state.store_mut()).unwrap();
+        let changes =
+            conversation_protocol::v3::tree::diff(state.store(), Some(&before), &proposed).unwrap();
+        let (files, conflicts) =
+            plan_file_changes(state.store_mut(), &changes, &current_files).unwrap();
+        assert!(conflicts.is_empty());
+        assert_eq!(
+            files
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["code", "memory"]
+        );
+        let merged = Oid::parse_line(&files[0].1.as_ref().unwrap().1, "merged code").unwrap();
+        assert!(state.store().is_ancestor(&current, &merged).unwrap());
+        assert!(state.store().is_ancestor(&proposal, &merged).unwrap());
+        let mut collision = TreeBuilder::from(Some(current_files));
+        collision.put("memory", Mode::Blob, b"concurrent".to_vec());
+        let collision = collision.build(state.store_mut()).unwrap();
+        let (files, conflicts) =
+            plan_file_changes(state.store_mut(), &changes, &collision).unwrap();
+        assert!(
+            files.is_empty(),
+            "a conflict must not apply half the shell result"
+        );
+        assert_eq!(conflicts, ["memory"]);
     }
 
     fn test_entry(message_id: &str, role: Role, blocks: Vec<Block>) -> TranscriptEntry {
@@ -3399,7 +3639,7 @@ mod tests {
             model: None,
             blocks,
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         }
     }
 
@@ -3421,21 +3661,21 @@ mod tests {
             },
         )?;
         let request = Oid::parse(&"a".repeat(40), "request")?;
-        let request_workspaces = Conversation::open(&store, &user)?.workspaces_tree()?;
+
         let admitted = append_memory(
             &mut store,
             &user,
-            Transition::RequestAdmit {
-                record: RequestRecord {
+            Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
-                    request_workspaces,
+
                     model: "test-model".to_string(),
                     configuration: "test-config".to_string(),
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -3445,7 +3685,7 @@ mod tests {
         let claimed = append_memory(
             &mut store,
             &admitted,
-            Transition::RequestClaim {
+            Transition::TurnClaim {
                 request: request.clone(),
                 latest_message: USER_ID.to_string(),
             },
@@ -3492,7 +3732,7 @@ mod tests {
                         },
                     ],
                     proposal: None,
-                    workspace_resolution: None,
+                    source_tree_resolution: None,
                 },
                 payloads: vec![
                     (
@@ -3596,7 +3836,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::tool_payload_dir(golden.request.as_str(), 0, "first")
+                    paths::call_payload_dir(golden.request.as_str(), 0, "first")
                 ),
                 proposal: None,
             },
@@ -3619,7 +3859,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::tool_payload_dir(golden.request.as_str(), 0, "second")
+                    paths::call_payload_dir(golden.request.as_str(), 0, "second")
                 ),
                 proposal: None,
             },
@@ -3688,7 +3928,7 @@ mod tests {
         for id in ["first", "second"] {
             assert_eq!(
                 view.tool(&golden.request, 0, id).unwrap().unwrap().status,
-                ToolStatus::Cancelled
+                CallStatus::Cancelled
             );
         }
     }
@@ -3705,7 +3945,7 @@ mod tests {
             Transition::AsyncStart {
                 record: AsyncRecord {
                     task: task.clone(),
-                    status: AsyncStatus::Pending,
+                    status: TaskStatus::Pending,
                     target_ref: Some("refs/caos/v3/conversations/conversation/head".to_string()),
                     result: None,
                     reason: None,
@@ -3718,14 +3958,14 @@ mod tests {
             &pending,
             Transition::AsyncTerminal {
                 task: task.clone(),
-                status: AsyncStatus::Failed,
+                status: TaskStatus::Failed,
                 result: Some(result),
                 reason: None,
             },
         )
         .unwrap();
         let view = Conversation::open(&store, &terminal).unwrap();
-        let notices = pending_async_notices(CONVERSATION, &view).unwrap();
+        let notices = pending_task_notices(CONVERSATION, &view).unwrap();
         assert_eq!(notices.len(), 1);
         let notice_id = ids::protocol_id("async-notice", &json!({"task":task.as_str()})).unwrap();
         assert_eq!(notices[0].message_id, notice_id);
@@ -3747,7 +3987,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(pending_async_notices(
+        assert!(pending_task_notices(
             CONVERSATION,
             &Conversation::open(&store, &announced).unwrap()
         )
@@ -3758,14 +3998,26 @@ mod tests {
     #[test]
     fn subagent_notice_is_idempotent_and_names_the_checkpoint() {
         let mut store = MemoryStore::new();
-        let head = conversation_protocol::v3::fixtures::golden(&mut store);
+        let fork = conversation_protocol::v3::fixtures::golden(&mut store);
+        let head = store.read_commit(&fork).unwrap().parents[0].clone();
         let view = Conversation::open(&store, &head).unwrap();
         let child = view.children().unwrap().into_iter().next().unwrap();
         let terminal = child.terminal_head.clone().unwrap();
-        let notices = pending_subagent_notices("golden-conversation", &view).unwrap();
-        assert_eq!(notices.len(), 1);
+        let notices = pending_task_notices("golden-conversation", &view).unwrap();
+        assert_eq!(notices.len(), 2);
+        let notice = notices
+            .iter()
+            .find(|entry| {
+                entry.message_id
+                    == ids::protocol_id(
+                        "subagent-notice",
+                        &json!({"child":child.id.as_str(),"terminal_head":terminal.as_str()}),
+                    )
+                    .unwrap()
+            })
+            .unwrap();
         assert_eq!(
-            notices[0].blocks,
+            notice.blocks,
             vec![Block::Text {
                 text: format!(
                     "Subagent {} is completed. Its result is {terminal}.",
@@ -3773,16 +4025,19 @@ mod tests {
                 )
             }]
         );
-        let announced = append_memory(
-            &mut store,
-            &head,
-            Transition::MessageAppend {
-                entry: notices[0].clone(),
-                payloads: Vec::new(),
-            },
-        )
-        .unwrap();
-        assert!(pending_subagent_notices(
+        let mut announced = head.clone();
+        for notice in notices {
+            announced = append_memory(
+                &mut store,
+                &announced,
+                Transition::MessageAppend {
+                    entry: notice,
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        assert!(pending_task_notices(
             "golden-conversation",
             &Conversation::open(&store, &announced).unwrap()
         )
@@ -3810,24 +4065,21 @@ mod tests {
         )
         .unwrap();
         let request = test_oid('d');
-        let request_workspaces = Conversation::open(&store, &user)
-            .unwrap()
-            .workspaces_tree()
-            .unwrap();
+
         let admitted = append_memory(
             &mut store,
             &user,
-            Transition::RequestAdmit {
-                record: RequestRecord {
+            Transition::TurnAdmit {
+                record: TurnRecord {
                     id: request.clone(),
                     request_head: user.clone(),
-                    request_workspaces,
+
                     model: "test-model".to_string(),
                     configuration: "test-config".to_string(),
                     round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
-                    status: RequestStatus::Queued,
+                    status: TurnStatus::Queued,
                     latest_message: None,
                     escape_reason: None,
                     outcome: None,
@@ -3838,7 +4090,7 @@ mod tests {
         let escaped = append_memory(
             &mut store,
             &admitted,
-            Transition::RequestEscape {
+            Transition::TurnEscape {
                 request: request.clone(),
                 reason: Some("escape".to_string()),
             },
@@ -3851,14 +4103,28 @@ mod tests {
     }
 
     #[test]
-    fn explicit_workspace_files_path_targets_workspace() {
+    fn explicit_source_tree_files_path_targets_source_tree() {
         let mut store = MemoryStore::default();
-        let head = root_with(
-            &mut store,
-            BTreeMap::from([("main".into(), (test_oid('a'), None))]),
-        )
-        .unwrap();
+        let head = root_with(&mut store, BTreeMap::from([("main".into(), test_oid('a'))])).unwrap();
         let view = Conversation::open(&store, &head).unwrap();
+        let browse = Call {
+            id: "browse".into(),
+            name: "ls".into(),
+            input: json!({}),
+        };
+        assert!(matches!(
+            resolve_target(&view, &browse).unwrap(),
+            Target::Files
+        ));
+        let read = Call {
+            id: "read".into(),
+            name: "read".into(),
+            input: json!({"file-path":"main/README.md"}),
+        };
+        assert!(matches!(
+            resolve_target(&view, &read).unwrap(),
+            Target::Files
+        ));
         for (name, path_arg) in [
             ("read", "file-path"),
             ("write", "file-path"),
@@ -3868,20 +4134,20 @@ mod tests {
             let mut call = Call {
                 id: "call-1".into(),
                 name: name.into(),
-                input: json!({"workspace":"main", path_arg:"files/config.json"}),
+                input: json!({"source_tree":"main", path_arg:"files/config.json"}),
             };
             assert!(
                 matches!(
                     resolve_target(&view, &call).unwrap(),
-                    Target::Workspace { .. }
+                    Target::SourceTree { .. }
                 ),
                 "{name}"
             );
-            call.input["workspace"] = json!("missing");
+            call.input["source_tree"] = json!("missing");
             assert!(resolve_target(&view, &call)
                 .unwrap_err()
-                .contains("unknown workspace"));
-            call.input.as_object_mut().unwrap().remove("workspace");
+                .contains("unknown source tree"));
+            call.input.as_object_mut().unwrap().remove("source_tree");
             assert!(
                 matches!(resolve_target(&view, &call).unwrap(), Target::Files),
                 "{name}"
@@ -3890,27 +4156,26 @@ mod tests {
     }
 
     #[test]
-    fn target_resolution_errors_name_available_workspaces() {
+    fn filesystem_tools_use_the_root_with_zero_or_multiple_source_trees() {
         let mut store = MemoryStore::new();
-        let empty = root_with(&mut store, BTreeMap::new()).unwrap();
-        let call = Call {
-            id: "call".to_string(),
-            name: "bash".to_string(),
-            input: json!({"cmd":"true"}),
-        };
-        assert_eq!(
-            resolve_target(&Conversation::open(&store, &empty).unwrap(), &call).unwrap_err(),
-            "this conversation has no workspace"
-        );
-        let workspaces = BTreeMap::from([
-            ("api".to_string(), (test_oid('a'), None)),
-            ("web".to_string(), (test_oid('b'), None)),
-        ]);
-        let two = root_with(&mut store, workspaces).unwrap();
-        assert_eq!(
-            resolve_target(&Conversation::open(&store, &two).unwrap(), &call).unwrap_err(),
-            "several workspaces: api, web; pass workspace=<name>"
-        );
+        for trees in [
+            BTreeMap::new(),
+            BTreeMap::from([("api".into(), test_oid('a')), ("web".into(), test_oid('b'))]),
+        ] {
+            let head = root_with(&mut store, trees).unwrap();
+            let view = Conversation::open(&store, &head).unwrap();
+            for name in ["bash", "grep", "read", "write", "ls"] {
+                let call = Call {
+                    id: "call".into(),
+                    name: name.into(),
+                    input: json!({}),
+                };
+                assert!(matches!(
+                    resolve_target(&view, &call).unwrap(),
+                    Target::Files
+                ));
+            }
+        }
     }
 
     fn test_oid(character: char) -> Oid {

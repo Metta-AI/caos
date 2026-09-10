@@ -48,13 +48,16 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         app.view,
         !app.selection_locked
             && app.palette.is_none()
-            && state.publish_base.is_none()
+            && app.source_tree_picker.is_none()
+            && state.publish_plan.is_none()
             && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
+    render_source_tree_picker(app, frame);
+    render_publication_plan(app, frame);
     render_screen_selection(app, frame);
 }
 
@@ -177,11 +180,11 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.completion_count(&state.workspace_names()) as u16
+        state.composer.completion_count(&state.source_tree_names()) as u16
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() || state.publish_base.is_some() {
+    let notice_height = if state.command_error.is_some() {
         3
     } else if state.reference_notice.is_some() {
         4
@@ -222,33 +225,6 @@ fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         );
         return;
     }
-    if let Some(prompt) = state.publish_base.as_ref() {
-        let branch = if prompt.input.is_empty() {
-            Span::styled(
-                format!("origin/{} (default)", prompt.default_base),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan))
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::raw("Base branch: "), branch])).block(
-                Block::default()
-                    .title(" Publish PR — Ctrl+P confirms, Esc cancels ")
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .borders(Borders::ALL),
-            ),
-            area,
-        );
-        frame.set_cursor_position(Position::new(
-            area.x
-                .saturating_add(14)
-                .saturating_add(prompt.input.cell_width())
-                .min(area.right().saturating_sub(2)),
-            area.y.saturating_add(1),
-        ));
-        return;
-    }
     if let Some(reference) = state.reference_notice.as_ref() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -279,7 +255,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || state.publish_base.is_some() || app.palette.is_some() {
+    if state.command_error.is_some() || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;
@@ -405,8 +381,14 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     }
     push_metadata(
         state
-            .selected_workspace_diff()
-            .map(|workspace| format!("ws {} {}", workspace.name, short_hash(&workspace.head)))
+            .selected_source_tree_diff()
+            .map(|source_tree| {
+                format!(
+                    "source {} {}",
+                    source_tree.name,
+                    short_hash(&source_tree.head)
+                )
+            })
             .or_else(|| {
                 state
                     .current_hash()
@@ -1281,37 +1263,38 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
 
 fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = Vec::new();
-    if state.workspaces.len() > 1 {
+    if state.source_trees.len() > 1 {
         lines.push(Line::from(
             state
-                .workspaces
+                .source_trees
                 .iter()
                 .enumerate()
-                .flat_map(|(index, workspace)| {
+                .flat_map(|(index, source_tree)| {
                     let separator = (index > 0).then(|| Span::raw(" "));
-                    let name =
-                        if state.selected_workspace.as_deref() == Some(workspace.name.as_str()) {
-                            Span::styled(
-                                format!("[{}]", workspace.name),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            Span::raw(workspace.name.clone())
-                        };
+                    let name = if state.selected_source_tree.as_deref()
+                        == Some(source_tree.name.as_str())
+                    {
+                        Span::styled(
+                            format!("[{}]", source_tree.name),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::raw(source_tree.name.clone())
+                    };
                     separator.into_iter().chain(std::iter::once(name))
                 })
                 .collect::<Vec<_>>(),
         ));
     }
-    let text = if state.workspaces.is_empty() {
-        "This conversation has no workspace."
+    let text = if state.source_trees.is_empty() {
+        "This conversation has no source tree."
     } else {
-        match state.selected_workspace_diff() {
+        match state.selected_source_tree_diff() {
             Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
-            Some(_) => "No workspace changes in this conversation.",
-            None => "Choose a workspace with /workspace use <name>.",
+            Some(_) => "No source tree changes in this conversation.",
+            None => "Choose a source tree with /source-tree use <name>.",
         }
     };
     lines.extend(text.lines().map(|line| {
@@ -1328,10 +1311,10 @@ fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     }));
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
-    let title = if state.selected_workspace_is_published() {
-        " Workspace diff · Published "
+    let title = if state.selected_source_tree_is_published() {
+        " Source tree diff · Published "
     } else {
-        " Workspace diff "
+        " Source tree diff "
     };
     frame.render_widget(
         paragraph
@@ -1349,8 +1332,8 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::raw("  read, ls, write, edit  — inline workspace operations"),
-        Line::raw("  bash                  — commands in the workspace sandbox"),
+        Line::raw("  read, ls, write, edit  — inline source tree operations"),
+        Line::raw("  bash                  — commands in the source tree sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
         Line::raw(""),
         Line::styled(
@@ -1497,10 +1480,10 @@ fn render_composer(
     } else {
         Vec::new()
     };
-    let workspaces = if view == View::Chat {
+    let source_trees = if view == View::Chat {
         state
             .composer
-            .workspace_completion(&state.workspace_names())
+            .source_tree_completion(&state.source_tree_names())
             .map(|completion| completion.values)
             .unwrap_or_default()
     } else {
@@ -1510,7 +1493,7 @@ fn render_composer(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let command_height =
-        (commands.len() + models.len() + workspaces.len()).min(inner.height as usize) as u16;
+        (commands.len() + models.len() + source_trees.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1544,7 +1527,7 @@ fn render_composer(
     render_command_menu(
         &commands,
         &models,
-        &workspaces,
+        &source_trees,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1640,7 +1623,7 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
 fn render_command_menu(
     commands: &[&Command],
     models: &[&str],
-    workspaces: &[String],
+    source_trees: &[String],
     selected: usize,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1671,7 +1654,7 @@ fn render_command_menu(
         };
         Line::styled(format!("{marker}{model}"), style)
     });
-    let workspace_lines = workspaces.iter().enumerate().map(|(index, completion)| {
+    let source_tree_lines = source_trees.iter().enumerate().map(|(index, completion)| {
         let index = index + commands.len() + models.len();
         let marker = if index == selected { "> " } else { "  " };
         let style = if index == selected {
@@ -1687,7 +1670,7 @@ fn render_command_menu(
         Paragraph::new(
             command_lines
                 .chain(model_lines)
-                .chain(workspace_lines)
+                .chain(source_tree_lines)
                 .collect::<Vec<_>>(),
         ),
         area,
@@ -1713,9 +1696,9 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
-    } else if app.selected().publish_base.is_some() {
+    } else if app.selected().publish_plan.is_some() {
         Line::raw(
-            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
+            " Publish PRs: Space selects  b edits base  h edits branch  Enter/^P confirms  Esc cancels",
         )
     } else if app.focus() == Focus::List {
         Line::raw(
@@ -1767,6 +1750,219 @@ pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &S
 pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
     scroll.resolve(line_count.saturating_sub(visible))
+}
+
+pub(super) fn source_tree_picker_area(terminal: Rect) -> Rect {
+    terminal.centered(
+        Constraint::Length(terminal.width.saturating_sub(4).min(100)),
+        Constraint::Length(terminal.height.saturating_sub(2).min(18)),
+    )
+}
+
+fn render_source_tree_picker(app: &App, frame: &mut Frame<'_>) {
+    let Some(picker) = &app.source_tree_picker else {
+        return;
+    };
+    let state = app.selected();
+    let area = source_tree_picker_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Source trees ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    if let Some(form) = &picker.attaching {
+        let labels = [
+            "Source tree name",
+            "Repository URL or absolute path",
+            "Branch or full commit (blank: default branch)",
+        ];
+        let mut lines = vec![Line::from("Attach repository"), Line::from("")];
+        for (index, label) in labels.iter().enumerate() {
+            lines.push(Line::styled(
+                format!("{label}: {}", form.fields[index]),
+                Style::default().fg(if index == form.selected {
+                    Color::Cyan
+                } else {
+                    Color::White
+                }),
+            ));
+            lines.push(Line::from(""));
+        }
+        frame.render_widget(Paragraph::new(lines), rows[0]);
+        frame.render_widget(
+            Paragraph::new("Tab/Enter advances   Enter on last field attaches   Esc cancels"),
+            rows[1],
+        );
+    } else if let Some(name) = &picker.creating {
+        let source = picker.source.as_deref().unwrap_or("");
+        frame.render_widget(
+            Paragraph::new(format!("Copy reference {source}\n\nNew path: {name}")),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new("Enter creates   Esc cancels")
+                .style(Style::default().fg(Color::DarkGray)),
+            rows[1],
+        );
+    } else {
+        let items = state
+            .source_trees
+            .iter()
+            .map(|ws| {
+                let selected = if Some(&ws.name) == state.selected_source_tree.as_ref() {
+                    "*"
+                } else {
+                    " "
+                };
+                let additions = ws
+                    .patch
+                    .lines()
+                    .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+                    .count();
+                let deletions = ws
+                    .patch
+                    .lines()
+                    .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+                    .count();
+                let repository = ws
+                    .config
+                    .repository()
+                    .unwrap_or_else(|| "no publication repository".into());
+                let publication = state
+                    .publications
+                    .iter()
+                    .find(|item| item.source_tree == ws.name)
+                    .map(|item| format!("{:?}", item.status))
+                    .unwrap_or_else(|| "unpublished".into());
+                let base = ws
+                    .config
+                    .upstream
+                    .as_ref()
+                    .map(|base| format!("base {}", base.name()))
+                    .unwrap_or_default();
+                ListItem::new(vec![
+                    Line::from(format!(
+                        "{selected} {}   +{additions} -{deletions}   {publication}{}",
+                        ws.name,
+                        if state.source_tree_is_stale(&ws.name) {
+                            "   needs update"
+                        } else {
+                            ""
+                        }
+                    )),
+                    Line::styled(
+                        format!("  {repository}  {base}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            frame.render_widget(Paragraph::new("No source tree attached yet."), rows[0]);
+        } else {
+            let mut selection = ListState::default().with_selected(Some(picker.selected));
+            frame.render_stateful_widget(
+                List::new(items).highlight_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rows[0],
+                &mut selection,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(
+                "Up/Down selects   Enter switches   n creates   a attaches   u updates stack   Esc closes",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
+            rows[1],
+        );
+    }
+}
+
+fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
+    let Some(prompt) = &app.selected().publish_plan else {
+        return;
+    };
+    let terminal = frame.area();
+    let area = terminal.centered(
+        Constraint::Length(terminal.width.saturating_sub(4).min(112)),
+        Constraint::Length(terminal.height.saturating_sub(2).min(24)),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Publish source trees ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    if prompt.loading {
+        frame.render_widget(
+            Paragraph::new("Loading repositories and pull requests..."),
+            rows[0],
+        );
+    } else {
+        let items = prompt
+            .rows
+            .iter()
+            .map(|row| {
+                let check = if row.included { "[x]" } else { "[ ]" };
+                let operation = row
+                    .target
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or("Create or update PR");
+                ListItem::new(vec![
+                    Line::from(format!(
+                        "{check} {}   {}",
+                        row.target.source_tree,
+                        short_hash(&row.target.head)
+                    )),
+                    Line::from(format!("    {} -> {}", row.target.branch, row.target.base)),
+                    Line::styled(
+                        format!("    {}   {operation}", row.target.repository),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let mut selection = ListState::default().with_selected(Some(prompt.selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[0],
+            &mut selection,
+        );
+    }
+
+    if let Some(error) = &prompt.error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(Style::default().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new("Selected source trees will be prepared, tested, and published in stack order.\nEach source tree gets its own branch and PR."), rows[1]);
+    }
+    frame.render_widget(
+        Paragraph::new("Space select   a all   Enter/Ctrl+P publish   Esc cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
 }
 
 #[cfg(test)]

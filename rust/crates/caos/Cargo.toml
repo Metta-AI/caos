@@ -42,3 +42,6 @@ path = "../caos-world"
 
 [dependencies.caos-eval]
 path = "../caos-eval"
+
+[dependencies.git-locator]
+path = "../git-locator"

@@ -10,6 +10,10 @@ pub(crate) struct Args {
     pub(crate) conversation: Option<String>,
     pub(crate) new_conversation: bool,
     pub(crate) from_commit: Option<String>,
+    pub(crate) empty: bool,
+    pub(crate) import: Option<String>,
+    pub(crate) harness: Option<String>,
+    pub(crate) server: Option<String>,
     pub(crate) turn: TurnOptions,
 }
 
@@ -49,6 +53,13 @@ impl Args {
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
                 "-c" | "--conversation" => parsed.conversation = Some(value(&mut args, arg)?),
                 "--new" => parsed.new_conversation = true,
+                "--empty" => {
+                    parsed.empty = true;
+                    parsed.new_conversation = true;
+                }
+                "--import" => parsed.import = Some(value(&mut args, arg)?),
+                "--harness" => parsed.harness = Some(value(&mut args, arg)?),
+                "--server" => parsed.server = Some(value(&mut args, arg)?),
                 "--from" => parsed.from_commit = Some(value(&mut args, arg)?),
                 "--base" => parsed.turn.base = Some(value(&mut args, arg)?),
                 "--system" => parsed.turn.system = Some(value(&mut args, arg)?),
@@ -75,6 +86,9 @@ impl Args {
         };
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
+        }
+        if parsed.empty && (parsed.from_commit.is_some() || parsed.turn.base.is_some()) {
+            return Err("--empty cannot be combined with --from or --base".into());
         }
         if parsed.from_commit.is_some() && parsed.turn.base.is_some() {
             return Err("--from and --base are mutually exclusive".to_string());
@@ -124,7 +138,7 @@ impl Args {
 pub(crate) fn usage() -> String {
     "usage: caos tui --llm-step:@=<path> --llm-call:@=<path> [--username <name>] \
      [--list-archived | --unarchive <conversation-id>] \
-     [--new | --from <commit>] [--base <revspec>] \
+     [--new | --from <commit> | --empty] [--import <path>] [--base <revspec>] [--server <url>] [--harness <path>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]\n\
      \x20 the two image args also take :@@=<git ref>, :hash=<oid> and :docker=<ref>"
         .to_string()

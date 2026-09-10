@@ -100,7 +100,7 @@ pub enum ArgType {
     /// `--name:hash=oid` — the value is the hash of an object the *server*
     /// already holds (typically an earlier run's result), referenced directly
     /// by oid with no content round-trip: a **tree** or a **blob**. This is how
-    /// results compose into new requests: e.g. a workspace-build job's `bin`
+    /// results compose into new requests: e.g. a source-tree-build job's `bin`
     /// tree feeding a downstream job as `--bins:hash=<oid>`. (Generalizes the
     /// former `:tree=`, which was tree-only.)
     Hash,

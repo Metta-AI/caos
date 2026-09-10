@@ -12,18 +12,18 @@ pub const SPAWN_TOOL: &str = "spawn_agent";
 pub const WAIT_TOOL: &str = "wait_agent";
 pub const HARVEST_TOOL: &str = "harvest_agent";
 
-const FOCUSED_SYSTEM: &str = "You are a focused subagent. Work only on the user's delegated task in this isolated snapshot. Use the available tools, make any requested workspace edits, and finish with a concise report. You cannot spawn further agents.";
+const FOCUSED_SYSTEM: &str = "You are a focused subagent. Work only on the user's delegated task in this isolated snapshot. Use the available tools, make any requested source tree edits, and finish with a concise report. You cannot spawn further agents.";
 
 pub fn declarations() -> [Value; 3] {
     [
         json!({
             "name": SPAWN_TOOL,
-            "description": "Start a focused coding agent in a durable child conversation. The child receives the selected workspace snapshot and can be joined with wait_agent, then its code can be applied with harvest_agent.",
+            "description": "Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with wait_agent, then its code can be applied with harvest_agent.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "A self-contained task with the desired output and constraints."},
-                    "workspace": {"type": "string", "description": "Workspace to seed. Required when the conversation has several workspaces; omit when it has none."}
+                    "source_tree": {"type": "string", "description": "Optional source tree path to include. Omit to include all source trees. Ordinary conversation files are copied in either case."}
                 },
                 "required": ["prompt"]
             }
@@ -41,13 +41,13 @@ pub fn declarations() -> [Value; 3] {
         }),
         json!({
             "name": HARVEST_TOOL,
-            "description": "Apply a terminal child agent's named workspace to a parent workspace with the ordinary three-way reconciliation rules.",
+            "description": "Apply a terminal child agent's named source tree to a parent source tree with the ordinary three-way reconciliation rules.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "child": {"type": "string", "description": "The terminal child id returned by spawn_agent."},
-                    "child_workspace": {"type": "string", "description": "Child workspace to apply; defaults to the workspace seeded at spawn."},
-                    "workspace": {"type": "string", "description": "Parent workspace to update; defaults when the parent has exactly one workspace."}
+                    "child_source_tree": {"type": "string", "description": "Child source tree to apply; defaults to the source tree seeded at spawn."},
+                    "source_tree": {"type": "string", "description": "Parent source tree to update; defaults when the parent has exactly one source tree."}
                 },
                 "required": ["child"]
             }
@@ -100,6 +100,8 @@ pub fn child_request(
         "system",
         "subagent",
         "merge-refs",
+        "repository-refs",
+        "focus-source-tree",
         "wc",
         "run",
         "round",

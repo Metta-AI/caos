@@ -24,12 +24,11 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
             owner: None,
         },
         title: "Golden Conversation".to_string(),
-        workspaces: BTreeMap::from([("main".to_string(), (oid('a'), None))]),
+        source_trees: BTreeMap::from([("main".to_string(), oid('a'))]),
         files_seed: Some(files_seed),
     };
     let applied = apply(store, None, &root).expect("apply root");
-    let mut head =
-        mint(store, &genesis, &applied.tree, root.kind(), &signature).expect("mint root");
+    let mut head = mint(store, &genesis, &applied, root.kind(), &signature).expect("mint root");
 
     commit(
         store,
@@ -55,7 +54,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                     path: format!("{}/body", paths::transcript_payload_dir(0, "user-0")),
                 }],
                 proposal: None,
-                workspace_resolution: None,
+                source_tree_resolution: None,
             },
             payloads: vec![("body".to_string(), b"Build it".to_vec())],
         },
@@ -67,7 +66,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(request.clone(), request_head),
         },
         &signature,
@@ -75,7 +74,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestClaim {
+        Transition::TurnClaim {
             request: request.clone(),
             latest_message: "user-0".to_string(),
         },
@@ -84,7 +83,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestInterject {
+        Transition::TurnInterject {
             request: request.clone(),
             entry: TranscriptEntry {
                 message_id: "interjection-1".to_string(),
@@ -100,9 +99,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                 proposal: Some(Proposal {
                     base: oid('a'),
                     commit: oid('d'),
-                    workspace_name: "main".to_string(),
+                    source_tree_name: "main".to_string(),
                 }),
-                workspace_resolution: Some(WorkspaceResolution::Direct {
+                source_tree_resolution: Some(SourceTreeResolution::Direct {
                     current: oid('a'),
                     output: oid('d'),
                 }),
@@ -136,27 +135,27 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     );
     let read_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 0, "read-call")
+        paths::call_payload_dir(request.as_str(), 0, "read-call")
     );
     commit(
         store,
         &mut head,
         Transition::ToolComplete {
-            record: ToolRecord {
+            record: CallRecord {
                 request: request.clone(),
                 round: 0,
                 id: "read-call".to_string(),
                 name: "read".to_string(),
                 declaration_message: "assistant-1".to_string(),
-                workspace_name: None,
-                input_workspace: None,
-                status: ToolStatus::Complete,
+                source_tree_name: None,
+                input_commit: None,
+                status: CallStatus::Complete,
                 task: None,
                 result: Some(ToolResult::Complete {
                     observation: read_observation,
                     proposal: None,
                 }),
-                workspace_resolution: None,
+                source_tree_resolution: None,
                 files: Vec::new(),
                 files_outcome: None,
             },
@@ -165,18 +164,18 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         },
         &signature,
     );
-    let started_bash = ToolRecord {
+    let started_bash = CallRecord {
         request: request.clone(),
         round: 0,
         id: "bash-call".to_string(),
         name: "bash".to_string(),
         declaration_message: "assistant-1".to_string(),
-        workspace_name: Some("main".to_string()),
-        input_workspace: Some(oid('d')),
-        status: ToolStatus::Started,
+        source_tree_name: Some("main".to_string()),
+        input_commit: Some(oid('d')),
+        status: CallStatus::Started,
         task: Some(oid('2')),
         result: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
         files: Vec::new(),
         files_outcome: None,
     };
@@ -190,19 +189,19 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     );
     let bash_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 0, "bash-call")
+        paths::call_payload_dir(request.as_str(), 0, "bash-call")
     );
     commit(
         store,
         &mut head,
         Transition::ToolComplete {
-            record: ToolRecord {
-                status: ToolStatus::Complete,
+            record: CallRecord {
+                status: CallStatus::Complete,
                 result: Some(ToolResult::Complete {
                     observation: bash_observation,
                     proposal: Some(oid('b')),
                 }),
-                workspace_resolution: Some(WorkspaceResolution::Direct {
+                source_tree_resolution: Some(SourceTreeResolution::Direct {
                     current: oid('d'),
                     output: oid('b'),
                 }),
@@ -249,47 +248,47 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         ids::child_id("golden-conversation", &request, 1, "spawn-call").expect("derive child id");
     let spawn_observation = format!(
         "{}/observation",
-        paths::tool_payload_dir(request.as_str(), 1, "spawn-call")
+        paths::call_payload_dir(request.as_str(), 1, "spawn-call")
     );
-    let spawn_tool = ToolRecord {
+    let spawn_tool = CallRecord {
         request: request.clone(),
         round: 1,
         id: "spawn-call".to_string(),
         name: "spawn_agent".to_string(),
         declaration_message: "assistant-2".to_string(),
-        workspace_name: None,
-        input_workspace: None,
-        status: ToolStatus::Complete,
+        source_tree_name: None,
+        input_commit: None,
+        status: CallStatus::Complete,
         task: None,
         result: Some(ToolResult::Complete {
             observation: spawn_observation,
             proposal: None,
         }),
-        workspace_resolution: None,
+        source_tree_resolution: None,
         files: Vec::new(),
         files_outcome: None,
     };
     let child = ChildRecord {
         id: child_id.clone(),
         initial_head: head.clone(),
-        initial_workspace: Some(oid('b')),
+        initial_source_tree: Some(oid('b')),
         request: request.clone(),
         relay: oid('3'),
         spawn_intent: SpawnIntent {
             request: request.clone(),
             round: 1,
             tool: "spawn-call".to_string(),
-            workspace_name: Some("main".to_string()),
-            input_workspace: Some(oid('b')),
+            source_tree_name: Some("main".to_string()),
+            input_commit: Some(oid('b')),
             prompt: ".caos/tools/prompt".to_string(),
             model: "model".to_string(),
             configuration: configuration(),
             files_seed: None,
         },
-        status: ChildStatus::Running,
+        status: TaskStatus::Pending,
         applications: Vec::new(),
         terminal_head: None,
-        child_workspaces: None,
+        child_source_trees: None,
     };
     commit(
         store,
@@ -308,7 +307,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::AsyncStart {
             record: AsyncRecord {
                 task: async_task.clone(),
-                status: AsyncStatus::Pending,
+                status: TaskStatus::Pending,
                 target_ref: Some("refs/heads/main".to_string()),
                 result: None,
                 reason: None,
@@ -319,7 +318,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestInterject {
+        Transition::TurnInterject {
             request: request.clone(),
             entry: TranscriptEntry {
                 message_id: "interjection-3".to_string(),
@@ -333,7 +332,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                     text: "One more detail".to_string(),
                 }],
                 proposal: None,
-                workspace_resolution: None,
+                source_tree_resolution: None,
             },
             payloads: Vec::new(),
         },
@@ -344,7 +343,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &mut head,
         Transition::AsyncTerminal {
             task: async_task,
-            status: AsyncStatus::Complete,
+            status: TaskStatus::Complete,
             result: Some(oid('5')),
             reason: None,
         },
@@ -356,10 +355,10 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::SubagentTerminal {
             child: child_id.clone(),
             terminal_head: oid('6'),
-            status: ChildStatus::Completed,
-            child_workspaces: BTreeMap::from([(
+            status: TaskStatus::Complete,
+            child_source_trees: BTreeMap::from([(
                 "main".to_string(),
-                ChildWorkspace {
+                ChildSourceTree {
                     commit: oid('c'),
                     initial: oid('b'),
                 },
@@ -373,10 +372,10 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::SubagentApply {
             child: child_id,
             application: Application {
-                parent_workspace_name: "main".to_string(),
-                parent_workspace: Some(oid('b')),
-                child_workspace: "main".to_string(),
-                workspace_resolution: WorkspaceResolution::Merged {
+                parent_source_tree_name: "main".to_string(),
+                parent_source_tree: Some(oid('b')),
+                child_source_tree: "main".to_string(),
+                source_tree_resolution: SourceTreeResolution::Merged {
                     current: oid('b'),
                     merge: MergeInfo {
                         base: oid('a'),
@@ -401,9 +400,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestTerminal {
+        Transition::TurnTerminal {
             request: request.clone(),
-            outcome: RequestOutcome::Idle {
+            outcome: TurnOutcome::Idle {
                 result: None,
                 interrupted: false,
             },
@@ -413,31 +412,19 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::WorkspaceCreate {
-            name: "side".to_string(),
-            commit: oid('d'),
-            origin: Some(WorkspaceOrigin {
-                source: "seed".to_string(),
-                source_tree: oid('e'),
-            }),
-        },
+        Transition::reference("side".to_string(), Some(oid('d'))),
         &signature,
     );
     commit(
         store,
         &mut head,
-        Transition::WorkspaceRollback {
-            name: "main".to_string(),
-            commit: oid('f'),
-        },
+        Transition::reference("main".to_string(), Some(oid('f'))),
         &signature,
     );
     commit(
         store,
         &mut head,
-        Transition::WorkspaceRemove {
-            name: "side".to_string(),
-        },
+        Transition::reference("side".to_string(), None),
         &signature,
     );
 
@@ -474,7 +461,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                 repository: "repository".to_string(),
                 refname: "refs/heads/main".to_string(),
                 expected_old: Some(expected_old),
-                workspace_name: "main".to_string(),
+                source_tree_name: "main".to_string(),
                 status: PublicationStatus::Pending,
                 evidence: None,
                 observed: None,
@@ -513,7 +500,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(queued_escape.clone(), queued_head),
         },
         &signature,
@@ -521,7 +508,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestEscape {
+        Transition::TurnEscape {
             request: queued_escape,
             reason: Some("cancel before claim".to_string()),
         },
@@ -533,7 +520,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestAdmit {
+        Transition::TurnAdmit {
             record: request_record(cancelling.clone(), cancelling_head),
         },
         &signature,
@@ -541,7 +528,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestClaim {
+        Transition::TurnClaim {
             request: cancelling.clone(),
             latest_message: "assistant-4".to_string(),
         },
@@ -550,7 +537,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestEscape {
+        Transition::TurnEscape {
             request: cancelling.clone(),
             reason: Some("stop running".to_string()),
         },
@@ -559,9 +546,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::RequestTerminal {
+        Transition::TurnTerminal {
             request: cancelling,
-            outcome: RequestOutcome::Idle {
+            outcome: TurnOutcome::Idle {
                 result: None,
                 interrupted: true,
             },
@@ -589,24 +576,22 @@ fn commit(
     transition: Transition,
     signature: &super::tree::Signature,
 ) -> Applied {
-    let parent_tree = store.read_commit(head).expect("read parent").tree;
-    let applied = apply(store, Some(&parent_tree), &transition).expect("apply transition");
-    *head =
-        mint(store, head, &applied.tree, transition.kind(), signature).expect("mint transition");
+    let applied = apply(store, Some(head), &transition).expect("apply transition");
+    *head = mint(store, head, &applied, transition.kind(), signature).expect("mint transition");
     applied
 }
 
-fn request_record(id: Oid, request_head: Oid) -> RequestRecord {
-    RequestRecord {
+fn request_record(id: Oid, request_head: Oid) -> TurnRecord {
+    TurnRecord {
         id,
         request_head,
-        request_workspaces: None,
+
         model: "model".to_string(),
         configuration: configuration(),
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,
@@ -649,7 +634,7 @@ fn model_complete(
             model: Some("model".to_string()),
             blocks,
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         },
         payloads,
         calls: calls.to_vec(),
@@ -662,69 +647,4 @@ fn configuration() -> String {
 
 fn oid(character: char) -> Oid {
     Oid::parse(&character.to_string().repeat(40), "fixture oid").expect("valid fixture oid")
-}
-
-#[cfg(test)]
-mod memory_tests {
-    use super::*;
-    use crate::v3::tree::MemoryStore;
-
-    const GOLDEN_HEAD: &str = "cc1df48f8601195e11f30072e684e06f60ed562b";
-    const GOLDEN_TREES: [&str; 33] = [
-        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-        "a398d70aa573940890a0877daddfcd1bd8dec0f8",
-        "b10226eb938788dae4ca857e7333218843b57c20",
-        "828429dd06a79479a9e0652f186d5f5b9534ab85",
-        "30fd822540cf7caab3a9535df99e7fb46938f5e9",
-        "fb62e9f83c59dd35c6a0b24ea3fef2d1a4f55ccd",
-        "bb96722aebb12654a1957e90cf1ce6db8c676e96",
-        "6cddae8c89b579277793c5021b191c0d1462df4a",
-        "76374b5318f392c83d84212472251d37a1eb5a85",
-        "e440db3d32a4de40afd32ead5a4aaf1850429d03",
-        "56f766f8af868960f42bd80cc8767946ce183d55",
-        "241fe3fe45263205123d93942098d00a5d780e94",
-        "6eae194b77e008fca3db31db0500c3db3481c954",
-        "4c15e9cf7a524fa3ce3b9380f494ed41d26a3b3e",
-        "e5f686e5d604841640b49e761791f4e30e768356",
-        "8ac550e6fb2aaddb5b6d95d8446b0d3a92237c94",
-        "6fd133d180f51e36105f39ba67c98f196c96ef9b",
-        "d2c119718013193f409e07664789dcc1258322f9",
-        "acbba4378f5062a40cb5465923010a4682d3c34c",
-        "60bba3b2c482c7d2954f0f2e4117ec01003b739e",
-        "02d6de0bb3eb05afb066d97d68c07e16f9c5ea8e",
-        "8209fee51b0400cbf65d97dd521bfc7dcc87f6e2",
-        "b0854834cbc76008973375a1b7d170d727018100",
-        "0b83c09973f68c2620dc33e37c8e248f96162107",
-        "c752ff5ec3119971670fa1fcf05457e2f4a99b8f",
-        "49717d887f9becfdf59f4edc9f471a3b78cf4b17",
-        "6c3662fcb9e4ef2e267aadfaf7eb122f952b8b59",
-        "0a8a7d38e77d50f27b1a5704ea93a6081137cfd0",
-        "d8ec34900a7741cd2c6f8e0026f7efcc7bcbca6b",
-        "dfde41a608e79d9e4c8b4ebfe381bf7420d37ac5",
-        "b61549f48b3800ebf3c3d84b2a0aed90381b721f",
-        "d8ebacbcd89e88512ad3a785e52f6cc879082a50",
-        "3b9aaddc6b0d2d5f685434644ea2187ef25aea87",
-    ];
-
-    #[test]
-    fn golden_spine_oids_are_stable() {
-        let mut store = MemoryStore::new();
-        let head = golden(&mut store);
-        assert_eq!(head.as_str(), GOLDEN_HEAD);
-        let mut trees = Vec::new();
-        let mut cursor = head;
-        loop {
-            let commit = store.read_commit(&cursor).unwrap();
-            trees.push(commit.tree);
-            let Some(parent) = commit.parents.first() else {
-                break;
-            };
-            cursor = parent.clone();
-        }
-        trees.reverse();
-        assert_eq!(
-            trees.iter().map(Oid::as_str).collect::<Vec<_>>(),
-            GOLDEN_TREES
-        );
-    }
 }

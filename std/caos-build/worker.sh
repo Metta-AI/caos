@@ -13,18 +13,18 @@ set -euo pipefail
 
 fail() { echo "BUILD FAIL: $*" >&2; exit 1; }
 
-# The workspace, materialized. Cheap by measurement rather than by hope: the
+# The source tree, materialized. Cheap by measurement rather than by hope: the
 # tracked tree is 335 files and 2.76 MB, so this is not a place to be clever.
-caos get -r /cas/args/in || fail "materializing the workspace"
+caos get -r /cas/args/in || fail "materializing the source tree"
 cd /cas/args/in
 
 # WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-build is registered on
 # every conversation (it is one of the harness's own tools), so it is offered
-# even when the workspace is not caos. There it has nothing to build: rather
+# even when the source tree is not caos. There it has nothing to build: rather
 # than fail the turn, put a plain log saying so and exit 0, so the model reads a
 # calm "not applicable here" tool_result instead of a red one.
 if [ ! -f flake.nix ]; then
-  { echo "caos-build compiles the caos source tree with nix, and this workspace"
+  { echo "caos-build compiles the caos source tree with nix, and this source tree"
     echo "has no flake.nix — there is nothing here for it to build."
     echo "caos-build is specific to the caos codebase; run it there."
   } > /tmp/build.log

@@ -827,7 +827,7 @@ mod tests {
     use crate::v3::fixtures::golden;
     use crate::v3::oid::{ensure_genesis, g3};
     use crate::v3::reconcile::{reconcile, RECONCILE_MESSAGE};
-    use crate::v3::records::WorkspaceResolution;
+    use crate::v3::records::SourceTreeResolution;
     use crate::v3::tree::{canonical_tree_order, Mode, Snapshot, TreeBuilder};
     use crate::v3::validate_spine;
 
@@ -1535,7 +1535,7 @@ mod tests {
         init(&repository, false);
         let mut store = GitStore::open(&repository, None).expect("open git store");
         let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
-        // GitHub's signed commits are ordinary workspace inputs. Keep their
+        // GitHub's signed commits are ordinary source tree inputs. Keep their
         // headers and object identity through reads, writes, and merges.
         let base_bytes = format!(
             "tree {base_tree}\nauthor Git Store <git-store@example.com> 1700000000 +0000\n\
@@ -1606,7 +1606,7 @@ mod tests {
 
         assert_eq!(
             reconcile(&mut store, &base, &theirs, Some(&base), &signature()).unwrap(),
-            WorkspaceResolution::Direct {
+            SourceTreeResolution::Direct {
                 current: base.clone(),
                 output: theirs.clone(),
             }
@@ -1614,7 +1614,7 @@ mod tests {
 
         let merged = reconcile(&mut store, &base, &theirs, Some(&ours), &signature()).unwrap();
         let merged_output = match merged {
-            WorkspaceResolution::Merged { merge, output, .. } => {
+            SourceTreeResolution::Merged { merge, output, .. } => {
                 assert_eq!(merge.output, Some(output.clone()));
                 assert!(merge.implementation.starts_with("git-merge-tree/"));
                 output
@@ -1635,7 +1635,7 @@ mod tests {
                 &signature()
             )
             .unwrap(),
-            WorkspaceResolution::Conflict { merge: Some(_), .. }
+            SourceTreeResolution::Conflict { merge: Some(_), .. }
         ));
 
         let root_tree = store.write_tree(&[]).unwrap();
@@ -1668,7 +1668,7 @@ mod tests {
                 &signature()
             )
             .unwrap(),
-            WorkspaceResolution::Merged { .. }
+            SourceTreeResolution::Merged { .. }
         ));
 
         let equal_tree = update_tree(&mut store, Some(&base_tree), "equal.txt", b"equal\n");
@@ -1693,14 +1693,14 @@ mod tests {
         )
         .unwrap()
         {
-            WorkspaceResolution::Merged { output, .. } => output,
+            SourceTreeResolution::Merged { output, .. } => output,
             other => panic!("equal trees must retain both histories: {other:?}"),
         };
         assert_eq!(store.tree_of(&output).unwrap(), equal_tree);
         assert!(store.is_ancestor(&equal_current, &output).unwrap());
         assert!(store.is_ancestor(&equal_proposal, &output).unwrap());
 
-        // A merge can add ancestry without changing the workspace tree.
+        // A merge can add ancestry without changing the source tree.
         let upstream = write_commit(
             &mut store,
             &base_tree,
@@ -1715,8 +1715,8 @@ mod tests {
         );
         let output =
             match reconcile(&mut store, &ours, &proposal, Some(&ours), &signature()).unwrap() {
-                WorkspaceResolution::Direct { output, .. } => output,
-                other => panic!("merge ancestry must advance the workspace: {other:?}"),
+                SourceTreeResolution::Direct { output, .. } => output,
+                other => panic!("merge ancestry must advance the source tree: {other:?}"),
             };
         assert_eq!(output, proposal);
         assert_eq!(store.tree_of(&output).unwrap(), ours_tree);

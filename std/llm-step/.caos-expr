@@ -22,5 +22,5 @@ CAOS_BUILD=curry --base:@=DEEP-DEPS/caos-build
 CAOS_TEST=curry --base:@=DEEP-DEPS/caos-test
 CAOS_TEST_RESULT=curry --base:@=DEEP-DEPS/caos-test-result
 ASYNC_WORKER=curry --base:@=DEEP-DEPS/run-and-update-ref
-STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --output-runner:@=DEEP-DEPS/git-runner
+STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --dep2:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
 curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --tools-image=$TOOLS --merge-image=$MERGE --caos-build-image=$CAOS_BUILD --caos-test-image=$CAOS_TEST --caos-test-result-image=$CAOS_TEST_RESULT --run-and-update-ref-image=$ASYNC_WORKER

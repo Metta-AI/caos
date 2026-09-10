@@ -20,7 +20,7 @@ run-then and first-class commits, the bounded bash tool
 ## Idea
 
 Each turn of a conversation (a human update, or an agent response) is a git
-commit: message = the turn's text, tree = the workspace after the turn,
+commit: message = the turn's text, tree = the source tree after the turn,
 parent = the previous turn (or the base commit the conversation started from).
 The commit DAG *is* the conversation store: branching a conversation is a
 commit with the same parent, retrying is a new commit with a new timestamp,
@@ -31,7 +31,7 @@ Why it fits caos:
 - map-then is already an agent loop: a worker either computes a value or
   describes the remaining work and exits. An LLM step is exactly that — call
   the API, and either the turn is done or there are tool calls to run.
-- Tool calls become sandboxed caos sub-runs on the workspace tree.
+- Tool calls become sandboxed caos sub-runs on the source tree.
 - No cache hits are expected on LLM steps (prompt + tree are effectively
   unique), so commits' timestamp nondeterminism costs nothing. Tool runs on
   identical trees do cache.
@@ -41,17 +41,17 @@ Why it fits caos:
 Two kinds of commits, one conversation spine:
 
 - **Human turn** — created client-side, no run needed. Parent = conversation
-  head; tree = workspace (with any human edits); message = the human's text.
+  head; tree = source tree (with any human edits); message = the human's text.
 - **Step commit** (internal) — one LLM API round. The chain of steps hangs
   off the human turn (step 1's parent is the human commit; each next step's
-  parent the previous step). Tree = workspace **plus a reserved top-level
+  parent the previous step). Tree = source tree **plus a reserved top-level
   `.caos/step.json`** (format below) holding that round's verbatim response
   blocks — the API requires replaying assistant blocks, including
   thinking-block signatures, unmodified — plus the `tool_result` blocks the
   round's *request* carried.
 - **Turn commit (agent)** — a **merge**: first parent = the human turn,
   second parent = the last step commit — or, for a turn that used no tools at
-  all, a plain single-parent commit (no steps exist). Tree = final workspace
+  all, a plain single-parent commit (no steps exist). Tree = final source tree
   with `.caos/` dropped (pure). Message = the response text.
 
 Step and turn commits are authored **`caos-agent <caos@caos>`** with real
@@ -82,7 +82,7 @@ tool_results from the tree.)
 So `git log --first-parent` is the clean conversation; following second
 parents gives the full transcript with stock git tooling. All step data is
 tree-reachable, so a plain fetch of the conversation head transfers every
-workspace state and every API exchange (a blob oid named only in a commit
+source tree state and every API exchange (a blob oid named only in a commit
 message would be unreachable — messages are text, not references).
 
 Diff shapes: step↔step = real edits + one modified `.caos/step.json`;
@@ -136,19 +136,19 @@ messages; a toolless turn as its message text), POSTs `/v1/messages`, then:
 Tool classes:
 
 - **Inline tools** (implemented — `read`, `ls`, `write`, `edit`;
-  `worker-llm-step/src/tools.rs`): hash-level workspace operations the step
+  `worker-llm-step/src/tools.rs`): hash-level source tree operations the step
   worker executes in-process — no sub-run, no container. Reads materialize
   only the path they touch (bounded: 100KB / offset+limit; `ls` reads one
   tree level); writes/edits rebuild the tree by symlinking every untouched
   entry and `caos put`ting the result (mkdir is implicit). One call queue
-  drives both classes serially (`drive`): inline calls advance the workspace
+  drives both classes serially (`drive`): inline calls advance the source tree
   in-process, a bash call tail-exits into its sub-run, and an
   inline-tools-only round costs zero containers. Failures (missing file,
   non-unique `old_string`) are `is_error` tool_results, not errors. Parameter
   shapes mirror Claude Code's file tools, which models know well.
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
-  includes the workspace tree **with `.caos/` stripped** — tools never see
-  transcripts, and tool cache keys stay identical to real workspace trees.
+  includes the source tree **with `.caos/` stripped** — tools never see
+  transcripts, and tool cache keys stay identical to real source trees.
   No network in tool images; only the llm-step image has egress. (Not yet
   enforced: both workers currently run as `curry(runner, bin)` in the shared
   runner pool, whose containers all sit on the compute network — a per-image
@@ -162,10 +162,10 @@ Tool classes:
   (one `in` tree from run-then, or direct `--tree`/`--cmd`/`--paths` args;
   `paths` newline-separated) → a result tree
   `{exit, stdout, stderr, denied?, tree}`: the exit code (decimal;
-  128+signal), 100KB tails of both streams, and the staged workspace. The
+  128+signal), 100KB tails of both streams, and the staged source tree. The
   worker fetches each declared path's ancestors one level and the leaf
   recursively, then runs `cmd` via `/bin/sh -c` in a *mirror* of the
-  workspace: loaded content as writable copies, every undeclared entry a
+  source tree: loaded content as writable copies, every undeclared entry a
   symlink to its owner-only `/cas` placeholder (worker unprivileged) → loud
   EACCES; permission-denied paths found in stderr that resolve through a
   placeholder come back in `denied`, one per line — the structured "retry
@@ -191,7 +191,7 @@ Tool classes:
   boundary (100KB budget, then matching-file counts + a narrow-the-scope
   hint); the pattern is validated in llm-step BEFORE the sub-run launches,
   so a bad regex is an is_error tool_result, never a failed turn. A grep
-  result is not a workspace: the pre-grep workspace rides the continuation
+  result is not a source tree: the pre-grep source tree rides the continuation
   curry, and only bash results advance the tree. `tests/rgrep` drives the
   fold directly (sparse shape, binary skipping, file scope, empty tree,
   cache hit); the LLM integration is covered in the `tests/chat-tools*`
@@ -213,9 +213,9 @@ This now holds for the sub-run *itself* failing, too — object fetch failed,
 container died, the tool worker exited non-zero. Every tool launch uses
 `run-then --catch` (`map-then.md`, "Catch"), so the failure comes back as
 `--error` and the callback turns it into an `is_error` tool_result over the
-UNCHANGED workspace: the call is dead, the turn is not. `ws` rides the
+UNCHANGED source tree: the call is dead, the turn is not. `ws` rides the
 continuation for bash and merge purely for this path — their success paths
-rebuild the workspace from the result.
+rebuild the source tree from the result.
 
 It did not hold before, and the gap was expensive rather than theoretical. One
 aborting `tests/<name>/cli.sh` inside the `test` tool errored that tool's
@@ -232,7 +232,7 @@ caught one is not memoized either, so a retry really retries.
 
 Raw `POST /v1/messages` (no SDK — none exists for Rust, and the Agent SDK's
 job is owning the loop, which caos owns here). `minreq` with `https-rustls`
-(matches the workspace's pure-Rust static-musl constraints) + `serde_json`.
+(matches the source tree's pure-Rust static-musl constraints) + `serde_json`.
 One blocking POST per step; no streaming (progress granularity is the step
 commit). Hand-rolled retry on 429/5xx honoring `retry-after`. Top-level
 `cache_control: {"type": "ephemeral"}` on every request — each step replays
@@ -366,7 +366,7 @@ refused if its tree carries a top-level `.caos`), `--system <text>` /
 walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
 (checked before anything is minted).
 
-The workers are resolved from the WORKSPACE, which declares them in its own
+The workers are resolved from the SOURCE_TREE, which declares them in its own
 `DEPS` (`./std/llm-step llm-step`); the root `.caos-expr` expands that into a
 `DEEP-DEPS/` mount and the client descends it (design/caos-expr.md). Each
 resolves to a `curry(runner, bin=<static binary>)` node, so the per-turn state
@@ -438,7 +438,7 @@ deadlines are comfortable; the top-level pending timeout
    locally. **Done** (same files; `tests/chat-online` is the UX spec).
 7. Structured client events + `caos tui` — presentation-independent turn
    events, durable history/diff readers, multiline composer, task switching,
-   live activity, workspace review, and confirmed clean-checkout apply. **Done**
+   live activity, source tree review, and confirmed clean-checkout apply. **Done**
    (`crates/caos-cli/src/bin/tui`; unit tests plus the existing chat integration suite).
 8. **Talk while thinking** — interjections as a second commit branch that the
    turn merge reconciles: steer a running turn at round boundaries via a
