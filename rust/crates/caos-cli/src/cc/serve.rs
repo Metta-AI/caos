@@ -187,8 +187,27 @@ fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
             // to the main thread, and a transport opened before the remote
             // existed would not have it. This process already stands in the
             // work directory (`cc_transport`).
+            // REACHABILITY IS PROBED, WITH A DEADLINE; THE WORK IS NOT.
+            //
+            // A resolution legitimately takes minutes -- it may build the step
+            // -- so nothing here may impose a deadline on it. But the thing it
+            // does FIRST is talk to the caos server, and in a cloud container
+            // that server is reached through a tunnel. A tunnel whose far end
+            // is gone does not refuse: it accepts and swallows, so the push
+            // waits forever, this attempt never returns, the retry below never
+            // comes round, and the status says "nothing has failed yet"
+            // indefinitely. Measured in a container whose listener had died:
+            // that is exactly what it said, twenty-seven seconds in.
+            //
+            // `ensure_server_reachable` is a five-second HTTP round trip, which
+            // is the rule this tree already states for probing an address that
+            // might be stale. It turns the one failure that cannot announce
+            // itself into a sentence naming the server.
             let found = match GitTransport::from_cwd() {
-                Ok(t) => declarations(&t, &options),
+                Ok(t) => match t.ensure_server_reachable() {
+                    Ok(()) => declarations(&t, &options),
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(format!("cannot open the caos workspace: {error}")),
             };
             match found {

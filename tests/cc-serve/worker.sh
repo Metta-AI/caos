@@ -113,4 +113,29 @@ case "$listing" in
 esac
 close_server
 
+echo "== an unreachable caos server is named, not waited on ==" >&2
+# LAST, because it breaks the remote for everything after it. A caos server
+# reached through a dead tunnel ACCEPTS and never answers, so the resolution
+# hangs rather than failing and the status can never improve -- which is what a
+# real cloud container showed, twenty-seven seconds into "nothing has failed
+# yet". A refused port is the testable half of that: it proves the probe runs
+# and that its message names the server. The swallowing half is the same code
+# path with a timeout instead of a refusal.
+git remote set-url caos http://127.0.0.1:9
+open_server "--llm-step:@=DEEP-DEPS/llm-step"
+send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+await '"id":1' 10 >/dev/null || fail "the handshake did not answer without a server"
+status=""
+for id in 2 3 4 5; do
+  send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"caos_status\",\"arguments\":{}}}"
+  status=$(await "\"id\":$id" 20) || fail "caos_status did not answer"
+  case "$status" in *"cannot reach the CAOS server"*) break ;; esac
+  sleep 3
+done
+case "$status" in
+  *"cannot reach the CAOS server"*) ;;
+  *) fail "an unreachable server was not named: $status" ;;
+esac
+close_server
+
 echo "cc-serve: ALL PASS" >&2
