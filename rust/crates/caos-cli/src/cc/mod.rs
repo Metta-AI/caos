@@ -245,6 +245,14 @@ fn tools_configuration(
     id: &str,
     store: &[caos::ClientSecret],
 ) -> Result<String, String> {
+    // FIVE SECONDS, IN FRONT OF EVERYTHING BELOW. Resolving the step and
+    // preparing a request both talk to the caos server, and in a cloud session
+    // that server is reached through a tunnel. A tunnel whose far end is gone
+    // accepts and swallows, so those waits are unbounded -- and this is the
+    // path a HOOK takes. A `UserPromptSubmit` hook that never returns takes the
+    // session's prompt with it, which presents as Claude Code hanging on the
+    // first thing you type, with nothing anywhere saying why.
+    t.ensure_server_reachable()?;
     let mut config = vec![format!("--conversation={id}")];
     let merge_refs = crate::snapshot_merge_refs(t)?;
     if !merge_refs.is_empty() {
