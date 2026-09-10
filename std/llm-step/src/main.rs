@@ -739,7 +739,7 @@ fn llm_round(
         "thinking": {"type": "adaptive"},
         "cache_control": {"type": "ephemeral"},
         "system": format!("{}{}", cfg.system, format!("{}{}", source_trees::context(&state.conversation()?, cfg.focus_source_tree.as_deref())?, source_trees::repository_context(&state.conversation()?, source_trees)?)),
-        "tools": registry(cfg, source_trees)?,
+        "tools": registry(cfg)?,
         "messages": messages,
     });
     let status = |text: &str| eprintln!("llm-step: {text}");
@@ -1098,9 +1098,6 @@ fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String
         .filter(|name| !name.is_empty());
     if requested.is_none() {
         if matches!(call.name.as_str(), "bash" | "grep") {
-            return Ok(Target::Files);
-        }
-        if matches!(call.name.as_str(), "read" | "ls") && call.input.get("root").is_some() {
             return Ok(Target::Files);
         }
         if tools::is_inline(&call.name) {
@@ -1968,96 +1965,74 @@ fn tool_complete_transition(
     })
 }
 
+/// Older file calls name a source tree separately. Translate that selector once;
+/// every inline tool then reads or edits the same conversation filesystem.
+fn normalize_inline_call(call: &Call, target: &Target) -> Call {
+    let mut normalized = call.clone();
+    if let Some(input) = normalized.input.as_object_mut() {
+        input.remove("source_tree");
+    }
+    if let Some((key, mut path)) = inline_files_path(call) {
+        let explicit_root = matches!(call.name.as_str(), "read" | "ls")
+            && call.input["root"]
+                .as_str()
+                .is_some_and(|root| !root.trim().is_empty());
+        // Leave missing/empty file paths to the tools' normal validation.
+        let has_path =
+            call.name == "ls" || path.split('/').any(|part| !part.is_empty() && part != ".");
+        if !explicit_root && has_path {
+            if let Target::SourceTree { name, .. } = target {
+                path = format!("{name}/{path}");
+            }
+        }
+        normalized.input[key] = json!(path);
+    }
+    normalized
+}
+
 fn execute_inline(
     state: &mut progress::State,
     site: &CallSite<'_>,
     target: Target,
 ) -> Result<(), String> {
-    let call = site.call;
-    match target {
-        Target::SourceTree { name, commit } => {
-            let (ws, _) = materialize_source_tree(state, &commit)?;
-            let mut clean = call_without_source_tree(call);
-            if call.input.get("source_tree").is_none() {
-                if let Some((key, path)) = inline_files_path(call) {
-                    if path == name {
-                        clean["input"][key] = json!(".");
-                    } else if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
-                        clean["input"][key] = json!(relative);
-                    }
-                }
-            }
-            let (block, new_ws) = tools::execute(&clean, &ws)?;
-            let (proposal, resolution) = match new_ws {
-                None => (None, None),
-                Some(new_ws) => {
-                    let tree = Oid::parse(&cas_hash(&new_ws)?, "inline result tree")?;
-                    let proposal = mint_source_tree_commit(state, &tree, &commit, &call.name)?;
-                    // Inline mutation already published this tree through the
-                    // `caos put` in tools::rebuild.
-                    state.publish_commit(&proposal)?;
-                    (
-                        Some(proposal.clone()),
-                        Some(SourceTreeResolution::Direct {
-                            current: commit.clone(),
-                            output: proposal,
-                        }),
-                    )
-                }
-            };
-            site.complete(state, block, Some((name, commit)), proposal, resolution)?;
+    let call = normalize_inline_call(site.call, &target);
+    if let Some((_, relative)) = inline_files_path(&call) {
+        if matches!(call.name.as_str(), "write" | "edit")
+            && (relative == ".caos" || relative.starts_with(".caos/"))
+        {
+            return site.fail(
+                state,
+                ".caos is protocol metadata; use conversation commands to change it",
+            );
         }
-        Target::Files => {
-            let file_path = inline_files_path(call);
-            let (key, relative) = file_path.clone().unwrap_or(("file-path", String::new()));
-            if matches!(call.name.as_str(), "write" | "edit")
-                && (relative == ".caos" || relative.starts_with(".caos/"))
-            {
-                return site.fail(
-                    state,
-                    ".caos is protocol metadata; use conversation commands to change it",
-                );
-            }
-            let root = materialize_files(state)?;
-            let mut clean = call_without_source_tree(call);
-            if file_path.is_some() {
-                clean["input"][key] = Value::String(relative.clone());
-            }
-            let (block, new_root) = tools::execute(&clean, &root)?;
-            let mut stub = site.stub(None);
-            if let Some(root) = new_root {
-                let base = state.head().clone();
-                stub.input_commit = Some(base.clone());
-                let tree = Oid::parse(&cas_hash(&root)?, "inline result tree")?;
-                let proposal = mint_source_tree_commit(state, &tree, &base, &call.name)?;
-                state.publish_commit(&proposal)?;
-                complete_files_compute(state, &stub, block, &proposal)?;
-            } else {
-                let record = completed_record(
-                    &stub,
-                    ToolResult::Complete {
-                        observation: observation_path(&stub),
-                        proposal: None,
-                    },
-                    None,
-                );
-                state.append(tool_complete_transition(record, &block, Vec::new())?)?;
-            }
-        }
+    }
+    let root = materialize_files(state)?;
+    let (block, new_root) = tools::execute(&call.value(), &root)?;
+    let mut stub = site.stub(None);
+    if let Some(root) = new_root {
+        let base = state.head().clone();
+        stub.input_commit = Some(base.clone());
+        let tree = Oid::parse(&cas_hash(&root)?, "inline result tree")?;
+        let proposal = mint_source_tree_commit(state, &tree, &base, &call.name)?;
+        state.publish_commit(&proposal)?;
+        complete_files_compute(state, &stub, block, &proposal)?;
+    } else {
+        let record = completed_record(
+            &stub,
+            ToolResult::Complete {
+                observation: observation_path(&stub),
+                proposal: None,
+            },
+            None,
+        );
+        state.append(tool_complete_transition(record, &block, Vec::new())?)?;
     }
     Ok(())
 }
 
 fn materialize_files(state: &mut progress::State) -> Result<String, String> {
-    let files = Some(state.conversation()?.tree().clone());
     let output = fresh("conversation-files");
-    match files {
-        Some(tree) => caos(["get-hash", tree.as_str(), &output])?,
-        None => {
-            let empty = scratch("conversation-files-empty")?;
-            caos(["put", path(&empty), &output])?;
-        }
-    }
+    caos(["get-hash", state.conversation()?.tree().as_str(), &output])?;
     Ok(output)
 }
 
@@ -3042,7 +3017,7 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
     Ok(paths)
 }
 
-fn registry(cfg: &Config, _source_trees: &[String]) -> Result<Vec<Value>, String> {
+fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     let mut registry = vec![bash_tool()];
     registry.extend(tools::declarations());
     if cfg.run_and_update_ref_image.is_some() {
@@ -4103,7 +4078,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_tree_files_path_targets_source_tree() {
+    fn explicit_source_tree_files_paths_normalize_to_conversation_paths() {
         let mut store = MemoryStore::default();
         let head = root_with(&mut store, BTreeMap::from([("main".into(), test_oid('a'))])).unwrap();
         let view = Conversation::open(&store, &head).unwrap();
@@ -4142,6 +4117,27 @@ mod tests {
                     Target::SourceTree { .. }
                 ),
                 "{name}"
+            );
+            let target = resolve_target(&view, &call).unwrap();
+            let normalized = normalize_inline_call(&call, &target);
+            assert_eq!(normalized.input[path_arg], "main/files/config.json");
+            assert!(normalized.input.get("source_tree").is_none());
+            assert!(matches!(
+                resolve_target(&view, &normalized).unwrap(),
+                Target::Files
+            ));
+            if matches!(name, "read" | "ls") {
+                call.input["root"] = json!(test_oid('b').as_str());
+                assert_eq!(
+                    normalize_inline_call(&call, &target).input[path_arg],
+                    "files/config.json"
+                );
+                call.input.as_object_mut().unwrap().remove("root");
+            }
+            call.input[path_arg] = json!(".");
+            assert_eq!(
+                normalize_inline_call(&call, &target).input[path_arg],
+                if name == "ls" { "main/." } else { "." }
             );
             call.input["source_tree"] = json!("missing");
             assert!(resolve_target(&view, &call)

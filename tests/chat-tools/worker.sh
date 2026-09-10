@@ -44,7 +44,7 @@ $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/tools.js
 jq -s -e '
   length == 5 and
   (map(.id) | sort) == (["tu_w","tu_r","tu_e","tu_x","tu_l"] | sort) and
-  all(.[]; .status == "complete" and .task == null and (.source_tree_name == "main" or .id == "tu_w"))
+  all(.[]; .status == "complete" and .task == null and .source_tree_name == null)
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "inline tool records are wrong"; }
 [ "$($TOOL parents --repo /tmp/repo --head "$head" | grep -c ' tool.complete$')" -eq 5 ] \
   || fail "inline calls did not append five tool.complete transitions"
@@ -58,7 +58,7 @@ grep -qF '"is_error":true' /tmp/failed-edit.json \
 grep -qF '"hello world"' /tmp/stub/request-2.json || fail "read result not sent"
 grep -qF 'wrote main/files/new.txt (11 bytes)' /tmp/stub/request-2.json \
   || fail "write result not sent"
-grep -qF 'edited files/new.txt (1 replacement)' /tmp/stub/request-2.json \
+grep -qF 'edited main/files/new.txt (1 replacement)' /tmp/stub/request-2.json \
   || fail "edit result not sent"
 grep -qF 'new.txt\ntodo.txt' /tmp/stub/request-2.json || fail "ls listing not sent"
 grep -qF '"is_error":true' /tmp/stub/request-2.json || fail "bad edit not marked is_error"
