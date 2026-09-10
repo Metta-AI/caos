@@ -1,0 +1,9 @@
+# tests/cc-serve, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A CLIENT TEST — it drives `caos cc serve`, the tool server Claude Code
+# spawns, over the same stdio protocol Claude Code speaks. What it pins is the
+# server's TIMING, which is the whole design and was twice broken by changes
+# that looked correct: the handshake must not wait on anything, and a server
+# with no tools must still say why it has none.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
