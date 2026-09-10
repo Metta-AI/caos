@@ -149,16 +149,18 @@ move it into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
-  .base-url                 # two lines: repository URL, then base branch
+  .base-url                 # optional until publishing: URL, then base branch
   00-base          -> W_0   # exact incorporated base
   01-add-targeting -> W_1   # first PR boundary
   02-improve-it    -> W_2   # second PR boundary
   dirty            -> W_d   # current work, when present
 ```
 
-`.base-url` says where to fetch and publish. `00-base` says which commit has
-actually been incorporated. They are distinct: fetching a newer remote tip
-does not integrate it.
+`.base-url` is optional until publishing. Work, delegation, merging, tests,
+and review boundaries depend only on the recorded commits, so preparing a
+stack does not require choosing a destination. When present, `.base-url`
+names the publishing repository and base branch. `00-base` records the commit
+actually incorporated; fetching a newer remote tip does not integrate it.
 
 Review boundaries use exactly two digits from `01` through `99`, a hyphen,
 and a nonempty description, such as `01-parser`. They are not individual edits.
@@ -219,7 +221,8 @@ Credentials, server choice, and client caches remain local.
 
 ## Publication
 
-Select a stack directory and derive the plan:
+Choose a publishing destination when ready to publish, add `.base-url` if
+absent, then select a stack directory and derive the plan:
 
 - Repository and external base: `.base-url`.
 - Branch names: entry paths, such as `paintbot-feature/01-add-targeting`.
