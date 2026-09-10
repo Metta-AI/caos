@@ -165,7 +165,11 @@ install -d /usr/local/share/caos
 {
     echo "built:  $(date --iso-8601=seconds 2>/dev/null || date)"
     echo "base:   $base"
-    echo "client: $(caos --version 2>&1 | head -1)"
+    # `--version` is not a flag: the client answers with its usage, whose first
+    # line is `<prog> (<rev>)` -- carrying the `caos: ` prefix `main` puts on an
+    # error. Stripped here, or the stamp reads `client: caos: caos (build-…)`.
+    client="$(caos --version 2>&1 | head -1)"
+    echo "client: ${client#caos: }"
 } > /usr/local/share/caos/setup-stamp
 
 exit 0

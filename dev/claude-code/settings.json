@@ -1,12 +1,9 @@
 {
   "permissions": {
     "deny": [
-      "Read",
       "Write",
       "Edit",
-      "NotebookEdit",
-      "Glob",
-      "Grep"
+      "NotebookEdit"
     ],
     "allow": [
       "mcp__caos"

@@ -32,6 +32,13 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
+/// How long the tool resolution keeps trying: 20 attempts, 15 seconds apart,
+/// so five minutes of a session's setup being slow or out of order costs
+/// nothing. A cold BUILD is not what this waits out -- that happens inside one
+/// attempt -- it is a `caos` remote or a tunnel that does not exist yet.
+const RESOLVE_ATTEMPTS: u32 = 20;
+const RESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
 /// stop the server.
 ///
@@ -111,16 +118,41 @@ fn write_message(out: &Out, message: &Value) -> Result<(), String> {
 /// arrives, and the tools appear when they are ready.
 fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
     std::thread::spawn(move || {
-        // Its OWN transport: the one in `serve` belongs to the main thread, and
-        // this process already stands in the work directory (`cc_transport`).
-        let found = match GitTransport::from_cwd() {
-            Ok(t) => declarations(Ok(&t), &options),
-            Err(error) => {
-                eprintln!("caos cc serve: cannot open the caos workspace: {error}");
-                Vec::new()
+        // RETRIED, because this races the session's own setup. The client
+        // reaches caos through a `caos` git remote and a tunnel, and in a cloud
+        // container BOTH are established by the SessionStart hook -- which runs
+        // when the session starts, not before this server is spawned. A single
+        // attempt that lost that race would find no server, give up, and leave
+        // the session with an empty tool list and no second chance.
+        //
+        // Only "not ready yet" is worth retrying, and there is no way to tell
+        // that from any other failure, so everything is: the cost of a wrong
+        // guess is a few sleeping seconds in a thread nothing waits on.
+        let mut found = Vec::new();
+        for attempt in 0..RESOLVE_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(RESOLVE_INTERVAL);
             }
-        };
+            // Its OWN transport, opened per attempt: the one in `serve` belongs
+            // to the main thread, and a transport opened before the remote
+            // existed would not have it. This process already stands in the
+            // work directory (`cc_transport`).
+            found = match GitTransport::from_cwd() {
+                Ok(t) => declarations(Ok(&t), &options),
+                Err(error) => {
+                    eprintln!("caos cc serve: cannot open the caos workspace: {error}");
+                    Vec::new()
+                }
+            };
+            if !found.is_empty() {
+                break;
+            }
+        }
         if found.is_empty() {
+            eprintln!(
+                "caos cc serve: no tools after {RESOLVE_ATTEMPTS} attempts; \
+                 this session has none. The reasons are above."
+            );
             return;
         }
         match registry.lock() {
