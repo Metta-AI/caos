@@ -719,6 +719,10 @@ impl CodeOps for GitStore {
         if ancestor == descendant {
             return Ok(true);
         }
+        // Gitlinks do not bring their target commits into a conversation fetch.
+        // Raw Git needs both histories locally, just as read_commit does.
+        self.ensure_local(ancestor)?;
+        self.ensure_local(descendant)?;
         let output = self.output(&[
             "merge-base",
             "--is-ancestor",
@@ -1474,7 +1478,12 @@ mod tests {
                 oid: lazy_blob.clone(),
             }])
             .expect("write lazy tree");
-        let lazy_commit = write_commit(&mut first_store, &lazy_tree, &[], "lazy\n");
+        let lazy_commit = write_commit(
+            &mut first_store,
+            &lazy_tree,
+            &[fetched_commit.clone()],
+            "lazy\n",
+        );
         let fetched_ref = "refs/caos/test/fetched";
         let lazy_ref = "refs/caos/test/lazy";
         first_store
@@ -1487,7 +1496,7 @@ mod tests {
                 RefUpdate {
                     refname: lazy_ref.to_string(),
                     expected: None,
-                    new: Some(lazy_commit),
+                    new: Some(lazy_commit.clone()),
                 },
             ])
             .expect("push refs");
@@ -1505,6 +1514,13 @@ mod tests {
         assert!(second_store.has_local(&fetched_tree).unwrap());
         assert!(second_store.has_local(&fetched_blob).unwrap());
         assert!(!second_store.has_local(&lazy_blob).unwrap());
+        assert!(!second_store.has_local(&lazy_commit).unwrap());
+        assert!(second_store
+            .is_ancestor(&fetched_commit, &lazy_commit)
+            .unwrap());
+        assert!(!second_store
+            .is_ancestor(&lazy_commit, &fetched_commit)
+            .unwrap());
         assert_eq!(second_store.read_blob(&lazy_blob).unwrap(), b"lazy blob\n");
         assert!(second_store.has_local(&lazy_blob).unwrap());
     }
