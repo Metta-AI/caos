@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use worker_common::{
-    arg, caos, caos_curry, cas_hash, entries, file_name, link, map_then, own_image, path, read_arg,
-    read_arg_opt, run_worker, scratch, Arg,
+    arg, caos, caos_curry, cas_hash, cas_kind, entries, file_name, link, map_then, own_image, path,
+    read_arg, read_arg_opt, run_worker, scratch, Arg,
 };
 
 /// git's well-known empty tree — a child result with no matches, skipped so
@@ -61,7 +61,9 @@ fn grep() -> Result<(), String> {
     let re = regex::Regex::new(&pattern)
         .map_err(|e| format!("invalid pattern {pattern:?}: {e} (the caller validates)"))?;
 
-    let input = arg("in");
+    let original = arg("in");
+    let input = "/cas/rgrep-root".to_string();
+    caos(["resolve", &cas_hash(&original)?, ".", &input])?;
     caos(["get", &input])?; // a file: its content; a tree: one level
 
     if Path::new(&input).is_file() {
@@ -76,7 +78,10 @@ fn grep() -> Result<(), String> {
     let own = scratch("rgrep-own")?;
     let mut subdirs: Vec<PathBuf> = Vec::new();
     for child in entries(&input)? {
-        if child.is_dir() {
+        if child.is_symlink() {
+            continue;
+        }
+        if child.is_dir() || cas_kind(path(&child))? == "commit" {
             subdirs.push(child);
             continue;
         }

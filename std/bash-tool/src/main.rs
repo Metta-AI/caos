@@ -1,45 +1,15 @@
-//! caos-worker-bash-tool: the agent harness's *bounded* bash tool (see
-//! design/agent-harness.md). Input is `{tree, cmd, paths}` — a workspace tree,
-//! a shell command, and the workspace-relative paths the command intends to
-//! touch. Only the declared paths are materialized; the whole tree never is.
-//! The command runs via `/bin/sh -c` in a mirror of the workspace where every
-//! *undeclared* entry is a symlink to its owner-only `/cas` placeholder, so a
-//! touch of one fails loudly with EACCES — and the result carries a structured
-//! retry hint (`denied`) naming the placeholder paths the stderr mentions.
-//!
-//! The input arrives either as one `in` tree argument (`{tree, cmd, paths}` —
-//! the shape a run-then sub-run passes) or as the three direct arguments
-//! `--tree`/`--cmd`/`--paths` (convenient for `caos-cli run`). `paths` is a
-//! blob of newline-separated relative paths, and may be absent or empty.
-//!
-//! **Any command outcome is a value, never a worker error** — a failing
-//! command is something the model must see and react to. The result is a tree:
-//!
-//! ```text
-//! exit    blob  the command's exit code, decimal (128+signal if killed)
-//! stdout  blob  captured stdout, the last 100KB
-//! stderr  blob  captured stderr, the last 100KB
-//! denied  blob  (only when detected) unmaterialized paths the command
-//!               touched, one per line — retry with them added to `paths`
-//! tree    tree  the workspace after the command: real files staged back,
-//!               untouched placeholders round-tripped by their recorded hash
-//! ```
-//!
-//! Only infrastructure failures (a fetch failing, the staging put failing)
-//! error the run.
-//!
-//! The CAS carries git's executable bit on blobs (it rides on the materialized
-//! node's own mode), so a round-trip through this tool preserves the exec bit
-//! on files under declared paths as well as on the undeclared subtrees that
-//! round-trip untouched by hash.
+//! Bounded shell execution over a writable projection of an input Git tree.
+//! Input: {tree, cmd, paths, cwd?}. Paths are relative to the input root,
+//! independent of cwd. Commit entries become directories and retain their
+//! provenance through ordinary file operations; caos put restores the boundaries.
+//! Result: {tree, exit, stdout, stderr, denied?}. Command failures are values.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use worker_common::{arg, caos, entries, file_name, link, path, run_worker, scratch, ARGS};
+use worker_common::{arg, caos, cas_hash, link, path, run_worker, scratch, ARGS};
 
 /// Keep at most this many bytes (the tail) of each captured stream.
 const STREAM_CAP: usize = 100_000;
@@ -61,24 +31,37 @@ fn run() -> Result<(), String> {
     let paths = read_paths(&format!("{base}/paths"))?;
     let tree = format!("{base}/tree");
     if !Path::new(&tree).exists() {
-        return Err(format!("no workspace tree at {tree}"));
+        return Err(format!("no source tree at {tree}"));
     }
-    caos(["get", &tree])?; // the root's entries become visible (as placeholders)
-
-    // Materialize exactly the declared paths, nothing else.
-    for p in &paths {
-        materialize_declared(&tree, p)?;
-    }
-
-    // Mirror the workspace into a writable working tree: loaded content as real
-    // (rw) files/dirs, unloaded placeholders as symlinks into /cas.
     let work = scratch("work")?;
-    mirror(Path::new(&tree), &work)?;
+    let hash = cas_hash(&tree)?;
+    let mut checkout = vec!["checkout".to_string(), hash, path(&work).to_string()];
+    checkout.extend(paths);
+    worker_common::caos_argv(&checkout.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let cwd = if Path::new(&format!("{base}/cwd")).exists() {
+        read_blob(&format!("{base}/cwd"))?
+    } else {
+        ".".to_string()
+    };
+    if Path::new(&cwd).is_absolute()
+        || Path::new(&cwd)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("cwd must be a conversation-relative directory".into());
+    }
+    let cwd = work
+        .join(cwd)
+        .canonicalize()
+        .map_err(|e| format!("cwd: {e}"))?;
+    if !cwd.starts_with(&work) {
+        return Err("cwd leaves the writable tree".into());
+    }
 
     // Run the command as this (already unprivileged) worker, cwd the tree root.
     let out = Command::new("/bin/sh")
         .args(["-c", &cmd])
-        .current_dir(&work)
+        .current_dir(&cwd)
         .output()
         .map_err(|e| format!("running /bin/sh: {e}"))?;
     let exit = exit_code(&out.status);
@@ -124,86 +107,16 @@ fn read_paths(cas_path: &str) -> Result<Vec<String>, String> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .filter(|l| {
-            !l.starts_with('/')
-                && Path::new(l)
-                    .components()
-                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            *l == "."
+                || (!l.starts_with('/')
+                    && Path::new(l)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))))
         })
         .map(|l| l.trim_end_matches('/').to_string())
         .collect())
 }
 
-/// Materialize one declared path inside the (already one-level-loaded) tree:
-/// each intermediate directory one level, then the leaf recursively — so a
-/// declared file costs its ancestor trees plus itself, and a declared
-/// directory its whole subtree, never anything beside them. A path that
-/// doesn't exist (the command may be about to create it) or descends into a
-/// blob is left alone.
-fn materialize_declared(tree: &str, rel: &str) -> Result<(), String> {
-    let mut cur = PathBuf::from(tree);
-    let comps: Vec<&str> = rel.split('/').collect();
-    for (i, comp) in comps.iter().enumerate() {
-        cur.push(comp);
-        let Ok(meta) = fs::symlink_metadata(&cur) else {
-            return Ok(()); // no such entry — nothing to load
-        };
-        if meta.file_type().is_symlink() {
-            return Ok(()); // a git symlink is already fully materialized
-        }
-        if i + 1 == comps.len() {
-            caos(["get", "-r", path(&cur)])?; // the leaf, in full
-        } else if meta.is_dir() {
-            caos(["get", path(&cur)])?; // an ancestor, one level
-        } else {
-            return Ok(()); // path descends into a blob — nothing to do
-        }
-    }
-    Ok(())
-}
-
-/// Whether a CAS node has been fetched (world-readable) as opposed to an
-/// owner-only placeholder — the same mode convention the client uses.
-fn is_loaded(meta: &fs::Metadata) -> bool {
-    meta.permissions().mode() & 0o044 != 0
-}
-
-/// Mirror the (partially loaded) CAS tree at `src` into the writable working
-/// tree at `dst`: loaded directories become real rw directories (recursed),
-/// loaded blobs writable copies, git symlinks are recreated as-is, and
-/// unloaded placeholders become symlinks to their `/cas` node — unreadable to
-/// the worker (EACCES on touch) and resolved back to their recorded hash by
-/// `caos put` when staging.
-fn mirror(src: &Path, dst: &Path) -> Result<(), String> {
-    for entry in entries(path(src))? {
-        let target = dst.join(file_name(&entry));
-        let meta = fs::symlink_metadata(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-        if meta.file_type().is_symlink() {
-            let dest = fs::read_link(&entry).map_err(|e| format!("{}: {e}", entry.display()))?;
-            symlink(&dest, &target).map_err(|e| format!("linking {}: {e}", target.display()))?;
-        } else if !is_loaded(&meta) {
-            link(&entry, &target)?;
-        } else if meta.is_dir() {
-            fs::create_dir(&target).map_err(|e| format!("creating {}: {e}", target.display()))?;
-            mirror(&entry, &target)?;
-        } else {
-            fs::copy(&entry, &target).map_err(|e| format!("copying {}: {e}", entry.display()))?;
-            // A writable copy, keeping git's exec bit (the CAS node carries it)
-            // so an executable file stays executable — for the command that runs
-            // here and for the `caos put` that stages it back.
-            let mode = if meta.permissions().mode() & 0o111 != 0 {
-                0o755
-            } else {
-                0o644
-            };
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode))
-                .map_err(|e| format!("chmod {}: {e}", target.display()))?;
-        }
-    }
-    Ok(())
-}
-
-/// The command's exit code — or 128+signal when it died to one, the shell
-/// convention the model will recognize.
 fn exit_code(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
@@ -226,7 +139,7 @@ fn tail(bytes: &[u8]) -> Vec<u8> {
 /// Scan stderr for permission-denied complaints and collect the mentioned
 /// paths that resolve to unmaterialized placeholders in the working tree —
 /// the structured "retry with these in `paths`" hint. Tokens on offending
-/// lines are tried as workspace-relative (or work-tree-absolute) paths; one
+/// lines are tried as conversation-relative (or work-tree-absolute) paths; one
 /// counts if its resolution crosses a placeholder symlink.
 fn scan_denied(stderr: &str, work: &Path) -> BTreeSet<String> {
     let mut hits = BTreeSet::new();
@@ -253,7 +166,7 @@ fn scan_denied(stderr: &str, work: &Path) -> BTreeSet<String> {
 }
 
 /// Whether resolving `rel` from the work root crosses a placeholder symlink
-/// (a link into `/cas` — the only symlinks `mirror` creates for unloaded
+/// (a link into `/cas` — the symlinks checkout creates for unloaded
 /// nodes; git symlinks it recreates point elsewhere).
 fn crosses_placeholder(work: &Path, rel: &str) -> bool {
     let cas = Path::new(ARGS).parent().unwrap_or(Path::new("/cas"));
