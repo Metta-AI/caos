@@ -1,16 +1,14 @@
-//! Snapshot browsing and explicitly applied shell proposals.
+//! Read-only browsing of conversation files and adjacent source commits.
 use super::*;
-use conversation_protocol::v3::tree::{diff, Snapshot, TreeEntry};
+use conversation_protocol::v3::tree::{Snapshot, TreeEntry};
 use conversation_protocol::v3::Mode;
 
 const MAX_BLOB: usize = 256 * 1024;
-const MAX_SEARCH_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotInfo {
     pub head: String,
     pub tree: String,
-    pub parent: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -20,56 +18,22 @@ pub struct Entry {
     pub directory: bool,
     pub commit: Option<String>,
     pub change: char,
-    pub detail: String,
-    pub line: usize,
 }
 
-pub fn snapshot(
-    t: &GitTransport,
-    id: &str,
-    revision: Option<&str>,
-) -> Result<SnapshotInfo, String> {
+pub struct Preview {
+    pub title: String,
+    pub text: String,
+}
+
+pub fn snapshot(t: &GitTransport, id: &str) -> Result<SnapshotInfo, String> {
     let store = open_store(t)?;
-    let (_, current) =
+    let (_, head) =
         fetch_validated_head(t, &store, id)?.ok_or("conversation has no snapshot yet")?;
-    let head = revision
-        .map(|r| oid(r, "conversation snapshot"))
-        .transpose()?
-        .unwrap_or(current.clone());
-    if !spine_contains(&store, current, &head)? {
-        return Err("snapshot is not in this conversation's history".into());
-    }
     let commit = store.read_commit(&head)?;
     Ok(SnapshotInfo {
         head: head.to_string(),
         tree: commit.tree.to_string(),
-        parent: commit
-            .parents
-            .first()
-            .filter(|p| p.as_str() != G3)
-            .map(ToString::to_string),
     })
-}
-
-pub fn history(t: &GitTransport, head: &str) -> Result<Vec<SnapshotInfo>, String> {
-    let store = open_store(t)?;
-    let mut cursor = oid(head, "snapshot")?;
-    let mut out = Vec::new();
-    for _ in 0..200 {
-        if cursor.as_str() == G3 {
-            break;
-        }
-        let commit = store.read_commit(&cursor)?;
-        let parent = commit.parents.first().filter(|p| p.as_str() != G3).cloned();
-        out.push(SnapshotInfo {
-            head: cursor.to_string(),
-            tree: commit.tree.to_string(),
-            parent: parent.as_ref().map(ToString::to_string),
-        });
-        let Some(next) = parent else { break };
-        cursor = next;
-    }
-    Ok(out)
 }
 
 fn lookup(store: &dyn ObjectStore, root: &Oid, path: &str) -> Result<Option<TreeEntry>, String> {
@@ -116,32 +80,101 @@ fn children(store: &dyn ObjectStore, root: &Oid, path: &str) -> Result<Vec<TreeE
     Snapshot::new(store, entry.oid).list("")
 }
 
-pub fn list(
-    t: &GitTransport,
-    tree: &str,
-    baseline: &str,
-    path: &str,
-    changes: bool,
-) -> Result<Vec<Entry>, String> {
+// Feature boundaries are sibling gitlinks in descending filename order.
+// The final entry has no preceding boundary and is browsed as content.
+fn pair(
+    store: &GitStore,
+    root: &Oid,
+    folder: &str,
+    name: Option<&str>,
+) -> Result<Option<(TreeEntry, TreeEntry)>, String> {
+    let mut commits: Vec<_> = children(store, root, folder)?
+        .into_iter()
+        .filter(|e| e.mode == Mode::Commit)
+        .collect();
+    commits.sort_by(|a, b| b.name.cmp(&a.name));
+    let index = match name {
+        Some(name) => match commits.iter().position(|e| e.name == name) {
+            Some(index) => index,
+            None => return Ok(None),
+        },
+        None => 0,
+    };
+    Ok(commits
+        .get(index)
+        .zip(commits.get(index + 1))
+        .map(|(after, before)| (before.clone(), after.clone())))
+}
+
+struct Comparison {
+    before: Oid,
+    after: Oid,
+    path: String,
+    title: String,
+}
+
+fn comparison(store: &GitStore, root: &Oid, path: &str) -> Result<Option<Comparison>, String> {
+    let mut folder = String::new();
+    for part in path.split('/').filter(|s| !s.is_empty()) {
+        let entry = children(store, root, &folder)?
+            .into_iter()
+            .find(|e| e.name == part);
+        if entry.is_some_and(|e| e.mode == Mode::Commit) {
+            return pair(store, root, &folder, Some(part))?
+                .map(|(before, after)| {
+                    let prefix = if folder.is_empty() {
+                        part.to_string()
+                    } else {
+                        format!("{folder}/{part}")
+                    };
+                    Ok(Comparison {
+                        title: format!(
+                            "{}/{} {} -> {} {}",
+                            folder,
+                            before.name,
+                            &before.oid.as_str()[..7],
+                            after.name,
+                            &after.oid.as_str()[..7]
+                        ),
+                        before: store.read_commit(&before.oid)?.tree,
+                        after: store.read_commit(&after.oid)?.tree,
+                        path: path
+                            .strip_prefix(&prefix)
+                            .unwrap()
+                            .trim_start_matches('/')
+                            .into(),
+                    })
+                })
+                .transpose();
+        }
+        folder = if folder.is_empty() {
+            part.into()
+        } else {
+            format!("{folder}/{part}")
+        };
+    }
+    Ok(None)
+}
+
+pub fn list(t: &GitTransport, tree: &str, path: &str) -> Result<Vec<Entry>, String> {
     let store = open_store(t)?;
-    let before = children(&store, &oid(baseline, "baseline tree")?, path)?;
-    let after = children(&store, &oid(tree, "snapshot tree")?, path)?;
+    let root = oid(tree, "snapshot tree")?;
+    let comparison = comparison(&store, &root, path)?;
+    let comparing = comparison.is_some();
+    let (before, after) = match comparison {
+        Some(c) => (
+            children(&store, &c.before, &c.path)?,
+            children(&store, &c.after, &c.path)?,
+        ),
+        None => (Vec::new(), children(&store, &root, path)?),
+    };
     let names: std::collections::BTreeSet<_> =
         before.iter().chain(&after).map(|e| &e.name).collect();
     let mut out = Vec::new();
     for name in names {
         let a = before.iter().find(|e| &e.name == name);
         let b = after.iter().find(|e| &e.name == name);
-        let change = match (a, b) {
-            (None, Some(_)) => '+',
-            (Some(_), None) => '-',
-            (Some(a), Some(b)) if a.mode != b.mode || a.oid != b.oid => '~',
-            _ => ' ',
-        };
-        if (changes && change == ' ') || (!changes && b.is_none()) {
-            continue;
-        }
-        let e = b.or(a).expect("name belongs to one tree");
+        let e = b.or(a).unwrap();
         out.push(Entry {
             path: if path.is_empty() {
                 name.clone()
@@ -151,13 +184,16 @@ pub fn list(
             name: name.clone(),
             directory: matches!(e.mode, Mode::Tree | Mode::Commit),
             commit: (e.mode == Mode::Commit).then(|| e.oid.to_string()),
-            change,
-            detail: if e.mode == Mode::Link {
-                "symlink".into()
+            change: if !comparing {
+                ' '
             } else {
-                String::new()
+                match (a, b) {
+                    (None, Some(_)) => '+',
+                    (Some(_), None) => '-',
+                    (Some(a), Some(b)) if a.mode != b.mode || a.oid != b.oid => '~',
+                    _ => ' ',
+                }
             },
-            line: 0,
         });
     }
     out.sort_by(|a, b| b.directory.cmp(&a.directory).then(b.name.cmp(&a.name)));
@@ -191,245 +227,84 @@ fn blob(
     Ok(Some(bytes))
 }
 
-pub fn read(
-    t: &GitTransport,
-    tree: &str,
-    baseline: &str,
-    path: &str,
-    changes: bool,
-) -> Result<String, String> {
-    let mut store = open_store(t)?;
-    let before = lookup(&store, &oid(baseline, "baseline tree")?, path)?;
-    let after = lookup(&store, &oid(tree, "snapshot tree")?, path)?;
-    if changes {
-        if blob(t, &store, before.as_ref())?.is_none() || blob(t, &store, after.as_ref())?.is_none()
-        {
-            return Ok(
-                "Binary, directory, or file larger than 256 KiB; text diff unavailable.".into(),
-            );
+pub fn preview(t: &GitTransport, tree: &str, path: &str) -> Result<Preview, String> {
+    let store = open_store(t)?;
+    let root = oid(tree, "snapshot tree")?;
+    let mut compare = comparison(&store, &root, path)?;
+    if compare.is_none() {
+        if let Some((before, after)) = pair(&store, &root, path, None)? {
+            compare = Some(Comparison {
+                title: format!(
+                    "{path}: {} {} -> {} {}",
+                    before.name,
+                    &before.oid.as_str()[..7],
+                    after.name,
+                    &after.oid.as_str()[..7]
+                ),
+                before: store.read_commit(&before.oid)?.tree,
+                after: store.read_commit(&after.oid)?.tree,
+                path: String::new(),
+            });
         }
-        let empty = store.write_blob(b"")?;
-        let a = before.as_ref().map(|e| &e.oid).unwrap_or(&empty);
-        let b = after.as_ref().map(|e| &e.oid).unwrap_or(&empty);
-        let patch = t.git_capture(
+    }
+    if let Some(c) = compare {
+        let text = t.git_capture(
             &[
+                "--literal-pathspecs",
                 "diff",
                 "--no-ext-diff",
                 "--no-textconv",
                 "--color=never",
-                a.as_str(),
-                b.as_str(),
+                c.before.as_str(),
+                c.after.as_str(),
+                "--",
+                if c.path.is_empty() { "." } else { &c.path },
             ],
             None,
         )?;
-        return Ok(if patch.is_empty() {
-            "No text changes (the entry mode or commit may differ).".into()
-        } else {
-            patch
+        return Ok(Preview {
+            title: c.title,
+            text: if text.is_empty() {
+                "No changes.".into()
+            } else {
+                text
+            },
         });
     }
-    let entry = after
-        .as_ref()
-        .or(before.as_ref())
-        .ok_or("file no longer exists")?;
-    match blob(t, &store, Some(entry))? {
-        Some(bytes) => Ok(if entry.mode == Mode::Link {
-            format!(
-                "Symlink target (not followed): {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        } else {
-            String::from_utf8(bytes).map_err(|e| e.to_string())?
-        }),
-        None => Ok(format!(
-            "Binary or file larger than 256 KiB. Object: {}",
-            entry.oid
-        )),
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SearchResults {
-    pub entries: Vec<Entry>,
-    pub limited: bool,
-}
-
-pub fn search(
-    t: &GitTransport,
-    tree: &str,
-    baseline: &str,
-    query: &str,
-    changes: bool,
-) -> Result<SearchResults, String> {
-    if query.trim().is_empty() {
-        return Err("enter text to search for".into());
-    }
-    let store = open_store(t)?;
-    let root = oid(tree, "snapshot tree")?;
-    let mut pending = vec![(String::new(), 0usize)];
-    let mut found = Vec::new();
-    let mut scanned = 0;
-    let mut bytes = 0;
-    let query = query.to_lowercase();
-    let mut limited = false;
-    while let Some((path, depth)) = pending.pop() {
-        if depth > 64 {
-            limited = true;
-            continue;
-        }
-        for mut row in list(t, tree, baseline, &path, changes)? {
-            scanned += 1;
-            if scanned > 5000 || bytes > MAX_SEARCH_BYTES || found.len() >= 200 {
-                limited = true;
-                break;
-            }
-            if row.directory {
-                pending.push((row.path, depth + 1));
-                continue;
-            }
-            let entry = lookup(&store, &root, &row.path)?;
-            let Some(entry) = entry else { continue };
-            let Some(text) = blob(t, &store, Some(&entry))? else {
-                limited = true;
-                continue;
-            };
-            bytes += text.len();
-            for (line, text) in String::from_utf8_lossy(&text).lines().enumerate() {
-                if text.to_lowercase().contains(&query) {
-                    row.line = line;
-                    row.detail = format!(
-                        "{}: {}",
-                        line + 1,
-                        text.chars().take(120).collect::<String>()
-                    );
-                    row.name = row.path.clone();
-                    found.push(row.clone());
-                    if found.len() >= 200 {
-                        limited = true;
-                        break;
+    let entry = lookup(&store, &root, path)?.ok_or("file no longer exists")?;
+    let text = if matches!(entry.mode, Mode::Tree | Mode::Commit) {
+        children(&store, &root, path)?
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}{}",
+                    e.name,
+                    if matches!(e.mode, Mode::Tree | Mode::Commit) {
+                        "/"
+                    } else {
+                        ""
                     }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        match blob(t, &store, Some(&entry))? {
+            Some(bytes) => {
+                if entry.mode == Mode::Link {
+                    format!(
+                        "Symlink target (not followed): {}",
+                        String::from_utf8_lossy(&bytes)
+                    )
+                } else {
+                    String::from_utf8(bytes).map_err(|e| e.to_string())?
                 }
             }
+            None => format!("Binary or file larger than 256 KiB. Object: {}", entry.oid),
         }
-        if scanned > 5000 || bytes > MAX_SEARCH_BYTES || found.len() >= 200 {
-            break;
-        }
-    }
-    Ok(SearchResults {
-        entries: found,
-        limited,
-    })
-}
-
-#[derive(Clone, Debug)]
-pub struct ShellResult {
-    pub tree: String,
-    pub output: String,
-}
-
-pub fn shell(
-    t: &GitTransport,
-    options: &TurnOptions,
-    tree: &str,
-    command: &str,
-) -> Result<ShellResult, String> {
-    // Extract the existing shell worker from the selected harness; never invent
-    // another shell image or run repository commands on the host.
-    let step = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &[])?;
-    let request = prepare_client_request_with_store(t, &step, &[], &[])?;
-    let store = open_store(t)?;
-    let request = Snapshot::new(&store, oid(&request, "harness request")?);
-    let image = request
-        .entry("bash-image")?
-        .ok_or("this harness has no shell worker")?
-        .oid;
-    let quoted = format!("'{}'", command.replace('\'', "'\\''"));
-    let script = format!("if [ -d .caos ]; then chmod -R a-w .caos; fi\ntimeout 30 sh -c {quoted}");
-    let (kind, result) = run_client_request_with_store(
-        t,
-        image.as_str(),
-        &[
-            format!("--tree:hash={tree}"),
-            format!("--cmd={script}"),
-            "--paths=.".into(),
-            format!("--salt={}", caos::fresh_entropy()?),
-        ],
-        &[],
-    )?;
-    if kind != "tree" {
-        return Err(format!("shell returned {kind}, expected a tree"));
-    }
-    let result = Snapshot::new(&store, oid(&result, "shell result")?);
-    let proposed = result
-        .entry("tree")?
-        .ok_or("shell returned no filesystem")?
-        .oid;
-    let changes = diff(&store, Some(&oid(tree, "input tree")?), &proposed)?;
-    reject_metadata_changes(&changes)?;
-    let output = |name| -> Result<String, String> {
-        Ok(String::from_utf8_lossy(&result.read(name)?.unwrap_or_default()).into_owned())
     };
-    Ok(ShellResult {
-        tree: proposed.to_string(),
-        output: format!(
-            "$ {command}\n{}{}\nExit {}",
-            output("stdout")?,
-            output("stderr")?,
-            output("exit")?.trim()
-        ),
+    Ok(Preview {
+        title: path.into(),
+        text,
     })
-}
-
-fn reject_metadata_changes(
-    changes: &[conversation_protocol::v3::tree::Change],
-) -> Result<(), String> {
-    if changes
-        .iter()
-        .any(|c| c.path == ".caos" || c.path.starts_with(".caos/"))
-    {
-        return Err(
-            ".caos is read-only protocol metadata; none of the shell edits were accepted".into(),
-        );
-    }
-    Ok(())
-}
-
-pub fn apply_shell(
-    t: &GitTransport,
-    id: &str,
-    base: &str,
-    proposal: &str,
-) -> Result<String, String> {
-    let store = open_store(t)?;
-    let base = oid(base, "shell input snapshot")?;
-    let proposal = oid(proposal, "shell proposal tree")?;
-    let changes = diff(&store, Some(&store.read_commit(&base)?.tree), &proposal)?;
-    reject_metadata_changes(&changes)?;
-    t.ensure_pushed(proposal.as_str())?;
-    append_transition(
-        t,
-        id,
-        &refs::head_ref(id)?,
-        "applying shell edits",
-        |store, head| {
-            if !spine_contains(store, head.clone(), &base)? {
-                return Err("shell input is not in this conversation's history".into());
-            }
-            let tree = store.read_commit(head)?.tree;
-            let (files, conflicts) =
-                conversation_protocol::v3::reconcile::plan_file_changes(store, &changes, &tree)?;
-            if !conflicts.is_empty() {
-                return Err(format!("Nothing applied: concurrent edits conflict at {}. Shell proposal {proposal} is retained.",conflicts.join(", ")));
-            }
-            if files.is_empty() {
-                return Ok(Step::Done(head.to_string()));
-            }
-            for (_, value) in &files {
-                if let Some((Mode::Commit, bytes)) = value {
-                    ensure_code_commit(t, store, &Oid::parse_line(bytes, "source tree")?)?;
-                }
-            }
-            Ok(Step::Mint(Transition::FilesApply { files }))
-        },
-    )
 }

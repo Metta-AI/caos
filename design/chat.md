@@ -1,8 +1,10 @@
 # Conversations, code stacks, and publication
 
 Conversations record content and execution in Git. They reference ordinary
-code commits, organized into directories that define review boundaries and
-publication destinations.
+code commits through gitlinks. Files and folders organize source trees and
+review boundaries; a publication destination is optional until publishing.
+The TUI browses this filesystem read-only, showing file contents or the diff
+between adjacent code boundaries.
 
 | Thing | Where | Meaning |
 | --- | --- | --- |
@@ -165,8 +167,10 @@ actually incorporated; fetching a newer remote tip does not integrate it.
 Review boundaries use exactly two digits from `01` through `99`, a hyphen,
 and a nonempty description, such as `01-parser`. They are not individual edits.
 The browser lists entries in descending filename order. Publication derives
-each boundary's base from the preceding gitlink in the same directory;
-the browser compares the explicit conversation snapshots shown in its header.
+each boundary's base from the preceding gitlink in the same directory.
+The browser compares a selected gitlink with the next gitlink below it in
+descending filename order. A folder previews its newest two gitlinks; the
+oldest gitlink has no comparison and shows content.
 Intermediate code commits remain in ordinary Git ancestry.
 
 Keep **one moving `dirty` reference**. Each accepted edit produces a real code
@@ -248,8 +252,9 @@ the proposed destination, which appears in the preview.
 
 ## Client interactions
 
-- `Ctrl+O`: browse the pinned conversation filesystem, search files, and compare
-  explicit snapshots. Gitlinks open as directories; `.caos` is read-only.
+- `Ctrl+O`: browse conversation files and source-tree diffs. Highlighting an
+  entry previews it; arrows navigate folders and gitlinks. The whole browser
+  is read-only, including `.caos`.
 - `/import <path> <repository> [revision]`: fetch a commit from a local repository
   or remote URL and add a gitlink at that exact, unused conversation path.
 - `Ctrl+L`: check the selected code snapshot out locally.
@@ -258,12 +263,10 @@ the proposed destination, which appears in the preview.
 - `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
 - `/publish-branch`: push the selected boundary without creating a PR.
 
-The browser can run a noninteractive shell command using the same filesystem
-projection as agent tools. Commands start at the conversation root. Resulting
-edits remain a proposal until the user reviews and applies them; they do not
-send an agent message. Apply reconciles the proposal with the latest conversation
-head, preserving unrelated edits and rejecting conflicts atomically. A proposal
-that changes `.caos` is rejected. Browsing stays pinned until explicitly refreshed.
+The browser pins the conversation head when opened; refresh loads the latest
+head. Ordinary files show contents. Inside a source boundary, files show their
+diff against the preceding boundary, including deleted files. The preview labels
+the compared boundaries and hashes. There are no shell commands or Apply controls.
 
 The client handles host-side imports, checkout, and publication. The agent
 organizes conversation content using files and folders. There is no active

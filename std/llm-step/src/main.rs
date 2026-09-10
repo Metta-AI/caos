@@ -1715,7 +1715,76 @@ fn complete_compute(
     ))
 }
 
-use conversation_protocol::v3::reconcile::{plan_file_changes, FileEdits};
+type FileEdits = Vec<(String, Option<(Mode, Vec<u8>)>)>;
+
+fn plan_file_changes<S: ObjectStore + CodeOps>(
+    store: &mut S,
+    changes: &[conversation_protocol::v3::tree::Change],
+    current_tree: &Oid,
+) -> Result<(FileEdits, Vec<String>), String> {
+    use conversation_protocol::v3::tree::Snapshot;
+    let mut files = Vec::new();
+    let mut conflicts = Vec::new();
+    for change in changes {
+        let current = Snapshot::new(store, current_tree.clone())
+            .entry(&change.path)
+            .map(|entry| entry.map(|e| (e.mode, e.oid)));
+        let current = match current {
+            Ok(current) => current,
+            Err(error) if error.starts_with("path ") && error.ends_with(" is a file") => {
+                conflicts.push(change.path.clone());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if current == change.after {
+            continue;
+        }
+        let mut after = change.after.clone();
+        if current != change.before {
+            if let (
+                Some((Mode::Commit, before)),
+                Some((Mode::Commit, proposed)),
+                Some((Mode::Commit, current)),
+            ) = (&change.before, &after, &current)
+            {
+                let signature = inherited_signature(store, before)?;
+                let resolution = reconcile(store, before, proposed, Some(current), &signature)?;
+                match resolution.new_pointer() {
+                    Some(output) => {
+                        let output = output.clone();
+                        after = Some((Mode::Commit, output));
+                    }
+                    None if matches!(resolution, SourceTreeResolution::Conflict { .. }) => {
+                        conflicts.push(change.path.clone());
+                        continue;
+                    }
+                    None => continue,
+                }
+            } else {
+                conflicts.push(change.path.clone());
+                continue;
+            }
+        }
+        let value = after
+            .map(|(mode, oid)| {
+                let bytes = if matches!(mode, Mode::Commit | Mode::Tree) {
+                    oid.encode_line()
+                } else {
+                    store.read_blob(&oid).map_err(String::from)?
+                };
+                Ok::<_, String>((mode, bytes))
+            })
+            .transpose()?;
+        files.push((change.path.clone(), value));
+    }
+    // Apply the command atomically: a conflicting rename or edit must not
+    // leave half the shell operation installed.
+    if !conflicts.is_empty() {
+        files.clear();
+    }
+    Ok((files, conflicts))
+}
 
 fn complete_files_compute(
     state: &mut progress::State,
