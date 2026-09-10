@@ -574,33 +574,40 @@ impl GitTransport {
 
 impl Transport for GitTransport {
     fn put_object(&self, kind: &str, content: &[u8]) -> Result<gix::ObjectId, String> {
-        match kind {
-            "blob" => self
-                .repo
-                .write_blob(content)
-                .map(|id| id.detach())
-                .map_err(|e| format!("writing blob: {e}")),
-            "tree" => {
-                // Validate the canonical tree encoding, then write it as a real
-                // tree object so its hash is a genuine git tree hash.
-                let tree = gix::objs::TreeRef::from_bytes(content, self.repo.object_hash())
-                    .map_err(|e| format!("invalid tree: {e}"))?;
-                self.repo
-                    .write_object(&tree)
+        let write = |repo: &gix::Repository| {
+            match kind {
+                "blob" => repo
+                    .write_blob(content)
                     .map(|id| id.detach())
-                    .map_err(|e| format!("writing tree: {e}"))
+                    .map_err(|e| format!("writing blob: {e}")),
+                "tree" => {
+                    // Validate the canonical tree encoding, then write it as a real
+                    // tree object so its hash is a genuine git tree hash.
+                    let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
+                        .map_err(|e| format!("invalid tree: {e}"))?;
+                    repo.write_object(&tree)
+                        .map(|id| id.detach())
+                        .map_err(|e| format!("writing tree: {e}"))
+                }
+                "commit" => {
+                    // Validate the commit encoding, then store the raw bytes (not a
+                    // re-encoding), so the hash matches the bytes exactly — the same
+                    // rule the server's `post_object` applies.
+                    gix::objs::CommitRef::from_bytes(content, repo.object_hash())
+                        .map_err(|e| format!("invalid commit: {e}"))?;
+                    gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+                        .map_err(|e| format!("writing commit: {e}"))
+                }
+                other => Err(format!("cannot store object of kind {other}")),
             }
-            "commit" => {
-                // Validate the commit encoding, then store the raw bytes (not a
-                // re-encoding), so the hash matches the bytes exactly — the same
-                // rule the server's `post_object` applies.
-                gix::objs::CommitRef::from_bytes(content, self.repo.object_hash())
-                    .map_err(|e| format!("invalid commit: {e}"))?;
-                gix::objs::Write::write_buf(&self.repo.objects, gix::object::Kind::Commit, content)
-                    .map_err(|e| format!("writing commit: {e}"))
-            }
-            other => Err(format!("cannot store object of kind {other}")),
-        }
+        };
+        write(&self.repo).or_else(|original| {
+            // Fetches can add more packfiles than this long-lived handle's
+            // fixed slotmap can hold. Reopen against the current disk state
+            // before failing a write, as get_object already does for reads.
+            let repo = gix::open(&self.git_dir).map_err(|_| original)?;
+            write(&repo)
+        })
     }
 
     fn get_object(&self, hash: &str) -> Result<(String, Vec<u8>), String> {
@@ -4873,6 +4880,34 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         let expected_head = commit_file(&repo, "tracked", "temporary repo\n", "initial");
 
         let transport = GitTransport::discover(&nested).unwrap();
+
+        // Fetches may create packs after the transport was opened. Exceed
+        // gix's initial 32 slots, then exercise writing with the same handle.
+        let git_input = |args: &[&str], input: &[u8]| {
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), input).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        for index in 0..40 {
+            let hash = git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("pack {index}").as_bytes(),
+            );
+            git_input(&["pack-objects", ".git/objects/pack/pack"], hash.as_bytes());
+        }
+        let blob = transport.put_object("blob", b"after fetch").unwrap();
+        assert_eq!(
+            transport.get_object(&blob.to_string()).unwrap().1,
+            b"after fetch"
+        );
 
         assert_eq!(transport.work_dir(), repo.canonicalize().unwrap());
         assert_eq!(
