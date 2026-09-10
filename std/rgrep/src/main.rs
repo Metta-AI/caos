@@ -1,4 +1,4 @@
-//! caos-worker-rgrep: recursive grep over a workspace tree — one job per
+//! caos-worker-rgrep: recursive grep over a source tree — one job per
 //! directory, the result a **sparse tree** (design/agent-harness.md): only
 //! matching files appear, each holding its matches as `linenum:line` lines;
 //! a directory's result embeds its children's result trees *by hash*, so

@@ -1,6 +1,6 @@
 //! Inline file tools — `read`, `ls`, `write`, `edit` — executed in-process by
 //! the step worker (design/agent-harness.md, "Tool classes"): hash-level
-//! workspace operations that need no sub-run, no container, no dispatch.
+//! source tree operations that need no sub-run, no container, no dispatch.
 //! Reads materialize only the path they touch; writes rebuild the tree by
 //! symlinking every untouched entry and `caos put`ting the result (staging
 //! resolves links by recorded hash — the same surgery `mint_step` does for
@@ -17,12 +17,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use worker_common::{caos, entries, file_name, link, path, scratch};
+use worker_common::{caos, entries, file_name, path, scratch};
 
 use crate::{fresh, fresh_name, result_block};
-
-/// The reserved workspace entry (step transcripts); refused in tool paths.
-const STEP_DIR: &str = ".caos";
 
 /// Reads larger than this are truncated (with a note) unless `offset`/`limit`
 /// narrow them; `ls` listings cap at [`MAX_ENTRIES`] the same way.
@@ -39,30 +36,30 @@ pub fn is_inline(name: &str) -> bool {
 /// then dashed `@param` tags. They are parsed by the same `parse_help` the tree
 /// tools use, so a built-in and a project tool are described one way — the docs
 /// live with the tool, not inside a hand-written JSON schema.
-const READ_HELP: &str = "Read a file's contents. Defaults to the current workspace; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
-@param [file-path] Workspace-relative path (the workspace root is the repo root).
-@param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current workspace.
+const READ_HELP: &str = "Read a file's contents. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
+@param [file-path] Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
+@param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current conversation tree.
 @param [offset] 1-based first line to return.
 @param [limit] Number of lines to return.";
 
-const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Defaults to the current workspace; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
-@param [path] Directory to list (relative to `root`, or to the workspace root); omit for the root itself.
-@param [root] Optional commit or tree hash to list as of another revision. Omit for the current workspace.";
+const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
+@param [path] Directory to list (relative to `root`, or to the conversation root unless source tree is explicit); omit for the root itself.
+@param [root] Optional commit or tree hash to list as of another revision. Omit for the current conversation tree.";
 
-const WRITE_HELP: &str = "Write a file into the workspace (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
-@param file-path Workspace-relative path (the workspace root is the repo root).
+const WRITE_HELP: &str = "Write a file at a conversation path or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs/redirection via bash.
+@param file-path Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
 @param content The full new file content.";
 
-const EDIT_HELP: &str = "Replace text in a workspace file. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
-@param file-path Workspace-relative path (the workspace root is the repo root).
+const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code reference. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once — include surrounding context to disambiguate. Prefer this over sed via bash.
+@param file-path Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
 @param old-string Exact text to replace.
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
-const GREP_HELP: &str = "Search the workspace with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
+const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
 @param pattern The regular expression to search for.
-@param [path] Directory or file to search (relative to `root`, or to the workspace root); omit for everything.
-@param [root] Optional commit or tree hash to search as of another revision. Omit for the current workspace.";
+@param [path] Directory or file to search (relative to `root`, or to the conversation root); omit for everything.
+@param [root] Optional commit or tree hash to search as of another revision. Omit for the current conversation tree.";
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
@@ -128,7 +125,7 @@ const RESERVED_TOOLS: &[&str] = &[
     "run_async",
 ];
 
-/// The tree's tool directory (`caos-tools/` in the workspace), expanded one
+/// The tree's tool directory (`caos-tools/` in the source tree), expanded one
 /// level; `None` when the tree defines no tools.
 fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
     caos(["get", ws])?;
@@ -164,7 +161,7 @@ pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// The tool declared `@git`: bind the workspace commit (`wc`) and the
+    /// The tool declared `@git`: bind the source tree commit (`wc`) and the
     /// turn's ref snapshot (`refs`) so it can walk history. Off by default —
     /// `wc` changes every step, so binding it into a tool that doesn't need it
     /// (build/test) would turn every cache hit into a miss.
@@ -330,7 +327,7 @@ fn read_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
 
 /// Discover the tree-defined tools: each CHILD DIRECTORY of `caos-tools/` that
 /// carries a `.caos-expr`, described by the `help` that expression binds.
-/// Resolved fresh from the CURRENT workspace every round, so an agent that
+/// Resolved fresh from the CURRENT source tree every round, so an agent that
 /// adds, edits, or removes a tool sees the change on its next request.
 /// Reserved names are skipped loudly; a directory with no `.caos-expr`, or one
 /// whose expression binds no `--help`, is not a tool.
@@ -394,7 +391,7 @@ pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
 }
 
 /// One discovered tool's registry entry. A tool with no `@param` tags takes
-/// no parameters — the workspace tree IS its input — and one with them takes
+/// no parameters — the source tree IS its input — and one with them takes
 /// them as strings, since every arg reaches the script as a `/cas/args/<name>`
 /// blob whatever JSON type it left the model as.
 pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
@@ -420,23 +417,19 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
     })
 }
 
-/// Resolve tool `name` in the CURRENT workspace — invocation-time lookup, so a
-/// call made right after an edit runs the edited tool. Returns the tool's
-/// registry entry; its ArgTree comes from EVALUATING `caos-tools/<name>`, which
-/// only the server can do for a worker (see `launch_tree_tool`). `None` when
-/// the tree doesn't define it (or the name is reserved / not a clean name).
-pub fn tree_tool(ws: &str, name: &str) -> Result<Option<TreeTool>, String> {
-    if RESERVED_TOOLS.contains(&name) || name.contains('/') || name.contains("..") {
+/// Resolve a tool by path in its captured input snapshot and read its schema.
+pub fn tool_at(ws: &str, relative: &str) -> Result<Option<TreeTool>, String> {
+    let resolved = fresh("tool-path");
+    caos([
+        "resolve",
+        &worker_common::cas_hash(ws)?,
+        relative,
+        &resolved,
+    ])?;
+    if !Path::new(&resolved).is_dir() {
         return Ok(None);
     }
-    let Some(dir) = tree_tools_dir(ws)? else {
-        return Ok(None);
-    };
-    let p = format!("{dir}/{name}");
-    if !Path::new(&p).is_dir() {
-        return Ok(None);
-    }
-    read_tool(name, &p)
+    read_tool(relative, &resolved)
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,
@@ -524,7 +517,7 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
 
 /// Validate a grep call before its sub-run launches: the pattern must compile
 /// and the scope must exist. Returns the scope's CAS path and its
-/// workspace-relative prefix (`""` for the root) — or, on a user mistake, the
+/// source-tree-relative prefix (`""` for the root) — or, on a user mistake, the
 /// ready-made `is_error` tool_result.
 pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> {
     let id = call["id"].as_str().unwrap_or("");
@@ -541,7 +534,7 @@ pub fn grep_precheck(call: &Value, ws: &str) -> Result<(String, String), Value> 
         Err(User(msg)) => return fail(msg),
         Err(Infra(e)) => return fail(e),
     };
-    // `resolve` handles all four cases: no root + no path is the workspace
+    // `resolve` handles all four cases: no root + no path is the source tree
     // root; a `root` hash roots the search at another revision's tree.
     match resolve(root.as_deref(), ws, &comps) {
         Ok(p) => Ok((p.to_string_lossy().into_owned(), comps.join("/"))),
@@ -639,8 +632,8 @@ impl Fail {
     }
 }
 
-/// Execute one inline call against the workspace at CAS path `ws`. Returns the
-/// tool_result block and, for a mutation, the new workspace CAS path.
+/// Execute one inline call against the source tree at CAS path `ws`. Returns the
+/// tool_result block and, for a mutation, the new source tree CAS path.
 pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String> {
     let id = call["id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("");
@@ -684,62 +677,18 @@ fn read(call: &Value, ws: &str) -> Result<String, Fail> {
 }
 
 /// Resolve `(root, path)` to a materialized node. `root` `None` reads the
-/// current workspace tree `ws`; a `root` hash may name a TREE (navigate into
+/// current source tree `ws`; a `root` hash may name a TREE (navigate into
 /// it), a COMMIT (navigate into its tree), or a BLOB (a leaf — valid only with
 /// no `path`). This is the one place history reads root elsewhere; `read` and
 /// `ls` share it, then each checks the node is the kind it wants.
 fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
-    let Some(hash) = root else {
-        return materialize(ws, comps);
+    let hash = match root {
+        Some(hash) => hash.to_string(),
+        None => worker_common::cas_hash(ws).map_err(Infra)?,
     };
-    if !valid_oid(hash) {
-        return Err(User(format!("{hash:?} is not a git object hash")));
-    }
-    let dst = fresh("root");
-    caos(["get-hash", hash, &dst]).map_err(|e| User(format!("cannot read {hash}: {e}")))?;
-    let p = PathBuf::from(&dst);
-    if p.is_dir() {
-        // A tree: navigate straight into it.
-        return materialize(&dst, comps);
-    }
-    // A non-tree object materializes as a file — a commit (navigate into its
-    // tree) or a blob (a leaf).
-    let _ = caos(["get", &dst]);
-    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    if let Some(tree) = commit_tree_of(&bytes) {
-        let tdst = fresh("root");
-        caos(["get-hash", &tree, &tdst])
-            .map_err(|e| User(format!("cannot read tree {tree}: {e}")))?;
-        return materialize(&tdst, comps);
-    }
-    // A blob: it is the node, but only if no path was asked for.
-    if comps.is_empty() {
-        Ok(p)
-    } else {
-        Err(User(format!(
-            "{hash} is a blob; it has no paths inside it (drop `file-path`/`path` to read it)"
-        )))
-    }
-}
-
-/// If `bytes` is a git commit object, its `tree` hash. A commit's header (up to
-/// the first blank line) carries both a `tree <oid>` and an `author ` line;
-/// requiring both keeps a blob that merely starts with "tree " from passing.
-fn commit_tree_of(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let header = text.split("\n\n").next().unwrap_or("");
-    let mut tree = None;
-    let mut has_author = false;
-    for line in header.lines() {
-        if let Some(h) = line.strip_prefix("tree ").map(str::trim) {
-            if valid_oid(h) {
-                tree = Some(h.to_string());
-            }
-        } else if line.starts_with("author ") {
-            has_author = true;
-        }
-    }
-    has_author.then_some(tree).flatten()
+    let destination = fresh("resolved");
+    caos(["resolve", &hash, &comps.join("/"), &destination]).map_err(User)?;
+    Ok(PathBuf::from(destination))
 }
 
 /// An optional hash-valued input (`root`): trimmed, empty treated as absent.
@@ -749,11 +698,6 @@ fn opt_hash(call: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-/// A git object hash: hex, 40 (sha1) or 64 (sha256) chars.
-fn valid_oid(oid: &str) -> bool {
-    (oid.len() == 40 || oid.len() == 64) && oid.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
@@ -819,13 +763,12 @@ fn ls(call: &Value, ws: &str) -> Result<String, Fail> {
         .iter()
         .map(|c| {
             let name = file_name(c);
-            if c.is_dir() {
-                format!("{name}/")
-            } else {
-                name
-            }
+            let directory = c.is_dir()
+                || (!c.is_symlink()
+                    && worker_common::cas_kind(path(c)).map_err(Infra)? == "commit");
+            Ok(if directory { format!("{name}/") } else { name })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Fail>>()?;
     let total = lines.len();
     if total > MAX_ENTRIES {
         lines.truncate(MAX_ENTRIES);
@@ -908,7 +851,7 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace plumbing.
+// SourceTree plumbing.
 // ---------------------------------------------------------------------------
 
 /// Like [`components`] but for an OPTIONAL path: an absent or blank argument
@@ -924,8 +867,8 @@ fn components_opt(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     }
 }
 
-/// Validate and split a workspace-relative path argument. A leading `/` is
-/// tolerated (treated as the workspace root); `..` and the reserved `.caos`
+/// Validate and split a source-tree-relative path argument. A leading `/` is
+/// tolerated (treated as the source tree root); `..` and the reserved `.caos`
 /// are refused.
 fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     let raw = call["input"][key]
@@ -942,93 +885,47 @@ fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
         return Err(User(format!("`{key}` names no path: {raw:?}")));
     }
     if comps.iter().any(|c| c == "..") {
-        return Err(User("`..` is not allowed in workspace paths".to_string()));
-    }
-    if comps[0] == STEP_DIR && !(comps.len() == 2 && comps[1] == "conflicts") {
-        return Err(User(format!(
-            "{STEP_DIR}/ is reserved for the harness; only {STEP_DIR}/conflicts (the merge \
-             conflict set) is editable"
-        )));
+        return Err(User("`..` is not allowed in source tree paths".to_string()));
     }
     Ok(comps)
 }
 
-/// Walk `comps` down from the workspace root, materializing each level (`caos
+/// Walk `comps` down from the source tree root, materializing each level (`caos
 /// get` — a no-op when already fetched, hence the ignored result) and
 /// returning the leaf path. Missing entries and file-as-directory are user
 /// errors.
 fn materialize(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
-    let mut cur = PathBuf::from(ws);
-    for (i, comp) in comps.iter().enumerate() {
-        let _ = caos(["get", path(&cur)]);
-        if !cur.is_dir() {
-            return Err(User(format!(
-                "{} is a file, not a directory",
-                comps[..i].join("/")
-            )));
-        }
-        cur = cur.join(comp);
-        if !cur.exists() {
-            return Err(User(format!("no such path: {}", comps[..=i].join("/"))));
-        }
-    }
-    let _ = caos(["get", path(&cur)]);
-    Ok(cur)
+    resolve(None, ws, comps)
 }
 
-/// Rebuild the workspace with `comps` holding `content` (mode `mode`, default
+/// Rebuild the source tree with `comps` holding `content` (mode `mode`, default
 /// 0644): at each level every untouched entry is symlinked (staging resolves
 /// links by recorded hash — nothing else materializes) and the target
-/// component is descended into or written. Returns the new workspace CAS path.
+/// component is descended into or written. Returns the new source tree CAS path.
 fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
-    let dir = scratch(&fresh_name("inline")).map_err(Fail::from_infra)?;
-    build_level(Some(Path::new(ws)), &dir, comps, content, mode)?;
-    let out = fresh("ws-inline");
-    caos(["put", path(&dir), &out]).map_err(Fail::from_infra)?;
+    let work = scratch(&fresh_name("inline")).map_err(Infra)?;
+    let hash = worker_common::cas_hash(ws).map_err(Infra)?;
+    let relative = comps.join("/");
+    caos(["checkout", &hash, path(&work), &relative]).map_err(Infra)?;
+    let target = work.join(&relative);
+    let mut ancestor = work.clone();
+    for component in comps {
+        ancestor.push(component);
+        if ancestor.is_symlink() {
+            return Err(User(
+                "write/edit cannot follow a symlink; use bash to replace it explicitly".into(),
+            ));
+        }
+    }
+    fs::create_dir_all(target.parent().unwrap()).map_err(|e| Infra(e.to_string()))?;
+    fs::write(&target, content).map_err(|e| Infra(e.to_string()))?;
+    if let Some(mode) = mode {
+        fs::set_permissions(&target, fs::Permissions::from_mode(mode))
+            .map_err(|e| Infra(e.to_string()))?;
+    }
+    let out = fresh("files-inline");
+    caos(["put", path(&work), &out]).map_err(Infra)?;
     Ok(out)
-}
-
-fn build_level(
-    src: Option<&Path>,
-    dst: &Path,
-    comps: &[String],
-    content: &[u8],
-    mode: Option<u32>,
-) -> Result<(), Fail> {
-    if let Some(src) = src {
-        let _ = caos(["get", path(src)]);
-        for child in entries(path(src)).map_err(Fail::from_infra)? {
-            if file_name(&child) != comps[0] {
-                link(&child, dst.join(file_name(&child))).map_err(Fail::from_infra)?;
-            }
-        }
-    }
-    let target = dst.join(&comps[0]);
-    if comps.len() == 1 {
-        // Overwriting an existing file keeps its mode (the exec bit) unless
-        // the caller pinned one (edit does).
-        let mode = mode.or_else(|| {
-            src.map(|s| s.join(&comps[0])).and_then(|orig| {
-                let _ = caos(["get", path(&orig)]);
-                fs::metadata(&orig).ok().map(|m| m.permissions().mode())
-            })
-        });
-        fs::write(&target, content)
-            .map_err(|e| Infra(format!("writing {}: {e}", target.display())))?;
-        if let Some(m) = mode {
-            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(m));
-        }
-        return Ok(());
-    }
-    fs::create_dir(&target).map_err(|e| Infra(format!("mkdir {}: {e}", target.display())))?;
-    let src_sub = match src.map(|s| s.join(&comps[0])) {
-        Some(p) if p.is_dir() => Some(p),
-        Some(p) if p.exists() => {
-            return Err(User(format!("{} is a file, not a directory", comps[0])))
-        }
-        _ => None,
-    };
-    build_level(src_sub.as_deref(), &target, &comps[1..], content, mode)
 }
 
 #[cfg(test)]
@@ -1098,34 +995,6 @@ mod tests {
         // A `$VAR` naming no here-string is not help either.
         assert_eq!(expr_help("curry --base:@=x --help=$NOPE\n"), None);
     }
-    #[test]
-    fn oid_shape() {
-        assert!(valid_oid(&"a".repeat(40))); // sha1
-        assert!(valid_oid(&"0".repeat(64))); // sha256
-        assert!(valid_oid("0123456789abcdef0123456789abcdef01234567"));
-        assert!(!valid_oid("")); // empty
-        assert!(!valid_oid(&"a".repeat(39))); // too short
-        assert!(!valid_oid(&"a".repeat(41))); // between the two lengths
-        assert!(!valid_oid(&"g".repeat(40))); // not hex
-        assert!(!valid_oid("src/main.rs")); // a path, not an oid
-    }
-
-    #[test]
-    fn commit_vs_blob_root() {
-        // A commit object resolves to its tree; a lookalike blob does not.
-        let tree = "a".repeat(40);
-        let commit = format!(
-            "tree {tree}\nparent {}\nauthor x <x> 0 +0000\ncommitter x <x> 0 +0000\n\nmsg\n",
-            "b".repeat(40)
-        );
-        assert_eq!(commit_tree_of(commit.as_bytes()), Some(tree));
-        // No author line — a blob, even if it opens with "tree ...".
-        assert_eq!(
-            commit_tree_of(format!("tree {}\nsome file text\n", "c".repeat(40)).as_bytes()),
-            None
-        );
-        assert_eq!(commit_tree_of(b"just a normal file\n"), None);
-    }
 
     #[test]
     fn read_and_ls_are_inline_and_reserved() {
@@ -1162,7 +1031,7 @@ mod tests {
 
         // Rejected: an arg the interpreter already binds (curry errors on a
         // rebind), and anything that isn't a plain lower-case flag name.
-        assert!(parse_arg("in The workspace.").is_none());
+        assert!(parse_arg("in The source tree.").is_none());
         assert!(parse_arg("worker1 The script.").is_none());
         assert!(parse_arg("Hash The record hash.").is_none());
         assert!(parse_arg("--hash The record hash.").is_none());

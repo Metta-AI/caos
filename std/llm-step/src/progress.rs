@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Applied, Transition};
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::tree::encode_commit_bytes;
 use conversation_protocol::v3::view::Conversation;
@@ -153,18 +153,16 @@ impl State<GitStore> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
         let kind = transition.kind();
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        if ordinal.is_some() {
+        let applied = apply(&mut self.store, Some(expected), &transition)?;
+        if applied.ordinal.is_some() {
             return Err("subagent.spawn unexpectedly appended a transcript entry".to_string());
         }
         let signature = inherited_signature(&self.store, expected)?;
         let candidate = mint(
             &mut self.store,
             expected,
-            &tree,
+            &applied,
             transition.kind(),
             &signature,
         )?;
@@ -346,27 +344,7 @@ impl<S: RefStore> State<S> {
         expected: &Oid,
         transition: Transition,
     ) -> Result<TryAppend, String> {
-        if &self.head != expected {
-            return Ok(TryAppend::HeadChanged(self.head.clone()));
-        }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let transition =
-            retarget_transcript_transition(&self.store, &parent_info.tree, transition)?;
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let candidate = mint(
-            &mut self.store,
-            expected,
-            &tree,
-            transition.kind(),
-            &signature,
-        )?;
-        let pushed = self
-            .store
-            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!("push {}", transition.kind().as_str()));
-        self.finish_append(expected, candidate, ordinal, pushed)
+        self.try_append_many_at(expected, vec![transition])
     }
 
     pub fn try_append_pair_at(
@@ -375,49 +353,48 @@ impl<S: RefStore> State<S> {
         first: Transition,
         second: Transition,
     ) -> Result<TryAppend, String> {
+        self.try_append_many_at(expected, vec![first, second])
+    }
+
+    pub fn try_append_many_at(
+        &mut self,
+        expected: &Oid,
+        transitions: Vec<Transition>,
+    ) -> Result<TryAppend, String> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let first = retarget_transcript_transition(&self.store, &parent_info.tree, first)?;
-        let Applied {
-            tree: first_tree,
-            ordinal,
-        } = apply(&mut self.store, Some(&parent_info.tree), &first)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let first_candidate = mint(
-            &mut self.store,
-            expected,
-            &first_tree,
-            first.kind(),
-            &signature,
-        )?;
-
-        let second = retarget_transcript_transition(&self.store, &first_tree, second)?;
-        let Applied {
-            tree: second_tree,
-            ordinal: second_ordinal,
-        } = apply(&mut self.store, Some(&first_tree), &second)?;
-        let second_signature = inherited_signature(&self.store, &first_candidate)?;
-        let candidate = mint(
-            &mut self.store,
-            &first_candidate,
-            &second_tree,
-            second.kind(),
-            &second_signature,
-        )?;
+        if transitions.is_empty() {
+            return Err("an append needs a transition".into());
+        }
+        let mut candidate = expected.clone();
+        let mut ordinal = None;
+        let mut intermediate = Vec::new();
+        let mut kinds = Vec::new();
+        for transition in transitions {
+            let parent = self.store.read_commit(&candidate).map_err(String::from)?;
+            let transition = retarget_transcript_transition(&self.store, &parent.tree, transition)?;
+            let applied = apply(&mut self.store, Some(&candidate), &transition)?;
+            let signature = inherited_signature(&self.store, &candidate)?;
+            candidate = mint(
+                &mut self.store,
+                &candidate,
+                &applied,
+                transition.kind(),
+                &signature,
+            )?;
+            ordinal = ordinal.or(applied.ordinal);
+            kinds.push(transition.kind().as_str());
+            intermediate.push(candidate.clone());
+        }
         let pushed = self
             .store
             .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!(
-            "push {}+{}",
-            first.kind().as_str(),
-            second.kind().as_str()
-        ));
+        crate::timing::phase(&format!("push {}", kinds.join("+")));
         if pushed.is_ok() {
-            self.known_valid.insert(first_candidate);
+            self.known_valid.extend(intermediate);
         }
-        self.finish_append(expected, candidate, ordinal.or(second_ordinal), pushed)
+        self.finish_append(expected, candidate, ordinal, pushed)
     }
 
     // A failed response is ambiguous: the push may have landed, and another
@@ -497,9 +474,6 @@ impl<S: RefStore> State<S> {
                     .as_ref()
                     == Some(record)
             }
-            Transition::SubagentApply { child, application } => view
-                .child(child)?
-                .is_some_and(|record| record.applications.contains(application)),
             _ => false,
         };
         Ok(joined.then(|| Appended {
@@ -513,7 +487,6 @@ impl<S: RefStore> State<S> {
 fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
     observed.id == expected.id
         && observed.initial_head == expected.initial_head
-        && observed.initial_workspace == expected.initial_workspace
         && observed.request == expected.request
         && observed.relay == expected.relay
         && observed.spawn_intent == expected.spawn_intent
@@ -536,7 +509,7 @@ fn retarget_transcript_transition(
     let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
     match &mut transition {
         Transition::MessageAppend { entry, payloads }
-        | Transition::RequestInterject {
+        | Transition::TurnInterject {
             entry, payloads, ..
         }
         | Transition::ModelComplete {
@@ -586,7 +559,6 @@ fn parent_chain_contains(store: &dyn ObjectStore, tip: &Oid, needle: &Oid) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use conversation_protocol::v3::apply::{client_signature, mint};
     use conversation_protocol::v3::oid::ensure_genesis;
@@ -656,7 +628,7 @@ mod tests {
                 text: text.to_string(),
             }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         }
     }
 
@@ -665,10 +637,9 @@ mod tests {
         parent: &Oid,
         transition: Transition,
     ) -> Result<Oid, String> {
-        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
-        let applied = apply(store, Some(&parent_tree), &transition)?;
+        let applied = apply(store, Some(parent), &transition)?;
         let signature = inherited_signature(store, parent)?;
-        mint(store, parent, &applied.tree, transition.kind(), &signature)
+        mint(store, parent, &applied, transition.kind(), &signature)
     }
 
     fn root(store: &mut MemoryStore) -> Result<Oid, String> {
@@ -680,14 +651,13 @@ mod tests {
                 owner: None,
             },
             title: "test".to_string(),
-            workspaces: BTreeMap::new(),
-            files_seed: None,
+            content: None,
         };
         let applied = apply(store, None, &transition)?;
         mint(
             store,
             &genesis,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("test", "test@example.invalid", 1),
         )

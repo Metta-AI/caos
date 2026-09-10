@@ -9,7 +9,7 @@
 # the suite result (dev/run-test/worker.sh writes it), so nothing here re-runs
 # anything: this is a READ, addressed by hash, of a tree the suite already
 # published. That is why the report can afford to be short — and why this tool
-# touches no workspace and needs no caos tree.
+# touches no source tree and needs no caos tree.
 #
 # The result is a BLOB, not a tree with a `report`: both readers print a blob
 # verbatim (crates/caos/src/lib.rs's report_conventions, and the harness's

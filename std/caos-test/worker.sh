@@ -14,7 +14,7 @@
 #
 # So the suite's jobs key on the dev stack's world, not the host's: a test that
 # has not changed is a cache hit THERE, and this outer job is a cache hit here
-# whenever the workspace tree is unchanged. Two layers, each keyed on what it
+# whenever the source tree is unchanged. Two layers, each keyed on what it
 # actually depends on.
 #
 # WHY THE SUITE IS NOT RUN OUT HERE. It has to drive the code under test, which
@@ -32,19 +32,19 @@ fail() { echo "TEST FAIL: $*" >&2; exit 1; }
 T0=$SECONDS
 phase() { echo "==> [+$((SECONDS - T0))s] $*" >&2; }
 
-caos get -r /cas/args/in || fail "materializing the workspace"
-phase "materialized the workspace"
+caos get -r /cas/args/in || fail "materializing the source tree"
+phase "materialized the source tree"
 cd /cas/args/in
 
 # WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-test is registered on
 # every conversation (it is one of the harness's own tools), so it is offered
-# even when the workspace is not caos. There it has no stack to build and no
+# even when the source tree is not caos. There it has no stack to build and no
 # suite to run: rather than fail the turn, put a plain note saying so and exit 0,
 # so the model reads a calm "not applicable here" tool_result instead of a red
 # one. A plain blob renders through the same tool conventions as the report.
 if [ ! -f flake.nix ] || [ ! -x dev/stack-up ]; then
   { echo "caos-test builds a caos dev stack from the tree and runs the caos suite"
-    echo "on it. This workspace is not the caos codebase (no flake.nix / dev/stack-up),"
+    echo "on it. This source tree is not the caos codebase (no flake.nix / dev/stack-up),"
     echo "so there is nothing here for it to test."
     echo "caos-test is specific to the caos codebase; run it there."
   } > /tmp/not-caos
@@ -70,7 +70,7 @@ fi
 # carries the daemons and the worker images in a single derivation, so stack-up
 # resolves nothing. The dev stack is TEST world, so a host client is refused by
 # it and vice versa.
-# It shares every dependency with the host build; only the thin workspace
+# It shares every dependency with the host build; only the thin source tree
 # compile differs (measured: one derivation, 13.8s).
 phase "building the stack inputs"
 inputs=$(nix build "path:$PWD#caos-test-stack-inputs" --no-link --print-out-paths) \
@@ -80,7 +80,7 @@ phase "bringing the dev stack up"
 CLI=/caos-run/bin/caos-cli
 [ -x "$CLI" ] || fail "no client at $CLI after stack-up"
 
-# THE TESTED CLIENT GOES INTO THE WORKSPACE. `:@=` ingests git-tracked paths
+# THE TESTED CLIENT GOES INTO THE SOURCE TREE. `:@=` ingests git-tracked paths
 # inside the worktree and nothing else, so a client sitting in /caos-run is
 # rejected as "outside the git worktree".
 #
@@ -124,7 +124,7 @@ fi
 # a store for the dev stack naming `tests/chat-online` as its reader. The value
 # never enters an ArgTree or the CAS.
 #
-# AFTER `stack-up`, deliberately. stack-up git-inits this workspace with
+# AFTER `stack-up`, deliberately. stack-up git-inits this source tree with
 # `add -Af` — the tree is the truth — so a `.caos-secrets` written before it
 # would be COMMITTED and then ingested by `--in:@=.`. Written afterwards it is
 # untracked, and `:@=` ingests only tracked paths.
