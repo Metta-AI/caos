@@ -65,6 +65,12 @@ const SESSION_PREFIX: &str = "cc/";
 /// exactly as the model wrote it.
 const TOOL_PREFIX: &str = "mcp__caos__";
 
+/// Where a workspace keeps the tools it defines itself. The step reads this
+/// name out of the tree it is handed (`std/llm-step`'s `tree_tools_dir`); the
+/// client reads it off disk, to decide whether handing over a tree is worth
+/// what it costs.
+const TREE_TOOLS_DIR: &str = "caos-tools";
+
 /// What a request record says ran the turn. Claude Code chooses the model and
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
@@ -281,15 +287,29 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     let store = caos::build_secret_store(t)?;
     let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
     let mut kvs = vec!["--list-tools=1".to_string()];
-    // The tree whose `caos-tools/` entries are offered. This is the base a
-    // first prompt would root the conversation on, resolved the same way, so
-    // the listing describes the workspace the session is about to get.
-    if let Ok(workspace) = resolve_base(t, options) {
-        let mut objects = open_store(t)?;
-        let workspace = oid(&workspace, "conversation base")?;
-        ensure_code_commit(t, &mut objects, &workspace)?;
-        let tree = objects.tree_of(&workspace)?;
-        kvs.push(format!("--workspace:hash={tree}"));
+    // The tree whose `caos-tools/` entries are offered -- named ONLY when
+    // there are any, and the ordering is the whole point.
+    //
+    // Naming it PUSHES THE WHOLE WORKING TREE to the caos server, which for a
+    // repository of any size is the most expensive thing this client does, and
+    // for a repository with no `caos-tools/` it buys an answer of "none". So
+    // the cheap local question is asked first: a directory that is not there
+    // defines no tools.
+    //
+    // Worse than wasteful without it. A caos server that REFUSES is harmless
+    // -- the error is caught and the listing goes on without the tree -- but
+    // one reached through a tunnel whose far end is gone does not refuse. It
+    // accepts and swallows, so the push never returns, the resolution never
+    // finishes, and the session gets a tool server that is connected and
+    // permanently empty.
+    if t.work_dir().join(TREE_TOOLS_DIR).is_dir() {
+        if let Ok(workspace) = resolve_base(t, options) {
+            let mut objects = open_store(t)?;
+            let workspace = oid(&workspace, "conversation base")?;
+            ensure_code_commit(t, &mut objects, &workspace)?;
+            let tree = objects.tree_of(&workspace)?;
+            kvs.push(format!("--workspace:hash={tree}"));
+        }
     }
     let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
     let objects = open_store(t)?;
