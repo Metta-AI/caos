@@ -366,14 +366,25 @@ pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
 /// `help` its curried IMAGE carries — read the same way a tree tool's help is,
 /// so a built-in std tool and a project caos-tools tool are one mechanism, just
 /// sourced differently. `dir` is the materialized arg-tree path
-/// (`/cas/args/<name>-image`): a curry with only a base is the tool's ready
-/// ArgTree, whose `help` entry is the blob the tool's `.caos-expr` bound.
+/// (`/cas/args/<name>-image`).
 ///
-/// `None` when the image carries no `help` — treated as a configuration error by
-/// the caller, since the harness itself curried the image.
+/// THE HELP IS AT `args/help`, not `help`. That path is the curry node's own
+/// layout — `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`) — and the
+/// tool's `.caos-expr` binds `--help=` like any other argument. Looking at the
+/// top level finds nothing, which is exactly what happened: `registry` skipped
+/// a tool it could not describe, so every std tool silently vanished from the
+/// registry and the harness offered six tools where it meant to offer thirteen.
+///
+/// `None` when the image carries no `help` — a configuration error, since the
+/// harness itself curried the image, and its callers now say so.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
-    let help_path = format!("{dir}/help");
+    let args = format!("{dir}/args");
+    if !Path::new(&args).exists() {
+        return Ok(None);
+    }
+    caos(["get", &args])?;
+    let help_path = format!("{args}/help");
     if !Path::new(&help_path).exists() {
         return Ok(None);
     }

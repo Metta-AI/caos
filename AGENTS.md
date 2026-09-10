@@ -98,6 +98,19 @@ Every script here runs with it, and two constructs quietly break under it.
   fails instead of being fetched (`tests/lint/lint-bake-anchor.sh`). That is the build
   refusing to reach out, not the container being unable to.
 
+- **A CURRIED image handed to a worker is `{base, args/…, .caos-curry}`, so its
+  bindings are at `args/<name>`.** `caos_curry` builds that shape, and an
+  argument bound by reference keeps it — so a worker reads
+  `/cas/args/<x>-image/args/help`, never `/cas/args/<x>-image/help`.
+  `llm-step`'s `std_tool` read the latter, and since `registry` SKIPPED any
+  tool it could not describe, every std tool vanished from the registry: no
+  error, no log line, and `caos-build`, `caos-test`, `caos-test-result`,
+  `merge`, `log`, `show` and `diff` simply absent from every conversation the
+  tui ran. **A registry must fail on something it was configured with and
+  cannot describe** — the skip is what turned a wrong path into an invisible
+  one. `caos-cli run --base:@=std/llm-step --list-tools=1` prints the registry,
+  which is the cheapest way to see what a model is actually being offered.
+
 # Git
 
 - **A `git fetch` can fail over an object it never asked for.** The post-fetch
