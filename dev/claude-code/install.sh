@@ -120,14 +120,51 @@ while IFS=$'\t' read -r s r; do
     case "$r" in refs/tags/build-*) builds="$builds${r#refs/tags/}"$'\n' ;; esac
 done <<< "$refs"
 
+# THE NEWEST BUILD AT OR BEFORE A COMMIT, which is what the header at the top
+# of this file has always promised and what the code never did.
+#
+# A branch head has no build for the ~25 minutes its workflow takes, and in that
+# window every environment built from that branch failed to install a client AT
+# ALL -- one push, and the next cloud session comes up with no caos in it. A
+# slightly older client is a different thing from no client.
+#
+# Needs history, which `ls-remote` does not carry, so it shallow-fetches the ref
+# and walks back. Fifty is a bound, not a guess: past that, something other than
+# "CI is still running" is wrong, and saying so is more use than reaching
+# further back.
+WALK_DEPTH=50
+newest_build_at_or_before() { # <ref-or-sha> ; prints build-<12 hex>
+    local ref=$1 dir walk commit short
+    dir="$(mktemp -d)"
+    if ! git -C "$dir" init -q . 2>/dev/null \
+        || ! git -C "$dir" fetch -q --depth "$WALK_DEPTH" "$remote" "$ref" 2>/dev/null; then
+        rm -rf "$dir"
+        return 1
+    fi
+    walk="$(git -C "$dir" log --format=%H FETCH_HEAD 2>/dev/null)"
+    rm -rf "$dir"
+    [ -n "$walk" ] || return 1
+    while IFS= read -r commit; do
+        short="${commit:0:12}"
+        case "$builds" in
+            *"build-$short"$'\n'*) printf 'build-%s\n' "$short"; return 0 ;;
+        esac
+    done <<< "$walk"
+    return 1
+}
+
 if [ -n "$sha" ]; then
     VERSION="build-${sha:0:12}"
     case "$builds" in
         *"$VERSION"$'\n'*) ;;
         *)
             echo "$REPO $REF is $sha, which has no build yet" >&2
-            echo "  (the workflow publishes build-<commit>; is it still running?)" >&2
-            exit 1
+            echo "  (the workflow publishes build-<commit>; it may still be running)" >&2
+            if ! VERSION="$(newest_build_at_or_before "$REF")"; then
+                echo "  and no build exists in its last $WALK_DEPTH commits either" >&2
+                exit 1
+            fi
+            echo "  falling back to $VERSION, the newest build at or before it" >&2
             ;;
     esac
 else
