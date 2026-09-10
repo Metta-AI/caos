@@ -16,14 +16,13 @@ pub enum Kind {
     AsyncTerminal,
     SubagentSpawn,
     SubagentTerminal,
-    SubagentApply,
     PublicationPending,
     PublicationTerminal,
     FilesApply,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 20] = [
+    pub const ALL: [Kind; 19] = [
         Kind::ConversationRoot,
         Kind::ConversationFork,
         Kind::MetadataTitleSet,
@@ -40,7 +39,6 @@ impl Kind {
         Kind::AsyncTerminal,
         Kind::SubagentSpawn,
         Kind::SubagentTerminal,
-        Kind::SubagentApply,
         Kind::PublicationPending,
         Kind::PublicationTerminal,
         Kind::FilesApply,
@@ -64,7 +62,6 @@ impl Kind {
             Kind::AsyncTerminal => "async.terminal",
             Kind::SubagentSpawn => "subagent.spawn",
             Kind::SubagentTerminal => "subagent.terminal",
-            Kind::SubagentApply => "subagent.apply",
             Kind::PublicationPending => "publication.pending",
             Kind::PublicationTerminal => "publication.terminal",
             Kind::FilesApply => "files.apply",

@@ -1,8 +1,6 @@
 //! Preview and publish a selected set of named source_trees.
 use super::*;
-use caos_cli::source_trees::{
-    publication_order, publication_plan, resolve_publication_plan, PublicationTarget,
-};
+use caos_cli::source_trees::{publication_order, publication_plan, PublicationTarget};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PLAN: AtomicU64 = AtomicU64::new(1);
@@ -126,11 +124,6 @@ impl App {
             self.selected_mut().publish_plan = Some(prompt);
             return;
         }
-        let all = prompt
-            .rows
-            .iter()
-            .map(|row| row.target.clone())
-            .collect::<Vec<_>>();
         let selected = prompt
             .rows
             .iter()
@@ -167,33 +160,21 @@ impl App {
         }
         let conversation = self.selected().id.clone();
         let title = self.selected().title.clone();
-        let options = self.selected().turn_options.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.selected_mut().publication_cancel = Some(cancel.clone());
         self.selected_mut().publishing = true;
-        self.selected_mut().running = true;
-        self.selected_mut().local_turn = true;
-        self.selected_mut().status = "preparing publication".into();
-        let tx = self.tx.clone();
+        self.selected_mut().status = "publishing".into();
         let finished_conversation = conversation.clone();
         spawn(
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let targets = resolve_publication_plan(transport, &all, &targets)?;
                 caos_cli::publication::publish_plan(
                     transport,
                     &conversation,
                     &title,
-                    &options,
                     &targets,
                     &cancel,
-                    |event| {
-                        let _ = tx.send(UiMessage::Turn {
-                            conversation: conversation.clone(),
-                            event,
-                        });
-                    },
                 )
             },
             move |result| UiMessage::Published {

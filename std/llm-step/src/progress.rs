@@ -474,9 +474,6 @@ impl<S: RefStore> State<S> {
                     .as_ref()
                     == Some(record)
             }
-            Transition::SubagentApply { child, application } => view
-                .child(child)?
-                .is_some_and(|record| record.applications.contains(application)),
             _ => false,
         };
         Ok(joined.then(|| Appended {
@@ -490,7 +487,6 @@ impl<S: RefStore> State<S> {
 fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
     observed.id == expected.id
         && observed.initial_head == expected.initial_head
-        && observed.initial_source_tree == expected.initial_source_tree
         && observed.request == expected.request
         && observed.relay == expected.relay
         && observed.spawn_intent == expected.spawn_intent
@@ -563,7 +559,6 @@ fn parent_chain_contains(store: &dyn ObjectStore, tip: &Oid, needle: &Oid) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use conversation_protocol::v3::apply::{client_signature, mint};
     use conversation_protocol::v3::oid::ensure_genesis;
@@ -656,8 +651,7 @@ mod tests {
                 owner: None,
             },
             title: "test".to_string(),
-            source_trees: BTreeMap::new(),
-            files_seed: None,
+            content: None,
         };
         let applied = apply(store, None, &transition)?;
         mint(

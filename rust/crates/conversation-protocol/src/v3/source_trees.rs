@@ -2,104 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{paths, Oid};
-
-/// Resolved neighbors and publication destination for a commit-valued path.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceTreeConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<SourceTreeBase>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publication: Option<PublicationDestination>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PublicationDestination {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<String>,
-    pub branch: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base: Option<PublicationBase>,
-}
-
-/// A PR base stays typed until an execution plan resolves its destination.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "name",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum PublicationBase {
-    Default,
-    Branch(String),
-    SourceTree(String),
-}
-
-impl PublicationBase {
-    pub fn parent(&self) -> Option<&str> {
-        match self {
-            Self::SourceTree(name) => Some(name),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for PublicationBase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Default => f.write_str("repository default"),
-            Self::Branch(name) => f.write_str(name),
-            Self::SourceTree(name) => write!(f, "@{name}"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SourceTreeBase {
-    Branch {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        repository: Option<String>,
-        name: String,
-        commit: Oid,
-    },
-    SourceTree {
-        name: String,
-        commit: Oid,
-    },
-}
-
-impl SourceTreeBase {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Branch { name, .. } | Self::SourceTree { name, .. } => name,
-        }
-    }
-    pub fn commit(&self) -> &Oid {
-        match self {
-            Self::Branch { commit, .. } | Self::SourceTree { commit, .. } => commit,
-        }
-    }
-    pub fn with_commit(&self, commit: Oid) -> Self {
-        match self {
-            Self::Branch {
-                repository, name, ..
-            } => Self::Branch {
-                repository: repository.clone(),
-                name: name.clone(),
-                commit,
-            },
-            Self::SourceTree { name, .. } => Self::SourceTree {
-                name: name.clone(),
-                commit,
-            },
-        }
-    }
-}
-
 pub fn validate_source(source: &str) -> Result<git_locator::GitRef, String> {
     let parsed = git_locator::parse_git_ref(source)?;
     if parsed.rev.is_none() || parsed.dir.is_some() {
@@ -127,48 +29,8 @@ pub fn validate_repository(repository: &str) -> Result<(), String> {
     Ok(())
 }
 
-impl SourceTreeConfig {
-    pub fn repository(&self) -> Option<String> {
-        self.publication
-            .as_ref()
-            .and_then(|p| p.repository.clone())
-            .or_else(|| match &self.upstream {
-                Some(SourceTreeBase::Branch { repository, .. }) => repository.clone(),
-                _ => None,
-            })
-    }
-    pub fn validate(&self) -> Result<(), String> {
-        if let Some(destination) = &self.publication {
-            if let Some(repository) = &destination.repository {
-                validate_repository(repository)?;
-            }
-            validate_branch(&destination.branch)?;
-            match &destination.base {
-                Some(PublicationBase::Branch(name)) => validate_branch(name)?,
-                Some(PublicationBase::SourceTree(name)) => paths::validate_source_tree_name(name)?,
-                _ => {}
-            }
-        }
-        match &self.upstream {
-            Some(SourceTreeBase::Branch {
-                repository, name, ..
-            }) => {
-                if let Some(repository) = repository {
-                    validate_repository(repository)?;
-                }
-                validate_branch(name)?;
-            }
-            Some(SourceTreeBase::SourceTree { name, .. }) => {
-                paths::validate_source_tree_name(name)?
-            }
-            None => {}
-        }
-        Ok(())
-    }
-}
-
 /// The sole external locator in a stack. Two lines avoid ambiguous URL fragments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseUrl {
     pub repository: String,
     pub branch: String,
@@ -216,27 +78,6 @@ pub fn validate_branch(branch: &str) -> Result<(), String> {
         return Err(format!("invalid branch name {branch:?}"));
     }
     Ok(())
-}
-
-/// Create a named line of work from one pinned source tree snapshot. The caller
-/// publishes this sequence atomically with any associated operation receipt.
-pub fn create_from_source_tree(
-    view: &super::view::Conversation<'_>,
-    name: &str,
-    source: &str,
-) -> Result<Vec<super::apply::Transition>, String> {
-    paths::validate_source_tree_name(name)?;
-    if view.snapshot().exists(name)? {
-        return Err(format!("path {name:?} already exists"));
-    }
-    let ws = view
-        .source_tree(source)?
-        .ok_or_else(|| format!("no code reference {source:?}"))?;
-    let commit = ws.commit;
-    Ok(vec![super::apply::Transition::reference(
-        name.to_string(),
-        Some(commit),
-    )])
 }
 
 pub fn normalize_repository_identity(url: &str) -> Result<String, String> {

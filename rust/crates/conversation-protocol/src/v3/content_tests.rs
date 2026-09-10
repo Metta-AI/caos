@@ -104,11 +104,16 @@ fn code_paths_are_content_and_sealing_preserves_code_history() {
             owner: None,
         },
         title: "Content".into(),
-        source_trees: BTreeMap::from([
-            ("feature/00-base".into(), w.clone()),
-            ("feature/dirty".into(), w.clone()),
-        ]),
-        files_seed: None,
+        content: Some({
+            let mut content = crate::v3::tree::TreeBuilder::from(None);
+            for (name, commit) in BTreeMap::<String, Oid>::from([
+                ("feature/00-base".into(), w.clone()),
+                ("feature/dirty".into(), w.clone()),
+            ]) {
+                content.put_oid(&name, crate::v3::Mode::Commit, commit);
+            }
+            content.build(&mut store).unwrap()
+        }),
     };
     let applied = apply(&mut store, None, &root).unwrap();
     let head = mint(&mut store, &g3, &applied, root.kind(), &sig).unwrap();
@@ -141,19 +146,18 @@ fn code_paths_are_content_and_sealing_preserves_code_history() {
         w
     );
     assert_eq!(
-        view.stack_predecessor("feature/01-change")
+        view.previous_reference("feature/01-change")
             .unwrap()
             .unwrap()
             .0,
         "feature/00-base"
     );
     assert_eq!(
-        view.source_tree_config("feature/01-change")
+        view.base_url("feature/01-change")
             .unwrap()
-            .publication
             .unwrap()
-            .branch,
-        "feature/01-change"
+            .repository,
+        "https://example.com/repo.git"
     );
     assert!(Conversation::open(&store, &head)
         .unwrap()

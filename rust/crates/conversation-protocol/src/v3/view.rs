@@ -178,7 +178,7 @@ impl<'s> Conversation<'s> {
         Ok(initial)
     }
 
-    pub fn stack_predecessor(&self, name: &str) -> Result<Option<(String, Oid)>, String> {
+    pub fn previous_reference(&self, name: &str) -> Result<Option<(String, Oid)>, String> {
         let (dir, leaf) = name.rsplit_once('/').unwrap_or(("", name));
         let mut previous = None;
         for entry in self.snapshot.list(dir)? {
@@ -188,7 +188,7 @@ impl<'s> Conversation<'s> {
             if entry.name == leaf {
                 return Ok(previous);
             }
-            if super::source_trees::is_boundary(&entry.name) || entry.name == "00-base" {
+            {
                 let path = if dir.is_empty() {
                     entry.name
                 } else {
@@ -200,52 +200,18 @@ impl<'s> Conversation<'s> {
         Ok(None)
     }
 
-    /// Derived from ordinary neighboring entries, never a stored source tree record.
-    pub fn source_tree_config(&self, name: &str) -> Result<super::SourceTreeConfig, String> {
+    /// Optional publishing convention. Invalid content remains editable.
+    pub fn base_url(&self, name: &str) -> Result<Option<super::BaseUrl>, String> {
         let dir = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-        let base_path = if dir.is_empty() {
+        let path = if dir.is_empty() {
             ".base-url".into()
         } else {
             format!("{dir}/.base-url")
         };
-        let Some(bytes) = self.snapshot.read(&base_path)? else {
-            return Ok(Default::default());
-        };
-        // A malformed optional convention must not make conversation files
-        // unreadable: the user needs to be able to edit .base-url to repair it.
-        let Ok(base) = super::source_trees::BaseUrl::parse(&bytes) else {
-            return Ok(Default::default());
-        };
-        let mut config = super::SourceTreeConfig::default();
-        if let Some((path, commit)) = self.stack_predecessor(name)? {
-            config.upstream = Some(if path.ends_with("/00-base") || path == "00-base" {
-                super::SourceTreeBase::Branch {
-                    repository: Some(base.repository.clone()),
-                    name: base.branch.clone(),
-                    commit,
-                }
-            } else {
-                super::SourceTreeBase::SourceTree { name: path, commit }
-            });
-        }
-        config.publication = Some(super::PublicationDestination {
-            repository: Some(base.repository),
-            branch: name.to_string(),
-            base: Some(match &config.upstream {
-                Some(super::SourceTreeBase::SourceTree { name, .. }) => {
-                    super::source_trees::PublicationBase::SourceTree(name.clone())
-                }
-                _ => super::source_trees::PublicationBase::Branch(base.branch),
-            }),
-        });
-        Ok(config)
-    }
-
-    pub fn source_tree_configs(&self) -> Result<BTreeMap<String, super::SourceTreeConfig>, String> {
-        self.source_tree_names()?
-            .into_iter()
-            .map(|name| self.source_tree_config(&name).map(|config| (name, config)))
-            .collect()
+        Ok(self
+            .snapshot
+            .read(&path)?
+            .and_then(|bytes| super::BaseUrl::parse(&bytes).ok()))
     }
 
     pub fn source_trees(&self) -> Result<BTreeMap<String, SourceTreeRecord>, String> {

@@ -48,7 +48,7 @@ for request_number in 2 3 4 5; do
     "/tmp/stub/request-$request_number.json" >/dev/null; then
     if [ "$child_write_sent" -eq 0 ]; then
       printf '%s\n' \
-        '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","source_tree":"main","file-path":"child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+        '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","file-path":"main/child-output.txt"},"name":"write","type":"tool_use"},{"id":"toolu_child_note","input":{"content":"remember this\n","file-path":"memories/child.md"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
         > "/tmp/stub/response-$request_number.json"
       child_write_sent=1
     else
@@ -138,11 +138,8 @@ spawn_commit=$($TOOL parents --repo /tmp/repo --head "$head1" \
   | while read -r oid kind; do if [ "$kind" = subagent.spawn ]; then printf '%s\n' "$oid"; fi; done)
 assert_oid "$spawn_commit" "parent spawn commit"
 pre_spawn=$(git rev-parse "$spawn_commit^1")
-parent_main=$(jq -r '.input_commit' <<<"$spawn_record")
-[ "$(jq -r '.source_tree_name' <<<"$spawn_record")" = main ] \
-  || fail "spawn tool did not target main"
-[ "$(jq -r '.initial_source_tree' <<<"$child_record")" = "$parent_main" ] \
-  || fail "child record did not pin main at spawn"
+parent_main=$(source_tree_commit "$pre_spawn")
+assert_oid "$(jq -r '.spawn_intent.content' <<<"$child_record")" "child content seed"
 
 child_ref=$($TOOL ref --id "$child") || fail "forming child ref"
 child_ref=${child_ref#ref }
@@ -197,10 +194,8 @@ child_tip_output=$($TOOL fetch --repo /tmp/repo --ref "$child_ref") \
   || fail "fetching terminal child ref"
 [ "${child_tip_output#head }" = "$terminal_head" ] \
   || fail "parent terminal checkpoint is not the child ref head"
-child_main=$(jq -r '.child_source_trees.main.commit // empty' <<<"$terminal_record")
-child_base=$(jq -r '.child_source_trees.main.initial // empty' <<<"$terminal_record")
+child_main=$(source_tree_commit "$terminal_head")
 assert_oid "$child_main" "terminal child main"
-[ "$child_base" = "$parent_main" ] || fail "terminal child main lost its initial commit"
 terminal_count=$($TOOL parents --repo /tmp/repo --head "$head1" \
   | while read -r _ kind; do if [ "$kind" = subagent.terminal ]; then echo x; fi; done \
   | wc -l | tr -d ' ')
@@ -218,7 +213,7 @@ admit_turn "apply the child result"
 request2=$request
 start_turn
 wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
-printf '{"content":[{"id":"toolu_promote","input":{"cmd":"caos checkout %s review .","paths":[]},"name":"bash","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s","source_tree":"main"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+printf '{"content":[{"id":"toolu_promote","input":{"cmd":"caos checkout %s review .","paths":[]},"name":"bash","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
   "$child_main" "$child" > /tmp/stub/response-6.json
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
@@ -228,23 +223,22 @@ parent_after=$(source_tree_commit "$head2")
 fetch_code "$parent_after" "fetching harvested parent source_tree"
 [ "$(git show "$parent_after:child-output.txt")" = "written by child" ] \
   || fail "harvested parent tree lacks the child's file"
-$TOOL tool-observation --repo /tmp/repo --head "$head2" --request "$request2" \
-  --round 0 --id toolu_harvest > /tmp/harvest-observation.json
-resolution=$(jq -r '.kind // empty' /tmp/harvest-observation.json)
-case "$resolution" in direct|merged) ;; *) fail "harvest resolution is $resolution" ;; esac
+[ "$(git show "$head2:memories/child.md")" = "remember this" ] \
+  || fail "harvest omitted ordinary conversation content"
+$TOOL tools --repo /tmp/repo --head "$head2" --request "$request2" \
+  | jq -e 'select(.id == "toolu_harvest") | .files_outcome.applied | index("memories/child.md") != null' >/dev/null \
+  || fail "harvest did not use file application"
 
 stage "spines and parent-only cost"
 assert_spine "$head2"
 assert_spine "$terminal_head"
 spawn_count=0
 terminal_count=0
-apply_count=0
 harvest_complete_count=0
 while read -r oid kind; do
   case "$kind" in
     subagent.spawn) spawn_count=$((spawn_count + 1)) ;;
     subagent.terminal) terminal_count=$((terminal_count + 1)) ;;
-    subagent.apply) apply_count=$((apply_count + 1)) ;;
     tool.complete)
       if git show -s --format=%b "$oid" | jq -e --arg request "$request2" \
           '.events[] | select(.event == "tool" and .value.request == $request and .value.id == "toolu_harvest")' >/dev/null; then
@@ -261,7 +255,6 @@ done < <($TOOL parents --repo /tmp/repo --head "$head2" \
     done)
 [ "$spawn_count" -eq 1 ] || fail "parent has $spawn_count spawn commits"
 [ "$terminal_count" -eq 1 ] || fail "parent has $terminal_count terminal commits"
-[ "$apply_count" -eq 1 ] || fail "parent has $apply_count apply commits"
 [ "$harvest_complete_count" -eq 1 ] \
   || fail "parent has $harvest_complete_count harvest completion commits"
 

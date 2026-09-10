@@ -333,23 +333,11 @@ fn reconstruct(
             let terminal_head = record
                 .terminal_head
                 .ok_or_else(|| format!("{}: changed child has no terminal_head", kind.as_str()))?;
-            let child_source_trees = record.child_source_trees.ok_or_else(|| {
-                format!("{}: changed child has no child_source_trees", kind.as_str())
-            })?;
             Ok(Transition::SubagentTerminal {
                 child,
                 terminal_head,
                 status: record.status,
-                child_source_trees,
             })
-        }
-        Kind::SubagentApply => {
-            let (child, record) = child_change(kind, child_snapshot, changes)?;
-            let application =
-                record.applications.last().cloned().ok_or_else(|| {
-                    format!("{}: changed child has no application", kind.as_str())
-                })?;
-            Ok(Transition::SubagentApply { child, application })
         }
         Kind::PublicationPending => Ok(Transition::PublicationPending {
             record: publication_change(kind, child_snapshot, changes)?.1,

@@ -1,5 +1,4 @@
 pub use super::tasks::TaskStatus;
-use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -850,62 +849,25 @@ pub struct SpawnIntent {
     pub request: Oid,
     pub round: u64,
     pub tool: String,
-    #[serde(deserialize_with = "nullable")]
-    #[serde(alias = "workspace_name")]
-    pub source_tree_name: Option<String>,
-    #[serde(deserialize_with = "nullable")]
-    #[serde(alias = "input_workspace", alias = "input_source_tree")]
-    pub input_commit: Option<Oid>,
     pub prompt: String,
     pub model: String,
     pub configuration: String,
-    #[serde(deserialize_with = "nullable")]
-    pub files_seed: Option<Oid>,
+    pub content: Oid,
 }
 impl_record!(SpawnIntent, validate);
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChildSourceTree {
-    pub commit: Oid,
-    pub initial: Oid,
-}
-impl_record!(ChildSourceTree);
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Application {
-    #[serde(alias = "parent_workspace_name")]
-    pub parent_source_tree_name: String,
-    #[serde(deserialize_with = "nullable")]
-    #[serde(alias = "parent_workspace")]
-    pub parent_source_tree: Option<Oid>,
-    #[serde(alias = "child_workspace")]
-    pub child_source_tree: String,
-    #[serde(alias = "workspace_resolution")]
-    pub source_tree_resolution: SourceTreeResolution,
-}
-impl_record!(Application, validate);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildRecord {
     pub id: String,
     pub initial_head: Oid,
-    #[serde(deserialize_with = "nullable")]
-    #[serde(alias = "initial_workspace")]
-    pub initial_source_tree: Option<Oid>,
     pub request: Oid,
     pub relay: Oid,
     pub spawn_intent: SpawnIntent,
     #[serde(with = "child_status")]
     pub status: TaskStatus,
-    pub applications: Vec<Application>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     pub terminal_head: Option<Oid>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    #[serde(alias = "child_workspaces")]
-    pub child_source_trees: Option<BTreeMap<String, ChildSourceTree>>,
 }
 impl_record!(ChildRecord, validate);
 
@@ -1204,15 +1166,6 @@ impl SpawnIntent {
         if self.round > MAX_JSON_INT {
             return Err("spawn intent round exceeds the maximum JSON integer".to_string());
         }
-        if self.source_tree_name.is_some() != self.input_commit.is_some() {
-            return Err(
-                "spawn intent source_tree_name and input_commit must both be null or present"
-                    .to_string(),
-            );
-        }
-        if let Some(source_tree_name) = &self.source_tree_name {
-            paths::validate_source_tree_name(source_tree_name)?;
-        }
         path(&self.prompt, "spawn prompt path")?;
         if self.configuration.is_empty() {
             return Err("spawn configuration must not be empty".to_string());
@@ -1221,32 +1174,16 @@ impl SpawnIntent {
     }
 }
 
-impl Application {
-    fn validate(&self) -> Result<(), String> {
-        paths::validate_source_tree_name(&self.parent_source_tree_name)?;
-        paths::validate_source_tree_name(&self.child_source_tree)?;
-        self.source_tree_resolution.validate()
-    }
-}
-
 impl ChildRecord {
     fn validate(&self) -> Result<(), String> {
         if self.status == TaskStatus::Pending {
-            if self.terminal_head.is_some() || self.child_source_trees.is_some() {
+            if self.terminal_head.is_some() {
                 return Err("running child forbids terminal fields".to_string());
             }
-        } else if self.terminal_head.is_none() || self.child_source_trees.is_none() {
+        } else if self.terminal_head.is_none() {
             return Err("child terminal fields are required iff status is not running".to_string());
         }
         self.spawn_intent.validate()?;
-        for application in &self.applications {
-            application.validate()?;
-        }
-        if let Some(source_trees) = &self.child_source_trees {
-            for name in source_trees.keys() {
-                paths::validate_source_tree_name(name)?;
-            }
-        }
         Ok(())
     }
 }
@@ -1301,45 +1238,24 @@ mod tests {
         SpawnIntent {
             request: oid('1'),
             round: 2,
-            tool: "tool-1".to_string(),
-            source_tree_name: Some("main".to_string()),
-            input_commit: Some(oid('a')),
-            prompt: ".caos/tools/prompt".to_string(),
-            model: "model".to_string(),
-            configuration: "configuration-hash".to_string(),
-            files_seed: Some(oid('b')),
+            tool: "tool-1".into(),
+            prompt: ".caos/tools/prompt".into(),
+            model: "model".into(),
+            configuration: "configuration-hash".into(),
+            content: oid('a'),
         }
     }
-
     fn child(status: TaskStatus) -> ChildRecord {
-        let terminal = status != TaskStatus::Pending;
         ChildRecord {
-            id: "child-1".to_string(),
+            id: "child-1".into(),
             initial_head: oid('2'),
-            initial_source_tree: Some(oid('a')),
             request: oid('1'),
             relay: oid('3'),
             spawn_intent: spawn_intent(),
             status,
-            applications: vec![Application {
-                parent_source_tree_name: "main".to_string(),
-                parent_source_tree: Some(oid('a')),
-                child_source_tree: "main".to_string(),
-                source_tree_resolution: direct(),
-            }],
-            terminal_head: terminal.then(|| oid('4')),
-            child_source_trees: terminal.then(|| {
-                BTreeMap::from([(
-                    "main".to_string(),
-                    ChildSourceTree {
-                        commit: oid('b'),
-                        initial: oid('a'),
-                    },
-                )])
-            }),
+            terminal_head: (status != TaskStatus::Pending).then(|| oid('4')),
         }
     }
-
     fn descriptor() -> Descriptor {
         Descriptor {
             source_base: oid('a'),
@@ -1348,252 +1264,6 @@ mod tests {
             policy: "squash".to_string(),
             implementation: "project-v1".to_string(),
             commit_policy: "single".to_string(),
-        }
-    }
-
-    #[test]
-    fn record_bytes_are_stable() {
-        let owner = Owner {
-            parent: "parent".to_string(),
-            parent_head: oid('a'),
-            request: oid('b'),
-            round: 3,
-            tool: "tool".to_string(),
-        };
-        let merged = MergeInfo {
-            base: oid('a'),
-            ours: oid('b'),
-            theirs: oid('c'),
-            implementation: "merge-v1".to_string(),
-            output: Some(oid('d')),
-            conflict_paths: None,
-        };
-        let request = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "configuration-hash".to_string(),
-            round: 0,
-            calls: vec![DeclaredCall {
-                id: "tool-1".to_string(),
-                name: "shell".to_string(),
-            }],
-            interjections: vec!["note".to_string()],
-            status: TurnStatus::Idle,
-            latest_message: None,
-            escape_reason: Some("stop".to_string()),
-            outcome: Some(TurnOutcome::Idle {
-                result: Some(".caos/requests/result".to_string()),
-                interrupted: true,
-            }),
-        };
-        let tool_result = ToolResult::Complete {
-            observation: ".caos/tools/observation".to_string(),
-            proposal: Some(oid('b')),
-        };
-        let files_outcome = FilesOutcome {
-            applied: vec!["a.txt".to_string()],
-            conflicted: vec!["b.txt".to_string()],
-        };
-        let tool = CallRecord {
-            request: oid('1'),
-            round: 0,
-            id: "tool-1".to_string(),
-            name: "shell".to_string(),
-            declaration_message: "message-1".to_string(),
-            source_tree_name: Some("main".to_string()),
-            input_commit: Some(oid('a')),
-            status: CallStatus::Complete,
-            task: None,
-            result: Some(tool_result.clone()),
-            source_tree_resolution: Some(direct()),
-            files: vec!["a.txt".to_string()],
-            files_outcome: Some(files_outcome.clone()),
-        };
-        let application = Application {
-            parent_source_tree_name: "main".to_string(),
-            parent_source_tree: Some(oid('a')),
-            child_source_tree: "main".to_string(),
-            source_tree_resolution: direct(),
-        };
-        let transcript = TranscriptEntry {
-            message_id: "message-1".to_string(),
-            conversation: "conversation".to_string(),
-            role: Role::Assistant,
-            actor: "model".to_string(),
-            request: Some(oid('1')),
-            round: Some(0),
-            model: Some("model".to_string()),
-            blocks: vec![Block::ToolUse {
-                id: "tool-1".to_string(),
-                name: "shell".to_string(),
-                arguments: ".caos/transcript/arguments".to_string(),
-            }],
-            proposal: Some(Proposal {
-                base: oid('a'),
-                commit: oid('b'),
-                source_tree_name: "main".to_string(),
-            }),
-            source_tree_resolution: Some(direct()),
-        };
-        let publication = PublicationRecord {
-            id: "publication-1".to_string(),
-            key: "key".to_string(),
-            descriptor: descriptor(),
-            planned_head: oid('d'),
-            repository: "repo".to_string(),
-            refname: "refs/heads/main".to_string(),
-            expected_old: None,
-            source_tree_name: "main".to_string(),
-            status: PublicationStatus::Complete,
-            evidence: Some(Evidence {
-                kind: "push-success".to_string(),
-                diagnostic: Some("ok".to_string()),
-            }),
-            observed: Some(oid('e')),
-        };
-
-        let encoded = [
-            owner.clone().encode(),
-            Identity {
-                id: "root".to_string(),
-                kind: IdentityKind::Root,
-                owner: Some(owner),
-            }
-            .encode(),
-            SourceTreeRecord { commit: oid('a') }.encode(),
-            Block::ToolUse {
-                id: "tool-1".to_string(),
-                name: "shell".to_string(),
-                arguments: ".caos/transcript/arguments".to_string(),
-            }
-            .encode(),
-            Proposal {
-                base: oid('a'),
-                commit: oid('b'),
-                source_tree_name: "main".to_string(),
-            }
-            .encode(),
-            merged.clone().encode(),
-            SourceTreeResolution::Merged {
-                current: oid('b'),
-                merge: merged,
-                output: oid('d'),
-            }
-            .encode(),
-            transcript.encode(),
-            DeclaredCall {
-                id: "tool-1".to_string(),
-                name: "shell".to_string(),
-            }
-            .encode(),
-            request.encode(),
-            tool_result.encode(),
-            files_outcome.encode(),
-            tool.encode(),
-            AsyncRecord {
-                task: oid('1'),
-                status: TaskStatus::Complete,
-                target_ref: Some("refs/heads/main".to_string()),
-                result: Some(oid('2')),
-                reason: None,
-            }
-            .encode(),
-            spawn_intent().encode(),
-            ChildSourceTree {
-                commit: oid('b'),
-                initial: oid('a'),
-            }
-            .encode(),
-            application.encode(),
-            child(TaskStatus::Complete).encode(),
-            descriptor().encode(),
-            Evidence {
-                kind: "push-success".to_string(),
-                diagnostic: Some("ok".to_string()),
-            }
-            .encode(),
-            publication.encode(),
-        ];
-        const EXPECTED: [&str; 21] = [
-            concat!(
-                r#"{"parent":"parent","parent_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":3,"tool":"tool"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"id":"root","kind":"root","owner":{"parent":"parent","parent_head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","round":3,"tool":"tool"}}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"arguments":{"path":".caos/transcript/arguments"},"id":"tool-1","name":"shell","type":"tool_use"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_tree_name":"main"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","implementation":"merge-v1","ours":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","output":"dddddddddddddddddddddddddddddddddddddddd","theirs":"cccccccccccccccccccccccccccccccccccccccc"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"current":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","kind":"merged","merge":{"base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","implementation":"merge-v1","ours":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","output":"dddddddddddddddddddddddddddddddddddddddd","theirs":"cccccccccccccccccccccccccccccccccccccccc"},"output":"dddddddddddddddddddddddddddddddddddddddd"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"actor":"model","blocks":[{"arguments":{"path":".caos/transcript/arguments"},"id":"tool-1","name":"shell","type":"tool_use"}],"conversation":"conversation","message_id":"message-1","model":"model","proposal":{"base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_tree_name":"main"},"request":"1111111111111111111111111111111111111111","role":"assistant","round":0,"source_tree_resolution":{"current":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct","output":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
-                "\n"
-            ),
-            concat!(r#"{"id":"tool-1","name":"shell"}"#, "\n"),
-            concat!(
-                r#"{"calls":[{"id":"tool-1","name":"shell"}],"configuration":"configuration-hash","escape_reason":"stop","id":"1111111111111111111111111111111111111111","interjections":["note"],"interrupted":true,"model":"model","request_head":"2222222222222222222222222222222222222222","result":".caos/requests/result","round":0,"status":"idle"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"kind":"complete","observation":".caos/tools/observation","proposal":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
-                "\n"
-            ),
-            concat!(r#"{"applied":["a.txt"],"conflicted":["b.txt"]}"#, "\n"),
-            concat!(
-                r#"{"declaration_message":"message-1","files":["a.txt"],"files_outcome":{"applied":["a.txt"],"conflicted":["b.txt"]},"id":"tool-1","input_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"shell","request":"1111111111111111111111111111111111111111","result":{"kind":"complete","observation":".caos/tools/observation","proposal":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"round":0,"source_tree_name":"main","source_tree_resolution":{"current":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct","output":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"status":"complete"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"result":"2222222222222222222222222222222222222222","status":"complete","target_ref":"refs/heads/main","task":"1111111111111111111111111111111111111111"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"configuration":"configuration-hash","files_seed":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","input_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model":"model","prompt":".caos/tools/prompt","request":"1111111111111111111111111111111111111111","round":2,"source_tree_name":"main","tool":"tool-1"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","initial":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"child_source_tree":"main","parent_source_tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parent_source_tree_name":"main","source_tree_resolution":{"current":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct","output":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"applications":[{"child_source_tree":"main","parent_source_tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parent_source_tree_name":"main","source_tree_resolution":{"current":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct","output":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}],"child_source_trees":{"main":{"commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","initial":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"id":"child-1","initial_head":"2222222222222222222222222222222222222222","initial_source_tree":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relay":"3333333333333333333333333333333333333333","request":"1111111111111111111111111111111111111111","spawn_intent":{"configuration":"configuration-hash","files_seed":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","input_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model":"model","prompt":".caos/tools/prompt","request":"1111111111111111111111111111111111111111","round":2,"source_tree_name":"main","tool":"tool-1"},"status":"completed","terminal_head":"4444444444444444444444444444444444444444"}"#,
-                "\n"
-            ),
-            concat!(
-                r#"{"commit_policy":"single","implementation":"project-v1","policy":"squash","source_base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","target_base":"cccccccccccccccccccccccccccccccccccccccc"}"#,
-                "\n"
-            ),
-            concat!(r#"{"diagnostic":"ok","kind":"push-success"}"#, "\n"),
-            concat!(
-                r#"{"descriptor":{"commit_policy":"single","implementation":"project-v1","policy":"squash","source_base":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","target_base":"cccccccccccccccccccccccccccccccccccccccc"},"evidence":{"diagnostic":"ok","kind":"push-success"},"expected_old":null,"id":"publication-1","key":"key","observed":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","planned_head":"dddddddddddddddddddddddddddddddddddddddd","ref":"refs/heads/main","repository":"repo","source_tree_name":"main","status":"complete"}"#,
-                "\n"
-            ),
-        ];
-        for (actual, expected) in encoded.iter().zip(EXPECTED) {
-            assert_eq!(actual, expected.as_bytes());
         }
     }
 
@@ -1675,22 +1345,7 @@ mod tests {
             }
         );
         round_trip!(SpawnIntent, spawn_intent());
-        round_trip!(
-            ChildSourceTree,
-            ChildSourceTree {
-                commit: oid('b'),
-                initial: oid('a')
-            }
-        );
-        round_trip!(
-            Application,
-            Application {
-                parent_source_tree_name: "main".to_string(),
-                parent_source_tree: Some(oid('a')),
-                child_source_tree: "main".to_string(),
-                source_tree_resolution: direct(),
-            }
-        );
+
         round_trip!(Descriptor, descriptor());
         round_trip!(
             Evidence,
@@ -1939,12 +1594,7 @@ mod tests {
             files: Vec::new(),
             files_outcome: None,
         };
-        let application = Application {
-            parent_source_tree_name: "main".to_string(),
-            parent_source_tree: None,
-            child_source_tree: "main".to_string(),
-            source_tree_resolution: direct(),
-        };
+
         let publication = PublicationRecord {
             id: "publication-1".to_string(),
             key: "key".to_string(),
@@ -2040,23 +1690,7 @@ mod tests {
             }
         );
         rejects_unknown!(SpawnIntent, spawn_intent());
-        rejects_unknown!(
-            ChildSourceTree,
-            ChildSourceTree {
-                commit: oid('b'),
-                initial: oid('a'),
-            }
-        );
-        rejects_unknown!(Application, application);
-        rejects_unknown!(ChildRecord, child(TaskStatus::Pending));
-        rejects_unknown!(Descriptor, descriptor());
-        rejects_unknown!(
-            Evidence,
-            Evidence {
-                kind: "push-success".to_string(),
-                diagnostic: None,
-            }
-        );
+
         rejects_unknown!(PublicationRecord, publication);
     }
 
@@ -2231,36 +1865,8 @@ mod tests {
         };
         rejects_missing!(CallRecord, started_tool.clone(), "source_tree_name");
         rejects_missing!(CallRecord, started_tool, "input_commit");
-        let intent = SpawnIntent {
-            source_tree_name: None,
-            input_commit: None,
-            files_seed: None,
-            ..spawn_intent()
-        };
-        rejects_missing!(SpawnIntent, intent.clone(), "source_tree_name");
-        rejects_missing!(SpawnIntent, intent.clone(), "input_commit");
-        rejects_missing!(SpawnIntent, intent, "files_seed");
-        rejects_missing!(
-            Application,
-            Application {
-                parent_source_tree_name: "main".to_string(),
-                parent_source_tree: None,
-                child_source_tree: "main".to_string(),
-                source_tree_resolution: direct(),
-            },
-            "parent_source_tree"
-        );
-        rejects_missing!(
-            ChildRecord,
-            ChildRecord {
-                initial_source_tree: None,
-                ..child(TaskStatus::Pending)
-            },
-            "initial_source_tree"
-        );
-        let terminal_child = child(TaskStatus::Complete);
-        rejects_missing!(ChildRecord, terminal_child.clone(), "terminal_head");
-        rejects_missing!(ChildRecord, terminal_child, "child_source_trees");
+        rejects_missing!(SpawnIntent, spawn_intent(), "content");
+        rejects_missing!(ChildRecord, child(TaskStatus::Complete), "terminal_head");
         let pending_publication = PublicationRecord {
             id: "publication-1".to_string(),
             key: "key".to_string(),

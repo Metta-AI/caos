@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::events::Event;
 use super::ids;
@@ -15,8 +15,7 @@ pub enum Transition {
     ConversationRoot {
         identity: Identity,
         title: String,
-        source_trees: BTreeMap<String, Oid>,
-        files_seed: Option<Oid>,
+        content: Option<Oid>,
     },
     ConversationFork {
         identity: Identity,
@@ -81,11 +80,6 @@ pub enum Transition {
         child: String,
         terminal_head: Oid,
         status: TaskStatus,
-        child_source_trees: BTreeMap<String, ChildSourceTree>,
-    },
-    SubagentApply {
-        child: String,
-        application: Application,
     },
 
     PublicationPending {
@@ -103,29 +97,6 @@ pub enum Transition {
 }
 
 impl Transition {
-    pub fn stack_base(name: String, config: super::SourceTreeConfig) -> Self {
-        let dir = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-        let join = |leaf: &str| {
-            if dir.is_empty() {
-                leaf.to_string()
-            } else {
-                format!("{dir}/{leaf}")
-            }
-        };
-        let mut files = Vec::new();
-        if let Some(super::SourceTreeBase::Branch {
-            repository: Some(repository),
-            name: branch,
-            commit,
-        }) = config.upstream
-        {
-            let base = super::source_trees::BaseUrl { repository, branch };
-            files.push((join(".base-url"), Some((Mode::Blob, base.encode()))));
-            files.push((join("00-base"), Some((Mode::Commit, commit.encode_line()))));
-        }
-        Self::FilesApply { files }
-    }
-
     pub fn reference(name: String, commit: Option<Oid>) -> Self {
         Self::FilesApply {
             files: vec![(name, commit.map(|oid| (Mode::Commit, oid.encode_line())))],
@@ -150,7 +121,6 @@ impl Transition {
             Transition::AsyncTerminal { .. } => Kind::AsyncTerminal,
             Transition::SubagentSpawn { .. } => Kind::SubagentSpawn,
             Transition::SubagentTerminal { .. } => Kind::SubagentTerminal,
-            Transition::SubagentApply { .. } => Kind::SubagentApply,
             Transition::PublicationPending { .. } => Kind::PublicationPending,
             Transition::PublicationTerminal { .. } => Kind::PublicationTerminal,
             Transition::FilesApply { .. } => Kind::FilesApply,
@@ -192,8 +162,7 @@ pub fn apply(
         Transition::ConversationRoot {
             identity,
             title,
-            source_trees,
-            files_seed,
+            content,
         } => {
             canonical_shape(identity, "identity")?;
             if !matches!(identity.kind, IdentityKind::Root) {
@@ -206,15 +175,8 @@ pub fn apply(
             );
             builder.put(paths::IDENTITY, Mode::Blob, identity.content_bytes());
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
-            for (name, commit) in source_trees {
-                paths::validate_source_tree_name(name)?;
-                builder.put_oid(name, Mode::Commit, commit.clone());
-            }
-            if let Some(seed) = files_seed {
-                store
-                    .read_tree(seed)
-                    .map_err(|error| format!("files seed {seed} must be a tree: {error}"))?;
-                for entry in store.read_tree(seed).map_err(String::from)? {
+            if let Some(seed) = content {
+                for entry in super::tree::Snapshot::new(store, seed.clone()).list("")? {
                     if entry.name == ".caos" {
                         return Err("content seed must not contain .caos".into());
                     }
@@ -546,42 +508,12 @@ pub fn apply(
             child,
             terminal_head,
             status,
-            child_source_trees,
         } => {
             let conversation = parent(store, parent_head)?;
             let mut record = require_child(&conversation, child)?;
             record.status = record.status.finish(*status)?;
             record.terminal_head = Some(terminal_head.clone());
-            record.child_source_trees = Some(child_source_trees.clone());
             canonical_shape(&record, "child record")?;
-            put_child(&mut events, &record);
-        }
-        Transition::SubagentApply { child, application } => {
-            let conversation = parent(store, parent_head)?;
-            Application::from_value(&application.to_value())?;
-            let mut record = require_child(&conversation, child)?;
-            if record.status == TaskStatus::Pending {
-                return Err("cannot apply a running subagent".to_string());
-            }
-            let source_tree = conversation
-                .source_tree(&application.parent_source_tree_name)?
-                .ok_or_else(|| {
-                    format!(
-                        "source tree {:?} does not exist",
-                        application.parent_source_tree_name
-                    )
-                })?;
-            if application.parent_source_tree.as_ref() != Some(&source_tree.commit) {
-                return Err("subagent application parent source tree is stale".to_string());
-            }
-            move_source_tree_pointer(
-                &mut builder,
-                &application.parent_source_tree_name,
-                &source_tree.commit,
-                application.source_tree_resolution.new_pointer(),
-                "subagent application source tree update",
-            )?;
-            record.applications.push(application.clone());
             put_child(&mut events, &record);
         }
         Transition::PublicationPending { record } => {

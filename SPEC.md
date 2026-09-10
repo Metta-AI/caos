@@ -558,7 +558,7 @@ so a mid-merge head is fully reviewable.
 
 ## Reading by hash (`read`/`ls` with `root`)
 
-Both file readers default to the current source tree but accept a `root` — a
+Both file readers default to the conversation root but accept a `root` — a
 commit, tree, or blob hash — to read/list as of another revision. A commit or
 tree `root` navigates its tree by path; a bare blob `root` (no path) reads that
 object directly. This is load-bearing, not a convenience: the stage oids in
@@ -588,12 +588,12 @@ directory: `.base-url` supplies the repository and external base branch;
 numbered commit entries supply PR branches named by their full paths.
 `00-base` and `dirty` are excluded. The first PR targets the external branch;
 each later PR targets the preceding boundary. No publication defaults are stored.
-`Ctrl+P` previews the selected stack, prepares its boundaries in order, and
+`Ctrl+P` previews exact commits and destinations, publishes them in order, and
 opens or reuses each PR by repository and head branch. Publication verifies
 the captured content and remote tips; interrupted pushes are reconciled from
 the remote and execution events. `/publish-branch` pushes a selected review
-boundary without preparation or PR creation. Neither exports conversations.
+boundary without PR creation. Neither exports conversations.
 
 Per-mutation commits remain in the published source tree history. Only the
-prepared PR tip is checked for unresolved conflicts and reserved state;
+previewed PR tip is checked for unresolved conflicts and reserved state;
 intermediate commits may contain conflict markers or fail to build.

@@ -1,13 +1,13 @@
 //! Append terminal async records or child checkpoints to a v3 conversation.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::refs as conversation_refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    validate_spine, ChildSourceTree, CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus,
-    TurnOutcome, TurnStatus,
+    validate_spine, CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus, TurnOutcome,
+    TurnStatus,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -49,7 +49,7 @@ pub fn append_child_terminal(
         .fetch_ref(&child_ref)?
         .ok_or_else(|| format!("child conversation ref {child_ref} does not exist"))?;
     validate_spine(&store, &terminal_head, &mut HashSet::new()).map_err(String::from)?;
-    let (status, child_source_trees) = terminal_facts(&store, &terminal_head, &subrequest)?;
+    let status = terminal_facts(&store, &terminal_head, &subrequest)?;
     append_child_terminal_with(
         &mut store,
         refname,
@@ -58,7 +58,6 @@ pub fn append_child_terminal(
         &relay,
         &terminal_head,
         status,
-        &child_source_trees,
     )
 }
 
@@ -66,7 +65,7 @@ fn terminal_facts(
     store: &dyn ObjectStore,
     terminal_head: &Oid,
     subrequest: &Oid,
-) -> Result<(TaskStatus, BTreeMap<String, ChildSourceTree>), String> {
+) -> Result<TaskStatus, String> {
     let conversation = Conversation::open(store, terminal_head)?;
     let request = conversation
         .turn(subrequest)?
@@ -87,21 +86,7 @@ fn terminal_facts(
         (TurnStatus::Failed, Some(TurnOutcome::Failed { .. })) => TaskStatus::Failed,
         _ => return Err("child request not terminal".to_string()),
     };
-    let child_source_trees = conversation
-        .source_trees()?
-        .into_iter()
-        .map(|(name, source_tree)| {
-            let initial = conversation.reference_start(&name)?;
-            Ok((
-                name,
-                ChildSourceTree {
-                    commit: source_tree.commit,
-                    initial,
-                },
-            ))
-        })
-        .collect::<Result<_, String>>()?;
-    Ok((status, child_source_trees))
+    Ok(status)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -113,7 +98,6 @@ fn append_child_terminal_with<S: RefStore>(
     relay: &Oid,
     terminal_head: &Oid,
     status: TaskStatus,
-    child_source_trees: &BTreeMap<String, ChildSourceTree>,
 ) -> Result<(), String> {
     cas_append(store, refname, |store, head| {
         let record = {
@@ -149,7 +133,6 @@ fn append_child_terminal_with<S: RefStore>(
             child: child.to_string(),
             terminal_head: terminal_head.clone(),
             status,
-            child_source_trees: child_source_trees.clone(),
         }))
     })
 }
@@ -388,8 +371,7 @@ mod tests {
                 owner: None,
             },
             title: "Conversation".to_string(),
-            source_trees: BTreeMap::new(),
-            files_seed: None,
+            content: None,
         };
         let applied = apply(&mut objects, None, &root).unwrap();
         let mut head = mint(&mut objects, &genesis, &applied, root.kind(), &signature()).unwrap();
@@ -432,8 +414,13 @@ mod tests {
                 owner: None,
             },
             title: "Child".to_string(),
-            source_trees: BTreeMap::from([("main".to_string(), oid('a'))]),
-            files_seed: None,
+            content: Some({
+                let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+                for (name, commit) in BTreeMap::from([("main".to_string(), oid('a'))]) {
+                    content.put_oid(&name, conversation_protocol::v3::Mode::Commit, commit);
+                }
+                content.build(&mut store).unwrap()
+            }),
         };
         let applied = apply(&mut store, None, &root).unwrap();
         let mut head = mint(&mut store, &genesis, &applied, root.kind(), &signature()).unwrap();
@@ -512,15 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn child_terminal_facts_derive_status_and_source_trees() {
+    fn child_terminal_facts_derive_status() {
         for (interrupted, expected) in
             [(false, TaskStatus::Complete), (true, TaskStatus::Cancelled)]
         {
             let (store, head, request) = child_request_history(Some(interrupted));
-            let (status, source_trees) = terminal_facts(&store, &head, &request).unwrap();
+            let status = terminal_facts(&store, &head, &request).unwrap();
             assert_eq!(status, expected);
-            assert_eq!(source_trees["main"].commit, oid('a'));
-            assert_eq!(source_trees["main"].initial, oid('a'));
         }
     }
 

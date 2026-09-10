@@ -1,16 +1,14 @@
 //! Repository context derived from the conversation tree.
 use super::*;
 
-pub(super) fn context(view: &Conversation<'_>, focus: Option<&str>) -> Result<String, String> {
-    let source_trees = view.source_trees()?;
-    let mut rows = Vec::new();
-    for (name, ws) in &source_trees {
-        let config = view.source_tree_config(name)?;
-        rows.push(
-            json!({"name":name,"head":ws.commit,"repository":config.repository(),"base":config.upstream}),
-        );
-    }
-    Ok(format!("\n\nSource trees: {}\nSourceTree selected when this request started: {}. UI selection changes do not change this request's target. File tools, grep, and bash start at the conversation root; use full paths through source trees. Bash can edit ordinary conversation files and multiple source trees in one call. Use commit-entry paths to organize code. Edit dirty and move it to a numbered boundary when ready for review. Use spawn_agent for parallel work; merge its result into dirty or copy it into a review boundary.", serde_json::to_string(&rows).map_err(|error| error.to_string())?, focus.unwrap_or("none")))
+pub(super) fn context(view: &Conversation<'_>) -> Result<String, String> {
+    let entries = view
+        .source_trees()?
+        .into_iter()
+        .map(|(path, entry)| json!({"path":path,"commit":entry.commit}))
+        .collect::<Vec<_>>();
+    Ok(format!("\n\nCommit entries: {}. All file tools, grep, and bash use the conversation root. Use ordinary paths and filesystem operations to organize content. Git tools must name their target commit-entry path explicitly.",
+        serde_json::to_string(&entries).map_err(|e| e.to_string())?))
 }
 
 pub(super) fn repository_context(

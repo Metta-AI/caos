@@ -180,7 +180,7 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.completion_count(&state.source_tree_names()) as u16
+        state.composer.completion_count() as u16
     } else {
         0
     };
@@ -1294,7 +1294,7 @@ fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         match state.selected_source_tree_diff() {
             Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
             Some(_) => "No source tree changes in this conversation.",
-            None => "Choose a source tree with /source-tree use <name>.",
+            None => "Choose a commit entry in the source tree browser.",
         }
     };
     lines.extend(text.lines().map(|line| {
@@ -1480,20 +1480,10 @@ fn render_composer(
     } else {
         Vec::new()
     };
-    let source_trees = if view == View::Chat {
-        state
-            .composer
-            .source_tree_completion(&state.source_tree_names())
-            .map(|completion| completion.values)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let command_height =
-        (commands.len() + models.len() + source_trees.len()).min(inner.height as usize) as u16;
+    let command_height = (commands.len() + models.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1527,7 +1517,6 @@ fn render_composer(
     render_command_menu(
         &commands,
         &models,
-        &source_trees,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1623,7 +1612,6 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
 fn render_command_menu(
     commands: &[&Command],
     models: &[&str],
-    source_trees: &[String],
     selected: usize,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1654,25 +1642,8 @@ fn render_command_menu(
         };
         Line::styled(format!("{marker}{model}"), style)
     });
-    let source_tree_lines = source_trees.iter().enumerate().map(|(index, completion)| {
-        let index = index + commands.len() + models.len();
-        let marker = if index == selected { "> " } else { "  " };
-        let style = if index == selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        Line::styled(format!("{marker}{completion}"), style)
-    });
     frame.render_widget(
-        Paragraph::new(
-            command_lines
-                .chain(model_lines)
-                .chain(source_tree_lines)
-                .collect::<Vec<_>>(),
-        ),
+        Paragraph::new(command_lines.chain(model_lines).collect::<Vec<_>>()),
         area,
     );
 }
@@ -1773,115 +1744,68 @@ fn render_source_tree_picker(app: &App, frame: &mut Frame<'_>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    if let Some(form) = &picker.attaching {
-        let labels = [
-            "Source tree name",
-            "Repository URL or absolute path",
-            "Branch or full commit (blank: default branch)",
-        ];
-        let mut lines = vec![Line::from("Attach repository"), Line::from("")];
-        for (index, label) in labels.iter().enumerate() {
-            lines.push(Line::styled(
-                format!("{label}: {}", form.fields[index]),
-                Style::default().fg(if index == form.selected {
-                    Color::Cyan
-                } else {
-                    Color::White
-                }),
-            ));
-            lines.push(Line::from(""));
-        }
-        frame.render_widget(Paragraph::new(lines), rows[0]);
-        frame.render_widget(
-            Paragraph::new("Tab/Enter advances   Enter on last field attaches   Esc cancels"),
-            rows[1],
-        );
-    } else if let Some(name) = &picker.creating {
-        let source = picker.source.as_deref().unwrap_or("");
-        frame.render_widget(
-            Paragraph::new(format!("Copy reference {source}\n\nNew path: {name}")),
-            rows[0],
-        );
-        frame.render_widget(
-            Paragraph::new("Enter creates   Esc cancels")
-                .style(Style::default().fg(Color::DarkGray)),
-            rows[1],
-        );
-    } else {
-        let items = state
-            .source_trees
-            .iter()
-            .map(|ws| {
-                let selected = if Some(&ws.name) == state.selected_source_tree.as_ref() {
-                    "*"
-                } else {
-                    " "
-                };
-                let additions = ws
-                    .patch
-                    .lines()
-                    .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-                    .count();
-                let deletions = ws
-                    .patch
-                    .lines()
-                    .filter(|line| line.starts_with('-') && !line.starts_with("---"))
-                    .count();
-                let repository = ws
-                    .config
-                    .repository()
-                    .unwrap_or_else(|| "no publication repository".into());
-                let publication = state
-                    .publications
-                    .iter()
-                    .find(|item| item.source_tree == ws.name)
-                    .map(|item| format!("{:?}", item.status))
-                    .unwrap_or_else(|| "unpublished".into());
-                let base = ws
-                    .config
-                    .upstream
-                    .as_ref()
-                    .map(|base| format!("base {}", base.name()))
-                    .unwrap_or_default();
-                ListItem::new(vec![
-                    Line::from(format!(
-                        "{selected} {}   +{additions} -{deletions}   {publication}{}",
-                        ws.name,
-                        if state.source_tree_is_stale(&ws.name) {
-                            "   needs update"
-                        } else {
-                            ""
-                        }
-                    )),
-                    Line::styled(
-                        format!("  {repository}  {base}"),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        if items.is_empty() {
-            frame.render_widget(Paragraph::new("No source tree attached yet."), rows[0]);
-        } else {
-            let mut selection = ListState::default().with_selected(Some(picker.selected));
-            frame.render_stateful_widget(
-                List::new(items).highlight_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+    let items = state
+        .source_trees
+        .iter()
+        .map(|ws| {
+            let selected = if Some(&ws.name) == state.selected_source_tree.as_ref() {
+                "*"
+            } else {
+                " "
+            };
+            let additions = ws
+                .patch
+                .lines()
+                .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+                .count();
+            let deletions = ws
+                .patch
+                .lines()
+                .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+                .count();
+            let repository = ws.repository.clone().unwrap_or_default();
+            let publication = state
+                .publications
+                .iter()
+                .find(|item| item.source_tree == ws.name)
+                .map(|item| format!("{:?}", item.status))
+                .unwrap_or_else(|| "unpublished".into());
+            let base = ws
+                .base_name
+                .as_ref()
+                .map(|name| format!("base {name}"))
+                .unwrap_or_default();
+            ListItem::new(vec![
+                Line::from(format!(
+                    "{selected} {}   +{additions} -{deletions}   {publication}{}",
+                    ws.name, ""
+                )),
+                Line::styled(
+                    format!("  {repository}  {base}"),
+                    Style::default().fg(Color::DarkGray),
                 ),
-                rows[0],
-                &mut selection,
-            );
-        }
-        frame.render_widget(
-            Paragraph::new(
-                "Up/Down selects   Enter switches   n creates   a attaches   u updates stack   Esc closes",
-            )
-            .style(Style::default().fg(Color::DarkGray)),
-            rows[1],
+            ])
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        frame.render_widget(Paragraph::new("No source tree attached yet."), rows[0]);
+    } else {
+        let mut selection = ListState::default().with_selected(Some(picker.selected));
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rows[0],
+            &mut selection,
         );
     }
+    frame.render_widget(
+        Paragraph::new("Up/Down selects   Enter inspects   Esc closes")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
 }
 
 fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
@@ -1928,7 +1852,10 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
                         row.target.source_tree,
                         short_hash(&row.target.head)
                     )),
-                    Line::from(format!("    {} -> {}", row.target.branch, row.target.base)),
+                    Line::from(format!(
+                        "    {} -> {}",
+                        row.target.branch, row.target.base_branch
+                    )),
                     Line::styled(
                         format!("    {}   {operation}", row.target.repository),
                         Style::default().fg(Color::DarkGray),

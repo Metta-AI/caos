@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
-    conversation_load_at, conversation_ref, conversation_snapshot, create_source_tree,
-    default_title, describe_tool_set, first_available_conversation_name, fork_conversation,
+    conversation_load_at, conversation_ref, conversation_snapshot, default_title,
+    describe_tool_set, first_available_conversation_name, fork_conversation,
     generate_conversation_title, interrupt_request, invite_user_to_conversation,
     list_user_conversations, publication_diagnostic, publish_source_tree_branch,
-    publish_user_conversation, remove_source_tree, resume_request, rollback_source_tree,
-    run_chat_turn, set_conversation_title, submit_interjection, unarchive_user_conversation,
-    ConversationLoad, ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary,
-    PublishedBranch, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome,
-    TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
+    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
+    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
+    ConversationSnapshot, InviteOutcome, PublicationSummary, PublishedBranch, SourceTreeDiff,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
+    UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -731,51 +731,6 @@ impl Composer {
             .collect()
     }
 
-    fn source_tree_completion(&self, names: &[String]) -> Option<Completion> {
-        const PREFIX: &str = "/source-tree";
-        const SUBCOMMANDS: [&str; 4] = ["create", "use", "rollback", "remove"];
-
-        if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
-            return None;
-        }
-        let arguments = &self.text[PREFIX.len()..];
-        if !arguments.chars().next().is_some_and(char::is_whitespace) {
-            return None;
-        }
-        let start = self.text[..self.cursor]
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| ch.is_whitespace())
-            .map(|(index, ch)| index + ch.len_utf8())
-            .unwrap_or(PREFIX.len());
-        let end = self.text[self.cursor..]
-            .find(char::is_whitespace)
-            .map(|offset| self.cursor + offset)
-            .unwrap_or(self.text.len());
-        if self.cursor < start || self.cursor > end {
-            return None;
-        }
-        let prior = self.text[PREFIX.len()..start]
-            .split_whitespace()
-            .collect::<Vec<_>>();
-        let token = &self.text[start..end];
-        let values = match prior.as_slice() {
-            [] => SUBCOMMANDS
-                .iter()
-                .copied()
-                .filter(|subcommand| subcommand.starts_with(token))
-                .map(str::to_string)
-                .collect(),
-            ["use" | "rollback" | "remove"] => names
-                .iter()
-                .filter(|name| name.starts_with(token))
-                .cloned()
-                .collect(),
-            _ => Vec::new(),
-        };
-        Some(Completion { start, end, values })
-    }
-
     fn model_token(&self) -> Option<(usize, usize, &str)> {
         const PREFIX: &str = "/model";
         if self.command_menu_dismissed || !self.text.starts_with(PREFIX) {
@@ -813,16 +768,12 @@ impl Composer {
             .collect()
     }
 
-    fn completion_count(&self, source_tree_names: &[String]) -> usize {
-        self.command_matches().len()
-            + self.model_matches().len()
-            + self
-                .source_tree_completion(source_tree_names)
-                .map_or(0, |completion| completion.values.len())
+    fn completion_count(&self) -> usize {
+        self.command_matches().len() + self.model_matches().len()
     }
 
-    fn select_command(&mut self, amount: isize, source_tree_names: &[String]) -> bool {
-        let count = self.completion_count(source_tree_names);
+    fn select_command(&mut self, amount: isize) -> bool {
+        let count = self.completion_count();
         if count == 0 {
             return false;
         }
@@ -832,10 +783,9 @@ impl Composer {
     }
 
     #[allow(unknown_lints, clippy::manual_option_zip)]
-    fn complete_command(&mut self, source_tree_names: &[String]) -> bool {
+    fn complete_command(&mut self) -> bool {
         let commands = self.command_matches();
         let models = self.model_matches();
-        let source_tree = self.source_tree_completion(source_tree_names);
         if let Some(command) = commands.get(self.command_selection).copied() {
             let token_end = self
                 .text
@@ -850,15 +800,6 @@ impl Composer {
         }) {
             self.text.replace_range(start..end, model);
             self.cursor = start + model.len();
-        } else if let Some((completion, value)) = source_tree.and_then(|completion| {
-            self.command_selection
-                .checked_sub(commands.len() + models.len())
-                .and_then(|index| completion.values.get(index).cloned())
-                .map(|value| (completion, value))
-        }) {
-            self.text
-                .replace_range(completion.start..completion.end, &value);
-            self.cursor = completion.start + value.len();
         } else {
             return false;
         }
@@ -873,8 +814,8 @@ impl Composer {
         true
     }
 
-    fn dismiss_command_menu(&mut self, source_tree_names: &[String]) -> bool {
-        if self.completion_count(source_tree_names) == 0 {
+    fn dismiss_command_menu(&mut self) -> bool {
+        if self.completion_count() == 0 {
             return false;
         }
         self.command_menu_dismissed = true;
@@ -885,13 +826,6 @@ impl Composer {
         self.command_selection = 0;
         self.command_menu_dismissed = false;
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Completion {
-    start: usize,
-    end: usize,
-    values: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -906,9 +840,8 @@ enum AppAction {
     Reference,
     Title,
     UpdateTree,
-    SourceTree,
+    Import,
     SourceTrees,
-    UpdateStack,
     NewConversation,
     Checkout,
     Activity,
@@ -978,10 +911,10 @@ const COMMANDS: [Command; 10] = [
         takes_argument: true,
     },
     Command {
-        name: "/source-tree",
-        usage: "/source-tree [list|use|attach|create|rename|seal|update|remove] ...",
-        description: "list or manage named source trees",
-        action: AppAction::SourceTree,
+        name: "/import",
+        usage: "/import <path> <repository> [revision]",
+        description: "import a repository commit at a conversation path",
+        action: AppAction::Import,
         takes_argument: true,
     },
     Command {
@@ -1363,18 +1296,15 @@ impl ConversationState {
     }
 
     fn complete_command(&mut self) -> bool {
-        let names = self.source_tree_names();
-        self.composer.complete_command(&names)
+        self.composer.complete_command()
     }
 
     fn select_command(&mut self, amount: isize) -> bool {
-        let names = self.source_tree_names();
-        self.composer.select_command(amount, &names)
+        self.composer.select_command(amount)
     }
 
     fn dismiss_command_menu(&mut self) -> bool {
-        let names = self.source_tree_names();
-        self.composer.dismiss_command_menu(&names)
+        self.composer.dismiss_command_menu()
     }
 
     fn selected_source_tree_diff(&self) -> Option<&SourceTreeDiff> {
@@ -1697,17 +1627,11 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 13] = [
-    PaletteCommand {
-        label: "Update stack",
-        shortcut: None,
-        keywords: "source tree base merge stale",
-        action: AppAction::UpdateStack,
-    },
+const PALETTE_COMMANDS: [PaletteCommand; 12] = [
     PaletteCommand {
         label: "Source trees",
         shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
-        keywords: "select create switch repository stack",
+        keywords: "inspect browse code paths",
         action: AppAction::SourceTrees,
     },
     PaletteCommand {
@@ -1951,7 +1875,7 @@ impl App {
             .iter()
             .position(|state| state.id == selected_id)
             .expect("the selected conversation was inserted");
-        if !load_selected && states[selected].turn_options.initial_source_trees.is_some() {
+        if !load_selected && states[selected].turn_options.initial_content.is_some() {
             caos_cli::create_conversation(
                 &transport,
                 &states[selected].turn_options,
@@ -2090,16 +2014,9 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        if let Some(picker) = &mut self.source_tree_picker {
-            if let Some(form) = &mut picker.attaching {
-                form.fields[form.selected].push_str(text.trim());
-            } else if let Some(input) = &mut picker.creating {
-                input.push_str(text.trim());
-            }
-            return;
+        if self.source_tree_picker.is_none() {
+            self.selected_mut().composer.insert_paste(text);
         }
-
-        self.selected_mut().composer.insert_paste(text);
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> MouseAction {
@@ -2297,9 +2214,7 @@ impl App {
         }
         if let Some((command, arguments)) = parse_command(raw) {
             if !command.action.submits_message() {
-                if command.action != AppAction::SourceTree
-                    && command.takes_argument == arguments.is_empty()
-                {
+                if command.takes_argument == arguments.is_empty() {
                     self.selected_mut()
                         .show_command_error(format!("usage: {}", command.usage));
                 } else {
@@ -2374,13 +2289,6 @@ impl App {
         } else {
             raw
         };
-        if !self.selected().virtual_conversation && !self.selected().source_trees.is_empty() {
-            if let Err(error) = self.selected().require_selected_source_tree() {
-                self.selected_mut().show_command_error(error);
-                self.selected_mut().composer.restore_message(&message);
-                return;
-            }
-        }
         let should_generate_title =
             !interjecting && self.selected().automatic_title && !self.selected().generating_title;
         let observed_head = self.selected().remote_head.clone();
@@ -2416,7 +2324,9 @@ impl App {
 
         let tx = self.tx.clone();
         let mut options = self.selected().turn_options.clone();
-        options.source_tree = self.selected().selected_source_tree.clone();
+        options.source_tree = human_tree
+            .as_ref()
+            .and(self.selected().selected_source_tree.clone());
         let conversation = self.selected().id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
@@ -2545,9 +2455,8 @@ impl App {
             AppAction::Help | AppAction::Commands => self.execute_action(command.action),
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
-            AppAction::SourceTree => self.run_source_tree_command(arguments),
+            AppAction::Import => self.run_import(arguments),
             AppAction::SourceTrees => self.open_source_tree_picker(),
-            AppAction::UpdateStack => self.update_selected_stack(None),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
                     self.selected_mut()
@@ -2666,125 +2575,29 @@ impl App {
         }
     }
 
-    fn update_selected_stack(&mut self, name: Option<String>) {
-        let selected = name.or_else(|| self.selected().selected_source_tree.clone());
-        self.start_source_tree_mutation("updating stack", move |transport, conversation| {
-            let updated = caos_cli::source_trees::update_stack(
+    fn run_import(&mut self, arguments: &str) {
+        let parts: Vec<_> = arguments.split_whitespace().collect();
+        if !(2..=3).contains(&parts.len()) {
+            self.selected_mut()
+                .show_command_error("usage: /import <path> <repository> [revision]");
+            return;
+        }
+        let name = parts[0].to_string();
+        let repository = parts[1].to_string();
+        let revision = parts.get(2).map(|value| value.to_string());
+        self.start_import("importing repository", move |transport, conversation| {
+            let head = caos_cli::source_trees::import_source(
                 transport,
                 conversation,
-                selected.as_deref().filter(|name| *name != "--all"),
+                &name,
+                &repository,
+                revision.as_deref(),
             )?;
-            Ok(if updated.is_empty() {
-                "Stack is up to date.".into()
-            } else {
-                format!("Updated {}.", updated.join(", "))
-            })
+            Ok(format!("Imported {repository} at {name}: {head}"))
         });
     }
 
-    fn run_source_tree_command(&mut self, arguments: &str) {
-        let parts = arguments.split_whitespace().collect::<Vec<_>>();
-        match parts.as_slice() {
-            [] | ["list"] => self.open_source_tree_picker(),
-            ["update"] => self.update_selected_stack(None),
-            ["update", name] => self.update_selected_stack(Some((*name).to_string())),
-            ["use", name] => match self.selected_mut().select_source_tree(name) {
-                Ok(()) => {
-                    self.selected_mut()
-                        .push_info(format!("Using source tree {name:?}."));
-                    if self.view == View::Tools {
-                        self.load_selected_tool_set();
-                    }
-                }
-                Err(error) => self.selected_mut().show_command_error(error),
-            },
-            ["attach", name, repository] | ["attach", name, repository, _] => {
-                let name = (*name).to_string();
-                let repository = (*repository).to_string();
-                let revision = parts.get(3).map(|value| (*value).to_string());
-                self.start_source_tree_mutation("attaching repository", move |transport, conversation| {
-                    if revision.is_none() && (repository.starts_with("git+") || repository.starts_with("github:")) {
-                        caos_cli::source_trees::attach_source(transport, conversation, &name, &repository)?;
-                    } else {
-                        caos_cli::source_trees::attach(transport, conversation, &name, &repository, revision.as_deref())?;
-                    }
-                    Ok(format!("Attached {repository} as source tree {name:?}."))
-                });
-            }
-            ["rename", source, destination] => {
-                let source = (*source).to_string();
-                let destination = (*destination).to_string();
-                self.start_source_tree_mutation("renaming reference", move |transport, conversation| {
-                    caos_cli::source_trees::rename_reference(transport, conversation, &source, &destination)?;
-                    Ok(format!("Renamed {source} to {destination}."))
-                });
-            }
-            ["seal", boundary] => {
-                let source = match self.selected().require_selected_source_tree() {
-                    Ok(ws) => ws.name.clone(),
-                    Err(error) => { self.selected_mut().show_command_error(error); return; }
-                };
-                if source.rsplit('/').next() != Some("dirty")
-                    || !conversation_protocol::v3::source_trees::is_boundary(boundary) {
-                    self.selected_mut().show_command_error("select dirty, then /source-tree seal 01-description");
-                    return;
-                }
-                let destination = source.rsplit_once('/').map(|(dir, _)| format!("{dir}/{boundary}")).unwrap_or_else(|| (*boundary).to_string());
-                self.start_source_tree_mutation("sealing change", move |transport, conversation| {
-                    caos_cli::source_trees::rename_reference(transport, conversation, &source, &destination)?;
-                    Ok(format!("Ready for review: {destination}."))
-                });
-            }
-            ["create", name] | ["copy", name] => {
-                let source = match self.selected().require_selected_source_tree() {
-                    Ok(source_tree) => source_tree.name.clone(),
-                    Err(error) => { self.selected_mut().show_command_error(error); return; }
-                };
-                let name = (*name).to_string();
-                self.start_source_tree_mutation("creating source tree", move |transport, conversation| {
-                    caos_cli::source_trees::create_from_source_tree(transport, conversation, &name, &source)?;
-                    Ok(format!("Created source tree {name:?} from {source:?}."))
-                });
-            }
-            ["create", name, rev] => {
-                let name = (*name).to_string();
-                let rev = (*rev).to_string();
-                self.start_source_tree_mutation("creating source tree", move |transport, conversation| {
-                    let commit = resolve_source_tree_revision(transport, &rev)?;
-                    create_source_tree(transport, conversation, &name, &commit)?;
-                    Ok(format!("Created source tree {name:?} at {}.", short_hash(&commit)))
-                });
-            }
-            ["rollback", name, rev] => {
-                self.start_source_tree_mutation("rolling back source tree", {
-                    let name = (*name).to_string();
-                    let rev = (*rev).to_string();
-                    move |transport, conversation| {
-                        let commit = resolve_source_tree_revision(transport, &rev)?;
-                        rollback_source_tree(transport, conversation, &name, &commit)?;
-                        Ok(format!(
-                            "Rolled back source tree {name:?} to {}.",
-                            short_hash(&commit)
-                        ))
-                    }
-                });
-            }
-            ["remove", name] => {
-                self.start_source_tree_mutation("removing source tree", {
-                    let name = (*name).to_string();
-                    move |transport, conversation| {
-                        remove_source_tree(transport, conversation, &name)?;
-                        Ok(format!("Removed source tree {name:?}."))
-                    }
-                });
-            }
-            _ => self.selected_mut().show_command_error(
-                "usage: /source-tree [list|use <path>|create <path> [<rev>]|attach <directory> <repo> [<branch>|<sha>]|rename <from> <to>|seal <NN-description>|update [<directory>|--all]|rollback <path> <rev>|remove <path>]",
-            ),
-        }
-    }
-
-    fn start_source_tree_mutation(
+    fn start_import(
         &mut self,
         status: &str,
         operation: impl FnOnce(&GitTransport, &str) -> Result<String, String> + Send + 'static,
@@ -3804,7 +3617,6 @@ impl App {
     fn execute_action(&mut self, action: AppAction) {
         match action {
             AppAction::SourceTrees => self.open_source_tree_picker(),
-            AppAction::UpdateStack => self.update_selected_stack(None),
             AppAction::NewConversation => {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
@@ -3860,7 +3672,7 @@ impl App {
             | AppAction::Reference
             | AppAction::Title
             | AppAction::UpdateTree
-            | AppAction::SourceTree => unreachable!("slash action needs arguments"),
+            | AppAction::Import => unreachable!("slash action needs arguments"),
         }
     }
 
@@ -4175,8 +3987,12 @@ impl App {
     }
 
     fn checkout_selected_source_tree(&self, head: &str) -> Result<PathBuf, String> {
-        let config = &self.selected().require_selected_source_tree()?.config;
-        super::launcher::checkout_for(&self.repo_dir, config, head)
+        let repository = self
+            .selected()
+            .require_selected_source_tree()?
+            .repository
+            .as_deref();
+        super::launcher::checkout_for(&self.repo_dir, repository, head)
     }
 
     fn load_selected(&mut self) {
@@ -4264,58 +4080,18 @@ fn fresh_conversation_id(t: &GitTransport, user: &str) -> Result<String, String>
         .map(|id| id.to_string())
 }
 
-fn resolve_source_tree_revision(t: &GitTransport, rev: &str) -> Result<String, String> {
-    t.resolve_revspec(rev)?
-        .map(|commit| commit.to_string())
-        .ok_or_else(|| format!("cannot resolve source tree revision {rev:?}"))
-}
-
 fn new_conversation_options(
     mut options: TurnOptions,
     requested_base: Option<String>,
-    repo_dir: &Path,
+    _repo_dir: &Path,
 ) -> Result<(TurnOptions, String), String> {
-    if let Some(seeds) = &mut options.initial_source_trees {
-        if let Some(base) = requested_base {
-            let mut config = seeds
-                .values()
-                .next()
-                .map(|seed| seed.config.clone())
-                .unwrap_or_default();
-            config = caos_cli::source_trees::config_at_commit(
-                &GitTransport::discover(repo_dir)?,
-                config,
-                &base,
-            )?;
-            *seeds = std::collections::BTreeMap::from([(
-                seeds
-                    .keys()
-                    .next()
-                    .cloned()
-                    .unwrap_or_else(|| "code/dirty".into()),
-                caos_cli::InitialSourceTree {
-                    commit: base.clone(),
-                    config,
-                },
-            )]);
-            options.base = Some(base.clone());
-            return Ok((options, base));
-        }
-        let base = seeds
-            .values()
-            .next()
-            .map(|seed| seed.commit.clone())
-            .unwrap_or_default();
-        return Ok((options, base));
+    if let Some(base) = requested_base {
+        options.initial_content = None;
+        options.base = Some(base);
+    } else if options.initial_content.is_none() {
+        options.base = None;
     }
-    let base = match requested_base {
-        Some(base) => base,
-        None => {
-            options.base = None;
-            return Ok((options, String::new()));
-        }
-    };
-    options.base = Some(base.clone());
+    let base = options.base.clone().unwrap_or_default();
     Ok((options, base))
 }
 
@@ -4368,7 +4144,6 @@ fn choose_conversation(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use super::*;
     use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
@@ -4483,8 +4258,11 @@ mod tests {
                 owner: None,
             },
             title: message.to_string(),
-            source_trees: BTreeMap::from([("main".to_string(), base)]),
-            files_seed: None,
+            content: Some({
+                let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+                content.put_oid("main", conversation_protocol::v3::Mode::Commit, base);
+                content.build(&mut store).unwrap()
+            }),
         };
         let root_tree = apply(&mut store, None, &root_transition).unwrap();
         let root = mint(
@@ -4646,7 +4424,8 @@ mod tests {
 
     fn source_tree_diff(name: &str, base: char, head: char, patch: &str) -> SourceTreeDiff {
         SourceTreeDiff {
-            config: Default::default(),
+            repository: None,
+            base_name: None,
             name: name.to_string(),
             base_commit: base.to_string().repeat(40),
             head: head.to_string().repeat(40),
@@ -4720,17 +4499,19 @@ mod tests {
     }
 
     #[test]
-    fn source_tree_use_switches_the_diff_view() {
+    fn source_tree_picker_switches_the_diff_view() {
         let mut conversation = state("talk-1");
         conversation.source_trees = vec![
             source_tree_diff("main", 'a', 'b', "MAIN PATCH"),
             source_tree_diff("side", 'c', 'd', "SIDE PATCH"),
         ];
         conversation.selected_source_tree = Some("main".to_string());
-        conversation.composer.insert_str("/source-tree use side");
+
         let (mut app, _) = app_with(vec![conversation]);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.selected().selected_source_tree.as_deref(), Some("side"));
         assert_eq!(app.selected().turn_options.source_tree, None);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
@@ -4758,13 +4539,6 @@ mod tests {
         assert!(app.selected().running);
         assert!(app.source_tree_picker.is_none());
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
-        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        app.insert_paste("feature");
-        assert_eq!(
-            app.source_tree_picker.as_ref().unwrap().creating.as_deref(),
-            Some("feature")
-        );
-        assert_eq!(app.selected().composer.expanded_text(), "keep this draft");
     }
 
     #[test]
@@ -4845,32 +4619,6 @@ mod tests {
             Some("choose a source tree; available source trees: main, side")
         );
         assert!(!app.selected().running);
-    }
-
-    #[test]
-    fn source_tree_completion_only_offers_names_to_name_taking_subcommands() {
-        let names = vec!["main".to_string(), "side".to_string()];
-        let mut composer = Composer::default();
-        composer.insert_str("/source-tree ");
-        assert_eq!(
-            composer.source_tree_completion(&names).unwrap().values,
-            ["create", "use", "rollback", "remove"]
-        );
-
-        composer = Composer::default();
-        composer.insert_str("/source-tree create ");
-        assert!(composer
-            .source_tree_completion(&names)
-            .unwrap()
-            .values
-            .is_empty());
-
-        composer = Composer::default();
-        composer.insert_str("/source-tree use ");
-        assert_eq!(
-            composer.source_tree_completion(&names).unwrap().values,
-            names
-        );
     }
 
     fn wait_for_fork(app: &mut App, id: &str) -> bool {
@@ -5321,7 +5069,7 @@ mod tests {
                 "/help",
                 "/title",
                 "/update-tree",
-                "/source-tree",
+                "/import",
                 "/commands",
                 "/publish-branch",
                 "/ref",
@@ -5330,8 +5078,8 @@ mod tests {
             ]
         );
 
-        assert!(composer.select_command(2, &[]));
-        assert!(composer.complete_command(&[]));
+        assert!(composer.select_command(2));
+        assert!(composer.complete_command());
         assert_eq!(composer.text, "/title ");
         assert!(composer.command_matches().is_empty());
 
@@ -5344,7 +5092,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/title"]
         );
-        assert!(composer.dismiss_command_menu(&[]));
+        assert!(composer.dismiss_command_menu());
         assert!(composer.command_matches().is_empty());
         composer.insert_char('x');
         assert!(!composer.command_menu_dismissed);
@@ -5352,7 +5100,7 @@ mod tests {
         let mut composer = Composer::default();
         composer.insert_str("/model sonnet-5");
         assert_eq!(composer.model_matches(), ["claude-sonnet-5"]);
-        assert!(composer.complete_command(&[]));
+        assert!(composer.complete_command());
         assert_eq!(composer.text, "/model claude-sonnet-5 ");
     }
 
@@ -5375,9 +5123,10 @@ mod tests {
         assert_eq!(command.action, AppAction::From);
         assert_eq!(arguments, "abc123");
 
-        let (command, arguments) = parse_command("/source-tree use main").unwrap();
-        assert_eq!(command.action, AppAction::SourceTree);
-        assert_eq!(arguments, "use main");
+        let (command, arguments) =
+            parse_command("/import code https://example.com/repo.git").unwrap();
+        assert_eq!(command.action, AppAction::Import);
+        assert_eq!(arguments, "code https://example.com/repo.git");
 
         assert!(parse_command("/load https://github.com/Metta-AI/caos/pull/34").is_none());
 
@@ -6651,7 +6400,8 @@ mod tests {
 
         let mut selected = state("talk-1");
         selected.source_trees = vec![SourceTreeDiff {
-            config: Default::default(),
+            repository: None,
+            base_name: None,
             name: "main".to_string(),
             base_commit: base,
             head: head.clone(),
@@ -6963,7 +6713,8 @@ mod tests {
                     }],
                 },
                 source_trees: vec![SourceTreeDiff {
-                    config: Default::default(),
+                    repository: None,
+                    base_name: None,
                     name: "main".to_string(),
                     base_commit: "d".repeat(40),
                     head: head.clone(),
@@ -7080,7 +6831,8 @@ mod tests {
                     activity: Vec::new(),
                 },
                 source_trees: vec![SourceTreeDiff {
-                    config: Default::default(),
+                    repository: None,
+                    base_name: None,
                     name: "main".to_string(),
                     base_commit: "e".repeat(40),
                     head: old_head,
@@ -7183,8 +6935,11 @@ mod tests {
                     head: "a".repeat(40),
                     repository: "https://github.com/team/repo".into(),
                     branch: "caos/talk/docs".into(),
-                    base: caos_cli::source_trees::PublicationBase::Branch("main".into()),
-                    previous_config: Default::default(),
+                    base_branch: "main".into(),
+                    parent: None,
+                    base_url: None,
+                    remote_head: None,
+                    base_commit: None,
                     diagnostic: None,
                 },
             }],

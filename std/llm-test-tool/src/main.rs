@@ -887,8 +887,13 @@ fn conversation_root(
             owner: None,
         },
         title,
-        source_trees,
-        files_seed: None,
+        content: Some({
+            let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+            for (name, commit) in source_trees {
+                content.put_oid(&name, conversation_protocol::v3::Mode::Commit, commit);
+            }
+            content.build(store)?
+        }),
     };
     let applied = apply(store, None, &transition)?;
     mint(store, &genesis, &applied, transition.kind(), &signature()).map_err(ToolError::new)

@@ -80,7 +80,7 @@ worker, so they take neither.
 caos tui $W                  continue the most recent conversation
 caos tui $W --username alice use alice's active conversation list
 caos tui $W --new            start a fresh conversation
-caos tui $W --import feature load this checkout at feature/dirty
+caos tui $W --import feature/dirty  load this checkout at feature/dirty
 caos tui $W --server URL     use a specific server
 caos tui $W --from 5ec3751   branch from a completed turn
 caos tui --list-archived     list archived conversation IDs and titles
@@ -156,25 +156,20 @@ intended companion to `Ctrl+L` (check out the head, edit files, then
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+O` to browse commit-entry paths. Enter switches focus; `n` copies
-the highlighted snapshot to a new path. `a` attaches a repository in a directory
-containing `.base-url`, `00-base`, and `dirty`. `u` updates the selected stack.
-Selection preserves the draft and cannot retarget an admitted request.
+Press `Ctrl+O` to browse commit-entry paths. Enter selects a snapshot for
+inspection and local checkout; selection preserves the draft and never changes
+agent execution. Use `/import <path> <repository> [revision]` to import a commit
+at an unused path. The agent creates, copies, renames, and removes entries with
+ordinary file operations.
 
-Use `/source-tree seal 01-description` to rename selected `dirty` to a review
-boundary, then `/source-tree create feature/dirty` to start the next change from
-that boundary. `rename <from> <to>` and `remove <path>` are ordinary tree edits.
-
-`Ctrl+P` previews the selected directory's numbered boundaries. Branch names are
-their full paths; the first PR targets the branch in `.base-url` and later PRs
-target the preceding boundary. `00-base` and `dirty` are excluded. Space selects
-rows, `a` toggles all, Enter confirms, and Escape cancels. Change destinations by
-editing `.base-url` or renaming entries before previewing.
-
-`/source-tree` and `/source-tree list` open the picker. `update [directory|--all]`
-incorporates fetched base changes into all affected references atomically;
-conflicts leave the conversation unchanged. `/publish-branch` directly pushes
-the selected review boundary without preparation or PR creation.
+`Ctrl+P` previews the selected directory's numbered boundaries. Branch names
+are their full paths; the first PR targets the branch in `.base-url` and later
+PRs target the preceding entry. `00-base` and `dirty` are excluded. Space selects
+rows, `a` toggles all, Enter confirms, and Escape cancels. Publishing pushes
+the previewed commits; it does not run an agent or modify code. Incorporate
+base changes and run checks before previewing. Changed content or remote tips
+require another preview. `/publish-branch` pushes the selected review boundary
+without creating a PR.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -186,9 +181,9 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-The launcher starts without code. `--import feature` explicitly loads the
+The launcher starts without code. `--import feature/dirty` explicitly loads the
 checkout's committed HEAD at `feature/dirty`; `--base` selects another commit.
-`/from <turn-hash>` forks the selected conversation history. Old v3 conversations
+`/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
 require the previous build; this version does not migrate them implicitly.
 
 Typing `/` at the start of the prompt shows matching slash commands and their

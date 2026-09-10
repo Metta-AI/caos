@@ -18,12 +18,12 @@ pub fn declarations() -> [Value; 3] {
     [
         json!({
             "name": SPAWN_TOOL,
-            "description": "Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with wait_agent, then its code can be applied with harvest_agent.",
+            "description": "Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with wait_agent, then selected content can be applied with harvest_agent.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "A self-contained task with the desired output and constraints."},
-                    "source_tree": {"type": "string", "description": "Optional source tree path to include. Omit to include all source trees. Ordinary conversation files are copied in either case."}
+                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional conversation-relative paths to copy. Omit for all content. Select gitlinks as whole source trees. Protocol metadata is always excluded."}
                 },
                 "required": ["prompt"]
             }
@@ -41,13 +41,12 @@ pub fn declarations() -> [Value; 3] {
         }),
         json!({
             "name": HARVEST_TOOL,
-            "description": "Apply a terminal child agent's named source tree to a parent source tree with the ordinary three-way reconciliation rules.",
+            "description": "Apply selected content changes from a terminal child using the same atomic reconciliation as file tools. Code, memories, and notes keep their conversation-relative paths; protocol metadata is excluded.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "child": {"type": "string", "description": "The terminal child id returned by spawn_agent."},
-                    "child_source_tree": {"type": "string", "description": "Child source tree to apply; defaults to the source tree seeded at spawn."},
-                    "source_tree": {"type": "string", "description": "Parent source tree to update; defaults when the parent has exactly one source tree."}
+                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional paths to apply, including descendants. Omit for all changed content. Select gitlinks as whole source trees."}
                 },
                 "required": ["child"]
             }
@@ -62,14 +61,6 @@ pub fn required_string<'a>(call: &'a Value, name: &str, tool: &str) -> Result<&'
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{tool} needs a non-empty string `{name}`"))
-}
-
-pub fn optional_string<'a>(call: &'a Value, name: &str) -> Option<&'a str> {
-    call.get("input")
-        .and_then(|input| input.get(name))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 pub fn agent_title(prompt: &str) -> String {
@@ -100,8 +91,6 @@ pub fn child_request(
         "system",
         "subagent",
         "merge-refs",
-        "repository-refs",
-        "focus-source-tree",
         "wc",
         "run",
         "round",

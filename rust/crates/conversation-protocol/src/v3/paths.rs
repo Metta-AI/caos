@@ -1,7 +1,7 @@
 use super::oid::hex_lower;
 
 pub const FORMAT: &str = ".caos/format";
-pub const FORMAT_BYTES: &str = "caos-conversation-v4\n";
+pub const FORMAT_BYTES: &str = "caos-conversation-v5\n";
 pub const IDENTITY: &str = ".caos/identity.json";
 pub const TITLE: &str = ".caos/title";
 pub const TRANSCRIPT_DIR: &str = ".caos/transcript";

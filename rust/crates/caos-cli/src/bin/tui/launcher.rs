@@ -1,13 +1,11 @@
 //! The conversation client has its own harness checkout. Attached code never
 //! replaces that harness, and launcher state never enters a source tree.
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use caos::GitTransport;
-use caos_cli::InitialSourceTree;
-use conversation_protocol::v3::{GitStore, Oid, SourceTreeConfig};
+use conversation_protocol::v3::{GitStore, Oid};
 
 use super::args::Args;
 
@@ -112,7 +110,7 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
         args.turn.system =
             Some(fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?);
     }
-    let mut seeds = BTreeMap::new();
+    let mut seed = conversation_protocol::v3::tree::TreeBuilder::from(None);
     if let Some(name) = &args.import {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
         if let Some(checkout) = &checkout {
@@ -123,19 +121,9 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
             )?;
             let oid = Oid::parse(&commit, "initial checkout")?;
             import_checkout_commit(checkout, &client, &oid)?;
-            let config = caos_cli::source_trees::checkout_config(
-                &GitTransport::discover(checkout)?,
-                &commit,
-            )?;
-            seeds.insert(
-                format!("{name}/dirty"),
-                InitialSourceTree {
-                    commit: commit.clone(),
-                    config,
-                },
-            );
+            seed.put_oid(name, conversation_protocol::v3::Mode::Commit, oid);
             let supplied =
-                format!("Local Git snapshot {commit} was explicitly provided at {name}/dirty.");
+                format!("Local Git snapshot {commit} was explicitly provided at {name}.");
             args.turn.system = Some(match args.turn.system.take() {
                 Some(system) => format!("{system}\n\n{supplied}"),
                 None => supplied,
@@ -148,7 +136,10 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
             return Err("--import requires a Git checkout".into());
         }
     }
-    args.turn.initial_source_trees = Some(seeds);
+    args.turn.initial_content = Some(
+        seed.build(&mut GitStore::open(&client, Some(&server))?)?
+            .to_string(),
+    );
     Ok(client)
 }
 
@@ -344,7 +335,7 @@ fn create_client(
 /// harness. Importing objects is harmless; checking out/committing stays explicit.
 pub(super) fn checkout_for(
     client: &Path,
-    config: &SourceTreeConfig,
+    repository: Option<&str>,
     head: &str,
 ) -> Result<PathBuf, String> {
     if git(client, &["config", "--get", "caos.launcher"])
@@ -358,11 +349,11 @@ pub(super) fn checkout_for(
         "this client has no local checkout; open caos from a checkout to use checkout commands"
     })?;
     let checkout = PathBuf::from(value.strip_suffix('\0').ok_or("invalid checkout config")?);
-    let repository = git(&checkout, &["remote", "get-url", "origin"])
+    let checkout_repository = git(&checkout, &["remote", "get-url", "origin"])
         .unwrap_or_else(|_| checkout.to_string_lossy().into_owned());
-    if config.repository().as_deref().is_none_or(|repo| {
+    if repository.is_some_and(|repo| {
         caos_cli::normalize_repository_identity(repo).ok()
-            != caos_cli::normalize_repository_identity(&repository).ok()
+            != caos_cli::normalize_repository_identity(&checkout_repository).ok()
     }) {
         return Err("selected source tree belongs to another repository; open caos from a matching checkout to use checkout commands".into());
     }
@@ -516,8 +507,7 @@ mod tests {
             fs::read_to_string(first.join("DEPS")).unwrap(),
             "./std/llm-step llm-step\n"
         );
-        let error =
-            checkout_for(&first, &SourceTreeConfig::default(), &"a".repeat(40)).unwrap_err();
+        let error = checkout_for(&first, None, &"a".repeat(40)).unwrap_err();
         assert!(error.contains("no local checkout"));
         fs::remove_dir_all(root).unwrap();
     }

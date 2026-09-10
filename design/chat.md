@@ -33,8 +33,8 @@ flowchart TB
 ```
 
 This example dispatches bash to a worker; each listed `C` is a separate commit.
-Naming the review boundary creates a new `C`, but no new `W`. This example
-assumes publication preparation makes no further code changes.
+Naming the review boundary creates a new `C`, but no new `W`. Publishing
+pushes that exact code commit.
 
 ## Conversation commits
 
@@ -43,7 +43,7 @@ assumes publication preparation makes no further code changes.
 The tree contains the title, canonical transcript, ordinary conversation files,
 and code references. Protocol metadata lives under `.caos/`; ordinary content
 and code references live directly at paths outside it. The format marker in
-`.caos/format` is `caos-conversation-v4`.
+`.caos/format` is `caos-conversation-v5`.
 
 Structured commit messages record run requests, worker claims, tool calls and
 results, and background/subagent activity. The TUI derives the latest relevant
@@ -154,8 +154,10 @@ does not integrate it.
 
 Review boundaries use exactly two digits from `01` through `99`, a hyphen,
 and a nonempty description, such as `01-parser`. They are not individual edits.
-The TUI compares each boundary with its predecessor, and `dirty` with the last
-boundary. Intermediate code commits remain in ordinary Git ancestry.
+The TUI lists entries in descending filename order and compares each with the
+preceding gitlink in the same directory, regardless of its name. A lone entry
+is compared with its first recorded value. Intermediate code commits remain
+in ordinary Git ancestry.
 
 Keep **one moving `dirty` reference**. Each accepted edit produces a real code
 commit and updates its value; previous values remain in conversation history.
@@ -171,34 +173,35 @@ changing UI selection cannot redirect an in-flight operation. Git operations
 such as merge name the source tree they operate on; filesystem tools share
 the conversation root.
 
-Updating a stack fetches the branch in `.base-url`, merges its changes through
-the ordered boundaries and `dirty`, and updates all references in one conversation
-commit. A conflict leaves the conversation unchanged. The UI shows the last
-fetched tip; remote updates become visible when fetched.
+The agent updates a stack using ordinary tools: import the remote commit,
+merge it into the chosen entries, and move or copy directories as needed.
+There is no stack-update operation or background refresh of remote branches.
+Directory ordering does not replace integrating Git histories.
 
-Subagents have separate conversations, seeded with ordinary conversation
-files and source trees but fresh protocol metadata. An explicit source-tree
-selection narrows which code is copied. Their relationship and completion are
-recorded in events.
+Subagents start from one content tree with fresh protocol metadata. By default
+they receive all conversation content; optional `paths` selects files,
+directories, or gitlinks to copy at the same paths. Select a gitlink as a whole
+source tree; use ordinary file edits for finer changes inside it.
 
-`harvest_agent` reconciles one child source tree into one parent source tree
-per call; it does not bring back edits to ordinary conversation files such as
-memories. Harvest code into `dirty`, or copy a child's code commit into a
-numbered boundary when it deserves a separate PR. Directory ordering does not
-replace actually integrating Git histories.
+`harvest_agent` applies the child's changes since its initial snapshot, optionally
+restricted by `paths`. It uses the same atomic application as file tools:
+ordinary files and multiple source trees can arrive together, unrelated parent
+edits survive, and conflicts retain the proposal without partial application.
+Child identity, initial conversation head, run request, and terminal head are
+recorded in events; content is read from those commits.
 
 ### Starting a client
 
 The client starts from a CAOS harness independently of target code. A
-conversation begins without code until an import or attachment is requested.
+conversation begins from an optional content tree; without one it starts empty.
 
 The invocation names the workers with typed image arguments, for example
 `caos tui --llm-step:@=std/llm-step --llm-call:@=std/llm-call`.
 Paths resolve in the harness, not an attached source tree. Hash and Git-locator
 image arguments also work; no root DEPS entry is required.
 
-Add `--import feature` to load the committed HEAD of the launching checkout at
-`feature/dirty` (or choose a commit with `--base`). A system message states what
+Add `--import feature/dirty` to load the committed HEAD of the launching checkout
+at that exact path (or choose a commit with `--base`). A system message states what
 was provided. Local uncommitted edits are not included. Cloud
 sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
@@ -218,12 +221,12 @@ Select a stack directory and derive the plan:
 Exclude `00-base` and `dirty`. Naming a boundary does not squash the
 intervening commits.
 
-After the preview is confirmed, publication runs an agent to prepare each
-selected boundary in order. Preparation can merge the PR base and edit the
-code while building and testing it, advancing that boundary beyond the commit
-shown in the preview. Publication pushes the exact prepared commit and its
-ancestry. Before pushing, verify that references still match the prepared
-commits and that remote branches have not moved unexpectedly.
+The preview captures the code commits, destination branches, PR bases, and
+current remote tips. After confirmation, push those exact commits and ancestry,
+then open or reuse the PRs. Reject changed content, changed destinations, remote
+drift, unresolved conflicts, and a PR base not incorporated into the code.
+Preparation, builds, and tests happen before previewing; publishing never runs
+an agent or changes code.
 
 Find existing PRs by repository and inferred branch. Inspect destination refs
 after an interrupted push before retrying. Any recovery events belong in commit
@@ -232,24 +235,21 @@ history.
 Reject invalid or colliding derived branch names visibly. A renamed path changes
 the proposed destination, which appears in the preview.
 
-## Commands
+## Client interactions
 
-- `/source-tree` or `/source-tree list`: browse commit-entry paths.
-- `/source-tree use <path>`: select a code snapshot.
-- `/source-tree attach <directory> <repository> [branch|commit]`: create
-  `.base-url`, `00-base`, and `dirty` in that directory.
-- `/source-tree create <path> [commit]`: copy the selected snapshot, or use an
-  explicit commit. `copy` is an alias for copying the selected snapshot.
-- `/source-tree rename <source> <destination>`: move a reference.
-- `/source-tree seal 01-description`: rename selected `dirty` to a PR boundary.
-- `/source-tree update [directory|--all]`: incorporate the fetched base atomically.
-- `/source-tree rollback <path> <commit>` and `remove <path>`: move or remove a ref.
+- `Ctrl+O`: browse source trees; selection changes inspection only.
+- `/import <path> <repository> [revision]`: fetch a commit from a local repository
+  or remote URL and add a gitlink at that exact, unused conversation path.
+- `Ctrl+L`: check the selected code snapshot out locally.
+- `/update-tree <message>`: submit local edits to the selected code snapshot
+  with a user message.
 - `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
+- `/publish-branch`: push the selected boundary without creating a PR.
 
-These TUI commands are conveniences for editing the same conversation contents.
-They do not register source trees or define a separate agent management API.
-The selected source tree controls inspection, Git operations, and publication;
-it does not change the root of file tools or bash.
+The client handles host-side imports, checkout, and publication. The agent
+organizes conversation content using files and folders. There is no active
+source tree in execution: file tools use conversation-relative paths, and Git
+operations explicitly name their target. UI selection cannot retarget a run.
 
 ## Scope
 

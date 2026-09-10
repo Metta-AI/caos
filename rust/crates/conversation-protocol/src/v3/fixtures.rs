@@ -24,8 +24,13 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
             owner: None,
         },
         title: "Golden Conversation".to_string(),
-        source_trees: BTreeMap::from([("main".to_string(), oid('a'))]),
-        files_seed: Some(files_seed),
+        content: Some({
+            let mut content = crate::v3::tree::TreeBuilder::from(Some(files_seed.clone()));
+            for (name, commit) in BTreeMap::from([("main".to_string(), oid('a'))]) {
+                content.put_oid(&name, crate::v3::Mode::Commit, commit);
+            }
+            content.build(store).unwrap()
+        }),
     };
     let applied = apply(store, None, &root).expect("apply root");
     let mut head = mint(store, &genesis, &applied, root.kind(), &signature).expect("mint root");
@@ -271,24 +276,19 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     let child = ChildRecord {
         id: child_id.clone(),
         initial_head: head.clone(),
-        initial_source_tree: Some(oid('b')),
         request: request.clone(),
         relay: oid('3'),
         spawn_intent: SpawnIntent {
             request: request.clone(),
             round: 1,
             tool: "spawn-call".to_string(),
-            source_tree_name: Some("main".to_string()),
-            input_commit: Some(oid('b')),
             prompt: ".caos/tools/prompt".to_string(),
             model: "model".to_string(),
             configuration: configuration(),
-            files_seed: None,
+            content: files_seed,
         },
         status: TaskStatus::Pending,
-        applications: Vec::new(),
         terminal_head: None,
-        child_source_trees: None,
     };
     commit(
         store,
@@ -356,38 +356,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
             child: child_id.clone(),
             terminal_head: oid('6'),
             status: TaskStatus::Complete,
-            child_source_trees: BTreeMap::from([(
-                "main".to_string(),
-                ChildSourceTree {
-                    commit: oid('c'),
-                    initial: oid('b'),
-                },
-            )]),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::SubagentApply {
-            child: child_id,
-            application: Application {
-                parent_source_tree_name: "main".to_string(),
-                parent_source_tree: Some(oid('b')),
-                child_source_tree: "main".to_string(),
-                source_tree_resolution: SourceTreeResolution::Merged {
-                    current: oid('b'),
-                    merge: MergeInfo {
-                        base: oid('a'),
-                        ours: oid('b'),
-                        theirs: oid('c'),
-                        implementation: "merge-v1".to_string(),
-                        output: Some(oid('c')),
-                        conflict_paths: None,
-                    },
-                    output: oid('c'),
-                },
-            },
         },
         &signature,
     );
