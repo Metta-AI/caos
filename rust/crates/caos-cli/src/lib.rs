@@ -436,6 +436,50 @@ fn spine_contains(store: &GitStore, mut head: Oid, needle: &Oid) -> Result<bool,
     }
 }
 
+fn system_entry(id: &str, message_id: String, text: String) -> TranscriptEntry {
+    TranscriptEntry {
+        message_id,
+        conversation: id.to_string(),
+        role: Role::System,
+        actor: "caos".to_string(),
+        request: None,
+        round: None,
+        model: None,
+        blocks: vec![Block::Text { text }],
+        proposal: None,
+        source_tree_resolution: None,
+    }
+}
+
+fn append_system_notice(
+    t: &GitTransport,
+    id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    append_transition(
+        t,
+        id,
+        &refs::head_ref(id)?,
+        "recording client action",
+        |store, head| {
+            let view = Conversation::open(store, head)?;
+            if view
+                .transcript(0, view.transcript_len()?)?
+                .iter()
+                .any(|(_, _, entry)| entry.message_id == message_id)
+            {
+                return Ok(Step::Done(head.to_string()));
+            }
+            Ok(Step::Mint(Transition::MessageAppend {
+                entry: system_entry(id, message_id.into(), text.into()),
+                payloads: Vec::new(),
+            }))
+        },
+    )?;
+    Ok(())
+}
+
 fn user_entry(
     id: &str,
     username: &str,
@@ -2282,13 +2326,33 @@ fn append_publication_terminal(
             terminal.status = outcome.status;
             terminal.evidence = Some(outcome.evidence.clone());
             terminal.observed = outcome.observed.clone();
-            result = Some(terminal);
-            Ok(Step::Mint(Transition::PublicationTerminal {
+            let mut transitions = vec![Transition::PublicationTerminal {
                 publication: publication.to_string(),
                 status: outcome.status,
                 evidence: outcome.evidence.clone(),
                 observed: outcome.observed.clone(),
-            }))
+            }];
+            if outcome.status == PublicationStatus::Complete {
+                transitions.push(Transition::MessageAppend {
+                    entry: system_entry(
+                        id,
+                        format!("push-{publication}"),
+                        format!(
+                            "Published {} ({}) to {} branch {}.",
+                            terminal.source_tree_name,
+                            terminal.planned_head,
+                            terminal.repository,
+                            terminal
+                                .refname
+                                .strip_prefix("refs/heads/")
+                                .unwrap_or(&terminal.refname),
+                        ),
+                    ),
+                    payloads: Vec::new(),
+                });
+            }
+            result = Some(terminal);
+            Ok(Step::MintMany(transitions))
         },
     )?;
     Ok(result.expect("publication append always records a result"))
@@ -4103,6 +4167,81 @@ mod tests {
         .unwrap();
         fixture_reference(&transport, "stack", "feature/apples", Some(&two)).unwrap();
         assert!(source_trees::publish_target(&transport, "stack", &fresh, &base).is_err());
+
+        // A moved base needs an explicit import/agent handoff, never a push.
+        let advanced = commit_file(&transport, &base, "remote advance\n", "remote");
+        git(
+            transport.work_dir(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{advanced}:refs/heads/main"),
+            ],
+        );
+        let plan = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert!(plan.base_import.is_some());
+        assert!(
+            source_trees::publish_target(&transport, "stack", &plan, &advanced)
+                .unwrap_err()
+                .contains("does not contain")
+        );
+        let message = source_trees::import_publication_base(&transport, "stack", &plan).unwrap();
+        assert!(message.contains(&advanced));
+        assert!(message.contains("feature/dirty"));
+        assert!(message.contains("Do not publish"));
+        let imported_head = conversation_head(&transport, "stack").unwrap();
+        assert_eq!(
+            source_trees::import_publication_base(&transport, "stack", &plan).unwrap(),
+            message
+        );
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            imported_head
+        );
+        let load = conversation_load(&transport, "stack").unwrap().unwrap();
+        assert!(load
+            .source_trees
+            .iter()
+            .any(|entry| Some(&entry.name) == plan.base_import.as_ref() && entry.head == advanced));
+        assert_eq!(
+            git(
+                &root.join("origin.git"),
+                &["rev-parse", "refs/heads/feature/dirty"]
+            ),
+            two
+        );
+        let next_base = commit_file(
+            &transport,
+            &advanced,
+            "another remote advance\n",
+            "new remote",
+        );
+        git(
+            transport.work_dir(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{next_base}:refs/heads/main"),
+            ],
+        );
+        assert!(
+            source_trees::import_publication_base(&transport, "stack", &plan)
+                .unwrap_err()
+                .contains("base changed")
+        );
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            imported_head
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4253,7 +4392,14 @@ mod tests {
         let (_, first_head) = fetch_validated_head(&transport, &store, "publish-talk")
             .unwrap()
             .unwrap();
-        let complete = Conversation::open(&store, &first_head).unwrap();
+        let notice = Conversation::open(&store, &first_head).unwrap();
+        assert_eq!(notice.kind(), Some(Kind::MessageAppend));
+        let replay = replay_at(&store, &first_head).unwrap();
+        let last = replay.turns.last().unwrap();
+        assert_eq!(last.role, ConversationRole::System);
+        assert!(last.message.contains("Published main"));
+        let terminal_head = notice.parent().unwrap().clone();
+        let complete = Conversation::open(&store, &terminal_head).unwrap();
         assert_eq!(complete.kind(), Some(Kind::PublicationTerminal));
         let first_record = complete.publication(&first.publication).unwrap().unwrap();
         assert_eq!(first_record.planned_head.as_str(), base);

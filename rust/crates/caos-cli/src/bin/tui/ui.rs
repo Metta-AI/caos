@@ -1667,7 +1667,7 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
     };
     let area = frame
         .area()
-        .centered(Constraint::Percentage(90), Constraint::Length(13));
+        .centered(Constraint::Percentage(90), Constraint::Length(17));
     frame.render_widget(Clear, area);
     let mut lines = Vec::new();
     if prompt.loading {
@@ -1692,11 +1692,22 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
             )));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(if prompt.branch_only {
-            "Enter pushes this commit without creating a PR."
+        if let Some(path) = &target.base_import {
+            lines.push(Line::from("The source does not contain this PR base."));
+            lines.push(Line::from(format!("Import to: {path}")));
+            lines.push(Line::from(
+                "Enter imports the base and asks the agent to merge or rebase it and test.",
+            ));
+            lines.push(Line::from(
+                "Nothing is published. Run /pr again after reviewing the result.",
+            ));
         } else {
-            "Enter pushes this commit and opens or updates its PR."
-        }));
+            lines.push(Line::from(if prompt.branch_only {
+                "Enter pushes this commit without creating a PR."
+            } else {
+                "Enter pushes this commit and opens or updates its PR."
+            }));
+        }
     }
     if let Some(error) = &prompt.error {
         lines.push(Line::styled(

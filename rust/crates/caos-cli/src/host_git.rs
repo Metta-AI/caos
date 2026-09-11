@@ -104,6 +104,15 @@ pub fn pr_base_branch(input: &str) -> &str {
     input.trim().strip_prefix("origin/").unwrap_or(input.trim())
 }
 
+pub fn pr_base_is_ancestor(target: &str, head: &str, cwd: &Path) -> Result<bool, String> {
+    let result = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
+    if result.status.code() == Some(1) {
+        return Ok(false);
+    }
+    require_success("git merge-base --is-ancestor", result)?;
+    Ok(true)
+}
+
 pub fn validate_pr_source_tree(target: &str, head: &str, cwd: &Path) -> Result<(), String> {
     let ancestry = command_output("git", &["merge-base", target, head], cwd)?;
     if ancestry.status.code() == Some(1) {

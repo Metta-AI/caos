@@ -94,6 +94,31 @@ impl App {
             return;
         }
         let target = prompt.target.take().expect("preview completed");
+        if let Some(path) = &target.base_import {
+            let conversation = self.selected().id.clone();
+            self.selected_mut().source_tree_operation = true;
+            self.selected_mut().status = format!("PR base into {path}");
+            let finished = conversation.clone();
+            spawn(
+                self.repo_dir.clone(),
+                self.tx.clone(),
+                move |transport| {
+                    let message = caos_cli::source_trees::import_publication_base(
+                        transport,
+                        &conversation,
+                        &target,
+                    )?;
+                    let load = conversation_load(transport, &conversation)?
+                        .ok_or("conversation disappeared after importing PR base")?;
+                    Ok((message, Box::new(load)))
+                },
+                move |result| UiMessage::PublicationBaseImported {
+                    conversation: finished,
+                    result,
+                },
+            );
+            return;
+        }
         let conversation = self.selected().id.clone();
         let title = self.selected().title.clone();
         let cancel = Arc::new(AtomicBool::new(false));

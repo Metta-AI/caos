@@ -294,20 +294,11 @@ pub fn import_source(
             Ok(Step::MintMany(vec![
                 Transition::FilesApply { files },
                 Transition::MessageAppend {
-                    entry: TranscriptEntry {
-                        message_id: format!("import-{head}"),
-                        conversation: id.to_string(),
-                        role: Role::System,
-                        actor: "caos".to_string(),
-                        request: None,
-                        round: None,
-                        model: None,
-                        blocks: vec![Block::Text {
-                            text: format!("Imported at {name}: {commit}"),
-                        }],
-                        proposal: None,
-                        source_tree_resolution: None,
-                    },
+                    entry: system_entry(
+                        id,
+                        format!("import-{head}"),
+                        format!("Imported at {name}: {commit}"),
+                    ),
                     payloads: Vec::new(),
                 },
             ]))
@@ -336,6 +327,7 @@ pub struct PublicationTarget {
     pub base_branch: String,
     pub base_commit: Option<String>,
     pub remote_head: Option<String>,
+    pub base_import: Option<String>,
 }
 
 /// Capture exactly the gitlink named by the client, independent of sibling order.
@@ -358,6 +350,7 @@ pub fn publication_target(
         base_branch: String::new(),
         base_commit: None,
         remote_head: None,
+        base_import: None,
     })
 }
 
@@ -454,6 +447,9 @@ pub fn resolve_publication_target(
         }
         let base = branch_snapshot(t, &target.repository, &target.base_branch)?;
         crate::host_git::validate_pr_source_tree(&base, &target.head, t.work_dir())?;
+        target.base_import =
+            (!crate::host_git::pr_base_is_ancestor(&base, &target.head, t.work_dir())?)
+                .then(|| format!("imports/pr-base-{base}/base"));
         target.base_commit = Some(base);
     }
     target.remote_head = GitStore::open(t.work_dir(), Some(&target.repository))?
@@ -470,6 +466,9 @@ pub fn publish_target(
 ) -> Result<PublishedBranch, String> {
     if target.base_commit.as_deref() != Some(base_commit) {
         return Err("PR base changed since the preview; review again".into());
+    }
+    if !crate::host_git::pr_base_is_ancestor(base_commit, &target.head, t.work_dir())? {
+        return Err("source does not contain the PR base; run /pr again to import it and ask the agent to integrate it".into());
     }
     let store = open_store(t)?;
     let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
@@ -512,4 +511,54 @@ pub fn publish_branch_target(
         &target.repository,
         Some(target),
     )
+}
+
+/// Import the exact confirmed PR base before requesting agent work. Retrying
+/// reuses an identical import and never overwrites existing conversation content.
+pub fn import_publication_base(
+    t: &GitTransport,
+    id: &str,
+    target: &PublicationTarget,
+) -> Result<String, String> {
+    let path = target
+        .base_import
+        .as_deref()
+        .ok_or("PR base is already incorporated")?;
+    let base = target
+        .base_commit
+        .as_deref()
+        .ok_or("PR preview has no base")?;
+    if publication_target(t, id, &target.source_tree)?.head != target.head {
+        return Err("source changed since the preview; run /pr again".into());
+    }
+    if branch_snapshot(t, &target.repository, &target.base_branch)? != base {
+        return Err("PR base changed since the preview; run /pr again".into());
+    }
+    let load = conversation_load(t, id)?.ok_or("conversation disappeared")?;
+    match load.source_trees.iter().find(|entry| entry.name == path) {
+        Some(entry) if entry.head == base => {}
+        Some(_) => {
+            return Err(format!(
+                "import path {path:?} already contains a different commit"
+            ))
+        }
+        None => {
+            import_source(t, id, path, &target.repository, Some(base))?;
+        }
+    }
+    Ok(format!(
+        "Prepare {:?} for a PR against branch {:?} in {}. The base commit {} is imported at {:?}. \
+         Merge or rebase that base into {:?}, preserve the intended changes and other snapshots, \
+         resolve any conflicts, and run relevant tests. Do not publish. \
+         When finished, summarize the changes and suggest /pr {} {} {} for review.",
+        target.source_tree,
+        target.base_branch,
+        target.repository,
+        base,
+        path,
+        target.source_tree,
+        shell_words::quote(&target.source_tree),
+        shell_words::quote(&target.base_branch),
+        shell_words::quote(&target.repository),
+    ))
 }

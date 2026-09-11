@@ -1564,6 +1564,10 @@ enum UiMessage {
         conversation: String,
         result: Result<(Result<(), String>, Box<ConversationLoad>), String>,
     },
+    PublicationBaseImported {
+        conversation: String,
+        result: Result<(String, Box<ConversationLoad>), String>,
+    },
     Reconciled {
         conversation: String,
         request: String,
@@ -2200,7 +2204,6 @@ impl App {
                 .show_command_error("finish publishing before sending another message");
             return;
         }
-        let interjecting = self.selected().running;
         let Some(raw) = self.selected_mut().composer.take_message() else {
             return;
         };
@@ -2250,17 +2253,29 @@ impl App {
         } else {
             raw
         };
-        let should_generate_title =
-            !interjecting && self.selected().automatic_title && !self.selected().generating_title;
-        let observed_head = self.selected().remote_head.clone();
+        self.send_message(self.selected, message, human_tree, proposal_base);
+    }
+
+    fn send_message(
+        &mut self,
+        index: usize,
+        message: String,
+        human_tree: Option<String>,
+        proposal_base: Option<String>,
+    ) {
+        let interjecting = self.conversations[index].running;
+        let should_generate_title = !interjecting
+            && self.conversations[index].automatic_title
+            && !self.conversations[index].generating_title;
+        let observed_head = self.conversations[index].remote_head.clone();
         let pending_id = if interjecting {
-            let state = self.selected_mut();
+            let state = &mut self.conversations[index];
             let pending_id = state.queue_pending_submission(message.clone());
             state.follow_tail();
             state.transcript_selection = None;
             pending_id
         } else {
-            let state = self.selected_mut();
+            let state = &mut self.conversations[index];
             state.apply_automatic_title(&message);
             if should_generate_title {
                 state.generating_title = true;
@@ -2280,15 +2295,15 @@ impl App {
         };
 
         if should_generate_title {
-            self.publish_automatic_title_fallback();
+            self.publish_automatic_title_fallback(index);
         }
 
         let tx = self.tx.clone();
-        let mut options = self.selected().turn_options.clone();
+        let mut options = self.conversations[index].turn_options.clone();
         options.source_tree = human_tree
             .as_ref()
-            .and(self.selected().selected_source_tree.clone());
-        let conversation = self.selected().id.clone();
+            .and(self.conversations[index].selected_source_tree.clone());
+        let conversation = self.conversations[index].id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
             let title_options = options.clone();
@@ -2450,8 +2465,8 @@ impl App {
         }
     }
 
-    fn publish_automatic_title_fallback(&mut self) {
-        let state = self.selected();
+    fn publish_automatic_title_fallback(&mut self, index: usize) {
+        let state = &self.conversations[index];
         let Some(fallback) = state.automatic_title_fallback.clone() else {
             return;
         };
@@ -2465,10 +2480,10 @@ impl App {
         match self.transport().and_then(|transport| {
             compare_and_set_conversation_title(&transport, &id, &expected, &fallback)
         }) {
-            Ok(true) => self.selected_mut().remote_title = Some(fallback),
+            Ok(true) => self.conversations[index].remote_title = Some(fallback),
             Ok(false) => {}
             Err(error) => {
-                self.selected_mut().sidebar_attention =
+                self.conversations[index].sidebar_attention =
                     Some(format!("Failed to save conversation title: {error}"));
             }
         }
@@ -2784,7 +2799,8 @@ impl App {
                             state.remote_head = None;
                         }
                         match result {
-                            Ok(message) => state.push_info(message),
+                            Ok(message) if refreshed.is_none() => state.push_info(message),
+                            Ok(_) => state.status.clear(),
                             Err(error) => {
                                 state.sidebar_attention =
                                     Some("PR failed — open for details".to_string());
@@ -2823,6 +2839,21 @@ impl App {
                                 }
                             }
                             Err(error) => state.show_command_error(error),
+                        }
+                    }
+                }
+                UiMessage::PublicationBaseImported {
+                    conversation,
+                    result,
+                } => {
+                    if let Some(index) = self.conversation_index(&conversation) {
+                        self.conversations[index].source_tree_operation = false;
+                        match result {
+                            Ok((message, load)) => {
+                                self.conversations[index].apply_load(*load, &self.user);
+                                self.send_message(index, message, None, None);
+                            }
+                            Err(error) => self.conversations[index].show_command_error(error),
                         }
                     }
                 }
@@ -6415,6 +6446,23 @@ mod tests {
         assert!(app.drain_messages());
         assert_eq!(app.conversations[0].status, "running a tool");
         assert_eq!(app.selected().id, "talk-2");
+
+        // A confirmed base import sends to its original conversation, not
+        // whichever composer is focused when the import completes.
+        app.repo_dir = PathBuf::from("/nonexistent-caos-test-repository");
+        app.conversations[0].running = false;
+        app.conversations[0].automatic_title = false;
+        app.conversations[0].composer.insert_str("first draft");
+        app.conversations[1].composer.insert_str("second draft");
+        app.send_message(0, "Integrate the imported PR base".into(), None, None);
+        assert_eq!(app.selected().id, "talk-2");
+        assert_eq!(app.conversations[0].composer.text, "first draft");
+        assert_eq!(app.conversations[1].composer.text, "second draft");
+        assert_eq!(
+            app.conversations[0].pending_submissions[0].text,
+            "Integrate the imported PR base"
+        );
+        assert!(app.conversations[1].pending_submissions.is_empty());
     }
 
     #[test]
@@ -6793,6 +6841,7 @@ mod tests {
                 base_branch: "main".into(),
                 base_commit: Some("b".repeat(40)),
                 remote_head: None,
+                base_import: None,
             }),
         });
         let (mut app, tx) = app_with(vec![conversation]);
@@ -6815,6 +6864,18 @@ mod tests {
             "https://example.com/repo"
         );
         assert_eq!(app.selected().composer.text, "preserve this draft");
+        app.selected_mut()
+            .publish_plan
+            .as_mut()
+            .unwrap()
+            .target
+            .as_mut()
+            .unwrap()
+            .base_import = Some("imports/pr-base-abc/base".into());
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Enter imports the base"));
+        assert!(rendered.contains("Nothing is published"));
+        assert!(!rendered.contains("Enter pushes"));
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.selected().publish_plan.is_none());
         tx.send(UiMessage::PublicationPlanned {

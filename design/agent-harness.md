@@ -334,8 +334,9 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   confirms. The URL is explicit or inferred from matching import provenance.
   Publication pushes the exact code commit, using the gitlink path as the branch
   name, then opens or reuses its PR through `gh`. The agent tests the code before
-  this client operation. Source and base must share history, but the latest base
-  need not be an ancestor. Changed content, remote drift, conflict markers,
+  this client operation. Source and base must share history. If the latest base is not an ancestor,
+  Enter instead imports the base and sends an integration request to the agent;
+  the user runs `/pr` again afterward to review publication. Changed content, remote drift, conflict markers,
   unrelated histories, and reserved `.caos` state stop publication. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. `/publish-branch` pushes the same full-history branch without PR

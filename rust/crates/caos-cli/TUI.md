@@ -307,3 +307,10 @@ For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
 Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
 require Settings > General > Selection > Applications in terminal may access
 clipboard.
+
+When a PR source does not contain the fetched base tip, the preview offers to
+import that exact base and send an integration request to the agent. Enter
+confirms both; Escape cancels. The request stays in the original conversation
+and preserves drafts. It asks for a merge or rebase and tests, then stops for a
+fresh `/pr` review. This action does not publish. Successful pushes and PR
+creation or updates appear as persistent CAOS messages, including the PR URL.

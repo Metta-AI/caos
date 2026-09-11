@@ -47,12 +47,28 @@ pub fn publish_target(
             published.branch
         ));
     }
-    find_or_open_source_tree_pr_in(
+    let url = find_or_open_source_tree_pr_in(
         &target.repository,
         conversation,
         &format!("{}: {title}", target.source_tree),
         &published,
         &target.base_branch,
         transport.work_dir(),
+    )?;
+    let notice = format!(
+        "PR: {url}\nBranch: {}; base: {}; commit: {}.",
+        published.branch, target.base_branch, published.head
+    );
+    append_system_notice(
+        transport,
+        conversation,
+        &format!("pr-{}", published.publication),
+        &notice,
     )
+    .map_err(|error| {
+        format!(
+            "PR is available at {url}, but recording it in conversation history failed: {error}"
+        )
+    })?;
+    Ok(url)
 }

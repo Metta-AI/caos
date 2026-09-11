@@ -307,13 +307,22 @@ No local working checkout is required. `/publish-branch <conversation/gitlink>
 [remote-URL]` uses the same flow without creating a PR or requiring a base.
 
 Reject changed content, remote drift, conflict markers, and unrelated histories.
-The source and PR base must share an ancestor; the source need not contain the
-latest base tip. Publishing opens a PR, not a merge, and never runs an agent or
-edits code. The agent prepares and tests changes before publication. A base branch
+The source and PR base must share an ancestor. If the source does not contain
+the fetched base tip, the preview instead offers to import that exact commit and
+ask the agent to integrate it. Enter confirms both actions: import under
+`imports/pr-base-<commit>/base`, then send a message naming the base and source
+paths and requesting a merge or rebase plus tests. The import and request stay
+in the original conversation and preserve the user's draft. A failed import
+sends no message; retrying reuses an identical import. Nothing is published by
+this action. Run `/pr` again to review the updated source and current remote base.
+Publication itself never runs an agent or edits code. A base branch
 for a later PR must already exist remotely, so publish earlier PRs first.
 
 Find existing PRs by repository and branch. Inspect destination refs after an
-interrupted push before retrying. Publication events belong in commit history.
+interrupted push before retrying. A confirmed push appends a `CAOS` transcript entry with the source commit and
+destination. Successful PR creation or update appends another entry with the PR
+URL, branch, and base. These remain visible after reopening the conversation;
+a failed PR operation never records a successful PR.
 A renamed gitlink changes the proposed branch, which appears in the preview.
 
 ## Client interactions
