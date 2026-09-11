@@ -28,7 +28,7 @@ their prompt title and appear beneath the parent conversation.
 ## Build and run
 
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
-`--import <path>` explicitly seeds a source tree from HEAD. Outside a checkout, it starts
+`--import <path>` snapshots disk content; adding `--base HEAD` imports a Git commit. Outside a checkout, it starts
 without code and defaults to `http://localhost:9090`; `--server` overrides it.
 The harness and object database live under `$XDG_DATA_HOME/caos/clients`
 (default `~/.local/share/caos/clients`), independently of attached repositories.
@@ -130,7 +130,7 @@ so it never leaves the conversation pane.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` | Check out the selected source tree in the original matching checkout |
+| `Ctrl+L` | Check out the selected gitlink in its chosen local directory |
 | `Ctrl+O` | Browse conversation files and source-tree diffs |
 | `Ctrl+P` | Preview selected source trees and their PR destinations; Enter confirms |
 | `/publish-branch` | Push a review boundary to the repository in .base-url, using its path as the branch |
@@ -172,9 +172,12 @@ are no shell commands or controls that apply edits.
 
 On a source-tree entry in the current snapshot, `o` selects the target for
 local checkout and publication. Selection preserves the draft and never
-changes agent execution. Use `/import <path> <repository> [revision]` to import
-a commit at an unused path. The agent creates, copies, renames, and removes
-entries with ordinary file operations.
+changes agent execution. Use `/import <path> <source> [revision]` to import
+disk contents at an unused path, or a Git commit when given a URL or explicit
+revision. Local imports include uncommitted and untracked files while honoring
+Git ignore rules, including ancestor rules for subdirectories. Each import's
+portable repository details live in `<path>.source.json` when available. The
+agent preserves imports and organizes feature work with ordinary file operations.
 
 `Ctrl+P` previews the selected directory's numbered boundaries. Branch names
 are their full paths; the first PR targets the branch in `.base-url` and later
@@ -262,9 +265,10 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 Source tree code is referenced by ordinary commit hashes from the separate
 conversation history. Opening and running conversations never overwrite a
-checkout. Ctrl+L requires a clean original checkout matching the selected
-source tree's repository; it imports the code objects and detaches that checkout
-at the source tree head. /update-tree commits local edits there and imports their
+checkout. Ctrl+L uses the selected gitlink's remembered local destination, or
+prompts for `/checkout <directory>`. The destination must be a clean Git checkout
+or an empty/new directory. The client imports the code objects and detaches HEAD
+at the selected commit. /update-tree commits local edits there and imports their
 closure into the client before submission. These commands never replace the
 internal harness.
 
