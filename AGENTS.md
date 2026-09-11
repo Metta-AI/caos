@@ -229,22 +229,33 @@ concurrency.
   passing run and broke `nix build` on arrival. `tests/lint` now runs
   `tests/lint/lint-flake-src.sh` for the embedded-file case; for anything else the
   filter touches, run `nix build` yourself before committing.
-- **`caosd up` does NOT get a new `caos` binary into worker images —
-  `caosd reset` does.** A worker image's `/bin/caos` is copied in by the
-  flake-builder at IMAGE-BUILD time (`std/flake-builder/worker`:
-  `cp /bin/caos "$l/usr/bin/caos"`), and the flake-builder is reached through a
-  seeded sentinel whose ArgTree is `{base: docker://seeded-…, in: <std entry
-  tree>}` — the binary is nowhere in that key. So a rebuilt binary leaves every
-  key unmoved, redis answers from the memo, and the OLD image is handed out
-  however many times you re-run `caosd up`. Reproduced deliberately: a marker
-  compiled into the worker's usage banner, `nix build && caosd up`, and the
-  bash image came back at the same oid with no marker, while `server.log`
-  showed `cache hit: arg_tree=… -> tree …` naming the previous deploy's image
-  and the fresh seed record naming a different one.
+- **A rebuilt `caos` re-keys every worker image, and the one thing that makes
+  that true is the RESULT CACHE'S NAMESPACE.** The binary is not in the key and
+  cannot be: a worker image's `/bin/caos` is copied in by the flake-builder
+  (`std/flake-builder/worker`: `cp /bin/caos "$l/usr/bin/caos"`), and the
+  flake-builder is itself reached through a seeded sentinel whose ArgTree is
+  `{base: docker://seeded…, in: <std entry tree>}` — checked-in text and nothing
+  else, with the binary appearing only in the seeder's ANSWER. Downstream is
+  fine (a std entry's `base` is the flake-builder delta, which literally
+  contains `layer00/bin/caos`), so the whole chain hangs on those five seeded
+  keys moving. They don't — `run_work_request` reads redis BEFORE dispatching to
+  any runner, so the fresh seed record is never asked and the previous deploy's
+  delta comes back. Every entry then bases on it, consistently, which is why
+  nothing disagrees. What closes it is `CAOS_CACHE_NAMESPACE`: the nix out path
+  of the stack inputs, prefixed onto `caos:result:` keys only, set by
+  `stack/bootstrap` for the host stack and by `dev/stack-up` for a dev one.
+  A different build is a different namespace, so it cannot read the old answers.
+  **If you find yourself reaching for `caosd reset` to make a binary change
+  take, the namespace is not reaching the server** — check `serve`'s
+  `CAOS_CACHE_NAMESPACE=` line in `logs/serve.log` and the shape of
+  `caos:result:*` in redis (bare `caos:result:<hash>` means no prefix).
   This bites only when something calls a NEW VERB on the DEPLOYED (outer)
   stack — `caos-tools/*` do, the suite does not, because it compiles its own
   binaries inside the test stack. The symptom is a worker dying with a plain
   `caos: usage:` listing that is missing the verb you just added.
+  Nothing expensive is namespaced: the registry's `flake-<H>`, `deps-<D>` and
+  `clean-<name>-` tags, the nix store, and the `caos:image:`/`caos:layer:`
+  conversion memos are all keyed by content and stay shared across builds.
 - If this doesn't catch everything, we need to add it to the above step
 
 
