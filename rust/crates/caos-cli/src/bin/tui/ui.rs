@@ -185,8 +185,11 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() {
-        3
+    let notice_height = if let Some(error) = state.command_error.as_deref() {
+        let lines = Paragraph::new(error)
+            .wrap(Wrap { trim: false })
+            .line_count(composer_width);
+        lines.clamp(1, 12) as u16 + 2
     } else if state.reference_notice.is_some() {
         4
     } else {

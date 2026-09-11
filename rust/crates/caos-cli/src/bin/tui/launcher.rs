@@ -24,20 +24,20 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Import from the user's trusted checkout, including its unpushed commits.
+/// Transfer history between the trusted local checkout and client repository.
 /// upload-pack otherwise forbids fetching promised objects from a partial clone.
 /// Keep the override on this local import, never on arbitrary repository fetches.
-pub(super) fn import_checkout_commit(
-    checkout: &Path,
-    client: &Path,
+pub(super) fn import_local_commit(
+    source: &Path,
+    destination: &Path,
     commit: &Oid,
 ) -> Result<(), String> {
-    if GitStore::open(client, None)?.has_local(commit)? {
+    if GitStore::open(destination, None)?.has_local(commit)? {
         return Ok(());
     }
-    let checkout = checkout.canonicalize().map_err(|e| e.to_string())?;
+    let source = source.canonicalize().map_err(|e| e.to_string())?;
     let output = Command::new("git")
-        .current_dir(client)
+        .current_dir(destination)
         .env("GIT_NO_LAZY_FETCH", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
@@ -49,14 +49,14 @@ pub(super) fn import_checkout_commit(
             "--no-write-fetch-head",
             "--",
         ])
-        .arg(&checkout)
+        .arg(&source)
         .arg(commit.as_str())
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("starting checkout import: {e}"))?;
+        .map_err(|e| format!("starting local history import: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "importing checkout history: {}",
+            "importing local history: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -120,7 +120,7 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
                 &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
             )?;
             let oid = Oid::parse(&commit, "initial checkout")?;
-            import_checkout_commit(checkout, &client, &oid)?;
+            import_local_commit(checkout, &client, &oid)?;
             seed.put_oid(name, conversation_protocol::v3::Mode::Commit, oid);
             let repository = git(checkout, &["remote", "get-url", "origin"])
                 .ok()
@@ -369,8 +369,11 @@ pub(super) fn checkout_for(
     }) {
         return Err("selected source tree belongs to another repository; open caos from a matching checkout to use checkout commands".into());
     }
-    GitStore::open(&checkout, Some(&client.to_string_lossy()))?
-        .ensure_local(&Oid::parse(head, "source tree checkout")?)?;
+    import_local_commit(
+        client,
+        &checkout,
+        &Oid::parse(head, "source tree checkout")?,
+    )?;
     Ok(checkout)
 }
 
@@ -451,7 +454,18 @@ mod tests {
         let client = root.0.join("client");
         fs::create_dir(&client).unwrap();
         git(&client, &["init", "--quiet", "-b", "main"]).unwrap();
-        import_checkout_commit(&checkout, &client, &head).unwrap();
+        // Ctrl+L exports from a partial client into the user's checkout.
+        git(&checkout, &["config", "caos.launcher", "true"]).unwrap();
+        git(
+            &checkout,
+            &["config", "caos.checkout", &client.to_string_lossy()],
+        )
+        .unwrap();
+        assert_eq!(
+            checkout_for(&checkout, None, head.as_str()).unwrap(),
+            client
+        );
+        import_local_commit(&checkout, &client, &head).unwrap();
         // The destination is self-contained even after the source disappears.
         fs::remove_dir_all(&origin).unwrap();
         assert_eq!(git(&checkout, &["status", "--porcelain"]).unwrap(), status);
