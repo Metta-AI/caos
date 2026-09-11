@@ -104,7 +104,8 @@ worktrees are supported; plain directories, individual files, and subdirectory
 snapshots are not. An explicit revision, such as
 `/import imports/repo/base /path/to/repo main`, imports that commit instead of
 disk changes. Remote URLs import the requested revision or their default branch.
-Quote paths containing spaces.
+Quote paths containing spaces. Local paths are absolute or relative to the TUI's
+launch directory; `~` and environment variables are not expanded.
 
 A sibling `imports/repo/base.source.json` records a portable repository URL and
 optional default branch. Local discovery reads `origin` and `origin/HEAD`;
@@ -232,8 +233,9 @@ changing UI selection cannot redirect an in-flight operation. Git operations
 such as merge name the source tree they operate on; filesystem tools share
 the conversation root.
 
-The agent updates a stack using ordinary tools: import the remote commit,
-merge it into the chosen entries, and move or copy directories as needed.
+To update a stack, the agent gives the user a concrete `/import` command for
+the remote commit, then merges the imported commit into the chosen entries
+and moves or copies directories as needed.
 There is no stack-update operation or background refresh of remote branches.
 Directory ordering does not replace integrating Git histories.
 
@@ -339,8 +341,11 @@ head. Ordinary files show contents. Inside a source boundary, files show their
 diff against the preceding boundary, including deleted files. The preview labels
 the compared boundaries and hashes. There are no shell commands or Apply controls.
 
-The client handles host-side imports, checkout, and publication. The agent
-organizes conversation content using files and folders. There is no active
+The client handles host-side imports, checkout, and publication. The harness
+instructs the agent to give exact TUI commands or keys, with the intended paths,
+when user action is needed. A prose request to the agent does not run a client
+command. After an import finishes, a new user message resumes the agent. The
+agent organizes conversation content using files and folders. There is no active
 source tree in execution: file tools use conversation-relative paths, and Git
 operations explicitly name their target. UI selection cannot retarget a run.
 
