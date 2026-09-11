@@ -6,10 +6,10 @@ review boundaries; a publication destination is optional until publishing.
 The TUI browses this filesystem read-only, showing file contents or the diff
 between adjacent code boundaries.
 
-Local Git directory imports copy disk contents into ordinary conversation files and
-folders. Importing a Git revision preserves a code commit and its ancestry as
-a gitlink. Editing ordinary content changes `C`; editing a gitlink's contents
-also creates a new `W`.
+Imports are gitlinks to code commits. A local import snapshots the checkout's
+disk contents: an unchanged snapshot reuses HEAD; a changed snapshot becomes
+a child of HEAD. Editing an ordinary conversation file changes `C`; editing
+a gitlink's contents also creates a new `W`.
 
 | Thing | Where | Meaning |
 | --- | --- | --- |
@@ -84,6 +84,34 @@ new execution context while retaining ancestral tool results needed by its
 canonical transcript. Forking requires a quiescent request; it does not resume
 the source's background work.
 
+## Importing code
+
+`/import imports/repo/base /path/to/repo` is a client operation:
+
+1. Snapshot the checkout's disk contents into a Git tree, including uncommitted
+   and untracked files. Git's ignore rules apply to untracked files; tracked
+   files remain included. Preserve executable bits and symlinks; omit `.git`.
+2. If that tree matches HEAD's tree, reuse the exact HEAD commit `W_0`.
+   Otherwise create `W_0` with that tree and HEAD as its parent. Import the
+   required objects and history into CAOS without changing the source checkout's
+   index, branches, or files.
+3. Create a conversation commit parented by the previous `C`, adding a gitlink
+   at `imports/repo/base` that points to `W_0`. Update the conversation ref
+   against its expected previous head, then display the accepted head.
+
+Local disk imports require a Git checkout root with an existing HEAD. Linked
+worktrees are supported; plain directories, individual files, and subdirectory
+snapshots are not. An explicit revision, such as
+`/import imports/repo/base /path/to/repo main`, imports that commit instead of
+disk changes. Remote URLs import the requested revision or their default branch.
+Quote paths containing spaces.
+
+A sibling `imports/repo/base.source.json` records a portable repository URL and
+optional default branch. Local discovery reads `origin` and `origin/HEAD`;
+remote discovery reads the advertised default. Local paths and credential-bearing
+URLs are omitted. Metadata stays outside the imported code. Importing requires
+no publishing destination and establishes no local checkout destination.
+
 ## The agent's filesystem
 
 The harness supplies source-tree organization and publication conventions to
@@ -118,6 +146,12 @@ cp -a imports/caos/base feature/01-parser
 # After completing the first change, start the next:
 cp -a feature/01-parser feature/02-errors
 ```
+
+The initial two copies reference the same `W_0`. Editing
+`feature/01-parser/README.md` produces `W_1` with parent `W_0`; the next
+conversation commit advances only `feature/01-parser`. The import and
+`feature/00-base` remain unchanged. Several shell commands in one tool call
+are saved together, not as a separate conversation commit per shell command.
 
 A writable projection records each source directory's original commit in an
 extended attribute. `mv` and `cp -a` preserve it. On storage, an unchanged
@@ -226,8 +260,9 @@ Paths resolve in the harness, not an attached source tree. Hash and Git-locator
 image arguments also work; no root DEPS entry is required.
 
 Add `--import imports/caos/base` to snapshot the launching checkout
-at that exact path. Add `--base HEAD` (or another revision) to import a Git
-commit instead. Cloud sessions likewise start from a stable CAOS client repository/environment and
+at that exact path as a gitlink. Add `--base HEAD` (or another revision) to
+exclude disk changes and import that commit. Cloud sessions likewise start
+from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
 
@@ -282,23 +317,9 @@ the proposed destination, which appears in the preview.
 - `Ctrl+O`: browse conversation files and source-tree diffs. Highlighting an
   entry previews it; arrows navigate folders and gitlinks. The whole browser
   is read-only, including `.caos`.
-- `/import <path> <source> [revision]`: import at an unused conversation path.
-  A local source must be a Git repository directory (or a subdirectory of one).
-  It becomes an ordinary folder using the current disk contents, including
-  uncommitted and untracked files. Imports honor Git ignore rules, including
-  ancestor rules for subdirectories, and omit `.git`. Symlinks and executable
-  bits are preserved. Plain directories and individual files are not supported.
-  No source index, branch, or file is changed. Quote paths containing spaces.
-  A remote URL, or a local repository with an explicit revision, imports a commit
-  as a gitlink instead. Remote URLs without a revision use their default branch.
-  For PR work with ancestry, use `/import imports/caos/base /path/to/caos HEAD`.
-  A sibling `<import-path>.source.json` records a portable `repository` URL and an optional
-  `default_branch` when importing from Git. Local discovery reads `origin` and
-  `origin/HEAD` without network access; remote imports read the advertised default.
-  Local paths and credential-bearing URLs are omitted. Existing differing
-  provenance is rejected, not overwritten. This ordinary file informs the agent
-  and can prefill the publication preview when the stack base matches the import.
-  Importing does not choose a publishing destination or associate a local checkout.
+- `/import <path> <source> [revision]`: import a checkout snapshot or Git revision
+  at an unused conversation path, as described above. Existing differing
+  provenance is rejected, not overwritten.
 - `Ctrl+L`: check the selected code snapshot out in its remembered local directory.
   If none is selected, prompt for `/checkout <directory>`.
 - `/checkout <directory>`: choose an existing clean Git checkout or an empty/new

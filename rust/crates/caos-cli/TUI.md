@@ -28,7 +28,7 @@ their prompt title and appear beneath the parent conversation.
 ## Build and run
 
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
-`--import <path>` snapshots disk content; adding `--base HEAD` imports a Git commit. Outside a checkout, it starts
+`--import <path>` imports a commit snapshot of disk content; `--base HEAD` excludes disk changes. Outside a checkout, it starts
 without code and defaults to `http://localhost:9090`; `--server` overrides it.
 The harness and object database live under `$XDG_DATA_HOME/caos/clients`
 (default `~/.local/share/caos/clients`), independently of attached repositories.
@@ -173,10 +173,12 @@ are no shell commands or controls that apply edits.
 On a source-tree entry in the current snapshot, `o` selects the target for
 local checkout and publication. Selection preserves the draft and never
 changes agent execution. Use `/import <path> <source> [revision]` to import
-disk contents from a Git repository directory (or its subdirectory) at an unused
-path, or a Git commit when given a URL or explicit revision. Plain directories
-and individual files are not supported. Local imports include uncommitted and untracked files while honoring
-Git ignore rules, including ancestor rules for subdirectories. Each import's
+a Git checkout's disk snapshot at an unused path. An unchanged checkout reuses
+HEAD; changes become a child commit. A URL or explicit revision imports that
+commit instead. Local imports require a checkout root with a HEAD; linked
+worktrees work, but plain directories, individual files, and subdirectory
+snapshots are not supported. Untracked files honor Git ignore rules; tracked
+files remain included. The source index, branches, and files stay unchanged. Each import's
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
@@ -200,8 +202,8 @@ place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
 The launcher starts without code. `--import imports/caos/base` snapshots the
-checkout's current disk contents at that path. Add `--base HEAD` or another
-revision to import a gitlink with Git ancestry instead.
+checkout's current disk contents as a gitlink at that path. Add `--base HEAD`
+or another revision to exclude disk changes and import that commit.
 `/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
 require the previous build; this version does not migrate them implicitly.
 

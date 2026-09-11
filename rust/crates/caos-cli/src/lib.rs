@@ -3586,7 +3586,42 @@ mod tests {
         let repository = other_root.join("origin.git").to_str().unwrap().to_string();
         source_trees::import_source(&transport, "attached", "api", &repository, Some("main"))
             .unwrap();
-        let _local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
+        let local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "clean",
+                other.work_dir().to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            local_head
+        );
+        // Linked worktrees have a .git file rather than a .git directory.
+        let linked = other_root.join("linked");
+        git(
+            other.work_dir(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "linked",
+                linked.to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            local_head
+        );
         std::fs::write(other.work_dir().join("source_tree"), "uncommitted work\n").unwrap();
         std::fs::write(other.work_dir().join(".git/info/exclude"), "local-only\n").unwrap();
         std::fs::write(other.work_dir().join("local-only"), "not imported").unwrap();
@@ -3597,22 +3632,31 @@ mod tests {
             "excluded by ancestor",
         )
         .unwrap();
-        std::fs::write(other.work_dir().join(".gitignore"), "src/private.txt\n").unwrap();
-        let subtree = source_trees::import_source(
+        std::fs::write(
+            other.work_dir().join(".gitignore"),
+            "src/private.txt\nsource_tree\n",
+        )
+        .unwrap();
+        std::fs::write(other.work_dir().join("src/staged.txt"), "staged").unwrap();
+        git(other.work_dir(), &["add", "src/staged.txt"]);
+        std::fs::write(other.work_dir().join("src/staged.txt"), "disk").unwrap();
+        std::os::unix::fs::symlink("source_tree", other.work_dir().join("link")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            other.work_dir().join("src/public.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let source_index = std::fs::read(other.work_dir().join(".git/index")).unwrap();
+        assert!(source_trees::import_source(
             &transport,
             "attached",
             "subdir",
             other.work_dir().join("src").to_str().unwrap(),
             None,
         )
-        .unwrap();
-        let store = open_store(&transport).unwrap();
-        let subdir = conversation_protocol::v3::tree::Snapshot::new(
-            &store,
-            oid(&subtree, "subdir").unwrap(),
-        );
-        assert_eq!(subdir.read("public.txt").unwrap().unwrap(), b"public");
-        assert!(!subdir.exists("private.txt").unwrap());
+        .unwrap_err()
+        .contains("checkout root"));
         let disk_tree = source_trees::import_source(
             &transport,
             "attached",
@@ -3622,10 +3666,24 @@ mod tests {
         )
         .unwrap();
         let store = open_store(&transport).unwrap();
-        let disk = conversation_protocol::v3::tree::Snapshot::new(
-            &store,
-            oid(&disk_tree, "disk").unwrap(),
+        let imported = store
+            .read_commit(&oid(&disk_tree, "disk").unwrap())
+            .unwrap();
+        assert_eq!(imported.parents, vec![oid(&local_head, "parent").unwrap()]);
+        let disk = conversation_protocol::v3::tree::Snapshot::new(&store, imported.tree);
+        assert_eq!(disk.read("src/staged.txt").unwrap().unwrap(), b"disk");
+        assert_eq!(disk.entry("link").unwrap().unwrap().mode, Mode::Link);
+        assert_eq!(
+            disk.entry("src/public.txt").unwrap().unwrap().mode,
+            Mode::Executable
         );
+        assert!(!disk.exists("src/private.txt").unwrap());
+        assert!(!disk.exists("local-only").unwrap());
+        assert_eq!(
+            std::fs::read(other.work_dir().join(".git/index")).unwrap(),
+            source_index
+        );
+        assert_eq!(git(other.work_dir(), &["rev-parse", "HEAD"]), local_head);
         assert_eq!(
             disk.read("source_tree").unwrap().unwrap(),
             b"uncommitted work\n"
@@ -3662,7 +3720,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            assert!(error.contains("local imports require a Git repository directory"));
+            assert!(error.contains("local imports require a Git checkout root"));
         }
         // Local-only origins are not portable conversation metadata.
         assert!(

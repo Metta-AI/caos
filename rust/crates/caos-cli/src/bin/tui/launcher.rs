@@ -78,25 +78,24 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
         if let Some(checkout) = &checkout {
             let transport = GitTransport::discover(&client)?;
-            let caos_cli::source_trees::ImportedContent {
-                mode,
-                object,
-                metadata,
-            } = caos_cli::source_trees::prepare_import(
-                &transport,
+            let caos_cli::source_trees::ImportedContent { commit, metadata } =
+                caos_cli::source_trees::prepare_import(
+                    &transport,
+                    name,
+                    checkout.to_str().ok_or("checkout path must be UTF-8")?,
+                    args.turn.base.as_deref(),
+                )?;
+            seed.put_oid(
                 name,
-                checkout.to_str().ok_or("checkout path must be UTF-8")?,
-                args.turn.base.as_deref(),
-            )?;
-            seed.put_oid(name, mode, object.clone());
+                conversation_protocol::v3::Mode::Commit,
+                commit.clone(),
+            );
             if let Some((path, bytes)) = metadata {
                 seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
             }
-            if mode == conversation_protocol::v3::Mode::Commit {
-                args.turn.base = Some(object.to_string());
-                if args.from_commit.is_some() {
-                    args.from_commit = Some(object.to_string());
-                }
+            args.turn.base = Some(commit.to_string());
+            if args.from_commit.is_some() {
+                args.from_commit = Some(commit.to_string());
             }
         } else {
             return Err("--import requires a Git checkout".into());
