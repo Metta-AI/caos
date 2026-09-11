@@ -78,39 +78,21 @@ reachable() {
 # listener even though the address embedded in it goes stale. That is why one
 # ticket can live in the environment indefinitely.
 
-if [ -n "${CAOS_IROH_TICKET:-}" ]; then
-    # A live tunnel first: a resumed session may already have one, and then it
-    # does not matter whether dumbpipe is anywhere.
-    if reachable "$port"; then
-        log "tunnel already up on :$port"
-    elif ! command -v dumbpipe >/dev/null 2>&1; then
-        log "CAOS_IROH_TICKET is set but dumbpipe is not installed"
-    else
-        # A dumbpipe holding the port without serving anything would make the
-        # new one fail to bind and the failure would be attributed to iroh.
-        pkill -f "connect-tcp --addr 127.0.0.1:$port " 2>/dev/null
+# ---------------------------------------------------------------------------
+# The remote, THEN the tunnel
+# ---------------------------------------------------------------------------
+# ORDER MATTERS, and it used to be backwards. The `caos` remote only needs the
+# server's URL, not a tunnel that carries data, so it is added FIRST -- before
+# dumbpipe is even started. A resolver or a first tool call that runs while the
+# tunnel is still coming up then finds the remote and waits the tunnel out
+# (`ensure_server_reachable` retries a dead port); what it CANNOT retry away is
+# a remote that is not there yet, and adding it last -- after a tunnel bring-up
+# that can take twenty seconds -- is exactly what produced the intermittent
+# "no `caos` git remote" that failed a session's whole first turn.
 
-        log "opening the iroh tunnel on :$port"
-        (dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
-            >/tmp/caos-tunnel.log 2>&1 &)
-        # Bounded wait: the first tool call would otherwise race the tunnel and
-        # fail with a connection error that says nothing about why.
-        for _ in $(seq 1 20); do
-            reachable "$port" && break
-            sleep 1
-        done
-        if reachable "$port"; then
-            log "tunnel up"
-        else
-            log "tunnel did not reach a caos server; see /tmp/caos-tunnel.log"
-        fi
-    fi
+if [ -n "${CAOS_IROH_TICKET:-}" ]; then
     : "${server:=http://127.0.0.1:$port}"
 fi
-
-# ---------------------------------------------------------------------------
-# The remote
-# ---------------------------------------------------------------------------
 
 if [ -z "$server" ]; then
     log "no CAOS_SERVER_URL and no CAOS_IROH_TICKET; leaving the remote alone"
@@ -140,6 +122,39 @@ if current="$(git remote get-url caos 2>/dev/null)"; then
     fi
 else
     git remote add caos "$server" && log "caos remote -> $server"
+fi
+
+# ---------------------------------------------------------------------------
+# The tunnel, brought up now that the remote already points at its port
+# ---------------------------------------------------------------------------
+
+if [ -n "${CAOS_IROH_TICKET:-}" ]; then
+    # A live tunnel first: a resumed session may already have one, and then it
+    # does not matter whether dumbpipe is anywhere.
+    if reachable "$port"; then
+        log "tunnel already up on :$port"
+    elif ! command -v dumbpipe >/dev/null 2>&1; then
+        log "CAOS_IROH_TICKET is set but dumbpipe is not installed"
+    else
+        # A dumbpipe holding the port without serving anything would make the
+        # new one fail to bind and the failure would be attributed to iroh.
+        pkill -f "connect-tcp --addr 127.0.0.1:$port " 2>/dev/null
+
+        log "opening the iroh tunnel on :$port"
+        (dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
+            >/tmp/caos-tunnel.log 2>&1 &)
+        # Bounded wait: the first tool call would otherwise race the tunnel and
+        # fail with a connection error that says nothing about why.
+        for _ in $(seq 1 20); do
+            reachable "$port" && break
+            sleep 1
+        done
+        if reachable "$port"; then
+            log "tunnel up"
+        else
+            log "tunnel did not reach a caos server; see /tmp/caos-tunnel.log"
+        fi
+    fi
 fi
 
 exit 0
