@@ -327,20 +327,17 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   the clean hashes accepted by `--from` and the in-session `/from <turn>`
   command. Chat and diff scrolling count wrapped visual rows and accept both
   page keys and the mouse wheel. `Ctrl+Y` temporarily releases mouse capture
-  and freezes redraws for native terminal text selection. `Ctrl+L` checks out
-  the selected conversation commit as a detached HEAD after requiring a clean
-  host checkout. `Ctrl+H` opens the keyboard and slash-command reference.
-  `Ctrl+P` opens a PR-base prompt and a second press publishes the selected
-  conversation without checking it out. It points `caos/<conversation>` at the
-  validated conversation head after a publication-preparation turn. The turn
-  requests a merge of the fetched selected-base tip only when that tip is not
-  already an ancestor of the conversation head. This lets a child conversation
-  stack on its parent's published history, while subsequent publications
-  fast-forward the same branch without redundant merges. Conflicts and reserved
-  `.caos` state at the tip stop publication and are reported in the command-error
-  panel. CAOS uses ordinary fast-forward pushes after a one-time
-  exact-lease migration of a legacy snapshot branch, and opens or finds its open
-  PR through `gh` against the same branch. Merely
+  and freezes redraws for native terminal text selection. `/checkout <gitlink>
+  [directory]` checks out the named code commit as a detached HEAD in a clean
+  local checkout. `Ctrl+H` opens the keyboard and slash-command reference.
+  `/pr <gitlink> <base-remote-branch> [remote-URL]` previews one PR; Enter
+  confirms. The URL is explicit or inferred from matching import provenance.
+  Publication pushes the exact code commit, using the gitlink path as the branch
+  name, then opens or reuses its PR through `gh`. The agent tests the code before
+  this client operation. Source and base must share history. If the latest base is not an ancestor,
+  Enter instead imports the base and sends an integration request to the agent;
+  the user runs `/pr` again afterward to review publication. Changed content, remote drift, conflict markers,
+  unrelated histories, and reserved `.caos` state stop publication. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. `/publish-branch` pushes the same full-history branch without PR
   creation, while `/load` imports a `remote/caos/<conversation>` branch or

@@ -1,6 +1,4 @@
-//! Views derived from stack directory entries; none of these views are persisted.
-
-use serde::{Deserialize, Serialize};
+//! Validation for Git sources and publication destinations.
 
 pub fn validate_source(source: &str) -> Result<git_locator::GitRef, String> {
     let parsed = git_locator::parse_git_ref(source)?;
@@ -27,38 +25,6 @@ pub fn validate_repository(repository: &str) -> Result<(), String> {
         return Err("repository URLs must not contain credentials".into());
     }
     Ok(())
-}
-
-/// The sole external locator in a stack. Two lines avoid ambiguous URL fragments.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseUrl {
-    pub repository: String,
-    pub branch: String,
-}
-impl BaseUrl {
-    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-        let lines: Vec<_> = text.lines().collect();
-        if lines.len() != 2 {
-            return Err(".base-url needs a repository URL and branch on separate lines".into());
-        }
-        validate_repository(lines[0])?;
-        validate_branch(lines[1])?;
-        Ok(Self {
-            repository: lines[0].into(),
-            branch: lines[1].into(),
-        })
-    }
-    pub fn encode(&self) -> Vec<u8> {
-        format!("{}\n{}\n", self.repository, self.branch).into_bytes()
-    }
-}
-
-pub fn is_boundary(name: &str) -> bool {
-    name.len() > 3
-        && name.as_bytes()[..2].iter().all(u8::is_ascii_digit)
-        && name.as_bytes()[2] == b'-'
-        && !name.starts_with("00-")
 }
 
 pub fn validate_branch(branch: &str) -> Result<(), String> {

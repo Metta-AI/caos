@@ -24,44 +24,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Import from the user's trusted checkout, including its unpushed commits.
-/// upload-pack otherwise forbids fetching promised objects from a partial clone.
-/// Keep the override on this local import, never on arbitrary repository fetches.
-pub(super) fn import_checkout_commit(
-    checkout: &Path,
-    client: &Path,
-    commit: &Oid,
-) -> Result<(), String> {
-    if GitStore::open(client, None)?.has_local(commit)? {
-        return Ok(());
-    }
-    let checkout = checkout.canonicalize().map_err(|e| e.to_string())?;
-    let output = Command::new("git")
-        .current_dir(client)
-        .env("GIT_NO_LAZY_FETCH", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args([
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--",
-        ])
-        .arg(&checkout)
-        .arg(commit.as_str())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("starting checkout import: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "importing checkout history: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
+pub(super) use caos_cli::source_trees::import_local_commit;
 
 fn data_dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -114,35 +77,25 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     if let Some(name) = &args.import {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
         if let Some(checkout) = &checkout {
-            let rev = args.turn.base.as_deref().unwrap_or("HEAD");
-            let commit = git(
-                checkout,
-                &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
-            )?;
-            let oid = Oid::parse(&commit, "initial checkout")?;
-            import_checkout_commit(checkout, &client, &oid)?;
-            seed.put_oid(name, conversation_protocol::v3::Mode::Commit, oid);
-            let repository = git(checkout, &["remote", "get-url", "origin"])
-                .ok()
-                .filter(|url| {
-                    conversation_protocol::v3::source_trees::validate_repository(url).is_ok()
-                });
-            let supplied = format!(
-                "Local Git import (repository and revision are provenance, not worker paths): {}",
-                serde_json::json!({
-                    "path": name,
-                    "commit": commit,
-                    "revision": rev,
-                    "origin": repository,
-                })
+            let transport = GitTransport::discover(&client)?;
+            let caos_cli::source_trees::ImportedContent { commit, metadata } =
+                caos_cli::source_trees::prepare_import(
+                    &transport,
+                    name,
+                    checkout.to_str().ok_or("checkout path must be UTF-8")?,
+                    args.turn.base.as_deref(),
+                )?;
+            seed.put_oid(
+                name,
+                conversation_protocol::v3::Mode::Commit,
+                commit.clone(),
             );
-            args.turn.system = Some(match args.turn.system.take() {
-                Some(system) => format!("{system}\n\n{supplied}"),
-                None => supplied,
-            });
-            args.turn.base = Some(commit.clone());
+            if let Some((path, bytes)) = metadata {
+                seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
+            }
+            args.turn.base = Some(commit.to_string());
             if args.from_commit.is_some() {
-                args.from_commit = Some(commit);
+                args.from_commit = Some(commit.to_string());
             }
         } else {
             return Err("--import requires a Git checkout".into());
@@ -303,6 +256,14 @@ fn create_client(
         .to_string_lossy();
     let destination = clients.join(format!("{artifact}-{policy}"));
     if destination.exists() {
+        git(
+            &destination,
+            &[
+                "config",
+                "caos.checkout-settings",
+                &data.join("checkouts.gitconfig").to_string_lossy(),
+            ],
+        )?;
         return Ok(destination);
     }
     let staging = Staging(clients.join(format!(".new-{}", caos::fresh_entropy()?)));
@@ -321,6 +282,14 @@ fn create_client(
     git(&staging.0, &["config", "gc.auto", "0"])?;
     git(&staging.0, &["remote", "add", "caos", server])?;
     git(&staging.0, &["config", "caos.launcher", "true"])?;
+    git(
+        &staging.0,
+        &[
+            "config",
+            "caos.checkout-settings",
+            &data.join("checkouts.gitconfig").to_string_lossy(),
+        ],
+    )?;
     if let Some(checkout) = checkout {
         git(
             &staging.0,
@@ -343,35 +312,101 @@ fn create_client(
     }
 }
 
-/// Existing checkout commands remain tied to matching user code, never to the
-/// harness. Importing objects is harmless; checking out/committing stays explicit.
+/// Local checkout preferences are keyed by conversation and gitlink path, never
+/// inferred from a publishing destination or included in conversation content.
+fn checkout_key(client: &Path, conversation: &str, source: &str) -> Result<String, String> {
+    Ok(format!(
+        "caos.checkout-{}",
+        hash_key(
+            client,
+            &serde_json::json!([
+                git(client, &["remote", "get-url", "caos"]).ok(),
+                conversation,
+                source
+            ])
+        )?
+    ))
+}
+
+pub(super) fn remember_checkout(
+    client: &Path,
+    conversation: &str,
+    source: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    git(
+        client,
+        &[
+            "config",
+            "--file",
+            &git(client, &["config", "--get", "caos.checkout-settings"])?,
+            &checkout_key(client, conversation, source)?,
+            &destination.to_string_lossy(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Publication preferences stay beside local checkout preferences, outside CAOS.
 pub(super) fn checkout_for(
     client: &Path,
-    repository: Option<&str>,
+    conversation: &str,
+    source: &str,
     head: &str,
 ) -> Result<PathBuf, String> {
-    if git(client, &["config", "--get", "caos.launcher"])
-        .ok()
-        .as_deref()
-        != Some("true")
-    {
-        return Ok(client.into());
-    }
-    let value = git(client, &["config", "--null", "--get", "caos.checkout"]).map_err(|_| {
-        "this client has no local checkout; open caos from a checkout to use checkout commands"
+    let value = git(
+        client,
+        &[
+            "config",
+            "--file",
+            &git(client, &["config", "--get", "caos.checkout-settings"])?,
+            "--null",
+            "--get",
+            &checkout_key(client, conversation, source)?,
+        ],
+    )
+    .map_err(|_| {
+        format!(
+            "choose a local destination with /checkout {} <directory>",
+            shell_words::quote(source)
+        )
     })?;
     let checkout = PathBuf::from(value.strip_suffix('\0').ok_or("invalid checkout config")?);
-    let checkout_repository = git(&checkout, &["remote", "get-url", "origin"])
-        .unwrap_or_else(|_| checkout.to_string_lossy().into_owned());
-    if repository.is_some_and(|repo| {
-        caos_cli::normalize_repository_identity(repo).ok()
-            != caos_cli::normalize_repository_identity(&checkout_repository).ok()
-    }) {
-        return Err("selected source tree belongs to another repository; open caos from a matching checkout to use checkout commands".into());
-    }
-    GitStore::open(&checkout, Some(&client.to_string_lossy()))?
-        .ensure_local(&Oid::parse(head, "source tree checkout")?)?;
+    import_local_commit(
+        client,
+        &checkout,
+        &Oid::parse(head, "source tree checkout")?,
+    )?;
     Ok(checkout)
+}
+
+/// Resolve user-entered paths relative to where the TUI was launched.
+pub(super) fn local_path(client: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    let launch = git(client, &["config", "--null", "--get", "caos.checkout"])
+        .ok()
+        .and_then(|value| value.strip_suffix('\0').map(PathBuf::from));
+    launch.unwrap_or_else(|| client.into()).join(path)
+}
+
+pub(super) fn prepare_checkout(destination: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(destination).map_err(|e| format!("creating checkout: {e}"))?;
+    let destination = destination.canonicalize().map_err(|e| e.to_string())?;
+    if fs::read_dir(&destination)
+        .map_err(|e| e.to_string())?
+        .next()
+        .is_none()
+    {
+        git(&destination, &["init", "--quiet"])?;
+    }
+    let root = git(&destination, &["rev-parse", "--show-toplevel"])?;
+    if Path::new(&root) != destination {
+        return Err("choose the root of a Git checkout or an empty directory".into());
+    }
+    Ok(destination)
 }
 
 #[cfg(test)]
@@ -451,7 +486,22 @@ mod tests {
         let client = root.0.join("client");
         fs::create_dir(&client).unwrap();
         git(&client, &["init", "--quiet", "-b", "main"]).unwrap();
-        import_checkout_commit(&checkout, &client, &head).unwrap();
+        // Checkout exports from a partial client into the user's checkout.
+        git(
+            &checkout,
+            &[
+                "config",
+                "caos.checkout-settings",
+                &root.0.join("checkouts.gitconfig").to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        remember_checkout(&checkout, "conversation", "feature/dirty", &client).unwrap();
+        assert_eq!(
+            checkout_for(&checkout, "conversation", "feature/dirty", head.as_str()).unwrap(),
+            client
+        );
+        import_local_commit(&checkout, &client, &head).unwrap();
         // The destination is self-contained even after the source disappears.
         fs::remove_dir_all(&origin).unwrap();
         assert_eq!(git(&checkout, &["status", "--porcelain"]).unwrap(), status);
@@ -519,8 +569,17 @@ mod tests {
             fs::read_to_string(first.join("DEPS")).unwrap(),
             "./std/llm-step llm-step\n"
         );
-        let error = checkout_for(&first, None, &"a".repeat(40)).unwrap_err();
-        assert!(error.contains("no local checkout"));
+        let error =
+            checkout_for(&first, "conversation", "feature/dirty", &"a".repeat(40)).unwrap_err();
+        assert!(error.contains("choose a local destination"));
+        remember_checkout(&first, "conversation", "feature/dirty", &first).unwrap();
+        let head = git(&first, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            checkout_for(&third, "conversation", "feature/dirty", &head).unwrap(),
+            first
+        );
+        assert!(checkout_for(&third, "other", "feature/dirty", &head).is_err());
+        assert_eq!(git(&first, &["status", "--porcelain"]).unwrap(), "");
         fs::remove_dir_all(root).unwrap();
     }
 }

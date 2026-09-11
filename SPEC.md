@@ -493,29 +493,17 @@ publishing them is deferred.
   agent resolves over subsequent turns; each resolution is an ordinary
   mutation commit on top of `M`.
 
-## Resolving `--theirs` (the ref snapshot)
+## Resolving `--theirs`
 
-The model says "merge in `main`", but a ref name only exists in the user's git
-repo — the merge worker, mid-turn on the compute network, has no refs, and the
-model doesn't know hashes. So `--theirs` is resolved on the CLIENT, at turn
-START — the only place the refs live and the only moment the client is in the
-loop (a tool call three rounds deep cannot reach back into the repo):
+The normal client does not publish a map of local branch names to workers.
+Import the desired Git revision explicitly, then pass its full commit hash to
+`merge`. The selected source-tree path identifies `ours`; `theirs` identifies
+an immutable commit already available in CAOS. Importing a newer branch tip
+does not merge it automatically.
 
-- The client resolves a small, curated set of refs to hashes — `HEAD`'s
-  upstream, `main`/`master`, the `origin` default — `ensure_pushed`es their
-  closures (onto the CONTENT-ADDRESSED `refs/caos/req/<hash>`, exactly as
-  `--head:commit` is pushed; NO semantic ref like `main` is ever written to the
-  shared server, so users never contend for a name), and curries a
-  name→hash MAP into the llm-step worker as an ordinary blob arg.
-- The `merge` tool resolves `--theirs` against that map: a known ref name → its
-  snapshotted hash; a bare hash → used directly; anything else → an is_error
-  tool_result listing the available names. `ours` is never named — it is the
-  threaded source tree commit.
-
-**Snapshot semantics**, deliberately: "merge in `main`" merges `main` as it was
-when the turn started, so the merge is deterministic and immune to `main`
-moving mid-turn. `ensure_pushed` negotiates against the server, so an unmoved
-`main` re-pushes nothing — the steady-state cost is the delta since last time.
+A custom harness may supply a `merge-refs` map for named targets. Those names
+resolve to the supplied snapshot, not live remote refs. Without that map,
+names such as `main` and `origin/main` are unavailable; commit hashes still work.
 
 ## `.caos/conflicts`
 
@@ -541,17 +529,20 @@ The agent resolves a path by editing the file (removing markers) or fixing
 the entry, then DELETING that path's rows from `.caos/conflicts`. That
 deletion IS the per-path `git add` — an explicit "this one's done"
 assertion, trusted exactly as git trusts `add` (no re-scan). An empty
-`.caos/conflicts` means done; the agent need not remove the file (inline tools
-have no delete — `bash rm` does, for a clean mid-conversation checkout).
+`.caos/conflicts` means resolution is done. Recording an edited source tree
+removes its empty ledger and prunes the `.caos` directory if empty. Bash and
+inline edits share this rule. Unchanged commits, unresolved entries, other
+metadata, and ordinary conversation files are preserved.
 
 `.caos/conflicts` lives in the source tree, alongside the code. Inline
 file tools can edit it; compute tools receive it with the rest of the
 source tree. Conversation protocol files live in a separate tree, so no
 step metadata needs to be injected or preserved in the source tree.
 
-Publication rejects any `.caos` entry in the final source tree, including
-an empty `.caos/conflicts`. Earlier source tree commits retain their conflict
-scaffolding.
+Publication rejects any `.caos` content in the final source tree, including
+an empty `.caos/conflicts` or empty `.caos` directory. The check
+distinguishes unresolved conflicts from completed cleanup and does not rewrite
+the published commit. Earlier commits retain their conflict scaffolding.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
@@ -583,16 +574,18 @@ revision (and made the history tools' hashes readable the same way).
 
 ## Publication
 
-The [conversation publication flow](design/chat.md) derives a PR stack from a
-directory: `.base-url` supplies the repository and external base branch;
-numbered commit entries supply PR branches named by their full paths.
-`00-base` and `dirty` are excluded. The first PR targets the external branch;
-each later PR targets the preceding boundary. No publication defaults are stored.
-`Ctrl+P` previews exact commits and destinations, publishes them in order, and
-opens or reuses each PR by repository and head branch. Publication verifies
-the captured content and remote tips; interrupted pushes are reconciled from
-the remote and execution events. `/publish-branch` pushes a selected review
-boundary without PR creation. Neither exports conversations.
+The [conversation publication flow](design/chat.md) publishes one named gitlink
+with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
+branch name. The base is explicit; an omitted URL comes from unambiguous import
+provenance. Directory ordering guides review, not publication. Publish earlier
+PRs first, then name their remote branches as later PR bases.
+
+The client previews the exact source commit and destination before confirmation.
+If the source does not contain the fetched base tip, it offers to import that
+base and send the agent a merge/rebase and test request. This action publishes
+nothing; run `/pr` again after integration. Successful pushes and PR operations
+are recorded as CAOS transcript entries. No snapshot has a special working or
+sealed state.
 
 Per-mutation commits remain in the published source tree history. Only the
 previewed PR tip is checked for unresolved conflicts and reserved state;

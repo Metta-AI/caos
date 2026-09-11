@@ -200,20 +200,6 @@ impl<'s> Conversation<'s> {
         Ok(None)
     }
 
-    /// Optional publishing convention. Invalid content remains editable.
-    pub fn base_url(&self, name: &str) -> Result<Option<super::BaseUrl>, String> {
-        let dir = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-        let path = if dir.is_empty() {
-            ".base-url".into()
-        } else {
-            format!("{dir}/.base-url")
-        };
-        Ok(self
-            .snapshot
-            .read(&path)?
-            .and_then(|bytes| super::BaseUrl::parse(&bytes).ok()))
-    }
-
     pub fn source_trees(&self) -> Result<BTreeMap<String, SourceTreeRecord>, String> {
         self.source_tree_names()?
             .into_iter()
@@ -479,11 +465,7 @@ impl<'s> Conversation<'s> {
     }
 
     fn require_format(&self) -> Result<(), String> {
-        let bytes = self.required_blob(paths::FORMAT)?;
-        if bytes != paths::FORMAT_BYTES.as_bytes() {
-            return Err("unsupported conversation format; use the preserved build to open earlier conversations".to_string());
-        }
-        Ok(())
+        paths::validate_format(&self.required_blob(paths::FORMAT)?)
     }
 
     fn optional_blob(&self, path: &str) -> Result<Option<Vec<u8>>, String> {

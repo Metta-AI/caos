@@ -18,7 +18,7 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
-pub mod checkout;
+pub mod gitlinks;
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -2119,7 +2119,7 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
             .write_to(&mut buf)
             .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
         let oid = hash_bytes("tree", &buf)?;
-        return checkout::commit(
+        return gitlinks::commit(
             cas_real,
             path,
             Hashed {
@@ -4125,6 +4125,23 @@ impl ClientSecret {
     }
 }
 
+/// Check local configuration without evaluating reader expressions or building
+/// worker images. Grants are resolved when preparing an actual request.
+pub fn local_secret_present(dir: &Path, name: &str) -> Result<bool, String> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let mut present = false;
+    for (file_name, path) in local_secret_files(dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
+        let spec = parse_local_secret_spec(&file_name, &text)?;
+        resolve_local_secret_value(&file_name, &path, spec.value)?;
+        present |= spec.name == name;
+    }
+    Ok(present)
+}
+
 /// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
 /// each reader resolved HERE (via eval-path, against the store's pinned tree)
 /// to a partial arg tree of name → oid — so the server only subset-matches,
@@ -4760,15 +4777,24 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             ("commit".into(), base.clone())
         );
         let projection = dir.path().join("projection");
-        checkout::prepare(&t, &tree.to_string(), &[".".into()])
-            .unwrap()
-            .write(&projection)
-            .unwrap();
+        // Model the harness's writable directory metadata; put itself does
+        // not materialize editable files.
+        let source = cas.join(format!("checkout-{base}"));
+        get_hash(&t, &base, source.to_str().unwrap()).unwrap();
+        std::fs::create_dir(&projection).unwrap();
+        let project_fixture = |name: &str| {
+            let directory = projection.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for name in ["code", "run"] {
+                std::fs::copy(dir.path().join(name), directory.join(name)).unwrap();
+            }
+            std::os::unix::fs::symlink("code", directory.join("link")).unwrap();
+            xattr::set(&directory, "user.caos.commit", base.as_bytes()).unwrap();
+        };
+        project_fixture("dirty");
+        std::fs::write(projection.join("memory"), "remember").unwrap();
         assert_eq!(store(&t, Some(&cas), &projection).unwrap().1, tree);
-        checkout::prepare(&t, &base, &[".".into()])
-            .unwrap()
-            .write(&projection.join("copy"))
-            .unwrap();
+        project_fixture("copy");
         std::fs::rename(projection.join("copy"), projection.join("review")).unwrap();
         std::fs::write(
             projection.join("dirty/code"),
@@ -4784,7 +4810,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         assert_eq!(
             entry(b"review").oid.to_string(),
             base,
-            "cp -a/mv preserves exact signed commit"
+            "copied and renamed boundaries preserve the exact signed commit"
         );
         assert_eq!(
             entry(b"dirty").mode.kind(),
@@ -4801,7 +4827,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             "new content must not retain the old signature"
         );
         let resolved = cas.join("resolved");
-        checkout::resolve(
+        gitlinks::resolve(
             &t,
             &changed.to_string(),
             "dirty/run",
@@ -4812,7 +4838,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o111,
             0
         );
-        assert!(checkout::resolve(
+        assert!(gitlinks::resolve(
             &t,
             &changed.to_string(),
             "../code",
@@ -4820,6 +4846,72 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         )
         .is_err());
         assert!(projection.join("dirty/link").is_symlink());
+        // Clearing or deleting a resolved ledger cleans only source-tree metadata.
+        let metadata = projection.join("dirty/.caos");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(metadata.join("conflicts"), "unresolved code\n").unwrap();
+        let (_, unresolved) = store(&t, Some(&cas), &projection).unwrap();
+        let (_, unresolved) = eval::eval_path(&t, &unresolved.to_string(), "dirty", &[]).unwrap();
+        assert_eq!(
+            git(
+                dir.path(),
+                &["show", &format!("{unresolved}:.caos/conflicts")]
+            ),
+            "unresolved code\n"
+        );
+        let (_, raw) = t.get_object(&unresolved).unwrap();
+        let merge = String::from_utf8(raw).unwrap().replacen(
+            &format!("parent {base}\n"),
+            &format!("parent {base}\nparent {}\n", entry(b"dirty").oid),
+            1,
+        );
+        let merge = t
+            .put_object("commit", merge.as_bytes())
+            .unwrap()
+            .to_string();
+        get_hash(
+            &t,
+            &merge,
+            cas.join(format!("checkout-{merge}")).to_str().unwrap(),
+        )
+        .unwrap();
+        xattr::set(
+            projection.join("dirty"),
+            "user.caos.commit",
+            merge.as_bytes(),
+        )
+        .unwrap();
+        let (_, unchanged) = store(&t, Some(&cas), &projection).unwrap();
+        assert_eq!(
+            eval::eval_path(&t, &unchanged.to_string(), "dirty", &[])
+                .unwrap()
+                .1,
+            merge
+        );
+
+        // Ordinary conversation files are outside this cleanup rule.
+        std::fs::create_dir(projection.join(".caos")).unwrap();
+        std::fs::write(projection.join(".caos/conflicts"), "").unwrap();
+        for remove_ledger in [false, true] {
+            if remove_ledger {
+                std::fs::remove_file(metadata.join("conflicts")).unwrap();
+            } else {
+                std::fs::write(metadata.join("conflicts"), "").unwrap();
+            }
+            let (_, cleaned) = store(&t, Some(&cas), &projection).unwrap();
+            let (_, source) = eval::eval_path(&t, &cleaned.to_string(), "dirty", &[]).unwrap();
+            assert!(git(dir.path(), &["ls-tree", &source, "--", ".caos"]).is_empty());
+            assert_eq!(
+                git(dir.path(), &["rev-parse", &format!("{source}^")]).trim(),
+                merge
+            );
+            assert!(eval::eval_path(&t, &cleaned.to_string(), ".caos/conflicts", &[]).is_ok());
+        }
+        std::fs::write(metadata.join("conflicts"), "").unwrap();
+        std::fs::write(metadata.join("other"), "keep").unwrap();
+        let (_, retained) = store(&t, Some(&cas), &projection).unwrap();
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/conflicts", &[]).is_err());
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/other", &[]).is_ok());
     }
 
     #[test]
@@ -5033,6 +5125,29 @@ mod local_secret_tests {
             Some(LocalSecretValue::File(path)) => assert_eq!(path, "../key"),
             _ => panic!("value:@ was not preserved as an unresolved file value"),
         }
+    }
+
+    #[test]
+    fn presence_checks_local_specs_and_values_without_evaluating_readers() {
+        let dir = std::env::temp_dir().join(format!(
+            "secret-presence-{}",
+            super::fresh_entropy().unwrap()
+        ));
+        assert!(!super::local_secret_present(&dir, "api-key").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(
+            &file,
+            "name=api-key\nvalue=test-value\nreader=missing-worker\n",
+        )
+        .unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").unwrap());
+        assert!(!super::local_secret_present(&dir, "other").unwrap());
+        std::fs::write(&file, "name=api-key\nvalue:@=missing.value\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::write(&file, "not a spec\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

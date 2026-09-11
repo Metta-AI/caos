@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
-/// the TUI chooses when to mutate the checkout and requires confirmation before
-/// calling it. Rather than applying the base-to-head diff as unstaged changes,
+/// the TUI requires an explicit local destination, which it can remember.
+/// Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
 pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), String> {
@@ -34,7 +34,7 @@ pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), Strin
 /// user-authored turn. It deliberately DOES commit — staging everything with
 /// `git add -A` and committing when the tree is dirty — so the checkout is left
 /// clean and its `HEAD` matches exactly what the turn receives. A later
-/// `Ctrl+L` onto the conversation's new head then succeeds instead of tripping
+/// `/checkout` onto the conversation's new head then succeeds instead of tripping
 /// the clean-tree guard. When the working tree is already clean (the user
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
@@ -99,27 +99,26 @@ pub fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> 
     Ok((branch, commit))
 }
 
-pub fn remote_base_is_ancestor(target: &str, head: &str, cwd: &Path) -> Result<bool, String> {
-    let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
-    match ancestry.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => {
-            require_success("git merge-base --is-ancestor", ancestry)?;
-            unreachable!("a successful command has exit status 0")
-        }
-    }
-}
-
 /// Accept either a branch name or the familiar `origin/<branch>` spelling.
 pub fn pr_base_branch(input: &str) -> &str {
     input.trim().strip_prefix("origin/").unwrap_or(input.trim())
 }
 
-pub fn validate_prepared_source_tree(target: &str, head: &str, cwd: &Path) -> Result<(), String> {
-    if !remote_base_is_ancestor(target, head, cwd)? {
-        return Err("the preparation turn did not merge the selected PR base".to_string());
+pub fn pr_base_is_ancestor(target: &str, head: &str, cwd: &Path) -> Result<bool, String> {
+    let result = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
+    if result.status.code() == Some(1) {
+        return Ok(false);
     }
+    require_success("git merge-base --is-ancestor", result)?;
+    Ok(true)
+}
+
+pub fn validate_pr_source_tree(target: &str, head: &str, cwd: &Path) -> Result<(), String> {
+    let ancestry = command_output("git", &["merge-base", target, head], cwd)?;
+    if ancestry.status.code() == Some(1) {
+        return Err("source commit and PR base have no shared history; check the source path, repository, and base branch".into());
+    }
+    require_success("git merge-base", ancestry)?;
     let markers = command_output(
         "git",
         &[
@@ -313,11 +312,26 @@ mod tests {
         assert!(
             crate::source_trees::branch_snapshot(&transport, remote_url, "../invalid").is_err()
         );
-        validate_prepared_source_tree(&base, &base, &repo).unwrap();
-        assert!(validate_prepared_source_tree(&base, &local, &repo)
+        validate_pr_source_tree(&base, &base, &repo).unwrap();
+        let tree =
+            capture_required("git", &["rev-parse", &format!("{base}^{{tree}}")], &repo).unwrap();
+        let first = capture_required(
+            "git",
+            &["commit-tree", &tree, "-p", &base, "-m", "first branch"],
+            &repo,
+        )
+        .unwrap();
+        let second = capture_required(
+            "git",
+            &["commit-tree", &tree, "-p", &base, "-m", "second branch"],
+            &repo,
+        )
+        .unwrap();
+        validate_pr_source_tree(&first, &second, &repo).unwrap();
+        assert!(validate_pr_source_tree(&base, &local, &repo)
             .unwrap_err()
-            .contains("did not merge"));
-        assert!(validate_prepared_source_tree("bad-revision", &base, &repo).is_err());
+            .contains("no shared history"));
+        assert!(validate_pr_source_tree("bad-revision", &base, &repo).is_err());
         let conflicted = commit_file(
             &remote,
             "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n",
@@ -327,7 +341,7 @@ mod tests {
             crate::source_trees::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             conflicted
         );
-        assert!(validate_prepared_source_tree(&base, &conflicted, &repo)
+        assert!(validate_pr_source_tree(&base, &conflicted, &repo)
             .unwrap_err()
             .contains("unresolved merge markers"));
         assert_eq!(

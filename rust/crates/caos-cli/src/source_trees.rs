@@ -1,19 +1,118 @@
-//! Client imports and publication plans derived from directory contents.
+//! Client imports and publication of explicitly selected commits.
 use super::*;
-use conversation_protocol::v3::source_trees::{is_boundary, validate_repository, validate_source};
-use conversation_protocol::v3::BaseUrl;
-use std::collections::BTreeSet;
+use conversation_protocol::v3::source_trees::{validate_repository, validate_source};
+use conversation_protocol::v3::Mode;
+
+/// Transfer history between the trusted local checkout and client repository.
+/// upload-pack otherwise forbids fetching promised objects from a partial clone.
+/// Keep the override on this local import, never on arbitrary repository fetches.
+pub fn import_local_commit(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    commit: &Oid,
+) -> Result<(), String> {
+    if GitStore::open(destination, None)?.has_local(commit)? {
+        return Ok(());
+    }
+    let source = source.canonicalize().map_err(|e| e.to_string())?;
+    let output = std::process::Command::new("git")
+        .current_dir(destination)
+        .env("GIT_NO_LAZY_FETCH", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+        ])
+        .arg(&source)
+        .arg(commit.as_str())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("starting local history import: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "importing local history: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Portable provenance only: local paths and credentials stay on the client.
+fn source_metadata(
+    name: &str,
+    repository: &str,
+    default_branch: Option<String>,
+) -> Option<(String, Vec<u8>)> {
+    let portable = ["https://", "http://", "ssh://", "git://"]
+        .iter()
+        .any(|scheme| repository.starts_with(scheme))
+        || repository
+            .strip_prefix("git@")
+            .is_some_and(|rest| rest.contains(':'));
+    if !portable || repository.contains(['?', '#']) || validate_repository(repository).is_err() {
+        return None;
+    }
+    let mut value = serde_json::json!({"repository": repository});
+    if let Some(branch) = default_branch {
+        value["default_branch"] = branch.into();
+    }
+    Some((
+        format!("{name}.source.json"),
+        format!("{value}\n").into_bytes(),
+    ))
+}
+
+/// Read optional local Git metadata without contacting the remote.
+pub fn local_import_metadata(
+    name: &str,
+    checkout: &std::path::Path,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let optional = |args: &[&str]| -> Result<Option<String>, String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(checkout)
+            .output()
+            .map_err(|e| format!("reading import provenance: {e}"))?;
+        match output.status.code() {
+            Some(0) => String::from_utf8(output.stdout)
+                .map(|s| Some(s.trim_end().to_string()))
+                .map_err(|e| e.to_string()),
+            Some(1) => Ok(None),
+            _ => Err(format!(
+                "reading import provenance: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
+    };
+    let Some(repository) = optional(&["config", "--get", "remote.origin.url"])? else {
+        return Ok(None);
+    };
+    let branch =
+        optional(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])?.and_then(|reference| {
+            reference
+                .strip_prefix("refs/remotes/origin/")
+                .map(str::to_string)
+        });
+    Ok(source_metadata(name, &repository, branch))
+}
+
+fn advertised_default_branch(t: &GitTransport, repository: &str) -> Result<Option<String>, String> {
+    let output = t.git_capture(&["ls-remote", "--symref", "--", repository, "HEAD"], None)?;
+    Ok(output.lines().find_map(|line| {
+        let (reference, name) = line.strip_prefix("ref: ")?.split_once('\t')?;
+        (name == "HEAD")
+            .then(|| reference.strip_prefix("refs/heads/").map(str::to_string))
+            .flatten()
+    }))
+}
 
 pub fn default_branch(t: &GitTransport, repository: &str) -> Result<String, String> {
-    let output = t.git_capture(&["ls-remote", "--symref", "--", repository, "HEAD"], None)?;
-    output
-        .lines()
-        .find_map(|line| {
-            let (reference, name) = line.strip_prefix("ref: ")?.split_once('\t')?;
-            (name == "HEAD")
-                .then(|| reference.strip_prefix("refs/heads/").map(str::to_string))
-                .flatten()
-        })
+    advertised_default_branch(t, repository)?
         .ok_or_else(|| format!("repository {repository:?} did not advertise a default branch"))
 }
 
@@ -27,13 +126,81 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
     Ok(commit.to_string())
 }
 
-pub fn import_source(
+/// Snapshot a checkout without changing its index, object database, or refs.
+fn import_worktree(client: &GitTransport, path: &std::path::Path) -> Result<Oid, String> {
+    let source =
+        GitTransport::discover(path).map_err(|_| "local imports require a Git checkout root")?;
+    if source
+        .work_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        != path
+    {
+        return Err("local imports require a Git checkout root, not a subdirectory".into());
+    }
+    let head = oid(
+        source
+            .git_capture(&["rev-parse", "--verify", "HEAD^{commit}"], None)?
+            .trim(),
+        "import HEAD",
+    )?;
+    import_local_commit(path, client.work_dir(), &head)?;
+    let objects = client.git_capture(
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        None,
+    )?;
+    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let snapshot = |args: &[&str]| -> Result<String, String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("GIT_INDEX_FILE", temp.path().join("index"))
+            .env("GIT_OBJECT_DIRECTORY", objects.trim())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "snapshotting checkout: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().into())
+            .map_err(|e| e.to_string())
+    };
+    // Seed from HEAD so tracked files remain included even if now ignored.
+    snapshot(&["read-tree", head.as_str()])?;
+    snapshot(&["add", "--all", "--", "."])?;
+    let tree = oid(&snapshot(&["write-tree"])?, "import tree")?;
+    let mut store = open_store(client)?;
+    let mut commit = store.read_commit(&head)?;
+    if commit.tree == tree {
+        return Ok(head);
+    }
+    commit.tree = tree;
+    commit.parents = vec![head];
+    commit.extra_headers.clear();
+    commit.message = b"Import working tree\n".to_vec();
+    store.write_commit(&commit).map_err(String::from)
+}
+
+pub struct ImportedContent {
+    pub commit: Oid,
+    pub metadata: Option<(String, Vec<u8>)>,
+}
+
+/// Resolve the same import semantics for the launcher and interactive client.
+pub fn prepare_import(
     t: &GitTransport,
-    id: &str,
     name: &str,
     repository: &str,
     revision: Option<&str>,
-) -> Result<String, String> {
+) -> Result<ImportedContent, String> {
     paths::validate_source_tree_name(name)?;
     let parsed = if repository.starts_with("git+") || repository.starts_with("github:") {
         Some(validate_source(repository)?)
@@ -45,41 +212,110 @@ pub fn import_source(
         .map(|p| p.fetch_url())
         .unwrap_or_else(|| repository.to_string());
     validate_repository(&repository)?;
-    let reference = revision
-        .map(str::to_string)
-        .or_else(|| parsed.as_ref().and_then(|p| p.rev.clone()))
-        .map(Ok)
-        .unwrap_or_else(|| default_branch(t, &repository))?;
-    let commit = if let Ok(commit) = oid(&reference, "imported commit") {
-        GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
-        commit
+    let local = std::path::Path::new(&repository);
+    let (commit, metadata) = if local.exists() {
+        if !local.is_dir() {
+            return Err("local imports require a Git checkout root".into());
+        }
+        let source = local.canonicalize().map_err(|e| e.to_string())?;
+        let commit = if let Some(revision) = revision {
+            let resolved = crate::host_git::capture_required(
+                "git",
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{revision}^{{commit}}"),
+                ],
+                &source,
+            )?;
+            let commit = oid(&resolved, "local import")?;
+            import_local_commit(&source, t.work_dir(), &commit)?;
+            commit
+        } else {
+            import_worktree(t, &source)?
+        };
+        (commit, local_import_metadata(name, &source)?)
     } else {
-        oid(
-            &branch_snapshot(
-                t,
-                &repository,
-                reference.strip_prefix("refs/heads/").unwrap_or(&reference),
-            )?,
-            "imported commit",
-        )?
+        let default = advertised_default_branch(t, &repository)?;
+        let reference = revision
+            .map(str::to_string)
+            .or_else(|| parsed.as_ref().and_then(|p| p.rev.clone()))
+            .or_else(|| default.clone())
+            .ok_or_else(|| {
+                format!("repository {repository:?} did not advertise a default branch")
+            })?;
+        let commit = if let Ok(commit) = oid(&reference, "imported commit") {
+            GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
+            commit
+        } else {
+            oid(
+                &branch_snapshot(
+                    t,
+                    &repository,
+                    reference.strip_prefix("refs/heads/").unwrap_or(&reference),
+                )?,
+                "imported commit",
+            )?
+        };
+        (commit, source_metadata(name, &repository, default))
     };
     ensure_code_commit(t, &mut open_store(t)?, &commit)?;
+    Ok(ImportedContent { commit, metadata })
+}
+
+pub fn import_source(
+    t: &GitTransport,
+    id: &str,
+    name: &str,
+    repository: &str,
+    revision: Option<&str>,
+) -> Result<String, String> {
+    let ImportedContent { commit, metadata } = prepare_import(t, name, repository, revision)?;
+    let bytes = commit.encode_line();
     append_transition(
         t,
         id,
         &refs::head_ref(id)?,
-        "importing repository",
+        "importing content",
         |store, head| {
-            if Conversation::open(store, head)?.snapshot().exists(name)? {
+            let view = Conversation::open(store, head)?;
+            let snapshot = view.snapshot();
+            if snapshot.exists(name)? {
                 return Err(format!("path {name:?} already exists"));
             }
-            Ok(Step::MintMany(vec![Transition::reference(
-                name.to_string(),
-                Some(commit.clone()),
-            )]))
+            let mut files = vec![(name.to_string(), Some((Mode::Commit, bytes.clone())))];
+            if let Some((path, bytes)) = &metadata {
+                if snapshot.exists(path)? && snapshot.read(path)?.as_ref() != Some(bytes) {
+                    return Err(format!("import provenance {path:?} already exists with different content; choose another import path"));
+                }
+                files.push((path.clone(), Some((Mode::Blob, bytes.clone()))));
+            }
+            Ok(Step::MintMany(vec![
+                Transition::FilesApply { files },
+                Transition::MessageAppend {
+                    entry: system_entry(
+                        id,
+                        format!("import-{head}"),
+                        format!("Imported at {name}: {commit}"),
+                    ),
+                    payloads: Vec::new(),
+                },
+            ]))
         },
     )?;
     Ok(commit.to_string())
+}
+
+/// An explicit client choice, never read from conversation publication policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublicationDestination {
+    pub repository: String,
+    pub base_branch: String,
+}
+
+pub fn stack_directory(path: &str) -> &str {
+    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,105 +326,137 @@ pub struct PublicationTarget {
     pub branch: String,
     pub base_branch: String,
     pub base_commit: Option<String>,
-    pub parent: Option<String>,
-    pub base_url: Option<BaseUrl>,
     pub remote_head: Option<String>,
-    pub diagnostic: Option<String>,
+    pub base_import: Option<String>,
 }
 
-pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTarget>, String> {
+/// Capture exactly the gitlink named by the client, independent of sibling order.
+pub fn publication_target(
+    t: &GitTransport,
+    id: &str,
+    source: &str,
+) -> Result<PublicationTarget, String> {
     let store = open_store(t)?;
     let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
     let view = Conversation::open(&store, &head)?;
-    let mut targets = Vec::new();
-    for name in view.source_tree_names()? {
-        if !is_boundary(name.rsplit('/').next().unwrap()) {
-            continue;
-        }
-        let base_url = view.base_url(&name)?;
-        let mut diagnostic = None;
-        let (repository, mut base_branch) = match &base_url {
-            Some(base) => (base.repository.clone(), base.branch.clone()),
-            None => {
-                diagnostic =
-                    Some("add a valid .base-url beside this entry before publishing".into());
-                (String::new(), String::new())
-            }
-        };
-        let parent = view
-            .previous_reference(&name)?
-            .map(|(path, _)| path)
-            .filter(|path| path.rsplit('/').next() != Some("00-base"));
-        if let Some(parent) = &parent {
-            base_branch = parent.clone();
-        }
-        let base_commit = if let Some(parent) = &parent {
-            view.source_tree(parent)?
-                .map(|entry| entry.commit.to_string())
-        } else if diagnostic.is_none() {
-            match branch_snapshot(t, &repository, &base_branch) {
-                Ok(commit) => Some(commit),
-                Err(error) => {
-                    diagnostic = Some(error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let remote_head = if diagnostic.is_none() {
-            match GitStore::open(t.work_dir(), Some(&repository))
-                .and_then(|remote| remote.read_ref(&format!("refs/heads/{name}")))
-            {
-                Ok(head) => head.map(|oid| oid.to_string()),
-                Err(error) => {
-                    diagnostic = Some(error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        targets.push(PublicationTarget {
-            head: view
-                .source_tree(&name)?
-                .ok_or("entry disappeared")?
-                .commit
-                .to_string(),
-            branch: name.clone(),
-            source_tree: name,
-            repository,
-            base_branch,
-            parent,
-            base_url,
-            base_commit,
-            remote_head,
-            diagnostic,
-        });
-    }
-    Ok(targets)
+    let entry = view
+        .source_tree(source)?
+        .ok_or_else(|| format!("no source-tree gitlink at {source:?}"))?;
+    Ok(PublicationTarget {
+        source_tree: source.into(),
+        head: entry.commit.to_string(),
+        repository: String::new(),
+        branch: source.into(),
+        base_branch: String::new(),
+        base_commit: None,
+        remote_head: None,
+        base_import: None,
+    })
 }
 
-pub fn publication_order(plan: &[PublicationTarget]) -> Result<Vec<String>, String> {
-    let mut destinations = HashSet::new();
-    let mut names = BTreeSet::new();
-    for target in plan {
-        if let Some(error) = &target.diagnostic {
-            return Err(error.clone());
+/// A hint only when the oldest sibling exactly matches an imported gitlink.
+/// Multiple origins remain ambiguous; callers present the choice to the user.
+pub fn publication_provenance(
+    t: &GitTransport,
+    id: &str,
+    source: &str,
+) -> Result<Option<String>, String> {
+    let store = open_store(t)?;
+    let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+    let view = Conversation::open(&store, &head)?;
+    let names = view.source_tree_names()?;
+    let Some(first) = names
+        .iter()
+        .find(|name| stack_directory(name) == stack_directory(source))
+    else {
+        return Ok(None);
+    };
+    let base = view.source_tree(first)?.ok_or("entry disappeared")?.commit;
+    let snapshot = conversation_protocol::v3::tree::Snapshot::new(
+        &store,
+        store.read_commit(&head).map_err(String::from)?.tree,
+    );
+    let mut choices = Vec::new();
+    for name in names {
+        if view
+            .source_tree(&name)?
+            .is_none_or(|entry| entry.commit != base)
+        {
+            continue;
         }
-        validate_repository(&target.repository)?;
-        conversation_protocol::v3::source_trees::validate_branch(&target.branch)?;
-        if !destinations.insert((
-            normalize_repository_identity(&target.repository)?,
-            &target.branch,
-        )) {
-            return Err(format!("duplicate publication branch {:?}", target.branch));
+        let Some(bytes) = snapshot.read(&format!("{name}.source.json"))? else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(repository) = value["repository"].as_str() else {
+            continue;
+        };
+        if validate_repository(repository).is_err() {
+            continue;
         }
-        if !names.insert(target.source_tree.clone()) {
-            return Err(format!("duplicate entry {:?}", target.source_tree));
+        let choice = repository.to_string();
+        if !choices.contains(&choice) {
+            choices.push(choice);
         }
     }
-    Ok(names.into_iter().collect())
+    Ok((choices.len() == 1).then(|| choices.remove(0)))
+}
+
+/// Resolve one explicit client command before asking for confirmation.
+pub fn prepare_publication(
+    t: &GitTransport,
+    id: &str,
+    source: &str,
+    base_branch: Option<&str>,
+    repository: Option<&str>,
+) -> Result<PublicationTarget, String> {
+    let mut target = publication_target(t, id, source)?;
+    let repository = match repository {
+        Some(repository) => repository.to_owned(),
+        None => publication_provenance(t, id, source)?
+            .ok_or("no unambiguous import repository; supply the remote URL in the command")?,
+    };
+    if !repository.contains(':') && !repository.starts_with('/') {
+        return Err("remote must be a repository URL or absolute path, not a local remote name such as origin".into());
+    }
+    let destination = PublicationDestination {
+        repository,
+        base_branch: base_branch.unwrap_or("").into(),
+    };
+    resolve_publication_target(t, &mut target, &destination, base_branch.is_none())?;
+    Ok(target)
+}
+
+/// Freeze remote state for an explicitly supplied destination before confirmation.
+pub fn resolve_publication_target(
+    t: &GitTransport,
+    target: &mut PublicationTarget,
+    destination: &PublicationDestination,
+    branch_only: bool,
+) -> Result<(), String> {
+    crate::reject_publish_caos(t, &oid(&target.head, "publication head")?)?;
+    validate_repository(&destination.repository)?;
+    conversation_protocol::v3::source_trees::validate_branch(&target.branch)?;
+    target.repository = destination.repository.clone();
+    target.base_branch = destination.base_branch.clone();
+    if !branch_only {
+        conversation_protocol::v3::source_trees::validate_branch(&destination.base_branch)?;
+        if target.branch == target.base_branch {
+            return Err("PR branch and base branch must differ".into());
+        }
+        let base = branch_snapshot(t, &target.repository, &target.base_branch)?;
+        crate::host_git::validate_pr_source_tree(&base, &target.head, t.work_dir())?;
+        target.base_import =
+            (!crate::host_git::pr_base_is_ancestor(&base, &target.head, t.work_dir())?)
+                .then(|| format!("imports/pr-base-{base}/base"));
+        target.base_commit = Some(base);
+    }
+    target.remote_head = GitStore::open(t.work_dir(), Some(&target.repository))?
+        .read_ref(&format!("refs/heads/{}", target.branch))?
+        .map(|oid| oid.to_string());
+    Ok(())
 }
 
 pub fn publish_target(
@@ -200,28 +468,17 @@ pub fn publish_target(
     if target.base_commit.as_deref() != Some(base_commit) {
         return Err("PR base changed since the preview; review again".into());
     }
+    if !crate::host_git::pr_base_is_ancestor(base_commit, &target.head, t.work_dir())? {
+        return Err("source does not contain the PR base; run /pr again to import it and ask the agent to integrate it".into());
+    }
     let store = open_store(t)?;
     let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
     let view = Conversation::open(&store, &head)?;
     if view
         .source_tree(&target.source_tree)?
         .is_none_or(|entry| entry.commit.as_str() != target.head)
-        || view.base_url(&target.source_tree)? != target.base_url
-        || view
-            .previous_reference(&target.source_tree)?
-            .map(|(path, _)| path)
-            .filter(|path| path.rsplit('/').next() != Some("00-base"))
-            != target.parent
     {
         return Err("publication contents changed since the preview; review again".into());
-    }
-    if let Some(parent) = &target.parent {
-        if view
-            .source_tree(parent)?
-            .is_none_or(|entry| entry.commit.as_str() != base_commit)
-        {
-            return Err("preceding entry changed since the preview; review again".into());
-        }
     }
     let remote = GitStore::open(t.work_dir(), Some(&target.repository))?;
     if remote
@@ -236,6 +493,75 @@ pub fn publish_target(
         id,
         Some(&target.source_tree),
         Some(&target.head),
+        &target.repository,
         Some(target),
     )
+}
+
+/// Push the exact previewed branch without requiring a PR base.
+pub fn publish_branch_target(
+    t: &GitTransport,
+    id: &str,
+    target: &PublicationTarget,
+) -> Result<PublishedBranch, String> {
+    publish_source_tree_branch_inner(
+        t,
+        id,
+        Some(&target.source_tree),
+        Some(&target.head),
+        &target.repository,
+        Some(target),
+    )
+}
+
+/// Import the exact confirmed PR base before requesting agent work. Retrying
+/// reuses an identical import and never overwrites existing conversation content.
+pub fn import_publication_base(
+    t: &GitTransport,
+    id: &str,
+    target: &PublicationTarget,
+) -> Result<String, String> {
+    let path = target
+        .base_import
+        .as_deref()
+        .ok_or("PR base is already incorporated")?;
+    let base = target
+        .base_commit
+        .as_deref()
+        .ok_or("PR preview has no base")?;
+    if publication_target(t, id, &target.source_tree)?.head != target.head {
+        return Err("source changed since the preview; run /pr again".into());
+    }
+    if branch_snapshot(t, &target.repository, &target.base_branch)? != base {
+        return Err("PR base changed since the preview; run /pr again".into());
+    }
+    let load = conversation_load(t, id)?.ok_or("conversation disappeared")?;
+    match load.source_trees.iter().find(|entry| entry.name == path) {
+        Some(entry) if entry.head == base => {}
+        Some(_) => {
+            return Err(format!(
+                "import path {path:?} already contains a different commit"
+            ))
+        }
+        None => {
+            import_source(t, id, path, &target.repository, Some(base))?;
+        }
+    }
+    Ok(format!(
+        "Prepare {:?} for a PR against branch {:?} in {}. The base commit {} is imported at {:?}. \
+         Integrate that base into {:?}, preserving existing changes and other snapshots. \
+         First check whether this would publish unrelated inherited changes; if so, explain the scope and ask before proceeding. \
+         Merging upstream preserves existing branch changes; transplanting only the requested edit onto a new base is a separate operation. \
+         Resolve any conflicts and clear their ledger entries; saving removes empty merge metadata. Run relevant tests. Do not publish. \
+         When finished, summarize the changes and suggest /pr {} {} {} for review.",
+        target.source_tree,
+        target.base_branch,
+        target.repository,
+        base,
+        path,
+        target.source_tree,
+        shell_words::quote(&target.source_tree),
+        shell_words::quote(&target.base_branch),
+        shell_words::quote(&target.repository),
+    ))
 }
