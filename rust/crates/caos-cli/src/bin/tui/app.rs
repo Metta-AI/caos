@@ -2242,7 +2242,7 @@ impl App {
                 .checkout_selected_source_tree(&source_tree)
                 .and_then(|checkout| {
                     let (commit, base) = commit_working_tree(arguments, &source_tree, &checkout)?;
-                    super::launcher::import_checkout_commit(
+                    super::launcher::import_local_commit(
                         &checkout,
                         &self.repo_dir,
                         &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
