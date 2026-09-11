@@ -56,7 +56,8 @@ pub const LLM_CALL_ARG: &str = "llm-call";
 const AUTO_NAME_PREFIX: &str = "talk-";
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
-const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git source tree. Use the \
+const DEFAULT_SYSTEM: &str =
+    "You are a coding agent operating on a conversation filesystem. Use the \
     available tools for file access, builds, tests, and edits. Keep responses concise.";
 
 #[cfg(test)]
@@ -3596,7 +3597,8 @@ mod tests {
     }
 
     #[test]
-    fn repository_import_adds_one_gitlink_and_preserves_existing_content() {
+    fn imports_preserve_disk_contents_git_revisions_and_provenance() {
+        use conversation_protocol::v3::Mode;
         let (root, transport, base) = fixture("attach-host");
         let (other_root, other, other_base) = fixture("attach-other");
         let other_head = commit_file(&other, &other_base, "other repository\n", "other");
@@ -3610,20 +3612,34 @@ mod tests {
         );
         create_idle_conversation(&transport, "attached", &base);
         let repository = other_root.join("origin.git").to_str().unwrap().to_string();
-        source_trees::import_source(&transport, "attached", "api", &repository, None).unwrap();
-        let local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
+        source_trees::import_source(&transport, "attached", "api", &repository, Some("main"))
+            .unwrap();
+        let _local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
         std::fs::write(other.work_dir().join("source_tree"), "uncommitted work\n").unwrap();
-        assert_eq!(
-            source_trees::import_source(
-                &transport,
-                "attached",
-                "local",
-                other.work_dir().to_str().unwrap(),
-                None
-            )
-            .unwrap(),
-            local_head
+        std::fs::write(other.work_dir().join(".git/info/exclude"), "local-only\n").unwrap();
+        std::fs::write(other.work_dir().join("local-only"), "not imported").unwrap();
+        let disk_tree = source_trees::import_source(
+            &transport,
+            "attached",
+            "local",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let store = open_store(&transport).unwrap();
+        let disk = conversation_protocol::v3::tree::Snapshot::new(
+            &store,
+            oid(&disk_tree, "disk").unwrap(),
         );
+        assert_eq!(
+            disk.read("source_tree").unwrap().unwrap(),
+            b"uncommitted work\n"
+        );
+        assert!(disk
+            .list("")
+            .unwrap()
+            .iter()
+            .all(|entry| entry.name != ".git"));
         assert_eq!(
             source_trees::import_source(
                 &transport,
@@ -3638,6 +3654,159 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(other.work_dir().join("source_tree")).unwrap(),
             "uncommitted work\n"
+        );
+        // Arbitrary folders, files and symlinks do not need a Git repository.
+        let plain = other_root.join("plain folder");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join(".gitignore"), "ignored\n").unwrap();
+        std::fs::write(plain.join("ignored"), "excluded").unwrap();
+        std::fs::write(plain.join("note.txt"), "fresh untracked notes\n").unwrap();
+        std::os::unix::fs::symlink("note.txt", plain.join("link")).unwrap();
+        let tree = source_trees::import_source(
+            &transport,
+            "attached",
+            "notes",
+            plain.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let notes =
+            conversation_protocol::v3::tree::Snapshot::new(&store, oid(&tree, "notes").unwrap());
+        assert_eq!(
+            notes.read("note.txt").unwrap().unwrap(),
+            b"fresh untracked notes\n"
+        );
+        assert!(!notes.exists("ignored").unwrap());
+        assert_eq!(notes.entry("link").unwrap().unwrap().mode, Mode::Link);
+        source_trees::import_source(
+            &transport,
+            "attached",
+            "note.txt",
+            plain.join("note.txt").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let head = oid(
+            &conversation_head(&transport, "attached").unwrap().unwrap(),
+            "notes",
+        )
+        .unwrap();
+        assert_eq!(
+            Conversation::open(&store, &head)
+                .unwrap()
+                .snapshot()
+                .read("note.txt")
+                .unwrap()
+                .unwrap(),
+            b"fresh untracked notes\n"
+        );
+        // Local-only origins are not portable conversation metadata.
+        assert!(
+            source_trees::local_import_metadata("imports/local/base", other.work_dir())
+                .unwrap()
+                .is_none()
+        );
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/team/project.git",
+            ],
+        );
+        git(
+            other.work_dir(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        // This URL cannot be fetched: provenance discovery must stay offline.
+        source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/base",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let store = open_store(&transport).unwrap();
+        let imported_head = oid(
+            &conversation_head(&transport, "attached").unwrap().unwrap(),
+            "import",
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &imported_head).unwrap();
+        let metadata = view
+            .snapshot()
+            .read("imports/project/.source.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&metadata).unwrap(),
+            json!({
+                "repository": "https://example.invalid/team/project.git", "default_branch": "main"
+            })
+        );
+        assert_eq!(
+            view.snapshot()
+                .entry("imports/project/base")
+                .unwrap()
+                .unwrap()
+                .oid
+                .to_string(),
+            disk_tree
+        );
+        // Conflicting provenance cannot overwrite the preserved import.
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/other.git",
+            ],
+        );
+        assert!(source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/other",
+            other.work_dir().to_str().unwrap(),
+            None
+        )
+        .unwrap_err()
+        .contains("provenance"));
+        assert_eq!(
+            conversation_head(&transport, "attached").unwrap().unwrap(),
+            imported_head.to_string()
+        );
+        git(
+            other.work_dir(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let (_, bytes) =
+            source_trees::local_import_metadata("imports/other/base", other.work_dir())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"repository": "https://example.invalid/other.git"})
+        );
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://user:secret@example.invalid/repo.git",
+            ],
+        );
+        assert!(
+            source_trees::local_import_metadata("imports/private/base", other.work_dir())
+                .unwrap()
+                .is_none()
         );
         let before = conversation_head(&transport, "attached").unwrap().unwrap();
         assert!(source_trees::import_source(

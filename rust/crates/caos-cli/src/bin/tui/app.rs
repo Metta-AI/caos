@@ -917,8 +917,8 @@ const COMMANDS: [Command; 11] = [
     },
     Command {
         name: "/import",
-        usage: "/import <path> <repository> [revision]",
-        description: "import a repository commit at a conversation path",
+        usage: "/import <path> <source> [revision]",
+        description: "import local files or a repository revision at a conversation path",
         action: AppAction::Import,
         takes_argument: true,
     },
@@ -2556,21 +2556,28 @@ impl App {
     }
 
     fn run_import(&mut self, arguments: &str) {
-        let parts: Vec<_> = arguments.split_whitespace().collect();
+        let parts = match shell_words::split(arguments) {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.selected_mut()
+                    .show_command_error(format!("invalid import arguments: {error}"));
+                return;
+            }
+        };
         if !(2..=3).contains(&parts.len()) {
             self.selected_mut()
-                .show_command_error("usage: /import <path> <repository> [revision]");
+                .show_command_error("usage: /import <path> <source> [revision]");
             return;
         }
         let name = parts[0].to_string();
-        let local = super::launcher::local_path(&self.repo_dir, parts[1]);
-        let repository = if local.is_dir() {
+        let local = super::launcher::local_path(&self.repo_dir, &parts[1]);
+        let repository = if std::fs::symlink_metadata(&local).is_ok() {
             local.to_string_lossy().into_owned()
         } else {
             parts[1].to_string()
         };
         let revision = parts.get(2).map(|value| value.to_string());
-        self.start_import("importing repository", move |transport, conversation| {
+        self.start_import("importing content", move |transport, conversation| {
             let head = caos_cli::source_trees::import_source(
                 transport,
                 conversation,

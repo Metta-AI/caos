@@ -77,35 +77,39 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     if let Some(name) = &args.import {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
         if let Some(checkout) = &checkout {
-            let rev = args.turn.base.as_deref().unwrap_or("HEAD");
-            let commit = git(
-                checkout,
-                &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
-            )?;
-            let oid = Oid::parse(&commit, "initial checkout")?;
-            import_local_commit(checkout, &client, &oid)?;
-            seed.put_oid(name, conversation_protocol::v3::Mode::Commit, oid);
-            let repository = git(checkout, &["remote", "get-url", "origin"])
-                .ok()
-                .filter(|url| {
-                    conversation_protocol::v3::source_trees::validate_repository(url).is_ok()
-                });
-            let supplied = format!(
-                "Local Git import (repository and revision are provenance, not worker paths): {}",
-                serde_json::json!({
-                    "path": name,
-                    "commit": commit,
-                    "revision": rev,
-                    "origin": repository,
-                })
-            );
-            args.turn.system = Some(match args.turn.system.take() {
-                Some(system) => format!("{system}\n\n{supplied}"),
-                None => supplied,
-            });
-            args.turn.base = Some(commit.clone());
-            if args.from_commit.is_some() {
-                args.from_commit = Some(commit);
+            let transport = GitTransport::discover(&client)?;
+            let (mode, object) = if let Some(rev) = &args.turn.base {
+                let commit = git(
+                    checkout,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{rev}^{{commit}}"),
+                    ],
+                )?;
+                let oid = Oid::parse(&commit, "initial checkout")?;
+                import_local_commit(checkout, &client, &oid)?;
+                (conversation_protocol::v3::Mode::Commit, oid)
+            } else {
+                caos_cli::source_trees::import_local_path(&transport, checkout)?
+            };
+            seed.put_oid(name, mode, object.clone());
+            if let Some((path, bytes)) =
+                caos_cli::source_trees::local_import_metadata(name, checkout)?
+            {
+                if path == *name {
+                    return Err(
+                        "import path conflicts with its .source.json provenance file".into(),
+                    );
+                }
+                seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
+            }
+            if mode == conversation_protocol::v3::Mode::Commit {
+                args.turn.base = Some(object.to_string());
+                if args.from_commit.is_some() {
+                    args.from_commit = Some(object.to_string());
+                }
             }
         } else {
             return Err("--import requires a Git checkout".into());

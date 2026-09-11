@@ -85,10 +85,13 @@ the source's background work.
 The harness supplies source-tree organization and publication conventions to
 every model call, including subagents. Agents preserve bases, organize review
 boundaries, and integrate delegated changes using ordinary file operations;
-users specify the desired work and review structure. A launch-time `--import`
-supplies the commit, path, selected revision, and available credential-free origin.
-Publication destinations are chosen from that context or existing metadata,
-with clarification only when ambiguous.
+users specify the desired work and review structure. Imports conventionally live
+at `imports/<repo>/base`, with portable provenance in a sibling `.source.json`.
+Local paths import ordinary files or folders from disk; explicit Git revisions
+import gitlinks. The agent preserves imports. To build a PR stack, it copies an
+imported gitlink to `<feature>/00-base` and `<feature>/dirty` before editing.
+When publishing, it uses recorded repository and default-branch details to write `.base-url`, unless the user chose another
+destination. Missing or ambiguous details require clarification only then.
 
 Commands start at the conversation root. Memories, skills, notes, and source
 trees share one path space. A commit-valued entry appears as a directory whose
@@ -105,6 +108,9 @@ Use ordinary filesystem operations to organize content:
 
 ```sh
 mkdir -p feature
+cp -a imports/caos/base feature/00-base
+cp -a imports/caos/base feature/dirty
+# After completing the first change:
 mv feature/dirty feature/01-parser
 cp -a feature/01-parser feature/dirty
 ```
@@ -146,8 +152,8 @@ directories and lists each commit-valued entry it reaches, stopping at that
 entry. Nested gitlinks remain traversable by file tools but are not separate
 TUI source-tree targets.
 
-A single reference such as `paintbot` is enough for simple work. When useful,
-move it into a feature directory and follow this convention:
+A single reference is enough for simple work. For reviewable changes, copy the
+import into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
@@ -214,9 +220,9 @@ The invocation names the workers with typed image arguments, for example
 Paths resolve in the harness, not an attached source tree. Hash and Git-locator
 image arguments also work; no root DEPS entry is required.
 
-Add `--import feature/dirty` to load the committed HEAD of the launching checkout
-at that exact path (or choose a commit with `--base`). A system message states what
-was provided. Local uncommitted edits are not included. Cloud
+Add `--import imports/caos/base` to snapshot the launching checkout
+at that exact path. Add `--base HEAD` (or another revision) to import a Git
+commit instead. Cloud
 sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
@@ -265,12 +271,23 @@ the proposed destination, which appears in the preview.
 - `Ctrl+O`: browse conversation files and source-tree diffs. Highlighting an
   entry previews it; arrows navigate folders and gitlinks. The whole browser
   is read-only, including `.caos`.
-- `/import <path> <repository> [revision]`: fetch a commit from a local repository
-  or remote URL and add a gitlink at that exact, unused conversation path. Local
-  repositories default to committed `HEAD`, including unpushed commits but not
-  uncommitted files. Remote URLs default to the remote's default branch. An
-  explicit revision selects a different commit; importing does not choose a
-  publishing destination or associate a local checkout.
+- `/import <path> <source> [revision]`: import at an unused conversation path.
+  A local file becomes a file; a local directory becomes an ordinary folder,
+  using the current disk contents, including uncommitted and untracked files.
+  Directory imports honor `.gitignore` and repository-local excludes, and omit
+  `.git`; symlinks and executable bits are preserved. The source need not be a Git repository. No source index,
+  branch, or file is changed. Quote paths containing spaces.
+  For example: `/import imports/notes "/home/ubuntu/my notes"`.
+  A remote URL, or a local repository with an explicit revision, imports a commit
+  as a gitlink instead. Remote URLs without a revision use their default branch.
+  For PR work with ancestry, use `/import imports/caos/base /path/to/caos HEAD`.
+  A sibling `.source.json` records a portable `repository` URL and an optional
+  `default_branch` when importing from Git. Local discovery reads `origin` and
+  `origin/HEAD` without network access; remote imports read the advertised default.
+  Local paths and credential-bearing URLs are omitted. Existing differing
+  provenance is rejected, not overwritten. This ordinary file informs the agent;
+  publication reads only `.base-url`. Importing does not choose a publishing
+  destination or associate a local checkout.
 - `Ctrl+L`: check the selected code snapshot out in its remembered local directory.
   If none is selected, prompt for `/checkout <directory>`.
 - `/checkout <directory>`: choose an existing clean Git checkout or an empty/new
