@@ -157,7 +157,7 @@ see `design/flake-images.md`.
 Everything — an input file, a worker image, a result — is a git object named by
 its hash, so identical work is deduplicated and memoized.
 
-## server
+## Server
 
 One daemon (`crates/server`), image `caos-server`, serving everything over a
 single URL. It backs onto a git repository it **owns** (mounted at `/git`); in
