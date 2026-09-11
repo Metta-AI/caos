@@ -245,14 +245,22 @@ fn tools_configuration(
     id: &str,
     store: &[caos::ClientSecret],
 ) -> Result<String, String> {
-    // FIVE SECONDS, IN FRONT OF EVERYTHING BELOW. Resolving the step and
+    // REACHABLE FIRST, IN FRONT OF EVERYTHING BELOW. Resolving the step and
     // preparing a request both talk to the caos server, and in a cloud session
     // that server is reached through a tunnel. A tunnel whose far end is gone
     // accepts and swallows, so those waits are unbounded -- and this is the
     // path a HOOK takes. A `UserPromptSubmit` hook that never returns takes the
     // session's prompt with it, which presents as Claude Code hanging on the
     // first thing you type, with nothing anywhere saying why.
-    t.ensure_server_reachable()?;
+    //
+    // But a single 5s probe LOSES A RACE it must not lose. The SessionStart
+    // hook brings the tunnel up, and the first prompt can fire before it is
+    // proven -- and then this one probe fails, the whole conversation is never
+    // created, and every tool call of that first turn is refused with "no
+    // conversation to record into" while the tools list perfectly well (the
+    // serve resolver retries; this did not). So it retries, still bounded:
+    // enough to outlast tunnel bringup, never enough to hang the prompt.
+    wait_server_reachable(t)?;
     let mut config = vec![format!("--conversation={id}")];
     let merge_refs = crate::snapshot_merge_refs(t)?;
     if !merge_refs.is_empty() {
@@ -260,6 +268,31 @@ fn tools_configuration(
     }
     let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
+}
+
+/// Wait, bounded, for the caos server to answer -- the hook's counterpart to
+/// the serve resolver's retry loop.
+///
+/// The budget is a compromise between the two ways this hurts. Too short and
+/// the first prompt races tunnel bringup and loses (the bug this exists for);
+/// too long and a genuinely-down server hangs the prompt, since a
+/// `UserPromptSubmit` hook blocks the turn until it returns. Each attempt is
+/// `ensure_server_reachable`'s own 5s round trip, so `HOOK_REACH_ATTEMPTS`
+/// probes plus the interstitial sleeps is the ceiling -- ~35s, which outlasts
+/// tunnel bringup and stays well under Claude Code's hook timeout. The common
+/// case returns on the first probe.
+const HOOK_REACH_ATTEMPTS: u32 = 6;
+const HOOK_REACH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
+    let mut last = t.ensure_server_reachable();
+    let mut attempt = 1;
+    while last.is_err() && attempt < HOOK_REACH_ATTEMPTS {
+        std::thread::sleep(HOOK_REACH_INTERVAL);
+        last = t.ensure_server_reachable();
+        attempt += 1;
+    }
+    last
 }
 
 /// The observation the step recorded, read back from the conversation.
