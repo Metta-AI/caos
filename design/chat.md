@@ -93,7 +93,9 @@ For a user message and an agent turn:
 4. The worker records that it has started, creating another `C`.
 5. Model responses, tool operations, and turn completion create further `C`
    commits. Dispatched tools such as bash record start and completion separately;
-   inline tools such as read and edit record completion without a start commit.
+   inline tools such as read, edit, log, show, and diff record completion without
+   a start commit. History tools use Git against the named source commit; revision
+   names resolve only from the supplied ref snapshot.
 
 Conversation parent edges connect conversation commits; source-tree ancestry
 is carried by the `ST` commits referenced in their trees. Imports and saves
