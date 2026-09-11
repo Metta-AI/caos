@@ -25,11 +25,11 @@ Caos runs well-defined binaries with well-defined inputs and well-defined enviro
 
 # What
 
-* Your code is already in git. You already know docker
-* Caos provides the glue to use git as a distributed file system and docker containers as functions. We cache the results in redis
-* Workers (containers) receive their inputs as git objects, and lazily load only as much as they need. They stage their results into git. None of this is committed or clogs your main git repo
-* Workers can call other workers. They can also define other workers in their git return values (similar to functional programming)
-* Once we've run a worker with an input, we cache the mapping to the output value and reuse it for future requests
+* Your code is already in git. You already know docker.
+* Caos provides the glue to use git as a distributed file system and docker containers as functions. We cache the results in redis.
+* Workers (containers) receive their inputs as git objects, and lazily load only as much as they need. They stage their results into git. None of this is committed or clogs your main git repo.
+* Workers can call other workers. They can also define other workers in their git return values (similar to functional programming).
+* Once we've run a worker with an input, we cache the mapping to the output value and reuse it for future requests.
 
 
 | Crate | Binaries / image | What it is |
