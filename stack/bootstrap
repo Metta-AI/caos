@@ -101,6 +101,9 @@ echo "stack/bootstrap: inputs $inputs" >&2
 # publish runs from this tree. Everything else about the placement (which redis,
 # which registry, which engine, which netns) is the caller's and reaches serve
 # through the environment we inherit.
+# Seeded results include binaries and shared crates outside the sentinel key.
+# A new build must not reuse a previous build's compiler or worker images.
+export CAOS_CACHE_NAMESPACE="${CAOS_CACHE_NAMESPACE:-${inputs##*/}}"
 export CAOS_STACK_BIN="$inputs/bin"
 export CAOS_STACK_PUBLISH=yes
 export CAOS_STACK_PUBLISH_SCRIPT="$tree/stack/build-builtins.sh"
