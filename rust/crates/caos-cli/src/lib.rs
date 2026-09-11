@@ -7,7 +7,7 @@ pub mod source_trees;
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 #[cfg(test)]
 use std::process::Command;
@@ -36,11 +36,13 @@ use conversation_protocol::v3::records::{
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    reconcile, validate_spine, GitStore, Kind, ObjectStore, Oid, RefUpdate, Signature,
+    reconcile, validate_spine, GitStore, ObjectStore, Oid, RefUpdate, Signature,
 };
 
+#[cfg(test)]
+use conversation_protocol::v3::Kind;
+
 const MAX_APPEND_ATTEMPTS: usize = 32;
-const MAX_REQUEST_SPINE_WALK: usize = 4096;
 const MAX_FETCH_REFS: usize = 200;
 pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
@@ -1145,7 +1147,7 @@ pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
         let Some(request) = view.active_turn()? else {
-            let newest = newest_request(store, &view)?;
+            let newest = view.latest_turn()?;
             if newest.is_some_and(|record| {
                 matches!(record.status, TurnStatus::Cancelling | TurnStatus::Idle)
             }) {
@@ -1195,55 +1197,18 @@ fn text_blocks(blocks: &[Block]) -> String {
     text.join("\n\n")
 }
 
-fn newest_request(
-    store: &GitStore,
-    conversation: &Conversation<'_>,
-) -> Result<Option<TurnRecord>, String> {
-    for ordinal in (0..conversation.transcript_len()?).rev() {
-        let (_, entry) = conversation
-            .transcript_entry(ordinal)?
-            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
-        if matches!(entry.role, Role::Assistant | Role::System) {
-            if let Some(request) = entry.request {
-                return conversation.turn(&request);
-            }
-        }
-    }
-    let requests = conversation
-        .turn_ids()?
-        .into_iter()
-        .map(|id| {
-            conversation
-                .turn(&id)?
-                .ok_or_else(|| format!("request {id} disappeared"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut current = conversation.commit().cloned();
-    for _ in 0..MAX_REQUEST_SPINE_WALK {
-        let Some(commit) = current else {
-            return Ok(None);
-        };
-        if let Some(record) = requests.iter().find(|record| record.request_head == commit) {
-            return Ok(Some(record.clone()));
-        }
-        if commit.as_str() == G3 {
-            return Ok(None);
-        }
-        current = store
-            .read_commit(&commit)
-            .map_err(String::from)?
-            .parents
-            .first()
-            .cloned();
-    }
-    Ok(None)
+fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSnapshot, String> {
+    snapshot_from(&Conversation::open(store, head)?, id, head)
 }
 
-fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSnapshot, String> {
-    let conversation = Conversation::open(store, head)?;
+fn snapshot_from(
+    conversation: &Conversation<'_>,
+    id: &str,
+    head: &Oid,
+) -> Result<ConversationSnapshot, String> {
     let active = conversation.active_turn()?;
     let newest = if active.is_none() {
-        newest_request(store, &conversation)?
+        conversation.latest_turn()?
     } else {
         None
     };
@@ -1261,7 +1226,7 @@ fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSna
         );
     let error = match record.and_then(|record| record.outcome.as_ref()) {
         Some(ProtocolTurnOutcome::Failed { error }) => {
-            transcript_text_at_path(&conversation, error.as_str())?
+            transcript_text_at_path(conversation, error.as_str())?
         }
         _ => None,
     };
@@ -1290,8 +1255,16 @@ fn transcript_text_at_path(
     Ok(Some(text_blocks(&entry.blocks)))
 }
 
+#[cfg(test)]
 fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String> {
-    let conversation = Conversation::open(store, head)?;
+    replay_from(store, head, &Conversation::open(store, head)?)
+}
+
+fn replay_from(
+    store: &GitStore,
+    head: &Oid,
+    conversation: &Conversation<'_>,
+) -> Result<ConversationReplay, String> {
     let transcript = conversation.transcript(0, conversation.transcript_len()?)?;
     let mut turns = Vec::new();
     let mut request_order = Vec::new();
@@ -1393,7 +1366,7 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
                 if let Some(tool) = conversation.tool(&request, round, call_id)? {
                     if tool.is_terminal() {
                         let (is_error, content) =
-                            protocol_tool_result(&conversation, tool.result.as_ref())?;
+                            protocol_tool_result(conversation, tool.result.as_ref())?;
                         activity.push(TurnEvent::ToolResult {
                             request: request.to_string(),
                             round,
@@ -1471,60 +1444,19 @@ fn source_tree_diff(
     })
 }
 
-fn publication_summaries(store: &GitStore, head: &Oid) -> Result<Vec<PublicationSummary>, String> {
-    let mut records: BTreeMap<String, PublicationRecord> = Conversation::open(store, head)?
-        .publications()?
+fn publication_summaries(
+    conversation: &Conversation<'_>,
+) -> Result<Vec<PublicationSummary>, String> {
+    Ok(conversation
+        .publications_by_creation()?
         .into_iter()
-        .map(|record| (record.id.clone(), record))
-        .collect();
-    let mut ordered = Vec::with_capacity(records.len());
-    let mut cursor = head.clone();
-    while cursor.as_str() != G3 && !records.is_empty() {
-        let info = store.read_commit(&cursor).map_err(String::from)?;
-        let parent = info
-            .parents
-            .first()
-            .cloned()
-            .ok_or_else(|| format!("conversation commit {cursor} has no parent"))?;
-        if Kind::parse_message(&info.message)? == Kind::PublicationPending {
-            let conversation = Conversation::open(store, &cursor)?;
-            let parent_ids = if parent.as_str() == G3 {
-                HashSet::new()
-            } else {
-                Conversation::open(store, &parent)?
-                    .publications()?
-                    .into_iter()
-                    .map(|record| record.id)
-                    .collect()
-            };
-            let introduced: Vec<String> = conversation
-                .publications()?
-                .into_iter()
-                .map(|record| record.id)
-                .filter(|id| !parent_ids.contains(id))
-                .collect();
-            if introduced.len() != 1 {
-                return Err(format!(
-                    "publication.pending commit {cursor} introduced {} records",
-                    introduced.len()
-                ));
-            }
-            let id = &introduced[0];
-            if let Some(record) = records.remove(id) {
-                ordered.push(PublicationSummary {
-                    id: record.id,
-                    source_tree: record.source_tree_name,
-                    planned_head: record.planned_head.to_string(),
-                    status: record.status,
-                });
-            }
-        }
-        cursor = parent;
-    }
-    if !records.is_empty() {
-        return Err("publication records have no publication.pending commit".to_string());
-    }
-    Ok(ordered)
+        .map(|record| PublicationSummary {
+            id: record.id,
+            source_tree: record.source_tree_name,
+            planned_head: record.planned_head.to_string(),
+            status: record.status,
+        })
+        .collect())
 }
 
 pub fn conversation_load(t: &GitTransport, id: &str) -> Result<Option<ConversationLoad>, String> {
@@ -1574,13 +1506,13 @@ fn load_at(
         source_trees.push(diff);
     }
     Ok(ConversationLoad {
-        snapshot: snapshot_at(store, id, head)?,
-        replay: replay_at(store, head)?,
+        snapshot: snapshot_from(&conversation, id, head)?,
+        replay: replay_from(store, head, &conversation)?,
         source_trees: {
             source_trees.reverse();
             source_trees
         },
-        publications: publication_summaries(store, head)?,
+        publications: publication_summaries(&conversation)?,
     })
 }
 
@@ -4465,7 +4397,7 @@ mod tests {
             Some(base.as_str())
         );
         assert_eq!(conversation.publications().unwrap().len(), 2);
-        let summaries = publication_summaries(&store, &second_head).unwrap();
+        let summaries = publication_summaries(&conversation).unwrap();
         assert_eq!(summaries[0].id, second.publication);
         assert_eq!(summaries[1].id, first.publication);
         std::fs::remove_dir_all(root).unwrap();
