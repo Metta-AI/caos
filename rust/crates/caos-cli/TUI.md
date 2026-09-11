@@ -165,10 +165,10 @@ Completed user and agent turns show branchable hashes in the transcript. Enter
 TUI. Enter `/title <new title>` to change the shared title without changing the
 conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
-client default. Enter `/update-tree <message>` to send an ordinary
-user turn whose commit also folds in your current working-tree changes — the
+client default. Enter `/update-tree <gitlink> <message>` to send an ordinary
+user turn whose commit also folds in edits in that gitlink's remembered checkout — the
 intended companion to `/checkout <gitlink> [directory]` (check out the head, edit files, then
-`/update-tree <message>` with the text you want in that turn). Activity entries
+`/update-tree <gitlink> <message>` with the text you want in that turn). Activity entries
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
@@ -296,7 +296,8 @@ conversation history. Opening and running conversations never overwrite a
 checkout. `/checkout <gitlink> [directory]` uses an explicit destination or
 reuses that gitlink's remembered local directory. The destination must be a clean Git checkout
 or an empty/new directory. The client imports the code objects and detaches HEAD
-at the selected commit. /update-tree commits local edits there and imports their
+at the named commit. `/update-tree <gitlink> <message>` commits local edits in
+that gitlink's remembered checkout and imports their
 closure into the client before submission. These commands never replace the
 internal harness.
 
