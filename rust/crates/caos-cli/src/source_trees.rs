@@ -127,83 +127,71 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
     Ok(commit.to_string())
 }
 
-fn import_local_path(client: &GitTransport, path: &std::path::Path) -> Result<(Mode, Oid), String> {
-    if !path.is_dir() || GitTransport::discover(path).is_err() {
-        return Err("local imports require a Git repository directory".into());
+/// Snapshot a checkout without changing its index, object database, or refs.
+fn import_worktree(client: &GitTransport, path: &std::path::Path) -> Result<Oid, String> {
+    let source =
+        GitTransport::discover(path).map_err(|_| "local imports require a Git checkout root")?;
+    if source
+        .work_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        != path
+    {
+        return Err("local imports require a Git checkout root, not a subdirectory".into());
     }
-    import_path(&mut open_store(client)?, path)
-}
-
-/// Snapshot disk content, independently of the source repository's index or HEAD.
-/// Git enumerates paths using its ignore rules; the index here is always empty.
-fn import_path(store: &mut GitStore, path: &std::path::Path) -> Result<(Mode, Oid), String> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
-    let meta =
-        std::fs::symlink_metadata(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    if meta.is_dir() {
-        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-        // Keep the real worktree root so ancestor ignore files retain their scope.
-        let source_repo = GitTransport::discover(path)?;
-        let git_dir = source_repo.git_capture(&["rev-parse", "--absolute-git-dir"], None)?;
+    let head = oid(
+        source
+            .git_capture(&["rev-parse", "--verify", "HEAD^{commit}"], None)?
+            .trim(),
+        "import HEAD",
+    )?;
+    import_local_commit(path, client.work_dir(), &head)?;
+    let objects = client.git_capture(
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+        None,
+    )?;
+    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let snapshot = |args: &[&str]| -> Result<String, String> {
         let output = std::process::Command::new("git")
-            .arg("--git-dir")
-            .arg(git_dir.trim())
-            .arg("--work-tree")
-            .arg(source_repo.work_dir())
-            .args(["ls-files", "--others", "--exclude-standard", "-z"])
-            .env("GIT_INDEX_FILE", temp.path().join("index"))
+            .args(args)
             .current_dir(path)
+            .env("GIT_INDEX_FILE", temp.path().join("index"))
+            .env("GIT_OBJECT_DIRECTORY", objects.trim())
             .output()
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(format!(
-                "listing import: {}",
+                "snapshotting checkout: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-        let mut tree = conversation_protocol::v3::tree::TreeBuilder::from(None);
-        for name in output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|name| !name.is_empty())
-        {
-            let name = std::str::from_utf8(name)
-                .map_err(|_| "import paths must be UTF-8")?
-                .trim_end_matches('/');
-            let (mode, oid) = import_path(store, &path.join(name))?;
-            tree.put_oid(name, mode, oid);
-        }
-        Ok((Mode::Tree, tree.build(store)?))
-    } else {
-        let (mode, bytes) = if meta.file_type().is_symlink() {
-            (
-                Mode::Link,
-                std::fs::read_link(path)
-                    .map_err(|e| e.to_string())?
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec(),
-            )
-        } else if meta.is_file() {
-            (
-                if meta.permissions().mode() & 0o111 != 0 {
-                    Mode::Executable
-                } else {
-                    Mode::Blob
-                },
-                std::fs::read(path).map_err(|e| e.to_string())?,
-            )
-        } else {
-            return Err(format!("cannot import special file {}", path.display()));
-        };
-        Ok((mode, store.write_blob(&bytes)?))
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().into())
+            .map_err(|e| e.to_string())
+    };
+    // Seed from HEAD so tracked files remain included even if now ignored.
+    snapshot(&["read-tree", head.as_str()])?;
+    snapshot(&["add", "--all", "--", "."])?;
+    let tree = oid(&snapshot(&["write-tree"])?, "import tree")?;
+    let mut store = open_store(client)?;
+    let mut commit = store.read_commit(&head)?;
+    if commit.tree == tree {
+        return Ok(head);
     }
+    commit.tree = tree;
+    commit.parents = vec![head];
+    commit.extra_headers.clear();
+    commit.message = b"Import working tree\n".to_vec();
+    store.write_commit(&commit).map_err(String::from)
 }
 
 pub struct ImportedContent {
-    pub mode: Mode,
-    pub object: Oid,
+    pub commit: Oid,
     pub metadata: Option<(String, Vec<u8>)>,
 }
 
@@ -226,30 +214,29 @@ pub fn prepare_import(
         .unwrap_or_else(|| repository.to_string());
     validate_repository(&repository)?;
     let local = std::path::Path::new(&repository);
-    let (mode, object, metadata) = if revision.is_none() && std::fs::symlink_metadata(local).is_ok()
-    {
-        let source = std::path::absolute(local).map_err(|e| e.to_string())?;
-        let (mode, object) = import_local_path(t, &source)?;
-        let metadata = local_import_metadata(name, &source)?;
-        (mode, object, metadata)
-    } else if local.is_dir() {
-        let source = std::path::Path::new(&repository)
-            .canonicalize()
-            .map_err(|e| e.to_string())?;
-        let revision = revision.unwrap_or("HEAD");
-        let resolved = crate::host_git::capture_required(
-            "git",
-            &[
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                &format!("{revision}^{{commit}}"),
-            ],
-            &source,
-        )?;
-        let commit = oid(&resolved, "local import")?;
-        import_local_commit(&source, t.work_dir(), &commit)?;
-        (Mode::Commit, commit, local_import_metadata(name, &source)?)
+    let (commit, metadata) = if local.exists() {
+        if !local.is_dir() {
+            return Err("local imports require a Git checkout root".into());
+        }
+        let source = local.canonicalize().map_err(|e| e.to_string())?;
+        let commit = if let Some(revision) = revision {
+            let resolved = crate::host_git::capture_required(
+                "git",
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{revision}^{{commit}}"),
+                ],
+                &source,
+            )?;
+            let commit = oid(&resolved, "local import")?;
+            import_local_commit(&source, t.work_dir(), &commit)?;
+            commit
+        } else {
+            import_worktree(t, &source)?
+        };
+        (commit, local_import_metadata(name, &source)?)
     } else {
         let default = advertised_default_branch(t, &repository)?;
         let reference = revision
@@ -272,20 +259,10 @@ pub fn prepare_import(
                 "imported commit",
             )?
         };
-        (
-            Mode::Commit,
-            commit,
-            source_metadata(name, &repository, default),
-        )
+        (commit, source_metadata(name, &repository, default))
     };
-    if mode == Mode::Commit {
-        ensure_code_commit(t, &mut open_store(t)?, &object)?;
-    }
-    Ok(ImportedContent {
-        mode,
-        object,
-        metadata,
-    })
+    ensure_code_commit(t, &mut open_store(t)?, &commit)?;
+    Ok(ImportedContent { commit, metadata })
 }
 
 pub fn import_source(
@@ -295,16 +272,8 @@ pub fn import_source(
     repository: &str,
     revision: Option<&str>,
 ) -> Result<String, String> {
-    let ImportedContent {
-        mode,
-        object,
-        metadata,
-    } = prepare_import(t, name, repository, revision)?;
-    let bytes = if matches!(mode, Mode::Commit | Mode::Tree) {
-        object.encode_line()
-    } else {
-        open_store(t)?.read_blob(&object)?
-    };
+    let ImportedContent { commit, metadata } = prepare_import(t, name, repository, revision)?;
+    let bytes = commit.encode_line();
     append_transition(
         t,
         id,
@@ -316,7 +285,7 @@ pub fn import_source(
             if snapshot.exists(name)? {
                 return Err(format!("path {name:?} already exists"));
             }
-            let mut files = vec![(name.to_string(), Some((mode, bytes.clone())))];
+            let mut files = vec![(name.to_string(), Some((Mode::Commit, bytes.clone())))];
             if let Some((path, bytes)) = &metadata {
                 if snapshot.exists(path)? && snapshot.read(path)?.as_ref() != Some(bytes) {
                     return Err(format!("import provenance {path:?} already exists with different content; choose another import path"));
@@ -326,7 +295,7 @@ pub fn import_source(
             Ok(Step::MintMany(vec![Transition::FilesApply { files }]))
         },
     )?;
-    Ok(object.to_string())
+    Ok(commit.to_string())
 }
 
 /// An explicit client choice, never read from conversation publication policy.
