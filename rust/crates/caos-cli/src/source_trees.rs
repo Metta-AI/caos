@@ -128,6 +128,9 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
 }
 
 fn import_local_path(client: &GitTransport, path: &std::path::Path) -> Result<(Mode, Oid), String> {
+    if !path.is_dir() || GitTransport::discover(path).is_err() {
+        return Err("local imports require a Git repository directory".into());
+    }
     import_path(&mut open_store(client)?, path)
 }
 
@@ -141,32 +144,13 @@ fn import_path(store: &mut GitStore, path: &std::path::Path) -> Result<(Mode, Oi
     if meta.is_dir() {
         let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
         // Keep the real worktree root so ancestor ignore files retain their scope.
-        // Non-repositories get an empty Git directory, never the client's excludes.
-        let source_repo = GitTransport::discover(path).ok();
-        let (git_dir, worktree) = if let Some(repo) = &source_repo {
-            (
-                repo.git_capture(&["rev-parse", "--absolute-git-dir"], None)?,
-                repo.work_dir().to_path_buf(),
-            )
-        } else {
-            let git_dir = temp.path().join("git");
-            crate::host_git::capture_required(
-                "git",
-                &[
-                    "init",
-                    "--bare",
-                    "--quiet",
-                    git_dir.to_str().ok_or("temporary path must be UTF-8")?,
-                ],
-                path,
-            )?;
-            (git_dir.to_string_lossy().into_owned(), path.to_path_buf())
-        };
+        let source_repo = GitTransport::discover(path)?;
+        let git_dir = source_repo.git_capture(&["rev-parse", "--absolute-git-dir"], None)?;
         let output = std::process::Command::new("git")
             .arg("--git-dir")
             .arg(git_dir.trim())
             .arg("--work-tree")
-            .arg(worktree)
+            .arg(source_repo.work_dir())
             .args(["ls-files", "--others", "--exclude-standard", "-z"])
             .env("GIT_INDEX_FILE", temp.path().join("index"))
             .current_dir(path)
@@ -246,11 +230,7 @@ pub fn prepare_import(
     {
         let source = std::path::absolute(local).map_err(|e| e.to_string())?;
         let (mode, object) = import_local_path(t, &source)?;
-        let metadata = if source.is_dir() && GitTransport::discover(&source).is_ok() {
-            local_import_metadata(name, &source)?
-        } else {
-            None
-        };
+        let metadata = local_import_metadata(name, &source)?;
         (mode, object, metadata)
     } else if local.is_dir() {
         let source = std::path::Path::new(&repository)

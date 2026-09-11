@@ -917,7 +917,7 @@ const COMMANDS: [Command; 11] = [
     Command {
         name: "/import",
         usage: "/import <path> <source> [revision]",
-        description: "import local files or a repository revision at a conversation path",
+        description: "import a Git checkout or revision at a conversation path",
         action: AppAction::Import,
         takes_argument: true,
     },

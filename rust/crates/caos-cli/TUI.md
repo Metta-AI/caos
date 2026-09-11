@@ -173,8 +173,9 @@ are no shell commands or controls that apply edits.
 On a source-tree entry in the current snapshot, `o` selects the target for
 local checkout and publication. Selection preserves the draft and never
 changes agent execution. Use `/import <path> <source> [revision]` to import
-disk contents at an unused path, or a Git commit when given a URL or explicit
-revision. Local imports include uncommitted and untracked files while honoring
+disk contents from a Git repository directory (or its subdirectory) at an unused
+path, or a Git commit when given a URL or explicit revision. Plain directories
+and individual files are not supported. Local imports include uncommitted and untracked files while honoring
 Git ignore rules, including ancestor rules for subdirectories. Each import's
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
