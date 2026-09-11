@@ -171,8 +171,7 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
 fn validate_root_shape(store: &dyn ObjectStore, tree: &Oid) -> Result<(), String> {
     let snapshot = super::tree::Snapshot::new(store, tree.clone());
     match snapshot.read(paths::FORMAT)? {
-        Some(bytes) if bytes == paths::FORMAT_BYTES.as_bytes() => {}
-        Some(_) => return Err("conversation format is invalid".to_string()),
+        Some(bytes) => paths::validate_format(&bytes)?,
         None => return Err("conversation format is missing".to_string()),
     }
     for entry in snapshot.list(".caos")? {

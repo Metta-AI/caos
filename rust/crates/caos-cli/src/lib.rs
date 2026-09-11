@@ -1882,7 +1882,8 @@ fn summary_for_advertised_id(
         .get(id)
         .map(|(_, head)| head)
         .ok_or_else(|| "canonical head is absent".to_string())?;
-    validate_cached(store, head)?;
+    // Sidebar summaries read metadata only. Validate the full history when the
+    // conversation is opened or changed, not for every unopened sidebar entry.
     summary_at_head(store, id, head)
 }
 
@@ -1951,7 +1952,11 @@ fn group_child_conversations(
 
 fn warn_skipped_conversation(id: &str, error: &str) {
     if first_skip_warning(&format!("{id}: {error}")) {
-        eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+        if error.starts_with("unsupported conversation format") {
+            eprintln!("note: conversation {id:?} is preserved but unavailable: {error}");
+        } else {
+            eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+        }
     }
 }
 
@@ -2667,10 +2672,9 @@ pub fn image_arg_reader(argument: &str) -> Option<&str> {
     }
 }
 
-pub fn model_secret_missing(t: &GitTransport) -> Result<bool, String> {
-    Ok(build_secret_store(t)?
-        .iter()
-        .all(|secret| secret.name() != MODEL_API_SECRET))
+pub fn model_secret_missing() -> Result<bool, String> {
+    caos::local_secret_present(std::path::Path::new(caos::SECRETS_DIR), MODEL_API_SECRET)
+        .map(|present| !present)
 }
 
 fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {

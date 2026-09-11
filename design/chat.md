@@ -221,6 +221,10 @@ sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
 
+Startup checks local credential configuration without resolving worker images.
+The sidebar reads conversation metadata; opening or modifying a conversation
+validates its history. Reader grants are resolved when a request is prepared.
+
 Credentials, server choice, and client caches remain local. Checkout destinations
 are local preferences keyed by server, conversation, and gitlink path. Neither a
 code commit nor a publishing URL identifies a directory on the user's machine.

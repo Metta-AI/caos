@@ -4125,6 +4125,23 @@ impl ClientSecret {
     }
 }
 
+/// Check local configuration without evaluating reader expressions or building
+/// worker images. Grants are resolved when preparing an actual request.
+pub fn local_secret_present(dir: &Path, name: &str) -> Result<bool, String> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let mut present = false;
+    for (file_name, path) in local_secret_files(dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
+        let spec = parse_local_secret_spec(&file_name, &text)?;
+        resolve_local_secret_value(&file_name, &path, spec.value)?;
+        present |= spec.name == name;
+    }
+    Ok(present)
+}
+
 /// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
 /// each reader resolved HERE (via eval-path, against the store's pinned tree)
 /// to a partial arg tree of name → oid — so the server only subset-matches,
@@ -5033,6 +5050,29 @@ mod local_secret_tests {
             Some(LocalSecretValue::File(path)) => assert_eq!(path, "../key"),
             _ => panic!("value:@ was not preserved as an unresolved file value"),
         }
+    }
+
+    #[test]
+    fn presence_checks_local_specs_and_values_without_evaluating_readers() {
+        let dir = std::env::temp_dir().join(format!(
+            "secret-presence-{}",
+            super::fresh_entropy().unwrap()
+        ));
+        assert!(!super::local_secret_present(&dir, "api-key").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(
+            &file,
+            "name=api-key\nvalue=test-value\nreader=missing-worker\n",
+        )
+        .unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").unwrap());
+        assert!(!super::local_secret_present(&dir, "other").unwrap());
+        std::fs::write(&file, "name=api-key\nvalue:@=missing.value\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::write(&file, "not a spec\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
