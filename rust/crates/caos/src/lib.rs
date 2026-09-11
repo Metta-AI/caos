@@ -2914,7 +2914,19 @@ fn resolve_remote_arg(
     };
 
     let dir = git_ref.dir.as_deref().unwrap_or("");
-    let (kind, hash) = eval::eval_path(t, &root.to_string(), dir, store)
+    // Evaluate SERVER-SIDE, not with a local `.caos-expr` walk. The walk is
+    // CHATTY -- measured ~54 fresh HTTP round trips, each a new connection --
+    // which is 0.1s over a loopback but ~30s over a cloud session's iroh tunnel,
+    // where every connection pays the relay's setup and latency. `/eval-locator`
+    // does the whole walk inside the server, where each hop is sub-millisecond,
+    // so this makes ONE request. The result is byte-identical to `eval_path`
+    // (secret marking is a no-op through eval; it happens when the step RUNS).
+    //
+    // Falls back to the local walk on any failure: an older server without the
+    // endpoint, or a real eval error, both land here, and the local walk then
+    // either succeeds (slowly) or reproduces the same error to report.
+    let (kind, hash) = eval_locator_on_server(t, &root.to_string(), dir, store)
+        .or_else(|_| eval::eval_path(t, &root.to_string(), dir, store))
         .map_err(|e| format!("git ref {value:?}: {e}"))?;
     let resolved = (eval::mode_of_kind(&kind), parse_oid(&hash)?);
     if let Some(key) = memo_key {
@@ -2926,6 +2938,31 @@ fn resolve_remote_arg(
 /// [`resolve_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`, for the
 /// pinned schemes only. See the split at the top of that function.
 static REMOTE_ARG_MEMO: eval::Memo<(gix::objs::tree::EntryMode, gix::ObjectId)> = eval::Memo::new();
+
+/// Evaluate `dir` within the tree `root` on the SERVER, via `/eval-locator` --
+/// [`resolve_remote_arg`]'s fast path. Pushes `root` so the server can read it,
+/// then makes ONE request in place of the local walk's ~54. Returns
+/// `(kind, hash)`, exactly as [`eval::eval_path`] does, so the two are
+/// interchangeable and the caller can fall back to the walk on any failure.
+fn eval_locator_on_server(
+    t: &dyn Transport,
+    root: &str,
+    dir: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    // The server percent-decodes a query value and splits on `&`; a `#` ends the
+    // query. A path carrying any of those (or a `%`) is left to the local walk.
+    if dir.chars().any(|c| matches!(c, '&' | '#' | '%')) {
+        return Err(format!("eval dir {dir:?} has a query-unsafe character"));
+    }
+    t.ensure_pushed(root)?;
+    let base = t.server_url()?;
+    let url = format!(
+        "{}/eval-locator?in={root}&eval={dir}",
+        base.trim_end_matches('/')
+    );
+    request_compute_url(&url, &secret_store_header(store))
+}
 
 /// Parse a `:@@=` locator value into a [`GitRef`], validating the
 /// content-addressing invariant: a git fetch MUST pin a commit (`rev=<40-hex>`),
