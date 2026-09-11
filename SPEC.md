@@ -529,17 +529,18 @@ The agent resolves a path by editing the file (removing markers) or fixing
 the entry, then DELETING that path's rows from `.caos/conflicts`. That
 deletion IS the per-path `git add` — an explicit "this one's done"
 assertion, trusted exactly as git trusts `add` (no re-scan). An empty
-`.caos/conflicts` means done; the agent need not remove the file (inline tools
-have no delete — `bash rm` does, for a clean mid-conversation checkout).
+`.caos/conflicts` means resolution is done. Remove the ledger with `bash rm`
+before publication; that deletion is committed like any other code edit.
 
 `.caos/conflicts` lives in the source tree, alongside the code. Inline
 file tools can edit it; compute tools receive it with the rest of the
 source tree. Conversation protocol files live in a separate tree, so no
 step metadata needs to be injected or preserved in the source tree.
 
-Publication rejects any `.caos` entry in the final source tree, including
-an empty `.caos/conflicts`. Earlier source tree commits retain their conflict
-scaffolding.
+Publication rejects any `.caos` content in the final source tree, including
+an empty `.caos/conflicts`. An empty `.caos` directory may remain. The check
+distinguishes unresolved conflicts from completed cleanup and does not rewrite
+the published commit. Earlier commits retain their conflict scaffolding.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.

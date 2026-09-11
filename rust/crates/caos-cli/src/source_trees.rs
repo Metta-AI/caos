@@ -436,6 +436,7 @@ pub fn resolve_publication_target(
     destination: &PublicationDestination,
     branch_only: bool,
 ) -> Result<(), String> {
+    crate::reject_publish_caos(t, &oid(&target.head, "publication head")?)?;
     validate_repository(&destination.repository)?;
     conversation_protocol::v3::source_trees::validate_branch(&target.branch)?;
     target.repository = destination.repository.clone();
@@ -548,8 +549,10 @@ pub fn import_publication_base(
     }
     Ok(format!(
         "Prepare {:?} for a PR against branch {:?} in {}. The base commit {} is imported at {:?}. \
-         Merge or rebase that base into {:?}, preserve the intended changes and other snapshots, \
-         resolve any conflicts, and run relevant tests. Do not publish. \
+         Integrate that base into {:?}, preserving existing changes and other snapshots. \
+         First check whether this would publish unrelated inherited changes; if so, explain the scope and ask before proceeding. \
+         Merging upstream preserves existing branch changes; transplanting only the requested edit onto a new base is a separate operation. \
+         Resolve any conflicts, remove the resolved conflict ledger, and run relevant tests. Do not publish. \
          When finished, summarize the changes and suggest /pr {} {} {} for review.",
         target.source_tree,
         target.base_branch,

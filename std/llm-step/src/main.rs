@@ -2941,7 +2941,7 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
 fn bash_tool() -> Value {
     json!({
         "name":"bash",
-        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. Protected .caos metadata cannot be changed.",
+        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. Conversation-root .caos protocol metadata cannot be changed; a source tree's .caos/conflicts ledger is editable.",
         "input_schema":{"type":"object","properties":{
             "cmd":{"type":"string"},
             "cwd":{"type":"string","description":"Optional conversation-relative working directory; defaults to the conversation root."},
@@ -2953,7 +2953,7 @@ fn bash_tool() -> Value {
 fn merge_tool() -> Value {
     json!({
         "name": "merge",
-        "description": "Three-way merge another commit into the current source tree. `theirs` is a full commit hash already imported into CAOS (a custom harness may also supply a named ref snapshot); the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
+        "description": "Three-way merge another commit into the current source tree. `theirs` is a full commit hash already imported into CAOS (a custom harness may also supply a named ref snapshot); the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Once all conflicts are resolved, remove the ledger with bash (and optionally rmdir its empty .caos directory). Bash changes are committed automatically, just like inline edits. Then run relevant checks.",
         "input_schema": {
             "type":"object",
             "properties":{"theirs":{"type":"string","description":"Full imported commit hash. A ref name works only if the harness explicitly supplied a ref snapshot."}},
@@ -3020,7 +3020,7 @@ fn merge_result_block(id: &str, ws: &str) -> Result<Value, String> {
     }
     let text = match conflicts {
         Some(body) => format!(
-            "merge produced conflicts. The source tree now carries git's inline conflict markers in the affected files, plus .caos/conflicts (git's unmerged notation, richer than markers). Resolve each path — edit the file, reading a stage's content with `read` (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. Build and test when done.\n\n.caos/conflicts:\n{}",
+            "merge produced conflicts. The source tree now carries git's inline conflict markers in the affected files, plus .caos/conflicts (git's unmerged notation, richer than markers). Resolve each path — edit the file, reading a stage's content with `read` (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. When all conflicts are resolved, remove the ledger with bash; optionally rmdir its empty .caos directory. Bash edits and deletions are committed automatically. Run relevant checks.\n\n.caos/conflicts:\n{}",
             body.trim_end()
         ),
         None => "merge completed cleanly; the source tree is the merged result.".to_string(),

@@ -301,7 +301,10 @@ closure into the client before submission. These commands never replace the
 internal harness.
 
 Publication preserves source tree history, uses leased branch updates, and
-rejects unresolved conflicts or reserved conversation state. It leaves the local
+checks conflict cleanup before preview and again before pushing. Resolve a
+nonempty `.caos/conflicts` ledger and remove it with bash once finished; an
+empty ledger or other `.caos` content blocks publication, but an empty directory
+does not. Bash deletions are committed automatically. It leaves the local
 checkout and index unchanged. Credentials remain in the local secret store;
 the launcher reuses an existing checkout store or its own persistent store under
 the data directory.
