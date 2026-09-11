@@ -123,10 +123,10 @@ done <<< "$refs"
 # THE NEWEST BUILD AT OR BEFORE A COMMIT, which is what the header at the top
 # of this file has always promised and what the code never did.
 #
-# A branch head has no build for the ~25 minutes its workflow takes, and in that
-# window every environment built from that branch failed to install a client AT
-# ALL -- one push, and the next cloud session comes up with no caos in it. A
-# slightly older client is a different thing from no client.
+# A branch head has no build until its workflow finishes, and in that window
+# every environment built from that branch failed to install a client AT ALL --
+# one push, and the next cloud session comes up with no caos in it. A slightly
+# older client is a different thing from no client.
 #
 # Needs history, which `ls-remote` does not carry, so it shallow-fetches the ref
 # and walks back. Fifty is a bound, not a guess: past that, something other than

@@ -1,9 +1,15 @@
 # Running a caos session in a cloud container
 
-A cloud session needs two things: the **client** (`caos cc hook` records the
-conversation, `caos cc serve` is the tool server — one downloaded binary), and a
-**caos server** to point it at. Neither requires the repository to carry
-anything.
+A cloud session (claude.ai/code) needs two things: the **client** (`caos cc
+hook` records the conversation, `caos cc serve` is the tool server — one
+downloaded binary), and a **caos server** to point it at. Neither requires the
+repository to carry anything.
+
+The caos server is reached over an **iroh tunnel**: a `dumbpipe` listener on the
+machine that runs the server, dialled from inside the container by node id. The
+container only ever connects OUT — nothing listens for an inbound shell, which
+is what the sandbox refuses. See `../dumbpipe-system-certs.patch` for why the
+tunnel is our own build of dumbpipe rather than n0's.
 
 ## Nothing is committed to a repository
 
@@ -16,61 +22,87 @@ repo. Three routes were possible; only one works:
 | managed settings | ruled out — an Anthropic-hosted session "doesn't read a device's MDM profile or file" |
 | **user-level settings written by the setup script** | **what this uses** |
 
-Measured, not assumed: a setup script that wrote `settings.json` into every
-candidate home found the hooks firing from `/root`. The CLI runs as root, even
-though the repo sits at `/home/user/repo` and Claude's own state under
-`/home/claude/.claude`. All three are written anyway; it costs nothing.
+Measured: a setup script that wrote `settings.json` into every candidate home
+found the hooks firing from `/root`. The CLI runs as root, even though the repo
+sits at `/home/user/repo` and Claude's own state under `/home/claude/.claude`.
+All three are written anyway; it costs nothing.
 
 `SessionStart` is what makes it repo-independent. The client finds caos through
-a `caos` git remote and an arbitrary checkout has none, so the hook adds it from
-`$CAOS_SERVER_URL` — per-repo configuration applied from user-level settings.
+a `caos` git remote and an arbitrary checkout has none, so the hook brings up
+the tunnel and adds the remote per session, from user-level settings rather than
+anything committed.
 
 ## Configuring the environment
 
-**Setup script**: paste `setup.sh`. It downloads the client from the latest
-release, writes the hooks and deny list, declares the tool server, and touches
-no checkout.
+**Setup script**: paste these two lines into the environment's "Setup script"
+field (swap `main` for a branch or commit to test a change — everything else is
+read back out of it):
 
-**Environment variables**: `CAOS_SERVER_URL` for the caos server to use.
-Optionally `CAOS_VERSION` to pin a release.
+```
+B=https://raw.githubusercontent.com/Metta-AI/caos/main/dev/claude-code
+curl -fsSL "$B/cloud/setup.sh" | bash -s -- --base="$B"
+```
 
-**Network access**: the default **Trusted** level covers GitHub, which is where
-the client comes from. Reaching the caos server needs whatever that server's
-transport needs.
+**Environment variables**: one of —
+- `CAOS_IROH_TICKET` — the iroh ticket of the caos server's dumbpipe listener.
+  The tunnel comes up on `127.0.0.1:19090` and the `caos` remote points there.
+- `CAOS_SERVER_URL` — a direct URL, when the server is reachable without a
+  tunnel.
 
-## Still unproven
+**Network access**: the environment's normal egress is enough. GitHub (the
+client), `api.anthropic.com`, and iroh's relays (`*.relay.n0.iroh.link`,
+`dns.iroh.link`) are all reachable, and iroh needs the relays to connect the
+tunnel. Measured from a container: all return 200.
 
-The tool server is declared in `/root/.claude.json`, and while hooks are
-measured to be read from `/root/.claude/settings.json`, the MCP declaration
-beside it is NOT yet confirmed to be picked up. It is the same mechanism the
-remote-control launcher uses successfully, but that is reasoning rather than
-measurement.
+## The ticket must name the RUNNING listener
 
-## The risk worth measuring first
+This is the one failure that looks like something else. `CAOS_IROH_TICKET`
+carries an iroh NODE id, derived from the listener's `IROH_SECRET`. Restart the
+listener with a different secret and the node changes; the env's ticket then
+names a node that no longer exists, and every session's `connect-tcp` dials a
+dead node. Iroh's relay swallows the connection rather than refusing it, so it
+presents as `caos_status: cannot reach the CAOS server … timeout` and a hanging
+`git ls-remote caos` — indistinguishable from a network fault, which it is not.
 
-The setup script is asked to finish in roughly five minutes so the cache can
-build, and a cold `nix build` of this tree will not fit. That matters more than
-a slow first run: work done AFTER the snapshot is never cached, so a build
-deferred into the hook is paid again by **every** session.
+Keep the listener's `IROH_SECRET` FIXED and the ticket is permanent — set the
+env once and it survives restarts and laptop sleep. To check agreement without
+starting anything: `IROH_SECRET=<the listener's> dumbpipe generate-ticket`
+prints the node ticket; its prefix must match the env's `CAOS_IROH_TICKET`.
 
-`setup.sh` therefore fetches (`nix flake archive`) rather than builds, and the
-hook builds in the background. Whether that is tolerable depends on how long a
-build takes with a warm store and no compilation left to do — `time nix build`
-from a cold store is the number to get before investing further.
+## What is proven
 
-If it is not tolerable, the fix is a binary cache (cachix or attic) that the
-setup script substitutes from, turning the build into a download that fits in
-the budget and lands in the snapshot.
+Measured end to end, a fresh session on a correctly-ticketed environment:
 
-## Unknowns to test, in order
+- **hooks fire** — `SessionStart` brings up the tunnel and adds the `caos`
+  remote; `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
+- **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
+  is honoured, `caos cc serve` is spawned, and the model can call it.
+- **the full tool set resolves** — `bash read ls grep edit write caos-build
+  caos-test caos-test-result log show diff merge spawn_agent run_async
+  wait_agent harvest_agent`, within SECONDS of init when the server has the
+  `std/llm-step` image cached warm. The `caos_status` placeholder stands in only
+  until they arrive (`../../rust/crates/caos-cli/CC.md`).
 
-1. **Do hooks fire at all in a cloud session?** Everything rests on this. The
-   cheapest check is a `SessionStart` hook that writes a file, and a session that
-   looks for it.
-2. **Does dockerd run in the VM, and can it run the stack's containers?** The VM
-   has `docker`/`dockerd` pre-installed, but caos runs containers that run
-   containers, and whether nested/privileged workloads are permitted here is not
-   documented either way.
-3. **Does the stack come up at all**, and how long the first turn waits for it.
+The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
+is fixed on their side; the first session against a step-tree the server has
+never built also waits out one rustc compile, and only that first one.
 
-Only after those does any of the hosted-caos work become worth doing.
+## The setup-time budget
+
+The setup script is asked to finish in roughly five minutes so the filesystem
+snapshot can be taken, and a cold `nix build` of this tree will not fit. That
+matters more than a slow first run: work done AFTER the snapshot is never cached,
+so a build deferred into a hook is paid again by **every** session.
+
+`setup.sh` therefore only DOWNLOADS the client (a static binary from the
+release), and the per-session hook re-runs the installer — which stops at one
+`ls-remote` when the build is already current. Nothing compiles in the
+container.
+
+## A separate, untested direction: the stack in the container
+
+Everything above points the session at an EXTERNAL caos server over the tunnel.
+Running the caos stack INSIDE the cloud container is a different thing and is not
+done here — the VM has `docker`/`dockerd`, but caos runs containers that run
+containers, and whether nested/privileged workloads are permitted is unmeasured.
+Only pursue it if the external-server model proves insufficient.

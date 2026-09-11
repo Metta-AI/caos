@@ -172,6 +172,43 @@ Two things about that dir are worth knowing:
   declared into the copy with `claude mcp add --scope user`, so your real config
   is never modified.
 
+## Driving a cloud session from elsewhere
+
+A local Claude session (or a person at a terminal) can start a cloud session,
+prompt it, and read everything it did — with no shell INTO the container. The
+container refuses an inbound tunnel (`dumbpipe connect <endpoint> | bash` reads
+as a reverse shell and trips a model refusal), and it does not need one: the
+cloud session runs commands as its own tool calls, and its whole transcript —
+every tool call and its stdout — is readable over the claude.ai API.
+
+Three legs, each measured:
+
+```bash
+# start — a NEW session. `--cloud` needs a TTY, so wrap it in script(1);
+# piped/non-interactive stdout makes claude ignore --cloud and run locally.
+script -qec "claude --cloud 'your first prompt'" /dev/null   # prints session_…
+
+# continue — inject another prompt into an EXISTING session. No TTY. Re-wakes
+# an idle or reclaimed container from its snapshot (setup is cached, so it is
+# fast). This is NOT the interactive attach path (`claude --cloud <id> 'prompt'`
+# under a tty), which errors "attaching … is not enabled for your account";
+# `-p` is a different, message-post route that is enabled.
+claude --cloud session_XXXX -p 'your next prompt'
+
+# read — the full transcript, from anywhere. In Claude Code this is the
+# RemoteTrigger tool (action get_run_log, session_id …); by hand it is
+# GET /v1/code/sessions/<id>/events. A session takes ~2 min from create to its
+# first `init`, so poll after a wait.
+```
+
+Continuity does not depend on in-session memory: a cloud session against a caos
+workspace keeps its durable state in the caos SERVER (the conversation ref, the
+object store), reached over the iroh tunnel, so a fresh session started for the
+next task picks up exactly where the last left off. The session is disposable;
+the server is the thread. That is why session-per-task works as well as one
+long-lived session would — and it sidesteps the account-gated interactive
+attach entirely.
+
 ## When the server shows as broken
 
 `/mcp` reports a failed server but no reason, and neither the terminal nor

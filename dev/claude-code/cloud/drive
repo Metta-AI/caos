@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Drive a Claude Code cloud session from a terminal (or another Claude session).
+#
+# Starting a NEW session needs a TTY -- `claude --cloud` refuses a pipe and
+# would silently run locally -- so this wraps it in script(1). CONTINUING an
+# existing session is `-p`, which needs no TTY. Either way the prompt is read
+# from a FILE at run time and never interpolated into a command string: a
+# prompt with an apostrophe, a `$(...)`, a backtick or a pipe would otherwise
+# be truncated or executed by the shell building that string (measured: a
+# prompt saying "each block's output" was cut at the apostrophe and the session
+# received no commands at all).
+#
+#   drive 'a brand new session prompt'      # prints the new session id
+#   drive -c session_XXXX 'a follow-up'     # inject into an existing session
+#   drive -f prompt.txt                     # read the prompt from a file
+#   drive -c session_XXXX -f prompt.txt     # both
+#
+# Read the result back with the run-log API, not this tool:
+#   GET https://claude.ai/api ... or, in Claude Code, RemoteTrigger get_run_log.
+set -euo pipefail
+
+session=""
+file=""
+for ((i = 1; i <= $#; i++)); do
+    case "${!i}" in
+        -c) i=$((i + 1)); session="${!i}" ;;
+        -f) i=$((i + 1)); file="${!i}" ;;
+        -*) echo "drive: unknown flag ${!i}" >&2; exit 2 ;;
+        *) file=""; prompt="${!i}" ;;
+    esac
+done
+
+# The prompt lands in a temp file whether it came as an argument or a path, so
+# the launch below has exactly one shape to get right.
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+if [ -n "$file" ]; then
+    cat "$file" > "$tmp"
+elif [ -n "${prompt:-}" ]; then
+    printf '%s' "$prompt" > "$tmp"
+else
+    cat > "$tmp"   # from stdin
+fi
+if ! [ -s "$tmp" ]; then
+    echo "drive: empty prompt" >&2
+    exit 2
+fi
+
+if [ -n "$session" ]; then
+    # Continue: no TTY needed. `-p` posts a message into the running session.
+    claude --cloud "$session" -p "$(cat "$tmp")"
+else
+    # Start: `--cloud` needs a TTY, so run it under script(1). The prompt is
+    # read inside the single-quoted -c string, so nothing in it is parsed by
+    # the shell that assembles the command.
+    out="$(mktemp)"
+    trap 'rm -f "$tmp" "$out"' EXIT
+    CAOS_DRIVE_PROMPT="$tmp" \
+        script -qec 'claude --cloud "$(cat "$CAOS_DRIVE_PROMPT")"' "$out" >/dev/null 2>&1 || true
+    # The banner carries the session id; surface it and the whole banner.
+    sed -n 's/.*\(session_[A-Za-z0-9]*\).*/\1/p' "$out" | head -1
+    grep -aE 'session_|View:|Resume' "$out" >&2 || true
+fi
