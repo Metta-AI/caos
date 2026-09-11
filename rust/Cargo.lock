@@ -137,6 +137,8 @@ dependencies = [
  "ratatui-crossterm",
  "ratatui-widgets",
  "serde_json",
+ "shell-words",
+ "tempfile",
  "unicode-width",
 ]
 
