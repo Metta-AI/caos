@@ -177,6 +177,7 @@ pub struct TurnOutcome {
 pub enum ConversationRole {
     Human,
     Agent,
+    System,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1266,7 +1267,7 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
         let (author, role) = match entry.role {
             Role::User => (entry.actor.clone(), ConversationRole::Human),
             Role::Assistant => ("assistant".to_string(), ConversationRole::Agent),
-            Role::System => ("CAOS".to_string(), ConversationRole::Agent),
+            Role::System => ("CAOS".to_string(), ConversationRole::System),
         };
         turns.push(ConversationTurn {
             commit: String::new(),
@@ -3586,6 +3587,14 @@ mod tests {
         let repository = other_root.join("origin.git").to_str().unwrap().to_string();
         source_trees::import_source(&transport, "attached", "api", &repository, Some("main"))
             .unwrap();
+        let replay = conversation_load(&transport, "attached")
+            .unwrap()
+            .unwrap()
+            .replay;
+        let notice = replay.turns.last().unwrap();
+        assert_eq!(notice.role, ConversationRole::System);
+        assert_eq!(notice.message, format!("Imported at api: {other_head}"));
+        assert!(!notice.commit.is_empty());
         let local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
         assert_eq!(
             source_trees::import_source(

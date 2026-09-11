@@ -96,8 +96,10 @@ the source's background work.
    required objects and history into CAOS without changing the source checkout's
    index, branches, or files.
 3. Create a conversation commit parented by the previous `C`, adding a gitlink
-   at `imports/repo/base` that points to `W_0`. Update the conversation ref
-   against its expected previous head, then display the accepted head.
+   at `imports/repo/base` that points to `W_0`, then append a system transcript
+   entry recording the destination path and imported commit. Publish both commits
+   with one conversation-ref update against its expected previous head. The TUI
+   renders system entries as `CAOS`, so the import remains visible after reload.
 
 Local disk imports require a Git checkout root with an existing HEAD. Linked
 worktrees are supported; plain directories, individual files, and subdirectory
@@ -304,9 +306,10 @@ Git and GitHub credentials to push that exact commit and open or reuse a PR.
 No local working checkout is required. `/publish-branch <conversation/gitlink>
 [remote-URL]` uses the same flow without creating a PR or requiring a base.
 
-Reject changed content, remote drift, unresolved conflicts, and a PR base not
-incorporated into the code. The agent prepares, integrates, and tests changes
-before publication; publishing never runs an agent or edits code. A base branch
+Reject changed content, remote drift, conflict markers, and unrelated histories.
+The source and PR base must share an ancestor; the source need not contain the
+latest base tip. Publishing opens a PR, not a merge, and never runs an agent or
+edits code. The agent prepares and tests changes before publication. A base branch
 for a later PR must already exist remotely, so publish earlier PRs first.
 
 Find existing PRs by repository and branch. Inspect destination refs after an

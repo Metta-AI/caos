@@ -291,7 +291,26 @@ pub fn import_source(
                 }
                 files.push((path.clone(), Some((Mode::Blob, bytes.clone()))));
             }
-            Ok(Step::MintMany(vec![Transition::FilesApply { files }]))
+            Ok(Step::MintMany(vec![
+                Transition::FilesApply { files },
+                Transition::MessageAppend {
+                    entry: TranscriptEntry {
+                        message_id: format!("import-{head}"),
+                        conversation: id.to_string(),
+                        role: Role::System,
+                        actor: "caos".to_string(),
+                        request: None,
+                        round: None,
+                        model: None,
+                        blocks: vec![Block::Text {
+                            text: format!("Imported at {name}: {commit}"),
+                        }],
+                        proposal: None,
+                        source_tree_resolution: None,
+                    },
+                    payloads: Vec::new(),
+                },
+            ]))
         },
     )?;
     Ok(commit.to_string())
@@ -433,7 +452,9 @@ pub fn resolve_publication_target(
         if target.branch == target.base_branch {
             return Err("PR branch and base branch must differ".into());
         }
-        target.base_commit = Some(branch_snapshot(t, &target.repository, &target.base_branch)?);
+        let base = branch_snapshot(t, &target.repository, &target.base_branch)?;
+        crate::host_git::validate_pr_source_tree(&base, &target.head, t.work_dir())?;
+        target.base_commit = Some(base);
     }
     target.remote_head = GitStore::open(t.work_dir(), Some(&target.repository))?
         .read_ref(&format!("refs/heads/{}", target.branch))?

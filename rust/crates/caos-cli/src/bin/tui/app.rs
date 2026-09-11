@@ -1162,6 +1162,7 @@ impl ConversationState {
                     }
                     ConversationRole::Human => EntryRole::Human,
                     ConversationRole::Agent => EntryRole::Agent(turn.model),
+                    ConversationRole::System => EntryRole::Info,
                 },
                 commit: Some(turn.commit),
                 text: turn.message,
@@ -1561,7 +1562,7 @@ enum UiMessage {
     },
     SourceTreeUpdated {
         conversation: String,
-        result: Result<(Result<String, String>, Box<ConversationLoad>), String>,
+        result: Result<(Result<(), String>, Box<ConversationLoad>), String>,
     },
     Reconciled {
         conversation: String,
@@ -2558,21 +2559,21 @@ impl App {
         let revision = parts.get(2).map(|value| value.to_string());
         let status = format!("into {name}");
         self.start_import(&status, move |transport, conversation| {
-            let head = caos_cli::source_trees::import_source(
+            caos_cli::source_trees::import_source(
                 transport,
                 conversation,
                 &name,
                 &repository,
                 revision.as_deref(),
             )?;
-            Ok(format!("Imported {repository} at {name}: {head}"))
+            Ok(())
         });
     }
 
     fn start_import(
         &mut self,
         status: &str,
-        operation: impl FnOnce(&GitTransport, &str) -> Result<String, String> + Send + 'static,
+        operation: impl FnOnce(&GitTransport, &str) -> Result<(), String> + Send + 'static,
     ) {
         if self.selected().is_busy() {
             self.selected_mut().show_command_error(
@@ -2817,7 +2818,7 @@ impl App {
                                     let _ = state.select_source_tree(name);
                                 }
                                 match info {
-                                    Ok(info) => state.push_info(info),
+                                    Ok(()) => state.status.clear(),
                                     Err(error) => state.show_command_error(error),
                                 }
                             }
@@ -6539,13 +6540,22 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
-                    turns: vec![caos_cli::ConversationTurn {
-                        commit: "e".repeat(40),
-                        author: "assistant".to_string(),
-                        role: ConversationRole::Agent,
-                        model: Some("test-model".to_string()),
-                        message: String::new(),
-                    }],
+                    turns: vec![
+                        caos_cli::ConversationTurn {
+                            commit: "e".repeat(40),
+                            author: "assistant".to_string(),
+                            role: ConversationRole::Agent,
+                            model: Some("test-model".to_string()),
+                            message: String::new(),
+                        },
+                        caos_cli::ConversationTurn {
+                            commit: "f".repeat(40),
+                            author: "CAOS".into(),
+                            role: ConversationRole::System,
+                            model: None,
+                            message: "Imported at imports/repo/base: abc".into(),
+                        },
+                    ],
                     activity: vec![TurnEvent::ToolCall {
                         step_commit: "e".repeat(40),
                         request: request.clone(),
@@ -6570,9 +6580,15 @@ mod tests {
         assert_eq!(conversation.status, "running a tool");
         assert_eq!(conversation.turn_phase, TurnPhase::Model);
         assert_eq!(conversation.activities.len(), 1);
-        assert!(
-            conversation.transcript.is_empty(),
+        assert_eq!(
+            conversation.transcript.len(),
+            1,
             "tool-only replies have no text row"
+        );
+        assert_eq!(conversation.transcript[0].role, EntryRole::Info);
+        assert_eq!(
+            conversation.transcript[0].commit.as_deref(),
+            Some("ffffffffffffffffffffffffffffffffffffffff")
         );
         assert_eq!(conversation.activities[0].id, "sleep");
         assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");

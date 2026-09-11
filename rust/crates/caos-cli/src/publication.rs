@@ -1,9 +1,7 @@
 //! Prepare, validate, publish and open a PR for an explicit source tree plan.
 //! Client focus cannot retarget this operation; progress and cancellation are inputs.
 use super::*;
-use crate::host_git::{
-    find_or_open_source_tree_pr_in, remote_base_is_ancestor, validate_prepared_source_tree,
-};
+use crate::host_git::{find_or_open_source_tree_pr_in, validate_pr_source_tree};
 use crate::source_trees::{branch_snapshot, PublicationTarget};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,10 +31,7 @@ pub fn publish_target(
     if cancel.load(Ordering::Relaxed) {
         return Err("publication cancelled".into());
     }
-    validate_prepared_source_tree(&base, &target.head, transport.work_dir())?;
-    if !remote_base_is_ancestor(&base, &target.head, transport.work_dir())? {
-        return Err("PR base is not an ancestor; ask the agent to integrate it before previewing publication".into());
-    }
+    validate_pr_source_tree(&base, &target.head, transport.work_dir())?;
     let published = crate::source_trees::publish_target(transport, conversation, target, &base)?;
     if published.status != conversation_protocol::v3::PublicationStatus::Complete {
         return Err(format!(

@@ -333,9 +333,10 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   `/pr <gitlink> <base-remote-branch> [remote-URL]` previews one PR; Enter
   confirms. The URL is explicit or inferred from matching import provenance.
   Publication pushes the exact code commit, using the gitlink path as the branch
-  name, then opens or reuses its PR through `gh`. The agent integrates the base
-  and tests the code before this client operation. Changed content, remote drift,
-  conflicts, and reserved `.caos` state stop publication. Merely
+  name, then opens or reuses its PR through `gh`. The agent tests the code before
+  this client operation. Source and base must share history, but the latest base
+  need not be an ancestor. Changed content, remote drift, conflict markers,
+  unrelated histories, and reserved `.caos` state stop publication. Merely
   opening, running, switching, or publishing conversations never mutates the
   checkout. `/publish-branch` pushes the same full-history branch without PR
   creation, while `/load` imports a `remote/caos/<conversation>` branch or
