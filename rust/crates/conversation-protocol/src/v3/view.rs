@@ -479,11 +479,7 @@ impl<'s> Conversation<'s> {
     }
 
     fn require_format(&self) -> Result<(), String> {
-        let bytes = self.required_blob(paths::FORMAT)?;
-        if bytes != paths::FORMAT_BYTES.as_bytes() {
-            return Err("unsupported conversation format; use the preserved build to open earlier conversations".to_string());
-        }
-        Ok(())
+        paths::validate_format(&self.required_blob(paths::FORMAT)?)
     }
 
     fn optional_blob(&self, path: &str) -> Result<Option<Vec<u8>>, String> {

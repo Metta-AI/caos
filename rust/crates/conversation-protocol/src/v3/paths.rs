@@ -15,6 +15,14 @@ const MAX_TREE_DEPTH: usize = 64;
 pub const MAX_TITLE: usize = 1024;
 pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
 
+pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
+    match bytes {
+        bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(()),
+        b"caos-conversation-v4\n" => Err("unsupported conversation format v4; this build reads v5. Open it with the earlier v4 build".into()),
+        _ => Err("conversation format is invalid".into()),
+    }
+}
+
 pub fn validate_component(name: &str) -> Result<(), String> {
     let lower = name.to_ascii_lowercase();
     if name.is_empty()
