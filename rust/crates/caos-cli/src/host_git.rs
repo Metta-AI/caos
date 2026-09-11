@@ -6,8 +6,8 @@ use std::process::{Command, Output};
 /// Check out a conversation's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
-/// the TUI chooses when to mutate the checkout and requires confirmation before
-/// calling it. Rather than applying the base-to-head diff as unstaged changes,
+/// the TUI requires an explicit local destination, which it can remember.
+/// Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
 pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), String> {

@@ -3607,6 +3607,34 @@ mod tests {
         create_idle_conversation(&transport, "attached", &base);
         let repository = other_root.join("origin.git").to_str().unwrap().to_string();
         source_trees::import_source(&transport, "attached", "api", &repository, None).unwrap();
+        let local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
+        std::fs::write(other.work_dir().join("source_tree"), "uncommitted work\n").unwrap();
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "local",
+                other.work_dir().to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            local_head
+        );
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "pinned",
+                other.work_dir().to_str().unwrap(),
+                Some(&other_head)
+            )
+            .unwrap(),
+            other_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.work_dir().join("source_tree")).unwrap(),
+            "uncommitted work\n"
+        );
         let before = conversation_head(&transport, "attached").unwrap().unwrap();
         assert!(source_trees::import_source(
             &transport,

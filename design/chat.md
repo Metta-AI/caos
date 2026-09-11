@@ -221,7 +221,11 @@ sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
 
-Credentials, server choice, and client caches remain local.
+Credentials, server choice, and client caches remain local. Checkout destinations
+are local preferences keyed by server, conversation, and gitlink path. Neither a
+code commit nor a publishing URL identifies a directory on the user's machine.
+These preferences survive harness updates; renaming a gitlink requires choosing
+its checkout destination again.
 
 ## Publication
 
@@ -236,8 +240,10 @@ absent, then select a stack directory and derive the plan:
 Exclude `00-base` and `dirty`. Naming a boundary does not squash the
 intervening commits.
 
-The preview captures the code commits, destination branches, PR bases, and
-current remote tips. After confirmation, push those exact commits and ancestry,
+The TUI performs publication on the client host using its Git and GitHub
+credentials; no local working checkout is required. The preview captures the
+code commits, destination branches, PR bases, and current remote tips. After
+confirmation, push those exact commits and ancestry,
 then open or reuse the PRs. Reject changed content, changed destinations, remote
 drift, unresolved conflicts, and a PR base not incorporated into the code.
 Preparation, builds, and tests happen before previewing; publishing never runs
@@ -256,8 +262,16 @@ the proposed destination, which appears in the preview.
   entry previews it; arrows navigate folders and gitlinks. The whole browser
   is read-only, including `.caos`.
 - `/import <path> <repository> [revision]`: fetch a commit from a local repository
-  or remote URL and add a gitlink at that exact, unused conversation path.
-- `Ctrl+L`: check the selected code snapshot out locally.
+  or remote URL and add a gitlink at that exact, unused conversation path. Local
+  repositories default to committed `HEAD`, including unpushed commits but not
+  uncommitted files. Remote URLs default to the remote's default branch. An
+  explicit revision selects a different commit; importing does not choose a
+  publishing destination or associate a local checkout.
+- `Ctrl+L`: check the selected code snapshot out in its remembered local directory.
+  If none is selected, prompt for `/checkout <directory>`.
+- `/checkout <directory>`: choose an existing clean Git checkout or an empty/new
+  directory, check out the selected commit with detached HEAD, and remember the
+  destination locally. Relative paths are resolved from the launching directory.
 - `/update-tree <message>`: submit local edits to the selected code snapshot
   with a user message.
 - `Ctrl+P`: preview and publish the selected directory's numbered boundaries.

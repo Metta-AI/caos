@@ -4,6 +4,45 @@ use conversation_protocol::v3::source_trees::{is_boundary, validate_repository, 
 use conversation_protocol::v3::BaseUrl;
 use std::collections::BTreeSet;
 
+/// Transfer history between the trusted local checkout and client repository.
+/// upload-pack otherwise forbids fetching promised objects from a partial clone.
+/// Keep the override on this local import, never on arbitrary repository fetches.
+pub fn import_local_commit(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+    commit: &Oid,
+) -> Result<(), String> {
+    if GitStore::open(destination, None)?.has_local(commit)? {
+        return Ok(());
+    }
+    let source = source.canonicalize().map_err(|e| e.to_string())?;
+    let output = std::process::Command::new("git")
+        .current_dir(destination)
+        .env("GIT_NO_LAZY_FETCH", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+        ])
+        .arg(&source)
+        .arg(commit.as_str())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("starting local history import: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "importing local history: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 pub fn default_branch(t: &GitTransport, repository: &str) -> Result<String, String> {
     let output = t.git_capture(&["ls-remote", "--symref", "--", repository, "HEAD"], None)?;
     output
@@ -45,23 +84,43 @@ pub fn import_source(
         .map(|p| p.fetch_url())
         .unwrap_or_else(|| repository.to_string());
     validate_repository(&repository)?;
-    let reference = revision
-        .map(str::to_string)
-        .or_else(|| parsed.as_ref().and_then(|p| p.rev.clone()))
-        .map(Ok)
-        .unwrap_or_else(|| default_branch(t, &repository))?;
-    let commit = if let Ok(commit) = oid(&reference, "imported commit") {
-        GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
+    let commit = if std::path::Path::new(&repository).is_dir() {
+        let source = std::path::Path::new(&repository)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let revision = revision.unwrap_or("HEAD");
+        let resolved = crate::host_git::capture_required(
+            "git",
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{revision}^{{commit}}"),
+            ],
+            &source,
+        )?;
+        let commit = oid(&resolved, "local import")?;
+        import_local_commit(&source, t.work_dir(), &commit)?;
         commit
     } else {
-        oid(
-            &branch_snapshot(
-                t,
-                &repository,
-                reference.strip_prefix("refs/heads/").unwrap_or(&reference),
-            )?,
-            "imported commit",
-        )?
+        let reference = revision
+            .map(str::to_string)
+            .or_else(|| parsed.as_ref().and_then(|p| p.rev.clone()))
+            .map(Ok)
+            .unwrap_or_else(|| default_branch(t, &repository))?;
+        if let Ok(commit) = oid(&reference, "imported commit") {
+            GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
+            commit
+        } else {
+            oid(
+                &branch_snapshot(
+                    t,
+                    &repository,
+                    reference.strip_prefix("refs/heads/").unwrap_or(&reference),
+                )?,
+                "imported commit",
+            )?
+        }
     };
     ensure_code_commit(t, &mut open_store(t)?, &commit)?;
     append_transition(
