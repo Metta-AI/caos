@@ -303,18 +303,25 @@ fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
 /// to the append that would refuse it.
 ///
 /// The conversation is created by the `UserPromptSubmit` hook -- a SEPARATE
-/// process, whose step resolution measures ~12s in a cloud session (a shallow
-/// fetch of the pinned rev, a curry, a push over the tunnel). Claude Code does
-/// not hold the turn for it, so the model's first tool call can and does arrive
-/// before it lands. Refusing that call ("no conversation to record into") is
-/// what makes a session's WHOLE FIRST TURN fail while every later turn works,
-/// because by the second prompt the record exists. So a call waits for the
-/// record the prompt hook is even now pushing -- server-authoritative, so this
-/// process sees the other's push. Bounded well past the ~12s so a warm session
-/// never trips it; a conversation that never appears (the prompt hook failed
-/// outright) still errors, just after this rather than instantly.
-const TOOL_WAIT_ATTEMPTS: u32 = 30;
-const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// process, whose work measures ~12s in a cloud session: it is the CURRY AND
+/// PUSH of the request over the tunnel, not the fetch (a local `--llm-step`
+/// path is exactly as slow), and it does not cache, so every prompt pays it.
+/// Claude Code does not hold the turn for that, so the model's first tool call
+/// arrives before it lands, and refusing it ("no conversation to record into")
+/// is what makes a session's WHOLE FIRST TURN fail while every later turn works.
+///
+/// So a call WAITS for the record the prompt hook is pushing -- but SPARSELY,
+/// which is the whole subtlety. The probe is an ls-remote to the caos server,
+/// and the prompt hook is pushing to that same server through the same
+/// single-stream tunnel; a tight poll competes with the push for it and can
+/// starve the very thing it waits for -- measured, a 1s poll wedged the push so
+/// it never completed and the wait timed out against a conversation that would
+/// otherwise have landed at ~12s. Spaced probes leave the tunnel to the push.
+/// `fetch_validated_head` returns early on an absent ref, without a fetch or a
+/// local write, so a probe is cheap; the interval is what matters. Bounded well
+/// past the ~12s; a conversation that never appears still errors, just later.
+const TOOL_WAIT_ATTEMPTS: u32 = 15;
+const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
 
 fn wait_for_conversation(t: &GitTransport, id: &str) {
     for attempt in 0..TOOL_WAIT_ATTEMPTS {
