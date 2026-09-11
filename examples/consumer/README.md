@@ -4,7 +4,8 @@ This is a minimal flake for a project that *consumes* caos rather than being
 caos. It adds caos as a flake input and puts the caos commands on the dev
 shell's PATH: `caos-cli` (drive workers) and `caosd` (start the stack, which
 also publishes the builtin worker library on startup). Enter the shell once
-with `nix develop`, then run them as plain commands — no `nix run`/`nix build`.
+with `nix develop`, then run them as plain commands — no `nix run` or
+`nix build` needed.
 
 ## One-time
 
@@ -43,6 +44,6 @@ caos-cli run "$CAOS_CAS_DIR/out" --base:hash="$(git rev-parse HEAD:img)" --greet
 There is nothing to republish: `./inputs/caos/std/<name>` is a source directory
 in the tree you already have, and naming it resolves it — `caos-cli` ingests the
 directory and evaluates its `.caos-expr`. So after editing a builtin worker in
-the caos tree, update this repo's pin to it and the next run picks it up (a cache
+the caos tree, update this repo's pin and the next run picks it up (a cache
 hit for everything the edit didn't touch). No `caosd` restart, and no library ref
 to repoint.
