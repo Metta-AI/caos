@@ -571,13 +571,18 @@ revision (and made the history tools' hashes readable the same way).
 
 ## Publication
 
-The [conversation publication flow](design/chat.md) derives a PR stack from
-sibling gitlinks in filename order: the oldest is the base; each later snapshot
-is a PR boundary named by its full path. The client explicitly confirms the
-repository and external base branch. Provenance can suggest those fields;
-confirmed destinations are remembered locally. The first PR targets the external
-branch and each later PR targets the preceding boundary. Conversation files do
-not configure publication, and no snapshot has a special working or sealed state.
+The [conversation publication flow](design/chat.md) publishes one named gitlink
+with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
+branch name. The base is explicit; an omitted URL comes from unambiguous import
+provenance. Directory ordering guides review, not publication. Publish earlier
+PRs first, then name their remote branches as later PR bases.
+
+The client previews the exact source commit and destination before confirmation.
+If the source does not contain the fetched base tip, it offers to import that
+base and send the agent a merge/rebase and test request. This action publishes
+nothing; run `/pr` again after integration. Successful pushes and PR operations
+are recorded as CAOS transcript entries. No snapshot has a special working or
+sealed state.
 
 Per-mutation commits remain in the published source tree history. Only the
 previewed PR tip is checked for unresolved conflicts and reserved state;

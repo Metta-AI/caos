@@ -20,9 +20,8 @@ completed-turn hashes, and source tree diff.
 Turns continue running when another conversation is selected, so several agent
 source trees can advance concurrently without touching the working checkout.
 Agents may use `spawn_agent` to create an indexed child conversation. It runs
-through `run_async`; harvesting reconciles its result into a named source tree.
-Temporary child source trees stay inside the child; promote a completed result
-when it needs separate review. Child rows use
+through `run_async`; harvesting reconciles its changed conversation files and
+source trees into the parent, optionally restricted to named paths. Child rows use
 their prompt title and appear beneath the parent conversation.
 
 ## Build and run
@@ -158,7 +157,8 @@ so it never leaves the conversation pane.
 Failures from local UI commands are shown in a temporary red command-error
 panel instead of being inserted into the conversation transcript. Routine
 operation status is shown only while the operation is running and is not added
-to the transcript or title.
+to the transcript or title. Completed imports, pushes, and PR creation or
+updates remain in the transcript as CAOS messages.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
@@ -209,6 +209,13 @@ editor is involved. For a stack, publish the first PR, then run e.g.
 sibling ordering. `/publish-branch <gitlink> [remote-URL]` skips PR creation.
 Publication never edits or tests code. Ctrl+P and Ctrl+L have no bindings.
 
+When a PR source does not contain the fetched base tip, the preview offers to
+import that exact base and send an integration request to the agent. Enter
+confirms both; Escape cancels. The request stays in the original conversation
+and preserves drafts. It asks for a merge or rebase and tests, then stops for a
+fresh `/pr` review. This action does not publish. Successful pushes and PR
+creation or updates appear as persistent CAOS messages, including the PR URL.
+
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
@@ -234,8 +241,7 @@ slash-prefixed prompt is sent normally.
 `Ctrl+Shift+P` or `/commands` opens a searchable command palette without
 changing the current draft. Type any words from an action, use Up and Down to
 choose a match, then press Enter to run it. The palette covers conversation,
-source tree, publishing, activity, tool, help, reload, archive, and selection
-actions. Escape closes it.
+file browsing, activity, tool, help, reload, archive, and selection actions. Escape closes it.
 
 Bracketed paste mode keeps pasted newlines inside the prompt instead of
 submitting partial lines. Pastes over 1,000 characters are kept out of the
@@ -307,10 +313,3 @@ For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
 Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
 require Settings > General > Selection > Applications in terminal may access
 clipboard.
-
-When a PR source does not contain the fetched base tip, the preview offers to
-import that exact base and send an integration request to the agent. Enter
-confirms both; Escape cancels. The request stays in the original conversation
-and preserves drafts. It asks for a merge or rebase and tests, then stops for a
-fresh `/pr` review. This action does not publish. Successful pushes and PR
-creation or updates appear as persistent CAOS messages, including the PR URL.

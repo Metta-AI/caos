@@ -4,7 +4,9 @@ Conversations record content and execution in Git. They reference ordinary
 code commits through gitlinks. Files and folders organize source trees and
 review boundaries; a publication destination is optional until publishing.
 The TUI browses this filesystem read-only, showing file contents or the diff
-between adjacent code boundaries.
+between adjacent code boundaries. The client imports repositories, checks out
+code locally, and publishes explicitly named snapshots. Imports, pushes, and
+PR links remain visible as CAOS messages in conversation history.
 
 Imports are gitlinks to code commits. A local import snapshots the checkout's
 disk contents: an unchanged snapshot reuses HEAD; a changed snapshot becomes
@@ -121,8 +123,8 @@ The harness supplies source-tree organization and publication conventions to
 every model call, including subagents. Agents preserve bases, organize review
 boundaries, and integrate delegated changes using ordinary file operations;
 users specify the desired work and review structure. Imports conventionally live
-at `imports/<repo>/base`. A sibling `<import-path>.source.json` records available portable
-repository details, so sibling imports can come from different repositories.
+at `imports/<repo>/base`. A sibling `<import-path>.source.json` records portable
+repository details when available; imports can come from different repositories.
 The agent preserves imports. To build a PR stack, it copies an
 imported gitlink to `<feature>/00-base` and `<feature>/01-parser` before editing.
 Publication commands name the gitlink and base branch explicitly. The repository
@@ -194,8 +196,8 @@ conversation protocol metadata under `.caos/`.
 ## Code references and stack directories
 
 Code references are Git commit-valued tree entries (gitlinks, mode `160000`).
-A reference's value is a `W`; that commit's
-identity does not depend on the repository from which it was fetched.
+A reference's value is a `W`; its identity does not depend on the repository
+from which it was fetched.
 
 References may occur anywhere outside `.caos`. The TUI walks ordinary
 directories and lists each commit-valued entry it reaches, stopping at that
@@ -220,7 +222,9 @@ starting another reviewable change. Earlier snapshots remain unchanged.
 
 The browser lists entries in descending filename order. It compares a selected
 gitlink with the next gitlink below it; a folder previews its newest two
-gitlinks. The oldest entry has no comparison and shows content. Publication commands name their base branches explicitly. Naming a boundary does not squash intermediate Git commits.
+gitlinks. The oldest entry has no comparison and shows content. Publication
+commands name their base branches explicitly. Naming a boundary does not
+squash intermediate Git commits.
 
 Work, delegation, merging, tests, and review boundaries need only the recorded
 commits. No publication destination is required to prepare a stack. Fetching a
@@ -319,9 +323,9 @@ Publication itself never runs an agent or edits code. A base branch
 for a later PR must already exist remotely, so publish earlier PRs first.
 
 Find existing PRs by repository and branch. Inspect destination refs after an
-interrupted push before retrying. A confirmed push appends a `CAOS` transcript entry with the source commit and
-destination. Successful PR creation or update appends another entry with the PR
-URL, branch, and base. These remain visible after reopening the conversation;
+interrupted push before retrying. A confirmed push appends a `CAOS` transcript
+entry with the source commit and destination. Successful PR creation or update
+appends another entry with the PR URL, branch, and base. These remain visible after reopening the conversation;
 a failed PR operation never records a successful PR.
 A renamed gitlink changes the proposed branch, which appears in the preview.
 
@@ -341,7 +345,8 @@ A renamed gitlink changes the proposed branch, which appears in the preview.
 - `/update-tree <message>`: submit local edits to the selected code snapshot
   with a user message.
 - `/pr <conversation/gitlink> <base-remote-branch> [remote-URL]`: fetch and preview
-  one PR. Enter confirms publication; Escape cancels.
+  one PR. Enter confirms publication or the offered base-import and integration
+  request; Escape cancels.
 - `/publish-branch <conversation/gitlink> [remote-URL]`: preview and confirm a
   branch push without creating a PR.
 
@@ -356,9 +361,10 @@ the compared boundaries and hashes. There are no shell commands or Apply control
 The client handles host-side imports, checkout, and publication. The harness
 instructs the agent to give exact TUI commands or keys, with the intended paths,
 when user action is needed. A prose request to the agent does not run a client
-command. After an import finishes, a new user message resumes the agent. The
-agent organizes conversation content using files and folders. There is no active
-source tree in execution: file tools use conversation-relative paths, and Git
+command. After an ordinary `/import`, a new user message resumes the agent.
+The PR-base handoff sends its integration request as part of confirmation.
+The agent organizes conversation content using files and folders. There is no
+active source tree in execution: file tools use conversation-relative paths, and Git
 operations explicitly name their target. UI selection cannot retarget a run.
 
 ## Scope
