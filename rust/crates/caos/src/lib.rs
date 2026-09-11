@@ -18,7 +18,7 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
-pub mod checkout;
+pub mod gitlinks;
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -2119,7 +2119,7 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
             .write_to(&mut buf)
             .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
         let oid = hash_bytes("tree", &buf)?;
-        return checkout::commit(
+        return gitlinks::commit(
             cas_real,
             path,
             Hashed {
@@ -4777,15 +4777,24 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             ("commit".into(), base.clone())
         );
         let projection = dir.path().join("projection");
-        checkout::prepare(&t, &tree.to_string(), &[".".into()])
-            .unwrap()
-            .write(&projection)
-            .unwrap();
+        // Model the harness's writable directory metadata; put itself does
+        // not materialize editable files.
+        let source = cas.join(format!("checkout-{base}"));
+        get_hash(&t, &base, source.to_str().unwrap()).unwrap();
+        std::fs::create_dir(&projection).unwrap();
+        let project_fixture = |name: &str| {
+            let directory = projection.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for name in ["code", "run"] {
+                std::fs::copy(dir.path().join(name), directory.join(name)).unwrap();
+            }
+            std::os::unix::fs::symlink("code", directory.join("link")).unwrap();
+            xattr::set(&directory, "user.caos.commit", base.as_bytes()).unwrap();
+        };
+        project_fixture("dirty");
+        std::fs::write(projection.join("memory"), "remember").unwrap();
         assert_eq!(store(&t, Some(&cas), &projection).unwrap().1, tree);
-        checkout::prepare(&t, &base, &[".".into()])
-            .unwrap()
-            .write(&projection.join("copy"))
-            .unwrap();
+        project_fixture("copy");
         std::fs::rename(projection.join("copy"), projection.join("review")).unwrap();
         std::fs::write(
             projection.join("dirty/code"),
@@ -4801,7 +4810,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         assert_eq!(
             entry(b"review").oid.to_string(),
             base,
-            "cp -a/mv preserves exact signed commit"
+            "copied and renamed boundaries preserve the exact signed commit"
         );
         assert_eq!(
             entry(b"dirty").mode.kind(),
@@ -4818,7 +4827,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             "new content must not retain the old signature"
         );
         let resolved = cas.join("resolved");
-        checkout::resolve(
+        gitlinks::resolve(
             &t,
             &changed.to_string(),
             "dirty/run",
@@ -4829,7 +4838,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
             std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o111,
             0
         );
-        assert!(checkout::resolve(
+        assert!(gitlinks::resolve(
             &t,
             &changed.to_string(),
             "../code",

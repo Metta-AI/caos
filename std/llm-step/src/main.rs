@@ -2941,7 +2941,7 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
 fn bash_tool() -> Value {
     json!({
         "name":"bash",
-        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. To add an existing commit use caos checkout <full-hash> <destination> . . Protected .caos metadata cannot be changed.",
+        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. Protected .caos metadata cannot be changed.",
         "input_schema":{"type":"object","properties":{
             "cmd":{"type":"string"},
             "cwd":{"type":"string","description":"Optional conversation-relative working directory; defaults to the conversation root."},

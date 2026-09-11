@@ -28,6 +28,8 @@
 //! change. The latter is what a worker with mutable loop state wants — config
 //! rides along untouched, and only the state is unbound and rebound.
 
+pub mod files;
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};

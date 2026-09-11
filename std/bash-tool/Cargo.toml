@@ -3,8 +3,8 @@
 # source (src/main.rs), this manifest, its `.caos-expr` and `DEPS`. Resolving
 # this entry evaluates the expression, which builds this project with
 # rustc (reached by a local DEEP-DEPS/rustc mount) and curries it onto the
-# runner pool. No crates.io deps — only worker-common, spliced by rustc — so
-# nothing rides the std/cargo bake.
+# runner pool. worker-common is spliced by rustc; its dependency is provided by the
+# std/cargo bake.
 [package]
 name = "bash-tool"
 version = "0.0.0"

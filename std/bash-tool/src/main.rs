@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use worker_common::{arg, caos, cas_hash, link, path, run_worker, scratch, ARGS};
+use worker_common::{arg, caos, link, path, run_worker, scratch, ARGS};
 
 /// Keep at most this many bytes (the tail) of each captured stream.
 const STREAM_CAP: usize = 100_000;
@@ -34,10 +34,7 @@ fn run() -> Result<(), String> {
         return Err(format!("no source tree at {tree}"));
     }
     let work = scratch("work")?;
-    let hash = cas_hash(&tree)?;
-    let mut checkout = vec!["checkout".to_string(), hash, path(&work).to_string()];
-    checkout.extend(paths);
-    worker_common::caos_argv(&checkout.iter().map(String::as_str).collect::<Vec<_>>())?;
+    worker_common::files::materialize(&tree, &work, &paths)?;
     let cwd = if Path::new(&format!("{base}/cwd")).exists() {
         read_blob(&format!("{base}/cwd"))?
     } else {
@@ -166,7 +163,7 @@ fn scan_denied(stderr: &str, work: &Path) -> BTreeSet<String> {
 }
 
 /// Whether resolving `rel` from the work root crosses a placeholder symlink
-/// (a link into `/cas` — the symlinks checkout creates for unloaded
+/// (a link into `/cas` — the symlinks the harness creates for unloaded
 /// nodes; git symlinks it recreates point elsewhere).
 fn crosses_placeholder(work: &Path, rel: &str) -> bool {
     let cas = Path::new(ARGS).parent().unwrap_or(Path::new("/cas"));
