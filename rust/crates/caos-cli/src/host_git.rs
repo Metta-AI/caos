@@ -34,7 +34,7 @@ pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), Strin
 /// user-authored turn. It deliberately DOES commit — staging everything with
 /// `git add -A` and committing when the tree is dirty — so the checkout is left
 /// clean and its `HEAD` matches exactly what the turn receives. A later
-/// `Ctrl+L` onto the conversation's new head then succeeds instead of tripping
+/// `/checkout` onto the conversation's new head then succeeds instead of tripping
 /// the clean-tree guard. When the working tree is already clean (the user
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit

@@ -123,8 +123,9 @@ at `imports/<repo>/base`. A sibling `<import-path>.source.json` records availabl
 repository details, so sibling imports can come from different repositories.
 The agent preserves imports. To build a PR stack, it copies an
 imported gitlink to `<feature>/00-base` and `<feature>/01-parser` before editing.
-Publication destinations are confirmed in the client preview. Provenance can
-suggest a destination, but never selects one silently.
+Publication commands name the gitlink and base branch explicitly. The repository
+URL comes from the command or unambiguous import provenance; the preview shows
+the resolved destination before confirmation.
 
 Commands start at the conversation root. Memories, skills, notes, and source
 trees share one path space. A commit-valued entry appears as a directory whose
@@ -217,8 +218,7 @@ starting another reviewable change. Earlier snapshots remain unchanged.
 
 The browser lists entries in descending filename order. It compares a selected
 gitlink with the next gitlink below it; a folder previews its newest two
-gitlinks. The oldest entry has no comparison and shows content. Publication
-uses the same order. Naming a boundary does not squash intermediate Git commits.
+gitlinks. The oldest entry has no comparison and shows content. Publication commands name their base branches explicitly. Naming a boundary does not squash intermediate Git commits.
 
 Work, delegation, merging, tests, and review boundaries need only the recorded
 commits. No publication destination is required to prepare a stack. Fetching a
@@ -280,39 +280,38 @@ its checkout destination again.
 
 ## Publication
 
-Select a stack directory and choose its destination in the client:
+`/pr <conversation/gitlink> <base-remote-branch> [remote-URL]` prepares one PR.
+The gitlink supplies the exact code commit and its path supplies the branch
+name. The base branch is always explicit; directory order never chooses it.
+For example, publish a stack one boundary at a time:
 
-- Repository and external base branch: explicit fields in the preview.
-- Branch names: entry paths, such as `paintbot-feature/01-add-targeting`.
-- PR bases: the external branch for the first change, then the preceding
-  boundary's branch for each subsequent PR. The oldest sibling is the base,
-  so it does not become a PR.
+```text
+/pr paintbot-feature/01-add-targeting main
+/pr paintbot-feature/02-improve-it paintbot-feature/01-add-targeting
+```
 
-The client remembers confirmed destinations locally by server, conversation,
-and stack directory. Without a remembered choice, it can suggest provenance
-from an imported gitlink matching the stack's oldest commit exactly. Conflicting
-origins give no automatic suggestion. The user can edit all suggested values.
-Import provenance describes origin; it is not publication policy. No `.base-url`
-file is read or required, and a nearby metadata file cannot silently retarget a push.
+The optional remote is a repository URL, not a local remote name such as
+`origin`. Without it, the client uses import provenance matching the oldest
+sibling's commit. Multiple matching imports must agree on the URL; differing
+default branches do not matter because the command specifies the base. Missing
+or ambiguous provenance requires an explicit URL. No remembered publication
+destination or `.base-url` policy is consulted.
 
-Press Enter to fetch the chosen destination and inspect a preview, then Enter
-again to publish. Changing the selection or destination requires a fresh preview.
+The command fetches the destination and opens a read-only preview of the source
+path, commit, repository, branch, and base. Enter confirms; Escape cancels.
+Changing the request requires a new command and preview. The client uses its
+Git and GitHub credentials to push that exact commit and open or reuse a PR.
+No local working checkout is required. `/publish-branch <conversation/gitlink>
+[remote-URL]` uses the same flow without creating a PR or requiring a base.
 
-The TUI performs publication on the client host using its Git and GitHub
-credentials; no local working checkout is required. The preview captures the
-code commits, destination branches, PR bases, and current remote tips. After
-confirmation, push those exact commits and ancestry,
-then open or reuse the PRs. Reject changed content, changed boundaries, remote
-drift, unresolved conflicts, and a PR base not incorporated into the code.
-Preparation, builds, and tests happen before previewing; publishing never runs
-an agent or changes code.
+Reject changed content, remote drift, unresolved conflicts, and a PR base not
+incorporated into the code. The agent prepares, integrates, and tests changes
+before publication; publishing never runs an agent or edits code. A base branch
+for a later PR must already exist remotely, so publish earlier PRs first.
 
-Find existing PRs by confirmed repository and branch. Inspect destination refs
-after an interrupted push before retrying. Any recovery events belong in commit
-history.
-
-Reject invalid or colliding derived branch names visibly. A renamed path changes
-the proposed destination, which appears in the preview.
+Find existing PRs by repository and branch. Inspect destination refs after an
+interrupted push before retrying. Publication events belong in commit history.
+A renamed gitlink changes the proposed branch, which appears in the preview.
 
 ## Client interactions
 
@@ -322,19 +321,20 @@ the proposed destination, which appears in the preview.
 - `/import <path> <source> [revision]`: import a checkout snapshot or Git revision
   at an unused conversation path, as described above. Existing differing
   provenance is rejected, not overwritten.
-- `Ctrl+L`: check the selected code snapshot out in its remembered local directory.
-  If none is selected, prompt for `/checkout <directory>`.
-- `/checkout <directory>`: choose an existing clean Git checkout or an empty/new
-  directory, check out the selected commit with detached HEAD, and remember the
-  destination locally. Relative paths are resolved from the launching directory.
+- `/checkout <conversation/gitlink> [directory]`: check out the named commit
+  with detached HEAD in an existing clean Git checkout or an empty/new directory.
+  Remember the destination locally; omitting it reuses that gitlink's destination.
+  Relative paths resolve from the launching directory. A successful checkout
+  also selects the source for local edit submission.
 - `/update-tree <message>`: submit local edits to the selected code snapshot
   with a user message.
-- `Ctrl+P`: choose and preview the selected directory's review boundaries.
-  Space selects entries; `e` edits the repository and external base branch
-  (Tab switches fields, Ctrl+U clears). Enter loads the remote preview; a second
-  Enter confirms publication. Escape closes the preview.
-- `/publish-branch`: confirm a repository and push the selected snapshot without
-  creating a PR. A base branch is not required.
+- `/pr <conversation/gitlink> <base-remote-branch> [remote-URL]`: fetch and preview
+  one PR. Enter confirms publication; Escape cancels.
+- `/publish-branch <conversation/gitlink> [remote-URL]`: preview and confirm a
+  branch push without creating a PR.
+
+Checkout and publication use explicit paths, independent of browser selection.
+There are no Ctrl+L or Ctrl+P bindings.
 
 The browser pins the conversation head when opened; refresh loads the latest
 head. Ordinary files show contents. Inside a source boundary, files show their

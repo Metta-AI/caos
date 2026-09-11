@@ -3969,8 +3969,7 @@ mod tests {
         assert_eq!(
             source_trees::publication_provenance(&transport, "stack", "feature/apples")
                 .unwrap()
-                .unwrap()
-                .repository,
+                .unwrap(),
             "https://example.com/repo"
         );
         fixture_reference(&transport, "stack", "imports/other/base", Some(&base)).unwrap();
@@ -3988,53 +3987,86 @@ mod tests {
             "feature/.base-url",
             Some(b"https://wrong.example/repo\nwrong\n".to_vec()),
         );
-        // Review boundaries are complete and inspectable before a destination
-        // is chosen. Only publication needs that policy.
-        let unconfigured = source_trees::publication_plan(&transport, "stack")
-            .unwrap()
-            .into_iter()
-            .filter(|target| target.base_commit.is_some())
-            .collect::<Vec<_>>();
-        assert_eq!(unconfigured.len(), 2);
-        assert!(unconfigured
-            .iter()
-            .all(|target| target.repository.is_empty()));
-        assert_eq!(unconfigured[0].head, one);
-        assert_eq!(unconfigured[1].head, two);
-        assert!(source_trees::publication_order(&unconfigured)
-            .unwrap_err()
-            .contains("choose a destination"));
-
-        let destination = source_trees::PublicationDestination {
-            repository: repository.clone(),
-            base_branch: "main".into(),
-        };
-        let content_head = conversation_head(&transport, "stack").unwrap();
-        let mut plan = unconfigured;
-        for target in &mut plan {
-            source_trees::resolve_publication_target(&transport, target, &destination, false)
-                .unwrap();
+        assert!(source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            None
+        )
+        .unwrap_err()
+        .contains("unambiguous"));
+        assert!(source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "missing",
+            Some("main"),
+            Some(&repository)
+        )
+        .is_err());
+        // Repository inference is independent of the metadata's default branch.
+        let remote_url = format!("file://{repository}");
+        for (path, branch) in [
+            ("imports/repo/base.source.json", "main"),
+            ("imports/other/base.source.json", "develop"),
+        ] {
+            write_metadata(
+                path,
+                Some(
+                    serde_json::json!({"repository": remote_url, "default_branch": branch})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            );
         }
+        let inferred = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(inferred.repository, remote_url);
+        assert_eq!(inferred.base_branch, "main");
+        let content_head = conversation_head(&transport, "stack").unwrap();
+        let first = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
         assert_eq!(
             conversation_head(&transport, "stack").unwrap(),
             content_head
         );
-        assert!(plan.iter().all(|target| target.repository == repository));
-        assert!(
-            source_trees::publication_provenance(&transport, "stack", "feature/apples")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            plan.iter()
-                .map(|p| p.source_tree.as_str())
-                .collect::<Vec<_>>(),
-            ["feature/apples", "feature/dirty"]
-        );
-        assert_eq!(plan[0].base_branch, "main");
-        assert_eq!(plan[1].base_branch, "feature/apples");
-        source_trees::publish_target(&transport, "stack", &plan[0], &base).unwrap();
-        source_trees::publish_target(&transport, "stack", &plan[1], &one).unwrap();
+        assert_eq!(first.head, one);
+        assert_eq!(first.repository, repository);
+        source_trees::publish_target(&transport, "stack", &first, &base).unwrap();
+
+        // The explicit base wins even for a later sibling; a single PR is not an implicit stack.
+        let independent = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert_eq!(independent.base_branch, "main");
+        assert_eq!(independent.base_commit.as_deref(), Some(base.as_str()));
+        let second = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("feature/apples"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert_eq!(second.base_commit.as_deref(), Some(one.as_str()));
+        source_trees::publish_target(&transport, "stack", &second, &one).unwrap();
         assert_eq!(
             git(
                 &root.join("origin.git"),
@@ -4050,19 +4082,18 @@ mod tests {
             two
         );
 
-        // The remote changed since this preview: it cannot be silently reused.
-        assert!(source_trees::publish_target(&transport, "stack", &plan[0], &base).is_err());
-        let mut fresh = source_trees::publication_plan(&transport, "stack")
-            .unwrap()
-            .into_iter()
-            .filter(|target| target.base_commit.is_some())
-            .collect::<Vec<_>>();
-        for target in &mut fresh {
-            source_trees::resolve_publication_target(&transport, target, &destination, false)
-                .unwrap();
-        }
+        // A preview never authorizes different content or a changed remote branch.
+        assert!(source_trees::publish_target(&transport, "stack", &first, &base).is_err());
+        let fresh = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
         fixture_reference(&transport, "stack", "feature/apples", Some(&two)).unwrap();
-        assert!(source_trees::publish_target(&transport, "stack", &fresh[0], &base).is_err());
+        assert!(source_trees::publish_target(&transport, "stack", &fresh, &base).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

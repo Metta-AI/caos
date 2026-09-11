@@ -385,11 +385,11 @@ the object machinery through a one-way dependency. Their difference is the
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `tui` — interactive conversations, with a bundled harness independent of
-    target repositories. It starts without code; `caos tui --import feature/dirty`
+    target repositories. It starts without code; `caos tui --import imports/repo/base`
     imports the checkout at that path. Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
-    remote repository commits. Ctrl+P previews and publishes exact code commits
-    as a PR stack;
+    remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
+    one PR, and `/checkout <gitlink> [directory]` exports code for local editing;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form. A conversation NAMES the two

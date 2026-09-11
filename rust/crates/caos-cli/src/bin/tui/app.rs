@@ -33,7 +33,7 @@ pub(crate) mod ui;
 use filesystem::Browser;
 #[path = "publication.rs"]
 mod publication;
-use publication::{PlanRow, PublishPlanPrompt};
+use publication::PublishPrompt;
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
@@ -878,7 +878,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 11] = [
+const COMMANDS: [Command; 12] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -909,8 +909,8 @@ const COMMANDS: [Command; 11] = [
     },
     Command {
         name: "/checkout",
-        usage: "/checkout <directory>",
-        description: "check out the selected commit and remember its local directory",
+        usage: "/checkout <conversation/gitlink> [directory]",
+        description: "check out this gitlink, reusing its local directory when omitted",
         action: AppAction::Checkout,
         takes_argument: true,
     },
@@ -929,11 +929,18 @@ const COMMANDS: [Command; 11] = [
         takes_argument: false,
     },
     Command {
+        name: "/pr",
+        usage: "/pr <conversation/gitlink> <base-remote-branch> [remote-URL]",
+        description: "preview a PR for this gitlink against an explicit remote branch",
+        action: AppAction::Publish,
+        takes_argument: true,
+    },
+    Command {
         name: "/publish-branch",
-        usage: "/publish-branch",
-        description: "publish the selected source tree to its branch",
+        usage: "/publish-branch <conversation/gitlink> [remote-URL]",
+        description: "preview a branch push without creating a PR",
         action: AppAction::PublishBranch,
-        takes_argument: false,
+        takes_argument: true,
     },
     Command {
         name: "/ref",
@@ -1006,7 +1013,7 @@ struct ConversationState {
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     publishing: bool,
-    publish_plan: Option<PublishPlanPrompt>,
+    publish_plan: Option<PublishPrompt>,
     publication_cancel: Option<Arc<AtomicBool>>,
     forking: bool,
     source_tree_operation: bool,
@@ -1546,7 +1553,7 @@ enum UiMessage {
     PublicationPlanned {
         conversation: String,
         id: u64,
-        result: Result<Vec<PlanRow>, String>,
+        result: Result<caos_cli::source_trees::PublicationTarget, String>,
     },
     Published {
         conversation: String,
@@ -1606,7 +1613,7 @@ struct PaletteCommand {
     action: AppAction,
 }
 
-const PALETTE_COMMANDS: [PaletteCommand; 11] = [
+const PALETTE_COMMANDS: [PaletteCommand; 8] = [
     PaletteCommand {
         label: "Browse conversation files",
         shortcut: Some(Shortcut::new("o", "Ctrl+O", false)),
@@ -1618,24 +1625,6 @@ const PALETTE_COMMANDS: [PaletteCommand; 11] = [
         shortcut: Some(Shortcut::new("n", "Ctrl+N", false)),
         keywords: "create start chat",
         action: AppAction::NewConversation,
-    },
-    PaletteCommand {
-        label: "Check out conversation",
-        shortcut: Some(Shortcut::new("l", "Ctrl+L", false)),
-        keywords: "load source tree git",
-        action: AppAction::Checkout,
-    },
-    PaletteCommand {
-        label: "Publish pull request",
-        shortcut: Some(Shortcut::new("p", "Ctrl+P twice", false)),
-        keywords: "source tree push pr github origin",
-        action: AppAction::Publish,
-    },
-    PaletteCommand {
-        label: "Publish branch",
-        shortcut: None,
-        keywords: "source tree push origin",
-        action: AppAction::PublishBranch,
     },
     PaletteCommand {
         label: "Show activity",
@@ -1991,20 +1980,7 @@ impl App {
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        if let Some(prompt) = self.selected_mut().publish_plan.as_mut() {
-            if prompt.editing && !prompt.loading {
-                if text.chars().any(char::is_control) {
-                    prompt.error = Some("destination fields must be a single line".into());
-                } else if let Some(row) = prompt.rows.get_mut(prompt.selected) {
-                    let value = if prompt.field == 0 {
-                        &mut row.destination.repository
-                    } else {
-                        &mut row.destination.base_branch
-                    };
-                    value.push_str(text);
-                    prompt.sync_destination();
-                }
-            }
+        if self.selected().publish_plan.is_some() {
             return;
         }
         if self.browser_visible() {
@@ -2440,7 +2416,7 @@ impl App {
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
-            AppAction::Checkout => self.load_selected_at(Some(arguments)),
+            AppAction::Checkout => self.run_checkout(arguments),
             AppAction::BrowseFiles => self.open_browser(),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
@@ -2460,8 +2436,8 @@ impl App {
                     .push_info(format!("Model for future turns: {model}"));
             }
             AppAction::From => self.start_from_hash(arguments),
-            AppAction::Publish => self.publish_selected(),
-            AppAction::PublishBranch => self.publish_branch_selected(),
+            AppAction::Publish => self.run_publication(arguments, false),
+            AppAction::PublishBranch => self.run_publication(arguments, true),
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
             AppAction::NewConversation
@@ -2780,15 +2756,7 @@ impl App {
                         {
                             prompt.loading = false;
                             match result {
-                                Ok(rows) => {
-                                    prompt.selected =
-                                        rows.iter().position(|row| row.included).unwrap_or(0);
-                                    prompt.previewed = rows
-                                        .iter()
-                                        .filter(|row| row.included)
-                                        .all(|row| row.target.diagnostic.is_none());
-                                    prompt.rows = rows;
-                                }
+                                Ok(target) => prompt.target = Some(target),
                                 Err(error) => prompt.error = Some(error),
                             }
                         }
@@ -3297,10 +3265,6 @@ impl App {
             self.handle_palette_key(key);
             return;
         }
-        if shortcut == Some(AppAction::Publish) {
-            self.publish_selected();
-            return;
-        }
         if key.code == KeyCode::Esc && self.selected().reference_notice.is_some() {
             self.selected_mut().reference_notice = None;
             return;
@@ -3562,9 +3526,9 @@ impl App {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
             }
-            AppAction::Checkout => self.load_selected(),
-            AppAction::Publish => self.publish_selected(),
-            AppAction::PublishBranch => self.publish_branch_selected(),
+            AppAction::Publish | AppAction::PublishBranch => {
+                unreachable!("publication requires explicit command arguments")
+            }
             AppAction::Activity => {
                 self.view = if self.view == View::Activity {
                     View::Chat
@@ -3599,7 +3563,8 @@ impl App {
                 self.selected_mut().publish_plan = None;
                 self.palette = self.palette.take().is_none().then(CommandPalette::default);
             }
-            AppAction::From
+            AppAction::Checkout
+            | AppAction::From
             | AppAction::Invite
             | AppAction::Model
             | AppAction::Reference
@@ -3924,65 +3889,72 @@ impl App {
         super::launcher::checkout_for(&self.repo_dir, &self.selected().id, &source.name, head)
     }
 
-    fn load_selected(&mut self) {
-        self.load_selected_at(None);
-    }
-
-    fn load_selected_at(&mut self, directory: Option<&str>) {
+    fn run_checkout(&mut self, arguments: &str) {
+        let parts = match shell_words::split(arguments) {
+            Ok(parts)
+                if (1..=2).contains(&parts.len()) && parts.iter().all(|p| !p.trim().is_empty()) =>
+            {
+                parts
+            }
+            _ => {
+                self.selected_mut()
+                    .show_command_error("usage: /checkout <conversation/gitlink> [directory]");
+                return;
+            }
+        };
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before checking it out");
             return;
         }
         let result: Result<String, String> = (|| {
-            let diff = self.selected().require_selected_source_tree()?.clone();
-            let checkout = if let Some(directory) = directory {
-                if directory.trim().is_empty() {
-                    return Err("usage: /checkout <directory>".into());
-                }
+            let source = self
+                .selected()
+                .source_trees
+                .iter()
+                .find(|source| source.name == parts[0])
+                .ok_or_else(|| format!("no source-tree gitlink at {:?}", parts[0]))?;
+            let checkout = if let Some(directory) = parts.get(1) {
                 let path = super::launcher::local_path(&self.repo_dir, directory);
                 let checkout = super::launcher::prepare_checkout(&path)?;
                 super::launcher::import_local_commit(
                     &self.repo_dir,
                     &checkout,
-                    &conversation_protocol::v3::Oid::parse(&diff.head, "checkout")?,
+                    &conversation_protocol::v3::Oid::parse(&source.head, "checkout")?,
                 )?;
                 checkout
             } else {
-                self.checkout_selected_source_tree(&diff.head)?
+                super::launcher::checkout_for(
+                    &self.repo_dir,
+                    &self.selected().id,
+                    &source.name,
+                    &source.head,
+                )?
             };
-            load_conversation_source_tree(&diff.head, &checkout)?;
+            load_conversation_source_tree(&source.head, &checkout)?;
             super::launcher::remember_checkout(
                 &self.repo_dir,
                 &self.selected().id,
-                &diff.name,
+                &source.name,
                 &checkout,
             )?;
             Ok(format!(
                 "checked out {} at {} in {} (detached HEAD)",
-                diff.name,
-                short_hash(&diff.head),
+                source.name,
+                short_hash(&source.head),
                 checkout.display()
             ))
         })();
         match result {
             Ok(status) => {
-                self.selected_mut().command_error = None;
-                self.selected_mut().status = status;
+                let state = self.selected_mut();
+                let _ = state.select_source_tree(&parts[0]);
+                state.command_error = None;
+                state.status = status.clone();
+                state.push_info(status);
             }
-            Err(error) => {
-                if error == "choose a local destination with /checkout <directory>"
-                    && self.selected().composer.expanded_text().is_empty()
-                {
-                    self.selected_mut().composer.insert_str("/checkout ");
-                }
-                self.selected_mut().show_command_error(error);
-            }
+            Err(error) => self.selected_mut().show_command_error(error),
         }
-    }
-
-    fn publish_branch_selected(&mut self) {
-        self.open_publication(true);
     }
 }
 
@@ -4917,6 +4889,7 @@ mod tests {
                 "/checkout",
                 "/import",
                 "/commands",
+                "/pr",
                 "/publish-branch",
                 "/ref",
                 "/invite",
@@ -4976,9 +4949,12 @@ mod tests {
 
         assert!(parse_command("/load https://github.com/Metta-AI/caos/pull/34").is_none());
 
-        let (command, arguments) = parse_command("/publish-branch").unwrap();
+        let (command, arguments) = parse_command("/publish-branch feature/01-change").unwrap();
         assert_eq!(command.action, AppAction::PublishBranch);
-        assert!(arguments.is_empty());
+        assert_eq!(arguments, "feature/01-change");
+        let (command, arguments) = parse_command("/pr feature/01-change main").unwrap();
+        assert_eq!(command.action, AppAction::Publish);
+        assert_eq!(arguments, "feature/01-change main");
 
         let (command, arguments) = parse_command("/ref").unwrap();
         assert_eq!(command.action, AppAction::Reference);
@@ -6136,7 +6112,9 @@ mod tests {
         assert!(rendered.contains("follow-up"));
         assert!(rendered.contains("Enter/^J newline"));
         assert!(rendered.contains("^S send"));
-        assert!(rendered.contains("^L checkout"));
+        assert!(rendered.contains("/checkout"));
+        assert!(!rendered.contains("^L checkout"));
+        assert!(!rendered.contains("^P PR"));
         assert!(!rendered.contains("publish"));
         assert!(!rendered.contains("Alt+Enter"));
 
@@ -6217,7 +6195,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_l_requires_a_destination_then_reuses_it() {
+    fn checkout_command_requires_a_destination_then_reuses_it() {
         let dir = throwaway_repo("ctrl-l");
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -6262,21 +6240,27 @@ mod tests {
         ]);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(app.selected().publish_plan.is_none());
         assert_eq!(git(&["rev-parse", "HEAD"]), base);
-        assert_eq!(app.selected().composer.expanded_text(), "/checkout ");
-        app.load_selected_at(Some(&dir.to_string_lossy()));
+        assert!(app.selected().composer.expanded_text().is_empty());
+        app.run_checkout(&format!(
+            "main {}",
+            shell_words::quote(&dir.to_string_lossy())
+        ));
         git(&["checkout", "--detach", "-q", &base]);
-        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        app.run_checkout("main");
 
         assert_eq!(git(&["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            app.selected().status,
-            format!(
+        assert!(app
+            .selected()
+            .transcript
+            .iter()
+            .any(|entry| entry.text.contains(&format!(
                 "checked out main at {} in {} (detached HEAD)",
                 short_hash(&head),
                 dir.display()
-            )
-        );
+            ))));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -6776,71 +6760,54 @@ mod tests {
     }
 
     #[test]
-    fn publication_preview_preserves_drafts_and_selection() {
+    fn publication_preview_preserves_drafts_and_cannot_be_retargeted() {
         use caos_cli::source_trees::PublicationTarget;
         let mut conversation = state("talk-1");
-        conversation.composer.insert_str("preserve this draft");
-        conversation.publish_plan = Some(PublishPlanPrompt {
+        conversation.composer.text = "preserve this draft".into();
+        conversation.publish_plan = Some(PublishPrompt {
             id: 1,
             loading: false,
-            selected: 0,
             error: None,
             branch_only: false,
-            previewed: true,
-            editing: false,
-            field: 0,
-            rows: vec![PlanRow {
-                destination: caos_cli::source_trees::PublicationDestination {
-                    repository: "https://github.com/team/repo".into(),
-                    base_branch: "main".into(),
-                },
-                included: true,
-                target: PublicationTarget {
-                    source_tree: "docs".into(),
-                    head: "a".repeat(40),
-                    repository: "https://github.com/team/repo".into(),
-                    branch: "caos/talk/docs".into(),
-                    base_branch: "main".into(),
-                    parent: None,
-                    remote_head: None,
-                    base_commit: None,
-                    diagnostic: None,
-                },
-            }],
+            target: Some(PublicationTarget {
+                source_tree: "feature/02-change".into(),
+                head: "a".repeat(40),
+                repository: "https://example.com/repo".into(),
+                branch: "feature/02-change".into(),
+                base_branch: "main".into(),
+                base_commit: Some("b".repeat(40)),
+                remote_head: None,
+            }),
         });
-        let (mut app, _) = app_with(vec![conversation]);
-        assert!(rendered_screen(&app).contains("Publish source trees"));
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        let (mut app, tx) = app_with(vec![conversation]);
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Publish PR"));
+        assert!(rendered.contains("feature/02-change"));
+        assert!(rendered.contains("PR base: main"));
         app.insert_paste("https://example.com/other");
-        assert_eq!(app.selected().composer.text, "preserve this draft");
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for ch in "develop".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let prompt = app.selected().publish_plan.as_ref().unwrap();
-        assert!(!prompt.previewed);
-        assert!(!prompt.editing);
-        assert_eq!(
-            prompt.rows[0].destination.repository,
-            "https://example.com/other"
-        );
-        assert_eq!(prompt.rows[0].destination.base_branch, "develop");
-        assert!(rendered_screen(&app).contains("Enter preview"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app
-            .selected()
-            .publish_plan
-            .as_ref()
-            .unwrap()
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("select at least one"));
+        assert_eq!(
+            app.selected()
+                .publish_plan
+                .as_ref()
+                .unwrap()
+                .target
+                .as_ref()
+                .unwrap()
+                .repository,
+            "https://example.com/repo"
+        );
+        assert_eq!(app.selected().composer.text, "preserve this draft");
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.selected().publish_plan.is_none());
+        tx.send(UiMessage::PublicationPlanned {
+            conversation: "talk-1".into(),
+            id: 1,
+            result: Err("late result".into()),
+        })
+        .unwrap();
+        app.drain_messages();
         assert!(app.selected().publish_plan.is_none());
         assert_eq!(app.selected().composer.text, "preserve this draft");
     }
