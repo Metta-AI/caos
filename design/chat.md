@@ -6,6 +6,11 @@ review boundaries; a publication destination is optional until publishing.
 The TUI browses this filesystem read-only, showing file contents or the diff
 between adjacent code boundaries.
 
+Local path imports copy disk contents into ordinary conversation files and
+folders. Importing a Git revision preserves a code commit and its ancestry as
+a gitlink. Editing ordinary content changes `C`; editing a gitlink's contents
+also creates a new `W`.
+
 | Thing | Where | Meaning |
 | --- | --- | --- |
 | `C` | CAOS Git | Conversation content in its tree; execution events in its commit message. |
@@ -86,12 +91,11 @@ The harness supplies source-tree organization and publication conventions to
 every model call, including subagents. Agents preserve bases, organize review
 boundaries, and integrate delegated changes using ordinary file operations;
 users specify the desired work and review structure. Imports conventionally live
-at `imports/<repo>/base`, with portable provenance in a sibling `.source.json`.
-Local paths import ordinary files or folders from disk; explicit Git revisions
-import gitlinks. The agent preserves imports. To build a PR stack, it copies an
+at `imports/<repo>/base`. A sibling `.source.json` records available portable
+repository details. The agent preserves imports. To build a PR stack, it copies an
 imported gitlink to `<feature>/00-base` and `<feature>/dirty` before editing.
-When publishing, it uses recorded repository and default-branch details to write `.base-url`, unless the user chose another
-destination. Missing or ambiguous details require clarification only then.
+When publishing, it uses recorded repository and default-branch details to write
+`.base-url`, unless the user chose another destination. Missing or ambiguous details require clarification only then.
 
 Commands start at the conversation root. Memories, skills, notes, and source
 trees share one path space. A commit-valued entry appears as a directory whose
@@ -104,7 +108,8 @@ Bash runs from this root, with an optional relative `cwd` for a single call.
 Its `paths` list is always relative to the conversation root: declared
 directories include their descendants; undeclared contents remain lazy.
 
-Use ordinary filesystem operations to organize content:
+Use ordinary filesystem operations to organize content. This example starts
+with a gitlink imported at `imports/caos/base`:
 
 ```sh
 mkdir -p feature
@@ -152,8 +157,8 @@ directories and lists each commit-valued entry it reaches, stopping at that
 entry. Nested gitlinks remain traversable by file tools but are not separate
 TUI source-tree targets.
 
-A single reference is enough for simple work. For reviewable changes, copy the
-import into a feature directory and follow this convention:
+A single reference is enough for simple work. For reviewable changes, copy an
+imported gitlink into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
@@ -222,8 +227,7 @@ image arguments also work; no root DEPS entry is required.
 
 Add `--import imports/caos/base` to snapshot the launching checkout
 at that exact path. Add `--base HEAD` (or another revision) to import a Git
-commit instead. Cloud
-sessions likewise start from a stable CAOS client repository/environment and
+commit instead. Cloud sessions likewise start from a stable CAOS client repository/environment and
 attach target code afterward. This also makes bootstrap caching independent
 of the target repositories.
 
@@ -275,8 +279,9 @@ the proposed destination, which appears in the preview.
   A local file becomes a file; a local directory becomes an ordinary folder,
   using the current disk contents, including uncommitted and untracked files.
   Directory imports honor `.gitignore` and repository-local excludes, and omit
-  `.git`; symlinks and executable bits are preserved. The source need not be a Git repository. No source index,
-  branch, or file is changed. Quote paths containing spaces.
+  `.git`; symlinks and executable bits are preserved. The source need not be a
+  Git repository. No source index, branch, or file is changed. Quote paths
+  containing spaces.
   For example: `/import imports/notes "/home/ubuntu/my notes"`.
   A remote URL, or a local repository with an explicit revision, imports a commit
   as a gitlink instead. Remote URLs without a revision use their default branch.
