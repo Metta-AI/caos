@@ -1,7 +1,7 @@
 //! Client imports and publication plans derived from directory contents.
 use super::*;
-use conversation_protocol::v3::source_trees::{is_boundary, validate_repository, validate_source};
-use conversation_protocol::v3::{BaseUrl, Mode};
+use conversation_protocol::v3::source_trees::{validate_repository, validate_source};
+use conversation_protocol::v3::Mode;
 use std::collections::BTreeSet;
 
 /// Transfer history between the trusted local checkout and client repository.
@@ -349,6 +349,17 @@ pub fn import_source(
     Ok(object.to_string())
 }
 
+/// An explicit client choice, never read from conversation publication policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublicationDestination {
+    pub repository: String,
+    pub base_branch: String,
+}
+
+pub fn stack_directory(path: &str) -> &str {
+    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationTarget {
     pub source_tree: String,
@@ -358,63 +369,22 @@ pub struct PublicationTarget {
     pub base_branch: String,
     pub base_commit: Option<String>,
     pub parent: Option<String>,
-    pub base_url: Option<BaseUrl>,
     pub remote_head: Option<String>,
     pub diagnostic: Option<String>,
 }
 
+/// Discover snapshots without fetching or selecting a publishing repository.
+/// The first sibling is the base; every later sibling is a review boundary.
 pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTarget>, String> {
     let store = open_store(t)?;
     let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
     let view = Conversation::open(&store, &head)?;
     let mut targets = Vec::new();
     for name in view.source_tree_names()? {
-        if !is_boundary(name.rsplit('/').next().unwrap()) {
-            continue;
-        }
-        let base_url = view.base_url(&name)?;
-        let mut diagnostic = None;
-        let (repository, mut base_branch) = match &base_url {
-            Some(base) => (base.repository.clone(), base.branch.clone()),
-            None => {
-                diagnostic =
-                    Some("add a valid .base-url beside this entry before publishing".into());
-                (String::new(), String::new())
-            }
-        };
-        let parent = view
-            .previous_reference(&name)?
-            .map(|(path, _)| path)
-            .filter(|path| path.rsplit('/').next() != Some("00-base"));
-        if let Some(parent) = &parent {
-            base_branch = parent.clone();
-        }
-        let base_commit = if let Some(parent) = &parent {
-            view.source_tree(parent)?
-                .map(|entry| entry.commit.to_string())
-        } else if diagnostic.is_none() {
-            match branch_snapshot(t, &repository, &base_branch) {
-                Ok(commit) => Some(commit),
-                Err(error) => {
-                    diagnostic = Some(error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let remote_head = if diagnostic.is_none() {
-            match GitStore::open(t.work_dir(), Some(&repository))
-                .and_then(|remote| remote.read_ref(&format!("refs/heads/{name}")))
-            {
-                Ok(head) => head.map(|oid| oid.to_string()),
-                Err(error) => {
-                    diagnostic = Some(error);
-                    None
-                }
-            }
-        } else {
-            None
+        let previous = view.previous_reference(&name)?;
+        let parent = match &previous {
+            Some((path, _)) if view.previous_reference(path)?.is_some() => Some(path.clone()),
+            _ => None,
         };
         targets.push(PublicationTarget {
             head: view
@@ -424,16 +394,95 @@ pub fn publication_plan(t: &GitTransport, id: &str) -> Result<Vec<PublicationTar
                 .to_string(),
             branch: name.clone(),
             source_tree: name,
-            repository,
-            base_branch,
+            repository: String::new(),
+            base_branch: String::new(),
+            base_commit: previous.map(|(_, commit)| commit.to_string()),
             parent,
-            base_url,
-            base_commit,
-            remote_head,
-            diagnostic,
+            remote_head: None,
+            diagnostic: Some("choose a destination and load its preview".into()),
         });
     }
     Ok(targets)
+}
+
+/// A hint only when the oldest sibling exactly matches an imported gitlink.
+/// Multiple origins remain ambiguous; callers present the choice to the user.
+pub fn publication_provenance(
+    t: &GitTransport,
+    id: &str,
+    source: &str,
+) -> Result<Option<PublicationDestination>, String> {
+    let store = open_store(t)?;
+    let (_, head) = fetch_validated_head(t, &store, id)?.ok_or("conversation disappeared")?;
+    let view = Conversation::open(&store, &head)?;
+    let names = view.source_tree_names()?;
+    let Some(first) = names
+        .iter()
+        .find(|name| stack_directory(name) == stack_directory(source))
+    else {
+        return Ok(None);
+    };
+    let base = view.source_tree(first)?.ok_or("entry disappeared")?.commit;
+    let snapshot = conversation_protocol::v3::tree::Snapshot::new(
+        &store,
+        store.read_commit(&head).map_err(String::from)?.tree,
+    );
+    let mut choices = Vec::new();
+    for name in names {
+        if view
+            .source_tree(&name)?
+            .is_none_or(|entry| entry.commit != base)
+        {
+            continue;
+        }
+        let Some(bytes) = snapshot.read(&format!("{name}.source.json"))? else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(repository) = value["repository"].as_str() else {
+            continue;
+        };
+        if validate_repository(repository).is_err() {
+            continue;
+        }
+        let choice = PublicationDestination {
+            repository: repository.into(),
+            base_branch: value["default_branch"].as_str().unwrap_or("").into(),
+        };
+        if !choices.contains(&choice) {
+            choices.push(choice);
+        }
+    }
+    Ok((choices.len() == 1).then(|| choices.remove(0)))
+}
+
+/// Freeze remote state for an explicitly supplied destination before confirmation.
+pub fn resolve_publication_target(
+    t: &GitTransport,
+    target: &mut PublicationTarget,
+    destination: &PublicationDestination,
+    branch_only: bool,
+) -> Result<(), String> {
+    validate_repository(&destination.repository)?;
+    conversation_protocol::v3::source_trees::validate_branch(&target.branch)?;
+    target.repository = destination.repository.clone();
+    target.base_branch = target
+        .parent
+        .clone()
+        .unwrap_or_else(|| destination.base_branch.clone());
+    if !branch_only {
+        conversation_protocol::v3::source_trees::validate_branch(&destination.base_branch)?;
+        if target.parent.is_none() {
+            target.base_commit = Some(branch_snapshot(t, &target.repository, &target.base_branch)?);
+        }
+    }
+    target.remote_head = GitStore::open(t.work_dir(), Some(&target.repository))?
+        .read_ref(&format!("refs/heads/{}", target.branch))?
+        .map(|oid| oid.to_string());
+    target.diagnostic = None;
+    Ok(())
 }
 
 pub fn publication_order(plan: &[PublicationTarget]) -> Result<Vec<String>, String> {
@@ -473,14 +522,16 @@ pub fn publish_target(
     if view
         .source_tree(&target.source_tree)?
         .is_none_or(|entry| entry.commit.as_str() != target.head)
-        || view.base_url(&target.source_tree)? != target.base_url
-        || view
-            .previous_reference(&target.source_tree)?
-            .map(|(path, _)| path)
-            .filter(|path| path.rsplit('/').next() != Some("00-base"))
-            != target.parent
     {
         return Err("publication contents changed since the preview; review again".into());
+    }
+    let previous = view.previous_reference(&target.source_tree)?;
+    let parent = match previous {
+        Some((path, _)) if view.previous_reference(&path)?.is_some() => Some(path),
+        _ => None,
+    };
+    if parent != target.parent {
+        return Err("publication boundaries changed since the preview; review again".into());
     }
     if let Some(parent) = &target.parent {
         if view
@@ -503,6 +554,23 @@ pub fn publish_target(
         id,
         Some(&target.source_tree),
         Some(&target.head),
+        &target.repository,
+        Some(target),
+    )
+}
+
+/// Push the exact previewed branch without requiring a PR base.
+pub fn publish_branch_target(
+    t: &GitTransport,
+    id: &str,
+    target: &PublicationTarget,
+) -> Result<PublishedBranch, String> {
+    publish_source_tree_branch_inner(
+        t,
+        id,
+        Some(&target.source_tree),
+        Some(&target.head),
+        &target.repository,
         Some(target),
     )
 }

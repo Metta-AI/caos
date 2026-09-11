@@ -11,10 +11,9 @@ use caos_cli::{
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
     describe_tool_set, first_available_conversation_name, fork_conversation,
     generate_conversation_title, interrupt_request, invite_user_to_conversation,
-    list_user_conversations, publication_diagnostic, publish_source_tree_branch,
-    publish_user_conversation, resume_request, run_chat_turn, set_conversation_title,
-    submit_interjection, unarchive_user_conversation, ConversationLoad, ConversationRole,
-    ConversationSnapshot, InviteOutcome, PublicationSummary, PublishedBranch, SourceTreeDiff,
+    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
+    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
     ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
     UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
 };
@@ -1088,18 +1087,6 @@ impl ConversationState {
             {
                 previous_selection
             }
-            _ if load
-                .source_trees
-                .iter()
-                .filter(|ws| ws.name.rsplit('/').next() == Some("dirty"))
-                .count()
-                == 1 =>
-            {
-                load.source_trees
-                    .iter()
-                    .find(|ws| ws.name.rsplit('/').next() == Some("dirty"))
-                    .map(|ws| ws.name.clone())
-            }
             _ if load.source_trees.len() == 1 => Some(load.source_trees[0].name.clone()),
             _ => None,
         };
@@ -1565,10 +1552,6 @@ enum UiMessage {
         conversation: String,
         result: Result<String, String>,
     },
-    BranchPublished {
-        conversation: String,
-        result: Result<(PublishedBranch, Option<String>), String>,
-    },
     SourceTreeUpdated {
         conversation: String,
         result: Result<(Result<String, String>, Box<ConversationLoad>), String>,
@@ -2003,7 +1986,27 @@ impl App {
         self.view == View::Chat
     }
 
+    pub(crate) fn publication_visible(&self) -> bool {
+        self.selected().publish_plan.is_some()
+    }
+
     pub(crate) fn insert_paste(&mut self, text: &str) {
+        if let Some(prompt) = self.selected_mut().publish_plan.as_mut() {
+            if prompt.editing && !prompt.loading {
+                if text.chars().any(char::is_control) {
+                    prompt.error = Some("destination fields must be a single line".into());
+                } else if let Some(row) = prompt.rows.get_mut(prompt.selected) {
+                    let value = if prompt.field == 0 {
+                        &mut row.destination.repository
+                    } else {
+                        &mut row.destination.base_branch
+                    };
+                    value.push_str(text);
+                    prompt.sync_destination();
+                }
+            }
+            return;
+        }
         if self.browser_visible() {
             return;
         }
@@ -2779,6 +2782,10 @@ impl App {
                                 Ok(rows) => {
                                     prompt.selected =
                                         rows.iter().position(|row| row.included).unwrap_or(0);
+                                    prompt.previewed = rows
+                                        .iter()
+                                        .filter(|row| row.included)
+                                        .all(|row| row.target.diagnostic.is_none());
                                     prompt.rows = rows;
                                 }
                                 Err(error) => prompt.error = Some(error),
@@ -2807,72 +2814,12 @@ impl App {
                             state.remote_head = None;
                         }
                         match result {
-                            Ok(url) => state.push_info(format!("PR ready: {url}")),
+                            Ok(message) => state.push_info(message),
                             Err(error) => {
                                 state.sidebar_attention =
                                     Some("PR failed — open for details".to_string());
                                 state.show_command_error_preserving_status(format!(
                                     "PR failed: {error}"
-                                ));
-                            }
-                        }
-                    }
-                }
-                UiMessage::BranchPublished {
-                    conversation,
-                    result,
-                } => {
-                    let transport = self.transport();
-                    let user = self.user.clone();
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        let state = &mut self.conversations[index];
-                        state.publishing = false;
-                        match result {
-                            Ok((published, diagnostic)) => {
-                                if let Ok(transport) = &transport {
-                                    let _ = state.reload(transport, &user);
-                                }
-                                match published.status {
-                                    conversation_protocol::v3::PublicationStatus::Complete => {
-                                        state.push_info(format!(
-                                            "Branch ready: origin/{} at {}",
-                                            published.branch,
-                                            short_hash(&published.head)
-                                        ));
-                                    }
-                                    conversation_protocol::v3::PublicationStatus::Conflict => {
-                                        let observed = published
-                                            .observed
-                                            .as_deref()
-                                            .map(short_hash)
-                                            .unwrap_or("deleted");
-                                        state.show_command_error(format!(
-                                            "branch {} moved on origin to {observed}; rollback or create a source tree from it before publishing again",
-                                            published.branch
-                                        ));
-                                    }
-                                    conversation_protocol::v3::PublicationStatus::Uncertain => {
-                                        state.show_command_error(format!(
-                                            "publishing {} is uncertain: {}",
-                                            published.branch,
-                                            diagnostic.as_deref().unwrap_or(
-                                                "the recorded diagnostic could not be loaded"
-                                            )
-                                        ));
-                                    }
-                                    conversation_protocol::v3::PublicationStatus::Pending => {
-                                        state.show_command_error(format!(
-                                            "publication {} is still pending",
-                                            published.publication
-                                        ));
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                state.sidebar_attention =
-                                    Some("Branch publish failed — open for details".to_string());
-                                state.show_command_error(format!(
-                                    "publishing branch failed: {error}"
                                 ));
                             }
                         }
@@ -4034,43 +3981,7 @@ impl App {
     }
 
     fn publish_branch_selected(&mut self) {
-        if self.selected().is_busy() {
-            self.selected_mut().show_command_error(
-                "finish this conversation's operation before publishing its branch",
-            );
-            return;
-        }
-        let source_tree = match self.selected().require_selected_source_tree() {
-            Ok(diff) => diff.name.clone(),
-            Err(error) => {
-                self.selected_mut().show_command_error(error);
-                return;
-            }
-        };
-        let conversation = self.selected().id.clone();
-        self.selected_mut().publishing = true;
-        self.selected_mut().status = "publishing source tree branch".to_string();
-        let published_conversation = conversation.clone();
-        spawn(
-            self.repo_dir.clone(),
-            self.tx.clone(),
-            move |transport| {
-                let published =
-                    publish_source_tree_branch(transport, &conversation, Some(&source_tree))?;
-                let diagnostic = if published.status
-                    == conversation_protocol::v3::PublicationStatus::Uncertain
-                {
-                    publication_diagnostic(transport, &conversation, &published.publication)?
-                } else {
-                    None
-                };
-                Ok((published, diagnostic))
-            },
-            move |result| UiMessage::BranchPublished {
-                conversation: published_conversation,
-                result,
-            },
-        );
+        self.open_publication(true);
     }
 }
 
@@ -4438,7 +4349,6 @@ mod tests {
 
     fn source_tree_diff(name: &str, base: char, head: char, patch: &str) -> SourceTreeDiff {
         SourceTreeDiff {
-            repository: None,
             base_name: None,
             name: name.to_string(),
             base_commit: base.to_string().repeat(40),
@@ -6335,7 +6245,6 @@ mod tests {
 
         let mut selected = state("talk-1");
         selected.source_trees = vec![SourceTreeDiff {
-            repository: None,
             base_name: None,
             name: "main".to_string(),
             base_commit: base.clone(),
@@ -6662,7 +6571,6 @@ mod tests {
                     }],
                 },
                 source_trees: vec![SourceTreeDiff {
-                    repository: None,
                     base_name: None,
                     name: "main".to_string(),
                     base_commit: "d".repeat(40),
@@ -6780,7 +6688,6 @@ mod tests {
                     activity: Vec::new(),
                 },
                 source_trees: vec![SourceTreeDiff {
-                    repository: None,
                     base_name: None,
                     name: "main".to_string(),
                     base_commit: "e".repeat(40),
@@ -6877,7 +6784,15 @@ mod tests {
             loading: false,
             selected: 0,
             error: None,
+            branch_only: false,
+            previewed: true,
+            editing: false,
+            field: 0,
             rows: vec![PlanRow {
+                destination: caos_cli::source_trees::PublicationDestination {
+                    repository: "https://github.com/team/repo".into(),
+                    base_branch: "main".into(),
+                },
                 included: true,
                 target: PublicationTarget {
                     source_tree: "docs".into(),
@@ -6886,7 +6801,6 @@ mod tests {
                     branch: "caos/talk/docs".into(),
                     base_branch: "main".into(),
                     parent: None,
-                    base_url: None,
                     remote_head: None,
                     base_commit: None,
                     diagnostic: None,
@@ -6895,6 +6809,25 @@ mod tests {
         });
         let (mut app, _) = app_with(vec![conversation]);
         assert!(rendered_screen(&app).contains("Publish source trees"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.insert_paste("https://example.com/other");
+        assert_eq!(app.selected().composer.text, "preserve this draft");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for ch in "develop".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let prompt = app.selected().publish_plan.as_ref().unwrap();
+        assert!(!prompt.previewed);
+        assert!(!prompt.editing);
+        assert_eq!(
+            prompt.rows[0].destination.repository,
+            "https://example.com/other"
+        );
+        assert_eq!(prompt.rows[0].destination.base_branch, "develop");
+        assert!(rendered_screen(&app).contains("Enter preview"));
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app

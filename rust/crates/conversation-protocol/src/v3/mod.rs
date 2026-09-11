@@ -26,7 +26,6 @@ pub use oid::Oid;
 pub use reconcile::{reconcile, CodeOps};
 pub use records::*;
 pub use refs::Membership;
-pub use source_trees::BaseUrl;
 #[cfg(any(test, feature = "memory-store"))]
 pub use tree::MemoryStore;
 pub use tree::{
