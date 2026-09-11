@@ -128,12 +128,21 @@ struct ToolOutcome {
 /// session in another repository gets the same tools as the tui: they are the
 /// step's, reached through `--llm-step`, not a copy of them compiled in here.
 fn run_tool(
-    t: &GitTransport,
+    _serve_transport: &GitTransport,
     options: &TurnOptions,
     session: &str,
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
+    // A FRESH transport, not the one `serve` opened at spawn. That one was read
+    // once, and in a cloud session it can predate the SessionStart hook that
+    // adds the `caos` remote -- so a call driven through it dials a server it
+    // does not know and fails "no `caos` git remote" while the remote is right
+    // there. The resolver thread re-opens per attempt for exactly this reason
+    // (see `resolve_in_background`); a call has to as well.
+    let fresh = GitTransport::from_cwd()
+        .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
+    let t = &fresh;
     let id = conversation_id_for(session)?;
     // The prompt hook that opens this conversation runs in another process and
     // takes seconds; the first tool call can beat it. Wait for the record
