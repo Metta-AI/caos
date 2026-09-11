@@ -1,5 +1,5 @@
 use super::oid::Oid;
-use super::records::{MergeInfo, WorkspaceResolution};
+use super::records::{MergeInfo, SourceTreeResolution};
 use super::tree::Signature;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,9 +30,9 @@ pub fn reconcile(
     proposal: &Oid,
     current: Option<&Oid>,
     signature: &Signature,
-) -> Result<WorkspaceResolution, String> {
+) -> Result<SourceTreeResolution, String> {
     let Some(current) = current else {
-        return Ok(WorkspaceResolution::Conflict {
+        return Ok(SourceTreeResolution::Conflict {
             current: None,
             candidate: proposal.clone(),
             merge: None,
@@ -44,13 +44,13 @@ pub fn reconcile(
         ));
     }
     if proposal == base || proposal == current || ops.is_ancestor(proposal, current)? {
-        return Ok(WorkspaceResolution::AlreadyApplied {
+        return Ok(SourceTreeResolution::AlreadyApplied {
             current: current.clone(),
             candidate: None,
         });
     }
     if current == base || (ops.is_ancestor(base, current)? && ops.is_ancestor(current, proposal)?) {
-        return Ok(WorkspaceResolution::Direct {
+        return Ok(SourceTreeResolution::Direct {
             current: current.clone(),
             output: proposal.clone(),
         });
@@ -64,7 +64,7 @@ pub fn reconcile(
                 RECONCILE_MESSAGE,
                 signature,
             )?;
-            Ok(WorkspaceResolution::Merged {
+            Ok(SourceTreeResolution::Merged {
                 current: current.clone(),
                 merge: MergeInfo {
                     base: base.clone(),
@@ -77,7 +77,7 @@ pub fn reconcile(
                 output,
             })
         }
-        MergeOutcome::Conflict { paths } => Ok(WorkspaceResolution::Conflict {
+        MergeOutcome::Conflict { paths } => Ok(SourceTreeResolution::Conflict {
             current: Some(current.clone()),
             candidate: proposal.clone(),
             merge: Some(MergeInfo {
@@ -242,7 +242,7 @@ mod tests {
         ] {
             assert_eq!(
                 reconcile(&mut ops, &base, proposal, Some(current), &signature()).unwrap(),
-                WorkspaceResolution::AlreadyApplied {
+                SourceTreeResolution::AlreadyApplied {
                     current: current.clone(),
                     candidate: None,
                 }
@@ -263,7 +263,7 @@ mod tests {
         ops.add(&current, &tree, &[&base]);
         let output =
             match reconcile(&mut ops, &base, &proposal, Some(&current), &signature()).unwrap() {
-                WorkspaceResolution::Merged { output, .. } => output,
+                SourceTreeResolution::Merged { output, .. } => output,
                 other => panic!("expected merge, got {other:?}"),
             };
         assert!(ops.is_ancestor(&current, &output).unwrap());
@@ -282,7 +282,7 @@ mod tests {
         for current in [&base, &middle] {
             assert_eq!(
                 reconcile(&mut ops, &base, &proposal, Some(current), &signature()).unwrap(),
-                WorkspaceResolution::Direct {
+                SourceTreeResolution::Direct {
                     current: current.clone(),
                     output: proposal.clone(),
                 }
@@ -305,7 +305,7 @@ mod tests {
         let output = Oid::parse(&format!("{:040x}", 1), "output").unwrap();
         assert_eq!(
             resolution,
-            WorkspaceResolution::Merged {
+            SourceTreeResolution::Merged {
                 current: ours.clone(),
                 merge: MergeInfo {
                     base: base.clone(),
@@ -350,7 +350,7 @@ mod tests {
         ops.add(&theirs, &oid('3'), &[&base]);
         assert_eq!(
             reconcile(&mut ops, &base, &theirs, Some(&ours), &signature()).unwrap(),
-            WorkspaceResolution::Conflict {
+            SourceTreeResolution::Conflict {
                 current: Some(ours.clone()),
                 candidate: theirs.clone(),
                 merge: Some(MergeInfo {
@@ -377,7 +377,7 @@ mod tests {
         ops.add(&proposal, &oid('3'), &[&base]);
         let resolution =
             reconcile(&mut ops, &base, &proposal, Some(&current), &signature()).unwrap();
-        assert!(matches!(resolution, WorkspaceResolution::Merged { .. }));
+        assert!(matches!(resolution, SourceTreeResolution::Merged { .. }));
         assert_eq!(ops.merge_calls.len(), 1);
     }
 
@@ -388,7 +388,7 @@ mod tests {
         let proposal = oid('b');
         assert_eq!(
             reconcile(&mut ops, &base, &proposal, None, &signature()).unwrap(),
-            WorkspaceResolution::Conflict {
+            SourceTreeResolution::Conflict {
                 current: None,
                 candidate: proposal,
                 merge: None,

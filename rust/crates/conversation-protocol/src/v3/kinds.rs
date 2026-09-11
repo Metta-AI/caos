@@ -4,11 +4,11 @@ pub enum Kind {
     ConversationFork,
     MetadataTitleSet,
     MessageAppend,
-    RequestAdmit,
-    RequestClaim,
-    RequestInterject,
-    RequestEscape,
-    RequestTerminal,
+    TurnAdmit,
+    TurnClaim,
+    TurnInterject,
+    TurnEscape,
+    TurnTerminal,
     ModelComplete,
     ToolStart,
     ToolComplete,
@@ -16,26 +16,22 @@ pub enum Kind {
     AsyncTerminal,
     SubagentSpawn,
     SubagentTerminal,
-    SubagentApply,
-    WorkspaceCreate,
-    WorkspaceRollback,
-    WorkspaceRemove,
     PublicationPending,
     PublicationTerminal,
     FilesApply,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 23] = [
+    pub const ALL: [Kind; 19] = [
         Kind::ConversationRoot,
         Kind::ConversationFork,
         Kind::MetadataTitleSet,
         Kind::MessageAppend,
-        Kind::RequestAdmit,
-        Kind::RequestClaim,
-        Kind::RequestInterject,
-        Kind::RequestEscape,
-        Kind::RequestTerminal,
+        Kind::TurnAdmit,
+        Kind::TurnClaim,
+        Kind::TurnInterject,
+        Kind::TurnEscape,
+        Kind::TurnTerminal,
         Kind::ModelComplete,
         Kind::ToolStart,
         Kind::ToolComplete,
@@ -43,10 +39,6 @@ impl Kind {
         Kind::AsyncTerminal,
         Kind::SubagentSpawn,
         Kind::SubagentTerminal,
-        Kind::SubagentApply,
-        Kind::WorkspaceCreate,
-        Kind::WorkspaceRollback,
-        Kind::WorkspaceRemove,
         Kind::PublicationPending,
         Kind::PublicationTerminal,
         Kind::FilesApply,
@@ -58,11 +50,11 @@ impl Kind {
             Kind::ConversationFork => "conversation.fork",
             Kind::MetadataTitleSet => "metadata.title.set",
             Kind::MessageAppend => "message.append",
-            Kind::RequestAdmit => "request.admit",
-            Kind::RequestClaim => "request.claim",
-            Kind::RequestInterject => "request.interject",
-            Kind::RequestEscape => "request.escape",
-            Kind::RequestTerminal => "request.terminal",
+            Kind::TurnAdmit => "request.admit",
+            Kind::TurnClaim => "request.claim",
+            Kind::TurnInterject => "request.interject",
+            Kind::TurnEscape => "request.escape",
+            Kind::TurnTerminal => "request.terminal",
             Kind::ModelComplete => "model.complete",
             Kind::ToolStart => "tool.start",
             Kind::ToolComplete => "tool.complete",
@@ -70,10 +62,6 @@ impl Kind {
             Kind::AsyncTerminal => "async.terminal",
             Kind::SubagentSpawn => "subagent.spawn",
             Kind::SubagentTerminal => "subagent.terminal",
-            Kind::SubagentApply => "subagent.apply",
-            Kind::WorkspaceCreate => "workspace.create",
-            Kind::WorkspaceRollback => "workspace.rollback",
-            Kind::WorkspaceRemove => "workspace.remove",
             Kind::PublicationPending => "publication.pending",
             Kind::PublicationTerminal => "publication.terminal",
             Kind::FilesApply => "files.apply",
@@ -94,16 +82,7 @@ impl Kind {
     }
 
     pub fn parse_message(message: &[u8]) -> Result<Kind, String> {
-        let parsed = message
-            .strip_suffix(b"\n")
-            .and_then(|name| std::str::from_utf8(name).ok())
-            .and_then(|name| Self::parse(name).ok());
-        match parsed {
-            Some(kind) if kind.message() == message => Ok(kind),
-            _ => Err(format!(
-                "commit message is not a registered kind: {message:?}"
-            )),
-        }
+        super::events::decode(message).map(|(kind, _)| kind)
     }
 }
 
@@ -115,7 +94,10 @@ mod tests {
     fn registered_kinds_round_trip() {
         for kind in Kind::ALL {
             assert_eq!(Kind::parse(kind.as_str()), Ok(kind));
-            assert_eq!(Kind::parse_message(&kind.message()), Ok(kind));
+            assert_eq!(
+                Kind::parse_message(&super::super::events::encode(kind, &[])),
+                Ok(kind)
+            );
         }
     }
 

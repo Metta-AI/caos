@@ -1,4 +1,4 @@
-//! Local-checkout and PR publication policy for the conversation TUI.
+//! Host Git and GitHub operations shared by clients.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 /// calling it. Rather than applying the base-to-head diff as unstaged changes,
 /// this moves the local HEAD onto the conversation head commit so the checkout
 /// exactly matches it.
-pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), String> {
+pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -27,9 +27,9 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 }
 
 /// Commit the current working tree onto the local `HEAD` and return the new
-/// commit together with its shared ancestor with the selected workspace.
+/// commit together with its shared ancestor with the selected source_tree.
 ///
-/// This is the inverse of `load_conversation_workspace`: after checking out a
+/// This is the inverse of `load_conversation_source_tree`: after checking out a
 /// conversation head and editing files, `/update-tree` folds those files into a
 /// user-authored turn. It deliberately DOES commit — staging everything with
 /// `git add -A` and committing when the tree is dirty — so the checkout is left
@@ -39,19 +39,20 @@ pub(crate) fn load_conversation_workspace(head: &str, cwd: &Path) -> Result<(), 
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
 /// mirrors what a normal commit of the working tree would contain.
-pub(crate) fn commit_working_tree(
+pub fn commit_working_tree(
     message: &str,
-    workspace: &str,
+    source_tree: &str,
     cwd: &Path,
 ) -> Result<(String, String), String> {
     // HEAD can already contain user commits. Their delta starts at the shared
     // ancestor, not at HEAD just before staging the remaining edits.
-    let base = capture_required("git", &["merge-base", "--all", workspace, "HEAD"], cwd).map_err(
-        |error| format!("cannot find a shared base for the checkout and workspace: {error}"),
-    )?;
+    let base = capture_required("git", &["merge-base", "--all", source_tree, "HEAD"], cwd)
+        .map_err(|error| {
+            format!("cannot find a shared base for the checkout and source tree: {error}")
+        })?;
     if base.lines().count() != 1 {
         return Err(
-            "checkout and workspace have multiple merge bases; merge them before /update-tree"
+            "checkout and source tree have multiple merge bases; merge them before /update-tree"
                 .to_string(),
         );
     }
@@ -78,7 +79,7 @@ pub(crate) fn commit_working_tree(
 /// your checked-out branch as it is right now. It runs no `git ls-remote`/`git
 /// fetch`, so it stays instant (e.g. on every Ctrl+N) instead of blocking on
 /// round-trips to `origin`.
-pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
+pub fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), String> {
     // `refs/remotes/origin/HEAD` is the local symref recording origin's default
     // branch; it is set at clone time and refreshed by `git remote set-head`.
     let head_ref = capture_required("git", &["symbolic-ref", "refs/remotes/origin/HEAD"], cwd)
@@ -98,11 +99,7 @@ pub(crate) fn local_default_branch_tip(cwd: &Path) -> Result<(String, String), S
     Ok((branch, commit))
 }
 
-pub(crate) fn remote_base_is_ancestor(
-    target: &str,
-    head: &str,
-    cwd: &Path,
-) -> Result<bool, String> {
+pub fn remote_base_is_ancestor(target: &str, head: &str, cwd: &Path) -> Result<bool, String> {
     let ancestry = command_output("git", &["merge-base", "--is-ancestor", target, head], cwd)?;
     match ancestry.status.code() {
         Some(0) => Ok(true),
@@ -114,54 +111,12 @@ pub(crate) fn remote_base_is_ancestor(
     }
 }
 
-pub(crate) fn remote_default_branch(cwd: &Path) -> Result<String, String> {
-    let output = command_output("git", &["ls-remote", "--symref", "origin", "HEAD"], cwd)?;
-    let stdout = require_success("git", output)?;
-    parse_remote_default_branch(&String::from_utf8_lossy(&stdout))
-}
-
-fn parse_remote_default_branch(output: &str) -> Result<String, String> {
-    for line in output.lines() {
-        let mut fields = line.split_whitespace();
-        let (Some(marker), Some(reference), Some(target)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if marker == "ref:" && target == "HEAD" {
-            let branch = reference
-                .strip_prefix("refs/heads/")
-                .ok_or_else(|| format!("origin HEAD points outside refs/heads: {reference}"))?;
-            if branch.is_empty() {
-                return Err("origin HEAD advertises an empty default branch".to_string());
-            }
-            return Ok(branch.to_string());
-        }
-    }
-    Err("origin HEAD did not advertise a default branch".to_string())
-}
-
-/// Accept either a branch name or the familiar origin/<branch> spelling.
-pub(crate) fn pr_base_branch(input: &str) -> &str {
+/// Accept either a branch name or the familiar `origin/<branch>` spelling.
+pub fn pr_base_branch(input: &str) -> &str {
     input.trim().strip_prefix("origin/").unwrap_or(input.trim())
 }
 
-pub(crate) fn fetch_remote_branch_tip(branch: &str, cwd: &Path) -> Result<String, String> {
-    let reference = format!("refs/heads/{branch}");
-    capture_required("git", &["check-ref-format", &reference], cwd)?;
-    let origin = conversation_protocol::v3::GitStore::open(cwd, Some("origin"))?;
-    let head = origin
-        .read_ref(&reference)?
-        .ok_or_else(|| format!("origin has no branch {branch:?}"))?;
-    origin.fetch_object(&head)?;
-    Ok(head.to_string())
-}
-
-pub(crate) fn validate_prepared_workspace(
-    target: &str,
-    head: &str,
-    cwd: &Path,
-) -> Result<(), String> {
+pub fn validate_prepared_source_tree(target: &str, head: &str, cwd: &Path) -> Result<(), String> {
     if !remote_base_is_ancestor(target, head, cwd)? {
         return Err("the preparation turn did not merge the selected PR base".to_string());
     }
@@ -194,54 +149,59 @@ pub(crate) fn validate_prepared_workspace(
     Ok(())
 }
 
-pub(crate) fn find_or_open_workspace_pr(
+pub fn find_or_open_source_tree_pr_in(
+    repository: &str,
     name: &str,
     title: &str,
-    published: &caos_cli::PublishedBranch,
+    published: &crate::PublishedBranch,
     base: &str,
     cwd: &Path,
 ) -> Result<String, String> {
-    let transport = caos::GitTransport::discover(cwd)?;
-    let repository = caos_cli::origin_repository(&transport)?;
-    find_or_open_workspace_pr_with(&repository, name, title, published, base, |args| {
+    let repository = crate::normalize_repository_identity(repository)?;
+    find_or_open_source_tree_pr_with(&repository, name, title, published, base, |args| {
         capture_required("gh", args, cwd)
     })
 }
 
-fn find_or_open_workspace_pr_with(
+fn lookup_source_tree_pr_with(
+    repository: &str,
+    branch: &str,
+    gh: &mut impl FnMut(&[&str]) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let matches = gh(&[
+        "pr", "list", "--repo", repository, "--head", branch, "--state", "open", "--json", "url",
+        "--jq", ".[].url",
+    ])?;
+    let urls = matches
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    match urls.as_slice() {
+        [] => Ok(None),
+        [url] => Ok(Some((*url).to_string())),
+        _ => Err(format!(
+            "several open PRs use branch {branch:?}; choose a distinct publication branch"
+        )),
+    }
+}
+
+fn find_or_open_source_tree_pr_with(
     repository: &str,
     name: &str,
     title: &str,
-    published: &caos_cli::PublishedBranch,
+    published: &crate::PublishedBranch,
     base: &str,
     mut gh: impl FnMut(&[&str]) -> Result<String, String>,
 ) -> Result<String, String> {
-    let title = format!("caos conversation: {title}");
-    let existing = gh(&[
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--head",
-        &published.branch,
-        "--base",
-        base,
-        "--state",
-        "open",
-        "--json",
-        "url",
-        "--jq",
-        ".[0].url // empty",
-    ])?;
-    if !existing.is_empty() {
+    if let Some(existing) = lookup_source_tree_pr_with(repository, &published.branch, &mut gh)? {
         gh(&[
-            "pr", "edit", &existing, "--repo", repository, "--title", &title,
+            "pr", "edit", &existing, "--repo", repository, "--base", base,
         ])?;
         return Ok(existing);
     }
     let body = format!(
-        "Published workspace `{}` from CAOS conversation `{name}` at `{}`.",
-        published.workspace, published.head
+        "Published source tree `{}` from CAOS conversation `{name}` at `{}`.",
+        published.source_tree, published.head
     );
     gh(&[
         "pr",
@@ -253,13 +213,13 @@ fn find_or_open_workspace_pr_with(
         "--base",
         base,
         "--title",
-        &title,
+        title,
         "--body",
         &body,
     ])
 }
 
-pub(crate) fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+pub fn capture_required(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     capture_required_bytes(program, args, cwd)
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
 }
@@ -333,32 +293,41 @@ mod tests {
         std::fs::write(repo.join("file.txt"), "unstaged\n").unwrap();
         let index = capture_required("git", &["write-tree"], &repo).unwrap();
 
-        assert_eq!(remote_default_branch(&repo).unwrap(), "release/next");
+        let transport = caos::GitTransport::discover(&repo).unwrap();
+        let remote_url = remote.to_str().unwrap();
+        assert_eq!(
+            crate::source_trees::default_branch(&transport, remote_url).unwrap(),
+            "release/next"
+        );
         assert_eq!(pr_base_branch(" origin/release/next "), "release/next");
         assert_eq!(pr_base_branch("release/next"), "release/next");
         assert_eq!(
-            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            crate::source_trees::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             base
         );
-        assert!(fetch_remote_branch_tip("missing", &repo)
-            .unwrap_err()
-            .contains("no branch"));
-        assert!(fetch_remote_branch_tip("../invalid", &repo).is_err());
-        validate_prepared_workspace(&base, &base, &repo).unwrap();
-        assert!(validate_prepared_workspace(&base, &local, &repo)
+        assert!(
+            crate::source_trees::branch_snapshot(&transport, remote_url, "missing")
+                .unwrap_err()
+                .contains("does not exist")
+        );
+        assert!(
+            crate::source_trees::branch_snapshot(&transport, remote_url, "../invalid").is_err()
+        );
+        validate_prepared_source_tree(&base, &base, &repo).unwrap();
+        assert!(validate_prepared_source_tree(&base, &local, &repo)
             .unwrap_err()
             .contains("did not merge"));
-        assert!(validate_prepared_workspace("bad-revision", &base, &repo).is_err());
+        assert!(validate_prepared_source_tree("bad-revision", &base, &repo).is_err());
         let conflicted = commit_file(
             &remote,
             "<<<<<<< ours\nours\n=======\ntheirs\n>>>>>>> theirs\n",
             "conflict",
         );
         assert_eq!(
-            fetch_remote_branch_tip("release/next", &repo).unwrap(),
+            crate::source_trees::branch_snapshot(&transport, remote_url, "release/next").unwrap(),
             conflicted
         );
-        assert!(validate_prepared_workspace(&base, &conflicted, &repo)
+        assert!(validate_prepared_source_tree(&base, &conflicted, &repo)
             .unwrap_err()
             .contains("unresolved merge markers"));
         assert_eq!(
@@ -379,8 +348,8 @@ mod tests {
 
     #[test]
     fn pr_publication_creates_or_reuses_the_matching_origin_pr() {
-        let published = caos_cli::PublishedBranch {
-            workspace: "docs".to_string(),
+        let published = crate::PublishedBranch {
+            source_tree: "docs".to_string(),
             branch: "caos/talk-1".to_string(),
             head: "a".repeat(40),
             publication: "publication-1".to_string(),
@@ -390,7 +359,7 @@ mod tests {
         let url = "https://github.com/owner/repo/pull/1";
         for existing in [false, true] {
             let mut calls = Vec::new();
-            let result = find_or_open_workspace_pr_with(
+            let result = find_or_open_source_tree_pr_with(
                 "https://github.com/owner/repo",
                 "talk-1",
                 "Fix documentation",
@@ -418,20 +387,28 @@ mod tests {
                     "https://github.com/owner/repo",
                     "--head",
                     "caos/talk-1",
-                    "--base",
-                    "release/next",
                     "--state",
                     "open",
                     "--json",
                     "url",
                     "--jq",
-                    ".[0].url // empty"
+                    ".[].url"
                 ]
             );
             assert_eq!(calls[1][1], if existing { "edit" } else { "create" });
-            assert!(calls[1]
-                .windows(2)
-                .any(|pair| pair == ["--title", "caos conversation: Fix documentation"]));
+            if existing {
+                assert!(
+                    !calls[1].iter().any(|arg| arg == "--title"),
+                    "preserve a manually edited PR title"
+                );
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--base", "release/next"]));
+            } else {
+                assert!(calls[1]
+                    .windows(2)
+                    .any(|pair| pair == ["--title", "Fix documentation"]));
+            }
             assert!(calls[1]
                 .windows(2)
                 .any(|pair| pair == ["--repo", "https://github.com/owner/repo"]));
@@ -448,7 +425,7 @@ mod tests {
             }
         }
         let mut calls = 0;
-        let error = find_or_open_workspace_pr_with(
+        let error = find_or_open_source_tree_pr_with(
             "owner/repo",
             "talk-1",
             "title",
@@ -473,7 +450,7 @@ mod tests {
         let base = commit_file(&dir, "base\n", "base");
         let head = commit_file(&dir, "conversation result\n", "turn");
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
-        load_conversation_workspace(&head, &dir).unwrap();
+        load_conversation_source_tree(&head, &dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
             "conversation result\n"
@@ -484,7 +461,7 @@ mod tests {
         );
 
         std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
-        assert!(load_conversation_workspace(&head, &dir)
+        assert!(load_conversation_source_tree(&head, &dir)
             .unwrap_err()
             .contains("working tree is not clean"));
 
@@ -492,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn update_tree_includes_committed_edits_and_uses_the_shared_workspace_base() {
+    fn update_tree_includes_committed_edits_and_uses_the_shared_source_tree_base() {
         let dir = temp_repo("committed-update");
         let base = commit_file(&dir, "base\n", "base");
         let local = commit_file(&dir, "committed edit\n", "local");
@@ -526,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_workspace_is_rejected_before_staging_local_edits() {
+    fn unrelated_source_tree_is_rejected_before_staging_local_edits() {
         let dir = temp_repo("unrelated-update");
         let head = commit_file(&dir, "base\n", "base");
         let tree = capture_required("git", &["rev-parse", "HEAD^{tree}"], &dir).unwrap();

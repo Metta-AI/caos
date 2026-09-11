@@ -58,7 +58,7 @@ built)
   # The head this run is over. Its tree is a real tree with content behind it,
   # so "the child snapshots the head's tree" is a claim about an actual object.
   rm -rf /tmp/ws; mkdir -p /tmp/ws
-  printf 'workspace survives\n' > /tmp/ws/workspace.txt
+  printf 'source tree survives\n' > /tmp/ws/source_tree.txt
   caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the head's tree"
   head_tree=$(caos hash /cas/ws)
   # TWO COMMITS, because the worker WALKS ONE GENERATION: it reads the head's

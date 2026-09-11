@@ -25,19 +25,19 @@ assert_parent_dates() {
   done < <(git log --first-parent --format='%H %ct' "$conversation_head")
 }
 
-stage "workspace and scripted model"
+stage "source tree and scripted model"
 llm_test_setup
 
 rm -rf /tmp/ws
 mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
-ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
-R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > out.txt","paths":[]},"name":"bash","type":"tool_use"}]'
+R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > main/out.txt","paths":["main"]},"name":"bash","type":"tool_use"}]'
 R2='[{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
 EARLY_INTERJECTION_TEXT="also keep the notes subtree"
 INTERJECTION_TEXT="one more thing before you finish"
-STALE_T2_TEXT="the workspace still holds out.txt"
+STALE_T2_TEXT="the source tree still holds out.txt"
 T2_TEXT="yes, I also saw your last message"
 
 rm -rf /tmp/stub
@@ -53,7 +53,7 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
 
 start_stub /tmp/stub
 new_llm_conversation llm-step "$STUB_PORT" "$ws" \
-  "You are a coding agent operating on a git workspace."
+  "You are a coding agent operating on a git source_tree."
 
 stage "first turn: pre-dispatch interjection and durable tool records"
 admit_turn "create out.txt containing hi, then confirm"
@@ -91,10 +91,10 @@ grep -qF "\"content\":$R2,\"role\":\"assistant\"" /tmp/stub/request-3.json \
 grep -qF 'exit: 3' /tmp/stub/request-3.json || fail "failed command result missing"
 [ ! -f /tmp/stub/request-4.json ] || fail "unexpected extra model round"
 
-workspace1=$(workspace_commit "$head1")
-fetch_code "$workspace1" "fetching the first-turn workspace"
-[ "$(git show "$workspace1:out.txt")" = hi ] || fail "out.txt is missing"
-[ "$(git show "$workspace1:notes/todo.txt")" = "hello notes" ] \
+source_tree1=$(source_tree_commit "$head1")
+fetch_code "$source_tree1" "fetching the first-turn source_tree"
+[ "$(git show "$source_tree1:out.txt")" = hi ] || fail "out.txt is missing"
+[ "$(git show "$source_tree1:notes/todo.txt")" = "hello notes" ] \
   || fail "untouched subtree lost"
 assert_parent_dates "$head1"
 
@@ -130,7 +130,7 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
 
 wait_turn || fail "the second turn never reached a terminal head"
 head2=$head
-[ "$(workspace_commit "$head2")" = "$workspace1" ] \
+[ "$(source_tree_commit "$head2")" = "$source_tree1" ] \
   || fail "toolless second turn changed main"
 $TOOL transcript --repo /tmp/repo --head "$head2" > /tmp/transcript2
 interjection_ordinal=""
@@ -157,15 +157,15 @@ grep -qF "{\"content\":\"$INTERJECTION_TEXT\",\"role\":\"user\"}]" /tmp/stub/req
   || fail "racing interjection was not replayed in the replacement call"
 assert_parent_dates "$head2"
 
-stage "workspace and blocked model response"
+stage "source_tree and blocked model response"
 rm -rf /tmp/ws
 mkdir -p /tmp/ws
 echo "hello" > /tmp/ws/greeting.txt
-ws=$(publish_tree /tmp/ws /cas/ws-interrupt "publishing the workspace")
+ws=$(publish_tree /tmp/ws /cas/ws-interrupt "publishing the source tree")
 
 mkfifo /tmp/stub/response-6.json
 new_llm_conversation llm-interrupt "$STUB_PORT" "$ws" \
-  "You are a coding agent operating on a git workspace."
+  "You are a coding agent operating on a git source_tree."
 
 stage "escape a running request at the model boundary"
 dispatch_turn "this prompt was accidental"
@@ -203,13 +203,13 @@ interrupted_transcript=$(transcript_text "$head1")
 if grep -qF 'I had started this response.' <<<"$interrupted_transcript"; then
   fail "post-escape model response became canonical"
 fi
-[ "$(workspace_commit "$head1")" = "$base" ] \
+[ "$(source_tree_commit "$head1")" = "$base" ] \
   || fail "interrupted write changed main"
 [ ! -e /tmp/stub/request-7.json ] || fail "escape allowed another model round"
 
 stage "escape a queued request before it can be claimed"
 new_llm_conversation llm-interrupt-queued "$STUB_PORT" - \
-  "You are a coding agent operating on a git workspace." "$base" \
+  "You are a coding agent operating on a git source_tree." "$base" \
   "currying queued-interrupt llm-step"
 admit_turn "cancel this before dispatch"
 queued_request=$request

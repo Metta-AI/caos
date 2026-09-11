@@ -86,7 +86,7 @@ fi
 # this used to be four, which was 12 seconds of a 16-second bring-up.
 #
 # `path:` rather than a bare path, so nix reads the DIRECTORY as it is rather
-# than a git tree: a materialized workspace may not be a repo at all, and where
+# than a git tree: a materialized source tree may not be a repo at all, and where
 # it is one, keying the eval cache on the rev would mint a new one per run.
 echo "stack/bootstrap: building $attr from $tree" >&2
 inputs=$(nix build "path:$tree#$attr" --no-link --print-out-paths) \

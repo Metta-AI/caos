@@ -6,14 +6,14 @@ caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1
 # shellcheck disable=SC1090
 source /cas/args/common
 
-stage "workspace, worker barrier, and scripted model"
+stage "source_tree, worker barrier, and scripted model"
 llm_test_setup
 caos get /cas/args/async || fail "reading async.sh"
 
 rm -rf /tmp/ws
 mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
-ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
 rm -rf /tmp/async-gate
 mkdir -p /tmp/async-gate
@@ -38,13 +38,13 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
 start_stub /tmp/stub
 
 new_llm_conversation llm-async "$STUB_PORT" "$ws" \
-  "You are a coding agent operating on a git workspace."
+  "You are a coding agent operating on a git source_tree."
 
 stage "primary turn records pending work and becomes idle"
 dispatch_turn "queue the independent request"
 wait_turn || fail "the primary turn never reached a terminal head"
 head1=$head
-workspace1=$(workspace_commit "$head1")
+source_tree1=$(source_tree_commit "$head1")
 $TOOL async --repo /tmp/repo --head "$head1" > /tmp/async.pending
 task=$(jq -r 'select(.status == "pending") | .task' /tmp/async.pending)
 assert_oid "$task" "pending task"
@@ -82,9 +82,9 @@ done
 [ "$(git rev-parse "$completion_head^1")" = "$head1" ] \
   || fail "completion did not append to the idle head"
 changed=$(git diff-tree --no-commit-id --name-only -r "$head1" "$completion_head")
-[ "$changed" = ".caos/async/$task.json" ] \
-  || fail "completion changed more than its async record: $changed"
-[ "$(workspace_commit "$completion_head")" = "$workspace1" ] \
+[ -z "$changed" ] \
+  || fail "event-only completion changed content: $changed"
+[ "$(source_tree_commit "$completion_head")" = "$source_tree1" ] \
   || fail "completion changed main"
 $TOOL async --repo /tmp/repo --head "$completion_head" --task "$task" > /tmp/async.complete
 task_result=$(jq -r 'select(.status == "complete") | .result' /tmp/async.complete)
@@ -106,7 +106,7 @@ while read -r _ role _ _ encoded; do
   fi
 done < /tmp/async.transcript
 [ "$system_notice" -eq 1 ] || fail "completion notice is not a system transcript entry"
-[ "$(workspace_commit "$head2")" = "$workspace1" ] \
+[ "$(source_tree_commit "$head2")" = "$source_tree1" ] \
   || fail "post-completion observation changed main"
 
 pass llm-async
