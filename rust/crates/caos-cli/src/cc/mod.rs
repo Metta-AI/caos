@@ -418,12 +418,57 @@ fn hook(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     let payload: Value =
         serde_json::from_str(&input).map_err(|error| format!("parsing hook payload: {error}"))?;
     let event = string_field(&payload, "hook_event_name")?;
-    match event {
+    // Logged at the START too, so a hook killed mid-run (its process gone before
+    // the end line) is distinguishable from one that never fired.
+    debug_log_hook("start", event, &payload, None);
+    let started = std::time::Instant::now();
+    let result = match event {
         "UserPromptSubmit" => on_user_prompt(t, options, &payload),
         "PreToolUse" => on_pre_tool_use(&payload),
         "Stop" => on_stop(t, &payload),
         "StopFailure" => on_stop_failure(t, &payload),
         _ => Ok(()),
+    };
+    debug_log_hook("end", event, &payload, Some((started.elapsed(), &result)));
+    result
+}
+
+/// A best-effort line per hook invocation, appended to `$CAOS_CC_HOOK_LOG`, or
+/// to `<tmp>/caos-cc-hook.log` when that is unset. The hooks are the one part
+/// of this that runs in a process nobody watches -- Claude Code spawns them and
+/// keeps only a pass/fail -- so when the conversation a session should have is
+/// simply absent, there is otherwise nothing to say which hook fired, for which
+/// session, and whether it returned or failed and why.
+fn debug_log_hook(
+    phase: &str,
+    event: &str,
+    payload: &Value,
+    done: Option<(std::time::Duration, &Result<(), String>)>,
+) {
+    let path = match std::env::var("CAOS_CC_HOOK_LOG") {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => std::env::temp_dir().join("caos-cc-hook.log"),
+    };
+    let session = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let prompt_len = payload
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::len)
+        .unwrap_or(0);
+    let tail = match done {
+        None => String::new(),
+        Some((elapsed, Ok(()))) => format!(" {:.1}s ok", elapsed.as_secs_f64()),
+        Some((elapsed, Err(error))) => {
+            format!(" {:.1}s ERR {}", elapsed.as_secs_f64(), error.replace('\n', " "))
+        }
+    };
+    let line = format!("{phase} {event} session={session} prompt_len={prompt_len}{tail}\n");
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
