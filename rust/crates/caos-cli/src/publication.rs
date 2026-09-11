@@ -51,14 +51,7 @@ fn publish_target(
         .iter()
         .find(|source_tree| source_tree.name == target.source_tree)
         .ok_or("source tree disappeared")?;
-    if source_tree.head != target.head
-        || Conversation::open(
-            &open_store(transport)?,
-            &oid(&load.snapshot.head, "conversation")?,
-        )?
-        .base_url(&target.source_tree)?
-            != target.base_url
-    {
+    if source_tree.head != target.head {
         return Err(format!(
             "source tree {:?} changed since the publication preview; review it again",
             target.source_tree

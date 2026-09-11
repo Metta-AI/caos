@@ -181,7 +181,6 @@ pub enum ConversationRole {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceTreeDiff {
-    pub repository: Option<String>,
     pub base_name: Option<String>,
     pub name: String,
     pub base_commit: String,
@@ -1419,7 +1418,6 @@ fn source_tree_diff(
         None,
     )?;
     Ok(SourceTreeDiff {
-        repository: None,
         base_name: None,
         name: name.to_string(),
         base_commit: initial.to_string(),
@@ -1520,13 +1518,11 @@ fn load_at(
     let conversation = Conversation::open(store, head)?;
     let mut source_trees = Vec::new();
     for (name, source_tree) in conversation.source_trees()? {
-        let repository = conversation.base_url(&name)?.map(|base| base.repository);
         let base = match conversation.previous_reference(&name)? {
             Some((_, commit)) => commit,
             None => conversation.reference_start(&name)?,
         };
         let mut diff = source_tree_diff(t, store, &name, &base, &source_tree.commit)?;
-        diff.repository = repository;
         diff.base_name = conversation
             .previous_reference(&name)?
             .map(|(path, _)| path);
@@ -2185,7 +2181,6 @@ fn append_publication_pending(
     id: &str,
     refname: &str,
     pending: &PublicationRecord,
-    previous: &Option<conversation_protocol::v3::BaseUrl>,
 ) -> Result<PublicationRecord, String> {
     let mut result = None;
     append_transition(
@@ -2203,12 +2198,6 @@ fn append_publication_pending(
                 }
                 result = Some(existing);
                 return Ok(Step::Done(head.to_string()));
-            }
-            let config = Conversation::open(store, head)?.base_url(&pending.source_tree_name)?;
-            if &config != previous {
-                return Err(
-                    "source tree settings changed while preparing publication; review again".into(),
-                );
             }
             let transitions = vec![Transition::PublicationPending {
                 record: pending.clone(),
@@ -2359,8 +2348,9 @@ pub fn publish_source_tree_branch(
     t: &GitTransport,
     id: &str,
     source_tree: Option<&str>,
+    repository: &str,
 ) -> Result<PublishedBranch, String> {
-    publish_source_tree_branch_inner(t, id, source_tree, None, None)
+    publish_source_tree_branch_inner(t, id, source_tree, None, repository, None)
 }
 
 /// Publish exactly the selected commit.
@@ -2369,8 +2359,16 @@ pub fn publish_prepared_source_tree_branch(
     id: &str,
     source_tree: &str,
     prepared_head: &str,
+    repository: &str,
 ) -> Result<PublishedBranch, String> {
-    publish_source_tree_branch_inner(t, id, Some(source_tree), Some(prepared_head), None)
+    publish_source_tree_branch_inner(
+        t,
+        id,
+        Some(source_tree),
+        Some(prepared_head),
+        repository,
+        None,
+    )
 }
 
 fn publish_source_tree_branch_inner(
@@ -2378,6 +2376,7 @@ fn publish_source_tree_branch_inner(
     id: &str,
     source_tree: Option<&str>,
     prepared_head: Option<&str>,
+    repository_url: &str,
     preview: Option<&source_trees::PublicationTarget>,
 ) -> Result<PublishedBranch, String> {
     refs::validate_conversation_id(id)?;
@@ -2390,11 +2389,6 @@ fn publish_source_tree_branch_inner(
     let record = conversation
         .source_tree(&source_tree)?
         .ok_or_else(|| format!("source tree {source_tree:?} disappeared"))?;
-    if matches!(source_tree.rsplit('/').next(), Some("dirty" | "00-base")) {
-        return Err(
-            "copy or rename this entry to a numbered review boundary before publishing".into(),
-        );
-    }
     let planned_head = record.commit;
     if prepared_head.is_some_and(|prepared| prepared != planned_head.as_str()) {
         return Err(format!(
@@ -2403,27 +2397,12 @@ fn publish_source_tree_branch_inner(
     }
     let initial = conversation.reference_start(&source_tree)?;
     let publications = conversation.publications()?;
-    let config = conversation.base_url(&source_tree)?;
-    let (repository_url, branch) = match preview {
-        Some(target) => {
-            if config != target.base_url {
-                return Err("publication destination changed since preview".into());
-            }
-            (target.repository.clone(), target.branch.clone())
-        }
-        None => {
-            let repository = config
-                .as_ref()
-                .ok_or("add .base-url before publishing")?
-                .repository
-                .clone();
-            let branch = source_tree.clone();
-            (repository, branch)
-        }
-    };
-    conversation_protocol::v3::source_trees::validate_repository(&repository_url)?;
+    let branch = preview
+        .map(|target| target.branch.clone())
+        .unwrap_or_else(|| source_tree.clone());
+    conversation_protocol::v3::source_trees::validate_repository(repository_url)?;
     conversation_protocol::v3::source_trees::validate_branch(&branch)?;
-    let repository = normalize_repository_identity(&repository_url)?;
+    let repository = normalize_repository_identity(repository_url)?;
     drop(conversation);
 
     store.ensure_local(&planned_head)?;
@@ -2432,7 +2411,7 @@ fn publish_source_tree_branch_inner(
     ensure_code_commit(t, &mut store, &planned_head)?;
 
     let branch_ref = format!("refs/heads/{branch}");
-    let origin = GitStore::open(t.work_dir(), Some(&repository_url))?;
+    let origin = GitStore::open(t.work_dir(), Some(repository_url))?;
     let expected_old = origin.read_ref(&branch_ref)?;
     if preview.is_some_and(|target| {
         target.remote_head.as_deref() != expected_old.as_ref().map(Oid::as_str)
@@ -2496,7 +2475,7 @@ fn publish_source_tree_branch_inner(
         evidence: None,
         observed: None,
     };
-    let joined = append_publication_pending(t, id, &conversation_ref, &pending, &config)?;
+    let joined = append_publication_pending(t, id, &conversation_ref, &pending)?;
     if joined.status != PublicationStatus::Pending {
         return Ok(PublishedBranch {
             source_tree,
@@ -3364,6 +3343,10 @@ mod tests {
         git(transport.work_dir(), &["rev-parse", "HEAD"])
     }
 
+    fn publishing_repository(transport: &GitTransport) -> String {
+        git(transport.work_dir(), &["remote", "get-url", "origin"])
+    }
+
     fn create_idle_conversation(transport: &GitTransport, id: &str, base: &str) {
         submit_message_inner_with(
             transport,
@@ -3377,28 +3360,6 @@ mod tests {
         )
         .unwrap();
         interrupt_request(transport, id).unwrap();
-        let base_url = format!(
-            "{}\nmain\n",
-            git(transport.work_dir(), &["remote", "get-url", "origin"])
-        );
-        append_transition(
-            transport,
-            id,
-            &refs::head_ref(id).unwrap(),
-            "fixture destination",
-            |_, _| {
-                Ok(Step::Mint(Transition::FilesApply {
-                    files: vec![(
-                        ".base-url".into(),
-                        Some((
-                            conversation_protocol::v3::Mode::Blob,
-                            base_url.as_bytes().to_vec(),
-                        )),
-                    )],
-                }))
-            },
-        )
-        .unwrap();
     }
 
     #[test]
@@ -3513,10 +3474,21 @@ mod tests {
                 }));
             });
             assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_source_tree_branch(&transport, "retry-talk", None)
+                publish_source_tree_branch(
+                    &transport,
+                    "retry-talk",
+                    None,
+                    &publishing_repository(&transport),
+                )
             }))
             .is_err());
-            let retry = publish_source_tree_branch(&transport, "retry-talk", None).unwrap();
+            let retry = publish_source_tree_branch(
+                &transport,
+                "retry-talk",
+                None,
+                &publishing_repository(&transport),
+            )
+            .unwrap();
             assert_eq!(retry.status, PublicationStatus::Complete);
             let head = conversation_head(&transport, "retry-talk")
                 .unwrap()
@@ -3934,68 +3906,128 @@ mod tests {
         let one = commit_file(&transport, &base, "first change\n", "first");
         let two = commit_file(&transport, &one, "second change\n", "second");
         fixture_reference(&transport, "stack", "feature/00-base", Some(&base)).unwrap();
-        fixture_reference(&transport, "stack", "feature/01-first", Some(&one)).unwrap();
-        fixture_reference(&transport, "stack", "feature/02-second", Some(&two)).unwrap();
+        fixture_reference(&transport, "stack", "feature/apples", Some(&one)).unwrap();
+        fixture_reference(&transport, "stack", "feature/dirty", Some(&two)).unwrap();
+        fixture_reference(&transport, "stack", "imports/repo/base", Some(&base)).unwrap();
+        let write_metadata = |path: &str, value: Option<Vec<u8>>| {
+            append_transition(
+                &transport,
+                "stack",
+                &refs::head_ref("stack").unwrap(),
+                "import provenance",
+                |_, _| {
+                    Ok(Step::Mint(Transition::FilesApply {
+                        files: vec![(
+                            path.into(),
+                            value
+                                .clone()
+                                .map(|bytes| (conversation_protocol::v3::Mode::Blob, bytes)),
+                        )],
+                    }))
+                },
+            )
+            .unwrap();
+        };
+        write_metadata(
+            "imports/repo/base.source.json",
+            Some(br#"{"repository":"https://example.com/repo","default_branch":"main"}"#.to_vec()),
+        );
+        assert_eq!(
+            source_trees::publication_provenance(&transport, "stack", "feature/apples")
+                .unwrap()
+                .unwrap()
+                .repository,
+            "https://example.com/repo"
+        );
+        fixture_reference(&transport, "stack", "imports/other/base", Some(&base)).unwrap();
+        write_metadata(
+            "imports/other/base.source.json",
+            Some(br#"{"repository":"https://example.com/other","default_branch":"main"}"#.to_vec()),
+        );
+        assert!(
+            source_trees::publication_provenance(&transport, "stack", "feature/apples")
+                .unwrap()
+                .is_none()
+        );
+        // A legacy policy file cannot supply or override an explicit destination.
+        write_metadata(
+            "feature/.base-url",
+            Some(b"https://wrong.example/repo\nwrong\n".to_vec()),
+        );
         // Review boundaries are complete and inspectable before a destination
         // is chosen. Only publication needs that policy.
-        let unconfigured = source_trees::publication_plan(&transport, "stack").unwrap();
+        let unconfigured = source_trees::publication_plan(&transport, "stack")
+            .unwrap()
+            .into_iter()
+            .filter(|target| target.base_commit.is_some())
+            .collect::<Vec<_>>();
         assert_eq!(unconfigured.len(), 2);
-        assert!(unconfigured.iter().all(|target| target.base_url.is_none()));
+        assert!(unconfigured
+            .iter()
+            .all(|target| target.repository.is_empty()));
         assert_eq!(unconfigured[0].head, one);
         assert_eq!(unconfigured[1].head, two);
         assert!(source_trees::publication_order(&unconfigured)
             .unwrap_err()
-            .contains("before publishing"));
+            .contains("choose a destination"));
 
-        append_transition(
-            &transport,
-            "stack",
-            &refs::head_ref("stack").unwrap(),
-            "publication destination",
-            |_, _| {
-                Ok(Step::Mint(Transition::FilesApply {
-                    files: vec![(
-                        "feature/.base-url".into(),
-                        Some((
-                            conversation_protocol::v3::Mode::Blob,
-                            format!("{repository}\nmain\n").into_bytes(),
-                        )),
-                    )],
-                }))
-            },
-        )
-        .unwrap();
-
-        let plan = source_trees::publication_plan(&transport, "stack").unwrap();
+        let destination = source_trees::PublicationDestination {
+            repository: repository.clone(),
+            base_branch: "main".into(),
+        };
+        let content_head = conversation_head(&transport, "stack").unwrap();
+        let mut plan = unconfigured;
+        for target in &mut plan {
+            source_trees::resolve_publication_target(&transport, target, &destination, false)
+                .unwrap();
+        }
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            content_head
+        );
+        assert!(plan.iter().all(|target| target.repository == repository));
+        assert!(
+            source_trees::publication_provenance(&transport, "stack", "feature/apples")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             plan.iter()
                 .map(|p| p.source_tree.as_str())
                 .collect::<Vec<_>>(),
-            ["feature/01-first", "feature/02-second"]
+            ["feature/apples", "feature/dirty"]
         );
         assert_eq!(plan[0].base_branch, "main");
-        assert_eq!(plan[1].base_branch, "feature/01-first");
+        assert_eq!(plan[1].base_branch, "feature/apples");
         source_trees::publish_target(&transport, "stack", &plan[0], &base).unwrap();
         source_trees::publish_target(&transport, "stack", &plan[1], &one).unwrap();
         assert_eq!(
             git(
                 &root.join("origin.git"),
-                &["rev-parse", "refs/heads/feature/01-first"]
+                &["rev-parse", "refs/heads/feature/apples"]
             ),
             one
         );
         assert_eq!(
             git(
                 &root.join("origin.git"),
-                &["rev-parse", "refs/heads/feature/02-second"]
+                &["rev-parse", "refs/heads/feature/dirty"]
             ),
             two
         );
 
         // The remote changed since this preview: it cannot be silently reused.
         assert!(source_trees::publish_target(&transport, "stack", &plan[0], &base).is_err());
-        let fresh = source_trees::publication_plan(&transport, "stack").unwrap();
-        fixture_reference(&transport, "stack", "feature/01-first", Some(&two)).unwrap();
+        let mut fresh = source_trees::publication_plan(&transport, "stack")
+            .unwrap()
+            .into_iter()
+            .filter(|target| target.base_commit.is_some())
+            .collect::<Vec<_>>();
+        for target in &mut fresh {
+            source_trees::resolve_publication_target(&transport, target, &destination, false)
+                .unwrap();
+        }
+        fixture_reference(&transport, "stack", "feature/apples", Some(&two)).unwrap();
         assert!(source_trees::publish_target(&transport, "stack", &fresh[0], &base).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -4004,7 +4036,13 @@ mod tests {
     fn publication_fast_forwards_but_rejects_divergent_source_trees() {
         let (root, transport, base) = fixture("publish-advance");
         create_idle_conversation(&transport, "advance-talk", &base);
-        publish_source_tree_branch(&transport, "advance-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let next = commit_file(&transport, &base, "updated\n", "updated");
         submit_message_inner_with(
             &transport,
@@ -4018,14 +4056,26 @@ mod tests {
         )
         .unwrap();
         interrupt_request(&transport, "advance-talk").unwrap();
-        let published = publish_source_tree_branch(&transport, "advance-talk", None).unwrap();
+        let published = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(published.status, PublicationStatus::Complete);
         assert_eq!(published.head, next);
         let source_head = conversation_head(&transport, "advance-talk")
             .unwrap()
             .unwrap();
         fork_conversation(&transport, "Alice", "forked-talk", "fork", &source_head).unwrap();
-        let forked = publish_source_tree_branch(&transport, "forked-talk", None).unwrap();
+        let forked = publish_source_tree_branch(
+            &transport,
+            "forked-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(forked.branch, "main");
         assert_eq!(
             git(&root.join("origin.git"), &["rev-parse", "refs/heads/main"]),
@@ -4034,8 +4084,13 @@ mod tests {
 
         let side = commit_file(&transport, &base, "side source tree\n", "side");
         fixture_reference(&transport, "advance-talk", "side", Some(&side)).unwrap();
-        let side_publication =
-            publish_source_tree_branch(&transport, "advance-talk", Some("side")).unwrap();
+        let side_publication = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            Some("side"),
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(side_publication.status, PublicationStatus::Complete);
         assert_eq!(side_publication.branch, "side");
         // An outside writer can still advance a source tree's own branch. Preserve it.
@@ -4043,8 +4098,13 @@ mod tests {
             &root.join("origin.git"),
             &["update-ref", "refs/heads/side", &next],
         );
-        let error =
-            publish_source_tree_branch(&transport, "advance-talk", Some("side")).unwrap_err();
+        let error = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            Some("side"),
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert!(error.contains("would not fast-forward"), "{error}");
         assert_eq!(
             git(&root.join("origin.git"), &["rev-parse", "refs/heads/main"]),
@@ -4073,6 +4133,7 @@ mod tests {
             "publish-talk",
             "main",
             &"0".repeat(40),
+            &publishing_repository(&transport),
         )
         .unwrap_err();
         assert!(
@@ -4085,8 +4146,14 @@ mod tests {
         );
         assert!(git(&root.join("origin.git"), &["for-each-ref", branch_ref]).is_empty());
 
-        let first =
-            publish_prepared_source_tree_branch(&transport, "publish-talk", "main", &base).unwrap();
+        let first = publish_prepared_source_tree_branch(
+            &transport,
+            "publish-talk",
+            "main",
+            &base,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(first.source_tree, "main");
         assert_eq!(first.branch, "main");
         assert_eq!(first.head, base);
@@ -4133,7 +4200,13 @@ mod tests {
         drop(complete);
         drop(store);
 
-        let second = publish_source_tree_branch(&transport, "publish-talk", None).unwrap();
+        let second = publish_source_tree_branch(
+            &transport,
+            "publish-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(second.status, PublicationStatus::Complete);
         assert_ne!(second.publication, first.publication);
         let store = open_store(&transport).unwrap();
@@ -4160,7 +4233,13 @@ mod tests {
     fn publication_preserves_a_remote_commit_present_before_publish() {
         let (root, transport, base) = fixture("publish-existing-drift");
         create_idle_conversation(&transport, "existing-drift-talk", &base);
-        publish_source_tree_branch(&transport, "existing-drift-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "existing-drift-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let teammate = commit_file(&transport, &base, "teammate change\n", "teammate");
         let branch_ref = "refs/heads/main";
         git(
@@ -4172,8 +4251,13 @@ mod tests {
                 &format!("{teammate}:{branch_ref}"),
             ],
         );
-        let error =
-            publish_source_tree_branch(&transport, "existing-drift-talk", None).unwrap_err();
+        let error = publish_source_tree_branch(
+            &transport,
+            "existing-drift-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert!(error.contains("would not fast-forward"), "{error}");
         assert_eq!(
             git(&root.join("origin.git"), &["rev-parse", branch_ref]),
@@ -4186,7 +4270,13 @@ mod tests {
     fn source_tree_branch_publication_records_remote_drift_without_overwriting_it() {
         let (root, transport, base) = fixture("publish-conflict");
         create_idle_conversation(&transport, "conflict-talk", &base);
-        publish_source_tree_branch(&transport, "conflict-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "conflict-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let unrelated = commit_file(&transport, &base, "unrelated\n", "unrelated");
         let branch_ref = "refs/heads/main";
         git(
@@ -4218,7 +4308,13 @@ mod tests {
             }));
         });
 
-        let published = publish_source_tree_branch(&transport, "conflict-talk", None).unwrap();
+        let published = publish_source_tree_branch(
+            &transport,
+            "conflict-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(published.status, PublicationStatus::Conflict);
         assert_eq!(published.observed.as_deref(), Some(unrelated.as_str()));
         assert_eq!(
@@ -4271,7 +4367,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let error = publish_source_tree_branch(&transport, "guard-talk", None).unwrap_err();
+        let error = publish_source_tree_branch(
+            &transport,
+            "guard-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert_eq!(
             error,
             "the source tree carries `.caos/` state; resolve and remove `.caos/conflicts` first"
@@ -4653,7 +4755,6 @@ mod tests {
         assert!(
             matches!(view.identity().unwrap().kind, IdentityKind::Fork { source: ref parent } if parent.as_str() == source)
         );
-        assert_eq!(view.base_url("main").unwrap(), None);
         assert!(
             spine_contains(&store, fork_oid.clone(), &oid(&source, "source").unwrap()).unwrap()
         );

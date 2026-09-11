@@ -200,20 +200,6 @@ impl<'s> Conversation<'s> {
         Ok(None)
     }
 
-    /// Optional publishing convention. Invalid content remains editable.
-    pub fn base_url(&self, name: &str) -> Result<Option<super::BaseUrl>, String> {
-        let dir = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-        let path = if dir.is_empty() {
-            ".base-url".into()
-        } else {
-            format!("{dir}/.base-url")
-        };
-        Ok(self
-            .snapshot
-            .read(&path)?
-            .and_then(|bytes| super::BaseUrl::parse(&bytes).ok()))
-    }
-
     pub fn source_trees(&self) -> Result<BTreeMap<String, SourceTreeRecord>, String> {
         self.source_tree_names()?
             .into_iter()

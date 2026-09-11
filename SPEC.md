@@ -571,16 +571,13 @@ revision (and made the history tools' hashes readable the same way).
 
 ## Publication
 
-The [conversation publication flow](design/chat.md) derives a PR stack from a
-directory: `.base-url` supplies the repository and external base branch;
-numbered commit entries supply PR branches named by their full paths.
-`00-base` and `dirty` are excluded. The first PR targets the external branch;
-each later PR targets the preceding boundary. No publication defaults are stored.
-`Ctrl+P` previews exact commits and destinations, publishes them in order, and
-opens or reuses each PR by repository and head branch. Publication verifies
-the captured content and remote tips; interrupted pushes are reconciled from
-the remote and execution events. `/publish-branch` pushes a selected review
-boundary without PR creation. Neither exports conversations.
+The [conversation publication flow](design/chat.md) derives a PR stack from
+sibling gitlinks in filename order: the oldest is the base; each later snapshot
+is a PR boundary named by its full path. The client explicitly confirms the
+repository and external base branch. Provenance can suggest those fields;
+confirmed destinations are remembered locally. The first PR targets the external
+branch and each later PR targets the preceding boundary. Conversation files do
+not configure publication, and no snapshot has a special working or sealed state.
 
 Per-mutation commits remain in the published source tree history. Only the
 previewed PR tip is checked for unresolved conflicts and reserved state;

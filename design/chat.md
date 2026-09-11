@@ -26,22 +26,21 @@ flowchart TB
         before["C_0: user message<br/>C_1: record run request<br/>C_2: worker starts run<br/>C_3: model requests bash<br/>C_4: bash starts"]
         after["C_5: bash completes edit<br/>C_6: model replies<br/>C_7: run finishes"]
         before -->|conversation continues| after
-        before -.->|feature/dirty| W0["W_0: original code"]
-        after -.->|feature/dirty| W1["W_1: edited code"]
+        before -.->|feature/01-parser| W0["W_0: original code"]
+        after -.->|feature/01-parser| W1["W_1: edited code"]
         W1 -->|Git parent| W0
-        after --> ready["C_8: rename dirty to 01-feature"]
-        ready -.->|feature/01-feature| W1
+        after -.->|feature/00-base| W0
     end
     subgraph destination["Destination Git"]
-        P["P: feature/01-feature"] --> published1["W_1"]
+        P["P: feature/01-parser"] --> published1["W_1"]
         published1 -->|Git parent| published0["W_0"]
     end
     W1 -.->|publish same commits and ancestry| published1
 ```
 
 This example dispatches bash to a worker; each listed `C` is a separate commit.
-Naming the review boundary creates a new `C`, but no new `W`. Publishing
-pushes that exact code commit.
+Editing the named snapshot advances its `W`; the base stays unchanged.
+Publishing pushes that exact code commit.
 
 ## Conversation commits
 
@@ -94,9 +93,9 @@ users specify the desired work and review structure. Imports conventionally live
 at `imports/<repo>/base`. A sibling `<import-path>.source.json` records available portable
 repository details, so sibling imports can come from different repositories.
 The agent preserves imports. To build a PR stack, it copies an
-imported gitlink to `<feature>/00-base` and `<feature>/dirty` before editing.
-When publishing, it uses recorded repository and default-branch details to write
-`.base-url`, unless the user chose another destination. Missing or ambiguous details require clarification only then.
+imported gitlink to `<feature>/00-base` and `<feature>/01-parser` before editing.
+Publication destinations are confirmed in the client preview. Provenance can
+suggest a destination, but never selects one silently.
 
 Commands start at the conversation root. Memories, skills, notes, and source
 trees share one path space. A commit-valued entry appears as a directory whose
@@ -104,7 +103,7 @@ contents are that commit's tree; a regular file containing a SHA remains a file.
 Nested commit entries follow the same rule.
 
 The file tools and grep use conversation-relative paths, such as
-`memories/project.md` or `feature/dirty/README.md`. Grep traverses source trees.
+`memories/project.md` or `feature/01-parser/README.md`. Grep traverses source trees.
 Bash runs from this root, with an optional relative `cwd` for a single call.
 Its `paths` list is always relative to the conversation root: declared
 directories include their descendants; undeclared contents remain lazy.
@@ -115,10 +114,9 @@ with a gitlink imported at `imports/caos/base`:
 ```sh
 mkdir -p feature
 cp -a imports/caos/base feature/00-base
-cp -a imports/caos/base feature/dirty
-# After completing the first change:
-mv feature/dirty feature/01-parser
-cp -a feature/01-parser feature/dirty
+cp -a imports/caos/base feature/01-parser
+# After completing the first change, start the next:
+cp -a feature/01-parser feature/02-errors
 ```
 
 A writable projection records each source directory's original commit in an
@@ -134,7 +132,7 @@ imports happen through the client. No host filesystem path is implicitly
 available inside a worker.
 
 Call a repository tool with `run_tool` and a conversation-relative path, such
-as `feature/dirty/caos-tools/test`, plus its arguments. The harness resolves
+as `feature/01-parser/caos-tools/test`, plus its arguments. The harness resolves
 the tool against the captured snapshot and dispatches its content-addressed
 request. Its input is the outermost source tree on that path: the first
 commit-valued entry reached from the conversation root, even if the tool lies
@@ -163,32 +161,25 @@ imported gitlink into a feature directory and follow this convention:
 
 ```text
 paintbot-feature/
-  .base-url                 # optional until publishing: URL, then base branch
-  00-base          -> W_0   # exact incorporated base
+  00-base          -> W_0   # preserved starting commit
   01-add-targeting -> W_1   # first PR boundary
-  02-improve-it    -> W_2   # second PR boundary
-  dirty            -> W_d   # current work, when present
+  02-improve-it    -> W_2   # second PR boundary, currently being edited
 ```
 
-`.base-url` is optional until publishing. Work, delegation, merging, tests,
-and review boundaries depend only on the recorded commits, so preparing a
-stack does not require choosing a destination. When present, `.base-url`
-names the publishing repository and base branch. `00-base` records the commit
-actually incorporated; fetching a newer remote tip does not integrate it.
+Each sibling gitlink names a snapshot. In ascending filename order, the first
+is the base; every later entry is a review boundary. Number prefixes make this
+order clear but have no special syntax. Names such as `dirty` have no special
+meaning. Work directly in a named boundary, then copy it to the next name when
+starting another reviewable change. Earlier snapshots remain unchanged.
 
-Review boundaries use exactly two digits from `01` through `99`, a hyphen,
-and a nonempty description, such as `01-parser`. They are not individual edits.
-The browser lists entries in descending filename order. Publication derives
-each boundary's base from the preceding gitlink in the same directory.
-The browser compares a selected gitlink with the next gitlink below it in
-descending filename order. A folder previews its newest two gitlinks; the
-oldest gitlink has no comparison and shows content.
-Intermediate code commits remain in ordinary Git ancestry.
+The browser lists entries in descending filename order. It compares a selected
+gitlink with the next gitlink below it; a folder previews its newest two
+gitlinks. The oldest entry has no comparison and shows content. Publication
+uses the same order. Naming a boundary does not squash intermediate Git commits.
 
-Keep **one moving `dirty` reference**. Each accepted edit produces a real code
-commit and updates its value; previous values remain in conversation history.
-When ready, rename it to the next numbered boundary. Start another `dirty`
-from that commit when needed.
+Work, delegation, merging, tests, and review boundaries need only the recorded
+commits. No publication destination is required to prepare a stack. Fetching a
+newer remote tip does not integrate it; the agent must merge it explicitly.
 
 Creating, copying, renaming, or removing references is ordinary tree editing.
 
@@ -244,27 +235,34 @@ its checkout destination again.
 
 ## Publication
 
-Choose a publishing destination when ready to publish, add `.base-url` if
-absent, then select a stack directory and derive the plan:
+Select a stack directory and choose its destination in the client:
 
-- Repository and external base: `.base-url`.
+- Repository and external base branch: explicit fields in the preview.
 - Branch names: entry paths, such as `paintbot-feature/01-add-targeting`.
-- PR bases: the external branch for the first boundary, then the preceding
-  boundary's branch for each subsequent PR.
+- PR bases: the external branch for the first change, then the preceding
+  boundary's branch for each subsequent PR. The oldest sibling is the base,
+  so it does not become a PR.
 
-Exclude `00-base` and `dirty`. Naming a boundary does not squash the
-intervening commits.
+The client remembers confirmed destinations locally by server, conversation,
+and stack directory. Without a remembered choice, it can suggest provenance
+from an imported gitlink matching the stack's oldest commit exactly. Conflicting
+origins give no automatic suggestion. The user can edit all suggested values.
+Import provenance describes origin; it is not publication policy. No `.base-url`
+file is read or required, and a nearby metadata file cannot silently retarget a push.
+
+Press Enter to fetch the chosen destination and inspect a preview, then Enter
+again to publish. Changing the selection or destination requires a fresh preview.
 
 The TUI performs publication on the client host using its Git and GitHub
 credentials; no local working checkout is required. The preview captures the
 code commits, destination branches, PR bases, and current remote tips. After
 confirmation, push those exact commits and ancestry,
-then open or reuse the PRs. Reject changed content, changed destinations, remote
+then open or reuse the PRs. Reject changed content, changed boundaries, remote
 drift, unresolved conflicts, and a PR base not incorporated into the code.
 Preparation, builds, and tests happen before previewing; publishing never runs
 an agent or changes code.
 
-Find existing PRs by repository and inferred branch. Inspect destination refs
+Find existing PRs by confirmed repository and branch. Inspect destination refs
 after an interrupted push before retrying. Any recovery events belong in commit
 history.
 
@@ -292,9 +290,9 @@ the proposed destination, which appears in the preview.
   `default_branch` when importing from Git. Local discovery reads `origin` and
   `origin/HEAD` without network access; remote imports read the advertised default.
   Local paths and credential-bearing URLs are omitted. Existing differing
-  provenance is rejected, not overwritten. This ordinary file informs the agent;
-  publication reads only `.base-url`. Importing does not choose a publishing
-  destination or associate a local checkout.
+  provenance is rejected, not overwritten. This ordinary file informs the agent
+  and can prefill the publication preview when the stack base matches the import.
+  Importing does not choose a publishing destination or associate a local checkout.
 - `Ctrl+L`: check the selected code snapshot out in its remembered local directory.
   If none is selected, prompt for `/checkout <directory>`.
 - `/checkout <directory>`: choose an existing clean Git checkout or an empty/new
@@ -302,8 +300,12 @@ the proposed destination, which appears in the preview.
   destination locally. Relative paths are resolved from the launching directory.
 - `/update-tree <message>`: submit local edits to the selected code snapshot
   with a user message.
-- `Ctrl+P`: preview and publish the selected directory's numbered boundaries.
-- `/publish-branch`: push the selected boundary without creating a PR.
+- `Ctrl+P`: choose and preview the selected directory's review boundaries.
+  Space selects entries; `e` edits the repository and external base branch
+  (Tab switches fields, Ctrl+U clears). Enter loads the remote preview; a second
+  Enter confirms publication. Escape closes the preview.
+- `/publish-branch`: confirm a repository and push the selected snapshot without
+  creating a PR. A base branch is not required.
 
 The browser pins the conversation head when opened; refresh loads the latest
 head. Ordinary files show contents. Inside a source boundary, files show their

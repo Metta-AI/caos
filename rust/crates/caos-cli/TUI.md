@@ -80,7 +80,7 @@ worker, so they take neither.
 caos tui $W                  continue the most recent conversation
 caos tui $W --username alice use alice's active conversation list
 caos tui $W --new            start a fresh conversation
-caos tui $W --import feature/dirty  load this checkout at feature/dirty
+caos tui $W --import imports/caos/base  load this checkout at imports/caos/base
 caos tui $W --server URL     use a specific server
 caos tui $W --from 5ec3751   branch from a completed turn
 caos tui --list-archived     list archived conversation IDs and titles
@@ -133,7 +133,7 @@ so it never leaves the conversation pane.
 | `Ctrl+L` | Check out the selected gitlink in its chosen local directory |
 | `Ctrl+O` | Browse conversation files and source-tree diffs |
 | `Ctrl+P` | Preview selected source trees and their PR destinations; Enter confirms |
-| `/publish-branch` | Push a review boundary to the repository in .base-url, using its path as the branch |
+| `/publish-branch` | Preview a repository and push the selected snapshot without creating a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -179,14 +179,14 @@ Git ignore rules, including ancestor rules for subdirectories. Each import's
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
-`Ctrl+P` previews the selected directory's numbered boundaries. Branch names
-are their full paths; the first PR targets the branch in `.base-url` and later
-PRs target the preceding entry. `00-base` and `dirty` are excluded. Space selects
-rows, `a` toggles all, Enter confirms, and Escape cancels. Publishing pushes
-the previewed commits; it does not run an agent or modify code. Incorporate
-base changes and run checks before previewing. Changed content or remote tips
-require another preview. `/publish-branch` pushes the selected review boundary
-without creating a PR.
+`Ctrl+P` previews sibling gitlinks in filename order. The oldest is the base;
+each later snapshot becomes a PR branch named by its full path. The repository
+and external base branch are explicit client choices. Remembered destinations
+or unambiguous import provenance can prefill them. Press `e` to edit, Tab to
+switch fields, Ctrl+U to clear, and Enter to finish editing. Enter loads remote
+state for review; Enter again publishes. The first PR targets the chosen base;
+later PRs target the preceding boundary. Publication never edits or tests code.
+`/publish-branch` uses the same confirmation flow without requiring a PR base.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -198,8 +198,9 @@ it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first
 prompt keeps that explicit title instead.
 
-The launcher starts without code. `--import feature/dirty` explicitly loads the
-checkout's committed HEAD at `feature/dirty`; `--base` selects another commit.
+The launcher starts without code. `--import imports/caos/base` snapshots the
+checkout's current disk contents at that path. Add `--base HEAD` or another
+revision to import a gitlink with Git ancestry instead.
 `/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
 require the previous build; this version does not migrate them implicitly.
 

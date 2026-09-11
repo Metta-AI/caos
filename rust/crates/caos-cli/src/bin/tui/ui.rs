@@ -1686,10 +1686,7 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
     ])
     .split(inner);
     if prompt.loading {
-        frame.render_widget(
-            Paragraph::new("Loading repositories and pull requests..."),
-            rows[0],
-        );
+        frame.render_widget(Paragraph::new("Loading publication preview..."), rows[0]);
     } else {
         let items = prompt
             .rows
@@ -1709,10 +1706,22 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
                     )),
                     Line::from(format!(
                         "    {} -> {}",
-                        row.target.branch, row.target.base_branch
+                        row.target.branch,
+                        if prompt.previewed {
+                            &row.target.base_branch
+                        } else {
+                            &row.destination.base_branch
+                        }
                     )),
                     Line::styled(
-                        format!("    {}   {operation}", row.target.repository),
+                        format!(
+                            "    {}   {operation}",
+                            if prompt.previewed {
+                                &row.target.repository
+                            } else {
+                                &row.destination.repository
+                            }
+                        ),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ])
@@ -1730,7 +1739,20 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
         );
     }
 
-    if let Some(error) = &prompt.error {
+    if prompt.editing {
+        if let Some(row) = prompt.rows.get(prompt.selected) {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{} Repository: {}\n{} Base branch: {}",
+                    if prompt.field == 0 { ">" } else { " " },
+                    row.destination.repository,
+                    if prompt.field == 1 { ">" } else { " " },
+                    row.destination.base_branch
+                )),
+                rows[1],
+            );
+        }
+    } else if let Some(error) = &prompt.error {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .style(Style::default().fg(Color::Red))
@@ -1738,11 +1760,24 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
             rows[1],
         );
     } else {
-        frame.render_widget(Paragraph::new("Selected source trees will be prepared, tested, and published in stack order.\nEach source tree gets its own branch and PR."), rows[1]);
+        let help = if prompt.rows.is_empty() && !prompt.loading {
+            "No review boundaries. Copy a base and a named change into the same folder."
+        } else if prompt.previewed {
+            "Confirm to push these exact commits. Publication does not edit code or run tests."
+        } else {
+            "Choose the repository and external base branch. Provenance is only a suggestion."
+        };
+        frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), rows[1]);
     }
+    let help = if prompt.editing {
+        "Tab field   Ctrl+U clear   Enter done   Esc close editor"
+    } else if prompt.previewed {
+        "Space select   e destination   Enter publish   Esc cancel"
+    } else {
+        "Space select   a all   e destination   Enter preview   Esc cancel"
+    };
     frame.render_widget(
-        Paragraph::new("Space select   a all   Enter/Ctrl+P publish   Esc cancel")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         rows[2],
     );
 }

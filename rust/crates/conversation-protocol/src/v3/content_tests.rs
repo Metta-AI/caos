@@ -92,7 +92,7 @@ fn event_only_commits_validate_and_tampered_events_do_not() {
 }
 
 #[test]
-fn code_paths_are_content_and_sealing_preserves_code_history() {
+fn code_paths_are_content_and_renaming_preserves_code_history() {
     let mut store = MemoryStore::new();
     let g3 = oid::ensure_genesis(&mut store).unwrap();
     let sig = client_signature("Test", "test@example.com", 1);
@@ -108,7 +108,7 @@ fn code_paths_are_content_and_sealing_preserves_code_history() {
             let mut content = crate::v3::tree::TreeBuilder::from(None);
             for (name, commit) in BTreeMap::<String, Oid>::from([
                 ("feature/00-base".into(), w.clone()),
-                ("feature/dirty".into(), w.clone()),
+                ("feature/01-draft".into(), w.clone()),
             ]) {
                 content.put_oid(&name, crate::v3::Mode::Commit, commit);
             }
@@ -119,14 +119,14 @@ fn code_paths_are_content_and_sealing_preserves_code_history() {
     let head = mint(&mut store, &g3, &applied, root.kind(), &sig).unwrap();
     let edits = Transition::FilesApply {
         files: vec![
-            ("feature/dirty".into(), None),
+            ("feature/01-draft".into(), None),
             (
                 "feature/01-change".into(),
                 Some((Mode::Commit, w.encode_line())),
             ),
             (
-                "feature/.base-url".into(),
-                Some((Mode::Blob, b"https://example.com/repo.git\nmain\n".to_vec())),
+                "feature/notes".into(),
+                Some((Mode::Blob, b"review notes\n".to_vec())),
             ),
         ],
     };
@@ -152,16 +152,9 @@ fn code_paths_are_content_and_sealing_preserves_code_history() {
             .0,
         "feature/00-base"
     );
-    assert_eq!(
-        view.base_url("feature/01-change")
-            .unwrap()
-            .unwrap()
-            .repository,
-        "https://example.com/repo.git"
-    );
     assert!(Conversation::open(&store, &head)
         .unwrap()
-        .source_tree("feature/dirty")
+        .source_tree("feature/01-draft")
         .unwrap()
         .is_some());
 }
