@@ -3650,51 +3650,20 @@ mod tests {
             std::fs::read_to_string(other.work_dir().join("source_tree")).unwrap(),
             "uncommitted work\n"
         );
-        // Arbitrary folders, files and symlinks do not need a Git repository.
         let plain = other_root.join("plain folder");
         std::fs::create_dir(&plain).unwrap();
-        std::fs::write(plain.join(".gitignore"), "ignored\n").unwrap();
-        std::fs::write(plain.join("ignored"), "excluded").unwrap();
-        std::fs::write(plain.join("note.txt"), "fresh untracked notes\n").unwrap();
-        std::os::unix::fs::symlink("note.txt", plain.join("link")).unwrap();
-        let tree = source_trees::import_source(
-            &transport,
-            "attached",
-            "notes",
-            plain.to_str().unwrap(),
-            None,
-        )
-        .unwrap();
-        let notes =
-            conversation_protocol::v3::tree::Snapshot::new(&store, oid(&tree, "notes").unwrap());
-        assert_eq!(
-            notes.read("note.txt").unwrap().unwrap(),
-            b"fresh untracked notes\n"
-        );
-        assert!(!notes.exists("ignored").unwrap());
-        assert_eq!(notes.entry("link").unwrap().unwrap().mode, Mode::Link);
-        source_trees::import_source(
-            &transport,
-            "attached",
-            "note.txt",
-            plain.join("note.txt").to_str().unwrap(),
-            None,
-        )
-        .unwrap();
-        let head = oid(
-            &conversation_head(&transport, "attached").unwrap().unwrap(),
-            "notes",
-        )
-        .unwrap();
-        assert_eq!(
-            Conversation::open(&store, &head)
-                .unwrap()
-                .snapshot()
-                .read("note.txt")
-                .unwrap()
-                .unwrap(),
-            b"fresh untracked notes\n"
-        );
+        std::fs::write(plain.join("note.txt"), "notes").unwrap();
+        for source in [&plain, &plain.join("note.txt")] {
+            let error = source_trees::import_source(
+                &transport,
+                "attached",
+                "notes",
+                source.to_str().unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("local imports require a Git repository directory"));
+        }
         // Local-only origins are not portable conversation metadata.
         assert!(
             source_trees::local_import_metadata("imports/local/base", other.work_dir())
@@ -3798,12 +3767,19 @@ mod tests {
             "https://example.invalid/other.git"
         );
         // A user file at this import's sidecar path is still never overwritten.
-        source_trees::import_source(
+        append_transition(
             &transport,
             "attached",
-            "imports/project/conflict.source.json",
-            plain.join("note.txt").to_str().unwrap(),
-            None,
+            &refs::head_ref("attached").unwrap(),
+            "fixture metadata",
+            |_, _| {
+                Ok(Step::Mint(Transition::FilesApply {
+                    files: vec![(
+                        "imports/project/conflict.source.json".into(),
+                        Some((Mode::Blob, b"notes".to_vec())),
+                    )],
+                }))
+            },
         )
         .unwrap();
         let before = conversation_head(&transport, "attached").unwrap().unwrap();

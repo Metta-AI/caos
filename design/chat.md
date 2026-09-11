@@ -6,7 +6,7 @@ review boundaries; a publication destination is optional until publishing.
 The TUI browses this filesystem read-only, showing file contents or the diff
 between adjacent code boundaries.
 
-Local path imports copy disk contents into ordinary conversation files and
+Local Git directory imports copy disk contents into ordinary conversation files and
 folders. Importing a Git revision preserves a code commit and its ancestry as
 a gitlink. Editing ordinary content changes `C`; editing a gitlink's contents
 also creates a new `W`.
@@ -283,14 +283,12 @@ the proposed destination, which appears in the preview.
   entry previews it; arrows navigate folders and gitlinks. The whole browser
   is read-only, including `.caos`.
 - `/import <path> <source> [revision]`: import at an unused conversation path.
-  A local file becomes a file; a local directory becomes an ordinary folder,
-  using the current disk contents, including uncommitted and untracked files.
-  Directory imports honor `.gitignore` and repository-local excludes, and omit
-  `.git`. Ancestor ignore rules apply when importing a repository subdirectory.
-  Symlinks and executable bits are preserved. The source need not be a
-  Git repository. No source index, branch, or file is changed. Quote paths
-  containing spaces.
-  For example: `/import imports/notes "/home/ubuntu/my notes"`.
+  A local source must be a Git repository directory (or a subdirectory of one).
+  It becomes an ordinary folder using the current disk contents, including
+  uncommitted and untracked files. Imports honor Git ignore rules, including
+  ancestor rules for subdirectories, and omit `.git`. Symlinks and executable
+  bits are preserved. Plain directories and individual files are not supported.
+  No source index, branch, or file is changed. Quote paths containing spaces.
   A remote URL, or a local repository with an explicit revision, imports a commit
   as a gitlink instead. Remote URLs without a revision use their default branch.
   For PR work with ancestry, use `/import imports/caos/base /path/to/caos HEAD`.
