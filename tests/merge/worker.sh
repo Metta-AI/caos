@@ -128,10 +128,10 @@ conflicted)
 
   t=$(merged_tree "$m")
   f=$(cat "$t/f.txt")
-  printf '%s' "$f" | grep -q '<<<<<<<' || fail "no conflict marker in f.txt:
+  [[ "$f" == *'<<<<<<<'* ]] || fail "no conflict marker in f.txt:
 $f"
-  printf '%s' "$f" | grep -q 'OURS'   || fail "ours side missing from f.txt"
-  printf '%s' "$f" | grep -q 'THEIRS' || fail "theirs side missing from f.txt"
+  [[ "$f" == *OURS* ]]   || fail "ours side missing from f.txt"
+  [[ "$f" == *THEIRS* ]] || fail "theirs side missing from f.txt"
   [ "$(cat "$t/ours.txt")" = "o" ]      || fail "ours.txt not merged in"
   [ "$(cat "$t/theirs.txt")" = "t" ]    || fail "theirs.txt not merged in"
   [ "$(cat "$t/keep.txt")" = "keep" ]   || fail "untouched keep.txt changed"
@@ -140,9 +140,9 @@ $f"
   # the conflicted path (and only it).
   caos get -r "$t/.caos" || fail "M has no .caos"
   conflicts=$(cat "$t/.caos/conflicts") || fail "M has no .caos/conflicts"
-  printf '%s' "$conflicts" | grep -q 'f.txt' || fail ".caos/conflicts does not name f.txt:
+  [[ "$conflicts" == *f.txt* ]] || fail ".caos/conflicts does not name f.txt:
 $conflicts"
-  if printf '%s' "$conflicts" | grep -q 'ours.txt'; then
+  if [[ "$conflicts" == *ours.txt* ]]; then
     fail ".caos/conflicts names the clean ours.txt"
   fi
   echo "  ok: markers in f.txt; .caos/conflicts lists f.txt and nothing else" >&2
