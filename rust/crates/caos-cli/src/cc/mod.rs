@@ -135,6 +135,10 @@ fn run_tool(
     args: &Value,
 ) -> Result<ToolOutcome, String> {
     let id = conversation_id_for(session)?;
+    // The prompt hook that opens this conversation runs in another process and
+    // takes seconds; the first tool call can beat it. Wait for the record
+    // rather than refuse the call. A no-op on every turn but the racing first.
+    wait_for_conversation(t, &id);
     let call = args
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
@@ -293,6 +297,36 @@ fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
         attempt += 1;
     }
     last
+}
+
+/// How long a tool call waits for its conversation to exist before proceeding
+/// to the append that would refuse it.
+///
+/// The conversation is created by the `UserPromptSubmit` hook -- a SEPARATE
+/// process, whose step resolution measures ~12s in a cloud session (a shallow
+/// fetch of the pinned rev, a curry, a push over the tunnel). Claude Code does
+/// not hold the turn for it, so the model's first tool call can and does arrive
+/// before it lands. Refusing that call ("no conversation to record into") is
+/// what makes a session's WHOLE FIRST TURN fail while every later turn works,
+/// because by the second prompt the record exists. So a call waits for the
+/// record the prompt hook is even now pushing -- server-authoritative, so this
+/// process sees the other's push. Bounded well past the ~12s so a warm session
+/// never trips it; a conversation that never appears (the prompt hook failed
+/// outright) still errors, just after this rather than instantly.
+const TOOL_WAIT_ATTEMPTS: u32 = 30;
+const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn wait_for_conversation(t: &GitTransport, id: &str) {
+    for attempt in 0..TOOL_WAIT_ATTEMPTS {
+        if let Ok(store) = open_store(t) {
+            if matches!(fetch_validated_head(t, &store, id), Ok(Some(_))) {
+                return;
+            }
+        }
+        if attempt + 1 < TOOL_WAIT_ATTEMPTS {
+            std::thread::sleep(TOOL_WAIT_INTERVAL);
+        }
+    }
 }
 
 /// The observation the step recorded, read back from the conversation.
