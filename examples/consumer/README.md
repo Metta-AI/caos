@@ -44,6 +44,6 @@ caos-cli run "$CAOS_CAS_DIR/out" --base:hash="$(git rev-parse HEAD:img)" --greet
 There is nothing to republish: `./inputs/caos/std/<name>` is a source directory
 in the tree you already have, and naming it resolves it — `caos-cli` ingests the
 directory and evaluates its `.caos-expr`. So after editing a builtin worker in
-the caos tree, update this repo's pin to it and the next run picks it up (a cache
+the caos tree, update this repo's pin and the next run picks it up (a cache
 hit for everything the edit didn't touch). No `caosd` restart, and no library ref
 to repoint.
