@@ -879,7 +879,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 10] = [
+const COMMANDS: [Command; 11] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -906,6 +906,13 @@ const COMMANDS: [Command; 10] = [
         usage: "/update-tree <message>",
         description: "fold working-tree edits into the commit",
         action: AppAction::UpdateTree,
+        takes_argument: true,
+    },
+    Command {
+        name: "/checkout",
+        usage: "/checkout <directory>",
+        description: "check out the selected commit and remember its local directory",
+        action: AppAction::Checkout,
         takes_argument: true,
     },
     Command {
@@ -2430,6 +2437,7 @@ impl App {
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
+            AppAction::Checkout => self.load_selected_at(Some(arguments)),
             AppAction::BrowseFiles => self.open_browser(),
             AppAction::Model => {
                 if arguments.split_whitespace().count() != 1 {
@@ -2454,7 +2462,6 @@ impl App {
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
             AppAction::NewConversation
-            | AppAction::Checkout
             | AppAction::Activity
             | AppAction::Tools
             | AppAction::Reload
@@ -2556,7 +2563,12 @@ impl App {
             return;
         }
         let name = parts[0].to_string();
-        let repository = parts[1].to_string();
+        let local = super::launcher::local_path(&self.repo_dir, parts[1]);
+        let repository = if local.is_dir() {
+            local.to_string_lossy().into_owned()
+        } else {
+            parts[1].to_string()
+        };
         let revision = parts.get(2).map(|value| value.to_string());
         self.start_import("importing repository", move |transport, conversation| {
             let head = caos_cli::source_trees::import_source(
@@ -3953,35 +3965,64 @@ impl App {
     }
 
     fn checkout_selected_source_tree(&self, head: &str) -> Result<PathBuf, String> {
-        let repository = self
-            .selected()
-            .require_selected_source_tree()?
-            .repository
-            .as_deref();
-        super::launcher::checkout_for(&self.repo_dir, repository, head)
+        let source = self.selected().require_selected_source_tree()?;
+        super::launcher::checkout_for(&self.repo_dir, &self.selected().id, &source.name, head)
     }
 
     fn load_selected(&mut self) {
+        self.load_selected_at(None);
+    }
+
+    fn load_selected_at(&mut self, directory: Option<&str>) {
         if self.selected().is_busy() {
             self.selected_mut()
                 .show_command_error("finish this conversation's operation before checking it out");
             return;
         }
-        match self.selected().require_selected_source_tree().cloned() {
-            Ok(diff) => match self
-                .checkout_selected_source_tree(&diff.head)
-                .and_then(|checkout| load_conversation_source_tree(&diff.head, &checkout))
-            {
-                Ok(()) => {
-                    self.selected_mut().status = format!(
-                        "checked out {} at {} in detached HEAD",
-                        diff.name,
-                        short_hash(&diff.head)
-                    );
+        let result: Result<String, String> = (|| {
+            let diff = self.selected().require_selected_source_tree()?.clone();
+            let checkout = if let Some(directory) = directory {
+                if directory.trim().is_empty() {
+                    return Err("usage: /checkout <directory>".into());
                 }
-                Err(error) => self.selected_mut().show_command_error(error),
-            },
-            Err(error) => self.selected_mut().show_command_error(error),
+                let path = super::launcher::local_path(&self.repo_dir, directory);
+                let checkout = super::launcher::prepare_checkout(&path)?;
+                super::launcher::import_local_commit(
+                    &self.repo_dir,
+                    &checkout,
+                    &conversation_protocol::v3::Oid::parse(&diff.head, "checkout")?,
+                )?;
+                checkout
+            } else {
+                self.checkout_selected_source_tree(&diff.head)?
+            };
+            load_conversation_source_tree(&diff.head, &checkout)?;
+            super::launcher::remember_checkout(
+                &self.repo_dir,
+                &self.selected().id,
+                &diff.name,
+                &checkout,
+            )?;
+            Ok(format!(
+                "checked out {} at {} in {} (detached HEAD)",
+                diff.name,
+                short_hash(&diff.head),
+                checkout.display()
+            ))
+        })();
+        match result {
+            Ok(status) => {
+                self.selected_mut().command_error = None;
+                self.selected_mut().status = status;
+            }
+            Err(error) => {
+                if error == "choose a local destination with /checkout <directory>"
+                    && self.selected().composer.expanded_text().is_empty()
+                {
+                    self.selected_mut().composer.insert_str("/checkout ");
+                }
+                self.selected_mut().show_command_error(error);
+            }
         }
     }
 
@@ -4955,6 +4996,7 @@ mod tests {
                 "/help",
                 "/title",
                 "/update-tree",
+                "/checkout",
                 "/import",
                 "/commands",
                 "/publish-branch",
@@ -6257,7 +6299,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_l_checks_out_the_conversation_on_the_first_press() {
+    fn ctrl_l_requires_a_destination_then_reuses_it() {
         let dir = throwaway_repo("ctrl-l");
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -6289,20 +6331,34 @@ mod tests {
             repository: None,
             base_name: None,
             name: "main".to_string(),
-            base_commit: base,
+            base_commit: base.clone(),
             head: head.clone(),
             patch: "changed".to_string(),
         }];
         selected.selected_source_tree = Some("main".to_string());
         let (mut app, _) = app_with(vec![selected]);
         app.repo_dir = dir.clone();
+        git(&[
+            "config",
+            "caos.checkout-settings",
+            &dir.join(".git/checkouts.gitconfig").to_string_lossy(),
+        ]);
 
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(git(&["rev-parse", "HEAD"]), base);
+        assert_eq!(app.selected().composer.expanded_text(), "/checkout ");
+        app.load_selected_at(Some(&dir.to_string_lossy()));
+        git(&["checkout", "--detach", "-q", &base]);
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
 
         assert_eq!(git(&["rev-parse", "HEAD"]), head);
         assert_eq!(
             app.selected().status,
-            format!("checked out main at {} in detached HEAD", short_hash(&head))
+            format!(
+                "checked out main at {} in {} (detached HEAD)",
+                short_hash(&head),
+                dir.display()
+            )
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
