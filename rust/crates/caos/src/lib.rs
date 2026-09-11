@@ -4846,6 +4846,72 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         )
         .is_err());
         assert!(projection.join("dirty/link").is_symlink());
+        // Clearing or deleting a resolved ledger cleans only source-tree metadata.
+        let metadata = projection.join("dirty/.caos");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(metadata.join("conflicts"), "unresolved code\n").unwrap();
+        let (_, unresolved) = store(&t, Some(&cas), &projection).unwrap();
+        let (_, unresolved) = eval::eval_path(&t, &unresolved.to_string(), "dirty", &[]).unwrap();
+        assert_eq!(
+            git(
+                dir.path(),
+                &["show", &format!("{unresolved}:.caos/conflicts")]
+            ),
+            "unresolved code\n"
+        );
+        let (_, raw) = t.get_object(&unresolved).unwrap();
+        let merge = String::from_utf8(raw).unwrap().replacen(
+            &format!("parent {base}\n"),
+            &format!("parent {base}\nparent {}\n", entry(b"dirty").oid),
+            1,
+        );
+        let merge = t
+            .put_object("commit", merge.as_bytes())
+            .unwrap()
+            .to_string();
+        get_hash(
+            &t,
+            &merge,
+            cas.join(format!("checkout-{merge}")).to_str().unwrap(),
+        )
+        .unwrap();
+        xattr::set(
+            projection.join("dirty"),
+            "user.caos.commit",
+            merge.as_bytes(),
+        )
+        .unwrap();
+        let (_, unchanged) = store(&t, Some(&cas), &projection).unwrap();
+        assert_eq!(
+            eval::eval_path(&t, &unchanged.to_string(), "dirty", &[])
+                .unwrap()
+                .1,
+            merge
+        );
+
+        // Ordinary conversation files are outside this cleanup rule.
+        std::fs::create_dir(projection.join(".caos")).unwrap();
+        std::fs::write(projection.join(".caos/conflicts"), "").unwrap();
+        for remove_ledger in [false, true] {
+            if remove_ledger {
+                std::fs::remove_file(metadata.join("conflicts")).unwrap();
+            } else {
+                std::fs::write(metadata.join("conflicts"), "").unwrap();
+            }
+            let (_, cleaned) = store(&t, Some(&cas), &projection).unwrap();
+            let (_, source) = eval::eval_path(&t, &cleaned.to_string(), "dirty", &[]).unwrap();
+            assert!(git(dir.path(), &["ls-tree", &source, "--", ".caos"]).is_empty());
+            assert_eq!(
+                git(dir.path(), &["rev-parse", &format!("{source}^")]).trim(),
+                merge
+            );
+            assert!(eval::eval_path(&t, &cleaned.to_string(), ".caos/conflicts", &[]).is_ok());
+        }
+        std::fs::write(metadata.join("conflicts"), "").unwrap();
+        std::fs::write(metadata.join("other"), "keep").unwrap();
+        let (_, retained) = store(&t, Some(&cas), &projection).unwrap();
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/conflicts", &[]).is_err());
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/other", &[]).is_ok());
     }
 
     #[test]

@@ -529,8 +529,10 @@ The agent resolves a path by editing the file (removing markers) or fixing
 the entry, then DELETING that path's rows from `.caos/conflicts`. That
 deletion IS the per-path `git add` — an explicit "this one's done"
 assertion, trusted exactly as git trusts `add` (no re-scan). An empty
-`.caos/conflicts` means resolution is done. Remove the ledger with `bash rm`
-before publication; that deletion is committed like any other code edit.
+`.caos/conflicts` means resolution is done. Recording an edited source tree
+removes its empty ledger and prunes the `.caos` directory if empty. Bash and
+inline edits share this rule. Unchanged commits, unresolved entries, other
+metadata, and ordinary conversation files are preserved.
 
 `.caos/conflicts` lives in the source tree, alongside the code. Inline
 file tools can edit it; compute tools receive it with the rest of the
@@ -538,7 +540,7 @@ source tree. Conversation protocol files live in a separate tree, so no
 step metadata needs to be injected or preserved in the source tree.
 
 Publication rejects any `.caos` content in the final source tree, including
-an empty `.caos/conflicts`. An empty `.caos` directory may remain. The check
+an empty `.caos/conflicts` or empty `.caos` directory. The check
 distinguishes unresolved conflicts from completed cleanup and does not rewrite
 the published commit. Earlier commits retain their conflict scaffolding.
 

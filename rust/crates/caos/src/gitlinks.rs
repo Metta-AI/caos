@@ -6,7 +6,7 @@ const BASE: &str = "user.caos.commit";
 /// Turn a projected directory back into a commit, retaining the exact old
 /// object (including signatures) when its tree is unchanged. The xattr only
 /// names an object in the protected CAS; it cannot supply forged headers.
-pub(super) fn commit(cas: Option<&Path>, path: &Path, tree: Hashed) -> Result<Hashed, String> {
+pub(super) fn commit(cas: Option<&Path>, path: &Path, mut tree: Hashed) -> Result<Hashed, String> {
     let Some(base) = xattr::get(path, BASE).map_err(|e| e.to_string())? else {
         return Ok(tree);
     };
@@ -28,6 +28,7 @@ pub(super) fn commit(cas: Option<&Path>, path: &Path, tree: Hashed) -> Result<Ha
             body: Body::Stored,
         });
     }
+    clean_merge_metadata(&mut tree, true)?;
     let headers = raw
         .split(|b| *b == b'\n')
         .take_while(|line| !line.is_empty());
@@ -44,6 +45,55 @@ pub(super) fn commit(cas: Option<&Path>, path: &Path, tree: Hashed) -> Result<Ha
         oid: hash_bytes("commit", &encoded)?,
         body: Body::Commit(encoded, Box::new(tree)),
     })
+}
+
+// Only edited commit projections use this rule. Plain trees (including the
+// conversation protocol), untouched commits, and lazy CAS references are exact.
+fn clean_merge_metadata(tree: &mut Hashed, source_root: bool) -> Result<(), String> {
+    use gix::objs::tree::{Entry, EntryKind};
+    let Body::Dir(bytes, children) = &mut tree.body else {
+        return Ok(());
+    };
+    let mut entries: Vec<Entry> = gix::objs::TreeRef::from_bytes(bytes, gix::hash::Kind::Sha1)
+        .map_err(|e| e.to_string())?
+        .entries
+        .into_iter()
+        .map(|entry| Entry {
+            mode: entry.mode,
+            filename: entry.filename.to_owned(),
+            oid: entry.oid.to_owned(),
+        })
+        .collect();
+    if source_root {
+        for entry in &mut entries {
+            if entry.filename == b".caos" && entry.mode.kind() == EntryKind::Tree {
+                if let Some(child) = children.iter_mut().find(|child| child.oid == entry.oid) {
+                    clean_merge_metadata(child, false)?;
+                    entry.oid = child.oid;
+                }
+            }
+        }
+    }
+    let empty = hash_bytes(if source_root { "tree" } else { "blob" }, b"")?;
+    entries.retain(|entry| {
+        let removable = if source_root {
+            entry.filename == b".caos" && entry.mode.kind() == EntryKind::Tree
+        } else {
+            entry.filename == b"conflicts"
+                && matches!(
+                    entry.mode.kind(),
+                    EntryKind::Blob | EntryKind::BlobExecutable
+                )
+        };
+        !(removable && entry.oid == empty)
+    });
+    children.retain(|child| entries.iter().any(|entry| entry.oid == child.oid));
+    bytes.clear();
+    gix::objs::Tree { entries }
+        .write_to(bytes)
+        .map_err(|e| e.to_string())?;
+    tree.oid = hash_bytes("tree", bytes)?;
+    Ok(())
 }
 
 /// Resolve a path through commit entries without projecting or copying content.

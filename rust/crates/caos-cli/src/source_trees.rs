@@ -552,7 +552,7 @@ pub fn import_publication_base(
          Integrate that base into {:?}, preserving existing changes and other snapshots. \
          First check whether this would publish unrelated inherited changes; if so, explain the scope and ask before proceeding. \
          Merging upstream preserves existing branch changes; transplanting only the requested edit onto a new base is a separate operation. \
-         Resolve any conflicts, remove the resolved conflict ledger, and run relevant tests. Do not publish. \
+         Resolve any conflicts and clear their ledger entries; saving removes empty merge metadata. Run relevant tests. Do not publish. \
          When finished, summarize the changes and suggest /pr {} {} {} for review.",
         target.source_tree,
         target.base_branch,

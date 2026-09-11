@@ -312,10 +312,11 @@ No local working checkout is required. `/publish-branch <conversation/gitlink>
 
 Reject changed content, remote drift, conflict markers, and unrelated histories.
 Check source-tree metadata before preview and again before pushing: a nonempty
-`.caos/conflicts` ledger requires resolution; an empty ledger must be removed.
-Bash removal is an ordinary committed edit. An empty `.caos` directory is harmless
-and may remain; other `.caos` content is rejected. Publication never strips files
-or rewrites the selected commit.
+`.caos/conflicts` ledger requires resolution. Recording an edited source tree
+removes an empty ledger and prunes its `.caos` directory if empty, for both bash
+and inline edits. Unchanged commits, unresolved entries, other metadata, and
+conversation protocol files are preserved. Publication rejects any remaining
+`.caos` entry; it never strips files or rewrites the selected commit.
 The source and PR base must share an ancestor. If the source does not contain
 the fetched base tip, the preview instead offers to import that exact commit and
 ask the agent to integrate it. Enter confirms both actions: import under

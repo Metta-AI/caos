@@ -2196,8 +2196,6 @@ pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
 }
 
 fn reject_publish_caos(t: &GitTransport, commit: &Oid) -> Result<(), String> {
-    // An empty directory left by `rm .caos/conflicts` contains no reserved state.
-    // Inspect leaves, so publication still pushes the exact selected commit.
     let listing = t.git_capture(
         &[
             "ls-tree",
@@ -2217,15 +2215,19 @@ fn reject_publish_caos(t: &GitTransport, commit: &Oid) -> Result<(), String> {
         return Err(if contents.trim().is_empty() {
             "the source tree has an empty `.caos/conflicts` file; remove it with bash before publishing (the removal is committed automatically)".into()
         } else {
-            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths, then remove the ledger with bash before publishing".into()
+            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata".into()
         });
     }
-    if listing.trim().is_empty() {
+    let root = t.git_capture(
+        &["ls-tree", "--name-only", commit.as_str(), "--", ".caos"],
+        None,
+    )?;
+    if root.trim().is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "the source tree contains reserved `.caos` content; remove it before publishing:\n{}",
-            listing.trim_end()
+            "the source tree contains reserved `.caos` content; record a cleaned source-tree edit before publishing:\n{}",
+            if listing.trim().is_empty() { ".caos/ (empty directory)" } else { listing.trim_end() }
         ))
     }
 }
@@ -4616,7 +4618,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths, then remove the ledger with bash before publishing"
+            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata"
         );
         assert_eq!(
             conversation_head(&transport, "guard-talk")
@@ -4638,8 +4640,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        // Clearing rows is distinct from removing the ledger; neither is a
-        // special resolution event. Both bash and inline edits store code commits.
+        // Publication also rejects legacy metadata, including an actual empty tree.
         use conversation_protocol::v3::tree::TreeBuilder;
         use conversation_protocol::v3::Mode;
         let mut store = open_store(&transport).unwrap();
@@ -4653,13 +4654,9 @@ mod tests {
         .unwrap();
         let empty = TreeBuilder::from(None).build(&mut store).unwrap();
         for (name, content, expected) in [
-            (
-                "empty-ledger",
-                Some(""),
-                Some("empty `.caos/conflicts` file"),
-            ),
-            ("other-state", None, Some("reserved `.caos` content")),
-            ("empty-directory", None, None),
+            ("empty-ledger", Some(""), "empty `.caos/conflicts` file"),
+            ("other-state", None, "reserved `.caos` content"),
+            ("empty-directory", None, ".caos/ (empty directory)"),
         ] {
             let mut tree = TreeBuilder::from(Some(base_tree.clone()));
             tree.put_oid(".caos", Mode::Tree, empty.clone());
@@ -4668,7 +4665,22 @@ mod tests {
             } else if name == "other-state" {
                 tree.put(".caos/format", Mode::Blob, b"protocol".to_vec());
             }
-            let tree = tree.build(&mut store).unwrap();
+            let tree = if name == "empty-directory" {
+                // TreeBuilder prunes empty directories; construct the Git entry directly.
+                let mut raw = b"40000 .caos\0".to_vec();
+                raw.extend(
+                    (0..40)
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&empty.as_str()[i..i + 2], 16).unwrap()),
+                );
+                oid(
+                    &transport.put_object("tree", &raw).unwrap().to_string(),
+                    "tree",
+                )
+                .unwrap()
+            } else {
+                tree.build(&mut store).unwrap()
+            };
             let commit = git(
                 transport.work_dir(),
                 &["commit-tree", tree.as_str(), "-p", &base, "-m", name],
@@ -4682,27 +4694,8 @@ mod tests {
                 None,
                 Some(&publishing_repository(&transport)),
             );
-            if let Some(expected) = expected {
-                let error = result.unwrap_err();
-                assert!(error.contains(expected), "{name}: {error}");
-            } else {
-                result.unwrap();
-                let published = publish_source_tree_branch(
-                    &transport,
-                    name,
-                    None,
-                    &publishing_repository(&transport),
-                )
-                .unwrap();
-                assert_eq!(published.status, PublicationStatus::Complete);
-                assert_eq!(
-                    git(
-                        &root.join("origin.git"),
-                        &["rev-parse", &format!("refs/heads/{}", published.branch)]
-                    ),
-                    commit
-                );
-            }
+            let error = result.unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
         }
         std::fs::remove_dir_all(root).unwrap();
     }
