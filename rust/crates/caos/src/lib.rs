@@ -18,6 +18,8 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
+pub mod checkout;
+
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
@@ -1570,6 +1572,16 @@ fn write_file(target: &Path, hash: &str, kind: &str, data: &[u8]) -> Result<(), 
     let exec = xattr::get(target, EXEC_XATTR)
         .map(|v| v.is_some())
         .unwrap_or(false);
+    write_file_with_mode(target, hash, kind, data, exec)
+}
+
+fn write_file_with_mode(
+    target: &Path,
+    hash: &str,
+    kind: &str,
+    data: &[u8],
+    exec: bool,
+) -> Result<(), String> {
     atomically(target, |tmp| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -1924,6 +1936,12 @@ pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String>
 /// to a path's identity: a worker minting a commit needs its parent's *hash*
 /// (for the `parent` line), and an unfetched placeholder's xattr is unreadable
 /// to the unprivileged worker directly.
+pub fn cas_kind(path: &str) -> Result<(), String> {
+    let target = validate_descendant(&cas_dir(), path)?;
+    println!("{}", result_kind(&target)?);
+    Ok(())
+}
+
 pub fn cas_hash(path: &str) -> Result<(), String> {
     let cas = cas_dir();
     let target = validate_descendant(&cas, path)?;
@@ -1991,6 +2009,7 @@ enum Body {
     Link(Vec<u8>),
     /// A directory: its encoded tree bytes and its children.
     Dir(Vec<u8>, Vec<Hashed>),
+    Commit(Vec<u8>, Box<Hashed>),
 }
 
 /// The git tree entry for a real symlink at `path`: a blob holding the link
@@ -2093,11 +2112,15 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
             .write_to(&mut buf)
             .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
         let oid = hash_bytes("tree", &buf)?;
-        return Ok(Hashed {
-            mode: EntryKind::Tree.into(),
-            oid,
-            body: Body::Dir(buf, children),
-        });
+        return checkout::commit(
+            cas_real,
+            path,
+            Hashed {
+                mode: EntryKind::Tree.into(),
+                oid,
+                body: Body::Dir(buf, children),
+            },
+        );
     }
 
     if ft.is_file() {
@@ -2143,6 +2166,11 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
             let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             refuse_if_leaks(&data, &path.display().to_string())?;
             t.put_object("blob", &data)?
+        }
+        Body::Commit(encoded, tree) => {
+            send(t, tree)?;
+            refuse_if_leaks(encoded, "a commit")?;
+            t.put_object("commit", encoded)?
         }
         Body::Dir(encoded, children) => {
             for child in children {
@@ -4823,6 +4851,7 @@ pub fn prog_name(args: &[String]) -> &str {
 #[cfg(test)]
 mod git_transport_tests {
     use super::*;
+    use std::process::Command;
 
     struct ObjectTransport {
         object: Option<(&'static str, Vec<u8>)>,
@@ -4880,6 +4909,135 @@ mod git_transport_tests {
         git(path, &["config", "user.name", "CAOS Test"]);
         git(path, &["config", "user.email", "caos@example.invalid"]);
         git(path, &["config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn projected_commits_preserve_identity_and_ancestry_through_file_operations() {
+        // Isolate the CAS env from other parallel unit tests.
+        const CHILD: &str = "CAOS_PROJECTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = TestDir::new("projection");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "git_transport_tests::projected_commits_preserve_identity_and_ancestry_through_file_operations", "--nocapture"])
+                .env(CHILD, "1").env(CAS_DIR_ENV, dir.path().join("cas"))
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = TestDir::new("projection-repo");
+        init_repo(dir.path());
+        std::fs::write(
+            dir.path().join("code"),
+            "original
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("run"),
+            "#!/bin/sh
+",
+        )
+        .unwrap();
+        set_mode(&dir.path().join("run"), 0o755).unwrap();
+        std::os::unix::fs::symlink("code", dir.path().join("link")).unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "base"]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        let t = GitTransport::discover(dir.path()).unwrap();
+        let (_, raw) = t.get_object(base.trim()).unwrap();
+        let signed = String::from_utf8(raw).unwrap().replacen(
+            "
+
+",
+            "
+gpgsig -----BEGIN PGP SIGNATURE-----
+ fixture
+ -----END PGP SIGNATURE-----
+
+",
+            1,
+        );
+        let base = t
+            .put_object("commit", signed.as_bytes())
+            .unwrap()
+            .to_string();
+        let cas = cas_dir();
+        std::fs::create_dir_all(&cas).unwrap();
+        let original = cas.join("original");
+        get_hash(&t, &base, original.to_str().unwrap()).unwrap();
+        let root = dir.path().join("conversation");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&original, root.join("dirty")).unwrap();
+        std::fs::write(root.join("memory"), "remember").unwrap();
+        let (_, tree) = store(&t, Some(&cas), &root).unwrap();
+        let (kind, resolved) = eval::eval_path(&t, &tree.to_string(), "dirty/code", &[]).unwrap();
+        assert_eq!(kind, "blob");
+        assert_eq!(t.get_object(&resolved).unwrap().0, "blob");
+        assert_eq!(
+            eval::eval_path(&t, &tree.to_string(), "dirty", &[]).unwrap(),
+            ("commit".into(), base.clone())
+        );
+        let projection = dir.path().join("projection");
+        checkout::prepare(&t, &tree.to_string(), &[".".into()])
+            .unwrap()
+            .write(&projection)
+            .unwrap();
+        assert_eq!(store(&t, Some(&cas), &projection).unwrap().1, tree);
+        checkout::prepare(&t, &base, &[".".into()])
+            .unwrap()
+            .write(&projection.join("copy"))
+            .unwrap();
+        std::fs::rename(projection.join("copy"), projection.join("review")).unwrap();
+        std::fs::write(
+            projection.join("dirty/code"),
+            "edited
+",
+        )
+        .unwrap();
+        std::fs::write(projection.join("memory"), "updated").unwrap();
+        let (_, changed) = store(&t, Some(&cas), &projection).unwrap();
+        let (_, bytes) = t.get_object(&changed.to_string()).unwrap();
+        let entries = gix::objs::TreeRef::from_bytes(&bytes, gix::hash::Kind::Sha1).unwrap();
+        let entry = |name: &[u8]| entries.entries.iter().find(|e| e.filename == name).unwrap();
+        assert_eq!(
+            entry(b"review").oid.to_string(),
+            base,
+            "cp -a/mv preserves exact signed commit"
+        );
+        assert_eq!(
+            entry(b"dirty").mode.kind(),
+            gix::objs::tree::EntryKind::Commit
+        );
+        let (_, edited) = t.get_object(&entry(b"dirty").oid.to_string()).unwrap();
+        let edited = String::from_utf8(edited).unwrap();
+        assert!(edited.contains(&format!(
+            "parent {base}
+"
+        )));
+        assert!(
+            !edited.contains("gpgsig"),
+            "new content must not retain the old signature"
+        );
+        let resolved = cas.join("resolved");
+        checkout::resolve(
+            &t,
+            &changed.to_string(),
+            "dirty/run",
+            resolved.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert!(checkout::resolve(
+            &t,
+            &changed.to_string(),
+            "../code",
+            resolved.to_str().unwrap()
+        )
+        .is_err());
+        assert!(projection.join("dirty/link").is_symlink());
     }
 
     #[test]

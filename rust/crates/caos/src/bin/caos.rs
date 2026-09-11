@@ -53,6 +53,31 @@ fn run(args: &[String]) -> Result<(), String> {
             (Some(hash), Some(path), None) => caos::get_hash(&http()?, hash, path),
             _ => Err(usage(args)),
         },
+        Some("kind") => match &args[2..] {
+            [path] => caos::cas_kind(path),
+            _ => Err(usage(args)),
+        },
+        Some("resolve") => match &args[2..] {
+            [hash, relative, destination] => {
+                caos::checkout::resolve(&http()?, hash, relative, destination)
+            }
+            _ => Err(usage(args)),
+        },
+        Some("checkout") => match &args[2..] {
+            [hash, destination, paths @ ..] => {
+                let checkout = caos::checkout::prepare(&http()?, hash, paths)?;
+                // Never write an agent-selected destination as setuid root.
+                extern "C" {
+                    fn getuid() -> u32;
+                    fn setuid(uid: u32) -> i32;
+                }
+                if unsafe { setuid(getuid()) } != 0 {
+                    return Err("dropping checkout privileges failed".into());
+                }
+                checkout.write(std::path::Path::new(destination))
+            }
+            _ => Err(usage(args)),
+        },
         Some("get") => {
             let (path, depth) = caos::parse_get(&args[2..])?;
             caos::get(&http()?, path, depth)
@@ -508,7 +533,7 @@ fn wipe_dir_contents(dir: &str) {
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
-        "usage:\n  {prog} get-hash <hash> <path>\n  \
+        "usage:\n  {prog} checkout <hash> <destination> [relative-path ...]\n  {prog} resolve <hash> <relative-path> <cas-path>\n  {prog} kind <cas-path>\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} put-commit <src-file> <cas-path>\n  \
