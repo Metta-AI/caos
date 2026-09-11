@@ -1608,9 +1608,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
     } else if app.selected().publish_plan.is_some() {
-        Line::raw(
-            " Publish PRs: Space selects  b edits base  h edits branch  Enter/^P confirms  Esc cancels",
-        )
+        Line::raw(" Publication: Enter confirms  Esc cancels")
     } else if app.focus() == Focus::List {
         Line::raw(
             " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
@@ -1633,7 +1631,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P PR  ^O files  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  /checkout  /pr  ^O files  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
@@ -1667,118 +1665,60 @@ fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
     let Some(prompt) = &app.selected().publish_plan else {
         return;
     };
-    let terminal = frame.area();
-    let area = terminal.centered(
-        Constraint::Length(terminal.width.saturating_sub(4).min(112)),
-        Constraint::Length(terminal.height.saturating_sub(2).min(24)),
-    );
+    let area = frame
+        .area()
+        .centered(Constraint::Percentage(90), Constraint::Length(13));
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Publish source trees ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(3),
-        Constraint::Length(2),
-    ])
-    .split(inner);
+    let mut lines = Vec::new();
     if prompt.loading {
-        frame.render_widget(Paragraph::new("Loading publication preview..."), rows[0]);
-    } else {
-        let items = prompt
-            .rows
-            .iter()
-            .map(|row| {
-                let check = if row.included { "[x]" } else { "[ ]" };
-                let operation = row
-                    .target
-                    .diagnostic
+        lines.push(Line::from("Loading publication preview…"));
+    } else if let Some(target) = &prompt.target {
+        lines.push(Line::from(format!(
+            "Source: {}  {}",
+            target.source_tree,
+            short_hash(&target.head)
+        )));
+        lines.push(Line::from(format!("Repository: {}", target.repository)));
+        lines.push(Line::from(format!("Branch: {}", target.branch)));
+        if !prompt.branch_only {
+            lines.push(Line::from(format!(
+                "PR base: {}  {}",
+                target.base_branch,
+                target
+                    .base_commit
                     .as_deref()
-                    .unwrap_or("Create or update PR");
-                ListItem::new(vec![
-                    Line::from(format!(
-                        "{check} {}   {}",
-                        row.target.source_tree,
-                        short_hash(&row.target.head)
-                    )),
-                    Line::from(format!(
-                        "    {} -> {}",
-                        row.target.branch,
-                        if prompt.previewed {
-                            &row.target.base_branch
-                        } else {
-                            &row.destination.base_branch
-                        }
-                    )),
-                    Line::styled(
-                        format!(
-                            "    {}   {operation}",
-                            if prompt.previewed {
-                                &row.target.repository
-                            } else {
-                                &row.destination.repository
-                            }
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        let mut selection = ListState::default().with_selected(Some(prompt.selected));
-        frame.render_stateful_widget(
-            List::new(items).highlight_style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rows[0],
-            &mut selection,
-        );
-    }
-
-    if prompt.editing {
-        if let Some(row) = prompt.rows.get(prompt.selected) {
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{} Repository: {}\n{} Base branch: {}",
-                    if prompt.field == 0 { ">" } else { " " },
-                    row.destination.repository,
-                    if prompt.field == 1 { ">" } else { " " },
-                    row.destination.base_branch
-                )),
-                rows[1],
-            );
+                    .map(short_hash)
+                    .unwrap_or_default()
+            )));
         }
-    } else if let Some(error) = &prompt.error {
-        frame.render_widget(
-            Paragraph::new(error.as_str())
-                .style(Style::default().fg(Color::Red))
-                .wrap(Wrap { trim: false }),
-            rows[1],
-        );
-    } else {
-        let help = if prompt.rows.is_empty() && !prompt.loading {
-            "No review boundaries. Copy a base and a named change into the same folder."
-        } else if prompt.previewed {
-            "Confirm to push these exact commits. Publication does not edit code or run tests."
+        lines.push(Line::from(""));
+        lines.push(Line::from(if prompt.branch_only {
+            "Enter pushes this commit without creating a PR."
         } else {
-            "Choose the repository and external base branch. Provenance is only a suggestion."
-        };
-        frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: false }), rows[1]);
+            "Enter pushes this commit and opens or updates its PR."
+        }));
     }
-    let help = if prompt.editing {
-        "Tab field   Ctrl+U clear   Enter done   Esc close editor"
-    } else if prompt.previewed {
-        "Space select   e destination   Enter publish   Esc cancel"
-    } else {
-        "Space select   a all   e destination   Enter preview   Esc cancel"
-    };
+    if let Some(error) = &prompt.error {
+        lines.push(Line::styled(
+            error.as_str(),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::from(
+        "Esc cancels. To change the target, run the command again.",
+    ));
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
-        rows[2],
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(if prompt.branch_only {
+                    " Publish branch "
+                } else {
+                    " Publish PR "
+                })
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
     );
 }
 

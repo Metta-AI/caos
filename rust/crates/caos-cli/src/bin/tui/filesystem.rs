@@ -195,7 +195,7 @@ impl App {
             KeyCode::PageUp => b.scroll = b.scroll.saturating_sub(15),
             KeyCode::PageDown => b.scroll = b.scroll.saturating_add(15),
             KeyCode::Char('r') => self.refresh_browser(),
-            // This selects a host-side checkout/publication target; it does not
+            // This selects the source for tool descriptions and local edits; it does not
             // change the conversation filesystem or agent execution.
             KeyCode::Char('o') => {
                 let Some(entry) = b.entries.get(b.selected) else {
@@ -205,7 +205,7 @@ impl App {
                 if self.selected().source_trees.iter().any(|s| s.name == name) {
                     let result = self.selected_mut().select_source_tree(&name);
                     self.browser.as_mut().unwrap().status = match result {
-                        Ok(()) => format!("Selected {name} for checkout/publication."),
+                        Ok(()) => format!("Selected {name} for tools and local edits."),
                         Err(error) => error,
                     };
                 }
@@ -347,6 +347,6 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
         Paragraph::new(safe(&b.status)),
         Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1),
     );
-    frame.render_widget(Paragraph::new("Up/Down select  Right/Enter open  Left back  PgUp/Dn scroll  r refresh  o checkout/PR target  Esc close"),
+    frame.render_widget(Paragraph::new("Up/Down select  Right/Enter open  Left back  PgUp/Dn scroll  r refresh  o select source  Esc close"),
         Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1));
 }

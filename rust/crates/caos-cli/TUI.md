@@ -148,10 +148,10 @@ so it never leaves the conversation pane.
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
-| `Ctrl+L` | Check out the selected gitlink in its chosen local directory |
+| `/checkout <gitlink> [directory]` | Check out this commit, reusing its local directory when omitted |
 | `Ctrl+O` | Browse conversation files and source-tree diffs |
-| `Ctrl+P` | Preview selected source trees and their PR destinations; Enter confirms |
-| `/publish-branch` | Preview a repository and push the selected snapshot without creating a PR |
+| `/pr <gitlink> <base-branch> [remote-URL]` | Preview one PR; Enter confirms |
+| `/publish-branch <gitlink> [remote-URL]` | Preview and push this snapshot without creating a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -167,7 +167,7 @@ conversation ID (the metadata update advances its conversation head). Enter `/mo
 for later turns; known model names type ahead. `/model default` restores the
 client default. Enter `/update-tree <message>` to send an ordinary
 user turn whose commit also folds in your current working-tree changes — the
-intended companion to `Ctrl+L` (check out the head, edit files, then
+intended companion to `/checkout <gitlink> [directory]` (check out the head, edit files, then
 `/update-tree <message>` with the text you want in that turn). Activity entries
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
@@ -188,9 +188,8 @@ compared boundaries and hashes. No publishing destination is required.
 The browser pins the conversation head when opened. `r` refreshes it. There
 are no shell commands or controls that apply edits.
 
-On a source-tree entry in the current snapshot, `o` selects the target for
-local checkout and publication. Selection preserves the draft and never
-changes agent execution. Use `/import <path> <source> [revision]` to import
+On a source-tree entry, `o` selects the source for tool descriptions and local
+edit submission. Checkout and publication take explicit paths. Use `/import <path> <source> [revision]` to import
 a Git checkout's disk snapshot at an unused path. An unchanged checkout reuses
 HEAD; changes become a child commit. A URL or explicit revision imports that
 commit instead. Local imports require a checkout root with a HEAD; linked
@@ -200,14 +199,15 @@ files remain included. The source index, branches, and files stay unchanged. Eac
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
-`Ctrl+P` previews sibling gitlinks in filename order. The oldest is the base;
-each later snapshot becomes a PR branch named by its full path. The repository
-and external base branch are explicit client choices. Remembered destinations
-or unambiguous import provenance can prefill them. Press `e` to edit, Tab to
-switch fields, Ctrl+U to clear, and Enter to finish editing. Enter loads remote
-state for review; Enter again publishes. The first PR targets the chosen base;
-later PRs target the preceding boundary. Publication never edits or tests code.
-`/publish-branch` uses the same confirmation flow without requiring a PR base.
+`/pr feature/01-change main [remote-URL]` fetches a preview for that exact
+snapshot against the named remote branch. Its full path is the PR branch name.
+The URL is inferred from matching import provenance when unambiguous; otherwise
+supply it explicitly. `origin` is not a portable repository URL. Enter confirms
+pushing and opening or updating the PR; Escape cancels. No picker or destination
+editor is involved. For a stack, publish the first PR, then run e.g.
+`/pr feature/02-next feature/01-change`. The command's base wins regardless of
+sibling ordering. `/publish-branch <gitlink> [remote-URL]` skips PR creation.
+Publication never edits or tests code. Ctrl+P and Ctrl+L have no bindings.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -287,8 +287,8 @@ Press `Ctrl+Y` or `Escape` to resume.
 
 Source tree code is referenced by ordinary commit hashes from the separate
 conversation history. Opening and running conversations never overwrite a
-checkout. Ctrl+L uses the selected gitlink's remembered local destination, or
-prompts for `/checkout <directory>`. The destination must be a clean Git checkout
+checkout. `/checkout <gitlink> [directory]` uses an explicit destination or
+reuses that gitlink's remembered local directory. The destination must be a clean Git checkout
 or an empty/new directory. The client imports the code objects and detaches HEAD
 at the selected commit. /update-tree commits local edits there and imports their
 closure into the client before submission. These commands never replace the

@@ -348,59 +348,6 @@ pub(super) fn remember_checkout(
 }
 
 /// Publication preferences stay beside local checkout preferences, outside CAOS.
-pub(super) fn publication_destination(
-    client: &Path,
-    conversation: &str,
-    source: &str,
-) -> Result<Option<caos_cli::source_trees::PublicationDestination>, String> {
-    let key = checkout_key(
-        client,
-        conversation,
-        caos_cli::source_trees::stack_directory(source),
-    )?
-    .replace("caos.checkout-", "caos.publication-");
-    let file = git(client, &["config", "--get", "caos.checkout-settings"])?;
-    let output = std::process::Command::new("git")
-        .current_dir(client)
-        .args(["config", "--file", &file, "--get", &key])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.code() == Some(1) {
-        return Ok(None);
-    }
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().into());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("reading publication preference: {e}"))?;
-    Ok(Some(caos_cli::source_trees::PublicationDestination {
-        repository: value["repository"]
-            .as_str()
-            .ok_or("invalid saved publication repository")?
-            .into(),
-        base_branch: value["base_branch"]
-            .as_str()
-            .ok_or("invalid saved publication base")?
-            .into(),
-    }))
-}
-
-pub(super) fn remember_publication(
-    client: &Path,
-    conversation: &str,
-    source: &str,
-    destination: &caos_cli::source_trees::PublicationDestination,
-) -> Result<(), String> {
-    let key = checkout_key(
-        client,
-        conversation,
-        caos_cli::source_trees::stack_directory(source),
-    )?
-    .replace("caos.checkout-", "caos.publication-");
-    git(client, &["config", "--file", &git(client, &["config", "--get", "caos.checkout-settings"])?, &key, &serde_json::json!({"repository": destination.repository, "base_branch": destination.base_branch}).to_string()])?;
-    Ok(())
-}
-
 pub(super) fn checkout_for(
     client: &Path,
     conversation: &str,
@@ -418,7 +365,12 @@ pub(super) fn checkout_for(
             &checkout_key(client, conversation, source)?,
         ],
     )
-    .map_err(|_| "choose a local destination with /checkout <directory>")?;
+    .map_err(|_| {
+        format!(
+            "choose a local destination with /checkout {} <directory>",
+            shell_words::quote(source)
+        )
+    })?;
     let checkout = PathBuf::from(value.strip_suffix('\0').ok_or("invalid checkout config")?);
     import_local_commit(
         client,
@@ -534,7 +486,7 @@ mod tests {
         let client = root.0.join("client");
         fs::create_dir(&client).unwrap();
         git(&client, &["init", "--quiet", "-b", "main"]).unwrap();
-        // Ctrl+L exports from a partial client into the user's checkout.
+        // Checkout exports from a partial client into the user's checkout.
         git(
             &checkout,
             &[
@@ -627,30 +579,6 @@ mod tests {
             first
         );
         assert!(checkout_for(&third, "other", "feature/dirty", &head).is_err());
-        let destination = caos_cli::source_trees::PublicationDestination {
-            repository: "https://example.com/repo".into(),
-            base_branch: "main".into(),
-        };
-        remember_publication(&first, "conversation", "feature/01-change", &destination).unwrap();
-        assert_eq!(
-            publication_destination(&third, "conversation", "feature/02-next").unwrap(),
-            Some(destination)
-        );
-        assert!(
-            publication_destination(&second, "conversation", "feature/01-change")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            publication_destination(&third, "other", "feature/01-change")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            publication_destination(&third, "conversation", "another/01-change")
-                .unwrap()
-                .is_none()
-        );
         assert_eq!(git(&first, &["status", "--porcelain"]).unwrap(), "");
         fs::remove_dir_all(root).unwrap();
     }
