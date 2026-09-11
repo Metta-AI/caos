@@ -3618,6 +3618,29 @@ mod tests {
         std::fs::write(other.work_dir().join("source_tree"), "uncommitted work\n").unwrap();
         std::fs::write(other.work_dir().join(".git/info/exclude"), "local-only\n").unwrap();
         std::fs::write(other.work_dir().join("local-only"), "not imported").unwrap();
+        std::fs::create_dir(other.work_dir().join("src")).unwrap();
+        std::fs::write(other.work_dir().join("src/public.txt"), "public").unwrap();
+        std::fs::write(
+            other.work_dir().join("src/private.txt"),
+            "excluded by ancestor",
+        )
+        .unwrap();
+        std::fs::write(other.work_dir().join(".gitignore"), "src/private.txt\n").unwrap();
+        let subtree = source_trees::import_source(
+            &transport,
+            "attached",
+            "subdir",
+            other.work_dir().join("src").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let store = open_store(&transport).unwrap();
+        let subdir = conversation_protocol::v3::tree::Snapshot::new(
+            &store,
+            oid(&subtree, "subdir").unwrap(),
+        );
+        assert_eq!(subdir.read("public.txt").unwrap().unwrap(), b"public");
+        assert!(!subdir.exists("private.txt").unwrap());
         let disk_tree = source_trees::import_source(
             &transport,
             "attached",
@@ -3741,7 +3764,7 @@ mod tests {
         let view = Conversation::open(&store, &imported_head).unwrap();
         let metadata = view
             .snapshot()
-            .read("imports/project/.source.json")
+            .read("imports/project/base.source.json")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3759,7 +3782,7 @@ mod tests {
                 .to_string(),
             disk_tree
         );
-        // Conflicting provenance cannot overwrite the preserved import.
+        // Sibling imports own independent provenance, even from different remotes.
         git(
             other.work_dir(),
             &[
@@ -3769,10 +3792,53 @@ mod tests {
                 "https://example.invalid/other.git",
             ],
         );
-        assert!(source_trees::import_source(
+        source_trees::import_source(
             &transport,
             "attached",
             "imports/project/other",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let head = oid(
+            &conversation_head(&transport, "attached").unwrap().unwrap(),
+            "siblings",
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &head).unwrap();
+        assert_eq!(
+            view.snapshot()
+                .read("imports/project/base.source.json")
+                .unwrap()
+                .unwrap(),
+            metadata
+        );
+        let other_metadata: serde_json::Value = serde_json::from_slice(
+            &view
+                .snapshot()
+                .read("imports/project/other.source.json")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            other_metadata["repository"],
+            "https://example.invalid/other.git"
+        );
+        // A user file at this import's sidecar path is still never overwritten.
+        source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/conflict.source.json",
+            plain.join("note.txt").to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let before = conversation_head(&transport, "attached").unwrap().unwrap();
+        assert!(source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/conflict",
             other.work_dir().to_str().unwrap(),
             None
         )
@@ -3780,7 +3846,7 @@ mod tests {
         .contains("provenance"));
         assert_eq!(
             conversation_head(&transport, "attached").unwrap().unwrap(),
-            imported_head.to_string()
+            before
         );
         git(
             other.work_dir(),

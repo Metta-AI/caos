@@ -493,29 +493,17 @@ publishing them is deferred.
   agent resolves over subsequent turns; each resolution is an ordinary
   mutation commit on top of `M`.
 
-## Resolving `--theirs` (the ref snapshot)
+## Resolving `--theirs`
 
-The model says "merge in `main`", but a ref name only exists in the user's git
-repo — the merge worker, mid-turn on the compute network, has no refs, and the
-model doesn't know hashes. So `--theirs` is resolved on the CLIENT, at turn
-START — the only place the refs live and the only moment the client is in the
-loop (a tool call three rounds deep cannot reach back into the repo):
+The normal client does not publish a map of local branch names to workers.
+Import the desired Git revision explicitly, then pass its full commit hash to
+`merge`. The selected source-tree path identifies `ours`; `theirs` identifies
+an immutable commit already available in CAOS. Importing a newer branch tip
+does not merge it automatically.
 
-- The client resolves a small, curated set of refs to hashes — `HEAD`'s
-  upstream, `main`/`master`, the `origin` default — `ensure_pushed`es their
-  closures (onto the CONTENT-ADDRESSED `refs/caos/req/<hash>`, exactly as
-  `--head:commit` is pushed; NO semantic ref like `main` is ever written to the
-  shared server, so users never contend for a name), and curries a
-  name→hash MAP into the llm-step worker as an ordinary blob arg.
-- The `merge` tool resolves `--theirs` against that map: a known ref name → its
-  snapshotted hash; a bare hash → used directly; anything else → an is_error
-  tool_result listing the available names. `ours` is never named — it is the
-  threaded source tree commit.
-
-**Snapshot semantics**, deliberately: "merge in `main`" merges `main` as it was
-when the turn started, so the merge is deterministic and immune to `main`
-moving mid-turn. `ensure_pushed` negotiates against the server, so an unmoved
-`main` re-pushes nothing — the steady-state cost is the delta since last time.
+A custom harness may supply a `merge-refs` map for named targets. Those names
+resolve to the supplied snapshot, not live remote refs. Without that map,
+names such as `main` and `origin/main` are unavailable; commit hashes still work.
 
 ## `.caos/conflicts`
 

@@ -62,12 +62,8 @@ fn source_metadata(
     if let Some(branch) = default_branch {
         value["default_branch"] = branch.into();
     }
-    let parent = name
-        .rsplit_once('/')
-        .map(|(parent, _)| format!("{parent}/"))
-        .unwrap_or_default();
     Some((
-        format!("{parent}.source.json"),
+        format!("{name}.source.json"),
         format!("{value}\n").into_bytes(),
     ))
 }
@@ -131,37 +127,46 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
     Ok(commit.to_string())
 }
 
-pub fn import_local_path(
-    client: &GitTransport,
-    path: &std::path::Path,
-) -> Result<(Mode, Oid), String> {
-    import_path(&mut open_store(client)?, client, path)
+fn import_local_path(client: &GitTransport, path: &std::path::Path) -> Result<(Mode, Oid), String> {
+    import_path(&mut open_store(client)?, path)
 }
 
 /// Snapshot disk content, independently of the source repository's index or HEAD.
 /// Git enumerates paths using its ignore rules; the index here is always empty.
-fn import_path(
-    store: &mut GitStore,
-    client: &GitTransport,
-    path: &std::path::Path,
-) -> Result<(Mode, Oid), String> {
+fn import_path(store: &mut GitStore, path: &std::path::Path) -> Result<(Mode, Oid), String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     let meta =
         std::fs::symlink_metadata(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     if meta.is_dir() {
         let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-        // Reuse source-local ignore policy, but never its index or tracked files.
+        // Keep the real worktree root so ancestor ignore files retain their scope.
+        // Non-repositories get an empty Git directory, never the client's excludes.
         let source_repo = GitTransport::discover(path).ok();
-        let git_dir = source_repo
-            .as_ref()
-            .unwrap_or(client)
-            .git_capture(&["rev-parse", "--absolute-git-dir"], None)?;
+        let (git_dir, worktree) = if let Some(repo) = &source_repo {
+            (
+                repo.git_capture(&["rev-parse", "--absolute-git-dir"], None)?,
+                repo.work_dir().to_path_buf(),
+            )
+        } else {
+            let git_dir = temp.path().join("git");
+            crate::host_git::capture_required(
+                "git",
+                &[
+                    "init",
+                    "--bare",
+                    "--quiet",
+                    git_dir.to_str().ok_or("temporary path must be UTF-8")?,
+                ],
+                path,
+            )?;
+            (git_dir.to_string_lossy().into_owned(), path.to_path_buf())
+        };
         let output = std::process::Command::new("git")
             .arg("--git-dir")
             .arg(git_dir.trim())
             .arg("--work-tree")
-            .arg(path)
+            .arg(worktree)
             .args(["ls-files", "--others", "--exclude-standard", "-z"])
             .env("GIT_INDEX_FILE", temp.path().join("index"))
             .current_dir(path)
@@ -182,7 +187,7 @@ fn import_path(
             let name = std::str::from_utf8(name)
                 .map_err(|_| "import paths must be UTF-8")?
                 .trim_end_matches('/');
-            let (mode, oid) = import_path(store, client, &path.join(name))?;
+            let (mode, oid) = import_path(store, &path.join(name))?;
             tree.put_oid(name, mode, oid);
         }
         Ok((Mode::Tree, tree.build(store)?))
@@ -212,13 +217,19 @@ fn import_path(
     }
 }
 
-pub fn import_source(
+pub struct ImportedContent {
+    pub mode: Mode,
+    pub object: Oid,
+    pub metadata: Option<(String, Vec<u8>)>,
+}
+
+/// Resolve the same import semantics for the launcher and interactive client.
+pub fn prepare_import(
     t: &GitTransport,
-    id: &str,
     name: &str,
     repository: &str,
     revision: Option<&str>,
-) -> Result<String, String> {
+) -> Result<ImportedContent, String> {
     paths::validate_source_tree_name(name)?;
     let parsed = if repository.starts_with("git+") || repository.starts_with("github:") {
         Some(validate_source(repository)?)
@@ -290,6 +301,25 @@ pub fn import_source(
     if mode == Mode::Commit {
         ensure_code_commit(t, &mut open_store(t)?, &object)?;
     }
+    Ok(ImportedContent {
+        mode,
+        object,
+        metadata,
+    })
+}
+
+pub fn import_source(
+    t: &GitTransport,
+    id: &str,
+    name: &str,
+    repository: &str,
+    revision: Option<&str>,
+) -> Result<String, String> {
+    let ImportedContent {
+        mode,
+        object,
+        metadata,
+    } = prepare_import(t, name, repository, revision)?;
     let bytes = if matches!(mode, Mode::Commit | Mode::Tree) {
         object.encode_line()
     } else {
@@ -308,10 +338,8 @@ pub fn import_source(
             }
             let mut files = vec![(name.to_string(), Some((mode, bytes.clone())))];
             if let Some((path, bytes)) = &metadata {
-                if path == name
-                    || (snapshot.exists(path)? && snapshot.read(path)?.as_ref() != Some(bytes))
-                {
-                    return Err(format!("import provenance {path:?} already exists with different content; choose a separate import folder"));
+                if snapshot.exists(path)? && snapshot.read(path)?.as_ref() != Some(bytes) {
+                    return Err(format!("import provenance {path:?} already exists with different content; choose another import path"));
                 }
                 files.push((path.clone(), Some((Mode::Blob, bytes.clone()))));
             }

@@ -78,31 +78,18 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
         if let Some(checkout) = &checkout {
             let transport = GitTransport::discover(&client)?;
-            let (mode, object) = if let Some(rev) = &args.turn.base {
-                let commit = git(
-                    checkout,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--end-of-options",
-                        &format!("{rev}^{{commit}}"),
-                    ],
-                )?;
-                let oid = Oid::parse(&commit, "initial checkout")?;
-                import_local_commit(checkout, &client, &oid)?;
-                (conversation_protocol::v3::Mode::Commit, oid)
-            } else {
-                caos_cli::source_trees::import_local_path(&transport, checkout)?
-            };
+            let caos_cli::source_trees::ImportedContent {
+                mode,
+                object,
+                metadata,
+            } = caos_cli::source_trees::prepare_import(
+                &transport,
+                name,
+                checkout.to_str().ok_or("checkout path must be UTF-8")?,
+                args.turn.base.as_deref(),
+            )?;
             seed.put_oid(name, mode, object.clone());
-            if let Some((path, bytes)) =
-                caos_cli::source_trees::local_import_metadata(name, checkout)?
-            {
-                if path == *name {
-                    return Err(
-                        "import path conflicts with its .source.json provenance file".into(),
-                    );
-                }
+            if let Some((path, bytes)) = metadata {
                 seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
             }
             if mode == conversation_protocol::v3::Mode::Commit {

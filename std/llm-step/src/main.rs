@@ -2953,10 +2953,10 @@ fn bash_tool() -> Value {
 fn merge_tool() -> Value {
     json!({
         "name": "merge",
-        "description": "Three-way merge another commit into the current source tree. `theirs` is a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
+        "description": "Three-way merge another commit into the current source tree. `theirs` is a full commit hash already imported into CAOS (a custom harness may also supply a named ref snapshot); the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
         "input_schema": {
             "type":"object",
-            "properties":{"theirs":{"type":"string","description":"The commit to merge in: a ref name from the snapshot, or a commit hash."}},
+            "properties":{"theirs":{"type":"string","description":"Full imported commit hash. A ref name works only if the harness explicitly supplied a ref snapshot."}},
             "required":["theirs"]
         }
     })

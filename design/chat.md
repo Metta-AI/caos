@@ -91,8 +91,9 @@ The harness supplies source-tree organization and publication conventions to
 every model call, including subagents. Agents preserve bases, organize review
 boundaries, and integrate delegated changes using ordinary file operations;
 users specify the desired work and review structure. Imports conventionally live
-at `imports/<repo>/base`. A sibling `.source.json` records available portable
-repository details. The agent preserves imports. To build a PR stack, it copies an
+at `imports/<repo>/base`. A sibling `<import-path>.source.json` records available portable
+repository details, so sibling imports can come from different repositories.
+The agent preserves imports. To build a PR stack, it copies an
 imported gitlink to `<feature>/00-base` and `<feature>/dirty` before editing.
 When publishing, it uses recorded repository and default-branch details to write
 `.base-url`, unless the user chose another destination. Missing or ambiguous details require clarification only then.
@@ -279,14 +280,15 @@ the proposed destination, which appears in the preview.
   A local file becomes a file; a local directory becomes an ordinary folder,
   using the current disk contents, including uncommitted and untracked files.
   Directory imports honor `.gitignore` and repository-local excludes, and omit
-  `.git`; symlinks and executable bits are preserved. The source need not be a
+  `.git`. Ancestor ignore rules apply when importing a repository subdirectory.
+  Symlinks and executable bits are preserved. The source need not be a
   Git repository. No source index, branch, or file is changed. Quote paths
   containing spaces.
   For example: `/import imports/notes "/home/ubuntu/my notes"`.
   A remote URL, or a local repository with an explicit revision, imports a commit
   as a gitlink instead. Remote URLs without a revision use their default branch.
   For PR work with ancestry, use `/import imports/caos/base /path/to/caos HEAD`.
-  A sibling `.source.json` records a portable `repository` URL and an optional
+  A sibling `<import-path>.source.json` records a portable `repository` URL and an optional
   `default_branch` when importing from Git. Local discovery reads `origin` and
   `origin/HEAD` without network access; remote imports read the advertised default.
   Local paths and credential-bearing URLs are omitted. Existing differing
