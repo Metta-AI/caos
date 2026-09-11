@@ -252,6 +252,106 @@ fn dispatch_call(
 /// It is the request's recorded `configuration` too, so a conversation says
 /// which worker ran its tools -- and the tui can pick the turn up, because what
 /// it names is an ordinary step.
+/// Resolve the `--llm-step` image, ONCE PER CONTAINER, shared across this
+/// session's processes.
+///
+/// `serve`'s resolver, the prompt hook and every tool dispatch all resolve the
+/// same step, in SEPARATE processes whose in-memory eval memo (`caos-eval`)
+/// cannot be shared. Each resolve is ~9s of round trips, and at session start
+/// they run CONCURRENTLY over one tunnel and starve each other -- which wedges
+/// the hook recording the first prompt and fails the whole first turn (later
+/// turns work because by then the record exists). Measured, that resolve is the
+/// dominant cost of the ~14s prompt hook.
+///
+/// So a file under the temp dir holds the resolved oid, and a `create_new`
+/// marker single-flights it: the first process to arrive resolves and writes
+/// the oid; the others find the marker, poll the (LOCAL) file until it appears,
+/// and reuse it -- no second resolve, no second tunnel user, no wedge. Keyed by
+/// the step arg AND the secret store, because the resolution depends on both
+/// (design/secrets.md) and the client-side resolve marks the step's tools with
+/// the caller's identity. The oid is deterministic in those inputs, so a cached
+/// entry can only be absent, never wrong.
+///
+/// Every filesystem failure falls back to a direct resolve: caching must never
+/// be what stops a session from working.
+fn resolve_step_cached(
+    t: &GitTransport,
+    options: &TurnOptions,
+    store: &[caos::ClientSecret],
+) -> Result<String, String> {
+    let direct = || crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store);
+    let Some(arg) = options.llm_step.as_deref() else {
+        return direct();
+    };
+    // FNV-1a over (arg, secret scope): a stable cross-process key with no new
+    // dependency (a hashing crate would have to be anchored in the cargo bake).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in arg
+        .as_bytes()
+        .iter()
+        .chain(b"\0")
+        .chain(caos::secret_store_header(store).as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dir = std::env::temp_dir();
+    let cache = dir.join(format!("caos-cc-step-{hash:016x}"));
+    let marker = dir.join(format!("caos-cc-step-{hash:016x}.flight"));
+
+    let read_cache = || -> Option<String> {
+        let oid = std::fs::read_to_string(&cache).ok()?;
+        let oid = oid.trim();
+        (!oid.is_empty()).then(|| oid.to_string())
+    };
+
+    // ~5 min of patience for a cold resolve, polling the local file: far longer
+    // than a resolve takes, so a live winner is always waited out; long enough
+    // that a dead one is reclaimed below rather than hung on forever.
+    for _ in 0..300 {
+        if let Some(oid) = read_cache() {
+            return Ok(oid);
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            // We own the flight: resolve, publish atomically, release.
+            Ok(_) => {
+                let result = direct();
+                if let Ok(oid) = &result {
+                    let tmp = dir.join(format!("caos-cc-step-{hash:016x}.{}", std::process::id()));
+                    if std::fs::write(&tmp, oid).is_ok() {
+                        let _ = std::fs::rename(&tmp, &cache);
+                    }
+                }
+                let _ = std::fs::remove_file(&marker);
+                return result;
+            }
+            // Someone else owns it. Reclaim a marker whose owner died (older
+            // than any real resolve), else wait for the cache to appear.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&marker)
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+                    .map(|age| age.as_secs() > 300)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&marker);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            // The lock dir is unusable; do not let that stop the session.
+            Err(_) => return direct(),
+        }
+    }
+    // Waited out the budget without a result -- resolve directly rather than
+    // hang the caller.
+    direct()
+}
+
 fn tools_configuration(
     t: &GitTransport,
     options: &TurnOptions,
@@ -279,7 +379,7 @@ fn tools_configuration(
     if !merge_refs.is_empty() {
         config.push(format!("--merge-refs={merge_refs}"));
     }
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
+    let base = resolve_step_cached(t, options, store)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
 
@@ -376,7 +476,7 @@ fn read_outcome(
 /// `caos-tools/` is offered here exactly as it is in the tui.
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
     let store = caos::build_secret_store(t)?;
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
+    let base = resolve_step_cached(t, options, &store)?;
     let mut kvs = vec!["--list-tools=1".to_string()];
     // The tree whose `caos-tools/` entries are offered -- named ONLY when
     // there are any, and the ordering is the whole point.
