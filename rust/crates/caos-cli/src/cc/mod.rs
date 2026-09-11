@@ -295,7 +295,17 @@ fn resolve_step_cached(
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let dir = std::env::temp_dir();
+    // A FIXED shared directory, not `temp_dir()`: the whole point is that
+    // `serve`, the hook and each tool dispatch find the SAME file, and Claude
+    // Code can spawn those processes with different `TMPDIR`s -- measured, the
+    // hook resolved anew (29s) beside a resolver that had already cached, so
+    // they were not sharing. `/tmp` is one path all of them agree on in the
+    // container; only where it is missing does this fall back to `temp_dir()`.
+    let dir = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
     let cache = dir.join(format!("caos-cc-step-{hash:016x}"));
     let marker = dir.join(format!("caos-cc-step-{hash:016x}.flight"));
 
