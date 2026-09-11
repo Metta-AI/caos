@@ -904,9 +904,8 @@ fn materialize(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 /// component is descended into or written. Returns the new source tree CAS path.
 fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
     let work = scratch(&fresh_name("inline")).map_err(Infra)?;
-    let hash = worker_common::cas_hash(ws).map_err(Infra)?;
     let relative = comps.join("/");
-    caos(["checkout", &hash, path(&work), &relative]).map_err(Infra)?;
+    worker_common::files::materialize(ws, &work, std::slice::from_ref(&relative)).map_err(Infra)?;
     let target = work.join(&relative);
     let mut ancestor = work.clone();
     for component in comps {

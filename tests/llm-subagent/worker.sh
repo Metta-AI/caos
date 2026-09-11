@@ -213,7 +213,7 @@ admit_turn "apply the child result"
 request2=$request
 start_turn
 wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
-printf '{"content":[{"id":"toolu_promote","input":{"cmd":"caos checkout %s review .","paths":[]},"name":"bash","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+printf '{"content":[{"id":"toolu_promote","input":{"cmd":"caos get-hash %s /cas/promoted && ln -s /cas/promoted review","paths":[]},"name":"bash","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
   "$child_main" "$child" > /tmp/stub/response-6.json
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head

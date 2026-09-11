@@ -126,10 +126,18 @@ becomes a child commit. Ordinary directories remain Git trees. Copying without
 preserving extended attributes copies files but loses the commit boundary.
 This metadata is local to the projection, not another conversation registry.
 
-Inside bash, `caos checkout <commit> <destination> <paths...>` adds a commit
-already available in CAOS; `.` loads its whole tree. Local or remote repository
-imports happen through the client. No host filesystem path is implicitly
-available inside a worker.
+The harness prepares editable files before each tool call; agents do not run a
+checkout command. Copy an existing source directory with `cp -a`. To add a
+reference to a commit already in CAOS, use the ordinary storage primitives:
+
+```sh
+caos get-hash <commit> /cas/source
+ln -s /cas/source feature/01-change
+```
+
+Storing the tool result records that link as a gitlink. The next tool call
+exposes it as an editable directory. Local or remote repository imports happen
+through the client; host filesystem paths are not implicitly available to workers.
 
 Call a repository tool with `run_tool` and a conversation-relative path, such
 as `feature/01-parser/caos-tools/test`, plus its arguments. The harness resolves

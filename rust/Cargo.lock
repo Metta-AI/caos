@@ -65,6 +65,7 @@ dependencies = [
  "sha1",
  "sha2",
  "tiny_http",
+ "xattr",
 ]
 
 [[package]]
@@ -2279,6 +2280,9 @@ dependencies = [
 [[package]]
 name = "worker-common"
 version = "0.1.0"
+dependencies = [
+ "xattr",
+]
 
 [[package]]
 name = "worker-deep-deps"
