@@ -27,6 +27,24 @@ their prompt title and appear beneath the parent conversation.
 
 ## Build and run
 
+Deploy matching client and daemon builds. The daemon seeds the compiler with
+shared libraries, so updating only the client can leave new tools linked against
+old libraries. Restart the updated daemon while preserving its Git store;
+bootstrap defaults to a computation-cache namespace for that build.
+
+Before declaring a deployment ready, resolve its workers against that server:
+
+```sh
+CAOS_SERVER_URL=http://127.0.0.1:9092 result/bin/caos eval-path std/llm-step
+CAOS_SERVER_URL=http://127.0.0.1:9092 result/bin/caos eval-path std/llm-call
+CAOS_SERVER_URL=http://127.0.0.1:9092 result/bin/caos run-tool tests/bash-tool --test-salt="$(date +%s)"
+```
+
+These checks compile the deployed dependencies and execute the bash worker
+without making a model API call. Merely opening the TUI does not resolve its
+worker images; the full test suite uses its own stack.
+
+
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
 `--import <path>` imports a commit snapshot of disk content; `--base HEAD` excludes disk changes. Outside a checkout, it starts
 without code and defaults to `http://localhost:9090`; `--server` overrides it.
