@@ -504,6 +504,15 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
 /// exactly as the tui prepares a turn -- because each of the turn's tool calls
 /// runs it. A request id that named nothing would leave the calls nothing to
 /// run and the record claiming a configuration that never existed.
+/// Print `cc-timing: <phase> <secs>` to stderr when `CAOS_CC_TIMING` is set.
+/// A `record_prompt` measures ~12s in a cloud session and it is not obvious
+/// which of its four server round trips owns that; this makes each one report.
+fn cc_timing(phase: &str, elapsed: std::time::Duration) {
+    if std::env::var_os("CAOS_CC_TIMING").is_some() {
+        eprintln!("cc-timing: {phase} {:.2}s", elapsed.as_secs_f64());
+    }
+}
+
 fn record_prompt(
     t: &GitTransport,
     options: &TurnOptions,
@@ -514,7 +523,9 @@ fn record_prompt(
     let signature = signature(&username)?;
     let refname = conversation_ref(id)?;
     let secrets = caos::build_secret_store(t)?;
+    let phase = std::time::Instant::now();
     let configuration = tools_configuration(t, options, id, &secrets)?;
+    cc_timing("tools_configuration", phase.elapsed());
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
@@ -557,6 +568,7 @@ fn record_prompt(
         // call runs THIS request rather than one of its own, so what the step
         // is handed -- the conversation, the head it was admitted at -- is what
         // the record says it was.
+        let phase = std::time::Instant::now();
         let request = oid(
             &caos::prepare_client_request_with_store(
                 t,
@@ -566,6 +578,7 @@ fn record_prompt(
             )?,
             "request",
         )?;
+        cc_timing("prepare_request", phase.elapsed());
         let view = Conversation::open(&store, &message)?;
         let workspaces = view.workspaces_tree()?;
         drop(view);
@@ -600,7 +613,10 @@ fn record_prompt(
             &admission,
         )?;
 
-        if push_cas(&store, &refname, observed.as_ref(), &claimed)? {
+        let phase = std::time::Instant::now();
+        let pushed = push_cas(&store, &refname, observed.as_ref(), &claimed)?;
+        cc_timing("push_cas", phase.elapsed());
+        if pushed {
             let _ = update_local_cache(t, &refname, claimed.as_str());
             return Ok(());
         }
@@ -619,8 +635,12 @@ fn root_commit(
     options: &TurnOptions,
     signature: &Signature,
 ) -> Result<Oid, String> {
+    let phase = std::time::Instant::now();
     let base = oid(&resolve_base(t, options)?, "conversation base")?;
+    cc_timing("resolve_base", phase.elapsed());
+    let phase = std::time::Instant::now();
     ensure_code_commit(t, store, &base)?;
+    cc_timing("ensure_code_commit", phase.elapsed());
     reject_reserved_caos(t, base.as_str(), "base workspace")?;
     let workspace = default_workspace_name(t, options)?;
     let genesis = oid(G3, "v3 genesis")?;
