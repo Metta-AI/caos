@@ -752,6 +752,7 @@ pub fn mint(
             parents: vec![parent.clone()],
             author: signature.clone(),
             committer: signature.clone(),
+            extra_headers: Vec::new(),
             message: kind.message(),
         })
         .map_err(String::from)
