@@ -616,10 +616,28 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
 /// Print `cc-timing: <phase> <secs>` to stderr when `CAOS_CC_TIMING` is set.
 /// A `record_prompt` measures ~12s in a cloud session and it is not obvious
 /// which of its four server round trips owns that; this makes each one report.
-fn cc_timing(phase: &str, elapsed: std::time::Duration) {
-    if std::env::var_os("CAOS_CC_TIMING").is_some() {
-        eprintln!("cc-timing: {phase} {:.2}s", elapsed.as_secs_f64());
+/// Where the hook debug log lives: `$CAOS_CC_HOOK_LOG`, else `<tmp>/caos-cc-hook.log`.
+fn hook_log_path() -> std::path::PathBuf {
+    match std::env::var("CAOS_CC_HOOK_LOG") {
+        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => std::env::temp_dir().join("caos-cc-hook.log"),
     }
+}
+
+/// Append one best-effort line to the hook debug log.
+fn append_hook_log(line: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(hook_log_path())
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn cc_timing(phase: &str, elapsed: std::time::Duration) {
+    append_hook_log(&format!("  timing {phase} {:.2}s\n", elapsed.as_secs_f64()));
 }
 
 fn record_prompt(
