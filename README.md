@@ -19,9 +19,9 @@ Caos breaks building and testing into small pieces and caches the results. When 
 
 ## Location independence
 
-Today, most people run most of their agent workloads on their local machine for convenience. When the work no longer fits, they buy a desktop and try to interact with it over tmux. If the work grows further, they have to split it up between cloud instances. If an agent wants to spin up subagents on other computers, it gets even more annoying
+Today, most people run most of their agent workloads on their local machine for convenience. When the work no longer fits, they buy a desktop and try to interact with it over tmux. If the work grows further, they have to split it up between cloud instances. If an agent wants to spin up subagents on other computers, it gets even more annoying.
 
-Caos runs well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers
+Caos runs well-defined binaries with well-defined inputs and well-defined environments. The work can move seamlessly between computers.
 
 # What
 
