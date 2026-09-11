@@ -27,9 +27,18 @@ feature/01-change              gitlink -> ST_4
 feature/02-tests               gitlink -> ST_8
 ```
 
-Editing `feature/01-change` advances its reference to a new source-tree commit.
-The import and `00-base` still point to `ST_0`. Many conversation commits can
-reference the same `ST`: messages and tool activity need not change code.
+If the agent calls `write` or `edit` on
+`feature/01-change/README.md` and changes its contents, saving the tool result
+automatically creates a new source-tree commit. Its tree contains the edited
+files and its parent is the previously referenced commit, here `ST_4`. The
+harness then records a conversation commit whose `feature/01-change` gitlink
+points to that new commit. The agent does not separately commit or update the
+gitlink; bash edits use the same save path.
+
+Other references, including `00-base` and `02-tests`, stay unchanged.
+An unchanged source tree keeps its existing commit. Many conversation commits
+can therefore reference the same `ST`: messages and tool activity need not
+change code.
 
 The filenames name review points, not individual editing steps. Here the
 boundaries point to `ST_0`, `ST_4`, and `ST_8`: there may be several edits and
