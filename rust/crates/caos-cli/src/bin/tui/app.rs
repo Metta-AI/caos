@@ -2580,7 +2580,8 @@ impl App {
             parts[1].to_string()
         };
         let revision = parts.get(2).map(|value| value.to_string());
-        self.start_import("importing content", move |transport, conversation| {
+        let status = format!("into {name}");
+        self.start_import(&status, move |transport, conversation| {
             let head = caos_cli::source_trees::import_source(
                 transport,
                 conversation,

@@ -308,7 +308,7 @@ pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) 
 }
 
 fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
-    if !state.running && !state.publishing {
+    if !state.running && !state.publishing && !state.source_tree_operation {
         return (area, None);
     }
     let split = Layout::default()
@@ -525,9 +525,9 @@ fn render_live_activity(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    // A publish runs a real agent turn, so a tool in flight names the work
-    // more precisely than the generic publishing verb.
-    let (verb, summary) = if let Some(activity) = state.running_activity() {
+    let (verb, summary) = if state.source_tree_operation {
+        ("Importing", state.status.as_str())
+    } else if let Some(activity) = state.running_activity() {
         (activity.running_verb(), activity.running_summary())
     } else if state.publishing {
         ("Publishing", state.status.as_str())
