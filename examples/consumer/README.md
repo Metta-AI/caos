@@ -4,7 +4,8 @@ This is a minimal flake for a project that *consumes* caos rather than being
 caos. It adds caos as a flake input and puts the caos commands on the dev
 shell's PATH: `caos-cli` (drive workers) and `caosd` (start the stack, which
 also publishes the builtin worker library on startup). Enter the shell once
-with `nix develop`, then run them as plain commands — no `nix run`/`nix build`.
+with `nix develop`, then run them as plain commands — no `nix run` or
+`nix build` needed.
 
 ## One-time
 
