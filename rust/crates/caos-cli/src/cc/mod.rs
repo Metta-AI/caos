@@ -464,7 +464,11 @@ fn append_hook_log(line: &str) {
         return;
     };
     use std::io::Write as _;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -500,7 +504,11 @@ fn debug_log_hook(
         None => String::new(),
         Some((elapsed, Ok(()))) => format!(" {:.1}s ok", elapsed.as_secs_f64()),
         Some((elapsed, Err(error))) => {
-            format!(" {:.1}s ERR {}", elapsed.as_secs_f64(), error.replace('\n', " "))
+            format!(
+                " {:.1}s ERR {}",
+                elapsed.as_secs_f64(),
+                error.replace('\n', " ")
+            )
         }
     };
     append_hook_log(&format!(
