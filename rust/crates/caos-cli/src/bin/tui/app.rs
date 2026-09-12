@@ -34,6 +34,9 @@ use filesystem::Browser;
 #[path = "publication.rs"]
 mod publication;
 use publication::PublishPrompt;
+#[path = "input_history.rs"]
+mod input_history;
+use input_history::InputHistory;
 
 const NEW_CONVERSATION_TITLE: &str = "New conversation";
 
@@ -528,13 +531,12 @@ impl Composer {
         self.move_cursor(self.line_bounds().1, true);
     }
 
-    fn move_vertical(&mut self, up: bool) {
-        self.selection_anchor = None;
+    fn move_vertical(&mut self, up: bool) -> bool {
         let (start, end) = self.line_bounds();
         let column = self.text[start..self.cursor].chars().count();
         let target = if up {
             if start == 0 {
-                return;
+                return false;
             }
             let target_end = start - 1;
             let target_start = self.text[..target_end]
@@ -544,7 +546,7 @@ impl Composer {
             (target_start, target_end)
         } else {
             if end == self.text.len() {
-                return;
+                return false;
             }
             let target_start = end + 1;
             let target_end = self.text[target_start..]
@@ -553,8 +555,10 @@ impl Composer {
                 .unwrap_or(self.text.len());
             (target_start, target_end)
         };
+        self.selection_anchor = None;
         self.cursor = byte_at_column(&self.text, target.0, target.1, column);
         self.snap_cursor_after_placeholder();
+        true
     }
 
     #[cfg(test)]
@@ -1011,6 +1015,7 @@ struct ConversationState {
     selected_source_tree: Option<String>,
     tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
+    input_history: Option<InputHistory>,
     status: String,
     command_error: Option<String>,
     reference_notice: Option<ReferenceNotice>,
@@ -1059,6 +1064,7 @@ impl ConversationState {
             selected_source_tree: None,
             tool_set: None,
             composer: Composer::default(),
+            input_history: None,
             status,
             command_error: None,
             reference_notice: None,
@@ -1408,6 +1414,7 @@ impl ConversationState {
     }
 
     fn queue_pending_submission(&mut self, text: String) -> u64 {
+        self.input_history = None;
         let id = self.next_pending_submission;
         self.next_pending_submission = self.next_pending_submission.wrapping_add(1);
         self.pending_submissions.push(PendingSubmission {
@@ -1462,6 +1469,7 @@ impl ConversationState {
             return;
         }
         self.discard_pending_submission(id);
+        self.input_history = None;
         self.composer.restore_message(&pending.text);
     }
 
@@ -2210,6 +2218,7 @@ impl App {
                     self.selected_mut()
                         .show_command_error(format!("usage: {}", command.usage));
                 } else {
+                    self.selected_mut().input_history = None;
                     self.selected_mut().composer.take_message();
                     self.run_local_command(command, arguments);
                 }
@@ -3353,6 +3362,7 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.selected_mut().input_history = None;
             if !self.selected_mut().composer.clear() {
                 self.should_quit = true;
             }
@@ -3537,12 +3547,12 @@ impl App {
             KeyCode::Right => self.selected_mut().composer.move_right(),
             KeyCode::Up => {
                 if !self.selected_mut().select_command(-1) {
-                    self.selected_mut().composer.move_vertical(true);
+                    self.navigate_input(true);
                 }
             }
             KeyCode::Down => {
                 if !self.selected_mut().select_command(1) {
-                    self.selected_mut().composer.move_vertical(false);
+                    self.navigate_input(false);
                 }
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -7389,6 +7399,49 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.selected().id, "talk-1");
         assert_eq!(app.selected().composer.text, "2");
+    }
+
+    #[test]
+    fn input_history_keys_recall_own_saved_messages_and_restore_the_draft() {
+        let (repo, remote, _) = repo_with_default_branch("input-history", "main");
+        git_ok(&repo, &["remote", "add", "caos", &remote.to_string_lossy()]);
+        seed_idle_conversation(&repo, "history", "tester", "saved prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let mut reopened = state("history");
+        assert!(reopened.reload(&transport, "tester").is_some());
+        reopened.composer.insert_str("unfinished draft");
+        let (mut app, _) = app_with(vec![reopened, state("another")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "saved prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.selected_mut().composer.clear();
+        app.selected_mut().composer.insert_str("/title");
+        app.start_turn();
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /title <new title>")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.selected().composer.text.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "another");
+        assert!(app.selected().composer.text.is_empty());
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
