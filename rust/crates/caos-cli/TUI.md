@@ -178,7 +178,10 @@ show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
 Press `Ctrl+O` to open the read-only conversation filesystem. Up/Down select
-entries and immediately preview them. Right/Enter opens a directory or gitlink;
+entries and immediately preview them. The list includes each directory's immediate
+children, indented one level, and those children can be selected directly.
+Gitlinks are magenta; ordinary directories are cyan.
+Right/Enter opens a directory or gitlink;
 Left/Backspace returns to its parent, preserving the selection. Escape closes
 the browser. Click to select; scroll over the file list to move the selection,
 or over the preview to scroll its text. PageUp/PageDown scroll the preview.
