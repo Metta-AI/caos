@@ -113,6 +113,23 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
     exit 0
 fi
 
+# UNSHALLOW THE CHECKOUT. caos pushes the WORKSPACE COMMIT to the server -- the
+# resolver does it for a repo that defines `caos-tools/`, and every prompt does
+# it as the conversation's base -- and that push packs the commit's whole
+# reachable graph, HISTORY included. claude.ai/code clones shallow, so the
+# history is not here, and the push dies "invalid commit object <HEAD>" against
+# a server that does not already hold the repo. (caos' own sessions work only
+# because that server was seeded with caos' history, making the push a thin
+# delta; an arbitrary repo gets no such head start.) So fetch the rest ONCE,
+# before the resolver or the first prompt tries to push. Non-fatal and quiet: a
+# complete checkout, or a fetch that cannot reach the origin, just carries on --
+# a big repo pays a one-time full-history fetch here rather than failing later.
+if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    log "unshallowing the checkout so caos can push its history"
+    git fetch --unshallow --quiet 2>/dev/null \
+        || log "could not unshallow; a repo the server has not seen may fail to resolve"
+fi
+
 # An existing remote is left alone: a checkout that already names a caos server
 # has been set up deliberately, and repointing it from the environment would
 # silently move someone's work to a different stack.
