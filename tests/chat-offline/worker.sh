@@ -125,12 +125,23 @@ if remote_tip "$bad_ref" >/dev/null; then
 fi
 [ ! -e stub/request-1.json ] || fail "conversation-base failure reached the LLM"
 
+# THE TWO WAITS BELOW BOUND A QUEUE, NOT A LATENCY. The `talk` this starts
+# dispatches a real llm-step job, and under `--test-salt` that job is COLD — the
+# salt reaches this client through dev/cli-test, so its ArgTree is novel and a
+# container has to be scheduled for it. In a full suite that container queues
+# behind 41 other tests on a bounded runner pool, which is why 30s was enough
+# while the request was answering from the memo and is not enough now: measured
+# 20s standalone against a >30s wait for a slot under full-suite contention.
+#
+# Both loops exit the moment they succeed, so a generous bound costs nothing on a
+# healthy run. The first also fails fast if the client dies, so only the second
+# pays the full bound before reporting a genuine hang.
 echo "== remote work survives loss of its submitting client ==" >&2
 "$CAOS_CLI" talk --new -c "$conv" "fresh start" --base "$base" \
   "${opts[@]}" >talk.out 2>talk.err &
 client_pid=$!
 request_started=0
-for _ in $(seq 1 150); do
+for _ in $(seq 1 600); do
   if [ -e stub/request-1.json ]; then
     request_started=1
     break
@@ -153,7 +164,7 @@ printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}' \
 recovered=0
 tip=""
 seen=""
-for _ in $(seq 1 150); do
+for _ in $(seq 1 480); do
   if remote=$(remote_tip "$ref") && [ "$remote" != "$seen" ]; then
     seen=$remote
     fetch_output=$($TOOL fetch --repo "$PWD" --ref "$ref") \

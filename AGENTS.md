@@ -110,10 +110,40 @@ Every script here runs with it, and two constructs quietly break under it.
   push, pack or traverse anything, and any defect in forming or packing the
   request is invisible. (It was invisible before that probe too: the push was a
   no-op update of a ref already at that hash.) Only a NEW ArgTree builds a real
-  pack — which is why the primary gate is
-  `CAOS_SALT=$(date --iso=s) result/bin/caos-cli run-tool caos-test` (SPEC.md) and
-  why a green unsalted suite once sat next to a hard-failing salted one for a
-  whole session. Run the salted form before believing a push-path change.
+  pack, and a green unsalted suite once sat next to a hard-failing salted one for
+  a whole session. Run a SALTED form before believing a push-path change.
+
+- **Either salt now serves that, because `--test-salt` reaches a client test's
+  own requests.** `dev/cli-test/worker` exports it as the inner client's
+  `CAOS_SALT` (appending to any outer one), so every test that drives `caos-cli`
+  forms novel ArgTrees and really pushes. It did not used to: `--test-salt` rode
+  in the test's ArgTree under a name the dispatcher ignores, so the test's SCRIPT
+  re-ran against requests it had already made and `tests/push-closure` — whose
+  whole subject is that a client can push a request whose base it cannot read —
+  passed on an unchanged tree without ever pushing. Measured before the fix: the
+  inner run kept ArgTree `b3457ccc` across two different `--test-salt` values and
+  answered `cache hit` both times.
+  **The two salts are still not interchangeable, and the difference is that salt
+  threads DOWN, never up.** `CAOS_SALT` at the top also re-keys the scaffolding
+  above the tests — the dev stack's bring-up, the client compile, the std publish
+  (47 cache misses against 8 for one test, 61s against 10s); `--test-salt`
+  re-keys from each test downward and leaves all of that a hit. Reach for
+  `CAOS_SALT` when the thing you changed lives in that scaffolding.
+  **A worker test's sub-runs are still NOT re-keyed by either flag from below** —
+  they go through the server, which supplies the salt from the parent job's
+  ArgTree, and `run_image` merges that last so nothing a worker binds can win.
+  A worker test whose subject is its computation rather than its assertions has
+  to fold `--test-salt` into the payload itself; `tests/rust-worker` says why,
+  and `tests/file-count` deliberately does not, because it wants its rustc build
+  memoized.
+
+- **A salted suite queues, so a test that waits on a job must bound a QUEUE, not
+  a latency.** Making client tests genuinely cold pushed `chat-offline` from 20s
+  to 58s and broke it: its 30s wait for a request to reach the stub was calibrated
+  against a memo hit, and under 42 tests contending for runner slots a cold job
+  does not get scheduled that fast. It read as a test failure
+  (`request never reached the LLM`), not as a wait. Bound such a loop generously —
+  it exits on success, so a large bound is free on a healthy run.
 
 # Caches and defaults, when a suite fans out
 
