@@ -23,6 +23,12 @@ pub struct RefUpdate {
     pub new: Option<Oid>,
 }
 
+pub enum HistoryQuery {
+    Log { count: usize },
+    Show,
+    Diff { from: Oid },
+}
+
 pub struct GitStore {
     dir: PathBuf,
     git_dir: PathBuf,
@@ -322,6 +328,74 @@ impl GitStore {
         } else {
             Err(self.output_error("git push", &output))
         }
+    }
+
+    /// Resolve ancestry syntax against an explicit commit, never ambient refs.
+    pub fn ancestor_revision(&self, base: &Oid, suffix: &str) -> Result<Oid, String> {
+        if !suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'^' | b'~'))
+        {
+            return Err(format!("invalid ancestry suffix {suffix:?}"));
+        }
+        self.ensure_local(base)?;
+        let output = self.output(&[
+            "rev-parse",
+            "--verify",
+            &format!("{base}{suffix}^{{commit}}"),
+        ])?;
+        if !output.status.success() {
+            return Err(self.output_error("git rev-parse", &output));
+        }
+        Oid::parse_line(&output.stdout, "resolved revision")
+    }
+
+    /// Read history using the same local object store as reconciliation.
+    /// Paths are literal, and external diff/textconv programs are disabled.
+    pub fn history(
+        &self,
+        head: &Oid,
+        query: HistoryQuery,
+        path: Option<&str>,
+    ) -> Result<String, String> {
+        self.ensure_local(head)?;
+        let count;
+        let from;
+        let mut arguments = vec!["--no-pager", "--literal-pathspecs", "-c", "color.ui=false"];
+        match query {
+            HistoryQuery::Log { count: limit } => {
+                count = format!("--max-count={limit}");
+                arguments.extend([
+                    "log",
+                    "--first-parent",
+                    "--abbrev=12",
+                    "--format=%h  %aI  %an  %s",
+                    &count,
+                ]);
+            }
+            HistoryQuery::Show => arguments.extend([
+                "show",
+                "--format=fuller",
+                "--root",
+                "--diff-merges=first-parent",
+                "--no-ext-diff",
+                "--no-textconv",
+            ]),
+            HistoryQuery::Diff { from: base } => {
+                self.ensure_local(&base)?;
+                from = base.to_string();
+                arguments.extend(["diff", "--no-ext-diff", "--no-textconv", &from]);
+            }
+        }
+        arguments.extend([head.as_str(), "--"]);
+        if let Some(path) = path.filter(|p| !p.is_empty()) {
+            arguments.push(path);
+        }
+        let output = self.output(&arguments)?;
+        if !output.status.success() {
+            return Err(self.output_error("reading Git history", &output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     pub fn git_version(&self) -> Result<String, String> {
@@ -1595,6 +1669,44 @@ mod tests {
             snapshot.read("theirs.txt").unwrap(),
             Some(b"theirs\n".to_vec())
         );
+
+        let merge = write_commit(
+            &mut store,
+            &merge_tree,
+            &[ours.clone(), theirs.clone()],
+            "merge\n",
+        );
+        assert_eq!(store.ancestor_revision(&merge, "^2").unwrap(), theirs);
+        assert_eq!(store.ancestor_revision(&merge, "~2").unwrap(), base);
+        assert!(store.ancestor_revision(&base, "^").is_err());
+        assert!(store.ancestor_revision(&base, ":shared.txt").is_err());
+        for _ in 0..2 {
+            let log = store
+                .history(&merge, HistoryQuery::Log { count: 20 }, None)
+                .unwrap();
+            assert_eq!(log.lines().count(), 3);
+            assert!(log.lines().next().unwrap().ends_with("merge"));
+            let diff = store
+                .history(&merge, HistoryQuery::Diff { from: ours.clone() }, None)
+                .unwrap();
+            assert!(diff.contains("+theirs"));
+            assert!(!diff.contains("+ours"));
+            let show = store
+                .history(&merge, HistoryQuery::Show, Some("theirs.txt"))
+                .unwrap();
+            assert!(show.contains("+theirs"));
+            assert!(store
+                .history(&base, HistoryQuery::Show, None)
+                .unwrap()
+                .contains("+base"));
+            assert!(
+                store
+                    .history(&merge, HistoryQuery::Log { count: 20 }, Some("*.txt"))
+                    .unwrap()
+                    .is_empty(),
+                "pathspecs must be literal"
+            );
+        }
 
         let conflict_ours_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"ours\n");
         let conflict_ours = write_commit(

@@ -57,7 +57,6 @@ struct Config {
     system: String,
     bash_image: String,
     grep_image: Option<String>,
-    tools_image: Option<String>,
     merge_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
@@ -88,7 +87,6 @@ impl Config {
             system: read_arg("system")?,
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
-            tools_image: image_arg("tools-image")?,
             merge_image: image_arg("merge-image")?,
             std_tool_images: STD_TOOLS
                 .iter()
@@ -1009,6 +1007,22 @@ fn drive_call(
         }
     };
 
+    if githist::is_builtin(&call.name) {
+        let (source, head) = match target {
+            Target::SourceTree { name, commit } => (Some(name), commit),
+            Target::Files => (None, state.head().clone()),
+        };
+        let block = githist::execute(
+            state.store(),
+            cfg.merge_refs.as_deref(),
+            &head,
+            &call_without_source_tree(call),
+            &call.name,
+        );
+        site.complete(state, block, source.map(|name| (name, head)), None, None)?;
+        return Ok(true);
+    }
+
     if tools::is_inline(&call.name) {
         execute_inline(state, &site, target)?;
         return Ok(true);
@@ -1226,9 +1240,6 @@ fn prepare_compute(
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
-        name if githist::is_builtin(name) && cfg.tools_image.is_some() => {
-            prepare_githist(cfg, &clean, name, ws, wc)
-        }
         name => Ok(Prepared::Result(error_block(
             &call.id,
             &format!("unavailable tool {name:?}; use run_tool with its conversation-relative path"),
@@ -1314,39 +1325,6 @@ fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<
         .iter()
         .map(|(name, value)| (name.as_str(), Arg::Lit(value)))
         .collect();
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    prepared_request(&curried, &[], ws)
-}
-
-fn prepare_githist(
-    cfg: &Config,
-    call: &Value,
-    name: &str,
-    ws: &str,
-    wc: &str,
-) -> Result<Prepared, String> {
-    let tool = githist::tool(name).ok_or_else(|| format!("no built-in tool {name}"))?;
-    let bound = match tools::tree_tool_args(call, &tool) {
-        Ok(bound) => bound,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
-    let dir = scratch(&format!("githist-{name}"))?;
-    let file = dir.join("worker.sh");
-    fs::write(&file, body).map_err(|error| format!("writing {name} script: {error}"))?;
-    let script = fresh("githist-script");
-    caos(["put", path(&file), &script])?;
-    let image = cfg.tools_image.as_deref().ok_or("tools image is absent")?;
-    let mut args: Vec<(&str, Arg<'_>)> = vec![("worker1", Arg::Path(&script))];
-    args.extend(
-        bound
-            .iter()
-            .map(|(name, value)| (name.as_str(), Arg::Lit(value))),
-    );
-    args.push(("wc", Arg::Path(wc)));
-    if let Some(refs) = cfg.merge_refs.as_deref() {
-        args.push(("refs", Arg::Lit(refs)));
-    }
     let curried = caos_curry(Arg::Hash(image), &args)?;
     prepared_request(&curried, &[], ws)
 }
@@ -2851,9 +2829,7 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.merge_image.is_some() {
         registry.push(with_source_tree(merge_tool()));
     }
-    if cfg.tools_image.is_some() {
-        registry.extend(githist::declarations().into_iter().map(with_source_tree));
-    }
+    registry.extend(githist::declarations().into_iter().map(with_source_tree));
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
@@ -3397,6 +3373,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(resolution, SourceTreeResolution::Merged { .. }));
+
+        let refs = format!("base {base}");
+        let show = githist::execute(
+            state.store(),
+            Some(&refs),
+            &current,
+            &json!({"id":"history","input":{"rev":"base"}}),
+            "show",
+        );
+        assert_ne!(show["is_error"], true);
+        let invalid = githist::execute(
+            state.store(),
+            Some(&refs),
+            &current,
+            &json!({"id":"history","input":{"rev":"absent"}}),
+            "show",
+        );
+        assert_eq!(invalid["is_error"], true);
 
         let mut before = TreeBuilder::from(None);
         before.put_oid("code", Mode::Commit, base.clone());
