@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    prepare_client_request_with_store, resolve_cli_image_arg, run_client_request_with_store,
-    ClientSecret, GitTransport, Transport, CAOS_REMOTE,
+    prepare_client_request_with_store, resolve_cli_image_arg, ClientSecret, GitTransport,
+    Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
     apply, client_signature, inherited_signature, mint, Transition,
@@ -671,6 +671,7 @@ fn prepare_queued_request_detail(
         &[format!("--head:commit={queued_head}")],
         &store,
     )?;
+    require_model_secret_for_request(t, &request, &store, options.llm_step.as_deref())?;
     Ok(PreparedRequest {
         request,
         configuration,
@@ -2710,6 +2711,30 @@ fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
     ))
 }
 
+fn require_model_secret_for_request(
+    t: &GitTransport,
+    request: &str,
+    store: &[ClientSecret],
+    image_argument: Option<&str>,
+) -> Result<(), String> {
+    if caos::client_request_has_secret(t, request, store, MODEL_API_SECRET)? {
+        return Ok(());
+    }
+    let reader = image_argument
+        .and_then(image_arg_reader)
+        .map(|path| format!("Set reader={path} for this worker."))
+        .unwrap_or_else(|| {
+            "Set reader= to the expression used by this worker's image argument.".to_string()
+        });
+    Err(format!(
+        "{MODEL_API_SECRET} is configured but is not granted to this worker. \
+         Check its reader= lines in .caos-secrets/{MODEL_API_SECRET}. {reader} \
+         Readers must resolve against the current harness (or the store's .tree). \
+         After correcting the configuration, start a new turn; an existing request \
+         may still carry the old secret permissions."
+    ))
+}
+
 fn invoked_as() -> String {
     std::env::var_os("CAOS_INVOKED_AS")
         .or_else(|| std::env::args_os().next())
@@ -2764,6 +2789,7 @@ fn request_is_active(status: TurnStatus) -> bool {
 pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
     oid(request, "request")?;
     let store = conversation_secret_store(t)?;
+    require_model_secret_for_request(t, request, &store, None)?;
     let server = t.server_url()?;
     compute_client_request_with_store(&server, request, &store).map(|_| ())
 }
@@ -2889,7 +2915,9 @@ pub fn generate_conversation_title(
             options.model.as_deref().unwrap_or(DEFAULT_MODEL)
         ),
     ];
-    let (kind, hash) = run_client_request_with_store(t, &llm, &call, &store)?;
+    let request = prepare_client_request_with_store(t, &llm, &call, &store)?;
+    require_model_secret_for_request(t, &request, &store, options.llm_call.as_deref())?;
+    let (kind, hash) = compute_client_request_with_store(&t.server_url()?, &request, &store)?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"

@@ -4225,6 +4225,50 @@ fn client_secret_hash(
     Ok(Some(hash_bytes("blob", &material)?.to_string()))
 }
 
+/// Check the same reader and isolation conditions used by server injection.
+/// Callers that require a credential can reject a prepared request before
+/// admitting durable work. Merely having a secret in the store, or a hash from
+/// some other secret in the request, does not authorize this credential.
+pub fn client_request_has_secret(
+    t: &dyn Transport,
+    request: &str,
+    store: &[ClientSecret],
+    name: &str,
+) -> Result<bool, String> {
+    let entries = fetch_tree_entries(t, request)?
+        .ok_or_else(|| format!("request {request} is not an ArgTree"))?
+        .into_iter()
+        .map(|entry| {
+            (
+                String::from_utf8_lossy(entry_name(&entry)).into_owned(),
+                entry.oid.to_string(),
+            )
+        })
+        .collect();
+    request_has_secret(&entries, store, name)
+}
+
+fn request_has_secret(
+    entries: &std::collections::BTreeMap<String, String>,
+    store: &[ClientSecret],
+    name: &str,
+) -> Result<bool, String> {
+    if !store.iter().any(|secret| {
+        secret.name == name
+            && secret
+                .readers
+                .iter()
+                .any(|reader| reader_subset(reader, entries))
+    }) {
+        return Ok(false);
+    }
+    let Some(digest) = client_secret_hash(store, entries)? else {
+        return Ok(false);
+    };
+    let expected = hash_bytes("blob", digest.as_bytes())?.to_string();
+    Ok(entries.get(caos_world::SECRET_HASH_ARG) == Some(&expected))
+}
+
 /// A stable in-process identity for a secret store: everything about it that can
 /// change an evaluation's answer, and nothing else.
 ///
@@ -5189,7 +5233,9 @@ mod local_secret_tests {
 
 #[cfg(test)]
 mod memo_tests {
-    use super::{eval::Memo, store_key, ClientSecret};
+    use super::{
+        client_secret_hash, eval::Memo, hash_bytes, request_has_secret, store_key, ClientSecret,
+    };
 
     fn secret(name: &str, value: &str, entropy: &str, reader: &[(&str, &str)]) -> ClientSecret {
         ClientSecret {
@@ -5201,6 +5247,57 @@ mod memo_tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()],
         }
+    }
+
+    #[test]
+    fn required_secret_checks_reader_and_isolation_before_dispatch() {
+        let image = "a".repeat(40);
+        let other_image = "b".repeat(40);
+        let mut entries = std::collections::BTreeMap::from([
+            ("base".to_string(), image.clone()),
+            ("extra".to_string(), "c".repeat(40)),
+        ]);
+        let store = vec![secret(
+            "model-key",
+            "private",
+            "entropy",
+            &[("base", &image)],
+        )];
+        // Matching the image alone must not authorize an old, unmarked request.
+        assert!(!request_has_secret(&entries, &store, "model-key").unwrap());
+        let digest = client_secret_hash(&store, &entries).unwrap().unwrap();
+        entries.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            hash_bytes("blob", digest.as_bytes()).unwrap().to_string(),
+        );
+        assert!(request_has_secret(&entries, &store, "model-key").unwrap());
+        assert!(!request_has_secret(&entries, &store, "other-key").unwrap());
+
+        let wrong_reader = vec![secret(
+            "model-key",
+            "private",
+            "entropy",
+            &[("base", &other_image)],
+        )];
+        assert!(!request_has_secret(&entries, &wrong_reader, "model-key").unwrap());
+        let mut absent_reader = secret("model-key", "private", "entropy", &[]);
+        absent_reader.readers.clear();
+        assert!(!request_has_secret(&entries, &[absent_reader], "model-key").unwrap());
+
+        let rotated = vec![secret(
+            "model-key",
+            "replacement",
+            "entropy",
+            &[("base", &image)],
+        )];
+        assert!(request_has_secret(&entries, &rotated, "model-key").unwrap());
+        let changed_identity = vec![secret(
+            "model-key",
+            "private",
+            "new entropy",
+            &[("base", &image)],
+        )];
+        assert!(!request_has_secret(&entries, &changed_identity, "model-key").unwrap());
     }
 
     /// The claim `store_key`'s doc comment makes: a store keys an evaluation by

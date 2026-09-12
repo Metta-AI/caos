@@ -89,6 +89,13 @@ moment it is submitted. A store that exists but fails to load is reported as
 the error it is rather than prompting, so an existing broken configuration is
 never overwritten.
 
+When preparing a turn or a generated title, the client also checks that the
+selected worker will actually receive the key. Missing or mismatched readers
+produce a local error naming the required `reader=` path before a turn is
+admitted. Update the existing entry to match the image argument (for example,
+`reader=std/llm-step`), then start a new turn. A request prepared under the old
+permissions cannot be repaired by repeatedly resuming it.
+
 Below, `$W` stands for the two required image args
 (`--llm-step:@=std/llm-step --llm-call:@=std/llm-call`). The last two run no
 worker, so they take neither.
