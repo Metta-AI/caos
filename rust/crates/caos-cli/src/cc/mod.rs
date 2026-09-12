@@ -252,116 +252,6 @@ fn dispatch_call(
 /// It is the request's recorded `configuration` too, so a conversation says
 /// which worker ran its tools -- and the tui can pick the turn up, because what
 /// it names is an ordinary step.
-/// Resolve the `--llm-step` image, ONCE PER CONTAINER, shared across this
-/// session's processes.
-///
-/// `serve`'s resolver, the prompt hook and every tool dispatch all resolve the
-/// same step, in SEPARATE processes whose in-memory eval memo (`caos-eval`)
-/// cannot be shared. Each resolve is ~9s of round trips, and at session start
-/// they run CONCURRENTLY over one tunnel and starve each other -- which wedges
-/// the hook recording the first prompt and fails the whole first turn (later
-/// turns work because by then the record exists). Measured, that resolve is the
-/// dominant cost of the ~14s prompt hook.
-///
-/// So a file under the temp dir holds the resolved oid, and a `create_new`
-/// marker single-flights it: the first process to arrive resolves and writes
-/// the oid; the others find the marker, poll the (LOCAL) file until it appears,
-/// and reuse it -- no second resolve, no second tunnel user, no wedge. Keyed by
-/// the step arg AND the secret store, because the resolution depends on both
-/// (design/secrets.md) and the client-side resolve marks the step's tools with
-/// the caller's identity. The oid is deterministic in those inputs, so a cached
-/// entry can only be absent, never wrong.
-///
-/// Every filesystem failure falls back to a direct resolve: caching must never
-/// be what stops a session from working.
-fn resolve_step_cached(
-    t: &GitTransport,
-    options: &TurnOptions,
-    store: &[caos::ClientSecret],
-) -> Result<String, String> {
-    let direct = || crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store);
-    let Some(arg) = options.llm_step.as_deref() else {
-        return direct();
-    };
-    // FNV-1a over (arg, secret scope): a stable cross-process key with no new
-    // dependency (a hashing crate would have to be anchored in the cargo bake).
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in arg
-        .as_bytes()
-        .iter()
-        .chain(b"\0")
-        .chain(caos::secret_store_header(store).as_bytes())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // A FIXED shared directory, not `temp_dir()`: the whole point is that
-    // `serve`, the hook and each tool dispatch find the SAME file, and Claude
-    // Code can spawn those processes with different `TMPDIR`s -- measured, the
-    // hook resolved anew (29s) beside a resolver that had already cached, so
-    // they were not sharing. `/tmp` is one path all of them agree on in the
-    // container; only where it is missing does this fall back to `temp_dir()`.
-    let dir = if std::path::Path::new("/tmp").is_dir() {
-        std::path::PathBuf::from("/tmp")
-    } else {
-        std::env::temp_dir()
-    };
-    let cache = dir.join(format!("caos-cc-step-{hash:016x}"));
-    let marker = dir.join(format!("caos-cc-step-{hash:016x}.flight"));
-
-    let read_cache = || -> Option<String> {
-        let oid = std::fs::read_to_string(&cache).ok()?;
-        let oid = oid.trim();
-        (!oid.is_empty()).then(|| oid.to_string())
-    };
-
-    // ~5 min of patience for a cold resolve, polling the local file: far longer
-    // than a resolve takes, so a live winner is always waited out; long enough
-    // that a dead one is reclaimed below rather than hung on forever.
-    for _ in 0..300 {
-        if let Some(oid) = read_cache() {
-            return Ok(oid);
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-        {
-            // We own the flight: resolve, publish atomically, release.
-            Ok(_) => {
-                let result = direct();
-                if let Ok(oid) = &result {
-                    let tmp = dir.join(format!("caos-cc-step-{hash:016x}.{}", std::process::id()));
-                    if std::fs::write(&tmp, oid).is_ok() {
-                        let _ = std::fs::rename(&tmp, &cache);
-                    }
-                }
-                let _ = std::fs::remove_file(&marker);
-                return result;
-            }
-            // Someone else owns it. Reclaim a marker whose owner died (older
-            // than any real resolve), else wait for the cache to appear.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&marker)
-                    .and_then(|m| m.modified())
-                    .and_then(|t| t.elapsed().map_err(std::io::Error::other))
-                    .map(|age| age.as_secs() > 300)
-                    .unwrap_or(false);
-                if stale {
-                    let _ = std::fs::remove_file(&marker);
-                    continue;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            // The lock dir is unusable; do not let that stop the session.
-            Err(_) => return direct(),
-        }
-    }
-    // Waited out the budget without a result -- resolve directly rather than
-    // hang the caller.
-    direct()
-}
-
 fn tools_configuration(
     t: &GitTransport,
     options: &TurnOptions,
@@ -389,7 +279,7 @@ fn tools_configuration(
     if !merge_refs.is_empty() {
         config.push(format!("--merge-refs={merge_refs}"));
     }
-    let base = resolve_step_cached(t, options, store)?;
+    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
 
@@ -421,26 +311,20 @@ fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
 /// How long a tool call waits for its conversation to exist before proceeding
 /// to the append that would refuse it.
 ///
-/// The conversation is created by the `UserPromptSubmit` hook -- a SEPARATE
-/// process, whose work measures ~12s in a cloud session: it is the CURRY AND
-/// PUSH of the request over the tunnel, not the fetch (a local `--llm-step`
-/// path is exactly as slow), and it does not cache, so every prompt pays it.
-/// Claude Code does not hold the turn for that, so the model's first tool call
-/// arrives before it lands, and refusing it ("no conversation to record into")
-/// is what makes a session's WHOLE FIRST TURN fail while every later turn works.
+/// The conversation is created by the `UserPromptSubmit` hook, a SEPARATE
+/// process, and Claude Code does not hold the turn for it -- so the model's
+/// first tool call can arrive before the record lands and would otherwise be
+/// refused ("no conversation to record into"), failing a session's whole first
+/// turn while every later turn works (by then the record exists). So a call
+/// WAITS for the record the hook is still writing.
 ///
-/// So a call WAITS for the record the prompt hook is pushing -- but SPARSELY,
-/// which is the whole subtlety. The probe is an ls-remote to the caos server,
-/// and the prompt hook is pushing to that same server through the same
-/// single-stream tunnel; a tight poll competes with the push for it and can
-/// starve the very thing it waits for -- measured, a 1s poll wedged the push so
-/// it never completed and the wait timed out against a conversation that would
-/// otherwise have landed at ~12s. Spaced probes leave the tunnel to the push.
-/// `fetch_validated_head` returns early on an absent ref, without a fetch or a
-/// local write, so a probe is cheap; the interval is what matters. Bounded well
-/// past the ~12s; a conversation that never appears still errors, just later.
-const TOOL_WAIT_ATTEMPTS: u32 = 15;
-const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+/// In a cloud session the hook takes ~10s -- its curry, base push and
+/// conversation push each cross the iroh tunnel -- so this is a short wait.
+/// Probing is cheap: `fetch_validated_head` returns early on an absent ref,
+/// with no fetch and no local write. Bounded well past the hook's time; a
+/// conversation that never appears still errors, just after the wait.
+const TOOL_WAIT_ATTEMPTS: u32 = 20;
+const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn wait_for_conversation(t: &GitTransport, id: &str) {
     for attempt in 0..TOOL_WAIT_ATTEMPTS {
@@ -486,7 +370,7 @@ fn read_outcome(
 /// `caos-tools/` is offered here exactly as it is in the tui.
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
     let store = caos::build_secret_store(t)?;
-    let base = resolve_step_cached(t, options, &store)?;
+    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
     let mut kvs = vec!["--list-tools=1".to_string()];
     // The tree whose `caos-tools/` entries are offered -- named ONLY when
     // there are any, and the ordering is the whole point.
@@ -559,22 +443,50 @@ fn hook(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     result
 }
 
-/// A best-effort line per hook invocation, appended to `$CAOS_CC_HOOK_LOG`, or
-/// to `<tmp>/caos-cc-hook.log` when that is unset. The hooks are the one part
-/// of this that runs in a process nobody watches -- Claude Code spawns them and
-/// keeps only a pass/fail -- so when the conversation a session should have is
-/// simply absent, there is otherwise nothing to say which hook fired, for which
-/// session, and whether it returned or failed and why.
+/// The hook debug log, when `CAOS_CC_HOOK_LOG` names one -- OFF by default.
+///
+/// The hooks are the one part of this that runs in a process nobody watches:
+/// Claude Code spawns them and keeps only a pass/fail. So when a session's
+/// conversation is unexpectedly absent, or its first turn is slow, set this to a
+/// path and every hook writes a start line, an end line (session, elapsed,
+/// ok/ERR) and its `record_prompt` phase timings. `None` -- unset -- makes all
+/// of `debug_log_hook`/`cc_timing` no-ops, so production writes nothing.
+fn hook_log_path() -> Option<std::path::PathBuf> {
+    match std::env::var("CAOS_CC_HOOK_LOG") {
+        Ok(path) if !path.is_empty() => Some(std::path::PathBuf::from(path)),
+        _ => None,
+    }
+}
+
+/// Append one line to the hook debug log, if it is enabled.
+fn append_hook_log(line: &str) {
+    let Some(path) = hook_log_path() else {
+        return;
+    };
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// One indented `timing <phase> <secs>` line under the hook's own, so a slow or
+/// wedged hook shows which of `record_prompt`'s phases owns the time (or, by the
+/// missing line, hangs). No-op unless the log is enabled.
+fn cc_timing(phase: &str, elapsed: std::time::Duration) {
+    append_hook_log(&format!("  timing {phase} {:.2}s\n", elapsed.as_secs_f64()));
+}
+
+/// A start/end line per hook invocation. The start line, logged before the work,
+/// distinguishes a hook killed mid-run (start, no end) from one that never fired.
 fn debug_log_hook(
     phase: &str,
     event: &str,
     payload: &Value,
     done: Option<(std::time::Duration, &Result<(), String>)>,
 ) {
-    let path = match std::env::var("CAOS_CC_HOOK_LOG") {
-        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
-        _ => std::env::temp_dir().join("caos-cc-hook.log"),
-    };
+    if hook_log_path().is_none() {
+        return;
+    }
     let session = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -591,11 +503,9 @@ fn debug_log_hook(
             format!(" {:.1}s ERR {}", elapsed.as_secs_f64(), error.replace('\n', " "))
         }
     };
-    let line = format!("{phase} {event} session={session} prompt_len={prompt_len}{tail}\n");
-    use std::io::Write as _;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = file.write_all(line.as_bytes());
-    }
+    append_hook_log(&format!(
+        "{phase} {event} session={session} prompt_len={prompt_len}{tail}\n"
+    ));
 }
 
 /// The user's prompt, and the only event allowed to create the conversation:
@@ -623,33 +533,6 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
 /// exactly as the tui prepares a turn -- because each of the turn's tool calls
 /// runs it. A request id that named nothing would leave the calls nothing to
 /// run and the record claiming a configuration that never existed.
-/// Print `cc-timing: <phase> <secs>` to stderr when `CAOS_CC_TIMING` is set.
-/// A `record_prompt` measures ~12s in a cloud session and it is not obvious
-/// which of its four server round trips owns that; this makes each one report.
-/// Where the hook debug log lives: `$CAOS_CC_HOOK_LOG`, else `<tmp>/caos-cc-hook.log`.
-fn hook_log_path() -> std::path::PathBuf {
-    match std::env::var("CAOS_CC_HOOK_LOG") {
-        Ok(path) if !path.is_empty() => std::path::PathBuf::from(path),
-        _ => std::env::temp_dir().join("caos-cc-hook.log"),
-    }
-}
-
-/// Append one best-effort line to the hook debug log.
-fn append_hook_log(line: &str) {
-    use std::io::Write as _;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(hook_log_path())
-    {
-        let _ = file.write_all(line.as_bytes());
-    }
-}
-
-fn cc_timing(phase: &str, elapsed: std::time::Duration) {
-    append_hook_log(&format!("  timing {phase} {:.2}s\n", elapsed.as_secs_f64()));
-}
-
 fn record_prompt(
     t: &GitTransport,
     options: &TurnOptions,

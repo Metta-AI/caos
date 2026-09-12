@@ -285,8 +285,16 @@ the tui against the same conversation.
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   entries say `claude-code` rather than naming a model. Better than a
   plausible-looking string nothing verified.
-- **A cold first listing.** The resolution is off the handshake now, but the
-  first session against a tree whose step has never been built still waits for
-  a rustc compile before its tools appear — with `caos_status` explaining the
-  wait. Caching the registry on disk, keyed by the step argument, would make
-  every later session instant; nothing does that yet.
+- **A cold server build.** Resolving the step is now ONE `GET /eval-locator`
+  request to the caos server, which walks `.caos-expr` there — where each hop is
+  sub-millisecond — instead of the ~54 chatty round trips the client used to
+  make over the tunnel (measured: the difference between ~30s and ~2s, and the
+  reason a cloud session's first turn works at all rather than the prompt hook
+  being killed mid-resolve). The result is memoized server-side, so only the
+  FIRST session against a step-tree the server has never built waits for the
+  real rustc/cargo compiles — `caos_status` explains that wait — and every
+  session after is a memo hit. A fully cold server therefore still risks the
+  first prompt: that one request blocks on the build, which can outlast the
+  hook's budget. Pre-warming the step (the `serve` resolver already resolves it
+  in the background) closes that; the resolver's warm-up is not yet fenced
+  against the first prompt.
