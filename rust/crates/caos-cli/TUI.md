@@ -89,6 +89,10 @@ moment it is submitted. A store that exists but fails to load is reported as
 the error it is rather than prompting, so an existing broken configuration is
 never overwritten.
 
+Before submitting a chat turn, the client checks that the selected worker
+will receive the key. Missing or mismatched readers produce a local error
+naming the required `reader=` setting. Correct the entry and resend the message.
+
 Below, `$W` stands for the two required image args
 (`--llm-step:@=std/llm-step --llm-call:@=std/llm-call`). The last two run no
 worker, so they take neither.

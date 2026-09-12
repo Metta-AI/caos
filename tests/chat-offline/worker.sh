@@ -105,15 +105,40 @@ if remote_tip "$queued_ref" >/dev/null; then
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
-echo "== a conversation-shaped base is refused ==" >&2
 mkdir -p .caos-secrets
 printf '.caos-secrets/\n' >> .git/info/exclude
+echo "== stale and mismatched model readers fail before admission ==" >&2
+for reader in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
+  printf '%s\n' \
+    'name=anthropic-api-key' \
+    'value=test-key' \
+    'entropy=0123456789abcdef0123456789abcdef' \
+    "reader=$reader" > .caos-secrets/anthropic-api-key
+  # Another credential still marks the selected worker. Its hash must not
+  # disguise the missing grant for the model key.
+  printf '%s\n' \
+    'name=unrelated-key' \
+    'value=unrelated-value' \
+    'entropy=abcdef0123456789abcdef0123456789' \
+    'reader=DEEP-DEPS/llm-step' > .caos-secrets/unrelated-key
+  if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>reader.err; then
+    fail "chat admitted a model key with reader=$reader"
+  fi
+  grep -qF 'not granted to this worker' reader.err || fail "reader error is unclear"
+  grep -qF 'reader=DEEP-DEPS/llm-step' reader.err || fail "reader error omits the selected image"
+  if remote_tip "$queued_ref" >/dev/null; then
+    fail "reader failure partially admitted a conversation"
+  fi
+  [ ! -e stub/request-1.json ] || fail "reader failure reached the LLM"
+done
+rm .caos-secrets/unrelated-key
 printf '%s\n' \
   'name=anthropic-api-key' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' \
-  > .caos-secrets/anthropic-api-key
+  'reader=DEEP-DEPS/llm-step' > .caos-secrets/anthropic-api-key
+
+echo "== a conversation-shaped base is refused ==" >&2
 fake_output=$($TOOL root --repo "$PWD" --id "${test_id}-fake-base" --title fake)
 fake_base=${fake_output#head }
 if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$fake_base" "${opts[@]}" 2>base.err; then

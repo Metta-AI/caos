@@ -673,6 +673,19 @@ fn prepare_queued_request_detail(
         &[format!("--head:commit={queued_head}")],
         &store,
     )?;
+    if !caos::client_request_has_secret(t, &request, &store, MODEL_API_SECRET)? {
+        let reader = options
+            .llm_step
+            .as_deref()
+            .and_then(image_arg_reader)
+            .map(|path| format!("reader={path}"))
+            .unwrap_or_else(|| "a reader= entry for the selected --llm-step image".to_string());
+        return Err(format!(
+            "{MODEL_API_SECRET} is configured but is not granted to this worker. \
+             Update .caos-secrets/{MODEL_API_SECRET} to include {reader}, \
+             then resend your message."
+        ));
+    }
     Ok(PreparedRequest {
         request,
         configuration,
