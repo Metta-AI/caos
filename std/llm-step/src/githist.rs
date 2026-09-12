@@ -88,7 +88,7 @@ pub fn execute(
         store.history(&revision, query, get("path"))
     };
     match run() {
-        Ok(text) => crate::result_block(id, &text, false),
+        Ok(text) => crate::tools::text_result_block(id, text, false),
         Err(error) => crate::error_block(id, &error),
     }
 }
