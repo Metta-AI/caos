@@ -308,9 +308,10 @@ checks out the named source commit with detached HEAD. The destination must be
 a clean Git checkout or an empty/new directory.
 
 The client remembers that destination locally, keyed by server, conversation,
-and gitlink path. A later `/checkout feature/01-change` can reuse it. Successful
-checkout also selects the source for `/update-tree <message>`, which submits local
-edits back to that source and continues the conversation with the user's message.
+and gitlink path. A later `/checkout feature/01-change` can reuse it.
+`/update-tree feature/01-change <message>` commits edits in that path's remembered
+checkout, submits them back to that source, and continues the conversation with
+the user's message. The source path is explicit in both commands.
 
 Browser selection does not choose checkout or publication targets, and does not
 change the agent's execution context.

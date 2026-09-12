@@ -902,8 +902,8 @@ const COMMANDS: [Command; 12] = [
     },
     Command {
         name: "/update-tree",
-        usage: "/update-tree <message>",
-        description: "fold working-tree edits into the commit",
+        usage: "/update-tree <conversation/gitlink> <message>",
+        description: "submit local edits",
         action: AppAction::UpdateTree,
         takes_argument: true,
     },
@@ -2213,32 +2213,44 @@ impl App {
         // and ordinary text reach the request path.
         let mut human_tree = None;
         let mut proposal_base = None;
+        let mut source_path = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             debug_assert!(command.action.submits_message());
-            if arguments.is_empty() {
+            let Some((name, message)) = parse_update_tree(arguments) else {
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
                 self.selected_mut().composer.restore_message(&raw);
                 return;
-            }
-            let source_tree = match self.selected().require_selected_source_tree() {
-                Ok(source_tree) => source_tree.head.clone(),
-                Err(error) => {
-                    self.selected_mut().show_command_error(error);
+            };
+            let source_tree = match self
+                .selected()
+                .source_trees
+                .iter()
+                .find(|source| source.name == name)
+            {
+                Some(source) => source.head.clone(),
+                None => {
+                    self.selected_mut()
+                        .show_command_error(format!("no source-tree gitlink at {name:?}"));
+                    self.selected_mut().composer.restore_message(&raw);
                     return;
                 }
             };
-            let committed = self
-                .checkout_selected_source_tree(&source_tree)
-                .and_then(|checkout| {
-                    let (commit, base) = commit_working_tree(arguments, &source_tree, &checkout)?;
-                    super::launcher::import_local_commit(
-                        &checkout,
-                        &self.repo_dir,
-                        &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
-                    )?;
-                    Ok((commit, base))
-                });
+            let committed = super::launcher::checkout_for(
+                &self.repo_dir,
+                &self.selected().id,
+                &name,
+                &source_tree,
+            )
+            .and_then(|checkout| {
+                let (commit, base) = commit_working_tree(message, &source_tree, &checkout)?;
+                super::launcher::import_local_commit(
+                    &checkout,
+                    &self.repo_dir,
+                    &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
+                )?;
+                Ok((commit, base))
+            });
             match committed {
                 Ok((tree, base)) => {
                     human_tree = Some(tree);
@@ -2249,11 +2261,18 @@ impl App {
                     return;
                 }
             }
-            arguments.to_string()
+            source_path = Some(name);
+            message.to_string()
         } else {
             raw
         };
-        self.send_message(self.selected, message, human_tree, proposal_base);
+        self.send_message(
+            self.selected,
+            message,
+            human_tree,
+            proposal_base,
+            source_path,
+        );
     }
 
     fn send_message(
@@ -2262,6 +2281,7 @@ impl App {
         message: String,
         human_tree: Option<String>,
         proposal_base: Option<String>,
+        source_path: Option<String>,
     ) {
         let interjecting = self.conversations[index].running;
         let should_generate_title = !interjecting
@@ -2300,9 +2320,7 @@ impl App {
 
         let tx = self.tx.clone();
         let mut options = self.conversations[index].turn_options.clone();
-        options.source_tree = human_tree
-            .as_ref()
-            .and(self.conversations[index].selected_source_tree.clone());
+        options.source_tree = source_path;
         let conversation = self.conversations[index].id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
@@ -2851,7 +2869,7 @@ impl App {
                         match result {
                             Ok((message, load)) => {
                                 self.conversations[index].apply_load(*load, &self.user);
-                                self.send_message(index, message, None, None);
+                                self.send_message(index, message, None, None, None);
                             }
                             Err(error) => self.conversations[index].show_command_error(error),
                         }
@@ -3916,11 +3934,6 @@ impl App {
         self.selected_mut().tool_set = Some(result);
     }
 
-    fn checkout_selected_source_tree(&self, head: &str) -> Result<PathBuf, String> {
-        let source = self.selected().require_selected_source_tree()?;
-        super::launcher::checkout_for(&self.repo_dir, &self.selected().id, &source.name, head)
-    }
-
     fn run_checkout(&mut self, arguments: &str) {
         let parts = match shell_words::split(arguments) {
             Ok(parts)
@@ -3980,7 +3993,6 @@ impl App {
         match result {
             Ok(status) => {
                 let state = self.selected_mut();
-                let _ = state.select_source_tree(&parts[0]);
                 state.command_error = None;
                 state.status = status.clone();
                 state.push_info(status);
@@ -3988,6 +4000,21 @@ impl App {
             Err(error) => self.selected_mut().show_command_error(error),
         }
     }
+}
+
+// Parse only the path as a shell word; the message is ordinary prose.
+fn parse_update_tree(arguments: &str) -> Option<(String, &str)> {
+    arguments
+        .char_indices()
+        .filter(|(_, ch)| ch.is_whitespace())
+        .find_map(|(end, _)| {
+            let words = shell_words::split(&arguments[..end]).ok()?;
+            let message = arguments[end..].trim();
+            match words.as_slice() {
+                [path] if !path.is_empty() && !message.is_empty() => Some((path.clone(), message)),
+                _ => None,
+            }
+        })
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4450,7 +4477,7 @@ mod tests {
     }
 
     #[test]
-    fn update_tree_refuses_an_ambiguous_source_tree() {
+    fn update_tree_requires_an_explicit_source_tree() {
         let mut conversation = state("talk-1");
         conversation.source_trees = vec![
             source_tree_diff("main", 'a', 'b', ""),
@@ -4465,9 +4492,18 @@ mod tests {
 
         assert_eq!(
             app.selected().command_error.as_deref(),
-            Some("choose a source tree; available source trees: main, side")
+            Some("no source-tree gitlink at \"include\"")
         );
         assert!(!app.selected().running);
+        assert_eq!(
+            parse_update_tree("feature/01-change don't drop \"quotes\""),
+            Some(("feature/01-change".into(), "don't drop \"quotes\""))
+        );
+        assert_eq!(
+            parse_update_tree("\"feature with spaces/01-change\" edit this"),
+            Some(("feature with spaces/01-change".into(), "edit this"))
+        );
+        assert_eq!(parse_update_tree("feature/01-change"), None);
     }
 
     fn wait_for_fork(app: &mut App, id: &str) -> bool {
@@ -5000,9 +5036,10 @@ mod tests {
         assert_eq!(command.action, AppAction::Model);
         assert_eq!(arguments, "claude-sonnet-5");
 
-        let (command, arguments) = parse_command("/update-tree include this text").unwrap();
+        let (command, arguments) =
+            parse_command("/update-tree feature/01-change include this text").unwrap();
         assert_eq!(command.action, AppAction::UpdateTree);
-        assert_eq!(arguments, "include this text");
+        assert_eq!(arguments, "feature/01-change include this text");
 
         let (command, arguments) = parse_command("/help").unwrap();
         assert_eq!(command.action, AppAction::Help);
@@ -5149,7 +5186,7 @@ mod tests {
         assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
         assert!(rendered.contains("/title <new title> — rename the selected conversation"));
         assert!(
-            rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
+            rendered.contains("/update-tree <conversation/gitlink> <message> — submit local edits")
         );
 
         app.selected_mut().composer = Composer::default();
@@ -6454,7 +6491,7 @@ mod tests {
         app.conversations[0].automatic_title = false;
         app.conversations[0].composer.insert_str("first draft");
         app.conversations[1].composer.insert_str("second draft");
-        app.send_message(0, "Integrate the imported PR base".into(), None, None);
+        app.send_message(0, "Integrate the imported PR base".into(), None, None, None);
         assert_eq!(app.selected().id, "talk-2");
         assert_eq!(app.conversations[0].composer.text, "first draft");
         assert_eq!(app.conversations[1].composer.text, "second draft");
