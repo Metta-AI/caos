@@ -1366,6 +1366,20 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     let mut lines = vec![
         Line::styled(
+            "Copying text",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw("  Drag to request a copy. Over SSH, your terminal may ignore the request."),
+        Line::raw("  iTerm2: Settings > General > Selection >"),
+        Line::raw("  enable 'Applications in terminal may access clipboard'."),
+        Line::raw(
+            "  Manual copy: Ctrl+Y, drag text, then Cmd+C (macOS) or your terminal's Copy action.",
+        ),
+        Line::raw("  Escape resumes the chat."),
+        Line::raw(""),
+        Line::styled(
             "Keyboard shortcuts",
             Style::default()
                 .fg(Color::Cyan)
@@ -1612,7 +1626,7 @@ fn render_command_menu(
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let footer = if app.selection_locked {
         Line::styled(
-            " Selection lock: redraws paused, ^Y/Esc resumes",
+            " Manual copy: drag text, then use terminal Copy (Cmd+C on macOS); ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.selected().running
@@ -1656,11 +1670,17 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
-    if let Some(chars) = app.copy_requested_chars {
+    if let Some((chars, outcome)) = app.copy_notice {
         let noun = if chars == 1 { "char" } else { "chars" };
+        let notice = match outcome {
+            super::CopyOutcome::Copied => format!(" Copied {chars} {noun} "),
+            super::CopyOutcome::Requested => {
+                format!(" Copy requested: {chars} {noun} (^Y manual, ^H help) ")
+            }
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" Copy requested: {chars} {noun} (Ctrl+Y: manual) "),
+                notice,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)

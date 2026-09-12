@@ -288,8 +288,11 @@ Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
 selection over the entire rendered interface. Drag across the header, sidebar,
 conversation, activity, diff, help, prompt, or footer to highlight text and copy
 automatically on mouse release. A click without a drag still selects a
-conversation in the sidebar. macOS uses `pbcopy`; other environments receive
-the same text through the standard OSC 52 terminal clipboard sequence.
+conversation in the sidebar. Local macOS sessions use `pbcopy` and show
+“Copied” after it succeeds. SSH sessions and other environments send the same
+text through the standard OSC 52 terminal clipboard sequence and show
+“Copy requested”. A clipboard helper or terminal write failure stays in the
+chat as a command error, preserving the draft. Press `Ctrl+H` for copying help.
 
 For native terminal selection, press `Ctrl+Y`. CAOS releases mouse capture and
 freezes redraws, so dragging and the terminal's normal copy shortcut (`Cmd+C`
@@ -324,4 +327,6 @@ means the sequence was sent; terminals can ignore it without acknowledging.
 For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
 Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
 require Settings > General > Selection > Applications in terminal may access
-clipboard.
+clipboard. This setting is required even when CAOS reports “Copy requested”;
+the request has no acknowledgement. If iTerm2's clipboard-access warning was
+previously dismissed, copying can fail silently until the setting is enabled.

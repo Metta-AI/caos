@@ -25,6 +25,7 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::source_tree::{commit_working_tree, load_conversation_source_tree};
+use super::CopyOutcome;
 
 #[path = "filesystem.rs"]
 mod filesystem;
@@ -1775,7 +1776,7 @@ pub(crate) struct App {
     selecting_screen: bool,
     pending_conversation_click: Option<usize>,
     rendered_screen: Option<Buffer>,
-    copy_requested_chars: Option<usize>,
+    copy_notice: Option<(usize, CopyOutcome)>,
     animation_frame: usize,
     enhanced_keyboard: bool,
     remote_polling: bool,
@@ -1914,7 +1915,7 @@ impl App {
             selecting_screen: false,
             pending_conversation_click: None,
             rendered_screen: None,
-            copy_requested_chars: None,
+            copy_notice: None,
             animation_frame: 0,
             enhanced_keyboard: false,
             remote_polling: false,
@@ -1996,11 +1997,17 @@ impl App {
     }
 
     pub(crate) fn clear_copy_notice(&mut self) {
-        self.copy_requested_chars = None;
+        self.copy_notice = None;
     }
 
-    pub(crate) fn note_copy(&mut self, text: &str) {
-        self.copy_requested_chars = Some(text.chars().count());
+    pub(crate) fn note_copy(&mut self, text: &str, result: std::io::Result<CopyOutcome>) {
+        self.copy_notice = None;
+        match result {
+            Ok(outcome) => self.copy_notice = Some((text.chars().count(), outcome)),
+            Err(error) => self.selected_mut().show_command_error_preserving_status(format!(
+                "Copy failed: {error}. Press Ctrl+Y, select text, then use your terminal's Copy action. Escape resumes the chat.",
+            )),
+        }
     }
 
     pub(crate) fn capture_screen(&mut self, buffer: &Buffer) {
@@ -4416,7 +4423,7 @@ mod tests {
                 selecting_screen: false,
                 pending_conversation_click: None,
                 rendered_screen: None,
-                copy_requested_chars: None,
+                copy_notice: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
                 remote_polling: false,
@@ -6299,6 +6306,56 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_status_distinguishes_confirmed_copy_and_unacknowledged_request() {
+        let (mut app, _) = app_with(vec![state("copy-status")]);
+        app.note_copy("é", Ok(CopyOutcome::Copied));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Copied 1 char"));
+        assert!(!rendered.contains("Copy requested"));
+
+        app.note_copy("é", Ok(CopyOutcome::Requested));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Copy requested: 1 char"));
+        assert!(rendered.contains("^Y manual, ^H help"));
+        assert!(!rendered.contains("Copied 1 char"));
+        app.clear_copy_notice();
+        assert!(app.copy_notice.is_none());
+    }
+
+    #[test]
+    fn clipboard_error_preserves_chat_and_draft_and_offers_manual_copy() {
+        let (mut app, _) = app_with(vec![state("copy-failure")]);
+        app.selected_mut().composer.insert_str("unfinished draft");
+        app.selected_mut().running = true;
+        app.selected_mut().status = "reading files".to_string();
+        let transcript_len = app.selected().transcript.len();
+        app.note_copy("text", Err(std::io::Error::other("clipboard unavailable")));
+        assert!(!app.should_quit());
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+        assert!(app.selected().running);
+        assert_eq!(app.selected().status, "reading files");
+        assert_eq!(app.selected().transcript.len(), transcript_len);
+        assert!(app.copy_notice.is_none());
+        let error = app.selected().command_error.as_deref().unwrap();
+        assert!(error.contains("clipboard unavailable"));
+        assert!(error.contains("Ctrl+Y"));
+    }
+
+    #[test]
+    fn clipboard_help_and_native_selection_explain_how_to_copy() {
+        let (mut app, _) = app_with(vec![state("copy-help")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Settings > General > Selection"));
+        assert!(rendered.contains("Applications in terminal may access clipboard"));
+        assert!(rendered.contains("Manual copy: Ctrl+Y"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.selection_locked());
+        assert!(rendered_screen(&app).contains("Manual copy: drag text"));
+    }
+
+    #[test]
     fn mouse_drag_selects_visible_transcript_text_for_copy() {
         let mut selected = state("talk-1");
         selected.transcript.push(TranscriptEntry {
@@ -6328,7 +6385,7 @@ mod tests {
             app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 29, 2), area),
             MouseAction::Copy("You".to_string())
         );
-        app.note_copy("You");
+        app.note_copy("You", Ok(CopyOutcome::Requested));
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6348,7 +6405,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(footer.ends_with(" Copy requested: 3 chars (Ctrl+Y: manual) "));
+        assert!(footer.ends_with(" Copy requested: 3 chars (^Y manual, ^H help) "));
     }
 
     #[test]

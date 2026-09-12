@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -79,9 +79,8 @@ fn run_app(
                         None
                     };
                     if let Some(text) = selected_text {
-                        copy_to_clipboard(terminal.backend_mut(), &text)
-                            .map_err(|error| format!("copying composer selection: {error}"))?;
-                        app.note_copy(&text);
+                        let result = copy_to_clipboard(terminal.backend_mut(), &text);
+                        app.note_copy(&text, result);
                     } else {
                         app.handle_key(key);
                     }
@@ -113,10 +112,8 @@ fn run_app(
                         MouseAction::Ignored => {}
                         MouseAction::Redraw => changed = true,
                         MouseAction::Copy(text) => {
-                            copy_to_clipboard(terminal.backend_mut(), &text).map_err(|error| {
-                                format!("copying transcript selection: {error}")
-                            })?;
-                            app.note_copy(&text);
+                            let result = copy_to_clipboard(terminal.backend_mut(), &text);
+                            app.note_copy(&text, result);
                             changed = true;
                         }
                     }
@@ -247,13 +244,37 @@ fn set_mouse_capture(writer: &mut impl io::Write, enabled: bool) -> io::Result<(
     }
 }
 
-fn copy_to_clipboard(writer: &mut impl Write, text: &str) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    if copy_with_pbcopy(text)? {
-        return Ok(());
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CopyOutcome {
+    Copied,
+    Requested,
+}
 
-    write_osc52(writer, text)
+fn copy_to_clipboard(writer: &mut impl Write, text: &str) -> io::Result<CopyOutcome> {
+    copy_with_native(writer, text, || {
+        #[cfg(target_os = "macos")]
+        if !["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return copy_with_command(Command::new("pbcopy"), text);
+        }
+        Ok(false)
+    })
+}
+
+fn copy_with_native(
+    writer: &mut impl Write,
+    text: &str,
+    native: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<CopyOutcome> {
+    if native()? {
+        return Ok(CopyOutcome::Copied);
+    }
+    // OSC 52 has no write acknowledgement. A successful flush says nothing
+    // about terminal permissions or whether the clipboard changed.
+    write_osc52(writer, text)?;
+    Ok(CopyOutcome::Requested)
 }
 
 fn write_osc52(writer: &mut impl Write, text: &str) -> io::Result<()> {
@@ -265,19 +286,32 @@ fn write_osc52(writer: &mut impl Write, text: &str) -> io::Result<()> {
     writer.flush()
 }
 
-#[cfg(target_os = "macos")]
-fn copy_with_pbcopy(text: &str) -> io::Result<bool> {
-    let mut child = match Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+#[cfg(any(target_os = "macos", test))]
+fn copy_with_command(mut command: Command, text: &str) -> io::Result<bool> {
+    let mut child = match command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
         Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    child
+    let write_result = child
         .stdin
         .take()
-        .expect("pbcopy was started with piped stdin")
-        .write_all(text.as_bytes())?;
-    child.wait().map(|status| status.success())
+        .expect("clipboard helper was started with piped stdin")
+        .write_all(text.as_bytes());
+    // Close stdin and reap the helper even when it rejected the input early.
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "clipboard helper exited with {status}"
+        )));
+    }
+    write_result?;
+    Ok(true)
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -470,6 +504,118 @@ mod tests {
         // An untouched log is deleted and nothing is reported.
         let redirect = stderr_guard::StderrRedirect::begin().expect("stderr redirect restarts");
         assert_eq!(redirect.finish(), None);
+    }
+
+    #[test]
+    fn clipboard_native_completion_and_terminal_request_are_distinct() {
+        let mut output = Vec::new();
+        assert_eq!(
+            copy_with_native(&mut output, "selected text", || Ok(true)).unwrap(),
+            CopyOutcome::Copied,
+        );
+        assert!(output.is_empty());
+        assert_eq!(
+            copy_with_native(&mut output, "héllo\n世界", || Ok(false)).unwrap(),
+            CopyOutcome::Requested,
+        );
+        assert_eq!(output, b"\x1b]52;c;aMOpbGxvCuS4lueVjA==\x07");
+    }
+
+    #[test]
+    fn clipboard_failures_never_report_success() {
+        let mut output = Vec::new();
+        let failure = copy_with_native(&mut output, "selected text", || {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        });
+        assert_eq!(failure.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(output.is_empty());
+
+        struct BrokenWriter {
+            fail_flush: bool,
+        }
+        impl Write for BrokenWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.fail_flush {
+                    Ok(buf.len())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "write failed"))
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "flush failed"))
+            }
+        }
+        for fail_flush in [false, true] {
+            let error = copy_with_native(&mut BrokenWriter { fail_flush }, "text", || Ok(false))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        }
+    }
+
+    #[cfg(unix)]
+    fn clipboard_test_command(mode: &str) -> Command {
+        // The cargo worker has no shell or coreutils. Reuse this test binary
+        // as the helper, with environment changes confined to its subprocess.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tui::tests::clipboard_helper_process",
+                "--nocapture",
+            ])
+            .env("CAOS_TEST_CLIPBOARD_HELPER", mode);
+        command
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_helper_process() {
+        use std::io::Read;
+
+        let Ok(mode) = std::env::var("CAOS_TEST_CLIPBOARD_HELPER") else {
+            return;
+        };
+        if mode == "early-exit" {
+            std::process::exit(9);
+        }
+        let mut bytes = Vec::new();
+        io::stdin().read_to_end(&mut bytes).unwrap();
+        if mode == "failure" {
+            std::process::exit(7);
+        }
+        assert_eq!(mode, "success");
+        let path = std::env::var_os("CAOS_TEST_CLIPBOARD_OUTPUT").unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_helper_receives_exact_bytes_and_waits_for_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("clipboard");
+        let mut command = clipboard_test_command("success");
+        command.env("CAOS_TEST_CLIPBOARD_OUTPUT", &output);
+        assert!(copy_with_command(command, "héllo\n世界\n").unwrap());
+        assert_eq!(std::fs::read(output).unwrap(), "héllo\n世界\n".as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_helper_reports_unavailable_and_failed_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !copy_with_command(Command::new(dir.path().join("missing-helper")), "text").unwrap()
+        );
+        let error = copy_with_command(clipboard_test_command("failure"), "text").unwrap_err();
+        assert!(error.to_string().contains("exit status: 7"));
+
+        // A helper that closes stdin immediately must still be waited for.
+        let error = copy_with_command(
+            clipboard_test_command("early-exit"),
+            &"x".repeat(1024 * 1024),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exit status: 9"));
     }
 
     #[test]
