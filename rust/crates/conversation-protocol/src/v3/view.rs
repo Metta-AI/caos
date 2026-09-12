@@ -11,10 +11,25 @@ use super::records::{
 };
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
+/// Latest records, reconstructed newest-first once for this immutable commit.
+/// The context flag distinguishes this conversation's execution from inherited
+/// results that remain readable in a fork's transcript.
+#[derive(Default)]
+struct Execution {
+    turns: BTreeMap<Oid, (bool, TurnRecord)>,
+    latest_turn: Option<Oid>,
+    tools: BTreeMap<(Oid, u64), BTreeMap<String, CallRecord>>,
+    children: BTreeMap<String, (bool, ChildRecord)>,
+    tasks: BTreeMap<Oid, AsyncRecord>,
+    publications: BTreeMap<String, PublicationRecord>,
+    publication_order: Vec<String>,
+    payloads: BTreeMap<String, Vec<u8>>,
+    fork_source: Option<Oid>,
+}
+
 pub struct Conversation<'s> {
     store: &'s dyn ObjectStore,
-    events: OnceCell<Vec<Event>>,
-    context_len: OnceCell<usize>,
+    execution: OnceCell<Execution>,
     commit: Option<Oid>,
     parent: Option<Oid>,
     kind: Option<Kind>,
@@ -33,8 +48,7 @@ impl<'s> Conversation<'s> {
         let kind = Kind::parse_message(&info.message)?;
         let conversation = Conversation {
             store,
-            events: OnceCell::new(),
-            context_len: OnceCell::new(),
+            execution: OnceCell::new(),
             commit: Some(commit.clone()),
             parent: info.parents.first().cloned(),
             kind: Some(kind),
@@ -48,8 +62,7 @@ impl<'s> Conversation<'s> {
     pub fn open_tree(store: &'s dyn ObjectStore, tree: &Oid) -> Result<Conversation<'s>, String> {
         let conversation = Conversation {
             store,
-            events: OnceCell::new(),
-            context_len: OnceCell::new(),
+            execution: OnceCell::new(),
             commit: None,
             parent: None,
             kind: None,
@@ -92,19 +105,9 @@ impl<'s> Conversation<'s> {
     pub fn identity(&self) -> Result<Identity, String> {
         let mut value = super::canonical::parse_canonical(&self.required_blob(paths::IDENTITY)?)?;
         value["kind"] = serde_json::json!("root");
-        let mut current = self.commit.clone();
-        while let Some(head) = current {
-            let info = self.store.read_commit(&head).map_err(String::from)?;
-            match Kind::parse_message(&info.message)? {
-                Kind::ConversationFork => {
-                    value["kind"] = serde_json::json!("fork");
-                    value["source"] =
-                        serde_json::json!(info.parents.first().ok_or("fork has no source")?);
-                    break;
-                }
-                Kind::ConversationRoot => break,
-                _ => current = info.parents.first().cloned(),
-            }
+        if let Some(source) = &self.execution()?.fork_source {
+            value["kind"] = serde_json::json!("fork");
+            value["source"] = serde_json::json!(source);
         }
         Identity::from_value(&value)
     }
@@ -211,41 +214,83 @@ impl<'s> Conversation<'s> {
             .collect()
     }
 
-    /// Retain ancestral results for the canonical transcript. A fork starts a
-    /// new execution context without erasing the results its transcript refers to.
-    fn events(&self) -> Result<&[Event], String> {
-        if self.events.get().is_none() {
-            let mut result = Vec::new();
+    fn execution(&self) -> Result<&Execution, String> {
+        if self.execution.get().is_none() {
+            let mut result = Execution::default();
             let mut current = self.commit.clone();
+            let mut in_context = true;
             while let Some(head) = current {
                 let info = self.store.read_commit(&head).map_err(String::from)?;
                 let (kind, events) = super::events::decode(&info.message)?;
-                result.extend(events.into_iter().rev());
-                if kind == Kind::ConversationFork {
-                    let _ = self.context_len.set(result.len());
+                for event in events.into_iter().rev() {
+                    match event {
+                        Event::Request(record) => {
+                            if in_context && result.latest_turn.is_none() {
+                                result.latest_turn = Some(record.id.clone());
+                            }
+                            result
+                                .turns
+                                .entry(record.id.clone())
+                                .or_insert((in_context, record));
+                        }
+                        Event::Tool(record) => {
+                            result
+                                .tools
+                                .entry((record.request.clone(), record.round))
+                                .or_default()
+                                .entry(record.id.clone())
+                                .or_insert(record);
+                        }
+                        Event::Child(record) => {
+                            result
+                                .children
+                                .entry(record.id.clone())
+                                .or_insert((in_context, record));
+                        }
+                        Event::Async(record) if in_context => {
+                            result.tasks.entry(record.task.clone()).or_insert(record);
+                        }
+                        Event::Publication(record) if in_context => {
+                            if kind == Kind::PublicationPending {
+                                result.publication_order.push(record.id.clone());
+                            }
+                            result
+                                .publications
+                                .entry(record.id.clone())
+                                .or_insert(record);
+                        }
+                        Event::Payload { path, bytes } => {
+                            result.payloads.entry(path).or_insert(bytes);
+                        }
+                        _ => {}
+                    }
+                }
+                if kind == Kind::ConversationFork && in_context {
+                    result.fork_source =
+                        Some(info.parents.first().ok_or("fork has no source")?.clone());
+                    in_context = false;
                 }
                 if kind == Kind::ConversationRoot {
                     break;
                 }
                 current = info.parents.first().cloned();
             }
-            let _ = self.context_len.set(result.len());
-            let _ = self.events.set(result);
+            let _ = self.execution.set(result);
         }
-        Ok(self.events.get().expect("loaded"))
+        Ok(self.execution.get().expect("loaded"))
     }
 
-    fn context_events(&self) -> Result<&[Event], String> {
-        let events = self.events()?;
-        Ok(&events[..*self.context_len.get().expect("loaded")])
+    pub fn latest_turn(&self) -> Result<Option<TurnRecord>, String> {
+        let execution = self.execution()?;
+        Ok(execution
+            .latest_turn
+            .as_ref()
+            .and_then(|id| execution.turns.get(id))
+            .map(|(_, r)| r.clone()))
     }
 
     pub fn active_turn(&self) -> Result<Option<TurnRecord>, String> {
-        let latest = self.context_events()?.iter().find_map(|event| match event {
-            Event::Request(r) => Some(r.clone()),
-            _ => None,
-        });
-        Ok(latest.filter(|r| {
+        Ok(self.latest_turn()?.filter(|r| {
             matches!(
                 r.status,
                 super::TurnStatus::Queued
@@ -256,39 +301,35 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn turn(&self, id: &Oid) -> Result<Option<TurnRecord>, String> {
-        Ok(self.events()?.iter().find_map(|event| match event {
-            Event::Request(r) if &r.id == id => Some(r.clone()),
-            _ => None,
-        }))
+        Ok(self.execution()?.turns.get(id).map(|(_, r)| r.clone()))
     }
 
     pub fn turn_ids(&self) -> Result<Vec<Oid>, String> {
         Ok(self
-            .context_events()?
+            .execution()?
+            .turns
             .iter()
-            .filter_map(|event| match event {
-                Event::Request(r) => Some(r.id.clone()),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
+            .filter(|(_, (context, _))| *context)
+            .map(|(id, _)| id.clone())
             .collect())
     }
 
     pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<CallRecord>, String> {
-        Ok(self.tools(request, round)?.into_iter().find(|r| r.id == id))
+        Ok(self
+            .execution()?
+            .tools
+            .get(&(request.clone(), round))
+            .and_then(|tools| tools.get(id))
+            .cloned())
     }
 
     pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<CallRecord>, String> {
-        let mut records = BTreeMap::new();
-        for event in self.events()? {
-            if let Event::Tool(r) = event {
-                if &r.request == request && r.round == round {
-                    records.entry(r.id.clone()).or_insert_with(|| r.clone());
-                }
-            }
-        }
-        Ok(records.into_values().collect())
+        Ok(self
+            .execution()?
+            .tools
+            .get(&(request.clone(), round))
+            .map(|tools| tools.values().cloned().collect())
+            .unwrap_or_default())
     }
 
     pub fn transcript_len(&self) -> Result<u64, String> {
@@ -374,16 +415,8 @@ impl<'s> Conversation<'s> {
 
     pub fn payload(&self, path: &str) -> Result<Vec<u8>, String> {
         paths::validate_tree_path(path)?;
-        for event in self.events()? {
-            if let Event::Payload {
-                path: stored,
-                bytes,
-            } = event
-            {
-                if stored == path {
-                    return Ok(bytes.clone());
-                }
-            }
+        if let Some(bytes) = self.execution()?.payloads.get(path) {
+            return Ok(bytes.clone());
         }
         self.snapshot
             .read(path)?
@@ -391,34 +424,25 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn async_task(&self, task: &Oid) -> Result<Option<AsyncRecord>, String> {
-        Ok(self.async_tasks()?.into_iter().find(|r| &r.task == task))
+        Ok(self.execution()?.tasks.get(task).cloned())
     }
 
     pub fn async_tasks(&self) -> Result<Vec<AsyncRecord>, String> {
-        let mut records = BTreeMap::new();
-        for event in self.context_events()? {
-            if let Event::Async(r) = event {
-                records.entry(r.task.clone()).or_insert_with(|| r.clone());
-            }
-        }
-        Ok(records.into_values().collect())
+        Ok(self.execution()?.tasks.values().cloned().collect())
     }
 
     pub fn child(&self, id: &str) -> Result<Option<ChildRecord>, String> {
-        Ok(self.events()?.iter().find_map(|event| match event {
-            Event::Child(r) if r.id == id => Some(r.clone()),
-            _ => None,
-        }))
+        Ok(self.execution()?.children.get(id).map(|(_, r)| r.clone()))
     }
 
     pub fn children(&self) -> Result<Vec<ChildRecord>, String> {
-        let mut records = BTreeMap::new();
-        for event in self.context_events()? {
-            if let Event::Child(r) = event {
-                records.entry(r.id.clone()).or_insert_with(|| r.clone());
-            }
-        }
-        Ok(records.into_values().collect())
+        Ok(self
+            .execution()?
+            .children
+            .values()
+            .filter(|(context, _)| *context)
+            .map(|(_, r)| r.clone())
+            .collect())
     }
 
     pub fn tasks(&self) -> Result<Vec<super::TaskRecord>, String> {
@@ -446,17 +470,26 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn publication(&self, id: &str) -> Result<Option<PublicationRecord>, String> {
-        Ok(self.publications()?.into_iter().find(|r| r.id == id))
+        Ok(self.execution()?.publications.get(id).cloned())
     }
 
     pub fn publications(&self) -> Result<Vec<PublicationRecord>, String> {
-        let mut records = BTreeMap::new();
-        for event in self.context_events()? {
-            if let Event::Publication(r) = event {
-                records.entry(r.id.clone()).or_insert_with(|| r.clone());
-            }
+        Ok(self.execution()?.publications.values().cloned().collect())
+    }
+
+    /// Latest publication states, newest creation first within this context.
+    pub fn publications_by_creation(&self) -> Result<Vec<PublicationRecord>, String> {
+        let execution = self.execution()?;
+        if execution.publication_order.len() != execution.publications.len() {
+            return Err(
+                "publication records do not have unique publication.pending commits".into(),
+            );
         }
-        Ok(records.into_values().collect())
+        Ok(execution
+            .publication_order
+            .iter()
+            .map(|id| execution.publications[id].clone())
+            .collect())
     }
 
     pub fn file(&self, relative: &str) -> Result<Option<Vec<u8>>, String> {

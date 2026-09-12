@@ -47,6 +47,18 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
         view.source_tree("main").unwrap().unwrap().commit
     );
     assert!(fork_view.active_turn().unwrap().is_none());
+    assert!(fork_view.latest_turn().unwrap().is_none());
+    assert!(view.latest_turn().unwrap().is_some());
+    assert!(fork_view.publications_by_creation().unwrap().is_empty());
+    let ordered = view.publications_by_creation().unwrap();
+    assert_eq!(ordered.len(), view.publications().unwrap().len());
+    for publication in ordered {
+        assert_eq!(
+            view.publication(&publication.id).unwrap(),
+            Some(publication)
+        );
+    }
+
     let request = Oid::parse(&"1".repeat(40), "request").unwrap();
     assert_eq!(
         fork_view.tools(&request, 0).unwrap(),
