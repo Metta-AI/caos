@@ -41,6 +41,18 @@ place the tool server offers **`llm-step`'s tools** — read, ls, grep, bash,
 write, edit, the history tools, the caos build/test tools, `merge`, and
 whatever the workspace defines under `caos-tools/`.
 
+The deny list is `Bash, Read, Edit, Write, Glob, Grep, NotebookEdit` — every
+built-in whose job a workspace tool does, so the model works in the RECORDED
+conversation tree, not the container's raw checkout (which a caos `write` never
+touches, so the two diverge). `Monitor` is on the list for a different reason:
+it is not a file tool, but it runs an arbitrary shell `command`, so leaving it
+would be a hole straight back to the shell the `Bash` deny closes — a session
+was seen reading files and running commands through it while everything else was
+blocked. Web access (`WebFetch`/`WebSearch`) and subagents (`Task`) are left
+alone: the step offers no equivalent, so denying them would remove a capability
+rather than redirect it. **Any new harness tool that can run a command or read a
+path belongs on this list**; the deny list is only as tight as its last audit.
+
 Not a copy of them: THE SAME ONES. `tools/list` runs the step with
 `--list-tools` and hands back the registry it answers with, and a call runs the
 step with `--tools-only`, which executes it exactly as it does for a turn the

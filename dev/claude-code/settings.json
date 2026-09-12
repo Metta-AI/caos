@@ -1,9 +1,14 @@
 {
   "permissions": {
     "deny": [
-      "Write",
+      "Bash",
+      "Read",
       "Edit",
-      "NotebookEdit"
+      "Write",
+      "Glob",
+      "Grep",
+      "NotebookEdit",
+      "Monitor"
     ],
     "allow": [
       "mcp__caos"
