@@ -818,6 +818,18 @@ impl Composer {
         true
     }
 
+    fn command_ready_to_submit(&self) -> bool {
+        if self.cursor != self.text.len() || self.text.contains(['\n', '\r']) {
+            return false;
+        }
+        let Some((_, arguments)) = parse_command(self.text.trim()) else {
+            return false;
+        };
+        // Enter still expands a partial model choice before running /model.
+        let models = self.model_matches();
+        models.is_empty() || models.contains(&arguments)
+    }
+
     fn dismiss_command_menu(&mut self) -> bool {
         if self.completion_count() == 0 {
             return false;
@@ -3500,7 +3512,11 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if !self.selected_mut().complete_command() {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.selected_mut().composer.insert_char('\n');
+                } else if self.selected().composer.command_ready_to_submit() {
+                    self.start_turn();
+                } else if !self.selected_mut().complete_command() {
                     self.selected_mut().composer.insert_char('\n');
                 }
             }
@@ -5214,6 +5230,83 @@ mod tests {
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
         assert!(parse_command("/rename A title").is_none());
+    }
+
+    #[test]
+    fn enter_runs_recognized_commands_at_the_end_of_the_prompt() {
+        let (mut app, _) = app_with(vec![virtual_state("talk-1")]);
+        app.selected_mut().composer.insert_str("/help");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Help);
+        assert!(app.selected().composer.text.is_empty());
+        assert!(!app.selected().running);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.selected_mut()
+            .composer
+            .insert_str("/title A useful title");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().title, "A useful title");
+        assert!(app.selected().composer.text.is_empty());
+    }
+
+    #[test]
+    fn enter_validates_known_commands_and_completes_partial_commands() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/tit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title ");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /title <new title>")
+        );
+        assert_eq!(app.selected().composer.text, "/title ");
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/model sonnet-5");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/model claude-sonnet-5 ");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert!(app.selected().composer.text.is_empty());
+    }
+
+    #[test]
+    fn enter_keeps_newlines_for_text_and_edits_inside_commands() {
+        for message in [
+            "ordinary text",
+            "/future unknown command",
+            "/title first\nsecond",
+        ] {
+            let (mut app, _) = app_with(vec![state("talk-1")]);
+            app.selected_mut().composer.insert_str(message);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.selected().composer.text, format!("{message}\n"));
+            assert!(!app.selected().running);
+        }
+
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/title title");
+        app.selected_mut().composer.move_left();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title titl\ne");
+        assert_eq!(app.selected().title, "talk-1");
+
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            app.selected_mut().composer = Composer::default();
+            app.selected_mut().composer.insert_str("/title title");
+            app.handle_key(key);
+            assert_eq!(app.selected().composer.text, "/title title\n");
+            assert_eq!(app.selected().title, "talk-1");
+        }
     }
 
     #[test]

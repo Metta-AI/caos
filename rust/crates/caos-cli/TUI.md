@@ -129,7 +129,8 @@ so it never leaves the conversation pane.
 | `Escape` | Stop a running turn, else dismiss the current layer |
 | `Ctrl+A` / `Ctrl+E` | Move to the start / end of the current line |
 | `Ctrl+S` | Send the prompt (`Ctrl+Enter` also works in terminals with enhanced keyboard input) |
-| `Enter` or `Ctrl+J` | Insert a newline |
+| `Enter` | Run a recognized slash command at the end of a single-line prompt; otherwise complete a command or insert a newline |
+| `Shift+Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right`, or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
@@ -238,8 +239,10 @@ require the previous build; this version does not migrate them implicitly.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
-or Enter to complete it with a trailing space. Typing arguments closes the
-menu. Escape dismisses it without changing the prompt. An unrecognized
+or Enter to complete a partial command with a trailing space. Enter runs a
+recognized command when the cursor is at the end of a single-line prompt.
+A partial model name completes first; Enter again applies it. Shift+Enter or
+Ctrl+J always inserts a newline. Typing arguments closes the command menu. Escape dismisses it without changing the prompt. An unrecognized
 slash-prefixed prompt is sent normally.
 
 `Ctrl+Shift+P` or `/commands` opens a searchable command palette without
