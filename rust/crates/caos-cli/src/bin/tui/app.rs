@@ -1714,6 +1714,12 @@ pub(crate) enum MouseAction {
     Copy(String),
 }
 
+struct LocalEdit {
+    path: String,
+    commit: String,
+    base: String,
+}
+
 pub(crate) struct App {
     repo_dir: PathBuf,
     user: String,
@@ -2211,10 +2217,7 @@ impl App {
         state.reference_notice = None;
         // Local commands were handled above; only message-submitting commands
         // and ordinary text reach the request path.
-        let mut human_tree = None;
-        let mut proposal_base = None;
-        let mut source_path = None;
-        let message = if let Some((command, arguments)) = parse_command(&raw) {
+        let (message, edit) = if let Some((command, arguments)) = parse_command(&raw) {
             debug_assert!(command.action.submits_message());
             let Some((name, message)) = parse_update_tree(arguments) else {
                 self.selected_mut()
@@ -2251,38 +2254,28 @@ impl App {
                 )?;
                 Ok((commit, base))
             });
-            match committed {
-                Ok((tree, base)) => {
-                    human_tree = Some(tree);
-                    proposal_base = Some(base);
-                }
+            let (commit, base) = match committed {
+                Ok(committed) => committed,
                 Err(error) => {
                     self.selected_mut().show_command_error(error);
                     return;
                 }
-            }
-            source_path = Some(name);
-            message.to_string()
+            };
+            (
+                message.to_string(),
+                Some(LocalEdit {
+                    path: name,
+                    commit,
+                    base,
+                }),
+            )
         } else {
-            raw
+            (raw, None)
         };
-        self.send_message(
-            self.selected,
-            message,
-            human_tree,
-            proposal_base,
-            source_path,
-        );
+        self.send_message(self.selected, message, edit);
     }
 
-    fn send_message(
-        &mut self,
-        index: usize,
-        message: String,
-        human_tree: Option<String>,
-        proposal_base: Option<String>,
-        source_path: Option<String>,
-    ) {
+    fn send_message(&mut self, index: usize, message: String, edit: Option<LocalEdit>) {
         let interjecting = self.conversations[index].running;
         let should_generate_title = !interjecting
             && self.conversations[index].automatic_title
@@ -2320,7 +2313,7 @@ impl App {
 
         let tx = self.tx.clone();
         let mut options = self.conversations[index].turn_options.clone();
-        options.source_tree = source_path;
+        options.source_tree = edit.as_ref().map(|edit| edit.path.clone());
         let conversation = self.conversations[index].id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
@@ -2352,8 +2345,8 @@ impl App {
                         &options,
                         &conversation,
                         &message,
-                        human_tree.as_deref(),
-                        proposal_base.as_deref(),
+                        edit.as_ref().map(|edit| edit.commit.as_str()),
+                        edit.as_ref().map(|edit| edit.base.as_str()),
                     )?;
                     let _ = committed_tx.send(UiMessage::SubmissionCommitted {
                         conversation: conversation.clone(),
@@ -2394,8 +2387,8 @@ impl App {
                     &options,
                     &conversation,
                     &message,
-                    human_tree.as_deref(),
-                    proposal_base.as_deref(),
+                    edit.as_ref().map(|edit| edit.commit.as_str()),
+                    edit.as_ref().map(|edit| edit.base.as_str()),
                     |commit| {
                         let _ = event_tx.send(UiMessage::SubmissionCommitted {
                             conversation: conversation.clone(),
@@ -2869,7 +2862,7 @@ impl App {
                         match result {
                             Ok((message, load)) => {
                                 self.conversations[index].apply_load(*load, &self.user);
-                                self.send_message(index, message, None, None, None);
+                                self.send_message(index, message, None);
                             }
                             Err(error) => self.conversations[index].show_command_error(error),
                         }
@@ -6491,7 +6484,7 @@ mod tests {
         app.conversations[0].automatic_title = false;
         app.conversations[0].composer.insert_str("first draft");
         app.conversations[1].composer.insert_str("second draft");
-        app.send_message(0, "Integrate the imported PR base".into(), None, None, None);
+        app.send_message(0, "Integrate the imported PR base".into(), None);
         assert_eq!(app.selected().id, "talk-2");
         assert_eq!(app.conversations[0].composer.text, "first draft");
         assert_eq!(app.conversations[1].composer.text, "second draft");

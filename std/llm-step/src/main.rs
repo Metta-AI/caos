@@ -1629,16 +1629,12 @@ fn complete_compute(
         .input_commit
         .as_ref()
         .ok_or("tool has no input commit")?;
-    let changes = if let Some(name) = &started.source_tree_name {
-        vec![conversation_protocol::v3::tree::Change {
-            path: name.clone(),
-            before: Some((Mode::Commit, base.clone())),
-            after: Some((Mode::Commit, proposal.clone())),
-        }]
-    } else {
+    let changes = if started.source_tree_name.is_none() {
         let base_tree = state.store().tree_of(base)?;
         let proposed_tree = state.store().tree_of(&proposal)?;
         conversation_protocol::v3::tree::diff(state.store(), Some(&base_tree), &proposed_tree)?
+    } else {
+        Vec::new()
     };
     if changes
         .iter()
@@ -1664,15 +1660,18 @@ fn complete_compute(
         }
         let current_tree = state.conversation()?.tree().clone();
         let FilePlan {
-            mut files,
+            files,
             conflicts,
             source_resolution,
-        } = plan_file_changes(
-            state.store_mut(),
-            &changes,
-            &current_tree,
-            started.source_tree_name.as_deref(),
-        )?;
+        } = match started.source_tree_name.as_deref() {
+            Some(name) => {
+                plan_source_result(state.store_mut(), base, &proposal, &current_tree, name)?
+            }
+            None => plan_file_changes(state.store_mut(), &changes, &current_tree)?,
+        };
+        if let Some(SourceTreeResolution::Merged { output, .. }) = &source_resolution {
+            state.push_code(output)?;
+        }
         for (name, value) in &files {
             if let Some((Mode::Commit, bytes)) = value {
                 let output = Oid::parse_line(bytes, "reconciled source tree")?;
@@ -1692,10 +1691,7 @@ fn complete_compute(
             },
             source_resolution,
         );
-        if started.source_tree_name.is_some() {
-            // Preserve the existing source-result record; its resolution applies the gitlink.
-            files.clear();
-        } else {
+        if started.source_tree_name.is_none() {
             if started.task.is_none() {
                 record.input_commit = None;
             }
@@ -1732,16 +1728,45 @@ struct FilePlan {
     source_resolution: Option<SourceTreeResolution>,
 }
 
+// A source-scoped tool proposes a descendant commit; filesystem tools can also
+// replace gitlinks outright (for example, copying a different snapshot).
+fn plan_source_result<S: ObjectStore + CodeOps>(
+    store: &mut S,
+    base: &Oid,
+    proposal: &Oid,
+    current_tree: &Oid,
+    name: &str,
+) -> Result<FilePlan, String> {
+    let current = match conversation_protocol::v3::tree::Snapshot::new(store, current_tree.clone())
+        .entry(name)
+    {
+        Ok(entry) => entry.filter(|e| e.mode == Mode::Commit).map(|e| e.oid),
+        Err(error) if error.starts_with("path ") && error.ends_with(" is a file") => None,
+        Err(error) => return Err(error),
+    };
+    let signature = inherited_signature(store, base)?;
+    let resolution = reconcile(store, base, proposal, current.as_ref(), &signature)?;
+    let conflicts = if matches!(resolution, SourceTreeResolution::Conflict { .. }) {
+        vec![name.to_string()]
+    } else {
+        Vec::new()
+    };
+    Ok(FilePlan {
+        // The existing source-result record applies its resolution directly.
+        files: Vec::new(),
+        conflicts,
+        source_resolution: Some(resolution),
+    })
+}
+
 fn plan_file_changes<S: ObjectStore + CodeOps>(
     store: &mut S,
     changes: &[conversation_protocol::v3::tree::Change],
     current_tree: &Oid,
-    source: Option<&str>,
 ) -> Result<FilePlan, String> {
     use conversation_protocol::v3::tree::Snapshot;
     let mut files = Vec::new();
     let mut conflicts = Vec::new();
-    let mut source_resolution = None;
     for change in changes {
         let current = Snapshot::new(store, current_tree.clone())
             .entry(&change.path)
@@ -1754,11 +1779,11 @@ fn plan_file_changes<S: ObjectStore + CodeOps>(
             }
             Err(error) => return Err(error),
         };
-        if current == change.after && source != Some(change.path.as_str()) {
+        if current == change.after {
             continue;
         }
         let mut after = change.after.clone();
-        if current != change.before || source == Some(change.path.as_str()) {
+        if current != change.before {
             if let (
                 Some((Mode::Commit, before)),
                 Some((Mode::Commit, proposed)),
@@ -1767,9 +1792,6 @@ fn plan_file_changes<S: ObjectStore + CodeOps>(
             {
                 let signature = inherited_signature(store, before)?;
                 let resolution = reconcile(store, before, proposed, Some(current), &signature)?;
-                if source == Some(change.path.as_str()) {
-                    source_resolution = Some(resolution.clone());
-                }
                 match resolution.new_pointer() {
                     Some(output) => {
                         let output = output.clone();
@@ -1803,17 +1825,10 @@ fn plan_file_changes<S: ObjectStore + CodeOps>(
     if !conflicts.is_empty() {
         files.clear();
     }
-    if let Some(source) = source {
-        if source_resolution.is_none() {
-            return Err(format!(
-                "source tree {source:?} was removed or replaced while the tool ran"
-            ));
-        }
-    }
     Ok(FilePlan {
         files,
         conflicts,
-        source_resolution,
+        source_resolution: None,
     })
 }
 
@@ -3319,7 +3334,11 @@ mod tests {
             .commit(&base_tree, &[], "base\n", &signature)
             .unwrap();
         let mut current_builder = TreeBuilder::from(Some(base_tree.clone()));
-        current_builder.put("current", Mode::Blob, b"current\n".to_vec());
+        current_builder.put(
+            "current",
+            Mode::Blob,
+            ("é".repeat(60_000) + "\nend\n").into_bytes(),
+        );
         let current_tree = current_builder.build(&mut writer_store).unwrap();
         let current = writer_store
             .commit(
@@ -3391,6 +3410,18 @@ mod tests {
             "show",
         );
         assert_eq!(invalid["is_error"], true);
+        let large = githist::execute(
+            state.store(),
+            None,
+            &current,
+            &json!({"id":"history","input":{}}),
+            "show",
+        );
+        assert_ne!(large["is_error"], true);
+        let text = large["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("[... truncated ...]"));
+        assert!(text.len() <= 100_100);
+        assert!(text.ends_with("+end"));
 
         let mut before = TreeBuilder::from(None);
         before.put_oid("code", Mode::Commit, base.clone());
@@ -3408,7 +3439,7 @@ mod tests {
             conversation_protocol::v3::tree::diff(state.store(), Some(&before), &proposed).unwrap();
         let FilePlan {
             files, conflicts, ..
-        } = plan_file_changes(state.store_mut(), &changes, &current_files, None).unwrap();
+        } = plan_file_changes(state.store_mut(), &changes, &current_files).unwrap();
         assert!(conflicts.is_empty());
         assert_eq!(
             files
@@ -3420,30 +3451,24 @@ mod tests {
         let merged = Oid::parse_line(&files[0].1.as_ref().unwrap().1, "merged code").unwrap();
         assert!(state.store().is_ancestor(&current, &merged).unwrap());
         assert!(state.store().is_ancestor(&proposal, &merged).unwrap());
-        let source_changes = &changes[..1];
         let FilePlan {
             files,
             conflicts,
             source_resolution,
-        } = plan_file_changes(
-            state.store_mut(),
-            source_changes,
-            &current_files,
-            Some("code"),
-        )
-        .unwrap();
+        } = plan_source_result(state.store_mut(), &base, &proposal, &current_files, "code")
+            .unwrap();
         assert!(conflicts.is_empty());
         let resolution = source_resolution.unwrap();
         assert!(matches!(resolution, SourceTreeResolution::Merged { .. }));
-        assert_eq!(
-            Oid::parse_line(&files[0].1.as_ref().unwrap().1, "source result").unwrap(),
-            *resolution.new_pointer().unwrap()
-        );
+        assert!(files.is_empty());
+        let output = resolution.new_pointer().unwrap();
+        assert!(state.store().is_ancestor(&current, output).unwrap());
+        assert!(state.store().is_ancestor(&proposal, output).unwrap());
         let FilePlan {
             files,
             source_resolution,
             ..
-        } = plan_file_changes(state.store_mut(), source_changes, &proposed, Some("code")).unwrap();
+        } = plan_source_result(state.store_mut(), &base, &proposal, &proposed, "code").unwrap();
         assert!(files.is_empty());
         assert!(matches!(
             source_resolution,
@@ -3452,15 +3477,23 @@ mod tests {
         let mut removed = TreeBuilder::from(Some(current_files.clone()));
         removed.put("code", Mode::Blob, b"replaced".to_vec());
         let removed = removed.build(state.store_mut()).unwrap();
-        assert!(
-            plan_file_changes(state.store_mut(), source_changes, &removed, Some("code")).is_err()
-        );
+        let removed =
+            plan_source_result(state.store_mut(), &base, &proposal, &removed, "code").unwrap();
+        assert_eq!(removed.conflicts, ["code"]);
+        assert!(matches!(
+            removed.source_resolution,
+            Some(SourceTreeResolution::Conflict { current: None, .. })
+        ));
+        let absent = TreeBuilder::from(None).build(state.store_mut()).unwrap();
+        let absent =
+            plan_source_result(state.store_mut(), &base, &proposal, &absent, "code").unwrap();
+        assert_eq!(absent.conflicts, ["code"]);
         let mut collision = TreeBuilder::from(Some(current_files));
         collision.put("memory", Mode::Blob, b"concurrent".to_vec());
         let collision = collision.build(state.store_mut()).unwrap();
         let FilePlan {
             files, conflicts, ..
-        } = plan_file_changes(state.store_mut(), &changes, &collision, None).unwrap();
+        } = plan_file_changes(state.store_mut(), &changes, &collision).unwrap();
         assert!(
             files.is_empty(),
             "a conflict must not apply half the shell result"

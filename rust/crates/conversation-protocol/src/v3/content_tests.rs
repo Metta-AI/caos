@@ -170,3 +170,62 @@ fn code_paths_are_content_and_renaming_preserves_code_history() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn tool_conflict_survives_a_removed_or_replaced_source() {
+    let mut store = MemoryStore::new();
+    let mut head = fixtures::golden(&mut store);
+    let mut record = loop {
+        let info = store.read_commit(&head).unwrap();
+        let (kind, events) = events::decode(&info.message).unwrap();
+        head = info.parents[0].clone();
+        if let Some(Event::Tool(record)) = events.into_iter().find(|event| {
+            kind == Kind::ToolComplete
+                && matches!(event, Event::Tool(record) if record.id == "bash-call")
+        }) {
+            break record;
+        }
+    };
+    let signature = client_signature("Test", "test@example.com", 1);
+    record.status = CallStatus::Conflict;
+    record.files.clear();
+    record.files_outcome = None;
+    record.source_tree_resolution = Some(SourceTreeResolution::Conflict {
+        current: None,
+        candidate: Oid::parse(&"b".repeat(40), "proposal").unwrap(),
+        merge: None,
+    });
+    for replacement in [None, Some((Mode::Blob, b"replaced".to_vec()))] {
+        let remove = Transition::FilesApply {
+            files: vec![("main".into(), replacement)],
+        };
+        let applied = apply(&mut store, Some(&head), &remove).unwrap();
+        let removed = mint(&mut store, &head, &applied, remove.kind(), &signature).unwrap();
+        let complete = Transition::ToolComplete {
+            record: record.clone(),
+            payloads: vec![(
+                "observation".into(),
+                b"Source removed; proposal retained".to_vec(),
+            )],
+            files: Vec::new(),
+        };
+        let applied = apply(&mut store, Some(&removed), &complete).unwrap();
+        let completed = mint(&mut store, &removed, &applied, complete.kind(), &signature).unwrap();
+        validate_spine(&store, &completed, &mut HashSet::new()).unwrap();
+        let view = Conversation::open(&store, &completed).unwrap();
+        assert_eq!(
+            view.tool(&record.request, record.round, &record.id)
+                .unwrap(),
+            Some(record.clone())
+        );
+        assert!(view.active_turn().unwrap().is_some());
+        assert_eq!(
+            view.snapshot().entry("main").unwrap(),
+            Conversation::open(&store, &removed)
+                .unwrap()
+                .snapshot()
+                .entry("main")
+                .unwrap()
+        );
+    }
+}

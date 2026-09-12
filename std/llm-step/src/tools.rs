@@ -483,7 +483,7 @@ pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, Stri
 pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
     caos(["get", result])?;
     let p = Path::new(result);
-    let (mut text, is_err) = if p.is_dir() {
+    let (text, is_err) = if p.is_dir() {
         let report = p.join("report");
         if report.exists() {
             caos(["get", path(&report)])?;
@@ -504,6 +504,10 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
         let bytes = fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?;
         (String::from_utf8_lossy(&bytes).into_owned(), false)
     };
+    Ok(text_result_block(id, text, is_err))
+}
+
+pub fn text_result_block(id: &str, mut text: String, is_err: bool) -> Value {
     if text.len() > MAX_READ_BYTES {
         // Keep the tail: reports and diagnostics put the summary last.
         let mut cut = text.len() - MAX_READ_BYTES;
@@ -512,7 +516,7 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
         }
         text = format!("[... truncated ...]\n{}", &text[cut..]);
     }
-    Ok(result_block(id, text.trim_end(), is_err))
+    result_block(id, text.trim_end(), is_err)
 }
 
 /// Validate a grep call before its sub-run launches: the pattern must compile
