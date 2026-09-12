@@ -880,7 +880,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 12] = [
+const COMMANDS: [Command; 13] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -964,6 +964,13 @@ const COMMANDS: [Command; 12] = [
         description: "select the model for future turns in this client",
         action: AppAction::Model,
         takes_argument: true,
+    },
+    Command {
+        name: "/archive",
+        usage: "/archive",
+        description: "archive the selected conversation",
+        action: AppAction::Archive,
+        takes_argument: false,
     },
 ];
 
@@ -2466,7 +2473,9 @@ impl App {
     fn run_local_command(&mut self, command: &Command, arguments: &str) {
         debug_assert!(!command.action.submits_message());
         match command.action {
-            AppAction::Help | AppAction::Commands => self.execute_action(command.action),
+            AppAction::Help | AppAction::Commands | AppAction::Archive => {
+                self.execute_action(command.action)
+            }
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
@@ -2498,7 +2507,6 @@ impl App {
             | AppAction::Activity
             | AppAction::Tools
             | AppAction::Reload
-            | AppAction::Archive
             | AppAction::SelectionLock => unreachable!("palette-only action has no slash command"),
         }
     }
@@ -3027,6 +3035,10 @@ impl App {
                     changed = true;
                 }
             } else if let Some(Ok(load)) = entry.load {
+                // A poll begun before a local archive must not reopen that row.
+                if entry.observed_head.is_some() || entry.observed_title.is_some() {
+                    continue;
+                }
                 let mut state = ConversationState::new(
                     entry.summary.id.clone(),
                     entry.summary.title,
@@ -3866,7 +3878,7 @@ impl App {
         } else {
             None
         };
-        if self.selected().current_hash().is_some() {
+        if !self.selected().virtual_conversation {
             let result = self.transport().and_then(|transport| {
                 archive_user_conversation(&transport, &self.user, &self.selected().id)
             });
@@ -4139,6 +4151,15 @@ mod tests {
 
     fn state(name: &str) -> ConversationState {
         ConversationState::new(
+            name.to_string(),
+            name.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        )
+    }
+
+    fn virtual_state(name: &str) -> ConversationState {
+        ConversationState::new_virtual(
             name.to_string(),
             name.to_string(),
             TurnOptions::default(),
@@ -5091,7 +5112,8 @@ mod tests {
                 "/publish-branch",
                 "/ref",
                 "/invite",
-                "/model"
+                "/model",
+                "/archive"
             ]
         );
 
@@ -7146,7 +7168,123 @@ mod tests {
         assert!(!rendered.contains("ready"));
     }
 
-    // Archiving has no key binding; it runs through the command palette.
+    #[test]
+    fn slash_archive_removes_selected_conversation_without_sending_a_message() {
+        let (mut app, _) = app_with(vec![virtual_state("talk-1"), virtual_state("talk-2")]);
+        app.selected_mut().composer.insert_str("/archive");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().id, "talk-2");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn slash_archive_rejects_arguments_and_preserves_busy_conversations() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2")]);
+        app.selected_mut().composer.insert_str("/archive extra");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().composer.text, "/archive extra");
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /archive")
+        );
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/archive");
+        app.selected_mut().running = true;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().id, "talk-1");
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("before archiving"));
+    }
+
+    #[test]
+    fn slash_archive_persists_before_the_first_prompt_and_ignores_stale_polls() {
+        let (repo, remote, _) = repo_with_default_branch("archive-before-prompt", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let options = TurnOptions {
+            username: Some("Alice".to_string()),
+            ..TurnOptions::default()
+        };
+        let id = "unprompted";
+        caos_cli::create_conversation(&transport, &options, id, "Imported project").unwrap();
+        publish_user_conversation(&transport, "Bob", id).unwrap();
+        let mut conversation = ConversationState::new(
+            id.to_string(),
+            "Imported project".to_string(),
+            options,
+            "ready".to_string(),
+        );
+        conversation.reload(&transport, "Alice").unwrap();
+        assert!(conversation.current_hash().is_none());
+        let head = conversation.remote_head.clone().unwrap();
+        let stale = RemotePollEntry {
+            summary: UserConversationSummary {
+                id: id.to_string(),
+                title: conversation.title.clone(),
+                head: head.clone(),
+                updated_unix: 1,
+                parent: None,
+            },
+            observed_head: conversation.remote_head.clone(),
+            observed_title: conversation.remote_title.clone(),
+            load: Some(Ok(Box::new(
+                conversation_load(&transport, id).unwrap().unwrap(),
+            ))),
+        };
+        let (mut app, _) = app_with(vec![conversation, state("other")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.remote_polling = true;
+        app.select(0);
+        assert!(app.selected().remote_head.is_none());
+        assert!(!app.selected().virtual_conversation);
+        app.selected_mut().composer.insert_str("/archive");
+        app.start_turn();
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().id, "other");
+        assert!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Archived).unwrap()
+                [0]
+            .id,
+            id
+        );
+        assert_eq!(
+            list_user_conversations(&transport, "Bob", UserConversationStatus::Active).unwrap()[0]
+                .id,
+            id
+        );
+        assert_eq!(
+            conversation_load(&transport, id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .head,
+            head
+        );
+        assert!(!app.apply_remote_poll(vec![stale]));
+        assert_eq!(app.conversations.len(), 1);
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    // Archiving is also available through the command palette.
     fn archive_via_palette(app: &mut App) {
         app.handle_key(KeyEvent::new(
             KeyCode::Char('P'),
@@ -7161,7 +7299,11 @@ mod tests {
 
     #[test]
     fn palette_archive_removes_virtual_conversations_and_replaces_the_last_one() {
-        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        let (mut app, _) = app_with(vec![
+            virtual_state("talk-1"),
+            virtual_state("talk-2"),
+            virtual_state("talk-3"),
+        ]);
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
         let (dir, remote, _tip) = repo_with_default_branch("palette-archive", "main");
