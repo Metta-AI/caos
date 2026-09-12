@@ -215,6 +215,8 @@ pub struct ConversationTurn {
 pub struct ConversationReplay {
     pub turns: Vec<ConversationTurn>,
     pub activity: Vec<TurnEvent>,
+    /// User messages sent to this conversation, excluding history inherited by a fork.
+    pub has_own_user_messages: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1279,10 +1281,13 @@ fn replay_from(
     conversation: &Conversation<'_>,
 ) -> Result<ConversationReplay, String> {
     let transcript = conversation.transcript(0, conversation.transcript_len()?)?;
+    let conversation_id = conversation.identity()?.id;
+    let mut has_own_user_messages = false;
     let mut turns = Vec::new();
     let mut request_order = Vec::new();
     let mut assistant_entries: HashMap<(Oid, u64), TranscriptEntry> = HashMap::new();
     for (_, _, entry) in transcript {
+        has_own_user_messages |= entry.role == Role::User && entry.conversation == conversation_id;
         if let (Some(request), Some(round)) = (&entry.request, entry.round) {
             if entry.role == Role::Assistant {
                 assistant_entries.insert((request.clone(), round), entry.clone());
@@ -1393,7 +1398,11 @@ fn replay_from(
             }
         }
     }
-    Ok(ConversationReplay { turns, activity })
+    Ok(ConversationReplay {
+        turns,
+        activity,
+        has_own_user_messages,
+    })
 }
 
 fn protocol_tool_result(

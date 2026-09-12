@@ -342,7 +342,13 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         ),
         Span::styled(
             format!("  {}", state.title),
-            Style::default().add_modifier(Modifier::BOLD),
+            if state.has_placeholder_title() {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
         ),
     ]);
     let mut metadata = Vec::new();
@@ -461,7 +467,16 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 Line::from(vec![
                     Span::raw(indent),
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::raw(title),
+                    Span::styled(
+                        title,
+                        if state.has_placeholder_title() {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw(format!("{indent}  ")),
