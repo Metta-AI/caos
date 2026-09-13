@@ -165,6 +165,10 @@ struct Areas {
     footer: Rect,
 }
 
+pub(super) fn composer_width(state: &ConversationState, area: Rect) -> u16 {
+    layout(state, false, area).composer.width.saturating_sub(2)
+}
+
 fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -1370,6 +1374,7 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Line::raw("  Ctrl+Shift+P    open the command palette"),
         Line::raw(format!("  {send_shortcut:<16}send the prompt")),
         Line::raw("  Enter/Ctrl+J    insert a newline"),
+        Line::raw("  Up/Down         move lines; recall sent prompts at the first/last line"),
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
@@ -1486,7 +1491,7 @@ fn render_composer(
     }
 }
 
-fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
+pub(super) fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let mut ranges = Vec::new();
     let mut logical_start = 0;
@@ -1522,7 +1527,7 @@ fn composer_visual_height(composer: &super::Composer, width: u16) -> usize {
     ranges.len().max(row + 1)
 }
 
-fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
+pub(super) fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
     let width = width.max(1);
     let ranges = composer_visual_ranges(&composer.text, width);
     let row = ranges

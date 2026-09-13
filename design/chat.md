@@ -120,6 +120,15 @@ Credentials, server configuration, caches, and checkout destinations stay on the
 client machine. The agent's host-side requests are communicated as concrete TUI
 commands for the user to run.
 
+## Reusing sent prompts
+
+Up and Down move within a multiline or wrapped prompt. At the first line, Up
+recalls your earlier messages in the selected conversation; at the last line,
+Down moves toward newer messages and restores your unfinished draft. Drafts
+retain their cursor and pasted content while browsing. History comes from the
+saved conversation, so it remains available after reopening the TUI. Messages
+from other participants, the agent, and CAOS are excluded.
+
 ## Importing code with `/import`
 
 The user enters this in the TUI:
