@@ -11,6 +11,14 @@
 # The second is what makes the whole arrangement repo-independent: the client
 # finds caos through a `caos` git remote, an arbitrary clone has none, and this
 # adds it from user-level configuration rather than from anything committed.
+#
+# ORDER IS THE WHOLE GAME HERE, because a session's first tool call races this
+# hook. The two things that call needs -- the `caos` remote and a live tunnel --
+# are quick, so they go FIRST; the two slow steps that need neither -- refreshing
+# the client binary and unshallowing the checkout -- go last, where they cannot
+# delay them. Put a slow step first (as earlier versions did, either way round)
+# and the model's opening `caos_status` reliably reported "no caos remote" or
+# "connection refused" for a remote/tunnel merely queued behind it.
 set -uo pipefail
 
 log() { printf 'caos: %s\n' "$*" >&2; }
@@ -34,6 +42,19 @@ else
     log "no setup stamp; this environment predates it"
 fi
 
+# Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
+# binds its local port before it has reached anything, and it accepts and then
+# silently drops connections when the far node is gone -- so a bound port reads
+# as "tunnel up" for a tunnel that carries nothing. A stale ticket presents
+# exactly that way, and the first caos job then hangs for minutes instead of
+# failing here. Any status code counts: a reply at all proves a live server.
+reachable() {
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+        "http://127.0.0.1:$1/info/refs?service=git-upload-pack" 2>/dev/null)"
+    [ -n "$code" ] && [ "$code" != 000 ]
+}
+
 # ---------------------------------------------------------------------------
 # The server URL and the repo -- computed FIRST, because the remote needs them
 # ---------------------------------------------------------------------------
@@ -41,7 +62,7 @@ fi
 # the listener's IROH_SECRET, so a ticket keeps working across restarts of the
 # listener even though the address embedded in it goes stale -- which is why one
 # ticket lives in the environment indefinitely. The remote points at the local
-# port the tunnel will bind; the tunnel itself comes up much later.
+# port the tunnel binds.
 if [ -n "${CAOS_IROH_TICKET:-}" ]; then
     : "${server:=http://127.0.0.1:$port}"
 fi
@@ -60,22 +81,17 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# The remote, FIRST -- ahead of the client refresh, the unshallow and the tunnel
+# The remote, FIRST
 # ---------------------------------------------------------------------------
 # The one thing a session's first tool call cannot survive is a missing `caos`
 # remote: the resolver and a first `caos_status` retry a dead PORT (the tunnel
-# still coming up) but CANNOT retry away a remote that is not there yet. And the
-# remote needs only a URL and a repo -- not the client refresh below, which
-# DOWNLOADS a fresh binary whenever the build moved (tens of seconds), nor the
-# unshallow, a whole-history fetch that runs for MINUTES on a big repo. Either of
-# those ahead of it delayed the remote past the model's opening `caos_status`,
-# which then reported "no `caos` git remote" for a remote merely queued behind
-# them (seen twice against coworld-ctf). So it goes first, added within a second
-# of the hook starting.
+# still coming up) but CANNOT retry away a remote that is not there yet. And it
+# needs only a URL and a repo -- neither the tunnel below, the client refresh nor
+# the unshallow -- so it is added within a second of the hook starting.
 #
 # An existing remote is left alone: a checkout that already names a caos server
-# has been set up deliberately, and repointing it from the environment would
-# silently move someone's work to a different stack.
+# has been set up deliberately, and repointing it would silently move someone's
+# work to a different stack.
 if [ -n "$server" ] && [ "$have_repo" = 1 ]; then
     if current="$(git remote get-url caos 2>/dev/null)"; then
         if [ "$current" != "$server" ]; then
@@ -91,66 +107,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# The client, refreshed -- AFTER the remote (see above)
+# The tunnel, SECOND -- before the two slow steps, because the remote points at
+# its port and every server round trip needs it live
 # ---------------------------------------------------------------------------
-# The setup script installed one, into a filesystem that is then FROZEN. A push
-# does not reach an existing environment, so a client left where the setup put
-# it is as old as the environment is, no matter how many sessions start.
-#
-# Re-running the installer costs one `git ls-remote` when nothing moved, because
-# it stops as soon as it finds the build already installed; when the build DID
-# move it downloads the new binary, which is the slow case the remote-add above
-# is deliberately not stuck behind. Not fatal on failure: a working client that
-# is out of date beats no session at all.
-if [ -n "$base" ]; then
-    if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
-        log "could not refresh the client; carrying on with the installed one"
-    fi
-    # AND THE CONFIGURATION, because it pins the commit the client was built
-    # from. A refreshed client left with the old configuration would drive a
-    # step from a different tree than itself, which is the one pairing that
-    # cannot be allowed to go quiet. Writes nothing when nothing moved.
-    if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
-        log "could not refresh the session configuration; carrying on"
-    fi
-fi
-
-# Liveness is an HTTP ROUND TRIP, never a TCP connect. `dumbpipe connect-tcp`
-# binds its local port before it has reached anything, and it accepts and then
-# silently drops connections when the far node is gone -- so a bound port reads
-# as "tunnel up" for a tunnel that carries nothing. A stale ticket presents
-# exactly that way, and the first caos job then hangs for minutes instead of
-# failing here. Any status code counts: a reply at all proves a live server.
-reachable() {
-    local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-        "http://127.0.0.1:$1/info/refs?service=git-upload-pack" 2>/dev/null)"
-    [ -n "$code" ] && [ "$code" != 000 ]
-}
-
-# UNSHALLOW THE CHECKOUT. caos pushes the WORKSPACE COMMIT to the server -- the
-# resolver does it for a repo that defines `caos-tools/`, and every prompt does
-# it as the conversation's base -- and that push packs the commit's whole
-# reachable graph, HISTORY included. claude.ai/code clones shallow, so the
-# history is not here, and the push dies "invalid commit object <HEAD>" against
-# a server that does not already hold the repo. (caos' own sessions work only
-# because that server was seeded with caos' history, making the push a thin
-# delta; an arbitrary repo gets no such head start.) So fetch the rest ONCE,
-# before the resolver or the first prompt tries to push. It runs AFTER the remote
-# above precisely because it is slow: the remote must not wait on it. Non-fatal
-# and quiet: a complete checkout, or a fetch that cannot reach the origin, just
-# carries on -- a big repo pays a one-time full-history fetch here rather than
-# failing later.
-if [ "$have_repo" = 1 ] \
-    && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
-    log "unshallowing the checkout so caos can push its history"
-    git fetch --unshallow --quiet 2>/dev/null \
-        || log "could not unshallow; a repo the server has not seen may fail to resolve"
-fi
-
-# ---------------------------------------------------------------------------
-# The tunnel, brought up last -- the remote already points at its port
-# ---------------------------------------------------------------------------
+# It does NOT depend on the client refresh (dumbpipe is installed at env setup)
+# nor on the unshallow (which fetches from origin, not through here), and both of
+# those run for tens of seconds to minutes -- so the tunnel comes up first, or a
+# first tool call reaches the remote and gets "connection refused" on a port
+# nothing is bound to yet.
 if [ -n "${CAOS_IROH_TICKET:-}" ]; then
     # A live tunnel first: a resumed session may already have one, and then it
     # does not matter whether dumbpipe is anywhere.
@@ -178,6 +142,54 @@ if [ -n "${CAOS_IROH_TICKET:-}" ]; then
             log "tunnel did not reach a caos server; see /tmp/caos-tunnel.log"
         fi
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# The client, refreshed -- AFTER the remote and tunnel (slow: may download)
+# ---------------------------------------------------------------------------
+# The setup script installed one, into a filesystem that is then FROZEN. A push
+# does not reach an existing environment, so a client left where the setup put
+# it is as old as the environment is, no matter how many sessions start.
+#
+# Re-running the installer costs one `git ls-remote` when nothing moved, because
+# it stops as soon as it finds the build already installed; when the build DID
+# move it downloads the new binary, which is why it runs here and not ahead of
+# the remote and tunnel. Not fatal on failure: a working client that is out of
+# date beats no session at all.
+if [ -n "$base" ]; then
+    if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
+        log "could not refresh the client; carrying on with the installed one"
+    fi
+    # AND THE CONFIGURATION, because it pins the commit the client was built
+    # from. A refreshed client left with the old configuration would drive a
+    # step from a different tree than itself, which is the one pairing that
+    # cannot be allowed to go quiet. Writes nothing when nothing moved.
+    if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
+        log "could not refresh the session configuration; carrying on"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Unshallow the checkout -- LAST, because it is the slowest and gates only the
+# first PUSH, which happens later than the first tool call
+# ---------------------------------------------------------------------------
+# caos pushes the WORKSPACE COMMIT to the server -- the resolver does it for a
+# repo that defines `caos-tools/`, and every prompt does it as the conversation's
+# base -- and that push packs the commit's whole reachable graph, HISTORY
+# included. claude.ai/code clones shallow, so the history is not here, and the
+# push dies "invalid commit object <HEAD>" against a server that does not already
+# hold the repo. (caos' own sessions work only because that server was seeded
+# with caos' history, making the push a thin delta; an arbitrary repo gets no
+# such head start.) So fetch the rest ONCE, before the resolver or the first
+# prompt tries to push -- but AFTER the remote and tunnel, which the first tool
+# call needs sooner and this must not delay. Non-fatal and quiet: a complete
+# checkout, or a fetch that cannot reach the origin, just carries on -- a big
+# repo pays a one-time full-history fetch here rather than failing later.
+if [ "$have_repo" = 1 ] \
+    && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    log "unshallowing the checkout so caos can push its history"
+    git fetch --unshallow --quiet 2>/dev/null \
+        || log "could not unshallow; a repo the server has not seen may fail to resolve"
 fi
 
 exit 0
