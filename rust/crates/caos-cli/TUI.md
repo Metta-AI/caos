@@ -166,8 +166,8 @@ updates remain in the transcript as CAOS messages.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
-TUI. Enter `/title <new title>` to change the shared title without changing the
-conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
+TUI. Enter `/title <new title>` to change the
+shared title without changing the conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
 client default. Enter `/update-tree <gitlink> <message>` to send an ordinary
 user turn whose commit also folds in edits in that gitlink's remembered checkout — the
@@ -223,12 +223,12 @@ creation or updates appear as persistent CAOS messages, including the PR URL.
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
-A fresh conversation starts with a temporary `talk-N` title. Its first prompt
+A fresh conversation starts with a dimmed `New conversation` placeholder.
+Reopening it before sending a prompt preserves automatic naming. Its first prompt
 provides an immediate fallback title and starts a stateless `llm-call` job using
 that message alone. Title generation runs concurrently with the agent turn, so
 it does not depend on the turn succeeding. Failure leaves the fallback in
-place, and later messages make no title calls. Using `/title` before the first
-prompt keeps that explicit title instead.
+place, and later messages make no title calls. Using `/title` before the first prompt keeps that explicit title instead.
 
 The launcher starts without code. `--import imports/caos/base` snapshots the
 checkout's current disk contents as a gitlink at that path. Add `--base HEAD`

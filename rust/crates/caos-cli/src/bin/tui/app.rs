@@ -9,13 +9,13 @@ use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
-    describe_tool_set, first_available_conversation_name, fork_conversation,
-    generate_conversation_title, interrupt_request, invite_user_to_conversation,
-    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
-    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
-    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
-    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
-    UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
+    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_request,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
+    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
+    TurnOutcome, TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary,
+    DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -34,6 +34,8 @@ use filesystem::Browser;
 #[path = "publication.rs"]
 mod publication;
 use publication::PublishPrompt;
+
+const NEW_CONVERSATION_TITLE: &str = "New conversation";
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
@@ -1028,13 +1030,14 @@ struct ConversationState {
 impl ConversationState {
     fn new(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let remote_title = Some(title.clone());
+        let automatic_title = title == NEW_CONVERSATION_TITLE;
         Self {
             id,
             title,
             parent: None,
             remote_title,
             sidebar_attention: None,
-            automatic_title: false,
+            automatic_title,
             automatic_title_fallback_applied: false,
             automatic_title_fallback: None,
             generating_title: false,
@@ -1082,6 +1085,17 @@ impl ConversationState {
     }
 
     fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
+        // Only prompts sent to this conversation end its placeholder state:
+        // a fork can inherit messages before receiving its own first prompt.
+        if !self.automatic_title_fallback_applied && load.replay.has_own_user_messages {
+            self.automatic_title = false;
+        }
+        if self.remote_title.is_none()
+            && self.has_placeholder_title()
+            && load.snapshot.title == self.title
+        {
+            self.remote_title = Some(load.snapshot.title.clone());
+        }
         self.publications = load.publications.clone();
         let previous_source_trees = std::mem::take(&mut self.source_trees);
         let previous_selection = self.selected_source_tree.clone();
@@ -1458,6 +1472,12 @@ impl ConversationState {
             self.automatic_title_fallback = Some(fallback);
             self.automatic_title_fallback_applied = true;
         }
+    }
+
+    fn has_placeholder_title(&self) -> bool {
+        self.automatic_title
+            && !self.automatic_title_fallback_applied
+            && self.title == NEW_CONVERSATION_TITLE
     }
 
     fn sidebar_text(&self, max_cells: u16) -> (String, String) {
@@ -2984,11 +3004,11 @@ impl App {
                     continue;
                 }
                 if state.remote_title.as_deref() != Some(entry.summary.title.as_str()) {
-                    let first_automatic_publication = state.generating_title
-                        && state.automatic_title
+                    let first_automatic_publication = state.automatic_title
                         && entry.observed_title.is_none()
-                        && state.automatic_title_fallback.as_deref()
-                            == Some(entry.summary.title.as_str());
+                        && (state.title == entry.summary.title
+                            || state.automatic_title_fallback.as_deref()
+                                == Some(entry.summary.title.as_str()));
                     state.remote_title = Some(entry.summary.title.clone());
                     if !first_automatic_publication {
                         state.title = entry.summary.title.clone();
@@ -3226,12 +3246,13 @@ impl App {
         if !state.automatic_title {
             return;
         }
+        // The first message gets one title request, including when that request fails.
+        state.automatic_title = false;
         let title = match result {
             Ok(title) => title,
             Err(_) => return,
         };
-        state.automatic_title = false;
-        if state.current_hash().is_some() {
+        if !state.virtual_conversation {
             let Some(expected) = state
                 .remote_title
                 .clone()
@@ -3708,16 +3729,8 @@ impl App {
                 return;
             }
         };
-        // Name the conversation from the ones already loaded in memory rather
-        // than re-listing the user's whole active+archived set from the server.
-        // `list_user_conversations` fetches every conversation's head object and
-        // title blob over the network, so doing it on each Ctrl+N made starting
-        // a conversation slower the more conversations you had accumulated. The
-        // default title only has to be unique among the conversations you can
-        // see, and the minted id is content-unique regardless of the title.
-        let title = first_available_conversation_name(
-            self.conversations.iter().map(|item| item.title.as_str()),
-        );
+        // Display titles can repeat; the minted ID supplies conversation identity.
+        let title = NEW_CONVERSATION_TITLE.to_string();
         let id = match fresh_conversation_id(&transport, &self.user) {
             Ok(id) => id,
             Err(error) => {
@@ -3818,11 +3831,7 @@ impl App {
             return;
         }
         let replacement = if self.conversations.len() == 1 {
-            let title = first_available_conversation_name(
-                self.conversations
-                    .iter()
-                    .map(|conversation| conversation.title.as_str()),
-            );
+            let title = NEW_CONVERSATION_TITLE.to_string();
             let id = match self
                 .transport()
                 .and_then(|transport| fresh_conversation_id(&transport, &self.user))
@@ -3892,7 +3901,7 @@ impl App {
                 .show_command_error("conversation title must be one line");
             return;
         }
-        let published = self.selected().current_hash().is_some();
+        let published = !self.selected().virtual_conversation;
         if published {
             let id = self.selected().id.clone();
             if let Err(error) = self
@@ -3907,11 +3916,9 @@ impl App {
         state.title = title.to_string();
         if published {
             state.remote_title = Some(title.to_string());
-        }
-        state.automatic_title = false;
-        if published {
             state.automatic_title_fallback = None;
         }
+        state.automatic_title = false;
         state.status = format!("renamed conversation to {title:?}");
     }
 
@@ -4091,11 +4098,7 @@ fn choose_conversation(
     }
     Ok(ConversationChoice::New {
         id: None,
-        title: first_available_conversation_name(
-            conversations
-                .iter()
-                .map(|conversation| conversation.title.as_str()),
-        ),
+        title: NEW_CONVERSATION_TITLE.to_string(),
     })
 }
 
@@ -4103,7 +4106,9 @@ fn choose_conversation(
 mod tests {
 
     use super::*;
-    use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
+    use caos_cli::{
+        conversation_head, conversation_ref, first_available_conversation_name, ConversationReplay,
+    };
     use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
@@ -4401,6 +4406,7 @@ mod tests {
                 error: None,
             },
             replay: ConversationReplay {
+                has_own_user_messages: false,
                 turns: Vec::new(),
                 activity: Vec::new(),
             },
@@ -4743,6 +4749,130 @@ mod tests {
     }
 
     #[test]
+    fn unprompted_conversations_keep_auto_naming_after_reload_and_poll() {
+        let mut load = load_with_source_trees(Vec::new());
+        load.snapshot.id = "stable-id".to_string();
+        load.snapshot.title = NEW_CONVERSATION_TITLE.to_string();
+        let mut conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_load(load.clone(), "tester");
+        assert_eq!(
+            conversation.remote_title.as_deref(),
+            Some(NEW_CONVERSATION_TITLE)
+        );
+        assert!(conversation.automatic_title);
+
+        let (mut app, _) = app_with(vec![ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        )]);
+        app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "stable-id".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
+                head: load.snapshot.head.clone(),
+                updated_unix: 1,
+                parent: None,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: Some(Ok(Box::new(load.clone()))),
+        }]);
+        assert!(app.selected().automatic_title);
+        app.selected_mut()
+            .apply_automatic_title("Name the first prompt");
+        assert_eq!(app.selected().title, "Name the first prompt");
+
+        let mut reopened = ConversationState::new(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        reopened.apply_load(load.clone(), "tester");
+        assert!(reopened.has_placeholder_title());
+        reopened.apply_automatic_title("Name after reopening");
+        assert_eq!(reopened.title, "Name after reopening");
+
+        // A saved conversation can have this literal title without being a placeholder.
+        load.replay.has_own_user_messages = true;
+        load.replay.turns.push(caos_cli::ConversationTurn {
+            commit: "a".repeat(40),
+            author: "tester".to_string(),
+            role: ConversationRole::Human,
+            model: None,
+            message: "Earlier prompt".to_string(),
+        });
+        let mut named = ConversationState::new(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        named.apply_load(load, "tester");
+        assert!(!named.has_placeholder_title());
+        named.apply_automatic_title("A later prompt");
+        assert_eq!(named.title, NEW_CONVERSATION_TITLE);
+    }
+
+    #[test]
+    fn title_generation_failure_keeps_fallback_without_retrying_later_messages() {
+        let mut conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("First message fallback");
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.finish_title_generation(0, Err("title worker unavailable".to_string()));
+        assert_eq!(app.selected().title, "First message fallback");
+        assert!(!app.selected().generating_title);
+        assert!(!app.selected().automatic_title);
+        app.selected_mut().apply_automatic_title("Later message");
+        assert_eq!(app.selected().title, "First message fallback");
+    }
+
+    #[test]
+    fn fresh_conversation_placeholders_are_dimmed_in_header_and_sidebar() {
+        let conversation = ConversationState::new_virtual(
+            "internal-identity".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let (app, _) = app_with(vec![conversation]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut occurrences = 0;
+        for row in 0..buffer.area.height {
+            let text = (0..buffer.area.width)
+                .map(|column| buffer[(column, row)].symbol())
+                .collect::<String>();
+            assert!(!text.contains("internal-identity"));
+            if let Some(column) = text.find(NEW_CONVERSATION_TITLE) {
+                assert!(
+                    buffer[(text[..column].cell_width(), row)]
+                        .modifier
+                        .contains(Modifier::DIM),
+                    "placeholder is not dimmed in row {row}"
+                );
+                occurrences += 1;
+            }
+        }
+        assert_eq!(occurrences, 2);
+    }
+
+    #[test]
     fn first_message_title_result_replaces_the_fallback_only_once() {
         let mut conversation = ConversationState::new_virtual(
             "internal-id".to_string(),
@@ -5051,6 +5181,7 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+        assert!(parse_command("/rename A title").is_none());
     }
 
     #[test]
@@ -5473,7 +5604,7 @@ mod tests {
             choose_conversation(None, true, &conversations).unwrap(),
             ConversationChoice::New {
                 id: None,
-                title: "talk-2".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
             }
         );
         assert!(choose_conversation(Some("recent"), true, &conversations).is_err());
@@ -5508,7 +5639,7 @@ mod tests {
             choose_conversation(None, true, &conversations).unwrap(),
             ConversationChoice::New {
                 id: None,
-                title: "talk-1".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
             }
         );
     }
@@ -6625,6 +6756,7 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
+                    has_own_user_messages: false,
                     turns: vec![
                         caos_cli::ConversationTurn {
                             commit: "e".repeat(40),
@@ -6770,6 +6902,7 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
+                    has_own_user_messages: false,
                     turns: Vec::new(),
                     activity: Vec::new(),
                 },
@@ -7050,7 +7183,7 @@ mod tests {
 
         archive_via_palette(&mut app);
         assert_eq!(app.conversations.len(), 1);
-        assert_eq!(app.selected().title, "talk-2");
+        assert_eq!(app.selected().title, NEW_CONVERSATION_TITLE);
         assert_ne!(app.selected().id, app.selected().title);
         assert_eq!(app.selected().turn_options.base.as_deref(), None);
         assert!(app.selected().remote_head.is_none());
@@ -7207,10 +7340,10 @@ mod tests {
     }
 
     #[test]
-    fn title_command_does_not_change_conversation_identity() {
+    fn title_command_preserves_identity_and_overrides_automatic_titles() {
         let conversation = ConversationState::new_virtual(
             "stable-id".to_string(),
-            "talk-1".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
             TurnOptions::default(),
             "ready".to_string(),
         );
@@ -7225,7 +7358,52 @@ mod tests {
         assert_eq!(app.selected().title, "Mutable title");
         app.selected_mut()
             .apply_automatic_title("This prompt must not replace it");
+        app.finish_title_generation(0, Ok("Late automatic title".to_string()));
         assert_eq!(app.selected().title, "Mutable title");
+        assert!(!app.selected().has_placeholder_title());
+    }
+
+    #[test]
+    fn title_saves_an_unprompted_durable_conversation() {
+        let (repo, remote, _) = repo_with_default_branch("rename-before-prompt", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let options = TurnOptions {
+            username: Some("Alice".to_string()),
+            ..TurnOptions::default()
+        };
+        let id = "unprompted";
+        caos_cli::create_conversation(&transport, &options, id, NEW_CONVERSATION_TITLE).unwrap();
+        let mut conversation = ConversationState::new(
+            id.to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            options,
+            "ready".to_string(),
+        );
+        conversation.reload(&transport, "Alice").unwrap();
+        assert!(conversation.current_hash().is_none());
+        assert!(conversation.remote_head.is_some());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+        app.remote_polling = true;
+        app.select(0);
+        assert!(app.selected().remote_head.is_none());
+        assert!(!app.selected().virtual_conversation);
+        app.selected_mut().composer.insert_str("/title My project");
+        app.start_turn();
+
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(app.selected().title, "My project");
+        assert_eq!(
+            conversation_snapshot(&transport, id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "My project"
+        );
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -7565,6 +7743,30 @@ mod tests {
         app.start_new_conversation(Some(source));
         let fork_id = app.selected().id.clone();
         assert!(wait_for_fork(&mut app, &fork_id));
+        for _ in 0..2 {
+            app.selected_mut().reload(&transport, "Alice").unwrap();
+            assert!(app.selected().automatic_title);
+        }
+        let load = conversation_load(&transport, &fork_id).unwrap().unwrap();
+        assert!(!load.replay.has_own_user_messages);
+        assert!(
+            conversation_load(&transport, "original")
+                .unwrap()
+                .unwrap()
+                .replay
+                .has_own_user_messages
+        );
+        let mut reopened = ConversationState::new(
+            fork_id.clone(),
+            load.snapshot.title.clone(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        reopened.apply_load(load, "Alice");
+        assert!(reopened.has_placeholder_title());
+        reopened.apply_automatic_title("Prompt after reopening a fork");
+        assert_eq!(reopened.title, "Prompt after reopening a fork");
+
         let placeholder = app.selected().title.clone();
         app.selected_mut()
             .apply_automatic_title("fallback from the first prompt");
