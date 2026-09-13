@@ -32,12 +32,32 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-/// How long the tool resolution keeps trying: 20 attempts, 15 seconds apart,
-/// so five minutes of a session's setup being slow or out of order costs
-/// nothing. A cold BUILD is not what this waits out -- that happens inside one
-/// attempt -- it is a `caos` remote or a tunnel that does not exist yet.
-const RESOLVE_ATTEMPTS: u32 = 20;
+/// How long the tool resolution keeps trying, and how OFTEN. What it waits out
+/// is a `caos` remote or a tunnel that does not exist yet -- the SessionStart
+/// hook establishes both, and it races this server's spawn -- and that race is
+/// decided in SECONDS, not minutes. But the thing that lands the tools is the
+/// resolver's NEXT attempt after the remote appears, so a long fixed interval
+/// is dead time stapled to the front of every cloud session: with a flat 15s,
+/// the model's opening `caos_status` reliably caught "attempt 1 failed" while
+/// the remote landed moments later, and the tools did not appear until 15s on.
+/// So poll FAST at first -- every second for the first ~20 attempts, covering
+/// the whole setup race -- then back off to 15s for the long tail (a genuinely
+/// absent remote or a dead tunnel, where retrying often buys nothing). A cold
+/// BUILD is not what any of this waits out; that happens INSIDE one attempt.
+const RESOLVE_ATTEMPTS: u32 = 40;
+const RESOLVE_FAST_ATTEMPTS: u32 = 20;
+const RESOLVE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const RESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The wait BEFORE attempt `n` (n is 0-based; attempt 0 waits nothing). Fast
+/// while the setup race is live, slow for the tail -- see [`RESOLVE_ATTEMPTS`].
+fn resolve_wait(attempt: u32) -> std::time::Duration {
+    if attempt <= RESOLVE_FAST_ATTEMPTS {
+        RESOLVE_FAST_INTERVAL
+    } else {
+        RESOLVE_INTERVAL
+    }
+}
 
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
 /// stop the server.
@@ -181,7 +201,7 @@ fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
         let mut last = "the caos tools have not resolved yet".to_string();
         for attempt in 0..RESOLVE_ATTEMPTS {
             if attempt > 0 {
-                std::thread::sleep(RESOLVE_INTERVAL);
+                std::thread::sleep(resolve_wait(attempt));
             }
             // Its OWN transport, opened per attempt: the one in `serve` belongs
             // to the main thread, and a transport opened before the remote
