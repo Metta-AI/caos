@@ -113,6 +113,26 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
     exit 0
 fi
 
+# THE REMOTE FIRST, BEFORE the unshallow below. Adding the remote is instant and
+# it is what every reachability check and `caos_status` needs; the unshallow is a
+# whole-history fetch that on a big repo (coworld-ctf) takes MINUTES. With the
+# unshallow first, the model's opening `caos_status` beat the remote into
+# existence and reported "no `caos` git remote" -- a spurious first-turn failure
+# for a remote that was merely still queued behind the fetch. The unshallow gates
+# only the first PUSH (the resolver's, a prompt's), which happens later; the
+# remote gates the very first probe, so it goes first.
+#
+# An existing remote is left alone: a checkout that already names a caos server
+# has been set up deliberately, and repointing it from the environment would
+# silently move someone's work to a different stack.
+if current="$(git remote get-url caos 2>/dev/null)"; then
+    if [ "$current" != "$server" ]; then
+        log "caos remote already set to $current; leaving it (wanted $server)"
+    fi
+else
+    git remote add caos "$server" && log "caos remote -> $server"
+fi
+
 # UNSHALLOW THE CHECKOUT. caos pushes the WORKSPACE COMMIT to the server -- the
 # resolver does it for a repo that defines `caos-tools/`, and every prompt does
 # it as the conversation's base -- and that push packs the commit's whole
@@ -128,17 +148,6 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     log "unshallowing the checkout so caos can push its history"
     git fetch --unshallow --quiet 2>/dev/null \
         || log "could not unshallow; a repo the server has not seen may fail to resolve"
-fi
-
-# An existing remote is left alone: a checkout that already names a caos server
-# has been set up deliberately, and repointing it from the environment would
-# silently move someone's work to a different stack.
-if current="$(git remote get-url caos 2>/dev/null)"; then
-    if [ "$current" != "$server" ]; then
-        log "caos remote already set to $current; leaving it (wanted $server)"
-    fi
-else
-    git remote add caos "$server" && log "caos remote -> $server"
 fi
 
 # ---------------------------------------------------------------------------

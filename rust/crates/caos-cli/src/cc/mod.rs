@@ -212,7 +212,7 @@ fn run_tool(
     let (request, request_head, round) =
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    dispatch_call(t, options, &id, &request, &request_head, &call)?;
+    dispatch_call(t, options, &id, name, &request, &request_head, &call)?;
     read_outcome(t, &id, &request, round, &call)
 }
 
@@ -222,26 +222,44 @@ fn run_tool(
 /// implied: this ArgTree is not that one, and must not be, or a second call
 /// would be answered from the first's memo. `--tools-only` carries the call id
 /// for exactly that reason, and the step checks it ran before returning.
+///
+/// A PROJECT TOOL (`caos-tools/<name>`) is resolved HERE, on the client, and its
+/// tree handed to the step -- see [`caos::eval_tree_tool`] for why: the step's
+/// own `eval-path-then` runs SERVER-SIDE and refuses a `:@@=` locator, so a tool
+/// that reaches one (coworld-ctf's do, through its root `.caos-expr`) can only be
+/// evaluated where the fetch lives. `--client-tool-tree` carries the resolved
+/// oid and `--client-tool-name` the tool it belongs to, so the step uses it only
+/// for the matching tool and evaluates everything else exactly as before. A
+/// resolution that fails is left to the step: it evaluates server-side and
+/// surfaces the same error the run would, so nothing is hidden.
 fn dispatch_call(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
+    name: &str,
     request: &Oid,
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
     let store = caos::build_secret_store(t)?;
     let configuration = tools_configuration(t, options, id, &store)?;
-    let dispatch = caos::prepare_client_request_with_store(
-        t,
-        &configuration,
-        &[
-            format!("--head:commit={request_head}"),
-            format!("--run={request}"),
-            format!("--tools-only={call}"),
-        ],
-        &store,
-    )?;
+    let mut kvs = vec![
+        format!("--head:commit={request_head}"),
+        format!("--run={request}"),
+        format!("--tools-only={call}"),
+    ];
+    match caos::eval_tree_tool(t, name, &store) {
+        Ok(Some(tree)) => {
+            kvs.push(format!("--client-tool-name={name}"));
+            kvs.push(format!("--client-tool-tree:hash={tree}"));
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "caos cc serve: could not resolve {name:?} on the client ({error}); \
+             letting the step evaluate it"
+        ),
+    }
+    let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
     let server = t.server_url()?;
     caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
 }

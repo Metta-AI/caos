@@ -121,6 +121,51 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
+/// Resolve a project tool `caos-tools/<name>` to its ArgTree oid, CLIENT-SIDE --
+/// the same `eval_path` walk [`cli_run_tool`] does, and the reason it exists as
+/// its own entry point.
+///
+/// The agent harness runs a tool by asking the SERVER to `eval-path-then`
+/// `caos-tools/<name>` (a worker cannot evaluate). That server walk refuses a
+/// `:@@=` locator (`EvalHost::resolve_remote` is client-only), so a repository
+/// whose tool reaches one through its root `.caos-expr` -- coworld-ctf mounts
+/// caos' std that way -- cannot have its tools run by an agent at all. Resolving
+/// here, on the client, does the `:@@=` fetch and hands the harness the finished
+/// tree; the walk is byte-identical to the one the server would do for a
+/// `:@=`-only tool, and the curry is marked with this caller's secret store, so
+/// a secret-needing resolution works exactly where the secret model lives.
+///
+/// `Ok(None)` when `caos-tools/<name>` is not a tool in the tracked worktree --
+/// a built-in (`bash`, `read`, …) or an unknown name -- so a caller can pass the
+/// result straight through and let the harness handle those as it always has.
+/// Evaluated against the dirty worktree (`ingest_path(".")`), like `run-tool`
+/// and `eval-path`, so an edited tool resolves edited.
+pub fn eval_tree_tool(
+    t: &dyn Transport,
+    name: &str,
+    store: &[ClientSecret],
+) -> Result<Option<String>, String> {
+    let dir = format!("caos-tools/{name}");
+    if !Path::new(&format!("{dir}/.caos-expr")).is_file() {
+        return Ok(None);
+    }
+    let (_, ws) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    let (kind, oid) = eval::eval_path(t, &ws.to_string(), &dir, store)?;
+    if kind != "tree" {
+        return Err(format!(
+            "{dir}/.caos-expr evaluates to a {kind}, not an ArgTree"
+        ));
+    }
+    // The walk builds the ArgTree in the LOCAL store; the server has only what a
+    // `run` it dispatched left there. A caller passes this oid as a `:hash=`
+    // arg, which the server must hold, so push its closure now -- sound for a
+    // tree (`ensure_pushed`), and a no-op when a prior resolution already sent it.
+    t.ensure_pushed(&oid)?;
+    Ok(Some(oid))
+}
+
 /// Print a tool result's report conventions, reading ONLY the objects they
 /// name: the top tree and a `report` blob, or the result itself when it is one.
 /// A tool with no `report` (`build` returns an image) costs exactly one object.

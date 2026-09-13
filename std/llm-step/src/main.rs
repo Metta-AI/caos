@@ -29,8 +29,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then_catching, run_worker, scratch,
-    secret, Arg,
+    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
+    run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -1404,9 +1404,46 @@ fn launch_tree_evaluation(
             ("tool-git", Arg::Lit(if git { "1" } else { "" })),
         ],
     )?;
-    let dispatched = eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me));
+    // The tool's ArgTree. Normally the SERVER evaluates `caos-tools/<name>` for
+    // us (a worker cannot), then runs `me` with the result bound as `--result`.
+    // But that server-side walk refuses a `:@@=` locator, so when the CLIENT
+    // resolved this tool for us (`caos cc serve`'s dispatch_call, for a tool that
+    // reaches such a locator) we skip the walk and run `me` with the tree it
+    // handed us bound as `--result` -- byte-identical to what the eval would have
+    // bound, so `launch_evaluated_tool` cannot tell the difference.
+    let dispatched = match client_tool_tree(name)? {
+        Some(tree) => {
+            let task = prepare_request(
+                Arg::Hash(&me),
+                &[("in", Arg::Path(ws)), ("result", Arg::Hash(&tree))],
+            )?;
+            run_request_then(&task, None)
+        }
+        None => eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me)),
+    };
     timing::phase(&format!("tool dispatch {name}"));
     dispatched
+}
+
+/// The client-resolved ArgTree for tool `name`, if `caos cc serve` handed one in
+/// for THIS tool (`--client-tool-name` / `--client-tool-tree`). The name guards
+/// it: a tools-only run drives one call, but a bare tree with no owner would be
+/// used for whatever tool happened to evaluate, so the two args travel together
+/// and only the matching tool consumes them. `None` (evaluate server-side) for
+/// every tool the client did not resolve -- the built-ins and any `:@=`-only
+/// project tool, which the server walk handles unchanged.
+fn client_tool_tree(name: &str) -> Result<Option<String>, String> {
+    match read_arg_opt("client-tool-name")? {
+        Some(owner) if owner == name => {
+            let tree = arg("client-tool-tree");
+            if Path::new(&tree).exists() {
+                Ok(Some(cas_hash(&tree)?))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn launch_evaluated_tool(
