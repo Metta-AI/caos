@@ -35,15 +35,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# The client, refreshed
+# The server URL and the repo -- computed FIRST, because the remote needs them
+# ---------------------------------------------------------------------------
+# A ticket names an iroh NODE, and the node id is the identity: it comes from
+# the listener's IROH_SECRET, so a ticket keeps working across restarts of the
+# listener even though the address embedded in it goes stale -- which is why one
+# ticket lives in the environment indefinitely. The remote points at the local
+# port the tunnel will bind; the tunnel itself comes up much later.
+if [ -n "${CAOS_IROH_TICKET:-}" ]; then
+    : "${server:=http://127.0.0.1:$port}"
+fi
+
+# The repo is named, not assumed from cwd. A hook's working directory is not
+# contractually the project -- in a cloud session the checkout is at
+# /home/user/repo while $HOME resolves to /root -- and a wrong cwd here does not
+# error, it silently adds the remote to some other repository or to none, and
+# the failure only shows up much later as a client that cannot find a server.
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_PROJECT_DIR" ]; then
+    cd "$CLAUDE_PROJECT_DIR" || true
+fi
+have_repo=0
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    have_repo=1
+fi
+
+# ---------------------------------------------------------------------------
+# The remote, FIRST -- ahead of the client refresh, the unshallow and the tunnel
+# ---------------------------------------------------------------------------
+# The one thing a session's first tool call cannot survive is a missing `caos`
+# remote: the resolver and a first `caos_status` retry a dead PORT (the tunnel
+# still coming up) but CANNOT retry away a remote that is not there yet. And the
+# remote needs only a URL and a repo -- not the client refresh below, which
+# DOWNLOADS a fresh binary whenever the build moved (tens of seconds), nor the
+# unshallow, a whole-history fetch that runs for MINUTES on a big repo. Either of
+# those ahead of it delayed the remote past the model's opening `caos_status`,
+# which then reported "no `caos` git remote" for a remote merely queued behind
+# them (seen twice against coworld-ctf). So it goes first, added within a second
+# of the hook starting.
+#
+# An existing remote is left alone: a checkout that already names a caos server
+# has been set up deliberately, and repointing it from the environment would
+# silently move someone's work to a different stack.
+if [ -n "$server" ] && [ "$have_repo" = 1 ]; then
+    if current="$(git remote get-url caos 2>/dev/null)"; then
+        if [ "$current" != "$server" ]; then
+            log "caos remote already set to $current; leaving it (wanted $server)"
+        fi
+    else
+        git remote add caos "$server" && log "caos remote -> $server"
+    fi
+elif [ -z "$server" ]; then
+    log "no CAOS_SERVER_URL and no CAOS_IROH_TICKET; leaving the remote alone"
+else
+    log "$PWD is not a git repository; nothing to point at $server"
+fi
+
+# ---------------------------------------------------------------------------
+# The client, refreshed -- AFTER the remote (see above)
 # ---------------------------------------------------------------------------
 # The setup script installed one, into a filesystem that is then FROZEN. A push
 # does not reach an existing environment, so a client left where the setup put
 # it is as old as the environment is, no matter how many sessions start.
 #
-# Re-running the installer costs one `git ls-remote`, because it stops as soon
-# as it finds the build already installed. Not fatal on failure: a working
-# client that is out of date beats no session at all.
+# Re-running the installer costs one `git ls-remote` when nothing moved, because
+# it stops as soon as it finds the build already installed; when the build DID
+# move it downloads the new binary, which is the slow case the remote-add above
+# is deliberately not stuck behind. Not fatal on failure: a working client that
+# is out of date beats no session at all.
 if [ -n "$base" ]; then
     if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
         log "could not refresh the client; carrying on with the installed one"
@@ -70,69 +128,6 @@ reachable() {
     [ -n "$code" ] && [ "$code" != 000 ]
 }
 
-# ---------------------------------------------------------------------------
-# The tunnel
-# ---------------------------------------------------------------------------
-# A ticket names an iroh NODE, and the node id is the identity -- it comes from
-# the listener's IROH_SECRET, so a ticket keeps working across restarts of the
-# listener even though the address embedded in it goes stale. That is why one
-# ticket can live in the environment indefinitely.
-
-# ---------------------------------------------------------------------------
-# The remote, THEN the tunnel
-# ---------------------------------------------------------------------------
-# ORDER MATTERS, and it used to be backwards. The `caos` remote only needs the
-# server's URL, not a tunnel that carries data, so it is added FIRST -- before
-# dumbpipe is even started. A resolver or a first tool call that runs while the
-# tunnel is still coming up then finds the remote and waits the tunnel out
-# (`ensure_server_reachable` retries a dead port); what it CANNOT retry away is
-# a remote that is not there yet, and adding it last -- after a tunnel bring-up
-# that can take twenty seconds -- is exactly what produced the intermittent
-# "no `caos` git remote" that failed a session's whole first turn.
-
-if [ -n "${CAOS_IROH_TICKET:-}" ]; then
-    : "${server:=http://127.0.0.1:$port}"
-fi
-
-if [ -z "$server" ]; then
-    log "no CAOS_SERVER_URL and no CAOS_IROH_TICKET; leaving the remote alone"
-    exit 0
-fi
-
-# The repo is named, not assumed from cwd. A hook's working directory is not
-# contractually the project -- in a cloud session the checkout is at
-# /home/user/repo while $HOME resolves to /root -- and a wrong cwd here does not
-# error, it silently adds the remote to some other repository or to none, and
-# the failure only shows up much later as a client that cannot find a server.
-if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -d "$CLAUDE_PROJECT_DIR" ]; then
-    cd "$CLAUDE_PROJECT_DIR" || exit 0
-fi
-
-if ! git rev-parse --git-dir >/dev/null 2>&1; then
-    log "$PWD is not a git repository; nothing to point at $server"
-    exit 0
-fi
-
-# THE REMOTE FIRST, BEFORE the unshallow below. Adding the remote is instant and
-# it is what every reachability check and `caos_status` needs; the unshallow is a
-# whole-history fetch that on a big repo (coworld-ctf) takes MINUTES. With the
-# unshallow first, the model's opening `caos_status` beat the remote into
-# existence and reported "no `caos` git remote" -- a spurious first-turn failure
-# for a remote that was merely still queued behind the fetch. The unshallow gates
-# only the first PUSH (the resolver's, a prompt's), which happens later; the
-# remote gates the very first probe, so it goes first.
-#
-# An existing remote is left alone: a checkout that already names a caos server
-# has been set up deliberately, and repointing it from the environment would
-# silently move someone's work to a different stack.
-if current="$(git remote get-url caos 2>/dev/null)"; then
-    if [ "$current" != "$server" ]; then
-        log "caos remote already set to $current; leaving it (wanted $server)"
-    fi
-else
-    git remote add caos "$server" && log "caos remote -> $server"
-fi
-
 # UNSHALLOW THE CHECKOUT. caos pushes the WORKSPACE COMMIT to the server -- the
 # resolver does it for a repo that defines `caos-tools/`, and every prompt does
 # it as the conversation's base -- and that push packs the commit's whole
@@ -141,19 +136,21 @@ fi
 # a server that does not already hold the repo. (caos' own sessions work only
 # because that server was seeded with caos' history, making the push a thin
 # delta; an arbitrary repo gets no such head start.) So fetch the rest ONCE,
-# before the resolver or the first prompt tries to push. Non-fatal and quiet: a
-# complete checkout, or a fetch that cannot reach the origin, just carries on --
-# a big repo pays a one-time full-history fetch here rather than failing later.
-if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+# before the resolver or the first prompt tries to push. It runs AFTER the remote
+# above precisely because it is slow: the remote must not wait on it. Non-fatal
+# and quiet: a complete checkout, or a fetch that cannot reach the origin, just
+# carries on -- a big repo pays a one-time full-history fetch here rather than
+# failing later.
+if [ "$have_repo" = 1 ] \
+    && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     log "unshallowing the checkout so caos can push its history"
     git fetch --unshallow --quiet 2>/dev/null \
         || log "could not unshallow; a repo the server has not seen may fail to resolve"
 fi
 
 # ---------------------------------------------------------------------------
-# The tunnel, brought up now that the remote already points at its port
+# The tunnel, brought up last -- the remote already points at its port
 # ---------------------------------------------------------------------------
-
 if [ -n "${CAOS_IROH_TICKET:-}" ]; then
     # A live tunnel first: a resumed session may already have one, and then it
     # does not matter whether dumbpipe is anywhere.
