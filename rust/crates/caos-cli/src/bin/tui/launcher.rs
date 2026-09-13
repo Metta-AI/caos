@@ -34,6 +34,15 @@ fn data_dir() -> Result<PathBuf, String> {
     Ok(base.join("caos"))
 }
 
+pub(super) fn input_history_dir(client: &Path, user: &str) -> Result<PathBuf, String> {
+    let data = data_dir()?;
+    let server = git(client, &["remote", "get-url", "caos"])?;
+    let key = hash_key(client, &serde_json::json!([server, user]))?;
+    let dir = data.join("input-history").join(key);
+    fs::create_dir_all(&dir).map_err(|e| format!("creating input history: {e}"))?;
+    Ok(dir)
+}
+
 pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let checkout = GitTransport::discover(&cwd)
@@ -136,7 +145,7 @@ fn copy_entry(source: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn hash_key(dir: &Path, value: &serde_json::Value) -> Result<String, String> {
+pub(super) fn hash_key(dir: &Path, value: &serde_json::Value) -> Result<String, String> {
     use std::io::Write;
     let mut child = Command::new("git")
         .args(["hash-object", "--stdin"])

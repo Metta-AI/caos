@@ -132,7 +132,7 @@ so it never leaves the conversation pane.
 | `Enter` | Run a recognized slash command at the end of a single-line prompt; otherwise complete a command or insert a newline |
 | `Shift+Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
-| `Up` / `Down` | Select a visible slash-command match |
+| `Up` / `Down` | Select a visible slash-command match; otherwise move within the prompt and recall attempted input at its first/last line |
 | `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right`, or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
 | `Alt+Backspace` / `Alt+Delete` | Delete the previous or next word |
 | `Ctrl+W` | Delete the previous word |
@@ -281,6 +281,13 @@ HEAD or affect other users. A running or publishing conversation must finish
 first. Closing an unsent virtual conversation simply discards it. Use
 `--list-archived` and `--unarchive <conversation-id>` outside the full-screen
 UI to recover old conversations.
+
+Up and Down recall attempted messages and slash commands, including inputs
+that failed validation or submission. History is local to each user, server,
+and conversation and survives TUI restarts under the client's data directory
+(`$XDG_DATA_HOME/caos/input-history`, or `~/.local/share/caos/input-history`).
+Existing saved prompts seed a conversation's history; later entries record
+what this client attempts. Down past the latest entry restores the draft.
 
 The transcript fills the conversation pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
