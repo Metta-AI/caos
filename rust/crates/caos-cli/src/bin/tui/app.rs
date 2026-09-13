@@ -3360,10 +3360,6 @@ impl App {
             }
             return;
         }
-        if key.code == KeyCode::Esc && (self.selected().running || self.selected().publishing) {
-            self.interrupt_selected();
-            return;
-        }
         let is_palette = key
             .modifiers
             .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
@@ -3375,6 +3371,16 @@ impl App {
         if self.palette.is_some() {
             self.handle_palette_key(key);
             return;
+        }
+        if key.code == KeyCode::Esc {
+            // Dismiss visible command menus before interrupting background work.
+            if self.view == View::Chat && self.selected_mut().dismiss_command_menu() {
+                return;
+            }
+            if self.selected().running || self.selected().publishing {
+                self.interrupt_selected();
+                return;
+            }
         }
         if key.code == KeyCode::Esc && self.selected().reference_notice.is_some() {
             self.selected_mut().reference_notice = None;
@@ -3529,9 +3535,6 @@ impl App {
             }
             KeyCode::Tab => {
                 self.selected_mut().complete_command();
-            }
-            KeyCode::Esc => {
-                self.selected_mut().dismiss_command_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
@@ -5504,6 +5507,93 @@ mod tests {
     }
 
     #[test]
+    fn escape_closes_command_palette_before_interrupting_work() {
+        for (running, publishing) in [(false, false), (true, false), (false, true)] {
+            let mut conversation = state("palette-escape");
+            conversation.running = running;
+            conversation.publishing = publishing;
+            conversation.composer.insert_str("keep this draft");
+            let cancel = Arc::new(AtomicBool::new(false));
+            if publishing {
+                conversation.publication_cancel = Some(cancel.clone());
+            }
+            let (mut app, _) = app_with(vec![conversation]);
+            app.repo_dir = std::env::temp_dir().join(format!(
+                "missing-caos-palette-escape-test-repo-{}",
+                std::process::id()
+            ));
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+            for ch in "help".chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            assert_eq!(
+                app.palette.as_ref().unwrap().selected_action(),
+                Some(AppAction::Help)
+            );
+            assert!(rendered_screen(&app).contains("Command palette"));
+
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+            assert!(app.palette.is_none());
+            assert!(!rendered_screen(&app).contains("Command palette"));
+            assert_eq!(app.view, View::Chat);
+            assert_eq!(app.selected().composer.text, "keep this draft");
+            assert_eq!(app.selected().status, "ready");
+            assert_eq!(app.selected().running, running);
+            assert_eq!(app.selected().publishing, publishing);
+            assert!(!app.selected().interrupting);
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(!app.should_quit());
+
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.selected().interrupting, running);
+            assert_eq!(
+                cancel.load(std::sync::atomic::Ordering::Relaxed),
+                publishing
+            );
+        }
+    }
+
+    #[test]
+    fn escape_dismisses_slash_completions_before_interrupting_work() {
+        for (running, publishing) in [(true, false), (false, true)] {
+            for draft in ["/", "/model son"] {
+                let mut conversation = state("completion-escape");
+                conversation.running = running;
+                conversation.publishing = publishing;
+                conversation.composer.insert_str(draft);
+                let cancel = Arc::new(AtomicBool::new(false));
+                if publishing {
+                    conversation.publication_cancel = Some(cancel.clone());
+                }
+                let (mut app, _) = app_with(vec![conversation]);
+                app.repo_dir = std::env::temp_dir().join(format!(
+                    "missing-caos-completion-escape-test-repo-{}",
+                    std::process::id()
+                ));
+                assert!(app.selected().composer.completion_count() > 0);
+
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+                assert_eq!(app.selected().composer.completion_count(), 0);
+                assert_eq!(app.selected().composer.text, draft);
+                assert!(!app.selected().interrupting);
+                assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(app.selected().interrupting, running);
+                assert_eq!(
+                    cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    publishing
+                );
+            }
+        }
+    }
+
+    #[test]
     fn command_palette_searches_keywords_and_wraps_selection() {
         let mut palette = CommandPalette {
             query: "archive remove".to_string(),
@@ -5710,6 +5800,7 @@ mod tests {
     fn escape_interrupts_before_list_or_view_navigation() {
         let mut running = state("talk-1");
         running.running = true;
+        running.composer.insert_str("/");
         let (mut app, _) = app_with(vec![running]);
         app.repo_dir = std::env::temp_dir().join(format!(
             "missing-caos-interrupt-test-repo-{}",

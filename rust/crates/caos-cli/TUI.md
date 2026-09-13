@@ -251,7 +251,9 @@ slash-prefixed prompt is sent normally.
 `Ctrl+Shift+P` or `/commands` opens a searchable command palette without
 changing the current draft. Type any words from an action, use Up and Down to
 choose a match, then press Enter to run it. The palette covers conversation,
-file browsing, activity, tool, help, reload, archive, and selection actions. Escape closes it.
+file browsing, activity, tool, help, reload, archive, and selection actions.
+Escape closes the palette or slash-command menu while an agent turn or
+publication keeps running. With the menu closed, Escape interrupts that work.
 
 Bracketed paste mode keeps pasted newlines inside the prompt instead of
 submitting partial lines. Pastes over 1,000 characters are kept out of the
