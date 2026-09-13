@@ -142,6 +142,39 @@ fn status_declaration() -> Value {
     })
 }
 
+/// [`status_result`], but it WAITS for the resolution it would otherwise report
+/// as unfinished.
+///
+/// The model calls `caos_status` the instant it finds no tools -- which, on a
+/// cloud session's first turn, is seconds before the SessionStart hook has
+/// finished setting up the `caos` remote and the tunnel the resolver needs. An
+/// instant answer there is "attempt 1 failed ... no `caos` git remote", which
+/// reads like a permanent misconfiguration: the model concludes caos is absent,
+/// or offers to `git remote add` it by hand. So HOLD the call while the resolver
+/// (now polling every second) works, and return the moment the tools land -- by
+/// which point its `tools/list_changed` has already reached Claude Code, so a
+/// model told "N tools are available" can turn round and use them in the same
+/// turn. Bounded, because a genuinely broken session must still get an answer:
+/// the wait covers the resolver's fast phase and no more, and a cold BUILD (the
+/// registry stays empty for minutes) returns "still resolving" and lets the
+/// model retry rather than blocking a tool call for the whole build.
+fn status_result_waiting(registry: &Registry) -> Value {
+    const WAIT_ATTEMPTS: u32 = 25;
+    const WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    for attempt in 0..WAIT_ATTEMPTS {
+        match registry.lock() {
+            Ok(found) if !found.tools.is_empty() => break,
+            // A poisoned lock will not un-poison; do not spin on it.
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        if attempt + 1 < WAIT_ATTEMPTS {
+            std::thread::sleep(WAIT_INTERVAL);
+        }
+    }
+    status_result(registry)
+}
+
 fn status_result(registry: &Registry) -> Value {
     let text = match registry.lock() {
         Err(_) => "the caos tool registry lock is poisoned; this server is broken".to_string(),
@@ -392,7 +425,7 @@ fn call(
     // This server's own tool, and the one call that belongs to no conversation:
     // it reports on the server, so it takes no session and records nothing.
     if name == STATUS_TOOL {
-        return Ok(status_result(registry));
+        return Ok(status_result_waiting(registry));
     }
     let args = params
         .get("arguments")
