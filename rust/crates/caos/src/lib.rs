@@ -1992,7 +1992,7 @@ fn store(
     cas_real: Option<&Path>,
     path: &Path,
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
-    let hashed = hash_path(cas_real, path)?;
+    let hashed = hash_path(t, cas_real, path)?;
     send(t, &hashed)?;
     Ok((hashed.mode, hashed.oid))
 }
@@ -2069,7 +2069,7 @@ fn cas_node(link: &Path, cas_real: &Path) -> Option<PathBuf> {
 /// Hash `path` into git objects without storing anything. Same shape rules as
 /// [`store`]: symlinks into the CAS reuse their recorded hash, other symlinks
 /// are blobs holding the link target, directories are trees.
-fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
+fn hash_path(t: &dyn Transport, cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
     use gix::objs::tree::EntryKind;
 
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -2104,7 +2104,7 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
         let mut children = Vec::new();
         for dirent in std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
             let dirent = dirent.map_err(|e| format!("{}: {e}", path.display()))?;
-            let child = hash_path(cas_real, &dirent.path())?;
+            let child = hash_path(t, cas_real, &dirent.path())?;
             entries.push(gix::objs::tree::Entry {
                 mode: child.mode,
                 filename: dirent.file_name().into_vec().into(),
@@ -2120,6 +2120,7 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
             .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
         let oid = hash_bytes("tree", &buf)?;
         return gitlinks::commit(
+            t,
             cas_real,
             path,
             Hashed {
@@ -4950,6 +4951,49 @@ gpgsig -----BEGIN PGP SIGNATURE-----
                 merge
             );
             assert!(eval::eval_path(&t, &cleaned.to_string(), ".caos/conflicts", &[]).is_ok());
+        }
+        // A partial projection leaves unselected metadata as a CAS link.
+        // Clean it by the same rule, retaining unresolved entries and other files.
+        for (index, (ledger, other)) in [("", false), ("unresolved code\n", false), ("", true)]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(
+                projection.join("dirty/code"),
+                format!("edited with lazy metadata {index}\n"),
+            )
+            .unwrap();
+            std::fs::write(metadata.join("conflicts"), ledger).unwrap();
+            if other {
+                std::fs::write(metadata.join("other"), "keep").unwrap();
+            }
+            let (_, metadata_tree) = store(&t, None, &metadata).unwrap();
+            let lazy_metadata = cas.join(format!("merge-metadata-{index}"));
+            get_hash(
+                &t,
+                &metadata_tree.to_string(),
+                lazy_metadata.to_str().unwrap(),
+            )
+            .unwrap();
+            std::fs::remove_dir_all(&metadata).unwrap();
+            std::os::unix::fs::symlink(&lazy_metadata, &metadata).unwrap();
+            let (_, cleaned) = store(&t, Some(&cas), &projection).unwrap();
+            let (_, source) = eval::eval_path(&t, &cleaned.to_string(), "dirty", &[]).unwrap();
+            let listing = git(
+                dir.path(),
+                &["ls-tree", "-r", "--name-only", &source, "--", ".caos"],
+            );
+            assert_eq!(listing.contains(".caos/conflicts"), !ledger.is_empty());
+            assert_eq!(listing.contains(".caos/other"), other);
+            if ledger.is_empty() && !other {
+                assert!(git(dir.path(), &["ls-tree", &source, "--", ".caos"]).is_empty());
+            }
+            assert_eq!(
+                git(dir.path(), &["rev-parse", &format!("{source}^")]).trim(),
+                merge
+            );
+            std::fs::remove_file(&metadata).unwrap();
+            std::fs::create_dir(&metadata).unwrap();
         }
         std::fs::write(metadata.join("conflicts"), "").unwrap();
         std::fs::write(metadata.join("other"), "keep").unwrap();

@@ -6,7 +6,12 @@ const BASE: &str = "user.caos.commit";
 /// Turn a projected directory back into a commit, retaining the exact old
 /// object (including signatures) when its tree is unchanged. The xattr only
 /// names an object in the protected CAS; it cannot supply forged headers.
-pub(super) fn commit(cas: Option<&Path>, path: &Path, mut tree: Hashed) -> Result<Hashed, String> {
+pub(super) fn commit(
+    t: &dyn Transport,
+    cas: Option<&Path>,
+    path: &Path,
+    mut tree: Hashed,
+) -> Result<Hashed, String> {
     let Some(base) = xattr::get(path, BASE).map_err(|e| e.to_string())? else {
         return Ok(tree);
     };
@@ -28,7 +33,7 @@ pub(super) fn commit(cas: Option<&Path>, path: &Path, mut tree: Hashed) -> Resul
             body: Body::Stored,
         });
     }
-    clean_merge_metadata(&mut tree, true)?;
+    clean_merge_metadata(t, &mut tree, true)?;
     let headers = raw
         .split(|b| *b == b'\n')
         .take_while(|line| !line.is_empty());
@@ -48,9 +53,22 @@ pub(super) fn commit(cas: Option<&Path>, path: &Path, mut tree: Hashed) -> Resul
 }
 
 // Only edited commit projections use this rule. Plain trees (including the
-// conversation protocol), untouched commits, and lazy CAS references are exact.
-fn clean_merge_metadata(tree: &mut Hashed, source_root: bool) -> Result<(), String> {
+// conversation protocol) and untouched commits are exact.
+fn clean_merge_metadata(
+    t: &dyn Transport,
+    tree: &mut Hashed,
+    source_root: bool,
+) -> Result<(), String> {
     use gix::objs::tree::{Entry, EntryKind};
+    if matches!(tree.body, Body::Stored) {
+        // Partial projections leave .caos lazy. Read only its tree; all of
+        // its children are already stored, so none need to be sent again.
+        let (kind, bytes) = t.get_object(&tree.oid.to_string())?;
+        if kind != "tree" {
+            return Err("source merge metadata is not a tree".into());
+        }
+        tree.body = Body::Dir(bytes, Vec::new());
+    }
     let Body::Dir(bytes, children) = &mut tree.body else {
         return Ok(());
     };
@@ -68,7 +86,7 @@ fn clean_merge_metadata(tree: &mut Hashed, source_root: bool) -> Result<(), Stri
         for entry in &mut entries {
             if entry.filename == b".caos" && entry.mode.kind() == EntryKind::Tree {
                 if let Some(child) = children.iter_mut().find(|child| child.oid == entry.oid) {
-                    clean_merge_metadata(child, false)?;
+                    clean_merge_metadata(t, child, false)?;
                     entry.oid = child.oid;
                 }
             }
