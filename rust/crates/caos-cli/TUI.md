@@ -266,7 +266,7 @@ step chain when the TUI restarts. If the selection is already on the newest
 step, new activity remains selected. Moving to an older step pauses that
 tail-follow behavior.
 
-Archive the selected conversation from the command palette (`Ctrl+Shift+P`,
+Archive the selected conversation with `/archive` or from the command palette (`Ctrl+Shift+P`,
 then `archive`). Archiving atomically moves only the selected user's
 membership ref from `active` to `archived`; it does not move the conversation
 HEAD or affect other users. A running or publishing conversation must finish
