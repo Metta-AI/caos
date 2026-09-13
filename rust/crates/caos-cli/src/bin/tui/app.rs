@@ -4182,7 +4182,7 @@ mod tests {
         }
     }
 
-    fn state(name: &str) -> ConversationState {
+    pub(super) fn state(name: &str) -> ConversationState {
         ConversationState::new(
             name.to_string(),
             name.to_string(),
@@ -4408,7 +4408,7 @@ mod tests {
         }
     }
 
-    fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
+    pub(super) fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
         let (tx, rx) = mpsc::channel();
         (
             App {
