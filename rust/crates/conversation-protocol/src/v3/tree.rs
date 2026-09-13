@@ -896,9 +896,17 @@ pub fn parse_commit_bytes(oid: &Oid, bytes: &[u8]) -> Result<CommitInfo, StoreEr
             author = Some(parse_signature(value).map_err(StoreError::Other)?);
         } else if let Some(value) = line.strip_prefix("committer ") {
             committer = Some(parse_signature(value).map_err(StoreError::Other)?);
-        } else {
-            return Err(StoreError::Other(format!("invalid commit object {oid}")));
         }
+        // Any other header is SKIPPED, not rejected. A commit made elsewhere
+        // carries headers we do not mint -- `gpgsig` on a GitHub-signed commit
+        // (with its PGP armor on space-prefixed continuation lines), `mergetag`,
+        // `encoding` -- and one of those is the conversation BASE the moment a
+        // session runs in someone else's repository. We read such a commit only
+        // for its tree and identity and never re-encode it, so ignoring what we
+        // don't interpret is exactly git's own tolerance; rejecting it made
+        // every signed-HEAD repo fail its first turn with "invalid commit
+        // object". Continuation lines start with a space, so they never collide
+        // with the bare `tree `/`author ` prefixes above.
     }
     Ok(CommitInfo {
         tree: tree.ok_or_else(|| StoreError::Other(format!("invalid commit object {oid}")))?,
@@ -1170,5 +1178,34 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "left/a/file");
         assert_eq!(store.tree_reads.get(), 6);
+    }
+
+    #[test]
+    fn signed_commit_parses_ignoring_gpgsig() {
+        // A GitHub-signed commit: a `gpgsig` header whose PGP armor rides on
+        // space-prefixed continuation lines, INCLUDING a blank one, between the
+        // committer and the message. The parser must skip what it does not mint
+        // and still find tree/author/committer and the true message -- rejecting
+        // it made every signed-HEAD repo fail as a conversation base.
+        let t = "1".repeat(40);
+        let p = "2".repeat(40);
+        let body = format!(
+            "tree {t}\n\
+             parent {p}\n\
+             author A U Thor <author@example.com> 1789170890 -0700\n\
+             committer GitHub <noreply@github.com> 1789170890 -0700\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsFcBAABCAAQ\n =vtXm\n \
+             -----END PGP SIGNATURE-----\n \n\
+             \n\
+             the real message\n"
+        );
+        let info = parse_commit_bytes(&oid('a'), body.as_bytes()).expect("signed commit parses");
+        assert_eq!(info.tree, Oid::parse(&t, "t").unwrap());
+        assert_eq!(info.parents, vec![Oid::parse(&p, "p").unwrap()]);
+        assert_eq!(info.author.name, "A U Thor");
+        assert_eq!(info.committer.name, "GitHub");
+        // The signature is NOT in the message; the message is what follows the
+        // header block's blank-line separator.
+        assert_eq!(info.message, b"the real message\n");
     }
 }
