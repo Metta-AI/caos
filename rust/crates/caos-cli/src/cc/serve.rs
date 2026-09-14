@@ -131,11 +131,12 @@ const STATUS_TOOL: &str = "caos_status";
 fn status_declaration() -> Value {
     json!({
         "name": STATUS_TOOL,
-        "description": "Report why the caos workspace tools are not available yet. \
-                        The caos tool server is connected but still resolving the step \
-                        that implements its tools, or failed to. This is the only caos \
-                        tool right now; call it and report what it says, rather than \
-                        concluding that caos is absent.",
+        "description": "Report why the caos workspace tools are not available yet, \
+                        plus provisioning diagnostics (client build, env stamp, caos \
+                        remote, tunnel log). The caos tool server is connected but still \
+                        resolving the step that implements its tools, or failed to. This \
+                        is the only caos tool right now; call it and report its FULL \
+                        output verbatim, rather than concluding that caos is absent.",
         "inputSchema": with_injected(json!({
             "type": "object", "properties": {}, "required": [],
         })),
@@ -219,7 +220,76 @@ fn status_result(registry: &Registry) -> Value {
                 .to_string(),
         },
     };
+    let text = format!("{text}\n{}", diagnostics());
     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
+}
+
+/// The container's provisioning facts, dumped into the status text.
+///
+/// This is the ONLY caos surface a locked-down cloud session has -- no shell, no
+/// filesystem tools, and maybe no tunnel -- so when the workspace tools don't
+/// come up, this is where "which client build am I actually running, and what is
+/// the tunnel doing" has to be answerable. Every line is a plain read: a missing
+/// file or a failed command becomes a note, never an error, because the one tool
+/// that explains a broken session must not break.
+fn diagnostics() -> String {
+    let mut d = String::from("--- caos diagnostics ---\n");
+    // The build THIS `cc serve` binary is: the wrapper exports it (install.sh).
+    // The one fact that settles "is the per-session refresh installing the
+    // latest, or is a stale client frozen in?".
+    d.push_str(&format!(
+        "client CAOS_REV: {}\n",
+        std::env::var("CAOS_REV").unwrap_or_else(|_| "<unset>".to_string())
+    ));
+    // What install.sh resolved this session -- repo, full commit, build tag.
+    d.push_str("build record (/usr/local/share/caos/build):\n");
+    d.push_str(&indent(&read_file("/usr/local/share/caos/build")));
+    // Where the env came from, stamped once at setup.
+    d.push_str("env stamp (/usr/local/share/caos/setup-stamp):\n");
+    d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
+    // The remote the client dials -- present means session-start added it.
+    d.push_str(&format!("caos remote: {}\n", caos_remote()));
+    // The tunnel's own words: why connect-tcp did or did not bind :19090.
+    d.push_str("tunnel log tail (/tmp/caos-tunnel.log):\n");
+    d.push_str(&indent(&tail(&read_file("/tmp/caos-tunnel.log"), 15)));
+    d
+}
+
+/// Read a file for [`diagnostics`], trimmed, or a note on why not.
+fn read_file(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(s) => s.trim_end().to_string(),
+        Err(e) => format!("<unreadable: {e}>"),
+    }
+}
+
+/// The last `n` lines of `s`.
+fn tail(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// Two-space-indent every line, or a placeholder for the empty string, so a
+/// multi-line file reads as one block under its heading.
+fn indent(s: &str) -> String {
+    if s.is_empty() {
+        return "  <empty>\n".to_string();
+    }
+    s.lines().map(|l| format!("  {l}\n")).collect::<String>()
+}
+
+/// The URL of the `caos` git remote, read from the project the hook names (a
+/// tool server's cwd is not contractually the repo -- see `run_tool`).
+fn caos_remote() -> String {
+    let mut cmd = std::process::Command::new("git");
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+        cmd.args(["-C", &dir]);
+    }
+    match cmd.args(["remote", "get-url", "caos"]).output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Ok(out) => format!("<none: {}>", String::from_utf8_lossy(&out.stderr).trim()),
+        Err(e) => format!("<git failed: {e}>"),
+    }
 }
 
 /// Stdout, shared with the resolver thread. Its own lock, not stdout's: the
