@@ -260,6 +260,12 @@ fn diagnostics() -> String {
         &read_file("/tmp/caos-tunnel.log"),
         15,
     ))));
+    // Where the discovery wait actually went, once a resolve has succeeded --
+    // the tunnel warmup is separate (the resolver's retry loop, seen as the
+    // "attempt N of 40" above); this is the work AFTER the server is reachable.
+    if let Some(timing) = super::discovery_timing() {
+        d.push_str(&format!("tool discovery: {timing}\n"));
+    }
     d
 }
 

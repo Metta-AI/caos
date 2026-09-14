@@ -386,9 +386,25 @@ fn read_outcome(
 /// Asked of the step that implements them, so there is one description of
 /// `edit` wherever a model meets it, and a tool a repository defines under
 /// `caos-tools/` is offered here exactly as it is in the tui.
+/// The last successful tool discovery's phase timings, for `caos_status` to
+/// report -- the one place a locked-down session can see WHERE the wait went.
+/// Discovery is not just the `:@@=` eval walk `/eval-locator` sped up; it also
+/// pushes the workspace tree and runs `llm-step` in a worker, and only a
+/// measurement says which dominates. Written once per successful resolve.
+static DISCOVERY_TIMING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The timing string [`declarations`] last recorded, or `None` before the first
+/// successful resolve.
+pub(crate) fn discovery_timing() -> Option<String> {
+    DISCOVERY_TIMING.lock().ok().and_then(|slot| slot.clone())
+}
+
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
+    let total = std::time::Instant::now();
     let store = caos::build_secret_store(t)?;
+    let mark = std::time::Instant::now();
     let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
+    let resolve_step = mark.elapsed();
     let mut kvs = vec!["--list-tools=1".to_string()];
     // The tree whose `caos-tools/` entries are offered -- named ONLY when
     // there are any, and the ordering is the whole point.
@@ -405,6 +421,7 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     // accepts and swallows, so the push never returns, the resolution never
     // finishes, and the session gets a tool server that is connected and
     // permanently empty.
+    let mark = std::time::Instant::now();
     if t.work_dir().join(TREE_TOOLS_DIR).is_dir() {
         if let Ok(workspace) = resolve_base(t, options) {
             let mut objects = open_store(t)?;
@@ -414,12 +431,28 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
             kvs.push(format!("--workspace:hash={tree}"));
         }
     }
+    let workspace_prep = mark.elapsed();
+    let mark = std::time::Instant::now();
     let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
+    let run_list = mark.elapsed();
     let objects = open_store(t)?;
     let result = oid(&result, "tool registry")?;
     objects.ensure_local(&result)?;
     let bytes = objects.read_blob(&result).map_err(String::from)?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("parsing the tool registry: {error}"))
+    let tools = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parsing the tool registry: {error}"))?;
+    // The run-list phase includes pushing the workspace closure to the server,
+    // so a big number there is usually the push, not the worker's own work.
+    if let Ok(mut slot) = DISCOVERY_TIMING.lock() {
+        *slot = Some(format!(
+            "resolve-llm-step {:.1}s, workspace-prep {:.1}s, run-list-tools {:.1}s (total {:.1}s)",
+            resolve_step.as_secs_f64(),
+            workspace_prep.as_secs_f64(),
+            run_list.as_secs_f64(),
+            total.elapsed().as_secs_f64(),
+        ));
+    }
+    Ok(tools)
 }
 
 /// The model's own arguments, without the values the hook injected: those are
