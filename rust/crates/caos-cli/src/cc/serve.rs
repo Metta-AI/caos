@@ -88,7 +88,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
             continue;
         }
         let method = method_of(&line);
-        let Some(response) = handle(t, &options, &registry, &line) else {
+        let Some(response) = handle(t, &options, &registry, &out, &line) else {
             continue;
         };
         write_message(&out, &response)?;
@@ -159,20 +159,53 @@ fn status_declaration() -> Value {
 /// registry stays empty for minutes) returns "still resolving" and lets the
 /// model retry rather than blocking a tool call for the whole build.
 fn status_result_waiting(registry: &Registry) -> Value {
-    const WAIT_ATTEMPTS: u32 = 25;
-    const WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-    for attempt in 0..WAIT_ATTEMPTS {
+    const STATUS_WAIT_ATTEMPTS: u32 = 25;
+    wait_for_tools(registry, STATUS_WAIT_ATTEMPTS);
+    status_result(registry)
+}
+
+/// How long a `tools/list` reply is held for the resolution to finish before
+/// answering with the status stand-in. Longer than the status tool's own wait
+/// because it is the ONE read a re-list-averse client makes -- it has to outlast
+/// the setup race, which is gated by the iroh tunnel coming up (tens of seconds)
+/// -- yet still bounded, so a stuck resolution answers rather than hanging the
+/// client's startup. It does not have to cover a cold BUILD: that is a `run`
+/// inside one resolver attempt, and the notification still corrects a client
+/// that honours it once the build lands.
+const TOOLS_LIST_WAIT_ATTEMPTS: u32 = 70;
+
+/// Block until the registry holds tools, or `attempts` one-second polls pass, or
+/// the lock is poisoned. Does NOT hold the lock across the sleep, so the resolver
+/// thread can publish into it. Shared by the status tool and the deferred
+/// `tools/list`.
+fn wait_for_tools(registry: &Registry, attempts: u32) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    for attempt in 0..attempts {
         match registry.lock() {
             Ok(found) if !found.tools.is_empty() => break,
-            // A poisoned lock will not un-poison; do not spin on it.
             Err(_) => break,
             Ok(_) => {}
         }
-        if attempt + 1 < WAIT_ATTEMPTS {
-            std::thread::sleep(WAIT_INTERVAL);
+        if attempt + 1 < attempts {
+            std::thread::sleep(INTERVAL);
         }
     }
-    status_result(registry)
+}
+
+/// The `tools/list` result: the resolved tools, or the status stand-in while
+/// there are none (a resolution that timed out or is still going).
+fn tools_list_reply(id: Value, registry: &Registry) -> Value {
+    match registry.lock() {
+        Ok(found) => {
+            let tools = if found.tools.is_empty() {
+                vec![status_declaration()]
+            } else {
+                found.tools.clone()
+            };
+            reply(id, json!({ "tools": tools }))
+        }
+        Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
+    }
 }
 
 fn status_result(registry: &Registry) -> Value {
@@ -332,6 +365,7 @@ fn handle(
     t: Result<&GitTransport, &String>,
     options: &TurnOptions,
     registry: &Registry,
+    out: &Out,
     line: &str,
 ) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
@@ -350,19 +384,38 @@ fn handle(
     let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
-        // Whatever has been found so far, which early on is nothing. The
-        // client is told when that changes -- and until it does, the one tool
-        // that can explain the emptiness stands in for the rest.
-        "tools/list" => Some(match registry.lock() {
-            Ok(found) => {
-                let tools = match found.tools.is_empty() {
-                    true => vec![status_declaration()],
-                    false => found.tools.clone(),
-                };
-                reply(id, json!({ "tools": tools }))
+        // The tools, once they are known -- and if they are not yet, the reply
+        // is DEFERRED until they are, rather than answered now with the status
+        // stand-in and corrected later by a `tools/list_changed` notification.
+        //
+        // That notification is the MCP way to say "re-read the list", and it is
+        // still sent (see `resolve_in_background`) for a client that honours it.
+        // But some do not: a client that reads `tools/list` exactly once, at
+        // startup, and never again is left with only `caos_status` forever,
+        // though the server resolved all 22 tools seconds later -- observed with
+        // the Claude Code that a self-hosted cloud environment mounts. Holding
+        // this one response until the tools exist puts them in the ONE read such
+        // a client makes. Bounded, so a genuinely stuck resolution still answers
+        // (with the stand-in) rather than hanging the client's startup forever.
+        //
+        // Deferred on a THREAD, not by blocking this loop: the loop must stay
+        // free to answer `ping` and anything else while the wait runs, or a
+        // client watching liveness would call the server dead mid-wait. The
+        // reply carries the request's own `id`, so it matches when it lands.
+        "tools/list" => {
+            let ready = matches!(registry.lock(), Ok(found) if !found.tools.is_empty());
+            if ready {
+                Some(tools_list_reply(id, registry))
+            } else {
+                let registry = Arc::clone(registry);
+                let out = Arc::clone(out);
+                std::thread::spawn(move || {
+                    wait_for_tools(&registry, TOOLS_LIST_WAIT_ATTEMPTS);
+                    let _ = write_message(&out, &tools_list_reply(id, &registry));
+                });
+                None
             }
-            Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
-        }),
+        }
         // A workspace we could not open is the model's problem to report, not
         // a protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
