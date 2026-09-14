@@ -131,12 +131,12 @@ const STATUS_TOOL: &str = "caos_status";
 fn status_declaration() -> Value {
     json!({
         "name": STATUS_TOOL,
-        "description": "Report why the caos workspace tools are not available yet, \
-                        plus provisioning diagnostics (client build, env stamp, caos \
-                        remote, tunnel log). The caos tool server is connected but still \
-                        resolving the step that implements its tools, or failed to. This \
-                        is the only caos tool right now; call it and report its FULL \
-                        output verbatim, rather than concluding that caos is absent.",
+        "description": "caos provisioning diagnostics: this session's client build, env \
+                        stamp, `caos` remote, tunnel-log tail, and the tool-resolution \
+                        status. Always available. If the other caos workspace tools are \
+                        MISSING, call this and report its FULL output verbatim rather than \
+                        concluding caos is absent -- it says why (and whether they are \
+                        still resolving). It takes no arguments and changes nothing.",
         "inputSchema": with_injected(json!({
             "type": "object", "properties": {}, "required": [],
         })),
@@ -198,11 +198,15 @@ fn wait_for_tools(registry: &Registry, attempts: u32) {
 fn tools_list_reply(id: Value, registry: &Registry) -> Value {
     match registry.lock() {
         Ok(found) => {
-            let tools = if found.tools.is_empty() {
-                vec![status_declaration()]
-            } else {
-                found.tools.clone()
-            };
+            // ALWAYS include `caos_status`, resolved or not. It used to be the
+            // stand-in offered ONLY while the real tools were missing, so it
+            // vanished the moment they resolved -- which meant its provisioning
+            // diagnostics (build, remote, tunnel log) were unreachable in the one
+            // session state where you might still want them: a working one you
+            // are trying to confirm. It carries no session and records nothing,
+            // so it is a harmless read to keep beside the workspace tools.
+            let mut tools = found.tools.clone();
+            tools.push(status_declaration());
             reply(id, json!({ "tools": tools }))
         }
         Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
