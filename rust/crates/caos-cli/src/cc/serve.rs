@@ -253,10 +253,28 @@ fn diagnostics() -> String {
     d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
     // The remote the client dials -- present means session-start added it.
     d.push_str(&format!("caos remote: {}\n", caos_remote()));
-    // The tunnel's own words: why connect-tcp did or did not bind :19090.
+    // The tunnel's own words: why connect-tcp did or did not bind :19090 --
+    // with the node's PRIVATE key scrubbed, since a model pastes this verbatim.
     d.push_str("tunnel log tail (/tmp/caos-tunnel.log):\n");
-    d.push_str(&indent(&tail(&read_file("/tmp/caos-tunnel.log"), 15)));
+    d.push_str(&indent(&redact_secrets(&tail(
+        &read_file("/tmp/caos-tunnel.log"),
+        15,
+    ))));
     d
+}
+
+/// Scrub anything a status must never surface. `dumbpipe` prints `using secret
+/// key <64 hex>` -- the tunnel node's PRIVATE key, which grants anyone who has
+/// it the ability to stand in for the server -- and this text is reported
+/// verbatim by a model, so the key cannot be in it.
+fn redact_secrets(s: &str) -> String {
+    s.lines()
+        .map(|line| match line.find("secret key") {
+            Some(i) => format!("{}secret key <redacted>", &line[..i]),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Read a file for [`diagnostics`], trimmed, or a note on why not.
