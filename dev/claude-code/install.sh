@@ -323,6 +323,37 @@ version=$VERSION
 RECORD
 chmod 0644 "$PREFIX/share/caos/build"
 
+# THE MCP ENTRY POINT, so the RUNNING tool server is never a stale binary.
+#
+# A cloud environment restored from a cache brings back the client the LAST
+# FRESH setup installed and skips the setup that would refresh it; the
+# SessionStart hook does refresh, but its `install.sh` lands AFTER Claude Code
+# has already spawned `cc serve` from the old binary, so the session runs stale
+# (its tools too -- `llm-step` is pinned to the client's commit). This wrapper
+# moves the refresh to the LAUNCH: `configure.sh` points the caos MCP server's
+# command at it, so before the server starts it reinstalls the newest build for
+# this base and then execs the client. `$BASE` is baked in -- the wrapper cannot
+# read its own argv for it any more than this script can. Bounded and non-fatal:
+# a slow or unreachable GitHub serves the installed client rather than hanging
+# startup. Its refresh output is forced to STDERR, because the wrapper's stdout
+# becomes the tool server's JSON-RPC the moment it execs.
+cat > "$PREFIX/bin/caos-serve" <<WRAP
+#!/bin/bash
+timeout 20 bash -c "curl -fsSL '$BASE/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
+# The step, pinned to the commit the refresh JUST installed -- not the one the
+# snapshot's mcp.json named. Refreshing the binary without this would run the new
+# server against an OLD llm-step (its tools are the pinned rev's), which is the
+# half-update that looks like the fix not working. Built the same way
+# configure.sh builds it, from the build record install.sh just wrote.
+r="\$(sed -n 's/^repo=//p' "$PREFIX/share/caos/build" 2>/dev/null)"
+c="\$(sed -n 's/^commit=//p' "$PREFIX/share/caos/build" 2>/dev/null)"
+if [ -n "\$r" ] && [ -n "\$c" ]; then
+    exec "$PREFIX/bin/caos" cc serve "--llm-step:@@=github:\$r?rev=\$c&dir=std/llm-step"
+fi
+exec "$PREFIX/bin/caos" "\$@"
+WRAP
+chmod 0755 "$PREFIX/bin/caos-serve"
+
 # The repository files. NOT overwritten without --force: a checkout that already
 # has `.claude/settings.json` has someone's configuration in it, and replacing
 # that silently is how a deny list nobody asked for disarms their session.

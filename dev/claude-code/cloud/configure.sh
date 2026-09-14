@@ -103,7 +103,13 @@ if ! settings="$(printf '%s' "$repo_settings" | jq --arg step "'$locator'" "$unb
     echo "FATAL: $base/settings.json is not the JSON this expects" >&2
     exit 1
 fi
-if ! servers="$(printf '%s' "$repo_mcp" | jq --arg step "$locator" "$unbin"' | .mcpServers')"; then
+# The command becomes `caos-serve`, not `caos`: install.sh installs a wrapper by
+# that name that refreshes the client to the newest build for its base and THEN
+# execs `caos`, so the running tool server is current even in a cached
+# environment whose snapshot froze an older binary. The args are untouched --
+# `caos-serve` execs `caos "$@"`, so `cc serve --llm-step:@@=…` still reaches it.
+if ! servers="$(printf '%s' "$repo_mcp" \
+    | jq --arg step "$locator" "$unbin"' | .mcpServers | .caos.command = "caos-serve"')"; then
     echo "FATAL: $base/mcp.json is not the JSON this expects" >&2
     exit 1
 fi
