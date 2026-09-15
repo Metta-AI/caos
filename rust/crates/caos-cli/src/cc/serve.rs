@@ -363,7 +363,48 @@ fn diagnostics() -> String {
     if let Some(timing) = super::discovery_timing() {
         d.push_str(&format!("tool discovery: {timing}\n"));
     }
+    // The warm step's own log: session-start runs `cc warm` before the client
+    // starts, and this is where it says whether it resolved and cached the
+    // tools or why it could not -- the reason a first turn does or does not
+    // already have them.
+    d.push_str("warm log (/tmp/caos-warm.log):\n");
+    d.push_str(&indent(&tail(&read_file("/tmp/caos-warm.log"), 10)));
+    // Whether a warm cache was on disk for THIS serve to load at startup.
+    d.push_str(&format!("registry cache: {}\n", registry_cache_state()));
     d
+}
+
+/// A one-line note on the on-disk tool-registry cache: present with how many
+/// tools and for which step, or why not. `cc warm` writes it and `cc serve`
+/// loads it (see [`registry_cache_path`]); a first turn with no tools when this
+/// says "absent" means the warm did not finish, and when it says "present" means
+/// the load key did not match.
+fn registry_cache_state() -> String {
+    let mut cmd = std::process::Command::new("git");
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+        cmd.args(["-C", &dir]);
+    }
+    let git_dir = match cmd.args(["rev-parse", "--absolute-git-dir"]).output() {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => return "<no git dir to look in>".to_string(),
+    };
+    let path = std::path::Path::new(&git_dir).join("caos-cc-registry.json");
+    match std::fs::read(&path) {
+        Err(e) => format!("absent ({e}) at {}", path.display()),
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => {
+                let n = v.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
+                let step = v
+                    .get("llm_step")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<none>");
+                format!("present: {n} tools, step {step}")
+            }
+            Err(e) => format!("present but unparseable ({e})"),
+        },
+    }
 }
 
 /// Scrub anything a status must never surface. `dumbpipe` prints `using secret

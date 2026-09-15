@@ -223,17 +223,24 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
     if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
         locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
         log "warming the caos tool registry for the first turn"
-        # Bounded TIGHTLY, and its output sent to a FILE, not the hook's own
-        # stdout/stderr. Both matter for the same reason: Claude Code holds the
-        # session at "starting" until this hook's output stream reaches EOF, so a
-        # warm that inherited that stream and left a child (a `git` the resolve
-        # forked) writing to it would keep the WHOLE SESSION from starting long
-        # after the warm itself returned. The redirect closes the hook's stream
-        # the moment the foreground `caos` exits; the 60s cap keeps a cold image
-        # build -- which no blocking step should wait out -- from delaying the
-        # session either. A warm that does not finish just leaves the background
-        # resolve in place, which is where this was before.
-        CLAUDE_PROJECT_DIR="$PWD" timeout 60 caos cc warm "$locator" \
+        # Its output goes to a FILE, not the hook's own stdout/stderr, and this
+        # is not tidiness: Claude Code holds the session at "starting" until this
+        # hook's output stream reaches EOF, so a warm that inherited that stream
+        # and left a child (a `git` the resolve forked) writing to it would keep
+        # the WHOLE SESSION from starting long after the warm itself returned.
+        # The redirect closes the hook's stream the moment the foreground `caos`
+        # exits.
+        #
+        # Bounded, but not tightly: the resolve talks to the caos server over the
+        # iroh tunnel and does real work there (it may run the step to list its
+        # tools), which measured around 110s in a cloud coworld session -- so a
+        # cap short enough to be "tight" would time out every warm and cache
+        # nothing, which is the whole point of it. 150s covers the observed
+        # resolve with room; `-k` turns SIGTERM into SIGKILL 10s later so a
+        # resolve that ignores the term (a blocked network read) cannot hold the
+        # hook past the cap. A warm that still does not finish leaves the
+        # background resolve in place, which is where this was before it existed.
+        CLAUDE_PROJECT_DIR="$PWD" timeout -k 10 150 caos cc warm "$locator" \
             >/tmp/caos-warm.log 2>&1 \
             || log "could not warm the tools in time; cc serve will resolve in the background"
         while IFS= read -r line; do log "warm: $line"; done < /tmp/caos-warm.log
