@@ -89,6 +89,10 @@ moment it is submitted. A store that exists but fails to load is reported as
 the error it is rather than prompting, so an existing broken configuration is
 never overwritten.
 
+Before submitting a chat turn, the client checks that the selected worker
+will receive the key. Missing or mismatched readers produce a local error
+naming the required `reader=` setting. Correct the entry and resend the message.
+
 Below, `$W` stands for the two required image args
 (`--llm-step:@=std/llm-step --llm-call:@=std/llm-call`). The last two run no
 worker, so they take neither.
@@ -125,7 +129,8 @@ so it never leaves the conversation pane.
 | `Escape` | Stop a running turn, else dismiss the current layer |
 | `Ctrl+A` / `Ctrl+E` | Move to the start / end of the current line |
 | `Ctrl+S` | Send the prompt (`Ctrl+Enter` also works in terminals with enhanced keyboard input) |
-| `Enter` or `Ctrl+J` | Insert a newline |
+| `Enter` | Run a recognized slash command at the end of a single-line prompt; otherwise complete a command or insert a newline |
+| `Shift+Enter` or `Ctrl+J` | Insert a newline |
 | `Tab` | Complete the selected slash command |
 | `Up` / `Down` | Select a visible slash-command match |
 | `Alt+Left` / `Alt+Right`, `Ctrl+Left` / `Ctrl+Right`, or `Alt+B` / `Alt+F` | Move by whitespace-delimited words |
@@ -162,18 +167,21 @@ updates remain in the transcript as CAOS messages.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
 `/from <turn-hash>` to start a fresh conversation from one without leaving the
-TUI. Enter `/title <new title>` to change the shared title without changing the
-conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
+TUI. Enter `/title <new title>` to change the
+shared title without changing the conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
-client default. Enter `/update-tree <message>` to send an ordinary
-user turn whose commit also folds in your current working-tree changes — the
+client default. Enter `/update-tree <gitlink> <message>` to send an ordinary
+user turn whose commit also folds in edits in that gitlink's remembered checkout — the
 intended companion to `/checkout <gitlink> [directory]` (check out the head, edit files, then
-`/update-tree <message>` with the text you want in that turn). Activity entries
+`/update-tree <gitlink> <message>` with the text you want in that turn). Activity entries
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
 Press `Ctrl+O` to open the read-only conversation filesystem. Up/Down select
-entries and immediately preview them. Right/Enter opens a directory or gitlink;
+entries and immediately preview them. The list includes each directory's immediate
+children, indented one level, and those children can be selected directly.
+Gitlinks are magenta; ordinary directories are cyan.
+Right/Enter opens a directory or gitlink;
 Left/Backspace returns to its parent, preserving the selection. Escape closes
 the browser. Click to select; scroll over the file list to move the selection,
 or over the preview to scroll its text. PageUp/PageDown scroll the preview.
@@ -219,12 +227,12 @@ creation or updates appear as persistent CAOS messages, including the PR URL.
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
-A fresh conversation starts with a temporary `talk-N` title. Its first prompt
+A fresh conversation starts with a dimmed `New conversation` placeholder.
+Reopening it before sending a prompt preserves automatic naming. Its first prompt
 provides an immediate fallback title and starts a stateless `llm-call` job using
 that message alone. Title generation runs concurrently with the agent turn, so
 it does not depend on the turn succeeding. Failure leaves the fallback in
-place, and later messages make no title calls. Using `/title` before the first
-prompt keeps that explicit title instead.
+place, and later messages make no title calls. Using `/title` before the first prompt keeps that explicit title instead.
 
 The launcher starts without code. `--import imports/caos/base` snapshots the
 checkout's current disk contents as a gitlink at that path. Add `--base HEAD`
@@ -234,14 +242,18 @@ require the previous build; this version does not migrate them implicitly.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
 usage. Matches are case-sensitive. Use Up and Down to choose a match, then Tab
-or Enter to complete it with a trailing space. Typing arguments closes the
-menu. Escape dismisses it without changing the prompt. An unrecognized
+or Enter to complete a partial command with a trailing space. Enter runs a
+recognized command when the cursor is at the end of a single-line prompt.
+A partial model name completes first; Enter again applies it. Shift+Enter or
+Ctrl+J always inserts a newline. Typing arguments closes the command menu. Escape dismisses it without changing the prompt. An unrecognized
 slash-prefixed prompt is sent normally.
 
 `Ctrl+Shift+P` or `/commands` opens a searchable command palette without
 changing the current draft. Type any words from an action, use Up and Down to
 choose a match, then press Enter to run it. The palette covers conversation,
-file browsing, activity, tool, help, reload, archive, and selection actions. Escape closes it.
+file browsing, activity, tool, help, reload, archive, and selection actions.
+Escape closes the palette or slash-command menu while an agent turn or
+publication keeps running. With the menu closed, Escape interrupts that work.
 
 Bracketed paste mode keeps pasted newlines inside the prompt instead of
 submitting partial lines. Pastes over 1,000 characters are kept out of the
@@ -262,7 +274,7 @@ step chain when the TUI restarts. If the selection is already on the newest
 step, new activity remains selected. Moving to an older step pauses that
 tail-follow behavior.
 
-Archive the selected conversation from the command palette (`Ctrl+Shift+P`,
+Archive the selected conversation with `/archive` or from the command palette (`Ctrl+Shift+P`,
 then `archive`). Archiving atomically moves only the selected user's
 membership ref from `active` to `archived`; it does not move the conversation
 HEAD or affect other users. A running or publishing conversation must finish
@@ -281,8 +293,11 @@ Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
 selection over the entire rendered interface. Drag across the header, sidebar,
 conversation, activity, diff, help, prompt, or footer to highlight text and copy
 automatically on mouse release. A click without a drag still selects a
-conversation in the sidebar. macOS uses `pbcopy`; other environments receive
-the same text through the standard OSC 52 terminal clipboard sequence.
+conversation in the sidebar. Local macOS sessions use `pbcopy` and show
+“Copied” after it succeeds. SSH sessions and other environments send the same
+text through the standard OSC 52 terminal clipboard sequence and show
+“Copy requested”. A clipboard helper or terminal write failure stays in the
+chat as a command error, preserving the draft. Press `Ctrl+H` for copying help.
 
 For native terminal selection, press `Ctrl+Y`. CAOS releases mouse capture and
 freezes redraws, so dragging and the terminal's normal copy shortcut (`Cmd+C`
@@ -296,7 +311,8 @@ conversation history. Opening and running conversations never overwrite a
 checkout. `/checkout <gitlink> [directory]` uses an explicit destination or
 reuses that gitlink's remembered local directory. The destination must be a clean Git checkout
 or an empty/new directory. The client imports the code objects and detaches HEAD
-at the selected commit. /update-tree commits local edits there and imports their
+at the named commit. `/update-tree <gitlink> <message>` commits local edits in
+that gitlink's remembered checkout and imports their
 closure into the client before submission. These commands never replace the
 internal harness.
 
@@ -316,4 +332,6 @@ means the sequence was sent; terminals can ignore it without acknowledging.
 For manual copying, press `Ctrl+Y`, select text with the terminal, and use its
 Copy action; Escape resumes the TUI. In iTerm2, automatic clipboard writes
 require Settings > General > Selection > Applications in terminal may access
-clipboard.
+clipboard. This setting is required even when CAOS reports “Copy requested”;
+the request has no acknowledgement. If iTerm2's clipboard-access warning was
+previously dismissed, copying can fail silently until the setting is enabled.

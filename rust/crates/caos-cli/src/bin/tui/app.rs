@@ -9,13 +9,13 @@ use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
-    describe_tool_set, first_available_conversation_name, fork_conversation,
-    generate_conversation_title, interrupt_request, invite_user_to_conversation,
-    list_user_conversations, publish_user_conversation, resume_request, run_chat_turn,
-    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
-    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
-    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
-    UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
+    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_request,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
+    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
+    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
+    InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
+    TurnOutcome, TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary,
+    DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -25,6 +25,7 @@ use ratatui_crossterm::crossterm::event::{
 
 use super::args::Args;
 use super::source_tree::{commit_working_tree, load_conversation_source_tree};
+use super::CopyOutcome;
 
 #[path = "filesystem.rs"]
 mod filesystem;
@@ -34,6 +35,11 @@ use filesystem::Browser;
 #[path = "publication.rs"]
 mod publication;
 use publication::PublishPrompt;
+#[path = "input_history.rs"]
+mod input_history;
+use input_history::InputHistory;
+
+const NEW_CONVERSATION_TITLE: &str = "New conversation";
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..7).unwrap_or(hash)
@@ -526,13 +532,12 @@ impl Composer {
         self.move_cursor(self.line_bounds().1, true);
     }
 
-    fn move_vertical(&mut self, up: bool) {
-        self.selection_anchor = None;
+    fn move_vertical(&mut self, up: bool) -> bool {
         let (start, end) = self.line_bounds();
         let column = self.text[start..self.cursor].chars().count();
         let target = if up {
             if start == 0 {
-                return;
+                return false;
             }
             let target_end = start - 1;
             let target_start = self.text[..target_end]
@@ -542,7 +547,7 @@ impl Composer {
             (target_start, target_end)
         } else {
             if end == self.text.len() {
-                return;
+                return false;
             }
             let target_start = end + 1;
             let target_end = self.text[target_start..]
@@ -551,8 +556,10 @@ impl Composer {
                 .unwrap_or(self.text.len());
             (target_start, target_end)
         };
+        self.selection_anchor = None;
         self.cursor = byte_at_column(&self.text, target.0, target.1, column);
         self.snap_cursor_after_placeholder();
+        true
     }
 
     #[cfg(test)]
@@ -812,6 +819,18 @@ impl Composer {
         true
     }
 
+    fn command_ready_to_submit(&self) -> bool {
+        if self.cursor != self.text.len() || self.text.contains(['\n', '\r']) {
+            return false;
+        }
+        let Some((_, arguments)) = parse_command(self.text.trim()) else {
+            return false;
+        };
+        // Enter still expands a partial model choice before running /model.
+        let models = self.model_matches();
+        models.is_empty() || models.contains(&arguments)
+    }
+
     fn dismiss_command_menu(&mut self) -> bool {
         if self.completion_count() == 0 {
             return false;
@@ -878,7 +897,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 12] = [
+const COMMANDS: [Command; 13] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -902,8 +921,8 @@ const COMMANDS: [Command; 12] = [
     },
     Command {
         name: "/update-tree",
-        usage: "/update-tree <message>",
-        description: "fold working-tree edits into the commit",
+        usage: "/update-tree <conversation/gitlink> <message>",
+        description: "submit local edits",
         action: AppAction::UpdateTree,
         takes_argument: true,
     },
@@ -963,6 +982,13 @@ const COMMANDS: [Command; 12] = [
         action: AppAction::Model,
         takes_argument: true,
     },
+    Command {
+        name: "/archive",
+        usage: "/archive",
+        description: "archive the selected conversation",
+        action: AppAction::Archive,
+        takes_argument: false,
+    },
 ];
 
 fn parse_command(message: &str) -> Option<(&'static Command, &str)> {
@@ -1002,6 +1028,7 @@ struct ConversationState {
     selected_source_tree: Option<String>,
     tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
+    input_history: Option<InputHistory>,
     status: String,
     command_error: Option<String>,
     reference_notice: Option<ReferenceNotice>,
@@ -1028,13 +1055,14 @@ struct ConversationState {
 impl ConversationState {
     fn new(id: String, title: String, turn_options: TurnOptions, status: String) -> Self {
         let remote_title = Some(title.clone());
+        let automatic_title = title == NEW_CONVERSATION_TITLE;
         Self {
             id,
             title,
             parent: None,
             remote_title,
             sidebar_attention: None,
-            automatic_title: false,
+            automatic_title,
             automatic_title_fallback_applied: false,
             automatic_title_fallback: None,
             generating_title: false,
@@ -1049,6 +1077,7 @@ impl ConversationState {
             selected_source_tree: None,
             tool_set: None,
             composer: Composer::default(),
+            input_history: None,
             status,
             command_error: None,
             reference_notice: None,
@@ -1082,6 +1111,17 @@ impl ConversationState {
     }
 
     fn apply_load(&mut self, load: ConversationLoad, current_user: &str) {
+        // Only prompts sent to this conversation end its placeholder state:
+        // a fork can inherit messages before receiving its own first prompt.
+        if !self.automatic_title_fallback_applied && load.replay.has_own_user_messages {
+            self.automatic_title = false;
+        }
+        if self.remote_title.is_none()
+            && self.has_placeholder_title()
+            && load.snapshot.title == self.title
+        {
+            self.remote_title = Some(load.snapshot.title.clone());
+        }
         self.publications = load.publications.clone();
         let previous_source_trees = std::mem::take(&mut self.source_trees);
         let previous_selection = self.selected_source_tree.clone();
@@ -1387,6 +1427,7 @@ impl ConversationState {
     }
 
     fn queue_pending_submission(&mut self, text: String) -> u64 {
+        self.input_history = None;
         let id = self.next_pending_submission;
         self.next_pending_submission = self.next_pending_submission.wrapping_add(1);
         self.pending_submissions.push(PendingSubmission {
@@ -1441,6 +1482,7 @@ impl ConversationState {
             return;
         }
         self.discard_pending_submission(id);
+        self.input_history = None;
         self.composer.restore_message(&pending.text);
     }
 
@@ -1458,6 +1500,12 @@ impl ConversationState {
             self.automatic_title_fallback = Some(fallback);
             self.automatic_title_fallback_applied = true;
         }
+    }
+
+    fn has_placeholder_title(&self) -> bool {
+        self.automatic_title
+            && !self.automatic_title_fallback_applied
+            && self.title == NEW_CONVERSATION_TITLE
     }
 
     fn sidebar_text(&self, max_cells: u16) -> (String, String) {
@@ -1728,7 +1776,7 @@ pub(crate) struct App {
     selecting_screen: bool,
     pending_conversation_click: Option<usize>,
     rendered_screen: Option<Buffer>,
-    copy_requested_chars: Option<usize>,
+    copy_notice: Option<(usize, CopyOutcome)>,
     animation_frame: usize,
     enhanced_keyboard: bool,
     remote_polling: bool,
@@ -1867,7 +1915,7 @@ impl App {
             selecting_screen: false,
             pending_conversation_click: None,
             rendered_screen: None,
-            copy_requested_chars: None,
+            copy_notice: None,
             animation_frame: 0,
             enhanced_keyboard: false,
             remote_polling: false,
@@ -1949,11 +1997,17 @@ impl App {
     }
 
     pub(crate) fn clear_copy_notice(&mut self) {
-        self.copy_requested_chars = None;
+        self.copy_notice = None;
     }
 
-    pub(crate) fn note_copy(&mut self, text: &str) {
-        self.copy_requested_chars = Some(text.chars().count());
+    pub(crate) fn note_copy(&mut self, text: &str, result: std::io::Result<CopyOutcome>) {
+        self.copy_notice = None;
+        match result {
+            Ok(outcome) => self.copy_notice = Some((text.chars().count(), outcome)),
+            Err(error) => self.selected_mut().show_command_error_preserving_status(format!(
+                "Copy failed: {error}. Press Ctrl+Y, select text, then use your terminal's Copy action. Escape resumes the chat.",
+            )),
+        }
     }
 
     pub(crate) fn capture_screen(&mut self, buffer: &Buffer) {
@@ -2183,6 +2237,7 @@ impl App {
                     self.selected_mut()
                         .show_command_error(format!("usage: {}", command.usage));
                 } else {
+                    self.selected_mut().input_history = None;
                     self.selected_mut().composer.take_message();
                     self.run_local_command(command, arguments);
                 }
@@ -2213,32 +2268,44 @@ impl App {
         // and ordinary text reach the request path.
         let mut human_tree = None;
         let mut proposal_base = None;
+        let mut source_path = None;
         let message = if let Some((command, arguments)) = parse_command(&raw) {
             debug_assert!(command.action.submits_message());
-            if arguments.is_empty() {
+            let Some((name, message)) = parse_update_tree(arguments) else {
                 self.selected_mut()
                     .show_command_error(format!("usage: {}", command.usage));
                 self.selected_mut().composer.restore_message(&raw);
                 return;
-            }
-            let source_tree = match self.selected().require_selected_source_tree() {
-                Ok(source_tree) => source_tree.head.clone(),
-                Err(error) => {
-                    self.selected_mut().show_command_error(error);
+            };
+            let source_tree = match self
+                .selected()
+                .source_trees
+                .iter()
+                .find(|source| source.name == name)
+            {
+                Some(source) => source.head.clone(),
+                None => {
+                    self.selected_mut()
+                        .show_command_error(format!("no source-tree gitlink at {name:?}"));
+                    self.selected_mut().composer.restore_message(&raw);
                     return;
                 }
             };
-            let committed = self
-                .checkout_selected_source_tree(&source_tree)
-                .and_then(|checkout| {
-                    let (commit, base) = commit_working_tree(arguments, &source_tree, &checkout)?;
-                    super::launcher::import_local_commit(
-                        &checkout,
-                        &self.repo_dir,
-                        &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
-                    )?;
-                    Ok((commit, base))
-                });
+            let committed = super::launcher::checkout_for(
+                &self.repo_dir,
+                &self.selected().id,
+                &name,
+                &source_tree,
+            )
+            .and_then(|checkout| {
+                let (commit, base) = commit_working_tree(message, &source_tree, &checkout)?;
+                super::launcher::import_local_commit(
+                    &checkout,
+                    &self.repo_dir,
+                    &conversation_protocol::v3::Oid::parse(&commit, "local edit")?,
+                )?;
+                Ok((commit, base))
+            });
             match committed {
                 Ok((tree, base)) => {
                     human_tree = Some(tree);
@@ -2249,11 +2316,18 @@ impl App {
                     return;
                 }
             }
-            arguments.to_string()
+            source_path = Some(name);
+            message.to_string()
         } else {
             raw
         };
-        self.send_message(self.selected, message, human_tree, proposal_base);
+        self.send_message(
+            self.selected,
+            message,
+            human_tree,
+            proposal_base,
+            source_path,
+        );
     }
 
     fn send_message(
@@ -2262,6 +2336,7 @@ impl App {
         message: String,
         human_tree: Option<String>,
         proposal_base: Option<String>,
+        source_path: Option<String>,
     ) {
         let interjecting = self.conversations[index].running;
         let should_generate_title = !interjecting
@@ -2300,9 +2375,7 @@ impl App {
 
         let tx = self.tx.clone();
         let mut options = self.conversations[index].turn_options.clone();
-        options.source_tree = human_tree
-            .as_ref()
-            .and(self.conversations[index].selected_source_tree.clone());
+        options.source_tree = source_path;
         let conversation = self.conversations[index].id.clone();
         let repo_dir = self.repo_dir.clone();
         if should_generate_title {
@@ -2428,7 +2501,9 @@ impl App {
     fn run_local_command(&mut self, command: &Command, arguments: &str) {
         debug_assert!(!command.action.submits_message());
         match command.action {
-            AppAction::Help | AppAction::Commands => self.execute_action(command.action),
+            AppAction::Help | AppAction::Commands | AppAction::Archive => {
+                self.execute_action(command.action)
+            }
             AppAction::Reference => self.show_selected_ref(),
             AppAction::Invite => self.invite_selected(arguments),
             AppAction::Import => self.run_import(arguments),
@@ -2460,7 +2535,6 @@ impl App {
             | AppAction::Activity
             | AppAction::Tools
             | AppAction::Reload
-            | AppAction::Archive
             | AppAction::SelectionLock => unreachable!("palette-only action has no slash command"),
         }
     }
@@ -2851,7 +2925,7 @@ impl App {
                         match result {
                             Ok((message, load)) => {
                                 self.conversations[index].apply_load(*load, &self.user);
-                                self.send_message(index, message, None, None);
+                                self.send_message(index, message, None, None, None);
                             }
                             Err(error) => self.conversations[index].show_command_error(error),
                         }
@@ -2966,11 +3040,11 @@ impl App {
                     continue;
                 }
                 if state.remote_title.as_deref() != Some(entry.summary.title.as_str()) {
-                    let first_automatic_publication = state.generating_title
-                        && state.automatic_title
+                    let first_automatic_publication = state.automatic_title
                         && entry.observed_title.is_none()
-                        && state.automatic_title_fallback.as_deref()
-                            == Some(entry.summary.title.as_str());
+                        && (state.title == entry.summary.title
+                            || state.automatic_title_fallback.as_deref()
+                                == Some(entry.summary.title.as_str()));
                     state.remote_title = Some(entry.summary.title.clone());
                     if !first_automatic_publication {
                         state.title = entry.summary.title.clone();
@@ -2989,6 +3063,10 @@ impl App {
                     changed = true;
                 }
             } else if let Some(Ok(load)) = entry.load {
+                // A poll begun before a local archive must not reopen that row.
+                if entry.observed_head.is_some() || entry.observed_title.is_some() {
+                    continue;
+                }
                 let mut state = ConversationState::new(
                     entry.summary.id.clone(),
                     entry.summary.title,
@@ -3208,12 +3286,13 @@ impl App {
         if !state.automatic_title {
             return;
         }
+        // The first message gets one title request, including when that request fails.
+        state.automatic_title = false;
         let title = match result {
             Ok(title) => title,
             Err(_) => return,
         };
-        state.automatic_title = false;
-        if state.current_hash().is_some() {
+        if !state.virtual_conversation {
             let Some(expected) = state
                 .remote_title
                 .clone()
@@ -3281,10 +3360,6 @@ impl App {
             }
             return;
         }
-        if key.code == KeyCode::Esc && (self.selected().running || self.selected().publishing) {
-            self.interrupt_selected();
-            return;
-        }
         let is_palette = key
             .modifiers
             .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
@@ -3297,11 +3372,22 @@ impl App {
             self.handle_palette_key(key);
             return;
         }
+        if key.code == KeyCode::Esc {
+            // Dismiss visible command menus before interrupting background work.
+            if self.view == View::Chat && self.selected_mut().dismiss_command_menu() {
+                return;
+            }
+            if self.selected().running || self.selected().publishing {
+                self.interrupt_selected();
+                return;
+            }
+        }
         if key.code == KeyCode::Esc && self.selected().reference_notice.is_some() {
             self.selected_mut().reference_notice = None;
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.selected_mut().input_history = None;
             if !self.selected_mut().composer.clear() {
                 self.should_quit = true;
             }
@@ -3439,15 +3525,16 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if !self.selected_mut().complete_command() {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.selected_mut().composer.insert_char('\n');
+                } else if self.selected().composer.command_ready_to_submit() {
+                    self.start_turn();
+                } else if !self.selected_mut().complete_command() {
                     self.selected_mut().composer.insert_char('\n');
                 }
             }
             KeyCode::Tab => {
                 self.selected_mut().complete_command();
-            }
-            KeyCode::Esc => {
-                self.selected_mut().dismiss_command_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.selected_mut().composer.insert_char('\n')
@@ -3486,12 +3573,12 @@ impl App {
             KeyCode::Right => self.selected_mut().composer.move_right(),
             KeyCode::Up => {
                 if !self.selected_mut().select_command(-1) {
-                    self.selected_mut().composer.move_vertical(true);
+                    self.navigate_input(true);
                 }
             }
             KeyCode::Down => {
                 if !self.selected_mut().select_command(1) {
-                    self.selected_mut().composer.move_vertical(false);
+                    self.navigate_input(false);
                 }
             }
             KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -3690,16 +3777,8 @@ impl App {
                 return;
             }
         };
-        // Name the conversation from the ones already loaded in memory rather
-        // than re-listing the user's whole active+archived set from the server.
-        // `list_user_conversations` fetches every conversation's head object and
-        // title blob over the network, so doing it on each Ctrl+N made starting
-        // a conversation slower the more conversations you had accumulated. The
-        // default title only has to be unique among the conversations you can
-        // see, and the minted id is content-unique regardless of the title.
-        let title = first_available_conversation_name(
-            self.conversations.iter().map(|item| item.title.as_str()),
-        );
+        // Display titles can repeat; the minted ID supplies conversation identity.
+        let title = NEW_CONVERSATION_TITLE.to_string();
         let id = match fresh_conversation_id(&transport, &self.user) {
             Ok(id) => id,
             Err(error) => {
@@ -3800,11 +3879,7 @@ impl App {
             return;
         }
         let replacement = if self.conversations.len() == 1 {
-            let title = first_available_conversation_name(
-                self.conversations
-                    .iter()
-                    .map(|conversation| conversation.title.as_str()),
-            );
+            let title = NEW_CONVERSATION_TITLE.to_string();
             let id = match self
                 .transport()
                 .and_then(|transport| fresh_conversation_id(&transport, &self.user))
@@ -3839,7 +3914,7 @@ impl App {
         } else {
             None
         };
-        if self.selected().current_hash().is_some() {
+        if !self.selected().virtual_conversation {
             let result = self.transport().and_then(|transport| {
                 archive_user_conversation(&transport, &self.user, &self.selected().id)
             });
@@ -3874,7 +3949,7 @@ impl App {
                 .show_command_error("conversation title must be one line");
             return;
         }
-        let published = self.selected().current_hash().is_some();
+        let published = !self.selected().virtual_conversation;
         if published {
             let id = self.selected().id.clone();
             if let Err(error) = self
@@ -3889,11 +3964,9 @@ impl App {
         state.title = title.to_string();
         if published {
             state.remote_title = Some(title.to_string());
-        }
-        state.automatic_title = false;
-        if published {
             state.automatic_title_fallback = None;
         }
+        state.automatic_title = false;
         state.status = format!("renamed conversation to {title:?}");
     }
 
@@ -3914,11 +3987,6 @@ impl App {
             .transport()
             .and_then(|transport| describe_tool_set(&transport, &name, &options));
         self.selected_mut().tool_set = Some(result);
-    }
-
-    fn checkout_selected_source_tree(&self, head: &str) -> Result<PathBuf, String> {
-        let source = self.selected().require_selected_source_tree()?;
-        super::launcher::checkout_for(&self.repo_dir, &self.selected().id, &source.name, head)
     }
 
     fn run_checkout(&mut self, arguments: &str) {
@@ -3980,7 +4048,6 @@ impl App {
         match result {
             Ok(status) => {
                 let state = self.selected_mut();
-                let _ = state.select_source_tree(&parts[0]);
                 state.command_error = None;
                 state.status = status.clone();
                 state.push_info(status);
@@ -3988,6 +4055,21 @@ impl App {
             Err(error) => self.selected_mut().show_command_error(error),
         }
     }
+}
+
+// Parse only the path as a shell word; the message is ordinary prose.
+fn parse_update_tree(arguments: &str) -> Option<(String, &str)> {
+    arguments
+        .char_indices()
+        .filter(|(_, ch)| ch.is_whitespace())
+        .find_map(|(end, _)| {
+            let words = shell_words::split(&arguments[..end]).ok()?;
+            let message = arguments[end..].trim();
+            match words.as_slice() {
+                [path] if !path.is_empty() && !message.is_empty() => Some((path.clone(), message)),
+                _ => None,
+            }
+        })
 }
 
 fn screen_point(column: u16, row: u16, area: Rect) -> TranscriptPoint {
@@ -4064,11 +4146,7 @@ fn choose_conversation(
     }
     Ok(ConversationChoice::New {
         id: None,
-        title: first_available_conversation_name(
-            conversations
-                .iter()
-                .map(|conversation| conversation.title.as_str()),
-        ),
+        title: NEW_CONVERSATION_TITLE.to_string(),
     })
 }
 
@@ -4076,7 +4154,9 @@ fn choose_conversation(
 mod tests {
 
     use super::*;
-    use caos_cli::{conversation_head, conversation_ref, ConversationReplay};
+    use caos_cli::{
+        conversation_head, conversation_ref, first_available_conversation_name, ConversationReplay,
+    };
     use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
@@ -4105,8 +4185,17 @@ mod tests {
         }
     }
 
-    fn state(name: &str) -> ConversationState {
+    pub(super) fn state(name: &str) -> ConversationState {
         ConversationState::new(
+            name.to_string(),
+            name.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        )
+    }
+
+    fn virtual_state(name: &str) -> ConversationState {
+        ConversationState::new_virtual(
             name.to_string(),
             name.to_string(),
             TurnOptions::default(),
@@ -4322,7 +4411,7 @@ mod tests {
         }
     }
 
-    fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
+    pub(super) fn app_with(conversations: Vec<ConversationState>) -> (App, Sender<UiMessage>) {
         let (tx, rx) = mpsc::channel();
         (
             App {
@@ -4337,7 +4426,7 @@ mod tests {
                 selecting_screen: false,
                 pending_conversation_click: None,
                 rendered_screen: None,
-                copy_requested_chars: None,
+                copy_notice: None,
                 animation_frame: 0,
                 enhanced_keyboard: false,
                 remote_polling: false,
@@ -4374,6 +4463,7 @@ mod tests {
                 error: None,
             },
             replay: ConversationReplay {
+                has_own_user_messages: false,
                 turns: Vec::new(),
                 activity: Vec::new(),
             },
@@ -4450,7 +4540,7 @@ mod tests {
     }
 
     #[test]
-    fn update_tree_refuses_an_ambiguous_source_tree() {
+    fn update_tree_requires_an_explicit_source_tree() {
         let mut conversation = state("talk-1");
         conversation.source_trees = vec![
             source_tree_diff("main", 'a', 'b', ""),
@@ -4465,9 +4555,18 @@ mod tests {
 
         assert_eq!(
             app.selected().command_error.as_deref(),
-            Some("choose a source tree; available source trees: main, side")
+            Some("no source-tree gitlink at \"include\"")
         );
         assert!(!app.selected().running);
+        assert_eq!(
+            parse_update_tree("feature/01-change don't drop \"quotes\""),
+            Some(("feature/01-change".into(), "don't drop \"quotes\""))
+        );
+        assert_eq!(
+            parse_update_tree("\"feature with spaces/01-change\" edit this"),
+            Some(("feature with spaces/01-change".into(), "edit this"))
+        );
+        assert_eq!(parse_update_tree("feature/01-change"), None);
     }
 
     fn wait_for_fork(app: &mut App, id: &str) -> bool {
@@ -4707,6 +4806,130 @@ mod tests {
     }
 
     #[test]
+    fn unprompted_conversations_keep_auto_naming_after_reload_and_poll() {
+        let mut load = load_with_source_trees(Vec::new());
+        load.snapshot.id = "stable-id".to_string();
+        load.snapshot.title = NEW_CONVERSATION_TITLE.to_string();
+        let mut conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_load(load.clone(), "tester");
+        assert_eq!(
+            conversation.remote_title.as_deref(),
+            Some(NEW_CONVERSATION_TITLE)
+        );
+        assert!(conversation.automatic_title);
+
+        let (mut app, _) = app_with(vec![ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        )]);
+        app.apply_remote_poll(vec![RemotePollEntry {
+            summary: UserConversationSummary {
+                id: "stable-id".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
+                head: load.snapshot.head.clone(),
+                updated_unix: 1,
+                parent: None,
+            },
+            observed_head: None,
+            observed_title: None,
+            load: Some(Ok(Box::new(load.clone()))),
+        }]);
+        assert!(app.selected().automatic_title);
+        app.selected_mut()
+            .apply_automatic_title("Name the first prompt");
+        assert_eq!(app.selected().title, "Name the first prompt");
+
+        let mut reopened = ConversationState::new(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        reopened.apply_load(load.clone(), "tester");
+        assert!(reopened.has_placeholder_title());
+        reopened.apply_automatic_title("Name after reopening");
+        assert_eq!(reopened.title, "Name after reopening");
+
+        // A saved conversation can have this literal title without being a placeholder.
+        load.replay.has_own_user_messages = true;
+        load.replay.turns.push(caos_cli::ConversationTurn {
+            commit: "a".repeat(40),
+            author: "tester".to_string(),
+            role: ConversationRole::Human,
+            model: None,
+            message: "Earlier prompt".to_string(),
+        });
+        let mut named = ConversationState::new(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        named.apply_load(load, "tester");
+        assert!(!named.has_placeholder_title());
+        named.apply_automatic_title("A later prompt");
+        assert_eq!(named.title, NEW_CONVERSATION_TITLE);
+    }
+
+    #[test]
+    fn title_generation_failure_keeps_fallback_without_retrying_later_messages() {
+        let mut conversation = ConversationState::new_virtual(
+            "stable-id".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        conversation.apply_automatic_title("First message fallback");
+        conversation.generating_title = true;
+        let (mut app, _) = app_with(vec![conversation]);
+
+        app.finish_title_generation(0, Err("title worker unavailable".to_string()));
+        assert_eq!(app.selected().title, "First message fallback");
+        assert!(!app.selected().generating_title);
+        assert!(!app.selected().automatic_title);
+        app.selected_mut().apply_automatic_title("Later message");
+        assert_eq!(app.selected().title, "First message fallback");
+    }
+
+    #[test]
+    fn fresh_conversation_placeholders_are_dimmed_in_header_and_sidebar() {
+        let conversation = ConversationState::new_virtual(
+            "internal-identity".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        let (app, _) = app_with(vec![conversation]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut occurrences = 0;
+        for row in 0..buffer.area.height {
+            let text = (0..buffer.area.width)
+                .map(|column| buffer[(column, row)].symbol())
+                .collect::<String>();
+            assert!(!text.contains("internal-identity"));
+            if let Some(column) = text.find(NEW_CONVERSATION_TITLE) {
+                assert!(
+                    buffer[(text[..column].cell_width(), row)]
+                        .modifier
+                        .contains(Modifier::DIM),
+                    "placeholder is not dimmed in row {row}"
+                );
+                occurrences += 1;
+            }
+        }
+        assert_eq!(occurrences, 2);
+    }
+
+    #[test]
     fn first_message_title_result_replaces_the_fallback_only_once() {
         let mut conversation = ConversationState::new_virtual(
             "internal-id".to_string(),
@@ -4925,7 +5148,8 @@ mod tests {
                 "/publish-branch",
                 "/ref",
                 "/invite",
-                "/model"
+                "/model",
+                "/archive"
             ]
         );
 
@@ -5000,9 +5224,10 @@ mod tests {
         assert_eq!(command.action, AppAction::Model);
         assert_eq!(arguments, "claude-sonnet-5");
 
-        let (command, arguments) = parse_command("/update-tree include this text").unwrap();
+        let (command, arguments) =
+            parse_command("/update-tree feature/01-change include this text").unwrap();
         assert_eq!(command.action, AppAction::UpdateTree);
-        assert_eq!(arguments, "include this text");
+        assert_eq!(arguments, "feature/01-change include this text");
 
         let (command, arguments) = parse_command("/help").unwrap();
         assert_eq!(command.action, AppAction::Help);
@@ -5014,6 +5239,84 @@ mod tests {
 
         assert!(parse_command("/future server convention").is_none());
         assert!(parse_command("/titlecard").is_none());
+        assert!(parse_command("/rename A title").is_none());
+    }
+
+    #[test]
+    fn enter_runs_recognized_commands_at_the_end_of_the_prompt() {
+        let (mut app, _) = app_with(vec![virtual_state("talk-1")]);
+        app.selected_mut().composer.insert_str("/help");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.view, View::Help);
+        assert!(app.selected().composer.text.is_empty());
+        assert!(!app.selected().running);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.selected_mut()
+            .composer
+            .insert_str("/title A useful title");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().title, "A useful title");
+        assert!(app.selected().composer.text.is_empty());
+    }
+
+    #[test]
+    fn enter_validates_known_commands_and_completes_partial_commands() {
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/tit");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title ");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /title <new title>")
+        );
+        assert_eq!(app.selected().composer.text, "/title ");
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/model sonnet-5");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/model claude-sonnet-5 ");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.selected().turn_options.model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert!(app.selected().composer.text.is_empty());
+    }
+
+    #[test]
+    fn enter_keeps_newlines_for_text_and_edits_inside_commands() {
+        for message in [
+            "ordinary text",
+            "/future unknown command",
+            "/title first\nsecond",
+        ] {
+            let (mut app, _) = app_with(vec![state("talk-1")]);
+            app.selected_mut().composer.insert_str(message);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.selected().composer.text, format!("{message}\n"));
+            assert!(!app.selected().running);
+        }
+
+        let (mut app, _) = app_with(vec![state("talk-1")]);
+        app.selected_mut().composer.insert_str("/title title");
+        app.selected_mut().composer.move_left();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "/title titl\ne");
+        assert_eq!(app.selected().title, "talk-1");
+
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            app.selected_mut().composer = Composer::default();
+            app.selected_mut().composer.insert_str("/title title");
+            app.handle_key(key);
+            assert_eq!(app.selected().composer.text, "/title title\n");
+            assert_eq!(app.selected().title, "talk-1");
+        }
     }
 
     #[test]
@@ -5149,7 +5452,7 @@ mod tests {
         assert!(rendered.contains("> /from <commit> — start a conversation from a completed turn"));
         assert!(rendered.contains("/title <new title> — rename the selected conversation"));
         assert!(
-            rendered.contains("/update-tree <message> — fold working-tree edits into the commit")
+            rendered.contains("/update-tree <conversation/gitlink> <message> — submit local edits")
         );
 
         app.selected_mut().composer = Composer::default();
@@ -5201,6 +5504,93 @@ mod tests {
         assert!(app.palette.is_none());
         assert!(app.browser_visible());
         assert_eq!(app.selected().composer.text, "keep this draft");
+    }
+
+    #[test]
+    fn escape_closes_command_palette_before_interrupting_work() {
+        for (running, publishing) in [(false, false), (true, false), (false, true)] {
+            let mut conversation = state("palette-escape");
+            conversation.running = running;
+            conversation.publishing = publishing;
+            conversation.composer.insert_str("keep this draft");
+            let cancel = Arc::new(AtomicBool::new(false));
+            if publishing {
+                conversation.publication_cancel = Some(cancel.clone());
+            }
+            let (mut app, _) = app_with(vec![conversation]);
+            app.repo_dir = std::env::temp_dir().join(format!(
+                "missing-caos-palette-escape-test-repo-{}",
+                std::process::id()
+            ));
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ));
+            for ch in "help".chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            assert_eq!(
+                app.palette.as_ref().unwrap().selected_action(),
+                Some(AppAction::Help)
+            );
+            assert!(rendered_screen(&app).contains("Command palette"));
+
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+            assert!(app.palette.is_none());
+            assert!(!rendered_screen(&app).contains("Command palette"));
+            assert_eq!(app.view, View::Chat);
+            assert_eq!(app.selected().composer.text, "keep this draft");
+            assert_eq!(app.selected().status, "ready");
+            assert_eq!(app.selected().running, running);
+            assert_eq!(app.selected().publishing, publishing);
+            assert!(!app.selected().interrupting);
+            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(!app.should_quit());
+
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.selected().interrupting, running);
+            assert_eq!(
+                cancel.load(std::sync::atomic::Ordering::Relaxed),
+                publishing
+            );
+        }
+    }
+
+    #[test]
+    fn escape_dismisses_slash_completions_before_interrupting_work() {
+        for (running, publishing) in [(true, false), (false, true)] {
+            for draft in ["/", "/model son"] {
+                let mut conversation = state("completion-escape");
+                conversation.running = running;
+                conversation.publishing = publishing;
+                conversation.composer.insert_str(draft);
+                let cancel = Arc::new(AtomicBool::new(false));
+                if publishing {
+                    conversation.publication_cancel = Some(cancel.clone());
+                }
+                let (mut app, _) = app_with(vec![conversation]);
+                app.repo_dir = std::env::temp_dir().join(format!(
+                    "missing-caos-completion-escape-test-repo-{}",
+                    std::process::id()
+                ));
+                assert!(app.selected().composer.completion_count() > 0);
+
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+                assert_eq!(app.selected().composer.completion_count(), 0);
+                assert_eq!(app.selected().composer.text, draft);
+                assert!(!app.selected().interrupting);
+                assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(app.selected().interrupting, running);
+                assert_eq!(
+                    cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    publishing
+                );
+            }
+        }
     }
 
     #[test]
@@ -5410,6 +5800,7 @@ mod tests {
     fn escape_interrupts_before_list_or_view_navigation() {
         let mut running = state("talk-1");
         running.running = true;
+        running.composer.insert_str("/");
         let (mut app, _) = app_with(vec![running]);
         app.repo_dir = std::env::temp_dir().join(format!(
             "missing-caos-interrupt-test-repo-{}",
@@ -5436,7 +5827,7 @@ mod tests {
             choose_conversation(None, true, &conversations).unwrap(),
             ConversationChoice::New {
                 id: None,
-                title: "talk-2".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
             }
         );
         assert!(choose_conversation(Some("recent"), true, &conversations).is_err());
@@ -5471,7 +5862,7 @@ mod tests {
             choose_conversation(None, true, &conversations).unwrap(),
             ConversationChoice::New {
                 id: None,
-                title: "talk-1".to_string(),
+                title: NEW_CONVERSATION_TITLE.to_string(),
             }
         );
     }
@@ -6006,6 +6397,56 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_status_distinguishes_confirmed_copy_and_unacknowledged_request() {
+        let (mut app, _) = app_with(vec![state("copy-status")]);
+        app.note_copy("é", Ok(CopyOutcome::Copied));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Copied 1 char"));
+        assert!(!rendered.contains("Copy requested"));
+
+        app.note_copy("é", Ok(CopyOutcome::Requested));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Copy requested: 1 char"));
+        assert!(rendered.contains("^Y manual, ^H help"));
+        assert!(!rendered.contains("Copied 1 char"));
+        app.clear_copy_notice();
+        assert!(app.copy_notice.is_none());
+    }
+
+    #[test]
+    fn clipboard_error_preserves_chat_and_draft_and_offers_manual_copy() {
+        let (mut app, _) = app_with(vec![state("copy-failure")]);
+        app.selected_mut().composer.insert_str("unfinished draft");
+        app.selected_mut().running = true;
+        app.selected_mut().status = "reading files".to_string();
+        let transcript_len = app.selected().transcript.len();
+        app.note_copy("text", Err(std::io::Error::other("clipboard unavailable")));
+        assert!(!app.should_quit());
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+        assert!(app.selected().running);
+        assert_eq!(app.selected().status, "reading files");
+        assert_eq!(app.selected().transcript.len(), transcript_len);
+        assert!(app.copy_notice.is_none());
+        let error = app.selected().command_error.as_deref().unwrap();
+        assert!(error.contains("clipboard unavailable"));
+        assert!(error.contains("Ctrl+Y"));
+    }
+
+    #[test]
+    fn clipboard_help_and_native_selection_explain_how_to_copy() {
+        let (mut app, _) = app_with(vec![state("copy-help")]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        let rendered = rendered_screen(&app);
+        assert!(rendered.contains("Settings > General > Selection"));
+        assert!(rendered.contains("Applications in terminal may access clipboard"));
+        assert!(rendered.contains("Manual copy: Ctrl+Y"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.selection_locked());
+        assert!(rendered_screen(&app).contains("Manual copy: drag text"));
+    }
+
+    #[test]
     fn mouse_drag_selects_visible_transcript_text_for_copy() {
         let mut selected = state("talk-1");
         selected.transcript.push(TranscriptEntry {
@@ -6035,7 +6476,7 @@ mod tests {
             app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 29, 2), area),
             MouseAction::Copy("You".to_string())
         );
-        app.note_copy("You");
+        app.note_copy("You", Ok(CopyOutcome::Requested));
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6055,7 +6496,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(footer.ends_with(" Copy requested: 3 chars (Ctrl+Y: manual) "));
+        assert!(footer.ends_with(" Copy requested: 3 chars (^Y manual, ^H help) "));
     }
 
     #[test]
@@ -6454,7 +6895,7 @@ mod tests {
         app.conversations[0].automatic_title = false;
         app.conversations[0].composer.insert_str("first draft");
         app.conversations[1].composer.insert_str("second draft");
-        app.send_message(0, "Integrate the imported PR base".into(), None, None);
+        app.send_message(0, "Integrate the imported PR base".into(), None, None, None);
         assert_eq!(app.selected().id, "talk-2");
         assert_eq!(app.conversations[0].composer.text, "first draft");
         assert_eq!(app.conversations[1].composer.text, "second draft");
@@ -6588,6 +7029,7 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
+                    has_own_user_messages: false,
                     turns: vec![
                         caos_cli::ConversationTurn {
                             commit: "e".repeat(40),
@@ -6733,6 +7175,7 @@ mod tests {
                     error: None,
                 },
                 replay: ConversationReplay {
+                    has_own_user_messages: false,
                     turns: Vec::new(),
                     activity: Vec::new(),
                 },
@@ -6976,7 +7419,123 @@ mod tests {
         assert!(!rendered.contains("ready"));
     }
 
-    // Archiving has no key binding; it runs through the command palette.
+    #[test]
+    fn slash_archive_removes_selected_conversation_without_sending_a_message() {
+        let (mut app, _) = app_with(vec![virtual_state("talk-1"), virtual_state("talk-2")]);
+        app.selected_mut().composer.insert_str("/archive");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().id, "talk-2");
+        assert!(app.selected().transcript.is_empty());
+        assert!(!app.selected().running);
+    }
+
+    #[test]
+    fn slash_archive_rejects_arguments_and_preserves_busy_conversations() {
+        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2")]);
+        app.selected_mut().composer.insert_str("/archive extra");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().composer.text, "/archive extra");
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /archive")
+        );
+
+        app.selected_mut().composer = Composer::default();
+        app.selected_mut().composer.insert_str("/archive");
+        app.selected_mut().running = true;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.selected().id, "talk-1");
+        assert!(app
+            .selected()
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("before archiving"));
+    }
+
+    #[test]
+    fn slash_archive_persists_before_the_first_prompt_and_ignores_stale_polls() {
+        let (repo, remote, _) = repo_with_default_branch("archive-before-prompt", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let options = TurnOptions {
+            username: Some("Alice".to_string()),
+            ..TurnOptions::default()
+        };
+        let id = "unprompted";
+        caos_cli::create_conversation(&transport, &options, id, "Imported project").unwrap();
+        publish_user_conversation(&transport, "Bob", id).unwrap();
+        let mut conversation = ConversationState::new(
+            id.to_string(),
+            "Imported project".to_string(),
+            options,
+            "ready".to_string(),
+        );
+        conversation.reload(&transport, "Alice").unwrap();
+        assert!(conversation.current_hash().is_none());
+        let head = conversation.remote_head.clone().unwrap();
+        let stale = RemotePollEntry {
+            summary: UserConversationSummary {
+                id: id.to_string(),
+                title: conversation.title.clone(),
+                head: head.clone(),
+                updated_unix: 1,
+                parent: None,
+            },
+            observed_head: conversation.remote_head.clone(),
+            observed_title: conversation.remote_title.clone(),
+            load: Some(Ok(Box::new(
+                conversation_load(&transport, id).unwrap().unwrap(),
+            ))),
+        };
+        let (mut app, _) = app_with(vec![conversation, state("other")]);
+        app.repo_dir = repo.clone();
+        app.user = "Alice".to_string();
+        app.remote_polling = true;
+        app.select(0);
+        assert!(app.selected().remote_head.is_none());
+        assert!(!app.selected().virtual_conversation);
+        app.selected_mut().composer.insert_str("/archive");
+        app.start_turn();
+
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.selected().id, "other");
+        assert!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_user_conversations(&transport, "Alice", UserConversationStatus::Archived).unwrap()
+                [0]
+            .id,
+            id
+        );
+        assert_eq!(
+            list_user_conversations(&transport, "Bob", UserConversationStatus::Active).unwrap()[0]
+                .id,
+            id
+        );
+        assert_eq!(
+            conversation_load(&transport, id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .head,
+            head
+        );
+        assert!(!app.apply_remote_poll(vec![stale]));
+        assert_eq!(app.conversations.len(), 1);
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
+    }
+
+    // Archiving is also available through the command palette.
     fn archive_via_palette(app: &mut App) {
         app.handle_key(KeyEvent::new(
             KeyCode::Char('P'),
@@ -6991,7 +7550,11 @@ mod tests {
 
     #[test]
     fn palette_archive_removes_virtual_conversations_and_replaces_the_last_one() {
-        let (mut app, _) = app_with(vec![state("talk-1"), state("talk-2"), state("talk-3")]);
+        let (mut app, _) = app_with(vec![
+            virtual_state("talk-1"),
+            virtual_state("talk-2"),
+            virtual_state("talk-3"),
+        ]);
         // Replacing the last conversation mints a fresh id through the
         // transport, so point the app at a real (scratch) repo.
         let (dir, remote, _tip) = repo_with_default_branch("palette-archive", "main");
@@ -7013,7 +7576,7 @@ mod tests {
 
         archive_via_palette(&mut app);
         assert_eq!(app.conversations.len(), 1);
-        assert_eq!(app.selected().title, "talk-2");
+        assert_eq!(app.selected().title, NEW_CONVERSATION_TITLE);
         assert_ne!(app.selected().id, app.selected().title);
         assert_eq!(app.selected().turn_options.base.as_deref(), None);
         assert!(app.selected().remote_head.is_none());
@@ -7077,6 +7640,49 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert_eq!(app.selected().id, "talk-1");
         assert_eq!(app.selected().composer.text, "2");
+    }
+
+    #[test]
+    fn input_history_keys_recall_own_saved_messages_and_restore_the_draft() {
+        let (repo, remote, _) = repo_with_default_branch("input-history", "main");
+        git_ok(&repo, &["remote", "add", "caos", &remote.to_string_lossy()]);
+        seed_idle_conversation(&repo, "history", "tester", "saved prompt");
+        let transport = GitTransport::discover(&repo).unwrap();
+        let mut reopened = state("history");
+        assert!(reopened.reload(&transport, "tester").is_some());
+        reopened.composer.insert_str("unfinished draft");
+        let (mut app, _) = app_with(vec![reopened, state("another")]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "saved prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.selected_mut().composer.clear();
+        app.selected_mut().composer.insert_str("/title");
+        app.start_turn();
+        assert_eq!(
+            app.selected().command_error.as_deref(),
+            Some("usage: /title <new title>")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected().composer.text, "unfinished draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.selected().composer.text.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.selected().id, "another");
+        assert!(app.selected().composer.text.is_empty());
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -7170,10 +7776,10 @@ mod tests {
     }
 
     #[test]
-    fn title_command_does_not_change_conversation_identity() {
+    fn title_command_preserves_identity_and_overrides_automatic_titles() {
         let conversation = ConversationState::new_virtual(
             "stable-id".to_string(),
-            "talk-1".to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
             TurnOptions::default(),
             "ready".to_string(),
         );
@@ -7188,7 +7794,52 @@ mod tests {
         assert_eq!(app.selected().title, "Mutable title");
         app.selected_mut()
             .apply_automatic_title("This prompt must not replace it");
+        app.finish_title_generation(0, Ok("Late automatic title".to_string()));
         assert_eq!(app.selected().title, "Mutable title");
+        assert!(!app.selected().has_placeholder_title());
+    }
+
+    #[test]
+    fn title_saves_an_unprompted_durable_conversation() {
+        let (repo, remote, _) = repo_with_default_branch("rename-before-prompt", "main");
+        git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
+        let transport = GitTransport::discover(&repo).unwrap();
+        let options = TurnOptions {
+            username: Some("Alice".to_string()),
+            ..TurnOptions::default()
+        };
+        let id = "unprompted";
+        caos_cli::create_conversation(&transport, &options, id, NEW_CONVERSATION_TITLE).unwrap();
+        let mut conversation = ConversationState::new(
+            id.to_string(),
+            NEW_CONVERSATION_TITLE.to_string(),
+            options,
+            "ready".to_string(),
+        );
+        conversation.reload(&transport, "Alice").unwrap();
+        assert!(conversation.current_hash().is_none());
+        assert!(conversation.remote_head.is_some());
+        let (mut app, _) = app_with(vec![conversation]);
+        app.repo_dir = repo.clone();
+        app.remote_polling = true;
+        app.select(0);
+        assert!(app.selected().remote_head.is_none());
+        assert!(!app.selected().virtual_conversation);
+        app.selected_mut().composer.insert_str("/title My project");
+        app.start_turn();
+
+        assert!(app.selected().command_error.is_none());
+        assert_eq!(app.selected().title, "My project");
+        assert_eq!(
+            conversation_snapshot(&transport, id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "My project"
+        );
+
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]
@@ -7528,6 +8179,30 @@ mod tests {
         app.start_new_conversation(Some(source));
         let fork_id = app.selected().id.clone();
         assert!(wait_for_fork(&mut app, &fork_id));
+        for _ in 0..2 {
+            app.selected_mut().reload(&transport, "Alice").unwrap();
+            assert!(app.selected().automatic_title);
+        }
+        let load = conversation_load(&transport, &fork_id).unwrap().unwrap();
+        assert!(!load.replay.has_own_user_messages);
+        assert!(
+            conversation_load(&transport, "original")
+                .unwrap()
+                .unwrap()
+                .replay
+                .has_own_user_messages
+        );
+        let mut reopened = ConversationState::new(
+            fork_id.clone(),
+            load.snapshot.title.clone(),
+            TurnOptions::default(),
+            "ready".to_string(),
+        );
+        reopened.apply_load(load, "Alice");
+        assert!(reopened.has_placeholder_title());
+        reopened.apply_automatic_title("Prompt after reopening a fork");
+        assert_eq!(reopened.title, "Prompt after reopening a fork");
+
         let placeholder = app.selected().title.clone();
         app.selected_mut()
             .apply_automatic_title("fallback from the first prompt");

@@ -1,30 +1,12 @@
-//! The built-in git-history tools — `log`, `show`, `diff`. Standard tools
-//! shipped with the harness (not project `caos-tools/<name>/`), so every stack
-//! that can run tree tools gets them.
-//!
-//! They are ordinary sub-run tools, launched exactly like a tree tool: the
-//! script (this module's embedded shell) rides curried on the std/bash image,
-//! with the `@git` context — the source tree commit `wc` and the ref snapshot
-//! `refs` — bound alongside the model's args. From `wc` the shell walks the
-//! commit graph by hash and shells out to `diff`; no git binary, no new image.
-//! The result is a VALUE (a text report), rendered by the same callback arm as
-//! a tree tool's.
-//!
-//! The scripts are baked into the binary (`include_str!`) rather than published
-//! into std: assembling `lib + <command>` and `caos put`ting it at launch keeps
-//! the whole feature inside the harness, with nothing to plumb through
-//! build-builtins.sh or the chat client.
+//! Read-only history tools over the existing Git store.
 
+use conversation_protocol::v3::git_store::HistoryQuery;
+use conversation_protocol::v3::{GitStore, ObjectStore, Oid};
 use serde_json::Value;
 
 use crate::tools::{builtin_tool, tree_tool_declaration, TreeTool};
 
-const LIB: &str = include_str!("githist/lib.sh");
-const LOG: &str = include_str!("githist/log.sh");
-const SHOW: &str = include_str!("githist/show.sh");
-const DIFF: &str = include_str!("githist/diff.sh");
-
-const LOG_HELP: &str = "Show the source tree's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
+const LOG_HELP: &str = "Show the source tree's first-parent commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
 @param [rev] Where to start (default HEAD, the current source tree). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^.
 @param [path] Only show commits that changed this source-tree-relative path.
 @param [count] Maximum number of commits to show (default 20).
@@ -46,21 +28,72 @@ pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
 }
 
-/// The worker script for `name`: the shared library followed by the command
-/// body, ready to `caos put` and curry as `worker1`.
-pub fn script(name: &str) -> Option<String> {
-    let body = match name {
-        "log" => LOG,
-        "show" => SHOW,
-        "diff" => DIFF,
-        _ => return None,
+pub fn execute(
+    store: &GitStore,
+    refs: Option<&str>,
+    head: &Oid,
+    call: &Value,
+    name: &str,
+) -> Value {
+    let id = call["id"].as_str().unwrap_or("");
+    let Some(tool) = tool(name) else {
+        return crate::error_block(id, "unknown history tool");
     };
-    Some(format!("{LIB}\n{body}"))
+    let bound = match crate::tools::tree_tool_args(call, &tool) {
+        Ok(bound) => bound,
+        Err(block) => return block,
+    };
+    let run = || -> Result<String, String> {
+        let get = |key: &str| {
+            bound
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        let resolve = |spec: &str| -> Result<Oid, String> {
+            let split = spec.find(['~', '^']).unwrap_or(spec.len());
+            let (base, suffix) = spec.split_at(split);
+            let base = match base {
+                "" | "HEAD" | "wc" | "@" => head.clone(),
+                _ => Oid::parse(&crate::lookup_theirs(refs, Some(base))?, "history revision")?,
+            };
+            store.ancestor_revision(&base, suffix)
+        };
+        let revision = resolve(get(if name == "diff" { "to" } else { "rev" }).unwrap_or("HEAD"))?;
+        let query = match name {
+            "log" => HistoryQuery::Log {
+                count: get("count")
+                    .unwrap_or("20")
+                    .parse()
+                    .map_err(|_| "count must be a nonnegative integer")?,
+            },
+            "show" => HistoryQuery::Show,
+            "diff" => {
+                let from = match get("from") {
+                    Some(from) => resolve(from)?,
+                    None => match store
+                        .read_commit(&revision)
+                        .map_err(String::from)?
+                        .parents
+                        .first()
+                    {
+                        Some(parent) => parent.clone(),
+                        None => return Ok("(no earlier revision: root commit)".into()),
+                    },
+                };
+                HistoryQuery::Diff { from }
+            }
+            _ => unreachable!(),
+        };
+        store.history(&revision, query, get("path"))
+    };
+    match run() {
+        Ok(text) => crate::result_block(id, &text, false),
+        Err(error) => crate::error_block(id, &error),
+    }
 }
 
-/// The registry descriptor for `name` — its docs and (all-optional) args. The
-/// `git` flag is set so the launch binds `wc`/`refs`, and `tree_tool_args`
-/// validates the model's call against these just like a tree tool's.
+/// Descriptors and validation shared with repository tools.
 pub fn tool(name: &str) -> Option<TreeTool> {
     let help = match name {
         "log" => LOG_HELP,
@@ -91,7 +124,7 @@ mod tests {
         let expected = json!([
             {
                 "name": "log",
-                "description": "Show the source tree's commit history newest-first (the conversation's turn/step commits and the repo history beneath them): one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.",
+                "description": "Show the source tree's first-parent commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.",
                 "input_schema": {"type": "object", "properties": {
                     "rev": {"type": "string", "description": "Where to start (default HEAD, the current source tree). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^."},
                     "path": {"type": "string", "description": "Only show commits that changed this source-tree-relative path."},

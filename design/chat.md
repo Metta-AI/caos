@@ -93,7 +93,9 @@ For a user message and an agent turn:
 4. The worker records that it has started, creating another `C`.
 5. Model responses, tool operations, and turn completion create further `C`
    commits. Dispatched tools such as bash record start and completion separately;
-   inline tools such as read and edit record completion without a start commit.
+   inline tools such as read, edit, log, show, and diff record completion without
+   a start commit. History tools use Git against the named source commit; revision
+   names resolve only from the supplied ref snapshot.
 
 Conversation parent edges connect conversation commits; source-tree ancestry
 is carried by the `ST` commits referenced in their trees. Imports and saves
@@ -117,6 +119,15 @@ A fresh conversation can start empty and import code afterward. The optional
 Credentials, server configuration, caches, and checkout destinations stay on the
 client machine. The agent's host-side requests are communicated as concrete TUI
 commands for the user to run.
+
+## Reusing sent prompts
+
+Up and Down move within a multiline or wrapped prompt. At the first line, Up
+recalls your earlier messages in the selected conversation; at the last line,
+Down moves toward newer messages and restores your unfinished draft. Drafts
+retain their cursor and pasted content while browsing. History comes from the
+saved conversation, so it remains available after reopening the TUI. Messages
+from other participants, the agent, and CAOS are excluded.
 
 ## Importing code with `/import`
 
@@ -308,9 +319,10 @@ checks out the named source commit with detached HEAD. The destination must be
 a clean Git checkout or an empty/new directory.
 
 The client remembers that destination locally, keyed by server, conversation,
-and gitlink path. A later `/checkout feature/01-change` can reuse it. Successful
-checkout also selects the source for `/update-tree <message>`, which submits local
-edits back to that source and continues the conversation with the user's message.
+and gitlink path. A later `/checkout feature/01-change` can reuse it.
+`/update-tree feature/01-change <message>` commits edits in that path's remembered
+checkout, submits them back to that source, and continues the conversation with
+the user's message. The source path is explicit in both commands.
 
 Browser selection does not choose checkout or publication targets, and does not
 change the agent's execution context.

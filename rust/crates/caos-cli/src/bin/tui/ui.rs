@@ -165,6 +165,10 @@ struct Areas {
     footer: Rect,
 }
 
+pub(super) fn composer_width(state: &ConversationState, area: Rect) -> u16 {
+    layout(state, false, area).composer.width.saturating_sub(2)
+}
+
 fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -342,7 +346,13 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         ),
         Span::styled(
             format!("  {}", state.title),
-            Style::default().add_modifier(Modifier::BOLD),
+            if state.has_placeholder_title() {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
         ),
     ]);
     let mut metadata = Vec::new();
@@ -461,7 +471,16 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 Line::from(vec![
                     Span::raw(indent),
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::raw(title),
+                    Span::styled(
+                        title,
+                        if state.has_placeholder_title() {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw(format!("{indent}  ")),
@@ -1347,6 +1366,20 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     let mut lines = vec![
         Line::styled(
+            "Copying text",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw("  Drag to request a copy. Over SSH, your terminal may ignore the request."),
+        Line::raw("  iTerm2: Settings > General > Selection >"),
+        Line::raw("  enable 'Applications in terminal may access clipboard'."),
+        Line::raw(
+            "  Manual copy: Ctrl+Y, drag text, then Cmd+C (macOS) or your terminal's Copy action.",
+        ),
+        Line::raw("  Escape resumes the chat."),
+        Line::raw(""),
+        Line::styled(
             "Keyboard shortcuts",
             Style::default()
                 .fg(Color::Cyan)
@@ -1354,7 +1387,9 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::raw("  Ctrl+Shift+P    open the command palette"),
         Line::raw(format!("  {send_shortcut:<16}send the prompt")),
-        Line::raw("  Enter/Ctrl+J    insert a newline"),
+        Line::raw("  Enter          run a slash command at the end; otherwise newline"),
+        Line::raw("  Shift+Enter/Ctrl+J  insert a newline"),
+        Line::raw("  Up/Down         move lines; recall sent prompts at the first/last line"),
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
@@ -1471,7 +1506,7 @@ fn render_composer(
     }
 }
 
-fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
+pub(super) fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let mut ranges = Vec::new();
     let mut logical_start = 0;
@@ -1507,7 +1542,7 @@ fn composer_visual_height(composer: &super::Composer, width: u16) -> usize {
     ranges.len().max(row + 1)
 }
 
-fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
+pub(super) fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
     let width = width.max(1);
     let ranges = composer_visual_ranges(&composer.text, width);
     let row = ranges
@@ -1591,7 +1626,7 @@ fn render_command_menu(
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let footer = if app.selection_locked {
         Line::styled(
-            " Selection lock: redraws paused, ^Y/Esc resumes",
+            " Manual copy: drag text, then use terminal Copy (Cmd+C on macOS); ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.selected().running
@@ -1635,11 +1670,17 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
-    if let Some(chars) = app.copy_requested_chars {
+    if let Some((chars, outcome)) = app.copy_notice {
         let noun = if chars == 1 { "char" } else { "chars" };
+        let notice = match outcome {
+            super::CopyOutcome::Copied => format!(" Copied {chars} {noun} "),
+            super::CopyOutcome::Requested => {
+                format!(" Copy requested: {chars} {noun} (^Y manual, ^H help) ")
+            }
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" Copy requested: {chars} {noun} (Ctrl+Y: manual) "),
+                notice,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
