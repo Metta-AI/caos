@@ -186,15 +186,28 @@ Tool classes:
   up, results are git-diffable, and identical subtrees share one cached job.
   Cached per (subtree hash, pattern): after a one-file edit, re-grepping
   costs only the spine above the edit, and a scoped grep of `src/` IS the
-  cached `src/` node of the full grep. Flattening to `path:linenum:line` is
-  the caller's presentation choice — llm-step renders it at the transcript
-  boundary (100KB budget, then matching-file counts + a narrow-the-scope
-  hint); the pattern is validated in llm-step BEFORE the sub-run launches,
-  so a bad regex is an is_error tool_result, never a failed turn. A grep
-  result is not a workspace: the pre-grep workspace rides the continuation
-  curry, and only bash results advance the tree. `tests/rgrep` drives the
-  fold directly (sparse shape, binary skipping, file scope, empty tree,
-  cache hit); the LLM integration is covered in the `tests/chat-tools*`
+  cached `src/` node of the full grep.
+
+  **The fold is not the tool.** `std/rgrep` is the recursion above; `std/rgrep-tool`
+  is the tool over it — it resolves the scope, drives the fold, and flattens
+  the sparse tree to `path:linenum:line` (100KB budget, then matching-file
+  counts + a narrow-the-scope hint), returning the ordinary `{report}` tree
+  every caos tool returns. It validates the pattern itself and reports a bad
+  one as `FAILED`, which the generic renderer marks `is_error`, so a bad
+  regex is still never a failed turn.
+
+  That split is why `grep` needs no special code in any caller. Flattening
+  used to be "the caller's presentation choice", which meant llm-step carried
+  a precheck, a bespoke launcher and a renderer, and the `caos cc` tool server
+  grew a second copy of the same walk — one user-visible contract with two
+  implementations, reachable by neither `run-tool` nor anything else. Now
+  llm-step registers it beside caos-build/caos-test, `caos cc` runs it through
+  the same generic path, and `run-tool rgrep-tool` works by hand.
+
+  A grep result is not a workspace: the pre-grep workspace rides the
+  continuation curry, and only bash results advance the tree. `tests/rgrep`
+  drives the fold directly (sparse shape, binary skipping, file scope, empty
+  tree, cache hit); the LLM integration is covered in the `tests/chat-tools*`
   suites.
 - **ls/listing**: tree objects are names+oids — no content fetch at all.
 - **build/test**: the existing caos-native decompositions (rustc,
@@ -227,6 +240,36 @@ longer classifies an unguarded `set -e` abort as infrastructure.
 
 Infrastructure failures are still uncached, and a request whose resolution
 caught one is not memoized either, so a retry really retries.
+
+### Running the tools without the model
+
+Two arguments cut the model out of the step, for a harness that owns the model
+itself. `caos cc` is that harness: Claude Code chooses the calls and reads the
+results, and caos keeps the durable record.
+
+- `--list-tools` (optionally `--workspace:hash=<tree>`) describes the registry
+  as JSON and stops. Nothing about a conversation is read: a tool server is
+  asked for its tools before there is a conversation to run them in.
+- `--tools-only=<call id>` drains the request's declared calls and stops,
+  leaving the request RUNNING for the next one, with the conversation as it
+  now stands as its result. The named call must have completed by the time the
+  queue empties, which is what makes a dispatch prove it did its own work.
+
+Neither reaches the model, so neither requires `--system`, `--model` or the
+API key — a Claude Code session may have no Anthropic key at all.
+
+The caller declares the call itself (one `model.complete` naming it, which is
+what `validate_current_call` demands of any tool), then runs the step once per
+call. Each dispatch is a FRESH ArgTree naming the admitted request through
+`--run`: the request is itself an ArgTree, so a second call that reused it
+would be answered from the first's memo. `--tools-only`'s value carries the
+call id for that reason as much as for the check.
+
+The point is that there is exactly one implementation of `edit`. A harness
+that reimplemented the tools client-side would give a model a second
+description and a second behaviour for every one of them, and `caos cc` used
+to. `tests/llm-tools-only` covers the mode, with an EMPTY stub fixture so a
+run that reaches the model fails rather than passing.
 
 ## LLM API
 
@@ -372,7 +415,7 @@ The workers are resolved from the WORKSPACE, which declares them in its own
 resolves to a `curry(runner, bin=<static binary>)` node, so the per-turn state
 (key, system, model…) is curried onto the llm-step curry and layers flatten.
 
-The tools a turn drives — bash-tool, rgrep, bash, merge — are NOT named by the
+The tools a turn drives — bash-tool, rgrep-tool, bash, merge — are NOT named by the
 caller. They are llm-step's dependencies, so `std/llm-step/DEPS` declares them
 and its `.caos-expr` binds them: resolving llm-step yields a step that already
 knows its tools. A caller says what the TURN is.
