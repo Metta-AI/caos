@@ -62,6 +62,17 @@ Every script here runs with it, and two constructs quietly break under it.
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
 
+- **`fetch_and_materialize` is the WORKER's materialization, not the host's.**
+  Its name reads like the obvious way to get a result onto disk, and host-side
+  it is the wrong one: it writes hash-tagged PLACEHOLDERS for a later `caos get`
+  to fill, and nothing on the host fills them. So every file arrives
+  ZERO-LENGTH and whatever reads them concludes the result was empty — a grep
+  over a correct result tree reported "no matches", which is a silent wrong
+  answer rather than an error. The host form is `checkout`, public as
+  `cli_get(t, hash, path)`: ordinary rw files, exec bit and symlinks preserved.
+  It is what `caos-cli run <output>` uses, which is why running the same job by
+  hand shows content and the in-process call does not.
+
 # Workers
 
 - **Workers are NOT network-free.** This gets asserted over and over and it is
@@ -86,6 +97,19 @@ Every script here runs with it, and two constructs quietly break under it.
   `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor
   fails instead of being fetched (`tests/lint/lint-bake-anchor.sh`). That is the build
   refusing to reach out, not the container being unable to.
+
+- **A CURRIED image handed to a worker is `{base, args/…, .caos-curry}`, so its
+  bindings are at `args/<name>`.** `caos_curry` builds that shape, and an
+  argument bound by reference keeps it — so a worker reads
+  `/cas/args/<x>-image/args/help`, never `/cas/args/<x>-image/help`.
+  `llm-step`'s `std_tool` read the latter, and since `registry` SKIPPED any
+  tool it could not describe, every std tool vanished from the registry: no
+  error, no log line, and `caos-build`, `caos-test`, `caos-test-result`,
+  `merge`, `log`, `show` and `diff` simply absent from every conversation the
+  tui ran. **A registry must fail on something it was configured with and
+  cannot describe** — the skip is what turned a wrong path into an invisible
+  one. `caos-cli run --base:@=std/llm-step --list-tools=1` prints the registry,
+  which is the cheapest way to see what a model is actually being offered.
 
 # Git
 
@@ -222,6 +246,15 @@ concurrency.
   reports `tail`'s status, so a failed command looks like a pass — that happened,
   and the next step ran against a stack that was not up. Use
   `cmd 2>&1 | tail; echo "EXIT=${PIPESTATUS[0]}"`, or don't pipe.
+- **`nix build` only sees GIT-TRACKED files.** A flake's source is the git
+  tree, so a NEW file that cargo compiles happily is simply absent from the
+  build — `mod cc;` failed with "to create the module `cc`, create file
+  ...cc.rs" while that exact file sat in the working tree. The error names the
+  file it is looking at, which reads as a typo rather than a missing `git add`.
+  This is NOT the `src` filter below (a `.rs` file is kept); dirty EDITS to
+  tracked files are picked up fine, which is what makes the exception easy to
+  forget. `git add` the file before believing a `nix build` failure about it.
+
 - **`run-tool caos-test` does not cover `nix build`.** The suite compiles the tree
   with cargo over the real `rust/crates/` directory; `nix build` compiles a copy
   filtered by the flake's `src`. Anything that filter drops is invisible to a
