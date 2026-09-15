@@ -32,32 +32,12 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-/// How long the tool resolution keeps trying, and how OFTEN. What it waits out
-/// is a `caos` remote or a tunnel that does not exist yet -- the SessionStart
-/// hook establishes both, and it races this server's spawn -- and that race is
-/// decided in SECONDS, not minutes. But the thing that lands the tools is the
-/// resolver's NEXT attempt after the remote appears, so a long fixed interval
-/// is dead time stapled to the front of every cloud session: with a flat 15s,
-/// the model's opening `caos_status` reliably caught "attempt 1 failed" while
-/// the remote landed moments later, and the tools did not appear until 15s on.
-/// So poll FAST at first -- every second for the first ~20 attempts, covering
-/// the whole setup race -- then back off to 15s for the long tail (a genuinely
-/// absent remote or a dead tunnel, where retrying often buys nothing). A cold
-/// BUILD is not what any of this waits out; that happens INSIDE one attempt.
-const RESOLVE_ATTEMPTS: u32 = 40;
-const RESOLVE_FAST_ATTEMPTS: u32 = 20;
+/// The pause between `warm`'s resolve attempts. `cc serve` itself no longer
+/// retries -- it serves the registry `warm` cached, or resolves ONCE inline when
+/// there is none (see `ensure_resolved`) -- but `warm`, which runs in the
+/// session-start hook before the client starts, still retries through the setup
+/// race until it succeeds or the hook's `timeout` stops it.
 const RESOLVE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-const RESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// The wait BEFORE attempt `n` (n is 0-based; attempt 0 waits nothing). Fast
-/// while the setup race is live, slow for the tail -- see [`RESOLVE_ATTEMPTS`].
-fn resolve_wait(attempt: u32) -> std::time::Duration {
-    if attempt <= RESOLVE_FAST_ATTEMPTS {
-        RESOLVE_FAST_INTERVAL
-    } else {
-        RESOLVE_INTERVAL
-    }
-}
 
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
 /// stop the server.
@@ -76,17 +56,17 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
             Err(error)
         }
     };
-    let have_workspace = workspace.is_ok();
     let t = workspace.as_ref();
     let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
-    // A registry left by `cc warm` in the session-start hook, if there is one:
-    // then `tools/list` is answered from the first read rather than deferred
-    // while a background resolve races the model's opening turn. The background
-    // resolve below STILL runs and republishes, so a cache that is stale (the
-    // workspace moved since the warm) is corrected within seconds; loading it is
-    // a head start, never the last word.
+    // The registry `cc warm` cached in the session-start hook, BEFORE the client
+    // started -- the whole point of warm, and now the whole story: with it,
+    // `tools/list` is answered from the first read. Without it (a dev checkout,
+    // or a warm that could not finish), the first `tools/list` or `caos_status`
+    // resolves ONCE, inline (`ensure_resolved`). Either way the answer is
+    // whatever resolution concludes -- no background retry loop, no timed hold,
+    // no `tools/list_changed` correcting it later.
     if let Ok(t) = t {
         if let Some(tools) = read_cached_registry(t, &options) {
             publish(&registry, tools);
@@ -99,17 +79,10 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         if line.trim().is_empty() {
             continue;
         }
-        let method = method_of(&line);
-        let Some(response) = handle(t, &options, &registry, &out, &line) else {
+        let Some(response) = handle(t, &options, &registry, &line) else {
             continue;
         };
         write_message(&out, &response)?;
-        // The handshake is answered; NOW go and find out what the tools are.
-        // Started here rather than before the loop so the notification it ends
-        // with cannot precede `initialize`, and only once.
-        if method.as_deref() == Some("initialize") && have_workspace {
-            resolve_in_background(options.clone(), Arc::clone(&registry), Arc::clone(&out));
-        }
     }
     Ok(())
 }
@@ -117,27 +90,27 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
 /// Resolve the tools once, up front, and leave them in the on-disk cache that
 /// the `cc serve` spawned moments later reads at startup.
 ///
-/// This is what lets a session be ready on TURN ONE. `cc serve`'s own resolution
-/// is asynchronous by necessity -- it cannot answer `initialize` and go build an
-/// image before the client's first `tools/list` -- so a client that reads that
-/// list exactly once, at startup (the mounted Claude Code a cloud environment
-/// uses), sees no tools however fast the resolve then finishes. Run from the
-/// session-start hook, which BLOCKS until it returns, this moves the resolve to
-/// before Claude Code is even launched, so the list is already known.
+/// This is what lets a session be ready on TURN ONE. `cc serve` cannot answer
+/// `initialize` and go build an image before the client's first `tools/list`, so
+/// without a cache that first `tools/list` blocks on the resolve -- fine once the
+/// step is built, but the first time in a tree it is a rustc compile measured in
+/// minutes. Run from the session-start hook, which BLOCKS until it returns, this
+/// moves the resolve to before Claude Code is even launched, so the list `cc
+/// serve` answers is already known and instant.
 ///
 /// NON-FATAL by contract. It always returns `Ok`, because the hook must not fail
 /// a session over a cold cache: a warm that cannot reach the server yet, or a
-/// resolve that errors, simply leaves no cache and `cc serve` resolves in the
-/// background exactly as it did before this existed.
+/// resolve that errors, simply leaves no cache and `cc serve` resolves inline on
+/// the first `tools/list` exactly as it would have without this.
 pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
-    // RETRIED, for the SAME reason `resolve_in_background` retries: this races
-    // the session's own setup. The first attempt commonly fails -- the tunnel
-    // is a second from settling, a `caos` remote a moment from being added --
-    // and a single-shot warm that gave up there would cache nothing and leave
-    // every first turn to the async path, which is the whole thing this exists
-    // to pre-empt. So keep trying until one succeeds or the outer `timeout` in
-    // the hook kills us; a reachability probe with a deadline sits in front so a
-    // dead tunnel is a short failure, not a swallowed one.
+    // RETRIED, because this races the session's own setup. The first attempt
+    // commonly fails -- the tunnel is a second from settling, a `caos` remote a
+    // moment from being added -- and a single-shot warm that gave up there would
+    // cache nothing and leave that first `tools/list` to block on the resolve,
+    // which is the whole thing this exists to pre-empt. So keep trying until one
+    // succeeds or the outer `timeout` in the hook kills us; a reachability probe
+    // with a deadline sits in front so a dead tunnel is a short failure, not a
+    // swallowed one.
     // The real stop is the hook's `timeout`; this bound just keeps the loop
     // finite. Each attempt is a reachability probe plus a full resolve, so even
     // at a second of sleep between them the count is reached only if every
@@ -166,9 +139,12 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
             Ok(_) => last = "the step answered with no tools".to_string(),
             Err(error) => last = error,
         }
-        eprintln!("caos cc warm: attempt {} did not cache: {last}", attempt + 1);
+        eprintln!(
+            "caos cc warm: attempt {} did not cache: {last}",
+            attempt + 1
+        );
     }
-    eprintln!("caos cc warm: gave up ({last}); cc serve will resolve in the background");
+    eprintln!("caos cc warm: gave up ({last}); cc serve will resolve on first use");
     Ok(())
 }
 
@@ -213,9 +189,9 @@ fn write_cached_registry(t: &GitTransport, options: &TurnOptions, tools: &[Value
     }
 }
 
-/// The tools this server has managed to find so far, and what it would say
-/// about them. Empty until the resolution below finishes, which is the entire
-/// point: see `resolve_in_background`.
+/// The tools this server offers, and what it would say about them. Populated by
+/// `warm`'s cache at startup, or by the inline resolve on the first `tools/list`
+/// (`ensure_resolved`); empty until one of those has run.
 type Registry = Arc<Mutex<Found>>;
 
 #[derive(Default)]
@@ -254,58 +230,51 @@ fn status_declaration() -> Value {
     })
 }
 
-/// [`status_result`], but it WAITS for the resolution it would otherwise report
-/// as unfinished.
+/// Resolve the tools ONCE, inline, if it has not happened yet -- then return, so
+/// the caller reads a settled registry. This is what `tools/list` and
+/// `caos_status` call before answering when `warm` left no cache.
 ///
-/// The model calls `caos_status` the instant it finds no tools -- which, on a
-/// cloud session's first turn, is seconds before the SessionStart hook has
-/// finished setting up the `caos` remote and the tunnel the resolver needs. An
-/// instant answer there is "attempt 1 failed ... no `caos` git remote", which
-/// reads like a permanent misconfiguration: the model concludes caos is absent,
-/// or offers to `git remote add` it by hand. So HOLD the call while the resolver
-/// (now polling every second) works, and return the moment the tools land -- by
-/// which point its `tools/list_changed` has already reached Claude Code, so a
-/// model told "N tools are available" can turn round and use them in the same
-/// turn. Bounded, because a genuinely broken session must still get an answer:
-/// the wait covers the resolver's fast phase and no more, and a cold BUILD (the
-/// registry stays empty for minutes) returns "still resolving" and lets the
-/// model retry rather than blocking a tool call for the whole build.
-fn status_result_waiting(registry: &Registry) -> Value {
-    const STATUS_WAIT_ATTEMPTS: u32 = 25;
-    wait_for_tools(registry, STATUS_WAIT_ATTEMPTS);
-    status_result(registry)
-}
-
-/// How long a `tools/list` reply is held for the resolution to finish before
-/// answering with the status stand-in. Longer than the status tool's own wait
-/// because it is the ONE read a re-list-averse client makes -- it has to outlast
-/// the setup race, which is gated by the iroh tunnel coming up (tens of seconds)
-/// -- yet still bounded, so a stuck resolution answers rather than hanging the
-/// client's startup. It does not have to cover a cold BUILD: that is a `run`
-/// inside one resolver attempt, and the notification still corrects a client
-/// that honours it once the build lands.
-const TOOLS_LIST_WAIT_ATTEMPTS: u32 = 70;
-
-/// Block until the registry holds tools, or `attempts` one-second polls pass, or
-/// the lock is poisoned. Does NOT hold the lock across the sleep, so the resolver
-/// thread can publish into it. Shared by the status tool and the deferred
-/// `tools/list`.
-fn wait_for_tools(registry: &Registry, attempts: u32) {
-    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-    for attempt in 0..attempts {
-        match registry.lock() {
-            Ok(found) if !found.tools.is_empty() => break,
-            Err(_) => break,
-            Ok(_) => {}
+/// Idempotent and single-shot: a registry that already holds tools (from the
+/// cache or a prior resolve) or a recorded failure is left alone. The handler
+/// loop is single-threaded, so no two requests race this. It BLOCKS the caller
+/// for exactly one resolution -- a `caos` server round trip, and at most a cold
+/// image build -- rather than a fixed hold; there is no retry, because `warm`
+/// already retried through the setup race before the client ever started, and a
+/// resolve that fails here fails for a reason `caos_status` then names.
+fn ensure_resolved(options: &TurnOptions, registry: &Registry) {
+    if let Ok(found) = registry.lock() {
+        if !found.tools.is_empty() || found.status.is_some() {
+            return;
         }
-        if attempt + 1 < attempts {
-            std::thread::sleep(INTERVAL);
+    }
+    let outcome = resolve_once(options);
+    if let Ok(mut found) = registry.lock() {
+        match outcome {
+            Ok(tools) => {
+                found.tools = tools;
+                found.status = None;
+            }
+            Err(reason) => found.status = Some(reason),
         }
     }
 }
 
-/// The `tools/list` result: the resolved tools, or the status stand-in while
-/// there are none (a resolution that timed out or is still going).
+/// One resolution attempt: open the workspace, prove the server is reachable
+/// (a bounded probe, so a dead tunnel is named rather than swallowed), then ask
+/// the step for its tools.
+///
+/// It does NOT write the on-disk cache -- `warm` owns that. A serve resolving
+/// here is the fallback for a session `warm` did not reach, and persisting its
+/// result would outlive the session's server: a later serve in the same checkout
+/// would then report the cached tools even against a server that has since gone,
+/// hiding exactly the unreachable-server failure `caos_status` exists to name.
+fn resolve_once(options: &TurnOptions) -> Result<Vec<Value>, String> {
+    let t = GitTransport::from_cwd().map_err(|e| format!("cannot open the caos workspace: {e}"))?;
+    t.ensure_server_reachable()?;
+    declarations(&t, options)
+}
+
+/// The `tools/list` result: the resolved tools, plus the `caos_status` stand-in.
 fn tools_list_reply(id: Value, registry: &Registry) -> Value {
     match registry.lock() {
         Ok(found) => {
@@ -330,8 +299,8 @@ fn status_result(registry: &Registry) -> Value {
         Ok(found) => match (&found.status, found.tools.is_empty()) {
             (_, false) => format!("{} caos tools are available.", found.tools.len()),
             (Some(status), true) => status.clone(),
-            (None, true) => "still resolving the caos tools; nothing has failed yet. \
-                             They arrive with a tools/list_changed notification."
+            (None, true) => "the caos tools have not been resolved yet; call tools/list \
+                             (or any caos tool) to resolve them."
                 .to_string(),
         },
     };
@@ -371,9 +340,9 @@ fn diagnostics() -> String {
         &read_file("/tmp/caos-tunnel.log"),
         15,
     ))));
-    // Where the discovery wait actually went, once a resolve has succeeded --
-    // the tunnel warmup is separate (the resolver's retry loop, seen as the
-    // "attempt N of 40" above); this is the work AFTER the server is reachable.
+    // Where the discovery time went, once a resolve has succeeded: the phases of
+    // the one resolution, AFTER the server was reachable (the reachability probe
+    // is separate). Blank until a resolve has run.
     if let Some(timing) = super::discovery_timing() {
         d.push_str(&format!("tool discovery: {timing}\n"));
     }
@@ -399,9 +368,7 @@ fn registry_cache_state() -> String {
         cmd.args(["-C", &dir]);
     }
     let git_dir = match cmd.args(["rev-parse", "--absolute-git-dir"]).output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return "<no git dir to look in>".to_string(),
     };
     let path = std::path::Path::new(&git_dir).join("caos-cc-registry.json");
@@ -472,9 +439,9 @@ fn caos_remote() -> String {
     }
 }
 
-/// Stdout, shared with the resolver thread. Its own lock, not stdout's: the
-/// protocol is one message per line, and two writers interleaving mid-message
-/// would corrupt the stream that `std::io::Stdout`'s internal lock protects
+/// Stdout, behind its own lock, not stdout's: the protocol is one message per
+/// line, and two writers interleaving mid-message would corrupt the stream that
+/// `std::io::Stdout`'s internal lock protects
 /// only per write call.
 type Out = Arc<Mutex<std::io::Stdout>>;
 
@@ -489,110 +456,6 @@ fn write_message(out: &Out, message: &Value) -> Result<(), String> {
         .map_err(|error| format!("flushing response: {error}"))
 }
 
-/// Find the tools, off the hot path, and say so when they arrive.
-///
-/// THIS IS WHY THE SERVER CONNECTS AT ALL. Asking the step what it offers
-/// means fetching it (a pinned locator is another repo), evaluating it against
-/// the caos server, and — the first time in a tree — BUILDING it, which is a
-/// rustc compile measured in minutes. Done inside `tools/list`, that outlasts
-/// the client's startup budget by two orders of magnitude, and the session sees
-/// a tool server that never answered rather than one still working.
-///
-/// So `tools/list` answers immediately with whatever is known (nothing, at
-/// first) and this thread does the work. `notifications/tools/list_changed` is
-/// the protocol's own answer to exactly this: the client re-lists when it
-/// arrives, and the tools appear when they are ready.
-fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
-    std::thread::spawn(move || {
-        // RETRIED, because this races the session's own setup. The client
-        // reaches caos through a `caos` git remote and a tunnel, and in a cloud
-        // container BOTH are established by the SessionStart hook -- which runs
-        // when the session starts, not before this server is spawned. A single
-        // attempt that lost that race would find no server, give up, and leave
-        // the session with an empty tool list and no second chance.
-        //
-        // Only "not ready yet" is worth retrying, and there is no way to tell
-        // that from any other failure, so everything is: the cost of a wrong
-        // guess is a few sleeping seconds in a thread nothing waits on.
-        let mut last = "the caos tools have not resolved yet".to_string();
-        for attempt in 0..RESOLVE_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(resolve_wait(attempt));
-            }
-            // Its OWN transport, opened per attempt: the one in `serve` belongs
-            // to the main thread, and a transport opened before the remote
-            // existed would not have it. This process already stands in the
-            // work directory (`cc_transport`).
-            // REACHABILITY IS PROBED, WITH A DEADLINE; THE WORK IS NOT.
-            //
-            // A resolution legitimately takes minutes -- it may build the step
-            // -- so nothing here may impose a deadline on it. But the thing it
-            // does FIRST is talk to the caos server, and in a cloud container
-            // that server is reached through a tunnel. A tunnel whose far end
-            // is gone does not refuse: it accepts and swallows, so the push
-            // waits forever, this attempt never returns, the retry below never
-            // comes round, and the status says "nothing has failed yet"
-            // indefinitely. Measured in a container whose listener had died:
-            // that is exactly what it said, twenty-seven seconds in.
-            //
-            // `ensure_server_reachable` is a five-second HTTP round trip, which
-            // is the rule this tree already states for probing an address that
-            // might be stale. It turns the one failure that cannot announce
-            // itself into a sentence naming the server.
-            let found = match GitTransport::from_cwd() {
-                Ok(t) => match t.ensure_server_reachable() {
-                    Ok(()) => declarations(&t, &options),
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(format!("cannot open the caos workspace: {error}")),
-            };
-            match found {
-                Ok(found) if found.is_empty() => {
-                    last = "the step answered with no tools at all".to_string();
-                }
-                // Recorded as it happens, not at the end: five minutes of
-                // retrying is five minutes in which the only honest answer to
-                // "why are there no tools" already exists.
-                Ok(found) => {
-                    // Cache before publishing (publish moves `found`), so the
-                    // NEXT `cc serve` on this checkout starts warm even if this
-                    // one never got a `warm` ahead of it.
-                    if let Ok(t) = GitTransport::from_cwd() {
-                        write_cached_registry(&t, &options, &found);
-                    }
-                    publish(&registry, found);
-                    let notification = json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/tools/list_changed",
-                    });
-                    if let Err(error) = write_message(&out, &notification) {
-                        eprintln!("caos cc serve: could not announce the tools: {error}");
-                    }
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("caos cc serve: attempt {}: {error}", attempt + 1);
-                    last = error;
-                }
-            }
-            if let Ok(mut state) = registry.lock() {
-                state.status = Some(format!(
-                    "attempt {} of {RESOLVE_ATTEMPTS} failed and it is still trying: {last}",
-                    attempt + 1
-                ));
-            }
-        }
-        // GIVING UP IS SAID OUT LOUD, twice: on stderr for whoever reads the
-        // server's log, and into the status this server's one remaining tool
-        // reports, for the model that has nothing else to go on.
-        let text = format!("after {RESOLVE_ATTEMPTS} attempts: {last}");
-        eprintln!("caos cc serve: no tools; {text}");
-        if let Ok(mut found) = registry.lock() {
-            found.status = Some(text);
-        }
-    });
-}
-
 /// Publish what was found, and stop describing the search.
 fn publish(registry: &Registry, tools: Vec<Value>) {
     match registry.lock() {
@@ -604,16 +467,6 @@ fn publish(registry: &Registry, tools: Vec<Value>) {
     }
 }
 
-/// The `method` of one request line, for a caller that has already had it
-/// handled and needs to know what it was.
-fn method_of(line: &str) -> Option<String> {
-    serde_json::from_str::<Value>(line)
-        .ok()?
-        .get("method")?
-        .as_str()
-        .map(str::to_string)
-}
-
 /// Handle one message. `None` means "say nothing", which is required rather
 /// than merely polite: a JSON-RPC notification has no `id`, and answering one
 /// is a protocol violation.
@@ -621,7 +474,6 @@ fn handle(
     t: Result<&GitTransport, &String>,
     options: &TurnOptions,
     registry: &Registry,
-    out: &Out,
     line: &str,
 ) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
@@ -640,37 +492,18 @@ fn handle(
     let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
-        // The tools, once they are known -- and if they are not yet, the reply
-        // is DEFERRED until they are, rather than answered now with the status
-        // stand-in and corrected later by a `tools/list_changed` notification.
-        //
-        // That notification is the MCP way to say "re-read the list", and it is
-        // still sent (see `resolve_in_background`) for a client that honours it.
-        // But some do not: a client that reads `tools/list` exactly once, at
-        // startup, and never again is left with only `caos_status` forever,
-        // though the server resolved all 22 tools seconds later -- observed with
-        // the Claude Code that a self-hosted cloud environment mounts. Holding
-        // this one response until the tools exist puts them in the ONE read such
-        // a client makes. Bounded, so a genuinely stuck resolution still answers
-        // (with the stand-in) rather than hanging the client's startup forever.
-        //
-        // Deferred on a THREAD, not by blocking this loop: the loop must stay
-        // free to answer `ping` and anything else while the wait runs, or a
-        // client watching liveness would call the server dead mid-wait. The
-        // reply carries the request's own `id`, so it matches when it lands.
+        // The tools. `warm` normally cached them before the client started, so
+        // this is a read. When it did not, the FIRST `tools/list` resolves them
+        // once, inline, and answers with the result -- real tools, or (on a
+        // failure) the `caos_status` stand-in that says why. No hold on a fixed
+        // clock, no `tools/list_changed` correction later: the answer to this one
+        // read is the settled answer, which is what a client that reads the list
+        // exactly once (the mounted Claude Code) needs and what makes the timing
+        // predictable. It can block for one resolution -- a server round trip,
+        // at most a cold build -- but never for a retry loop.
         "tools/list" => {
-            let ready = matches!(registry.lock(), Ok(found) if !found.tools.is_empty());
-            if ready {
-                Some(tools_list_reply(id, registry))
-            } else {
-                let registry = Arc::clone(registry);
-                let out = Arc::clone(out);
-                std::thread::spawn(move || {
-                    wait_for_tools(&registry, TOOLS_LIST_WAIT_ATTEMPTS);
-                    let _ = write_message(&out, &tools_list_reply(id, &registry));
-                });
-                None
-            }
+            ensure_resolved(options, registry);
+            Some(tools_list_reply(id, registry))
         }
         // A workspace we could not open is the model's problem to report, not
         // a protocol error: `isError` reaches the transcript, where a -32603
@@ -713,10 +546,11 @@ fn initialize(params: &Value) -> Value {
     };
     json!({
         "protocolVersion": version,
-        // `listChanged` is not decoration: this server answers `tools/list`
-        // before it knows the answer, and the notification is how the real one
-        // arrives. A client that ignores it sees the tools on its next listing.
-        "capabilities": { "tools": { "listChanged": true } },
+        // `listChanged` is false: `tools/list` now resolves before it answers, so
+        // its reply is final and this server never revises the list behind the
+        // client's back. Advertising the capability would promise a notification
+        // that no longer comes.
+        "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "caos", "version": env!("CARGO_PKG_VERSION") },
     })
 }
@@ -734,7 +568,11 @@ fn call(
     // This server's own tool, and the one call that belongs to no conversation:
     // it reports on the server, so it takes no session and records nothing.
     if name == STATUS_TOOL {
-        return Ok(status_result_waiting(registry));
+        // Resolve first, so a status called before any `tools/list` (a client
+        // that opens with a diagnostic) still reports what happened rather than
+        // "not resolved yet" -- the unreachable-server case names the server here.
+        ensure_resolved(options, registry);
+        return Ok(status_result(registry));
     }
     let args = params
         .get("arguments")
@@ -831,12 +669,10 @@ mod tests {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let workspace = "no workspace".to_string();
         let registry: Registry = Arc::new(Mutex::new(Found::default()));
-        let out: Out = Arc::new(Mutex::new(std::io::stdout()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
             &registry,
-            &out,
             notification
         )
         .is_none());
@@ -846,12 +682,10 @@ mod tests {
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
         let registry: Registry = Arc::new(Mutex::new(Found::default()));
-        let out: Out = Arc::new(Mutex::new(std::io::stdout()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
             &registry,
-            &out,
             "{not json"
         )
         .is_none());
