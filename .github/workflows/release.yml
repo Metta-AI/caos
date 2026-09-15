@@ -57,7 +57,7 @@ jobs:
         run: nix build .#caos-cli
 
       # The iroh tunnel, patched to use the OS trust store
-      # (integrations/claude-code/dumbpipe-system-certs.patch). Built here rather than
+      # (integrations/claude-code/cloud/dumbpipe-system-certs.patch). Built here rather than
       # taken from n0's releases, because n0's compiles in Mozilla's roots and
       # a cloud container's egress is a TLS-intercepting proxy -- the stock
       # binary cannot reach any relay there.
@@ -141,11 +141,11 @@ jobs:
             grep -aq "$marker" dist/dumbpipe-x86_64-linux \
               || { echo "the tunnel does not read the OS trust store ($marker absent)"; exit 1; } >&2
           done
-          cp integrations/claude-code/settings.json dist/claude-settings.json
-          cp integrations/claude-code/mcp.json      dist/mcp.json
+          cp integrations/claude-code/shared/settings.json dist/claude-settings.json
+          cp integrations/claude-code/shared/mcp.json      dist/mcp.json
           # Copied, not stamped. install.sh resolves the build from its --base
           # and reports that; a tag baked in here could only ever disagree.
-          install -m 0755 integrations/claude-code/install.sh dist/install.sh
+          install -m 0755 integrations/claude-code/cloud/install.sh dist/install.sh
 
           # Prove the thing we are about to publish actually runs, rather than
           # discovering it from a cloud VM that cannot say why.
@@ -161,7 +161,7 @@ jobs:
           esac
           cc="$(./dist/caos-x86_64-linux cc 2>&1 || true)"
           case "$cc" in
-            *"mcp hook"*|*"mcp serve"*) echo "cc subcommands present" ;;
+            *"mcp hook"*|*"mcp serve"*) echo "mcp subcommands present" ;;
             *) echo "the built client has no \`cc\` surface:"; printf '%s\n' "$cc"; exit 1 ;;
           esac
           dp="$(./dist/dumbpipe-x86_64-linux --help 2>&1 || true)"

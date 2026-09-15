@@ -2,7 +2,7 @@
 # Launch Claude Code against a caos workspace (see rust/crates/caos-cli/MCP.md).
 #
 # Everything this sets up could be passed by hand -- `claude --settings
-# integrations/claude-code/settings.json --mcp-config integrations/claude-code/mcp.json
+# integrations/claude-code/shared/settings.json --mcp-config integrations/claude-code/shared/mcp.json
 # --strict-mcp-config` -- except one thing, which is why this script exists.
 #
 # `${CLAUDE_PROJECT_DIR}` expands in a HOOK command but NOT in mcp.json.
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo="$(cd "$here/../.." && pwd)"
+repo="$(cd "$here/../../.." && pwd)"
 
 CAOS_BIN="${CAOS_BIN:-$repo/result/bin/caos}"
 if [ ! -x "$CAOS_BIN" ]; then
@@ -51,7 +51,7 @@ case "$probe" in
 esac
 
 exec claude \
-    --settings "$here/settings.json" \
-    --mcp-config "$here/mcp.json" \
+    --settings "$here/../shared/settings.json" \
+    --mcp-config "$here/../shared/mcp.json" \
     --strict-mcp-config \
     "$@"

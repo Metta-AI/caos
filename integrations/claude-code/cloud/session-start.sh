@@ -156,16 +156,13 @@ fi
 # move it downloads the new binary, which is why it runs here and not ahead of
 # the remote and tunnel. Not fatal on failure: a working client that is out of
 # date beats no session at all.
+# `--user-config` re-writes the configuration in the SAME pass, because it pins
+# the commit the client was built from: a refreshed client left with the old
+# configuration would drive a step from a different tree than itself, the one
+# pairing that cannot go quiet. Both are a no-op when nothing moved.
 if [ -n "$base" ]; then
-    if ! curl -fsSL "$base/install.sh" | bash -s -- --no-repo-files --base="$base"; then
+    if ! curl -fsSL "$base/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base"; then
         log "could not refresh the client; carrying on with the installed one"
-    fi
-    # AND THE CONFIGURATION, because it pins the commit the client was built
-    # from. A refreshed client left with the old configuration would drive a
-    # step from a different tree than itself, which is the one pairing that
-    # cannot be allowed to go quiet. Writes nothing when nothing moved.
-    if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
-        log "could not refresh the session configuration; carrying on"
     fi
 fi
 
@@ -204,7 +201,7 @@ fi
 # Then the first turn has the tools rather than racing a background resolve it
 # cannot see and cannot wait out.
 #
-# The step is pinned exactly as configure.sh pins it: to the commit THIS client
+# The step is pinned exactly as install.sh --user-config pins it: to the commit THIS client
 # was built from (the build record), so the warm resolves the same tree the
 # serve will. Bounded and non-fatal -- a warm that cannot finish just leaves the
 # background path in place, which is where we were before this ran.

@@ -33,7 +33,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo="$(cd "$here/../.." && pwd)"
+repo="$(cd "$here/../../.." && pwd)"
 
 CAOS_BIN="${CAOS_BIN:-$repo/result/bin/caos}"
 if [ ! -x "$CAOS_BIN" ]; then
@@ -105,10 +105,10 @@ if [ ! -e "$cfg/.claude.json" ]; then
     cat "$account" > "$cfg/.claude.json"
 fi
 
-# Also stateless, and refreshed so an edit to integrations/claude-code/settings.json takes
+# Also stateless, and refreshed so an edit to integrations/claude-code/shared/settings.json takes
 # effect on the next launch. Its hook commands read `${CAOS_BIN:-...}`, which the
 # shell expands from the export above, so the file needs no rewriting.
-cp "$here/settings.json" "$cfg/settings.json"
+cp "$here/../shared/settings.json" "$cfg/settings.json"
 
 # The tool server, declared only when it is absent or differs -- `claude mcp
 # add` refuses to overwrite an existing entry ("already exists"), so a change

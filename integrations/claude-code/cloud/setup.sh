@@ -80,11 +80,14 @@ esac
 # CAOS_IROH_TICKET is the one environment variable left, and could not be
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
-args="--no-repo-files --base=$base"
-installer="$base/install.sh"
+args="--no-repo-files --user-config --base=$base"
+installer="$base/cloud/install.sh"
 
-# `--no-repo-files`: the client goes on PATH, the configuration goes user-level
-# below, and the checkout is left exactly as it was found.
+# `--no-repo-files --user-config`: the client goes on PATH and its deny list,
+# hooks and server declaration go USER-level (pinned to the commit just
+# installed), leaving the checkout exactly as it was found. install.sh does both
+# in one pass -- there is no separate configure step -- because the config is
+# never wanted without an install and needs the very commit the install resolved.
 #
 # Checked afterwards rather than trusted: `curl -fsSL <404> | bash` exits ZERO.
 # curl writes nothing, bash reads an empty script and succeeds, and the setup
@@ -137,19 +140,9 @@ bash -n /usr/local/bin/caos-cloud-session-start || {
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# Hooks and the tool server, user-level
-# ---------------------------------------------------------------------------
-# Written by cloud/configure.sh, which the session hook also runs -- see the
-# note at the top of that file for why it is not inline here. It must succeed:
-# an environment snapshotted without a tool server declaration gives every
-# session a model with no caos tools and no way to say so.
-echo "writing the user-level configuration" >&2
-if ! curl -fsSL "$base/cloud/configure.sh" | bash -s -- --base="$base"; then
-    echo "FATAL: could not write the session configuration from $base" >&2
-    echo "  Its own error is above this line; read that, not this." >&2
-    exit 1
-fi
+# The user-level configuration was written by the `--user-config` install above;
+# session-start re-runs the same install each session to keep it pinned to the
+# refreshed client. There is no separate configure step to run here.
 
 # ---------------------------------------------------------------------------
 # When did this environment last get built?

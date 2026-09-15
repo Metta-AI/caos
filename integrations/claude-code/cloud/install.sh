@@ -2,7 +2,7 @@
 # Install the caos Claude Code client into a repository.
 #
 #   B=https://raw.githubusercontent.com/Metta-AI/caos/main/integrations/claude-code
-#   curl -fsSL "$B/install.sh" | bash -s -- --base="$B"
+#   curl -fsSL "$B/cloud/install.sh" | bash -s -- --base="$B"
 #
 # `--base` says which caos, and is the only thing that does. It names a repo and
 # a ref -- a branch, a tag or a sha -- and the client installed is the newest
@@ -38,6 +38,7 @@ BASE="$RAW/Metta-AI/caos/main/integrations/claude-code"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
+user_config=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -45,6 +46,12 @@ for arg in "$@"; do
         # For a cloud environment, where the configuration is user-level and
         # serves every repository: install the client and leave checkouts alone.
         --no-repo-files) repo_files="" ;;
+        # A cloud environment's counterpart to the repo files: write the SAME
+        # deny list, hooks and server declaration at the USER level, pinned to
+        # the commit this run installs. This is the old configure.sh, folded in
+        # because it is never wanted without an install and needs the very
+        # commit the install just resolved.
+        --user-config) user_config=yes ;;
         --base=*) BASE="${arg#--base=}"; BASE="${BASE%/}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -313,8 +320,8 @@ fi
 # every run, including the skipped-download path: it describes the resolution,
 # not the transfer, and a prefix that has the binary but not this record would
 # leave the reader with the twelve digits in the wrapper and no way to expand
-# them. `integrations/claude-code/cloud/configure.sh` reads it to build the locator it
-# writes into a session's configuration.
+# them. `write_user_config` below reads $REPO/$COMMIT (the same values) to build
+# the locator it pins into a session's configuration.
 install -d "$PREFIX/share/caos"
 cat > "$PREFIX/share/caos/build" <<RECORD
 repo=$REPO
@@ -339,7 +346,7 @@ chmod 0644 "$PREFIX/share/caos/build"
 # becomes the tool server's JSON-RPC the moment it execs.
 cat > "$PREFIX/bin/caos-serve" <<WRAP
 #!/bin/bash
-timeout 20 bash -c "curl -fsSL '$BASE/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
+timeout 20 bash -c "curl -fsSL '$BASE/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
 # The step, pinned to the commit the refresh JUST installed -- not the one the
 # snapshot's mcp.json named. Refreshing the binary without this would run the new
 # server against an OLD llm-step (its tools are the pinned rev's), which is the
@@ -402,4 +409,104 @@ DONE
     fi
 else
     echo "installed the client only; no repository files were written" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# The user-level configuration -- folded in from the old configure.sh
+# ---------------------------------------------------------------------------
+# A cloud session's config is USER-level (a container serves every repository),
+# so it is written here rather than into a checkout, and pinned to the commit
+# THIS run just installed -- the one pairing of client and step that cannot be
+# subtly wrong. Two callers reach it, both as `--no-repo-files --user-config`:
+# cloud/setup.sh once before the snapshot (Claude Code reads its MCP servers at
+# startup and a session cannot declare one for itself), and cloud/session-start.sh
+# each session right after the refresh (a refreshed client with the old config
+# would drive a step from a different tree than the binary driving it).
+write_user_config() {
+    if [ -z "$COMMIT" ] || [ -z "$REPO" ]; then
+        echo "FATAL: this build cannot say which commit it came from, so there is" >&2
+        echo "  no tree to pin the step to and the config would be useless." >&2
+        exit 1
+    fi
+    local raw_settings raw_mcp locator settings servers configured home cfg tmp changed
+    if ! raw_settings="$(curl -fsSL "${url%/*}/claude-settings.json")" \
+       || ! raw_mcp="$(curl -fsSL "${url%/*}/mcp.json")"; then
+        echo "FATAL: could not fetch the config assets from this build's release" >&2
+        exit 1
+    fi
+    # A `:@@=` locator pins the step to another repo's tree by full sha, fetched
+    # by the client and evaluated like a local directory -- so an arbitrary
+    # checkout needs no std/llm-step of its own, and the step comes from the SAME
+    # tree the client was built from.
+    locator="--llm-step:@@=github:$REPO?rev=$COMMIT&dir=std/llm-step"
+    echo "the tools come from $locator" >&2
+    local unbin='def plain: split("\"${CAOS_BIN:-caos}\"") | join("caos")
+                    | split("${CAOS_BIN:-caos}") | join("caos")
+                    | split("--llm-step:@=std/llm-step") | join($step);
+           def unbin: if type == "string" then plain else . end;
+           walk(unbin)'
+    # In the hook command the locator is a shell word (quote its `&`/`?`); in an
+    # mcp `args` entry it is bare argv. A SessionStart hook is added: the client
+    # finds caos through a `caos` git remote an arbitrary checkout lacks, so the
+    # remote is added per session from user-level settings.
+    if ! settings="$(printf '%s' "$raw_settings" | jq --arg step "'$locator'" "$unbin"'
+            | .hooks.SessionStart =
+            [ { hooks: [ { type: "command", command: "caos-cloud-session-start" } ] } ]')"; then
+        echo "FATAL: the settings asset is not the JSON this expects" >&2
+        exit 1
+    fi
+    # command becomes `caos-serve`, the refresh-then-exec wrapper installed above,
+    # so a snapshot's frozen binary is still current when it serves.
+    if ! servers="$(printf '%s' "$raw_mcp" \
+        | jq --arg step "$locator" "$unbin"' | .mcpServers | .caos.command = "caos-serve"')"; then
+        echo "FATAL: the mcp asset is not the JSON this expects" >&2
+        exit 1
+    fi
+    # A no-op substitution is the failure worth catching: the session starts and
+    # every tool call dies for want of --llm-step, and the reason is a literal
+    # nobody looked at.
+    for configured in "$settings" "$servers"; do
+        case "$configured" in
+            *"$locator"*) ;;
+            *)
+                echo "FATAL: the config assets do not name --llm-step, so nothing" >&2
+                echo "  points at the step. Is this base older than the client?" >&2
+                exit 1
+                ;;
+        esac
+    done
+    changed=0
+    for home in /root /home/claude /home/user; do
+        [ -d "$home" ] || continue
+        mkdir -p "$home/.claude"
+        # UNCHANGED MEANS UNTOUCHED: Claude Code re-reads a settings file live, so
+        # rewriting identical bytes mid-session would needlessly swap its hooks.
+        if [ "$(cat "$home/.claude/settings.json" 2>/dev/null)" != "$settings" ]; then
+            printf '%s\n' "$settings" > "$home/.claude/settings.json"
+            changed=1
+        fi
+        chmod 0644 "$home/.claude/settings.json"
+        # settings.json cannot declare an MCP server -- that lives in the user
+        # config beside it, MERGED (it also holds account state a session put there).
+        cfg="$home/.claude.json"
+        [ -s "$cfg" ] || echo '{}' > "$cfg"
+        tmp="$cfg.caos.$$"
+        if jq --argjson servers "$servers" \
+             '.mcpServers = ((.mcpServers // {}) + $servers)' "$cfg" > "$tmp" 2>/dev/null; then
+            if ! cmp -s "$tmp" "$cfg"; then
+                cat "$tmp" > "$cfg"
+                changed=1
+            fi
+        fi
+        rm -f "$tmp"
+    done
+    # `if`, not `&& echo`: as the last statement in this function a false test
+    # would return non-zero and, under the caller's `set -e`, exit install.sh.
+    if [ "$changed" = 1 ]; then
+        echo "wrote the user-level configuration (it takes effect next session)" >&2
+    fi
+}
+
+if [ -n "$user_config" ]; then
+    write_user_config
 fi

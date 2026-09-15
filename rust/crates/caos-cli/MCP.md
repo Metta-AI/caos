@@ -107,8 +107,8 @@ Any argument is passed through to `claude`. To drive it by hand instead, **from
 the repository root**:
 
 ```bash
-claude --settings integrations/claude-code/settings.json \
-       --mcp-config integrations/claude-code/mcp.json --strict-mcp-config
+claude --settings integrations/claude-code/shared/settings.json \
+       --mcp-config integrations/claude-code/shared/mcp.json --strict-mcp-config
 ```
 
 `mcp.json` names the server `${CAOS_BIN:-./result/bin/caos}`, so it finds the
@@ -122,7 +122,7 @@ removes them from the model's context rather than merely refusing their calls,
 and points every hook at `caos mcp hook`. `mcp.json` declares the tool server.
 Both pass `--llm-step:@=std/llm-step`, which is a statement about THIS
 checkout and nothing more: these two files are the caller. Elsewhere they say
-something else — `integrations/claude-code/cloud/configure.sh` rewrites that argument
+something else — `install.sh --user-config` rewrites that argument
 into a locator pinned to the commit the installed client was built from, so a
 session in an unrelated repository runs the step from the same tree as its
 client. It runs at setup AND at every session start, because the client is

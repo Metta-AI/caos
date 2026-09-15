@@ -22,8 +22,12 @@ Code's is `caos mcp` (`rust/crates/caos-cli/src/mcp/`, documented in that crate'
 `MCP.md`) — which stays compiled into the binary; only the host-side package lives
 here.
 
-## Harnesses
+## What's here
 
-- [`claude-code/`](claude-code/) — Anthropic's Claude Code, both as an MCP tool
-  server over caos and as cloud sessions caos provisions and drives from a
-  single `--base` URL.
+- [`mcp/`](mcp/) — the caos MCP server (`caos mcp serve`), the common piece: any
+  MCP client can point at it. It has no code of its own — the server is the
+  client binary — but it is named here because it is what the per-harness
+  packages below all wire up.
+- [`claude-code/`](claude-code/) — Anthropic's Claude Code, both as an MCP client
+  over caos (`cli/`, and the `shared/` config) and as cloud sessions caos
+  provisions and drives from a single `--base` URL (`cloud/`).

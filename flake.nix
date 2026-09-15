@@ -1273,14 +1273,14 @@ sandbox = false''
           # the relay presents Anthropic's gateway certificate, which chains to
           # a CA that only the system store knows, so the stock binary reaches
           # no relay at all while curl and git on the same host are fine. See
-          # integrations/claude-code/dumbpipe-system-certs.patch.
+          # integrations/claude-code/cloud/dumbpipe-system-certs.patch.
           #
           # STATIC, via pkgsStatic: the container is Ubuntu with no nix, so an
           # ordinary nix build would name /nix/store paths that do not exist
           # there. Same reason caos-x86_64-linux is built for musl.
           dumbpipe-caos = pkgs.pkgsStatic.dumbpipe.overrideAttrs (old: {
             patches = (old.patches or [ ]) ++ [
-              ./integrations/claude-code/dumbpipe-system-certs.patch
+              ./integrations/claude-code/cloud/dumbpipe-system-certs.patch
             ];
           });
           # The two stack-bring-up aggregates (see `stackInputs`): one nix
