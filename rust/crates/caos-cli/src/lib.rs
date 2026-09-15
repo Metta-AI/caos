@@ -519,16 +519,45 @@ fn reject_reserved_caos(t: &GitTransport, commit: &str, what: &str) -> Result<()
     }
 }
 
+/// Sub-phase timing of the most recent `ensure_code_commit`, so discovery can
+/// tell which of its three network/disk steps ate the wall clock. Written on
+/// every call; read once by `declarations`.
+static CODE_COMMIT_TIMING: Mutex<Option<String>> = Mutex::new(None);
+
+/// The breakdown recorded by the last `ensure_code_commit`, e.g.
+/// `ensure-local 0.1s, is-ancestor 0.0s, ensure-pushed 115.0s`.
+pub fn code_commit_timing() -> Option<String> {
+    CODE_COMMIT_TIMING.lock().ok().and_then(|slot| slot.clone())
+}
+
 fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> Result<(), String> {
+    let mark = Instant::now();
     store.ensure_local(commit)?;
+    let ensure_local = mark.elapsed();
+
     store.read_commit(commit).map_err(String::from)?;
     let genesis = ensure_genesis(store)?;
-    if conversation_protocol::v3::CodeOps::is_ancestor(store, &genesis, commit)? {
+    let mark = Instant::now();
+    let is_conversation = conversation_protocol::v3::CodeOps::is_ancestor(store, &genesis, commit)?;
+    let is_ancestor = mark.elapsed();
+    if is_conversation {
         return Err(format!(
             "conversation commit {commit} cannot be used as a workspace"
         ));
     }
-    t.ensure_pushed(commit.as_str())
+
+    let mark = Instant::now();
+    let pushed = t.ensure_pushed(commit.as_str());
+    let ensure_pushed = mark.elapsed();
+    if let Ok(mut slot) = CODE_COMMIT_TIMING.lock() {
+        *slot = Some(format!(
+            "ensure-local {:.1}s, is-ancestor {:.1}s, ensure-pushed {:.1}s",
+            ensure_local.as_secs_f64(),
+            is_ancestor.as_secs_f64(),
+            ensure_pushed.as_secs_f64(),
+        ));
+    }
+    pushed
 }
 
 struct PreparedRequest {

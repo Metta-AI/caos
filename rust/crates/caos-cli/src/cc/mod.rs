@@ -444,8 +444,11 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     // The run-list phase includes pushing the workspace closure to the server,
     // so a big number there is usually the push, not the worker's own work.
     if let Ok(mut slot) = DISCOVERY_TIMING.lock() {
+        let breakdown = crate::code_commit_timing()
+            .map(|b| format!(" [{b}]"))
+            .unwrap_or_default();
         *slot = Some(format!(
-            "resolve-llm-step {:.1}s, workspace-prep {:.1}s, run-list-tools {:.1}s (total {:.1}s)",
+            "resolve-llm-step {:.1}s, workspace-prep {:.1}s{breakdown}, run-list-tools {:.1}s (total {:.1}s)",
             resolve_step.as_secs_f64(),
             workspace_prep.as_secs_f64(),
             run_list.as_secs_f64(),
