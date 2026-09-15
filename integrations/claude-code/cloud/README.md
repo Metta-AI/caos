@@ -39,8 +39,8 @@ field (swap `main` for a branch or commit to test a change — everything else i
 read back out of it):
 
 ```
-B=https://raw.githubusercontent.com/Metta-AI/caos/main/integrations/claude-code
-curl -fsSL "$B/cloud/setup.sh" | bash -s -- --base="$B"
+B=https://raw.githubusercontent.com/Metta-AI/caos/main
+curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 ```
 
 **Environment variables**: one of —

@@ -161,7 +161,7 @@ fi
 # configuration would drive a step from a different tree than itself, the one
 # pairing that cannot go quiet. Both are a no-op when nothing moved.
 if [ -n "$base" ]; then
-    if ! curl -fsSL "$base/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base"; then
+    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
 fi

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install the caos Claude Code client into a repository.
 #
-#   B=https://raw.githubusercontent.com/Metta-AI/caos/main/integrations/claude-code
-#   curl -fsSL "$B/cloud/install.sh" | bash -s -- --base="$B"
+#   B=https://raw.githubusercontent.com/Metta-AI/caos/main
+#   curl -fsSL "$B/integrations/claude-code/cloud/install.sh" | bash -s -- --base="$B"
 #
 # `--base` says which caos, and is the only thing that does. It names a repo and
 # a ref -- a branch, a tag or a sha -- and the client installed is the newest
@@ -34,7 +34,7 @@ set -euo pipefail
 # is the kind of setting that gets exported once and then silently outranks the
 # argument someone is looking straight at.
 RAW="https://raw.githubusercontent.com"
-BASE="$RAW/Metta-AI/caos/main/integrations/claude-code"
+BASE="$RAW/Metta-AI/caos/main"
 PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
@@ -58,17 +58,19 @@ for arg in "$@"; do
     esac
 done
 
-# Peeled from BOTH ends rather than by field number: the trailing
-# `/integrations/claude-code` is fixed, so whatever is left in the middle is the ref --
-# which is what makes a slashed branch (`feature/x`) work, where counting
-# fields would silently take `feature` and resolve against the wrong tree.
+# --base is the repo and the ref -- `<raw>/<owner>/<repo>/<ref>` -- and NOTHING
+# more: the integration path is added by the URLs that fetch from it, not baked
+# into --base, so the value reads as the base it is. Peeled by stripping owner
+# and repo from the front; whatever remains is the ref, so a slashed branch
+# (`feature/x`) survives where counting fields would take `feature` and resolve
+# against the wrong tree.
 rest="${BASE#"$RAW"/}"
 owner="${rest%%/*}"; rest="${rest#*/}"
-name="${rest%%/*}";  rest="${rest#*/}"
-REF="${rest%/integrations/claude-code}"
-if [ "$BASE" = "$rest" ] || [ -z "$owner" ] || [ -z "$name" ] || [ -z "$REF" ]; then
+name="${rest%%/*}";  REF="${rest#*/}"
+if [ "${BASE#"$RAW"/}" = "$BASE" ] || [ -z "$owner" ] || [ -z "$name" ] \
+   || [ -z "$REF" ] || [ "$REF" = "$name" ]; then
     echo "--base must look like" >&2
-    echo "  $RAW/<owner>/<repo>/<ref>/integrations/claude-code" >&2
+    echo "  $RAW/<owner>/<repo>/<ref>" >&2
     echo "  got: $BASE" >&2
     exit 2
 fi
@@ -346,7 +348,7 @@ chmod 0644 "$PREFIX/share/caos/build"
 # becomes the tool server's JSON-RPC the moment it execs.
 cat > "$PREFIX/bin/caos-serve" <<WRAP
 #!/bin/bash
-timeout 20 bash -c "curl -fsSL '$BASE/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
+timeout 20 bash -c "curl -fsSL '$BASE/integrations/claude-code/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
 # The step, pinned to the commit the refresh JUST installed -- not the one the
 # snapshot's mcp.json named. Refreshing the binary without this would run the new
 # server against an OLD llm-step (its tools are the pinned rev's), which is the

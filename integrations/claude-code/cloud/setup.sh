@@ -9,8 +9,8 @@
 # so that editing this file is enough and the settings form never has to be
 # touched again:
 #
-#   B=https://raw.githubusercontent.com/Metta-AI/caos/main/integrations/claude-code
-#   curl -fsSL "$B/cloud/setup.sh" | bash -s -- --base="$B"
+#   B=https://raw.githubusercontent.com/Metta-AI/caos/main
+#   curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 #
 # `--base` is the whole configuration: everything else -- which repo, which
 # branch or commit, where the sibling scripts live -- is read back out of it. A
@@ -50,7 +50,7 @@ export DEBIAN_FRONTEND=noninteractive
 # Trusted allowlist, so this needs no network-policy change.
 
 RAW="https://raw.githubusercontent.com"
-base="$RAW/Metta-AI/caos/main/integrations/claude-code"
+base="$RAW/Metta-AI/caos/main"
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
@@ -64,10 +64,10 @@ done
 # step. The check is worth its four lines anyway -- a typo caught now names the
 # typo, where the same typo caught later is a 404 on a URL nobody typed.
 case "$base" in
-    "$RAW"/*/*/*/integrations/claude-code) ;;
+    "$RAW"/*/*/*) ;;
     *)
         echo "FATAL: --base must look like" >&2
-        echo "  $RAW/<owner>/<repo>/<ref>/integrations/claude-code" >&2
+        echo "  $RAW/<owner>/<repo>/<ref>" >&2
         echo "  got: $base" >&2
         exit 1
         ;;
@@ -81,7 +81,7 @@ esac
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
 args="--no-repo-files --user-config --base=$base"
-installer="$base/cloud/install.sh"
+installer="$base/integrations/claude-code/cloud/install.sh"
 
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
 # hooks and server declaration go USER-level (pinned to the commit just
@@ -128,8 +128,8 @@ EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
 # reason on stderr, rather than be blocked by its own setup.
-if ! script="$(curl -fsSL "$base/cloud/session-start.sh")"; then
-    echo "caos: could not fetch $base/cloud/session-start.sh; skipping" >&2
+if ! script="$(curl -fsSL "$base/integrations/claude-code/cloud/session-start.sh")"; then
+    echo "caos: could not fetch $base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
 exec bash -c "$script" caos-cloud-session-start --base="$base"
