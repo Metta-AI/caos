@@ -815,8 +815,7 @@ impl CodeOps for GitStore {
 mod tests {
     use std::collections::HashSet;
     use std::fs;
-    use std::io::Write as _;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};

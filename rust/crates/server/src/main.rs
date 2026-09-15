@@ -593,6 +593,17 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             status::serve(config, path.trim_start_matches("/status/"), &query)
         }
         Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
+        Method::Get if path == "/eval-locator" => {
+            // Secrets ride the same out-of-band header as `/run`, since an eval
+            // may mark a `curry` with the caller's identity (design/secrets.md).
+            let secrets_header = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(secrets::HEADER))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap_or_default();
+            compute::eval_locator_endpoint(config, &query, &secrets_header)
+        }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
             _ => Err(HttpError::new(404, "not found")),

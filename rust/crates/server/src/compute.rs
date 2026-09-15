@@ -114,6 +114,82 @@ pub(crate) fn resolve_image_endpoint(config: &Config, query: &str) -> Result<Vec
     Ok(reference.into_bytes())
 }
 
+/// `GET /eval-locator?in=<tree oid>&eval=<path>` — walk `.caos-expr` from the
+/// tree `in` down to `<path>` SERVER-SIDE, returning the resolved `"<type>
+/// <hash>"`, and memoize it.
+///
+/// This exists because that walk is otherwise re-run by EVERY client that names
+/// the same pinned tree and path -- and a caos session names it three times over
+/// (its `serve` resolver for `tools/list`, its `UserPromptSubmit` hook, and each
+/// tool call's dispatch), in separate processes whose in-memory eval memo
+/// (`caos-eval`) cannot be shared. Worse, the client walk is CHATTY: measured,
+/// ~54 fresh HTTP round trips, each a new connection -- 0.1s over a loopback,
+/// but ~30s over a cloud session's iroh tunnel, where every connection pays the
+/// relay's setup and latency. Resolving here does the whole walk where each hop
+/// is sub-millisecond, so the client makes ONE request, not fifty-four.
+///
+/// The walk is [`resolve_promise`]'s `eval` step ([`ServerEvalHost`]); its
+/// sub-builds already ride `/run`'s single-flight and memo, so concurrent
+/// callers are correct and cheap on repeat even before the small result cache
+/// below skips the re-walk. Secret marking is a no-op through eval (it happens
+/// when the step RUNS, not when it resolves -- measured: a marked and an
+/// unmarked resolve of `std/llm-step` produce the identical oid), so the object
+/// is byte-identical to a client `eval-path`. Scoped by the caller's secrets
+/// anyway, like `/run`, against the day that stops holding.
+pub(crate) fn eval_locator_endpoint(
+    config: &Config,
+    query: &str,
+    secrets_header: &str,
+) -> Result<Vec<u8>, HttpError> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let root = query_param(query, "in")
+        .ok_or_else(|| HttpError::new(400, "eval-locator needs ?in=<tree oid>"))?;
+    let path = query_param(query, "eval")
+        .ok_or_else(|| HttpError::new(400, "eval-locator needs &eval=<path>"))?;
+    let root_oid = gix::ObjectId::from_hex(root.as_bytes())
+        .map_err(|_| HttpError::new(400, format!("in={root:?} is not an object id")))?;
+    let secrets = crate::secrets::parse_header(secrets_header);
+
+    // The memo identity: the pinned input tree, the path, and the secret scope.
+    // Content-addressed by storing it, so the redis key is fixed-length.
+    let identity = format!("eval-locator\u{0}{root}\u{0}{path}\u{0}{secrets_header}");
+    let id = store_git_blob(config, identity.as_bytes()).map_err(|e| HttpError::new(500, e))?;
+    let key = result_key(config, &id.to_string());
+    if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
+        return Ok(result.into_bytes());
+    }
+
+    // The `{in, eval}` continuation `resolve_promise` walks: `in` is the tree,
+    // `eval` a blob naming the path within it.
+    let eval_blob = store_git_blob(config, path.as_bytes()).map_err(|e| HttpError::new(500, e))?;
+    let cont = store_git_tree(
+        config,
+        vec![
+            Entry {
+                mode: EntryKind::Tree.into(),
+                filename: b"in".to_vec().into(),
+                oid: root_oid,
+            },
+            Entry {
+                mode: EntryKind::Blob.into(),
+                filename: b"eval".to_vec().into(),
+                oid: eval_blob,
+            },
+        ],
+    )
+    .map_err(|e| HttpError::new(500, e))?;
+
+    // No salt and no stack: an eval is deterministic in its inputs, and this is
+    // a top-level resolution with no ancestors. `parent` is only a trace label
+    // here (no `then`, so no pool inheritance reads it), so the continuation
+    // names itself.
+    let cont = cont.to_string();
+    let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], &secrets)?;
+    let _ = cache_set(&config.redis_addr, &key, &result);
+    Ok(result.into_bytes())
+}
+
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
 /// the worker image and salt under reserved entries) and return its result
 /// as `"<type> <hash>"`. (`req` is the query param's historical name; its value
