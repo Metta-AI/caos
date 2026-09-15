@@ -188,6 +188,9 @@ admit_turn() {
   [ -n "$parsed_ref" ] || fail "the turn helper did not report the conversation ref"
   admitted=$parsed_head
   request=$parsed_request
+  # The head the request was ADMITTED at, which is what a dispatch has to pass
+  # as `--head` -- llm-step checks it against the record and refuses any other.
+  human=$parsed_human
   conversation_ref=$parsed_ref
   head=$admitted
   LLM_TEST_NEW_CONVERSATION=0

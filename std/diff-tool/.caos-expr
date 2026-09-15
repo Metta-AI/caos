@@ -1,0 +1,20 @@
+# The `diff` tool: std/githist-lib (std/bash with the shared history library
+# bound) with this directory's command body curried onto it, plus the `help` an
+# agent registers it by.
+#
+# The docs are a HERE-STRING, like std/caos-test's, so they live here rather
+# than in the worker -- and a `.caos-expr` is STRIPPED from the tree it is
+# evaluated against, so rewording them re-keys this tool's arg tree and nothing
+# it builds.
+#
+# `@git` is what asks the launch for the workspace commit (`wc`) and the turn's
+# ref snapshot (`refs`). Only `@git` tools get them: `wc` moves every step, so
+# binding it into a build or test tool would sink that tool's cache.
+HELP=<<END
+Unified diff between two revisions of the workspace, optionally scoped to a path. Defaults compare the previous commit to the current workspace (what the latest step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.
+@param [from] The base revision (default HEAD~1, the commit before the workspace).
+@param [to] The revision to compare against the base (default HEAD, the current workspace).
+@param [path] Restrict the diff to this workspace-relative path.
+@git
+END
+curry --base:@=DEEP-DEPS/githist-lib --worker1:@=worker.sh --help=$HELP

@@ -17,9 +17,11 @@
 ../../rust/crates/conversation-protocol conversation-protocol
 ../bash-tool bash-tool
 ../rgrep rgrep
-../bash bash
 ../merge merge
 ../caos-build caos-build
 ../caos-test caos-test
 ../caos-test-result caos-test-result
+../log-tool log-tool
+../show-tool show-tool
+../diff-tool diff-tool
 ../run-and-update-ref run-and-update-ref
