@@ -18,8 +18,8 @@ another coding agent, or a CI system driving caos — each a sibling here.
 What lives here is the deployable glue: install scripts, session hooks, the
 harness's configuration, and any patched tools it needs. The caos-side
 counterpart to a harness integration may be a verb in the client itself — Claude
-Code's is `caos cc` (`rust/crates/caos-cli/src/cc/`, documented in that crate's
-`CC.md`) — which stays compiled into the binary; only the host-side package lives
+Code's is `caos mcp` (`rust/crates/caos-cli/src/mcp/`, documented in that crate's
+`MCP.md`) — which stays compiled into the binary; only the host-side package lives
 here.
 
 ## Harnesses

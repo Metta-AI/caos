@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch Claude Code against a caos workspace (see rust/crates/caos-cli/CC.md).
+# Launch Claude Code against a caos workspace (see rust/crates/caos-cli/MCP.md).
 #
 # Everything this sets up could be passed by hand -- `claude --settings
 # integrations/claude-code/settings.json --mcp-config integrations/claude-code/mcp.json
@@ -39,11 +39,11 @@ export CAOS_BIN
 # first match and closes the pipe, the server takes SIGPIPE, and under
 # `pipefail` that pipeline reports failure for a probe that in fact SUCCEEDED.
 probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-    | "$CAOS_BIN" cc serve --llm-step:@=std/llm-step || true)"
+    | "$CAOS_BIN" mcp serve --llm-step:@=std/llm-step || true)"
 case "$probe" in
     *caos_session*) ;;
     *)
-        echo "$CAOS_BIN cc serve listed no tools (see the error above)." >&2
+        echo "$CAOS_BIN mcp serve listed no tools (see the error above)." >&2
         echo "The tools come from std/llm-step through the caos server, so" >&2
         echo "check that the server is up and the binary is current." >&2
         exit 1

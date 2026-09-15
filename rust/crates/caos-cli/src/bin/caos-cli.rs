@@ -73,10 +73,10 @@ fn run(args: &[String]) -> Result<(), String> {
         // `--new` starts another); with no prompt on a terminal it loops, one
         // turn per line. Flag parsing and usage live in the conversation client.
         Some("talk") => caos_cli::cli_talk(&transport()?, &args[2..]),
-        // `cc hook` / `cc serve` — record a Claude Code session as an ordinary
+        // `mcp hook` / `mcp serve` — record a Claude Code session as an ordinary
         // conversation. Its transport is not this one: the process is started
         // by Claude Code, not by a person standing in the repository.
-        Some("cc") => caos_cli::cli_cc(cc_transport(), &args[2..]),
+        Some("mcp") => caos_cli::cli_mcp(cc_transport(), &args[2..]),
         Some("tui") => tui::run(&args[2..]).map_err(|error| format!("tui: {error}")),
         // `chat <name> [-m <message>] [flags]` — one explicit turn of a named
         // conversation on its shared canonical head. Flag parsing (and the
@@ -139,7 +139,7 @@ fn transport() -> Result<GitTransport, String> {
     GitTransport::from_cwd()
 }
 
-/// The transport for `caos cc`, which is NOT started by a person in a shell.
+/// The transport for `caos mcp`, which is NOT started by a person in a shell.
 ///
 /// Claude Code spawns the hook and the tool server itself, and neither one's
 /// working directory is contractually the project: in a cloud session the

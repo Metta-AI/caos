@@ -8,7 +8,7 @@
 # neither was reachable by `run-tool`.
 #
 # This tool owns that rendering once. It returns the ordinary `{report}` tree
-# every other caos tool returns, so llm-step, `caos cc`, and a person running
+# every other caos tool returns, so llm-step, `caos mcp`, and a person running
 # `run-tool rgrep-tool` all get identical output through the SAME generic path,
 # with no grep-specific code in any of them.
 #

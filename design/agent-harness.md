@@ -198,10 +198,10 @@ Tool classes:
 
   That split is why `grep` needs no special code in any caller. Flattening
   used to be "the caller's presentation choice", which meant llm-step carried
-  a precheck, a bespoke launcher and a renderer, and the `caos cc` tool server
+  a precheck, a bespoke launcher and a renderer, and the `caos mcp` tool server
   grew a second copy of the same walk — one user-visible contract with two
   implementations, reachable by neither `run-tool` nor anything else. Now
-  llm-step registers it beside caos-build/caos-test, `caos cc` runs it through
+  llm-step registers it beside caos-build/caos-test, `caos mcp` runs it through
   the same generic path, and `run-tool rgrep-tool` works by hand.
 
   A grep result is not a workspace: the pre-grep workspace rides the
@@ -244,7 +244,7 @@ caught one is not memoized either, so a retry really retries.
 ### Running the tools without the model
 
 Two arguments cut the model out of the step, for a harness that owns the model
-itself. `caos cc` is that harness: Claude Code chooses the calls and reads the
+itself. `caos mcp` is that harness: Claude Code chooses the calls and reads the
 results, and caos keeps the durable record.
 
 - `--list-tools` (optionally `--workspace:hash=<tree>`) describes the registry
@@ -267,7 +267,7 @@ call id for that reason as much as for the check.
 
 The point is that there is exactly one implementation of `edit`. A harness
 that reimplemented the tools client-side would give a model a second
-description and a second behaviour for every one of them, and `caos cc` used
+description and a second behaviour for every one of them, and `caos mcp` used
 to. `tests/llm-tools-only` covers the mode, with an EMPTY stub fixture so a
 run that reaches the model fails rather than passing.
 

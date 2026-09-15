@@ -1,7 +1,7 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
-mod cc;
-pub use cc::cli_cc;
+mod mcp;
+pub use mcp::cli_mcp;
 
 #[cfg(test)]
 use std::cell::RefCell;

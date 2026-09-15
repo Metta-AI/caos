@@ -59,7 +59,7 @@ enum ToolCommand {
     },
     /// Declare a tool call on a request WITHOUT running it -- what a harness
     /// that drives the model itself records before handing the call to a
-    /// tools-only step (`caos cc`). Claims a queued request first, because a
+    /// tools-only step (`caos mcp`). Claims a queued request first, because a
     /// declaration needs a running one.
     Declare {
         repo: PathBuf,

@@ -195,12 +195,12 @@ fi
 # ---------------------------------------------------------------------------
 # Warm the tool registry -- LAST, after the checkout is complete enough to push
 # ---------------------------------------------------------------------------
-# `cc serve` cannot resolve the tools before it must answer the client's first
+# `mcp serve` cannot resolve the tools before it must answer the client's first
 # `tools/list` -- the resolution may build an image -- so a client that reads
 # that list exactly once at startup (the mounted Claude Code a cloud
 # environment uses) is left with no caos tools however fast the resolve then
 # finishes. Resolve them HERE instead, while this hook still blocks the session
-# from starting, and leave them in the cache `cc serve` reads when it launches.
+# from starting, and leave them in the cache `mcp serve` reads when it launches.
 # Then the first turn has the tools rather than racing a background resolve it
 # cannot see and cannot wait out.
 #
@@ -240,12 +240,12 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
         # resolve that ignores the term (a blocked network read) cannot hold the
         # hook past the cap. A warm that still does not finish leaves the
         # background resolve in place, which is where this was before it existed.
-        CLAUDE_PROJECT_DIR="$PWD" timeout -k 10 150 caos cc warm "$locator" \
+        CLAUDE_PROJECT_DIR="$PWD" timeout -k 10 150 caos mcp warm "$locator" \
             >/tmp/caos-warm.log 2>&1 \
-            || log "could not warm the tools in time; cc serve will resolve in the background"
+            || log "could not warm the tools in time; mcp serve will resolve in the background"
         while IFS= read -r line; do log "warm: $line"; done < /tmp/caos-warm.log
     else
-        log "no build record; leaving the tools to cc serve's background resolve"
+        log "no build record; leaving the tools to mcp serve's background resolve"
     fi
 fi
 

@@ -22,7 +22,7 @@
 #
 # It installs three things into the CURRENT REPOSITORY plus one binary:
 #
-#   /usr/local/bin/caos    the client: `caos cc hook` and `caos cc serve`
+#   /usr/local/bin/caos    the client: `caos mcp hook` and `caos mcp serve`
 #   .claude/settings.json  the hooks and the deny list
 #   .mcp.json              the tool server
 #
@@ -328,7 +328,7 @@ chmod 0644 "$PREFIX/share/caos/build"
 # A cloud environment restored from a cache brings back the client the LAST
 # FRESH setup installed and skips the setup that would refresh it; the
 # SessionStart hook does refresh, but its `install.sh` lands AFTER Claude Code
-# has already spawned `cc serve` from the old binary, so the session runs stale
+# has already spawned `mcp serve` from the old binary, so the session runs stale
 # (its tools too -- `llm-step` is pinned to the client's commit). This wrapper
 # moves the refresh to the LAUNCH: `configure.sh` points the caos MCP server's
 # command at it, so before the server starts it reinstalls the newest build for
@@ -348,7 +348,7 @@ timeout 20 bash -c "curl -fsSL '$BASE/install.sh' | bash -s -- --no-repo-files -
 r="\$(sed -n 's/^repo=//p' "$PREFIX/share/caos/build" 2>/dev/null)"
 c="\$(sed -n 's/^commit=//p' "$PREFIX/share/caos/build" 2>/dev/null)"
 if [ -n "\$r" ] && [ -n "\$c" ]; then
-    exec "$PREFIX/bin/caos" cc serve "--llm-step:@@=github:\$r?rev=\$c&dir=std/llm-step"
+    exec "$PREFIX/bin/caos" mcp serve "--llm-step:@@=github:\$r?rev=\$c&dir=std/llm-step"
 fi
 exec "$PREFIX/bin/caos" "\$@"
 WRAP
@@ -381,7 +381,7 @@ Done. Point the client at a caos server, then start a session:
   git remote add caos <server-url>        # or set CAOS_SERVER_URL
   claude
 
-`caos cc serve` is spawned by Claude Code from .mcp.json; the hooks in
+`caos mcp serve` is spawned by Claude Code from .mcp.json; the hooks in
 .claude/settings.json record the conversation.
 
 Both name the step whose tools the session offers. Nothing defaults it, so the

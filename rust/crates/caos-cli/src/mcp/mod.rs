@@ -2,7 +2,7 @@
 //!
 //! Claude Code drives the model; CAOS keeps the durable log. Every hook Claude
 //! Code fires arrives here as one JSON object on stdin, so the whole surface is
-//! a single `caos cc hook` command and `.claude/settings.json` needs no shell
+//! a single `caos mcp hook` command and `.claude/settings.json` needs no shell
 //! at all — no `jq`, no quoting, none of the constructs CLAUDE.md catalogs as
 //! this tree's most reliable source of bugs. The payload names its own event
 //! (`hook_event_name`), so one command serves every hook.
@@ -16,7 +16,7 @@
 //! AND THE TOOLS ARE ORDINARY TOOLS. Nothing here implements one. A call is
 //! recorded as the model's own declaration and then handed to `llm-step` in its
 //! tools-only mode, which runs it exactly as it runs a call in a turn it drives
-//! itself — so `caos cc` offers whatever that step offers, in whatever
+//! itself — so `caos mcp` offers whatever that step offers, in whatever
 //! repository it is pointed at, and a tool reads one way wherever a model meets
 //! it. The step is named by `--llm-step`, as `tui` and `chat` name it.
 //!
@@ -84,7 +84,7 @@ const CLAUDE_CODE_MODEL: &str = "claude-code";
 /// `--llm-step:<type>=<value>` names the step that runs the tools, exactly as
 /// `tui` and `chat` take it: a session in another repository points it at
 /// wherever that repository mounted caos.
-pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Result<(), String> {
+pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Result<(), String> {
     let mut options = TurnOptions::default();
     let mut rest = Vec::new();
     for argument in args {
@@ -103,9 +103,9 @@ pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Resul
 fn usage() -> String {
     format!(
         "usage:\n  \
-         caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos cc serve   (workspace tool server; JSON-RPC on stdio)\n  \
-         caos cc warm    (resolve the tools now and cache them for the next serve)\n\n\
+         caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
+         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n  \
+         caos mcp warm    (resolve the tools now and cache them for the next serve)\n\n\
          All name the step whose tools this session offers:\n  \
          {}",
         crate::missing_image_arg(LLM_STEP_ARG)
@@ -257,7 +257,7 @@ fn dispatch_call(
         }
         Ok(None) => {}
         Err(error) => eprintln!(
-            "caos cc serve: could not resolve {name:?} on the client ({error}); \
+            "caos mcp serve: could not resolve {name:?} on the client ({error}); \
              letting the step evaluate it"
         ),
     }

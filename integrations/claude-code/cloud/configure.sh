@@ -107,7 +107,7 @@ fi
 # that name that refreshes the client to the newest build for its base and THEN
 # execs `caos`, so the running tool server is current even in a cached
 # environment whose snapshot froze an older binary. The args are untouched --
-# `caos-serve` execs `caos "$@"`, so `cc serve --llm-step:@@=…` still reaches it.
+# `caos-serve` execs `caos "$@"`, so `mcp serve --llm-step:@@=…` still reaches it.
 if ! servers="$(printf '%s' "$repo_mcp" \
     | jq --arg step "$locator" "$unbin"' | .mcpServers | .caos.command = "caos-serve"')"; then
     echo "FATAL: $base/mcp.json is not the JSON this expects" >&2

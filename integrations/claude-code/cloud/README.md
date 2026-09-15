@@ -1,7 +1,7 @@
 # Running a caos session in a cloud container
 
-A cloud session (claude.ai/code) needs two things: the **client** (`caos cc
-hook` records the conversation, `caos cc serve` is the tool server — one
+A cloud session (claude.ai/code) needs two things: the **client** (`caos mcp
+hook` records the conversation, `caos mcp serve` is the tool server — one
 downloaded binary), and a **caos server** to point it at. Neither requires the
 repository to carry anything.
 
@@ -76,12 +76,12 @@ Measured end to end, a fresh session on a correctly-ticketed environment:
 - **hooks fire** — `SessionStart` brings up the tunnel and adds the `caos`
   remote; `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
-  is honoured, `caos cc serve` is spawned, and the model can call it.
+  is honoured, `caos mcp serve` is spawned, and the model can call it.
 - **the full tool set resolves** — `bash read ls grep edit write caos-build
   caos-test caos-test-result log show diff merge spawn_agent run_async
   wait_agent harvest_agent`, within SECONDS of init when the server has the
   `std/llm-step` image cached warm. The `caos_status` placeholder stands in only
-  until they arrive (`../../rust/crates/caos-cli/CC.md`).
+  until they arrive (`../../rust/crates/caos-cli/MCP.md`).
 
 The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
 is fixed on their side; the first session against a step-tree the server has

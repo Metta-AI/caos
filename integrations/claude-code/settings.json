@@ -18,7 +18,7 @@
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook --llm-step:@=std/llm-step" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
         ]
       }
     ],
@@ -26,21 +26,21 @@
       {
         "matcher": "mcp__caos__.*",
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook --llm-step:@=std/llm-step" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook --llm-step:@=std/llm-step" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
         ]
       }
     ],
     "StopFailure": [
       {
         "hooks": [
-          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" cc hook --llm-step:@=std/llm-step" }
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
         ]
       }
     ]

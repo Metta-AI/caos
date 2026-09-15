@@ -32,7 +32,7 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-/// The pause between `warm`'s resolve attempts. `cc serve` itself no longer
+/// The pause between `warm`'s resolve attempts. `mcp serve` itself no longer
 /// retries -- it serves the registry `warm` cached, or resolves ONCE inline when
 /// there is none (see `ensure_resolved`) -- but `warm`, which runs in the
 /// session-start hook before the client starts, still retries through the setup
@@ -51,8 +51,8 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     let workspace = match workspace {
         Ok(t) => Ok(t),
         Err(error) => {
-            eprintln!("caos cc serve: cannot open the caos workspace: {error}");
-            eprintln!("caos cc serve: serving anyway; tools will report this when called");
+            eprintln!("caos mcp serve: cannot open the caos workspace: {error}");
+            eprintln!("caos mcp serve: serving anyway; tools will report this when called");
             Err(error)
         }
     };
@@ -60,7 +60,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
-    // The registry `cc warm` cached in the session-start hook, BEFORE the client
+    // The registry `mcp warm` cached in the session-start hook, BEFORE the client
     // started -- the whole point of warm, and now the whole story: with it,
     // `tools/list` is answered from the first read. Without it (a dev checkout,
     // or a warm that could not finish), the first `tools/list` or `caos_status`
@@ -88,9 +88,9 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
 }
 
 /// Resolve the tools once, up front, and leave them in the on-disk cache that
-/// the `cc serve` spawned moments later reads at startup.
+/// the `mcp serve` spawned moments later reads at startup.
 ///
-/// This is what lets a session be ready on TURN ONE. `cc serve` cannot answer
+/// This is what lets a session be ready on TURN ONE. `mcp serve` cannot answer
 /// `initialize` and go build an image before the client's first `tools/list`, so
 /// without a cache that first `tools/list` blocks on the resolve -- fine once the
 /// step is built, but the first time in a tree it is a rustc compile measured in
@@ -100,7 +100,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
 ///
 /// NON-FATAL by contract. It always returns `Ok`, because the hook must not fail
 /// a session over a cold cache: a warm that cannot reach the server yet, or a
-/// resolve that errors, simply leaves no cache and `cc serve` resolves inline on
+/// resolve that errors, simply leaves no cache and `mcp serve` resolves inline on
 /// the first `tools/list` exactly as it would have without this.
 pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     // RETRIED, because this races the session's own setup. The first attempt
@@ -130,7 +130,7 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
             Ok(found) if !found.is_empty() => {
                 write_cached_registry(t, options, &found);
                 eprintln!(
-                    "caos cc warm: cached {} tools for the first turn (attempt {})",
+                    "caos mcp warm: cached {} tools for the first turn (attempt {})",
                     found.len(),
                     attempt + 1
                 );
@@ -140,16 +140,16 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
             Err(error) => last = error,
         }
         eprintln!(
-            "caos cc warm: attempt {} did not cache: {last}",
+            "caos mcp warm: attempt {} did not cache: {last}",
             attempt + 1
         );
     }
-    eprintln!("caos cc warm: gave up ({last}); cc serve will resolve on first use");
+    eprintln!("caos mcp warm: gave up ({last}); mcp serve will resolve on first use");
     Ok(())
 }
 
-/// The per-checkout file the resolved tool registry is cached in. `cc warm` and
-/// the `cc serve` that follows it both open the same checkout, so both derive
+/// The per-checkout file the resolved tool registry is cached in. `mcp warm` and
+/// the `mcp serve` that follows it both open the same checkout, so both derive
 /// this path from the git directory without one having to tell the other.
 fn registry_cache_path(t: &GitTransport) -> std::path::PathBuf {
     t.git_dir().join("caos-cc-registry.json")
@@ -318,7 +318,7 @@ fn status_result(registry: &Registry) -> Value {
 /// that explains a broken session must not break.
 fn diagnostics() -> String {
     let mut d = String::from("--- caos diagnostics ---\n");
-    // The build THIS `cc serve` binary is: the wrapper exports it (install.sh).
+    // The build THIS `mcp serve` binary is: the wrapper exports it (install.sh).
     // The one fact that settles "is the per-session refresh installing the
     // latest, or is a stale client frozen in?".
     d.push_str(&format!(
@@ -346,7 +346,7 @@ fn diagnostics() -> String {
     if let Some(timing) = super::discovery_timing() {
         d.push_str(&format!("tool discovery: {timing}\n"));
     }
-    // The warm step's own log: session-start runs `cc warm` before the client
+    // The warm step's own log: session-start runs `mcp warm` before the client
     // starts, and this is where it says whether it resolved and cached the
     // tools or why it could not -- the reason a first turn does or does not
     // already have them.
@@ -358,7 +358,7 @@ fn diagnostics() -> String {
 }
 
 /// A one-line note on the on-disk tool-registry cache: present with how many
-/// tools and for which step, or why not. `cc warm` writes it and `cc serve`
+/// tools and for which step, or why not. `mcp warm` writes it and `mcp serve`
 /// loads it (see [`registry_cache_path`]); a first turn with no tools when this
 /// says "absent" means the warm did not finish, and when it says "present" means
 /// the load key did not match.
@@ -463,7 +463,7 @@ fn publish(registry: &Registry, tools: Vec<Value>) {
             found.tools = tools;
             found.status = None;
         }
-        Err(_) => eprintln!("caos cc serve: the tool registry lock is poisoned"),
+        Err(_) => eprintln!("caos mcp serve: the tool registry lock is poisoned"),
     }
 }
 
@@ -481,7 +481,7 @@ fn handle(
         // A malformed line has no id to answer against, so the only correct
         // response is none. Report it where a human will see it.
         Err(error) => {
-            eprintln!("caos cc serve: ignoring unparseable request: {error}");
+            eprintln!("caos mcp serve: ignoring unparseable request: {error}");
             return None;
         }
     };

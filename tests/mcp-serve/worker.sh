@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# What `caos cc serve` must do, in the terms Claude Code judges it by.
+# What `caos mcp serve` must do, in the terms Claude Code judges it by.
 #
 # The contract is SYNCHRONOUS: `initialize` answers at once (it never resolves
 # the step), and `tools/list` resolves the step and answers with the result --
@@ -23,7 +23,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # has to skip lines it did not ask for rather than assume the next line is its
 # answer.
 open_server() { # <llm-step argument>
-  coproc SERVER { "$CAOS_CLI" cc serve "$1" 2>/tmp/cc-serve.err; }
+  coproc SERVER { "$CAOS_CLI" mcp serve "$1" 2>/tmp/mcp-serve.err; }
   SERVER_IN=${SERVER[1]}
   SERVER_OUT=${SERVER[0]}
 }
@@ -154,4 +154,4 @@ case "$status" in
 esac
 close_server
 
-echo "cc-serve: ALL PASS" >&2
+echo "mcp-serve: ALL PASS" >&2

@@ -71,7 +71,7 @@ struct Config {
     /// do not terminate the request.
     ///
     /// For a harness that drives the model ITSELF and wants only the tools:
-    /// `caos cc` records the call Claude Code is about to make, runs this to
+    /// `caos mcp` records the call Claude Code is about to make, runs this to
     /// execute it, and hands the observation back. Without it the step would
     /// answer a model that already answered.
     ///
@@ -113,7 +113,7 @@ impl Config {
         let tools_only = read_arg_opt("tools-only")?;
         let list_tools = read_arg_opt("list-tools")?.is_some();
         // Neither of those modes reaches the model, so neither may DEMAND what
-        // a model call takes. The key especially: `caos cc` runs Claude Code's
+        // a model call takes. The key especially: `caos mcp` runs Claude Code's
         // tools for a session whose model is Claude Code's own, and requiring
         // an Anthropic key of it would refuse a turn over a call nothing makes.
         let answers_model = tools_only.is_none() && !list_tools;
@@ -1407,7 +1407,7 @@ fn launch_tree_evaluation(
     // The tool's ArgTree. Normally the SERVER evaluates `caos-tools/<name>` for
     // us (a worker cannot), then runs `me` with the result bound as `--result`.
     // But that server-side walk refuses a `:@@=` locator, so when the CLIENT
-    // resolved this tool for us (`caos cc serve`'s dispatch_call, for a tool that
+    // resolved this tool for us (`caos mcp serve`'s dispatch_call, for a tool that
     // reaches such a locator) we skip the walk and run `me` with the tree it
     // handed us bound as `--result` -- byte-identical to what the eval would have
     // bound, so `launch_evaluated_tool` cannot tell the difference.
@@ -1425,7 +1425,7 @@ fn launch_tree_evaluation(
     dispatched
 }
 
-/// The client-resolved ArgTree for tool `name`, if `caos cc serve` handed one in
+/// The client-resolved ArgTree for tool `name`, if `caos mcp serve` handed one in
 /// for THIS tool (`--client-tool-name` / `--client-tool-tree`). The name guards
 /// it: a tools-only run drives one call, but a bare tree with no owner would be
 /// used for whatever tool happened to evaluate, so the two args travel together

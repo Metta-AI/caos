@@ -1,6 +1,6 @@
-# `caos cc` — Claude Code against a caos workspace
+# `caos mcp` — Claude Code against a caos workspace
 
-`caos cc` lets Claude Code drive a caos conversation. Claude Code runs the
+`caos mcp` lets Claude Code drive a caos conversation. Claude Code runs the
 model; caos keeps the durable log and owns the workspace. The result is an
 ordinary conversation — the same head ref (its id is `cc/<session-id>`, which
 v3 hex-encodes into the ref path), the same append-only spine, and the same
@@ -10,8 +10,8 @@ replay `caos tui` performs for a conversation it started itself
 Two commands make that work:
 
 ```text
-caos cc hook     record one Claude Code hook payload (JSON on stdin)
-caos cc serve    the workspace tool server (JSON-RPC on stdio)
+caos mcp hook     record one Claude Code hook payload (JSON on stdin)
+caos mcp serve    the workspace tool server (JSON-RPC on stdio)
 ```
 
 Both take `--llm-step:<type>=<value>`, exactly as `caos tui` and `caos chat`
@@ -119,7 +119,7 @@ absolute path from its own location and has no such constraint.
 
 `settings.json` denies Claude Code's built-in file and shell tools, which
 removes them from the model's context rather than merely refusing their calls,
-and points every hook at `caos cc hook`. `mcp.json` declares the tool server.
+and points every hook at `caos mcp hook`. `mcp.json` declares the tool server.
 Both pass `--llm-step:@=std/llm-step`, which is a statement about THIS
 checkout and nothing more: these two files are the caller. Elsewhere they say
 something else — `integrations/claude-code/cloud/configure.sh` rewrites that argument
@@ -240,7 +240,7 @@ is explicit:
 ```
 
 That is the log to check first for any "broken server" report — a wrong path,
-a binary too old to know `cc serve`, or a crash on startup all land there and
+a binary too old to know `mcp serve`, or a crash on startup all land there and
 nowhere else.
 
 ## What gets recorded

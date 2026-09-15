@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Code Remote Control against a caos workspace, driven from
-# claude.ai/code or the mobile app. See rust/crates/caos-cli/CC.md.
+# claude.ai/code or the mobile app. See rust/crates/caos-cli/MCP.md.
 #
 # `claude remote-control` takes NO --settings/--mcp-config: it is a persistent
 # server, so it reads configuration from the usual places rather than from its
@@ -46,12 +46,12 @@ export CAOS_BIN
 # Same probe as ./run: a stale binary should fail here, not leave a session
 # quietly toolless (a model with no tools does not say so -- it improvises).
 probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-    | "$CAOS_BIN" cc serve 2>/dev/null || true)"
+    | "$CAOS_BIN" mcp serve 2>/dev/null || true)"
 case "$probe" in
     *caos_session*) ;;
     *)
-        echo "$CAOS_BIN cc serve did not list its tools;" >&2
-        echo "it is probably older than \`caos cc\`. Rebuild it." >&2
+        echo "$CAOS_BIN mcp serve did not list its tools;" >&2
+        echo "it is probably older than \`caos mcp\`. Rebuild it." >&2
         exit 1
         ;;
 esac
@@ -118,7 +118,7 @@ cp "$here/settings.json" "$cfg/settings.json"
 # The ARGUMENTS are compared too, not just the binary: this dir persists across
 # launches, so an entry declared by an older version of this script would
 # otherwise keep whatever arguments it was given.
-command=("$CAOS_BIN" cc serve --llm-step:@=std/llm-step)
+command=("$CAOS_BIN" mcp serve --llm-step:@=std/llm-step)
 declared="$(jq -r '[.mcpServers.caos.command // ""]
                    + (.mcpServers.caos.args // []) | join(" ")' "$cfg/.claude.json")"
 if [ "$declared" != "${command[*]}" ]; then

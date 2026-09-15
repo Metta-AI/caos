@@ -602,8 +602,8 @@ impl GitTransport {
     }
 
     /// The git directory of the worktree. A per-checkout scratch location the
-    /// `cc serve` tool-registry cache lives under, so a `cc warm` in the
-    /// session-start hook and the `cc serve` spawned right after it agree on
+    /// `mcp serve` tool-registry cache lives under, so a `mcp warm` in the
+    /// session-start hook and the `mcp serve` spawned right after it agree on
     /// one path without being told it.
     pub fn git_dir(&self) -> &Path {
         &self.git_dir
