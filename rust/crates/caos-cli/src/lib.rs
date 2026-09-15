@@ -535,7 +535,7 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     store.ensure_local(commit)?;
     let ensure_local = mark.elapsed();
 
-    let info = store.read_commit(commit).map_err(String::from)?;
+    store.read_commit(commit).map_err(String::from)?;
     let genesis = ensure_genesis(store)?;
     let mark = Instant::now();
     let is_conversation = conversation_protocol::v3::CodeOps::is_ancestor(store, &genesis, commit)?;
@@ -546,17 +546,12 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
         ));
     }
 
-    // Push the base by its TREE, not by re-packing its closure: a caos-minted
-    // base commit shares no ref with the server for `git push` to negotiate
-    // against, so a plain push re-sends the whole (already-present) tree. When
-    // the server holds the tree, only the commit and any missing ancestry go
-    // over the wire; see [`GitTransport::push_workspace_commit`].
     let mark = Instant::now();
-    let pushed = t.push_workspace_commit(commit.as_str(), info.tree.as_str());
+    let pushed = t.ensure_pushed(commit.as_str());
     let ensure_pushed = mark.elapsed();
     if let Ok(mut slot) = CODE_COMMIT_TIMING.lock() {
         *slot = Some(format!(
-            "ensure-local {:.1}s, is-ancestor {:.1}s, push {:.1}s",
+            "ensure-local {:.1}s, is-ancestor {:.1}s, ensure-pushed {:.1}s",
             ensure_local.as_secs_f64(),
             is_ancestor.as_secs_f64(),
             ensure_pushed.as_secs_f64(),
