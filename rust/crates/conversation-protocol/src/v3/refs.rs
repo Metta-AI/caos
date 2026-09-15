@@ -29,7 +29,7 @@ pub fn id_of_key(key: &str) -> Result<String, String> {
         return Err(format!("invalid lowercase hexadecimal id key {key:?}"));
     }
     let mut bytes = Vec::with_capacity(key.len() / 2);
-    for pair in key.as_bytes().chunks_exact(2) {
+    for pair in key.as_bytes().as_chunks::<2>().0 {
         bytes.push((hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]));
     }
     let id = String::from_utf8(bytes).map_err(|_| format!("id key is not UTF-8: {key:?}"))?;
