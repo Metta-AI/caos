@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Claude Code Remote Control against a caos workspace, driven from
+# claude.ai/code or the mobile app. See rust/crates/caos-cli/CC.md.
+#
+# `claude remote-control` takes NO --settings/--mcp-config: it is a persistent
+# server, so it reads configuration from the usual places rather than from its
+# command line. Putting ours in the usual places would mean `.claude/` in this
+# repo, which applies to EVERY Claude Code session here -- including an ordinary
+# one you want to keep its built-in tools. Claude Code reloads settings files
+# live, so that would disarm a session already running in this checkout.
+#
+# So this builds a throwaway config dir and points CLAUDE_CONFIG_DIR at it,
+# which scopes the whole thing to this invocation.
+#
+#   settings.json      the deny list and hooks (written here)
+#   .credentials.json  SYMLINKED to the real one -- Remote Control needs
+#                      claude.ai subscription auth, and an api key does not
+#                      count (it refuses outright when ANTHROPIC_API_KEY is set)
+#   .claude.json       a COPY of yours, seeded once, with the tool server then
+#                      declared into it by `claude mcp add --scope user`. A copy
+#                      and not a symlink because that is where a session which
+#                      cannot take --mcp-config picks the server up, and writing
+#                      it through a symlink would add it to your real config for
+#                      every project. The account and org fields ride along --
+#                      Remote Control refuses without them -- so it is 0600 like
+#                      the original. It is also where session records land, which
+#                      is why it is seeded once and never re-copied.
+#
+# The dir PERSISTS between launches, because that is where sessions live. Session
+# history written by remote-control sessions stays there rather than in your real
+# config, and later changes to your real ~/.claude.json are not picked up at all
+# once it has been seeded.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+
+CAOS_BIN="${CAOS_BIN:-$repo/result/bin/caos}"
+if [ ! -x "$CAOS_BIN" ]; then
+    echo "no caos binary at $CAOS_BIN -- run \`nix build\` first," >&2
+    echo "or set CAOS_BIN to one (e.g. rust/target/debug/caos-cli)." >&2
+    exit 1
+fi
+export CAOS_BIN
+
+# Same probe as ./run: a stale binary should fail here, not leave a session
+# quietly toolless (a model with no tools does not say so -- it improvises).
+probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+    | "$CAOS_BIN" cc serve 2>/dev/null || true)"
+case "$probe" in
+    *caos_session*) ;;
+    *)
+        echo "$CAOS_BIN cc serve did not list its tools;" >&2
+        echo "it is probably older than \`caos cc\`. Rebuild it." >&2
+        exit 1
+        ;;
+esac
+
+src="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+account="${CLAUDE_ACCOUNT_JSON:-$HOME/.claude.json}"
+for f in "$src/.credentials.json" "$account"; do
+    if [ ! -e "$f" ]; then
+        echo "no $f -- run \`claude auth login\` first (Remote Control needs" >&2
+        echo "claude.ai subscription auth; an ANTHROPIC_API_KEY will not do)." >&2
+        exit 1
+    fi
+done
+
+# THE CONFIG DIR PERSISTS, because that is where sessions live: transcripts in
+# `projects/`, and the session records Remote Control writes in the
+# `.claude.json` copy. Rebuilding it each launch is what made a restart leave
+# the web UI holding sessions this machine no longer served.
+#
+# It lives in `.caos-data/`, the repo's own ignored state directory. It was in
+# `.git/` first, which was wrong: that directory belongs to git, and in a linked
+# worktree it is a FILE, so `mkdir` there fails outright.
+cfg="$repo/.caos-data/remote-control"
+
+# One-time moves of the earlier locations, so a restart does not lose sessions.
+for legacy in "$repo/.git/caos-remote-control" \
+              "${XDG_STATE_HOME:-$HOME/.local/state}/caos/remote-control/$(printf '%s' "$repo" | tr '/' '-' | sed 's/^-//')"; do
+    if [ -d "$legacy" ] && [ ! -d "$cfg" ]; then
+        mkdir -p "$(dirname "$cfg")"
+        mv "$legacy" "$cfg"
+        echo "moved remote-control state to $cfg" >&2
+    fi
+done
+
+mkdir -p "$cfg"
+chmod 700 "$cfg"
+
+# Stateless, so refreshed every launch: a symlink to whatever the real
+# credentials are now.
+ln -sfn "$src/.credentials.json" "$cfg/.credentials.json"
+
+# SEEDED ONCE, then left alone -- this is the file that accumulates session
+# state. 0600 before any content lands in it: it carries account and org fields.
+#
+# The account fields are therefore a SNAPSHOT. `claude auth login` refreshes the
+# credentials this dir symlinks, but not the org information copied here; if
+# Remote Control ever starts refusing on eligibility again, delete the dir.
+if [ ! -e "$cfg/.claude.json" ]; then
+    : > "$cfg/.claude.json"
+    chmod 600 "$cfg/.claude.json"
+    cat "$account" > "$cfg/.claude.json"
+fi
+
+# Also stateless, and refreshed so an edit to integrations/claude-code/settings.json takes
+# effect on the next launch. Its hook commands read `${CAOS_BIN:-...}`, which the
+# shell expands from the export above, so the file needs no rewriting.
+cp "$here/settings.json" "$cfg/settings.json"
+
+# The tool server, declared only when it is absent or differs -- `claude mcp
+# add` refuses to overwrite an existing entry ("already exists"), so a change
+# needs the removal first. Re-declaring unconditionally would be a no-op at
+# best and a lost binding at worst.
+#
+# The ARGUMENTS are compared too, not just the binary: this dir persists across
+# launches, so an entry declared by an older version of this script would
+# otherwise keep whatever arguments it was given.
+command=("$CAOS_BIN" cc serve --llm-step:@=std/llm-step)
+declared="$(jq -r '[.mcpServers.caos.command // ""]
+                   + (.mcpServers.caos.args // []) | join(" ")' "$cfg/.claude.json")"
+if [ "$declared" != "${command[*]}" ]; then
+    env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        claude mcp remove caos --scope user >/dev/null 2>&1 || true
+    env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        claude mcp add caos --scope user -- "${command[@]}" >/dev/null \
+        || { echo "could not declare the caos tool server" >&2; exit 1; }
+fi
+
+# ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
+# the variable is SET, and an empty one still counts as api-key auth.
+# NO FLAGS OF ITS OWN. This is a configuration wrapper, not an opinion about how
+# Remote Control should run, and each flag it used to add cost something:
+#
+#   --no-create-session-in-dir  ARCHIVES the server's sessions when it stops, so
+#       there is nothing to resume. It was the reason a restart left the web UI
+#       holding sessions this machine no longer served ("Can't reach <host>").
+#
+#   --spawn=same-dir  is already the default, so it added nothing -- and
+#       `--continue`/`--session-id` are documented as incompatible with
+#       `--spawn`, which says an explicit one reads as "create sessions" rather
+#       than "resume them". With it passed, a restart brought back the
+#       pre-created in-dir session but NOT sessions created from the web.
+#
+# A plain `claude remote-control` "brings back every session the server was
+# serving", for about four hours after it stopped, in the same directory, as
+# long as no other server ran there meanwhile. That is the daemon behaviour, and
+# it wants no help.
+#
+# ANTHROPIC_API_KEY is unset rather than emptied: Remote Control checks whether
+# the variable is SET, and an empty one still counts as api-key auth.
+# Print what is about to run, quoted so it can be copied and edited by hand --
+# the flags here are load-bearing and worth being able to fiddle with directly.
+{
+    printf 'caos remote-control:\n'
+    printf '  CAOS_BIN=%q\n' "$CAOS_BIN"
+    printf '  config=%q\n' "$cfg"
+    printf '  exec:'
+    printf ' %q' env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" \
+        "$(command -v claude || echo claude)" remote-control "$@"
+    printf '\n\n'
+} >&2
+
+exec env -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR="$cfg" claude remote-control "$@"
