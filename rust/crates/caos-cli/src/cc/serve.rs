@@ -130,31 +130,45 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
 /// resolve that errors, simply leaves no cache and `cc serve` resolves in the
 /// background exactly as it did before this existed.
 pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
-    // Wait BRIEFLY for reachability: the session-start hook opens the tunnel
-    // just before calling this, and it may still be settling. Once the server
-    // answers, resolve ONCE -- not the background resolver's many attempts,
-    // which would block the hook, and a resolve that fails past reachability
-    // fails the same way for `cc serve`, which retries regardless.
-    let mut reachable = false;
-    for _ in 0..RESOLVE_FAST_ATTEMPTS {
-        if t.ensure_server_reachable().is_ok() {
-            reachable = true;
-            break;
+    // RETRIED, for the SAME reason `resolve_in_background` retries: this races
+    // the session's own setup. The first attempt commonly fails -- the tunnel
+    // is a second from settling, a `caos` remote a moment from being added --
+    // and a single-shot warm that gave up there would cache nothing and leave
+    // every first turn to the async path, which is the whole thing this exists
+    // to pre-empt. So keep trying until one succeeds or the outer `timeout` in
+    // the hook kills us; a reachability probe with a deadline sits in front so a
+    // dead tunnel is a short failure, not a swallowed one.
+    // The real stop is the hook's `timeout`; this bound just keeps the loop
+    // finite. Each attempt is a reachability probe plus a full resolve, so even
+    // at a second of sleep between them the count is reached only if every
+    // resolve is returning fast failures -- exactly the setup-race case worth
+    // retrying through.
+    const WARM_ATTEMPTS: u32 = 120;
+    let mut last = "not started".to_string();
+    for attempt in 0..WARM_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(RESOLVE_FAST_INTERVAL);
         }
-        std::thread::sleep(RESOLVE_FAST_INTERVAL);
-    }
-    if !reachable {
-        eprintln!("caos cc warm: server not reachable yet; cc serve will resolve in the background");
-        return Ok(());
-    }
-    match declarations(t, options) {
-        Ok(found) if !found.is_empty() => {
-            write_cached_registry(t, options, &found);
-            eprintln!("caos cc warm: cached {} tools for the first turn", found.len());
+        if let Err(error) = t.ensure_server_reachable() {
+            last = format!("server not reachable: {error}");
+            continue;
         }
-        Ok(_) => eprintln!("caos cc warm: the step answered with no tools; not caching"),
-        Err(error) => eprintln!("caos cc warm: {error}; cc serve will retry in the background"),
+        match declarations(t, options) {
+            Ok(found) if !found.is_empty() => {
+                write_cached_registry(t, options, &found);
+                eprintln!(
+                    "caos cc warm: cached {} tools for the first turn (attempt {})",
+                    found.len(),
+                    attempt + 1
+                );
+                return Ok(());
+            }
+            Ok(_) => last = "the step answered with no tools".to_string(),
+            Err(error) => last = error,
+        }
+        eprintln!("caos cc warm: attempt {} did not cache: {last}", attempt + 1);
     }
+    eprintln!("caos cc warm: gave up ({last}); cc serve will resolve in the background");
     Ok(())
 }
 
