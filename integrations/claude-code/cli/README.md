@@ -5,14 +5,13 @@ Needs a `caos` you already have (`nix build`, or `CAOS_BIN=…`) and a `caos` gi
 remote pointing at a server.
 
 ```
-run              a normal interactive session
-remote-control   `claude remote-control`, driven from claude.ai/code or the app
+run    a normal interactive session
 ```
 
-Both pass `../shared/settings.json` (the deny list + hooks) and
+`run` passes `../shared/settings.json` (the deny list + hooks) and
 `../shared/mcp.json` (the `caos mcp serve` declaration) EXPLICITLY, so nothing is
-written into your checkout, and both probe the server first so a stale binary
-fails here rather than leaving a session quietly toolless.
+written into your checkout, and probes the server first so a stale binary fails
+here rather than leaving a session quietly toolless.
 
-Neither uses `cloud/install.sh` — that provisions a container from a release; on
-a machine you already build caos on, there is nothing to install.
+It does not use `cloud/install.sh` — that provisions a container from a release;
+on a machine you already build caos on, there is nothing to install.

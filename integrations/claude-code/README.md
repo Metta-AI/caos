@@ -9,7 +9,7 @@ Anthropic's Claude Code, wired to caos — in both directions, sharing one confi
 
 ```
 shared/   the deny list, hooks, and server declaration both paths consume
-cli/      launch Claude Code locally against caos (run, remote-control)
+cli/      launch Claude Code locally against caos (run)
 cloud/    configure a claude.ai/code cloud environment
             install.sh        the installer: binary + user-level config, pinned
             setup.sh          the env's "Setup script" field: install once, wire the hook

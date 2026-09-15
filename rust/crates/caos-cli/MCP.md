@@ -66,19 +66,23 @@ tool, a second bash-input shape (and so a second cache key for an identical
 command), a second rendering of a grep result. What is offered here now is
 whatever the named step offers, in whatever repository it is pointed at.
 
-The cost is that `tools/list` is a worker run rather than a constant — so it
-does not happen inside `tools/list`. The listing answers immediately with what
-is known, a background thread resolves the step (retrying, because a cloud
-session establishes its `caos` remote and its tunnel *after* spawning this
-server), and `notifications/tools/list_changed` announces the real list when it
-lands. Nothing in front of the handshake.
+Resolving the step is a worker run — the first time in a tree it BUILDS the step,
+minutes of rustc — so it cannot sit in front of the handshake. `caos mcp warm`
+resolves it in the session-start hook, BEFORE Claude Code starts, and leaves the
+registry in an on-disk cache; `tools/list` then serves that cache from its first
+read. Without a warm (a dev checkout, or one that could not finish) the first
+`tools/list` resolves ONCE, inline, and answers with the result — real tools, or,
+on failure, the stand-in below. The reply is final: no timed hold, no background
+retry, no `tools/list_changed` revising it afterward, which is what a client that
+reads the list exactly once needs.
 
-Until it lands there is exactly one tool, **`caos_status`**, and it exists
-because of how the alternative failed: a model handed zero tools does not
-report "my tool server has no tools", it reports that caos is absent — which is
-what every session said while its server sat connected and working. `caos_status`
-answers with the actual reason, including which resolution attempt failed and
-why.
+When there are no workspace tools there is one, **`caos_status`**, and it exists
+because of how the alternative failed: a model handed zero tools does not report
+"my tool server has no tools", it reports that caos is absent — which is what
+every session said while its server sat connected and working. `caos_status`
+answers with the actual reason (client build, `caos` remote, tunnel, the
+resolution's phases), and it rides alongside the real tools too, since those
+diagnostics are wanted most on a session you are trying to confirm.
 
 The tree the session's own `caos-tools/` come from is named ONLY if that
 directory exists, because naming it pushes the whole working tree to the caos
@@ -100,7 +104,6 @@ then:
 ```bash
 ./integrations/claude-code/run                 # a session against a caos workspace
 ./integrations/claude-code/run -p 'your task'  # or headless
-./integrations/claude-code/remote-control      # driven from claude.ai/code or the app
 ```
 
 Any argument is passed through to `claude`. To drive it by hand instead, **from
@@ -143,46 +146,6 @@ and report success, having written nothing. `integrations/claude-code/run` there
 probes `tools/list` before launching, so a missing binary — or a caos server
 that is not up, since the listing comes from the step — is an error at startup
 instead of a fabricated result later.
-
-## Remote Control
-
-```bash
-./integrations/claude-code/remote-control
-```
-
-Then connect from claude.ai/code or the mobile app. Arguments pass through to
-`claude remote-control` (`--name`, `--spawn`, …).
-
-It needs its own launcher because `claude remote-control` accepts **no**
-`--settings` or `--mcp-config`: it is a persistent server, so it reads
-configuration from the usual places. The usual place for this repo would be
-`.claude/`, which applies to every Claude Code session here — and since Claude
-Code reloads settings files live, dropping the deny list there would disarm an
-ordinary session already running in this checkout. So the launcher builds a
-throwaway config dir under `.git/caos-remote-control` and points
-`CLAUDE_CONFIG_DIR` at it, scoping everything to the one invocation.
-
-Two things about that dir are worth knowing:
-
-- **It needs claude.ai subscription auth.** Remote Control refuses outright when
-  `ANTHROPIC_API_KEY` is set — even to an empty string, since it tests whether
-  the variable is set at all — so the launcher unsets it. `.credentials.json` is
-  symlinked to the real one, and `~/.claude.json` is copied, because Remote
-  Control also reads account and org fields from it and refuses without them.
-  The copy is 0600, like the original.
-- **The dir persists, because that is where sessions live.** Transcripts land in
-  its `projects/`, and the session records Remote Control writes land in its
-  `.claude.json` — so the launcher seeds that file once and never re-copies it.
-  Rebuilding the dir on each launch is what used to make `--continue` and the
-  session list on claude.ai come up empty after a restart. To start over, delete
-  it: `rm -rf .git/caos-remote-control`.
-- **The account fields are a snapshot.** `claude auth login` refreshes the
-  credentials the dir symlinks, but not the org information copied into
-  `.claude.json` when it was seeded. If Remote Control starts refusing on
-  eligibility again, delete the dir so it reseeds. Any other user-scope MCP
-  servers you have also come along for the ride; the caos tool server is
-  declared into the copy with `claude mcp add --scope user`, so your real config
-  is never modified.
 
 ## Driving a cloud session from elsewhere
 
@@ -305,8 +268,9 @@ the tui against the same conversation.
   being killed mid-resolve). The result is memoized server-side, so only the
   FIRST session against a step-tree the server has never built waits for the
   real rustc/cargo compiles — `caos_status` explains that wait — and every
-  session after is a memo hit. A fully cold server therefore still risks the
-  first prompt: that one request blocks on the build, which can outlast the
-  hook's budget. Pre-warming the step (the `serve` resolver already resolves it
-  in the background) closes that; the resolver's warm-up is not yet fenced
-  against the first prompt.
+  session after is a memo hit. `caos mcp warm` now does that resolve in the
+  session-start hook, before Claude Code starts, and caches the result — so a
+  warm server's first turn is a cache read. What remains is the genuinely-cold
+  case: the FIRST session against a step-tree the server has never built, where
+  even the warm can outlast the hook's bounded budget and the tools arrive a
+  turn late instead of on turn one. `caos_status` explains that wait.
