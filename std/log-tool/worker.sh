@@ -1,3 +1,14 @@
+#!/usr/bin/env bash
+# The `log` tool. The shared history library arrives as `lib` from
+# std/githist-lib (this entry curries onto it), and the command body below
+# is everything specific to this tool.
+#
+# An arg is a PLACEHOLDER until it is fetched, so the library has to be
+# `caos get`-ed before it can be sourced.
+set -euo pipefail
+caos get /cas/args/lib >/dev/null
+. /cas/args/lib
+
 # ---- log ------------------------------------------------------------------
 githist_init
 

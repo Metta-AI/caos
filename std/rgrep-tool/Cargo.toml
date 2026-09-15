@@ -1,0 +1,40 @@
+# std/rgrep-tool — the grep TOOL: it renders, `std/rgrep` recurses.
+#
+# Split deliberately. `std/rgrep` is the fold: one job per directory, a sparse
+# result tree cached per (subtree, pattern). That shape is right for caching and
+# wrong for a model, which wants `path:linenum:line`. Flattening it used to live
+# in every CALLER — llm-step had `GrepRender`, and the Claude Code tool server
+# grew a second copy — so one user-visible contract had two implementations and
+# neither was reachable by `run-tool`.
+#
+# This tool owns that rendering once. It returns the ordinary `{report}` tree
+# every other caos tool returns, so llm-step, `caos cc`, and a person running
+# `run-tool rgrep-tool` all get identical output through the SAME generic path,
+# with no grep-specific code in any of them.
+#
+# regex is a crates.io dependency; the cargo image seeds the workspace's
+# vendored+precompiled deps (std/cargo/bake.nix) and the dev profile below
+# matches the bake, so the seeded `regex` artifact is reused, not recompiled.
+[package]
+name = "rgrep-tool"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
+regex = "1"
+
+# Match the caos workspace's dev profile (Cargo.toml) so dependency
+# fingerprints line up with the bake and `regex` is reused from the seeded
+# std/cargo target/ rather than recompiled.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

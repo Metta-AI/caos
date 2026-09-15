@@ -21,6 +21,9 @@
 //! stderr  blob  captured stderr, the last 100KB
 //! denied  blob  (only when detected) unmaterialized paths the command
 //!               touched, one per line — retry with them added to `paths`
+//! report  blob  the rendered form a model reads: exit, stdout, stderr and
+//!               the retry hint. Callers read this rather than composing
+//!               their own from the parts above
 //! tree    tree  the workspace after the command: real files staged back,
 //!               untouched placeholders round-tripped by their recorded hash
 //! ```
@@ -100,8 +103,37 @@ fn run() -> Result<(), String> {
         fs::write(res.join("denied"), listing.join("\n") + "\n")
             .map_err(|e| format!("writing denied: {e}"))?;
     }
+    // The rendered form, in the `report` blob every caos tool answers with, so
+    // each caller reads one instead of composing its own from the parts. The
+    // parts stay: `tree` and `exit` are DATA a harness consumes — advance the
+    // workspace, decide whether the call failed — while this is presentation,
+    // and presentation duplicated across callers is how one tool ends up
+    // reading two ways depending on who ran it.
+    fs::write(res.join("report"), report(exit, &out.stdout, &out.stderr, &denied))
+        .map_err(|e| format!("writing report: {e}"))?;
     link("/cas/newtree", res.join("tree"))?;
     caos(["put", path(&res), "/cas/out"])
+}
+
+/// What the model reads: the exit code, the captured streams, and — when the
+/// sandbox refused a path — the retry hint naming what to declare in `paths`.
+fn report(exit: i32, stdout: &[u8], stderr: &[u8], denied: &BTreeSet<String>) -> String {
+    // Lossy, deliberately: the streams are captured bytes and this is text for
+    // a model. The exact bytes stay in `stdout`/`stderr` for anything that
+    // needs them.
+    let mut text = format!(
+        "exit: {exit}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&tail(stdout)),
+        String::from_utf8_lossy(&tail(stderr))
+    );
+    if !denied.is_empty() {
+        let listing: Vec<&str> = denied.iter().map(String::as_str).collect();
+        text += &format!(
+            "\nunmaterialized paths touched: {}; retry with them in `paths`.",
+            listing.join(", ")
+        );
+    }
+    text
 }
 
 /// Fetch and read a blob at a CAS path.

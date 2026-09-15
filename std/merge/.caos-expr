@@ -1,8 +1,29 @@
 # std/merge's image (design/caos-expr.md, Phase 3): this directory is a flake
 # (flake.nix + flake.lock + worker), so its image is the flake-builder applied
 # to the directory itself. It names the builder by a LOCAL deep-deps mount
-# (DEEP-DEPS/flake-builder, declared in DEPS) — the only way it CAN name it,
+# (DEEP-DEPS/flake-builder, declared in DEPS) -- the only way it CAN name it,
 # since nothing resolves a builtin by name. Resolving this entry evaluates the
-# expression, which makes the flake→image step explicit rather than leaving it
+# expression, which makes the flake->image step explicit rather than leaving it
 # to the server to detect.
-run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
+#
+# The `help` is bound HERE so that every harness offering this tool describes it
+# the same way. It used to be a string literal inside llm-step, which meant a
+# second harness had to copy it -- and a copied description drifts.
+#
+# `@param theirs` is the only thing a caller supplies. `ours` is the workspace
+# it is merging into, which the launch binds; a model naming it would be naming
+# the conversation it is already in.
+HELP=<<END
+Three-way merge another commit into the current workspace. `theirs` is a ref
+name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the
+current side is the workspace as it is now. A clean merge advances the
+workspace to the merged result. A conflict advances it too, with git's inline
+conflict markers in the files and a reserved `.caos/conflicts` file listing
+every unresolved path -- including structural conflicts (delete/modify, mode,
+binary) that have NO markers. Resolve each: edit the file (use `read` with the
+stage's oid as `root` to inspect its content), then delete that path's rows
+from `.caos/conflicts`. Then build and test.
+@param theirs The commit to merge in: a ref name from the snapshot, or a commit hash.
+END
+IMAGE=run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
+curry --base=$IMAGE --help=$HELP

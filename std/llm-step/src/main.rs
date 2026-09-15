@@ -1,7 +1,6 @@
 //! The agent turn driver for the v3 conversation protocol.
 
 mod async_work;
-mod githist;
 mod progress;
 mod subagents;
 mod timing;
@@ -30,18 +29,28 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then_catching, run_worker, scratch,
-    secret, Arg,
+    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
+    run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
 const MAX_SPINE_WALK: usize = 4096;
 static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
-const STD_TOOLS: [(&str, &str); 3] = [
+const STD_TOOLS: [(&str, &str); 7] = [
     ("caos-build", "caos-build-image"),
     ("caos-test", "caos-test-image"),
     ("caos-test-result", "caos-test-result-image"),
+    // DESCRIBED from its help like the rest, though it is LAUNCHED specially
+    // below: it binds `ours`/`theirs` rather than the params a caller
+    // declares, and its result is a commit, not a report.
+    ("merge", "merge-image"),
+    // The history tools. Ordinary std entries: each is a directory whose
+    // `.caos-expr` carries its own help, `@git` included, so nothing here
+    // knows what `log` takes or that it reads history at all.
+    ("log", "log-image"),
+    ("show", "show-image"),
+    ("diff", "diff-image"),
 ];
 
 fn main() -> std::process::ExitCode {
@@ -56,10 +65,29 @@ struct Config {
     system: String,
     bash_image: String,
     grep_image: Option<String>,
-    tools_image: Option<String>,
-    merge_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
+    /// Drain this request's declared calls and STOP -- do not call the model,
+    /// do not terminate the request.
+    ///
+    /// For a harness that drives the model ITSELF and wants only the tools:
+    /// `caos cc` records the call Claude Code is about to make, runs this to
+    /// execute it, and hands the observation back. Without it the step would
+    /// answer a model that already answered.
+    ///
+    /// Distinct from `Cancelling`/`drain`, which CANCELS pending calls rather
+    /// than running them, and ends the request.
+    ///
+    /// The value is the id of the call the run was made FOR, checked against
+    /// the record once the queue is empty. It also separates one dispatch from
+    /// the next: every other argument is the same for every call of a request,
+    /// so without it a second call would name the first's ArgTree and be
+    /// answered from the memo.
+    tools_only: Option<String>,
+    /// Describe the tools and stop, writing the registry as JSON. A harness
+    /// that drives the model itself has to publish these declarations to it,
+    /// and they belong to the step that implements them.
+    list_tools: bool,
     merge_refs: Option<String>,
     model: String,
     base_url: String,
@@ -82,29 +110,52 @@ impl Config {
         } else {
             image_arg("run-and-update-ref-image")?
         };
+        let tools_only = read_arg_opt("tools-only")?;
+        let list_tools = read_arg_opt("list-tools")?.is_some();
+        // Neither of those modes reaches the model, so neither may DEMAND what
+        // a model call takes. The key especially: `caos cc` runs Claude Code's
+        // tools for a session whose model is Claude Code's own, and requiring
+        // an Anthropic key of it would refuse a turn over a call nothing makes.
+        let answers_model = tools_only.is_none() && !list_tools;
         Ok(Self {
-            api_key: secret("anthropic-api-key")?,
-            system: read_arg("system")?,
+            api_key: match answers_model {
+                true => secret("anthropic-api-key")?,
+                false => secret("anthropic-api-key").unwrap_or_default(),
+            },
+            system: match answers_model {
+                true => read_arg("system")?,
+                false => String::new(),
+            },
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
-            tools_image: image_arg("tools-image")?,
-            merge_image: image_arg("merge-image")?,
             std_tool_images: STD_TOOLS
                 .iter()
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
                 .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
+            tools_only,
+            list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
-            model: read_arg("model")?,
+            model: match answers_model {
+                true => read_arg("model")?,
+                false => String::new(),
+            },
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            conversation: read_arg_opt("conversation")?
-                .ok_or_else(|| "llm-step requires --conversation".to_string())?,
+            // A listing describes tools, which no conversation owns.
+            conversation: match (read_arg_opt("conversation")?, list_tools) {
+                (Some(conversation), _) => conversation,
+                (None, true) => String::new(),
+                (None, false) => return Err("llm-step requires --conversation".to_string()),
+            },
         })
     }
 }
 
 fn run() -> Result<(), String> {
     let cfg = Config::read()?;
+    if cfg.list_tools {
+        return list_tools(&cfg);
+    }
     let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
     let request = Oid::parse(&run_text, "conversation request")?;
     let request_head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
@@ -347,6 +398,16 @@ fn resume(
             return Ok(());
         }
 
+        // The queue is empty. A step would answer the model here; a tools-only
+        // run is finished, and leaves the request RUNNING for the next call.
+        // Its result is the conversation as it now stands, not a terminal one.
+        if let Some(call) = &cfg.tools_only {
+            reconcile_background_tasks(state)?;
+            require_completed_call(state, request, call)?;
+            let head = state.head().clone();
+            return forward_result(state, &head);
+        }
+
         reconcile_background_tasks(state)?;
         announce_background_tasks(&cfg.conversation, state)?;
         state.reload()?;
@@ -371,6 +432,32 @@ fn resume(
             &previous,
             current.round,
         );
+    }
+}
+
+/// Check that the call a tools-only run was dispatched for actually ran.
+///
+/// The run drains whatever is pending, so an empty queue is not on its own
+/// evidence that this call was among it -- a caller whose declaration lost a
+/// race, or that named a call from another round, would otherwise be handed a
+/// result with nothing of its own in it.
+fn require_completed_call(
+    state: &mut progress::State,
+    request: &Oid,
+    call: &str,
+) -> Result<(), String> {
+    let view = state.conversation()?;
+    let record = require_request(&view, request)?;
+    let round = round_state(&view, &record)?.declaring_round;
+    match view.tool(request, round, call)? {
+        Some(tool) if tool.is_terminal() => Ok(()),
+        Some(tool) => Err(format!(
+            "call {call} of request {request} is {:?}, not complete",
+            tool.status
+        )),
+        None => Err(format!(
+            "request {request} round {round} declares no call {call}"
+        )),
     }
 }
 
@@ -1162,12 +1249,9 @@ fn prepare_compute(
     let clean = call_without_workspace(call);
     match call.name.as_str() {
         "bash" => prepare_bash(cfg, &clean, ws),
-        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
+        "merge" if std_tool_image(cfg, "merge").is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
-        name if githist::is_builtin(name) && cfg.tools_image.is_some() => {
-            prepare_githist(cfg, &clean, name, ws, wc)
-        }
         name if !tools::is_inline(name) => {
             let Some(tool) = tools::tree_tool(ws, name)? else {
                 return Err(format!(
@@ -1237,7 +1321,7 @@ fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepa
     };
     let theirs_path = fresh("theirs");
     caos(["get-hash", &theirs, &theirs_path])?;
-    let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
+    let (image, _) = std_tool_image(cfg, "merge").ok_or("merge image is absent")?;
     let curried = caos_curry(
         Arg::Hash(image),
         &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
@@ -1270,39 +1354,6 @@ fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<
         .iter()
         .map(|(name, value)| (name.as_str(), Arg::Lit(value)))
         .collect();
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    prepared_request(&curried, &[], ws)
-}
-
-fn prepare_githist(
-    cfg: &Config,
-    call: &Value,
-    name: &str,
-    ws: &str,
-    wc: &str,
-) -> Result<Prepared, String> {
-    let tool = githist::tool(name).ok_or_else(|| format!("no built-in tool {name}"))?;
-    let bound = match tools::tree_tool_args(call, &tool) {
-        Ok(bound) => bound,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    let body = githist::script(name).ok_or_else(|| format!("no built-in script for {name}"))?;
-    let dir = scratch(&format!("githist-{name}"))?;
-    let file = dir.join("worker.sh");
-    fs::write(&file, body).map_err(|error| format!("writing {name} script: {error}"))?;
-    let script = fresh("githist-script");
-    caos(["put", path(&file), &script])?;
-    let image = cfg.tools_image.as_deref().ok_or("tools image is absent")?;
-    let mut args: Vec<(&str, Arg<'_>)> = vec![("worker1", Arg::Path(&script))];
-    args.extend(
-        bound
-            .iter()
-            .map(|(name, value)| (name.as_str(), Arg::Lit(value))),
-    );
-    args.push(("wc", Arg::Path(wc)));
-    if let Some(refs) = cfg.merge_refs.as_deref() {
-        args.push(("refs", Arg::Lit(refs)));
-    }
     let curried = caos_curry(Arg::Hash(image), &args)?;
     prepared_request(&curried, &[], ws)
 }
@@ -1353,9 +1404,46 @@ fn launch_tree_evaluation(
             ("tool-git", Arg::Lit(if git { "1" } else { "" })),
         ],
     )?;
-    let dispatched = eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me));
+    // The tool's ArgTree. Normally the SERVER evaluates `caos-tools/<name>` for
+    // us (a worker cannot), then runs `me` with the result bound as `--result`.
+    // But that server-side walk refuses a `:@@=` locator, so when the CLIENT
+    // resolved this tool for us (`caos cc serve`'s dispatch_call, for a tool that
+    // reaches such a locator) we skip the walk and run `me` with the tree it
+    // handed us bound as `--result` -- byte-identical to what the eval would have
+    // bound, so `launch_evaluated_tool` cannot tell the difference.
+    let dispatched = match client_tool_tree(name)? {
+        Some(tree) => {
+            let task = prepare_request(
+                Arg::Hash(&me),
+                &[("in", Arg::Path(ws)), ("result", Arg::Hash(&tree))],
+            )?;
+            run_request_then(&task, None)
+        }
+        None => eval_then_catching(ws, &format!("caos-tools/{name}"), Arg::Hash(&me)),
+    };
     timing::phase(&format!("tool dispatch {name}"));
     dispatched
+}
+
+/// The client-resolved ArgTree for tool `name`, if `caos cc serve` handed one in
+/// for THIS tool (`--client-tool-name` / `--client-tool-tree`). The name guards
+/// it: a tools-only run drives one call, but a bare tree with no owner would be
+/// used for whatever tool happened to evaluate, so the two args travel together
+/// and only the matching tool consumes them. `None` (evaluate server-side) for
+/// every tool the client did not resolve -- the built-ins and any `:@=`-only
+/// project tool, which the server walk handles unchanged.
+fn client_tool_tree(name: &str) -> Result<Option<String>, String> {
+    match read_arg_opt("client-tool-name")? {
+        Some(owner) if owner == name => {
+            let tree = arg("client-tool-tree");
+            if Path::new(&tree).exists() {
+                Ok(Some(cas_hash(&tree)?))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn launch_evaluated_tool(
@@ -2807,18 +2895,20 @@ fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Resul
     Err(format!("request {request} has no request.terminal commit"))
 }
 
-fn forward_result(state: &mut progress::State, terminal: &Oid) -> Result<(), String> {
-    let workspaces = state.conversation_at(terminal)?.workspaces()?;
+/// This job's result: the conversation at `commit`, and a link per workspace it
+/// names, so a caller reads both without consulting the ref.
+fn forward_result(state: &mut progress::State, commit: &Oid) -> Result<(), String> {
+    let workspaces = state.conversation_at(commit)?.workspaces()?;
     let dir = scratch("llm-step-result")?;
-    let conversation_path = fresh("terminal-conversation");
-    caos(["get-hash", terminal.as_str(), &conversation_path])?;
+    let conversation_path = fresh("result-conversation");
+    caos(["get-hash", commit.as_str(), &conversation_path])?;
     link(&conversation_path, dir.join("conversation"))?;
     if !workspaces.is_empty() {
         let workspace_dir = dir.join("workspaces");
         fs::create_dir(&workspace_dir)
             .map_err(|error| format!("creating {}: {error}", workspace_dir.display()))?;
         for (name, workspace) in workspaces {
-            let commit_path = fresh("terminal-workspace");
+            let commit_path = fresh("result-workspace");
             caos(["get-hash", workspace.commit.as_str(), &commit_path])?;
             link(&commit_path, workspace_dir.join(name))?;
         }
@@ -2845,17 +2935,15 @@ fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(with_workspace(tools::grep_declaration()));
     }
-    if cfg.merge_image.is_some() {
-        registry.push(with_workspace(merge_tool()));
-    }
-    if cfg.tools_image.is_some() {
-        registry.extend(githist::declarations().into_iter().map(with_workspace));
-    }
+    // A BOUND IMAGE THAT CANNOT BE DESCRIBED IS AN ERROR. The harness curried
+    // these itself, so a missing `help` is its own misconfiguration, and the
+    // skip that used to stand here hid one: `std_tool` was reading the wrong
+    // path and every std tool quietly disappeared from the registry.
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
-            if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
-                registry.push(with_workspace(tools::tree_tool_declaration(&tool)));
-            }
+            let tool = tools::std_tool(name, &arg(arg_name))?
+                .ok_or_else(|| format!("the {name} image carries no help"))?;
+            registry.push(with_workspace(tools::tree_tool_declaration(&tool)));
         }
     }
     let mut dynamic_names = HashSet::new();
@@ -2867,6 +2955,28 @@ fn registry(cfg: &Config, workspaces: &[String]) -> Result<Vec<Value>, String> {
         }
     }
     Ok(registry)
+}
+
+/// Write the tool registry as JSON and stop.
+///
+/// `--workspace:hash=<tree>` adds the tools that tree defines under
+/// `caos-tools/`; without it the answer is the fixed half, which is all a
+/// caller with no tree to name can be offered. Nothing here reads a
+/// conversation: a listing describes what the step CAN run, and is asked for
+/// before there is a conversation to run it in.
+fn list_tools(cfg: &Config) -> Result<(), String> {
+    let workspace = arg("workspace");
+    let workspaces = match Path::new(&workspace).exists() {
+        true => vec![workspace],
+        false => Vec::new(),
+    };
+    let registry = registry(cfg, &workspaces)?;
+    let dir = scratch("llm-step-tools")?;
+    let file = dir.join("tools.json");
+    let json = serde_json::to_vec(&registry)
+        .map_err(|error| format!("encoding the tool registry: {error}"))?;
+    fs::write(&file, json).map_err(|error| format!("writing {}: {error}", file.display()))?;
+    caos(["put", path(&file), "/cas/out"])
 }
 
 fn with_workspace(mut declaration: Value) -> Value {
@@ -2906,18 +3016,6 @@ fn bash_tool() -> Value {
                 "paths": {"type":"array", "items":{"type":"string"}, "description":"Workspace-relative paths the command reads or modifies; only these are materialized into the sandbox."}
             },
             "required": ["cmd"]
-        }
-    })
-}
-
-fn merge_tool() -> Value {
-    json!({
-        "name": "merge",
-        "description": "Three-way merge another commit into the current workspace. `theirs` is a ref name from the snapshot (e.g. `main`, `origin/main`) or a commit hash; the current side is the workspace as it is now. A clean merge advances the workspace to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Then build and test.",
-        "input_schema": {
-            "type":"object",
-            "properties":{"theirs":{"type":"string","description":"The commit to merge in: a ref name from the snapshot, or a commit hash."}},
-            "required":["theirs"]
         }
     })
 }
