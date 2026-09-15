@@ -233,7 +233,7 @@ turn RUNS it (`--run=<request> --tools-only=<call id>`, one fresh ArgTree per
 call, since the request is itself an ArgTree and a reused one would be answered
 from the first call's memo).
 
-So the two halves of a call have different authors, and that is the design: cc
+So the two halves of a call have different authors, and that is the design: `caos mcp`
 declares the call as the model's own (v3 accepts no tool that no message
 declared) and the step records starting it, running it and completing it. The
 protocol's first invariant — record an action before launching it — is the

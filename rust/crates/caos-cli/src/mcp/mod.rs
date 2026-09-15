@@ -122,7 +122,7 @@ struct ToolOutcome {
 
 /// Run one workspace tool, by declaring the call and handing it to `llm-step`.
 ///
-/// TWO STEPS, and the second is the whole design: cc records the call as the
+/// TWO STEPS, and the second is the whole design: `caos mcp` records the call as the
 /// model's own declaration -- v3 accepts no tool that no message declared
 /// (`validate_current_call`) -- and then runs the step in its tools-only mode,
 /// which starts the tool, executes it and completes it exactly as it does for a
