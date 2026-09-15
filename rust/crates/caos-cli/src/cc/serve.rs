@@ -81,6 +81,18 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
+    // A registry left by `cc warm` in the session-start hook, if there is one:
+    // then `tools/list` is answered from the first read rather than deferred
+    // while a background resolve races the model's opening turn. The background
+    // resolve below STILL runs and republishes, so a cache that is stale (the
+    // workspace moved since the warm) is corrected within seconds; loading it is
+    // a head start, never the last word.
+    if let Ok(t) = t {
+        if let Some(tools) = read_cached_registry(t, &options) {
+            publish(&registry, tools);
+        }
+    }
+
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|error| format!("reading request: {error}"))?;
@@ -100,6 +112,91 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         }
     }
     Ok(())
+}
+
+/// Resolve the tools once, up front, and leave them in the on-disk cache that
+/// the `cc serve` spawned moments later reads at startup.
+///
+/// This is what lets a session be ready on TURN ONE. `cc serve`'s own resolution
+/// is asynchronous by necessity -- it cannot answer `initialize` and go build an
+/// image before the client's first `tools/list` -- so a client that reads that
+/// list exactly once, at startup (the mounted Claude Code a cloud environment
+/// uses), sees no tools however fast the resolve then finishes. Run from the
+/// session-start hook, which BLOCKS until it returns, this moves the resolve to
+/// before Claude Code is even launched, so the list is already known.
+///
+/// NON-FATAL by contract. It always returns `Ok`, because the hook must not fail
+/// a session over a cold cache: a warm that cannot reach the server yet, or a
+/// resolve that errors, simply leaves no cache and `cc serve` resolves in the
+/// background exactly as it did before this existed.
+pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
+    // Wait BRIEFLY for reachability: the session-start hook opens the tunnel
+    // just before calling this, and it may still be settling. Once the server
+    // answers, resolve ONCE -- not the background resolver's many attempts,
+    // which would block the hook, and a resolve that fails past reachability
+    // fails the same way for `cc serve`, which retries regardless.
+    let mut reachable = false;
+    for _ in 0..RESOLVE_FAST_ATTEMPTS {
+        if t.ensure_server_reachable().is_ok() {
+            reachable = true;
+            break;
+        }
+        std::thread::sleep(RESOLVE_FAST_INTERVAL);
+    }
+    if !reachable {
+        eprintln!("caos cc warm: server not reachable yet; cc serve will resolve in the background");
+        return Ok(());
+    }
+    match declarations(t, options) {
+        Ok(found) if !found.is_empty() => {
+            write_cached_registry(t, options, &found);
+            eprintln!("caos cc warm: cached {} tools for the first turn", found.len());
+        }
+        Ok(_) => eprintln!("caos cc warm: the step answered with no tools; not caching"),
+        Err(error) => eprintln!("caos cc warm: {error}; cc serve will retry in the background"),
+    }
+    Ok(())
+}
+
+/// The per-checkout file the resolved tool registry is cached in. `cc warm` and
+/// the `cc serve` that follows it both open the same checkout, so both derive
+/// this path from the git directory without one having to tell the other.
+fn registry_cache_path(t: &GitTransport) -> std::path::PathBuf {
+    t.git_dir().join("caos-cc-registry.json")
+}
+
+/// The cache the previous function's path holds, IF it is for the step this
+/// server was configured with. Keyed by `--llm-step` so a client rebuilt to
+/// drive a different step cannot be handed the old step's tools; a mismatch or
+/// an empty list reads as "no cache" and the caller resolves from scratch.
+fn read_cached_registry(t: &GitTransport, options: &TurnOptions) -> Option<Vec<Value>> {
+    let bytes = std::fs::read(registry_cache_path(t)).ok()?;
+    let cached: Value = serde_json::from_slice(&bytes).ok()?;
+    if cached.get("llm_step").and_then(Value::as_str) != options.llm_step.as_deref() {
+        return None;
+    }
+    let tools = cached.get("tools")?.as_array()?.clone();
+    if tools.is_empty() {
+        None
+    } else {
+        Some(tools)
+    }
+}
+
+/// Write the registry cache. Best-effort and via a temp-then-rename, so a `cc
+/// serve` reading it concurrently sees either the old file or the new one whole,
+/// never a half-written one; a failure to write just means the next server
+/// resolves from scratch, which is the behaviour before any cache existed.
+fn write_cached_registry(t: &GitTransport, options: &TurnOptions, tools: &[Value]) {
+    let payload = json!({ "llm_step": options.llm_step, "tools": tools });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    let path = registry_cache_path(t);
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 /// The tools this server has managed to find so far, and what it would say
@@ -402,6 +499,12 @@ fn resolve_in_background(options: TurnOptions, registry: Registry, out: Out) {
                 // retrying is five minutes in which the only honest answer to
                 // "why are there no tools" already exists.
                 Ok(found) => {
+                    // Cache before publishing (publish moves `found`), so the
+                    // NEXT `cc serve` on this checkout starts warm even if this
+                    // one never got a `warm` ahead of it.
+                    if let Ok(t) = GitTransport::from_cwd() {
+                        write_cached_registry(&t, &options, &found);
+                    }
                     publish(&registry, found);
                     let notification = json!({
                         "jsonrpc": "2.0",
@@ -673,10 +776,12 @@ mod tests {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let workspace = "no workspace".to_string();
         let registry: Registry = Arc::new(Mutex::new(Found::default()));
+        let out: Out = Arc::new(Mutex::new(std::io::stdout()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
             &registry,
+            &out,
             notification
         )
         .is_none());
@@ -686,10 +791,12 @@ mod tests {
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
         let registry: Registry = Arc::new(Mutex::new(Found::default()));
+        let out: Out = Arc::new(Mutex::new(std::io::stdout()));
         assert!(handle(
             Err(&workspace),
             &TurnOptions::default(),
             &registry,
+            &out,
             "{not json"
         )
         .is_none());

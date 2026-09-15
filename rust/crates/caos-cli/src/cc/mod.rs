@@ -95,6 +95,7 @@ pub fn cli_cc(workspace: Result<GitTransport, String>, args: &[String]) -> Resul
     match rest.first().copied() {
         Some("hook") => hook(&workspace?, &options),
         Some("serve") => serve::serve(workspace, options),
+        Some("warm") => serve::warm(&workspace?, &options),
         _ => Err(usage()),
     }
 }
@@ -103,8 +104,9 @@ fn usage() -> String {
     format!(
         "usage:\n  \
          caos cc hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos cc serve   (workspace tool server; JSON-RPC on stdio)\n\n\
-         Both name the step whose tools this session offers:\n  \
+         caos cc serve   (workspace tool server; JSON-RPC on stdio)\n  \
+         caos cc warm    (resolve the tools now and cache them for the next serve)\n\n\
+         All name the step whose tools this session offers:\n  \
          {}",
         crate::missing_image_arg(LLM_STEP_ARG)
     )

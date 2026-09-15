@@ -192,4 +192,42 @@ if [ "$have_repo" = 1 ] \
         || log "could not unshallow; a repo the server has not seen may fail to resolve"
 fi
 
+# ---------------------------------------------------------------------------
+# Warm the tool registry -- LAST, after the checkout is complete enough to push
+# ---------------------------------------------------------------------------
+# `cc serve` cannot resolve the tools before it must answer the client's first
+# `tools/list` -- the resolution may build an image -- so a client that reads
+# that list exactly once at startup (the mounted Claude Code a cloud
+# environment uses) is left with no caos tools however fast the resolve then
+# finishes. Resolve them HERE instead, while this hook still blocks the session
+# from starting, and leave them in the cache `cc serve` reads when it launches.
+# Then the first turn has the tools rather than racing a background resolve it
+# cannot see and cannot wait out.
+#
+# The step is pinned exactly as configure.sh pins it: to the commit THIS client
+# was built from (the build record), so the warm resolves the same tree the
+# serve will. Bounded and non-fatal -- a warm that cannot finish just leaves the
+# background path in place, which is where we were before this ran.
+if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; then
+    record=/usr/local/share/caos/build
+    step_repo=""
+    step_commit=""
+    if [ -r "$record" ]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                repo) step_repo="$value" ;;
+                commit) step_commit="$value" ;;
+            esac
+        done < "$record"
+    fi
+    if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
+        locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
+        log "warming the caos tool registry for the first turn"
+        CLAUDE_PROJECT_DIR="$PWD" timeout 180 caos cc warm "$locator" \
+            || log "could not warm the tools; cc serve will resolve them in the background"
+    else
+        log "no build record; leaving the tools to cc serve's background resolve"
+    fi
+fi
+
 exit 0
