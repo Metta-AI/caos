@@ -166,7 +166,10 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
             Ok(_) => last = "the step answered with no tools".to_string(),
             Err(error) => last = error,
         }
-        eprintln!("caos cc warm: attempt {} did not cache: {last}", attempt + 1);
+        eprintln!(
+            "caos cc warm: attempt {} did not cache: {last}",
+            attempt + 1
+        );
     }
     eprintln!("caos cc warm: gave up ({last}); cc serve will resolve in the background");
     Ok(())
@@ -399,9 +402,7 @@ fn registry_cache_state() -> String {
         cmd.args(["-C", &dir]);
     }
     let git_dir = match cmd.args(["rev-parse", "--absolute-git-dir"]).output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return "<no git dir to look in>".to_string(),
     };
     let path = std::path::Path::new(&git_dir).join("caos-cc-registry.json");

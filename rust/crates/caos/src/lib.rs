@@ -1206,6 +1206,92 @@ impl GitTransport {
         self.post_object_http(&kind, &content)
     }
 
+    /// Get a workspace COMMIT onto the server without re-sending what it already
+    /// holds. `commit` is caos-minted (a conversation base), so the server never
+    /// has the commit itself -- but its TREE is the checked-out repo's, and for a
+    /// repo the server has resolved before (coworld, seen through earlier
+    /// sessions) that whole tree is already there.
+    ///
+    /// `git push` cannot exploit that. It decides what to pack by subtracting
+    /// what is reachable from the refs the server advertises AND the client also
+    /// holds; a fresh clone pushing a caos-minted commit shares no such ref, so
+    /// the subtraction is empty and git packs the ENTIRE tree closure -- ~139 MB
+    /// of coworld the server already has, ~170s over the tunnel, every session.
+    /// No ancestor ref fixes it, because consecutive sessions' bases share no git
+    /// ancestry to negotiate against.
+    ///
+    /// So gate on the tree: if the server holds it, only the commit (and any
+    /// ancestry it lacks) is missing -- POST exactly those with `hand_over_missing`,
+    /// which prunes every present subtree in one probe, the UPLOAD mirror of the
+    /// lazy per-object DOWNLOAD `get_object` documents. If the server does NOT
+    /// hold the tree (a repo it has never seen), fall back to one negotiated
+    /// `git push`: a single pack beats thousands of per-object round trips over
+    /// the tunnel for a genuinely cold closure.
+    pub fn push_workspace_commit(&self, commit: &str, tree: &str) -> Result<(), String> {
+        if self.server_holds(tree) {
+            self.hand_over_missing(commit)
+        } else {
+            self.ensure_pushed(commit)
+        }
+    }
+
+    /// POST everything reachable from `hash` that the server LACKS, one object at
+    /// a time, PRUNING any node it already holds -- and since holding a tree or
+    /// blob means holding its whole closure, a present subtree stops the walk
+    /// dead. For a commit whose tree is present that is a single POST: the commit
+    /// object.
+    ///
+    /// Unlike `hand_over_graph` -- the incomplete-graph fallback, which
+    /// `git push`es readable children -- this NEVER falls back to `git push`: a
+    /// readable child with no negotiation base would drag its whole closure
+    /// along, the very cost this avoids. It also descends a COMMIT (into its tree
+    /// and parents), which `hand_over_graph` does not, because that path only
+    /// ever carries the tree/blob closure of an ArgTree.
+    fn hand_over_missing(&self, hash: &str) -> Result<(), String> {
+        // Present already? A tree/blob means its whole closure is here; a commit
+        // means this same path put it (and its closure) here before -- the only
+        // way a caos-minted commit reaches the server.
+        if self.server_holds(hash) {
+            return Ok(());
+        }
+        let Some((kind, content)) = self.read_local(hash)? else {
+            // Unreadable ⇒ the server handed us this oid, so it holds it already
+            // (the invariant `hand_over_graph` documents).
+            return Ok(());
+        };
+        match kind.as_str() {
+            "tree" => {
+                let tree = gix::objs::TreeRef::from_bytes(&content, self.repo.object_hash())
+                    .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+                for entry in tree.entries {
+                    // A gitlink is not part of this graph -- a commit arg ships
+                    // separately, as in `hand_over_graph`.
+                    if entry.mode.is_commit() {
+                        continue;
+                    }
+                    self.hand_over_missing(&entry.oid.to_string())?;
+                }
+            }
+            "commit" => {
+                // The TREE only, NOT the parents. A workspace is a content
+                // snapshot -- caos re-roots a conversation on genesis, so the
+                // base's git ancestry is never walked server-side; the tree is
+                // what a turn materializes and what reconcile 3-way merges. And
+                // sending parents is not merely wasteful but a TRAP: the server
+                // holds coworld's trees and blobs (reachable from live refs) but
+                // not its ancestor COMMIT objects, so a parent walk would POST
+                // the entire ~1800-commit history one object at a time. The base
+                // caos mints is genesis-rooted anyway; its only parent is the
+                // genesis every conversation already put on the server.
+                let commit = gix::objs::CommitRef::from_bytes(&content, self.repo.object_hash())
+                    .map_err(|e| format!("malformed commit {hash}: {e}"))?;
+                self.hand_over_missing(&commit.tree().to_string())?;
+            }
+            _ => {} // a blob has nothing beneath it
+        }
+        self.post_object_http(&kind, &content)
+    }
+
     /// Hand the server ONE object's bytes over the HTTP object API, in the
     /// `<type> <size>\0<content>` framing `HttpTransport::put_object` uses.
     fn post_object_http(&self, kind: &str, content: &[u8]) -> Result<(), String> {
