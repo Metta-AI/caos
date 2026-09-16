@@ -73,39 +73,59 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
         args.turn.system =
             Some(fs::read_to_string(&file).map_err(|e| format!("reading {file}: {e}"))?);
     }
+    args.turn.initial_content = Some(initial_content(
+        args,
+        &client,
+        checkout.as_deref(),
+        &server,
+    )?);
+    Ok(client)
+}
+
+fn initial_content(
+    args: &mut Args,
+    client: &Path,
+    checkout: Option<&Path>,
+    server: &str,
+) -> Result<String, String> {
     let mut seed = conversation_protocol::v3::tree::TreeBuilder::from(None);
     if let Some(name) = &args.import {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
-        if let Some(checkout) = &checkout {
-            let transport = GitTransport::discover(&client)?;
-            let caos_cli::source_trees::ImportedContent { commit, metadata } =
-                caos_cli::source_trees::prepare_import(
-                    &transport,
-                    name,
-                    checkout.to_str().ok_or("checkout path must be UTF-8")?,
-                    args.turn.base.as_deref(),
-                )?;
-            seed.put_oid(
+        let repository = match &args.import_source {
+            Some(repository) => repository.clone(),
+            None => checkout
+                .as_ref()
+                .ok_or("--import without a source requires a Git checkout")?
+                .to_str()
+                .ok_or("checkout path must be UTF-8")?
+                .to_string(),
+        };
+        let transport = GitTransport::discover(client)?;
+        let caos_cli::source_trees::ImportedContent { commit, metadata } =
+            caos_cli::source_trees::prepare_import(
+                &transport,
                 name,
-                conversation_protocol::v3::Mode::Commit,
-                commit.clone(),
-            );
-            if let Some((path, bytes)) = metadata {
-                seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
-            }
-            args.turn.base = Some(commit.to_string());
-            if args.from_commit.is_some() {
-                args.from_commit = Some(commit.to_string());
-            }
-        } else {
-            return Err("--import requires a Git checkout".into());
+                &repository,
+                args.import_revision
+                    .as_deref()
+                    .or(args.turn.base.as_deref()),
+            )?;
+        seed.put_oid(
+            name,
+            conversation_protocol::v3::Mode::Commit,
+            commit.clone(),
+        );
+        if let Some((path, bytes)) = metadata {
+            seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
+        }
+        args.turn.base = Some(commit.to_string());
+        if args.from_commit.is_some() {
+            args.from_commit = Some(commit.to_string());
         }
     }
-    args.turn.initial_content = Some(
-        seed.build(&mut GitStore::open(&client, Some(&server))?)?
-            .to_string(),
-    );
-    Ok(client)
+    Ok(seed
+        .build(&mut GitStore::open(client, Some(server))?)?
+        .to_string())
 }
 
 struct Staging(PathBuf);
@@ -412,6 +432,99 @@ pub(super) fn prepare_checkout(destination: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_import_seeds_the_selected_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let client = root.path().join("client");
+        let server = root.path().join("server.git");
+        for path in [&source, &client] {
+            fs::create_dir(path).unwrap();
+            git(path, &["init", "--quiet", "-b", "main"]).unwrap();
+        }
+        git(
+            root.path(),
+            &["init", "--quiet", "--bare", server.to_str().unwrap()],
+        )
+        .unwrap();
+        git(
+            &client,
+            &["remote", "add", "caos", server.to_str().unwrap()],
+        )
+        .unwrap();
+        fs::write(source.join("file"), "committed").unwrap();
+        git(&source, &["add", "file"]).unwrap();
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let commit = git(&source, &["rev-parse", "HEAD"]).unwrap();
+        let parse =
+            |raw: &[&str]| Args::parse(&super::super::args::tests::with_images(raw)).unwrap();
+        let check = |args: &mut Args, checkout: Option<&Path>| {
+            let tree = initial_content(args, &client, checkout, server.to_str().unwrap()).unwrap();
+            assert_eq!(
+                git(&client, &["rev-parse", &format!("{tree}:code")]).unwrap(),
+                commit,
+            );
+            assert_eq!(args.turn.base.as_deref(), Some(commit.as_str()));
+        };
+        check(
+            &mut parse(&["--username", "test", "--import", "code"]),
+            Some(&source),
+        );
+        fs::write(source.join("file"), "dirty").unwrap();
+        assert!(initial_content(
+            &mut parse(&["--username", "test", "--import", "code"]),
+            &client,
+            Some(&source),
+            server.to_str().unwrap(),
+        )
+        .unwrap_err()
+        .contains("uncommitted changes"));
+        check(
+            &mut parse(&["--username", "test", "--import", "code", "--base", "main"]),
+            Some(&source),
+        );
+        // An explicit source works outside a checkout and resolves refs there.
+        check(
+            &mut parse(&[
+                "--username",
+                "test",
+                "--import",
+                "code",
+                source.to_str().unwrap(),
+                "main",
+            ]),
+            None,
+        );
+        let uri = format!("file://{}", source.display());
+        check(
+            &mut parse(&["--username", "test", "--import", "code", &uri, &commit]),
+            None,
+        );
+        assert!(initial_content(
+            &mut parse(&["--username", "test", "--import", "code", &uri]),
+            &client,
+            None,
+            server.to_str().unwrap(),
+        )
+        .unwrap_err()
+        .contains("full commit hash"));
+        assert_eq!(fs::read_to_string(source.join("file")).unwrap(), "dirty");
+    }
+
     #[test]
     fn checkout_import_completes_partial_history_and_keeps_local_edits() {
         let root = Staging(std::env::temp_dir().join(format!(

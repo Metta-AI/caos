@@ -12,6 +12,8 @@ pub(crate) struct Args {
     pub(crate) from_commit: Option<String>,
     pub(crate) empty: bool,
     pub(crate) import: Option<String>,
+    pub(crate) import_source: Option<String>,
+    pub(crate) import_revision: Option<String>,
     pub(crate) harness: Option<String>,
     pub(crate) server: Option<String>,
     pub(crate) turn: TurnOptions,
@@ -57,7 +59,29 @@ impl Args {
                     parsed.empty = true;
                     parsed.new_conversation = true;
                 }
-                "--import" => parsed.import = Some(value(&mut args, arg)?),
+                "--import" => {
+                    if parsed.import.is_some() {
+                        return Err("--import may only be specified once".into());
+                    }
+                    parsed.import = Some(value(&mut args, arg)?);
+                    // Initial content only applies to a new conversation; do
+                    // not silently discard an import when resuming the latest.
+                    parsed.new_conversation = true;
+                    if args
+                        .as_slice()
+                        .first()
+                        .is_some_and(|arg| !arg.starts_with('-'))
+                    {
+                        parsed.import_source = Some(value(&mut args, arg)?);
+                    }
+                    if args
+                        .as_slice()
+                        .first()
+                        .is_some_and(|arg| !arg.starts_with('-'))
+                    {
+                        parsed.import_revision = Some(value(&mut args, arg)?);
+                    }
+                }
                 "--harness" => parsed.harness = Some(value(&mut args, arg)?),
                 "--server" => parsed.server = Some(value(&mut args, arg)?),
                 "--from" => parsed.from_commit = Some(value(&mut args, arg)?),
@@ -84,6 +108,14 @@ impl Args {
                 })?
             }
         };
+        if parsed.import_revision.is_some()
+            && (parsed.turn.base.is_some() || parsed.from_commit.is_some())
+        {
+            return Err("an import revision cannot be combined with --base or --from".into());
+        }
+        if parsed.empty && parsed.import.is_some() {
+            return Err("--empty cannot be combined with --import".into());
+        }
         if parsed.turn.system.is_some() && parsed.turn.system_file.is_some() {
             return Err("--system and --system-file are mutually exclusive".to_string());
         }
@@ -106,7 +138,8 @@ impl Args {
             return Err("--list-archived and --unarchive are mutually exclusive".to_string());
         }
         if (parsed.list_archived || parsed.unarchive.is_some())
-            && (parsed.conversation.is_some()
+            && (parsed.import.is_some()
+                || parsed.conversation.is_some()
                 || parsed.new_conversation
                 || parsed.from_commit.is_some()
                 || parsed.turn != TurnOptions::default())
@@ -138,8 +171,10 @@ impl Args {
 pub(crate) fn usage() -> String {
     "usage: caos tui --llm-step:@=<path> --llm-call:@=<path> [--username <name>] \
      [--list-archived | --unarchive <conversation-id>] \
-     [--new | --from <commit> | --empty] [--import <path>] [--base <revspec>] [--server <url>] [--harness <path>] \
+     [--new | --from <commit> | --empty] [--import <path> [<source> [<revision>]]] [--base <revspec>] [--server <url>] [--harness <path>] \
      [--system <text> | --system-file <path>] [--model <model>] [--base-url <url>]\n\
+     \x20 imports start a new conversation: local sources default to clean HEAD; Git URIs require a full hash.\n\
+     \x20 omit the import source to use the launching checkout (--base selects its revision).\n\
      \x20 the two image args also take :@@=<git ref>, :hash=<oid> and :docker=<ref>"
         .to_string()
 }
@@ -156,6 +191,45 @@ pub(crate) mod tests {
             .chain(raw)
             .map(|argument| (*argument).to_string())
             .collect()
+    }
+
+    #[test]
+    fn startup_import_accepts_a_source_and_revision() {
+        let parse =
+            |raw: &[&str]| Args::parse_with_default_user(&with_images(raw), Some("alice".into()));
+        let shorthand = parse(&["--import", "code", "--base", "main"]).unwrap();
+        assert_eq!(shorthand.import.as_deref(), Some("code"));
+        assert_eq!(shorthand.import_source, None);
+        assert!(shorthand.new_conversation);
+        assert_eq!(shorthand.turn.base.as_deref(), Some("main"));
+        let local = parse(&["--import", "code", "/repo with spaces", "topic", "--new"]).unwrap();
+        assert_eq!(local.import_source.as_deref(), Some("/repo with spaces"));
+        assert_eq!(local.import_revision.as_deref(), Some("topic"));
+        assert!(local.new_conversation);
+        let clean = parse(&["--import", "code", "../repo", "--new"]).unwrap();
+        assert_eq!(clean.import_revision, None);
+        let hash = "0123456789012345678901234567890123456789";
+        let remote = parse(&["--import", "code", "https://example.com/repo.git", hash]).unwrap();
+        assert_eq!(
+            remote.import_source.as_deref(),
+            Some("https://example.com/repo.git")
+        );
+        assert_eq!(remote.import_revision.as_deref(), Some(hash));
+        for raw in [
+            vec!["--import"],
+            vec!["--import", "code", "../repo", "main", "extra"],
+            vec!["--import", "code", "../repo", "main", "--base", "other"],
+            vec!["--import", "code", "../repo", "main", "--from", hash],
+            vec!["--import", "code", "--empty"],
+            vec!["--import", "code", "--import", "other"],
+        ] {
+            assert!(parse(&raw).is_err(), "{raw:?}");
+        }
+        assert!(Args::parse_with_default_user(
+            &["--list-archived".into(), "--import".into(), "code".into()],
+            Some("alice".into()),
+        )
+        .is_err());
     }
 
     #[test]

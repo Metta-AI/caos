@@ -126,69 +126,6 @@ pub fn branch_snapshot(t: &GitTransport, repository: &str, branch: &str) -> Resu
     Ok(commit.to_string())
 }
 
-/// Snapshot a checkout without changing its index, object database, or refs.
-fn import_worktree(client: &GitTransport, path: &std::path::Path) -> Result<Oid, String> {
-    let source =
-        GitTransport::discover(path).map_err(|_| "local imports require a Git checkout root")?;
-    if source
-        .work_dir()
-        .canonicalize()
-        .map_err(|e| e.to_string())?
-        != path
-    {
-        return Err("local imports require a Git checkout root, not a subdirectory".into());
-    }
-    let head = oid(
-        source
-            .git_capture(&["rev-parse", "--verify", "HEAD^{commit}"], None)?
-            .trim(),
-        "import HEAD",
-    )?;
-    import_local_commit(path, client.work_dir(), &head)?;
-    let objects = client.git_capture(
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-path",
-            "objects",
-        ],
-        None,
-    )?;
-    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let snapshot = |args: &[&str]| -> Result<String, String> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .env("GIT_INDEX_FILE", temp.path().join("index"))
-            .env("GIT_OBJECT_DIRECTORY", objects.trim())
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err(format!(
-                "snapshotting checkout: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        String::from_utf8(output.stdout)
-            .map(|value| value.trim().into())
-            .map_err(|e| e.to_string())
-    };
-    // Seed from HEAD so tracked files remain included even if now ignored.
-    snapshot(&["read-tree", head.as_str()])?;
-    snapshot(&["add", "--all", "--", "."])?;
-    let tree = oid(&snapshot(&["write-tree"])?, "import tree")?;
-    let mut store = open_store(client)?;
-    let mut commit = store.read_commit(&head)?;
-    if commit.tree == tree {
-        return Ok(head);
-    }
-    commit.tree = tree;
-    commit.parents = vec![head];
-    commit.extra_headers.clear();
-    commit.message = b"Import working tree\n".to_vec();
-    store.write_commit(&commit).map_err(String::from)
-}
-
 pub struct ImportedContent {
     pub commit: Oid,
     pub metadata: Option<(String, Vec<u8>)>,
@@ -218,46 +155,54 @@ pub fn prepare_import(
             return Err("local imports require a Git checkout root".into());
         }
         let source = local.canonicalize().map_err(|e| e.to_string())?;
-        let commit = if let Some(revision) = revision {
-            let resolved = crate::host_git::capture_required(
+        if revision.is_none() {
+            let checkout = GitTransport::discover(&source)
+                .map_err(|_| "local imports require a Git checkout root")?;
+            if checkout
+                .work_dir()
+                .canonicalize()
+                .map_err(|e| e.to_string())?
+                != source
+            {
+                return Err("local imports require a Git checkout root, not a subdirectory".into());
+            }
+            // Include staged edits, untracked files and dirty submodules even
+            // when the checkout's status configuration normally hides them.
+            let status = crate::host_git::capture_required(
                 "git",
                 &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    &format!("{revision}^{{commit}}"),
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
                 ],
                 &source,
             )?;
-            let commit = oid(&resolved, "local import")?;
-            import_local_commit(&source, t.work_dir(), &commit)?;
-            commit
-        } else {
-            import_worktree(t, &source)?
-        };
+            if !status.is_empty() {
+                return Err("local import has uncommitted changes; commit them or supply an explicit revision (hash or ref)".into());
+            }
+        }
+        let resolved = crate::host_git::capture_required(
+            "git",
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{}^{{commit}}", revision.unwrap_or("HEAD")),
+            ],
+            &source,
+        )?;
+        let commit = oid(&resolved, "local import")?;
+        import_local_commit(&source, t.work_dir(), &commit)?;
         (commit, local_import_metadata(name, &source)?)
     } else {
-        let default = advertised_default_branch(t, &repository)?;
         let reference = revision
-            .map(str::to_string)
-            .or_else(|| parsed.as_ref().and_then(|p| p.rev.clone()))
-            .or_else(|| default.clone())
-            .ok_or_else(|| {
-                format!("repository {repository:?} did not advertise a default branch")
-            })?;
-        let commit = if let Ok(commit) = oid(&reference, "imported commit") {
-            GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
-            commit
-        } else {
-            oid(
-                &branch_snapshot(
-                    t,
-                    &repository,
-                    reference.strip_prefix("refs/heads/").unwrap_or(&reference),
-                )?,
-                "imported commit",
-            )?
-        };
+            .or_else(|| parsed.as_ref().and_then(|p| p.rev.as_deref()))
+            .ok_or("Git URI imports require a full commit hash")?;
+        let commit = oid(reference, "Git URI import requires a full commit hash")?;
+        GitStore::open(t.work_dir(), Some(&repository))?.ensure_local(&commit)?;
+        let default = advertised_default_branch(t, &repository)?;
         (commit, source_metadata(name, &repository, default))
     };
     ensure_code_commit(t, &mut open_store(t)?, &commit)?;
