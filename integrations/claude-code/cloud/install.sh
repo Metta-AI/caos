@@ -297,8 +297,21 @@ echo "installed $PREFIX/bin/caos ($stamped)" >&2
 # Not fatal when absent: a build from before this existed has no such asset, and
 # a client that can still reach an http:// server beats no client at all.
 if curl -fsSL "${url%/*}/git-remote-caos-x86_64-linux" -o "$tmp/git-remote-caos" 2>/dev/null; then
-    install -m 0755 "$tmp/git-remote-caos" "$PREFIX/bin/git-remote-caos"
-    echo "installed $PREFIX/bin/git-remote-caos" >&2
+    # BESIDE THE REAL BINARY, not beside the wrapper, and that distinction is
+    # the whole of it: the client puts its OWN directory on PATH before shelling
+    # out to git (`ensure_helper_on_path`), and its own directory is
+    # `lib/caos` — `bin/caos` is a shell wrapper that execs it. A helper only in
+    # `bin` is therefore invisible to the client's own git unless something else
+    # happens to have put `bin` on PATH, which is how this first failed: a
+    # session resolved its server, pushed, and died on
+    # `git: 'remote-caos' is not a git command`.
+    #
+    # The symlink in `bin` is for a person typing it and for a git that inherits
+    # an ordinary PATH. One copy, two names, the same shape the client itself is
+    # installed with.
+    install -m 0755 "$tmp/git-remote-caos" "$PREFIX/lib/caos/git-remote-caos"
+    ln -sf "$PREFIX/lib/caos/git-remote-caos" "$PREFIX/bin/git-remote-caos"
+    echo "installed $PREFIX/lib/caos/git-remote-caos (linked into $PREFIX/bin)" >&2
 else
     echo "no git-remote-caos in $VERSION; a caos:// server will not work" >&2
 fi
@@ -313,7 +326,13 @@ fi
 #
 # The helper counts as part of "installed": a prefix holding a current client
 # and no `git-remote-caos` would otherwise skip the download that fixes it.
-if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] && [ -x "$PREFIX/bin/git-remote-caos" ] \
+#
+# Asked of `lib/caos`, where the CLIENT looks, not of `bin`. An environment set
+# up by the version that installed it only into `bin` has a current client and a
+# helper its own git cannot find, and asking the wrong question there would skip
+# the download that repairs it on the next session.
+if [ -z "$force" ] && [ -x "$PREFIX/bin/caos" ] \
+   && [ -x "$PREFIX/lib/caos/git-remote-caos" ] \
    && grep -qF "CAOS_REV:-$VERSION}" "$PREFIX/bin/caos" 2>/dev/null; then
     echo "$PREFIX/bin/caos is already $VERSION" >&2
 else
