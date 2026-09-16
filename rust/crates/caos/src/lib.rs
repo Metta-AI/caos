@@ -123,6 +123,51 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
+/// Resolve a project tool `caos-tools/<name>` to its ArgTree oid, CLIENT-SIDE --
+/// the same `eval_path` walk [`cli_run_tool`] does, and the reason it exists as
+/// its own entry point.
+///
+/// The agent harness runs a tool by asking the SERVER to `eval-path-then`
+/// `caos-tools/<name>` (a worker cannot evaluate). That server walk refuses a
+/// `:@@=` locator (`EvalHost::resolve_remote` is client-only), so a repository
+/// whose tool reaches one through its root `.caos-expr` -- coworld-ctf mounts
+/// caos' std that way -- cannot have its tools run by an agent at all. Resolving
+/// here, on the client, does the `:@@=` fetch and hands the harness the finished
+/// tree; the walk is byte-identical to the one the server would do for a
+/// `:@=`-only tool, and the curry is marked with this caller's secret store, so
+/// a secret-needing resolution works exactly where the secret model lives.
+///
+/// `Ok(None)` when `caos-tools/<name>` is not a tool in the tracked worktree --
+/// a built-in (`bash`, `read`, …) or an unknown name -- so a caller can pass the
+/// result straight through and let the harness handle those as it always has.
+/// Evaluated against the dirty worktree (`ingest_path(".")`), like `run-tool`
+/// and `eval-path`, so an edited tool resolves edited.
+pub fn eval_tree_tool(
+    t: &dyn Transport,
+    name: &str,
+    store: &[ClientSecret],
+) -> Result<Option<String>, String> {
+    let dir = format!("caos-tools/{name}");
+    if !Path::new(&format!("{dir}/.caos-expr")).is_file() {
+        return Ok(None);
+    }
+    let (_, ws) = t
+        .ingest_path(".")?
+        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+    let (kind, oid) = eval::eval_path(t, &ws.to_string(), &dir, store)?;
+    if kind != "tree" {
+        return Err(format!(
+            "{dir}/.caos-expr evaluates to a {kind}, not an ArgTree"
+        ));
+    }
+    // The walk builds the ArgTree in the LOCAL store; the server has only what a
+    // `run` it dispatched left there. A caller passes this oid as a `:hash=`
+    // arg, which the server must hold, so push its closure now -- sound for a
+    // tree (`ensure_pushed`), and a no-op when a prior resolution already sent it.
+    t.ensure_pushed(&oid)?;
+    Ok(Some(oid))
+}
+
 /// Print a tool result's report conventions, reading ONLY the objects they
 /// name: the top tree and a `report` blob, or the result itself when it is one.
 /// A tool with no `report` (`build` returns an image) costs exactly one object.
@@ -366,6 +411,20 @@ pub trait Transport {
         Ok(())
     }
 
+    /// Push a COMMIT and its closure, skipping the `ensure_pushed` probe.
+    ///
+    /// A commit needs its own path because holding a commit does not imply
+    /// holding its parents: it arrives as a gitlink child of an ArgTree, and
+    /// git reachability does not traverse gitlinks. Anything that walks
+    /// history — the `log`/`show`/`diff` tools — reads those parents by hash
+    /// and fails on the server that never received them.
+    ///
+    /// Default: the same no-op as [`Transport::ensure_pushed`], since a worker
+    /// pushes nothing.
+    fn push_commit_closure(&self, _hash: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Ingest the filesystem path named by a `:@=` arg `value`, returning its
     /// `(mode, oid)` — or `Ok(None)` if this transport doesn't read host paths.
     /// The default is `None`: the worker has no host filesystem (only `/cas`), so
@@ -544,6 +603,14 @@ impl GitTransport {
         &self.work_dir
     }
 
+    /// The git directory of the worktree. A per-checkout scratch location the
+    /// `mcp serve` tool-registry cache lives under, so a `mcp warm` in the
+    /// session-start hook and the `mcp serve` spawned right after it agree on
+    /// one path without being told it.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
     /// Verify that the configured CAOS server accepts connections.
     ///
     /// The server deliberately returns 404 at its root, so any HTTP response
@@ -669,13 +736,19 @@ impl Transport for GitTransport {
         // expression dispatches lands here, so a resolution that is nothing but
         // cache hits was paying that advertisement a dozen times over.
         //
-        // Sound because the server holding `hash` means it holds everything
-        // under it. An object reaches it in exactly two ways, and both establish
-        // the closure: a `git push`, which packs and connectivity-checks the
-        // whole reachable graph, or `hand_over_graph`, which posts a tree's
-        // children before the tree itself. And the failure mode if that were
-        // ever false is loud, not silent — `/run` names the object it cannot
-        // read.
+        // Sound for a TREE or a BLOB, because the server holding one means it
+        // holds everything under it: it arrived either by `git push`, which
+        // packs and connectivity-checks the whole reachable graph, or by
+        // `hand_over_graph`, which posts a tree's children before the tree.
+        //
+        // NOT SOUND FOR A COMMIT, which is why `:commit=` args go through
+        // [`Transport::push_commit_closure`] instead. A commit reaches the
+        // server as a GITLINK child of an ArgTree, and git reachability does
+        // not traverse gitlinks (design/commits.md) — so the server can hold
+        // the commit while holding none of its parents, and this probe would
+        // skip the push that would have sent them. The failure is loud rather
+        // than silent — `/run` names the object it cannot read — but it lands
+        // in a worker, far from here.
         //
         // What is given up is the REF, which `hand_over_graph`'s raw posts do
         // not create either: an object the server got that way stops being a
@@ -684,62 +757,17 @@ impl Transport for GitTransport {
         if self.server_holds(hash) {
             return Ok(());
         }
+        self.push_closure(hash)
+    }
 
-        // Content-addressed ref: clobber-free across clients, idempotent (a
-        // re-push of the same content is a no-op), and it persists as the
-        // negotiation base for the next push, so an edited tree ships only its
-        // delta. The push carries the whole object graph reachable from `hash`.
-        let push = || self.push_req_ref(hash);
-
-        // RETRIED, for the create race between clients pushing the same object.
-        // They all read an advertisement without the ref, so they all plan a
-        // CREATE, and every one that locks after the first dies with "cannot
-        // lock ref …: reference already exists". `--force` does not help — the
-        // create precondition comes from the advertised state, not from the
-        // refspec.
-        //
-        // A retry usually succeeds because the winner has landed both the
-        // objects and the ref (receive-pack updates the ref last), so the next
-        // advertisement HAS it and the push becomes a no-op update — the ref
-        // can only be at `hash`, the name is the content.
-        //
-        // MORE THAN ONE RETRY, because under load that is not guaranteed: two
-        // losers can both re-read the advertisement before the winner's update
-        // lands, both plan a create again, and one loses again. Measured with
-        // six concurrent clients inside a loaded suite — a single retry left
-        // five of six failing (tests/push-race).
-        //
-        // Retried on ANY error rather than by matching git's wording, which
-        // varies by version: a few extra pushes on the failure path are cheaper
-        // than a fragile string test, and a genuine failure just fails N times.
-        let mut last = String::new();
-        let mut probed = false;
-        for attempt in 0..4 {
-            match push() {
-                Ok(_) => return Ok(()),
-                Err(e) => last = e,
-            }
-            // A graph we cannot READ is not the create race, and no retry will
-            // fix it — see `hand_over_graph`. Decided by asking git to walk the
-            // graph rather than by matching its wording, for the same reason the
-            // retry above is unconditional: the message varies by version.
-            // Probed once, and only after a failure, so a healthy push pays
-            // nothing.
-            if !probed {
-                probed = true;
-                if !self.graph_readable(hash) {
-                    return self.hand_over_graph(hash);
-                }
-            }
-            // Widening pause: the thing we are waiting for is another client's
-            // ref update landing, which is brief but not instant.
-            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
-        }
-        // The LAST error, not the first: reporting attempt one's message hides
-        // whatever actually defeated the retries, which is the only interesting
-        // one (it cost a debugging session — the visible error said "reference
-        // already exists" while the real failure was unknown).
-        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+    /// Always pushes: see the trait method, and the probe's note above.
+    ///
+    /// The cost is one `git push` per DISTINCT commit argument, not per call —
+    /// the ref is `refs/caos/req/<oid>`, so a re-push of the same commit is a
+    /// no-op update, and the ref it leaves behind is the negotiation base that
+    /// makes a descendant's push a delta.
+    fn push_commit_closure(&self, hash: &str) -> Result<(), String> {
+        self.push_closure(hash)
     }
 
     fn ingest_path(
@@ -1003,6 +1031,73 @@ impl GitTransport {
     /// Push `hash` under its content-addressed request ref. The single network
     /// step of [`Transport::ensure_pushed`], split out so the fallback below can
     /// reuse it per-child.
+    /// Push `hash` and everything reachable from it, WITHOUT the
+    /// `server_holds` probe.
+    ///
+    /// Separated from [`Transport::ensure_pushed`] because the probe is
+    /// sound only when holding an object implies holding its closure, and
+    /// for a COMMIT it does not: a commit reaches the server as a gitlink
+    /// child of an ArgTree, and git reachability does not traverse
+    /// gitlinks, so its parents come with it only if something else sent
+    /// them.
+    fn push_closure(&self, hash: &str) -> Result<(), String> {
+        // Content-addressed ref: clobber-free across clients, idempotent (a
+        // re-push of the same content is a no-op), and it persists as the
+        // negotiation base for the next push, so an edited tree ships only its
+        // delta. The push carries the whole object graph reachable from `hash`.
+        let push = || self.push_req_ref(hash);
+
+        // RETRIED, for the create race between clients pushing the same object.
+        // They all read an advertisement without the ref, so they all plan a
+        // CREATE, and every one that locks after the first dies with "cannot
+        // lock ref …: reference already exists". `--force` does not help — the
+        // create precondition comes from the advertised state, not from the
+        // refspec.
+        //
+        // A retry usually succeeds because the winner has landed both the
+        // objects and the ref (receive-pack updates the ref last), so the next
+        // advertisement HAS it and the push becomes a no-op update — the ref
+        // can only be at `hash`, the name is the content.
+        //
+        // MORE THAN ONE RETRY, because under load that is not guaranteed: two
+        // losers can both re-read the advertisement before the winner's update
+        // lands, both plan a create again, and one loses again. Measured with
+        // six concurrent clients inside a loaded suite — a single retry left
+        // five of six failing (tests/push-race).
+        //
+        // Retried on ANY error rather than by matching git's wording, which
+        // varies by version: a few extra pushes on the failure path are cheaper
+        // than a fragile string test, and a genuine failure just fails N times.
+        let mut last = String::new();
+        let mut probed = false;
+        for attempt in 0..4 {
+            match push() {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e,
+            }
+            // A graph we cannot READ is not the create race, and no retry will
+            // fix it — see `hand_over_graph`. Decided by asking git to walk the
+            // graph rather than by matching its wording, for the same reason the
+            // retry above is unconditional: the message varies by version.
+            // Probed once, and only after a failure, so a healthy push pays
+            // nothing.
+            if !probed {
+                probed = true;
+                if !self.graph_readable(hash) {
+                    return self.hand_over_graph(hash);
+                }
+            }
+            // Widening pause: the thing we are waiting for is another client's
+            // ref update landing, which is brief but not instant.
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+        }
+        // The LAST error, not the first: reporting attempt one's message hides
+        // whatever actually defeated the retries, which is the only interesting
+        // one (it cost a debugging session — the visible error said "reference
+        // already exists" while the real failure was unknown).
+        Err(format!("pushing {hash} to {CAOS_REMOTE}: {last}"))
+    }
+
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
         let refspec = format!("{hash}:refs/caos/req/{hash}");
         self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
@@ -2651,7 +2746,9 @@ fn resolve_commit_arg(
         })?
     };
     // Gitlinks aren't reachability-traversed, so push the commit's own closure.
-    t.ensure_pushed(&oid.to_string())?;
+    // NOT `ensure_pushed`: its probe would skip the push whenever the server
+    // already holds this commit as a gitlink, leaving the parents behind.
+    t.push_commit_closure(&oid.to_string())?;
     Ok(oid)
 }
 
@@ -2860,7 +2957,19 @@ fn resolve_remote_arg(
     };
 
     let dir = git_ref.dir.as_deref().unwrap_or("");
-    let (kind, hash) = eval::eval_path(t, &root.to_string(), dir, store)
+    // Evaluate SERVER-SIDE, not with a local `.caos-expr` walk. The walk is
+    // CHATTY -- measured ~54 fresh HTTP round trips, each a new connection --
+    // which is 0.1s over a loopback but ~30s over a cloud session's iroh tunnel,
+    // where every connection pays the relay's setup and latency. `/eval-locator`
+    // does the whole walk inside the server, where each hop is sub-millisecond,
+    // so this makes ONE request. The result is byte-identical to `eval_path`
+    // (secret marking is a no-op through eval; it happens when the step RUNS).
+    //
+    // Falls back to the local walk on any failure: an older server without the
+    // endpoint, or a real eval error, both land here, and the local walk then
+    // either succeeds (slowly) or reproduces the same error to report.
+    let (kind, hash) = eval_locator_on_server(t, &root.to_string(), dir, store)
+        .or_else(|_| eval::eval_path(t, &root.to_string(), dir, store))
         .map_err(|e| format!("git ref {value:?}: {e}"))?;
     let resolved = (eval::mode_of_kind(&kind), parse_oid(&hash)?);
     if let Some(key) = memo_key {
@@ -2872,6 +2981,31 @@ fn resolve_remote_arg(
 /// [`resolve_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`, for the
 /// pinned schemes only. See the split at the top of that function.
 static REMOTE_ARG_MEMO: eval::Memo<(gix::objs::tree::EntryMode, gix::ObjectId)> = eval::Memo::new();
+
+/// Evaluate `dir` within the tree `root` on the SERVER, via `/eval-locator` --
+/// [`resolve_remote_arg`]'s fast path. Pushes `root` so the server can read it,
+/// then makes ONE request in place of the local walk's ~54. Returns
+/// `(kind, hash)`, exactly as [`eval::eval_path`] does, so the two are
+/// interchangeable and the caller can fall back to the walk on any failure.
+fn eval_locator_on_server(
+    t: &dyn Transport,
+    root: &str,
+    dir: &str,
+    store: &[ClientSecret],
+) -> Result<(String, String), String> {
+    // The server percent-decodes a query value and splits on `&`; a `#` ends the
+    // query. A path carrying any of those (or a `%`) is left to the local walk.
+    if dir.chars().any(|c| matches!(c, '&' | '#' | '%')) {
+        return Err(format!("eval dir {dir:?} has a query-unsafe character"));
+    }
+    t.ensure_pushed(root)?;
+    let base = t.server_url()?;
+    let url = format!(
+        "{}/eval-locator?in={root}&eval={dir}",
+        base.trim_end_matches('/')
+    );
+    request_compute_url(&url, &secret_store_header(store))
+}
 
 /// Resolve curry layers, build the args tree, bundle + push the request, and run
 /// it — the CLI's blocking run. Ordinary worker sub-runs are continuations the
