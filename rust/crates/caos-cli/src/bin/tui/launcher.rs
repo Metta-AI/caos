@@ -76,29 +76,36 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     let mut seed = conversation_protocol::v3::tree::TreeBuilder::from(None);
     if let Some(name) = &args.import {
         conversation_protocol::v3::paths::validate_source_tree_name(name)?;
-        if let Some(checkout) = &checkout {
-            let transport = GitTransport::discover(&client)?;
-            let caos_cli::source_trees::ImportedContent { commit, metadata } =
-                caos_cli::source_trees::prepare_import(
-                    &transport,
-                    name,
-                    checkout.to_str().ok_or("checkout path must be UTF-8")?,
-                    args.turn.base.as_deref(),
-                )?;
-            seed.put_oid(
+        let repository = match &args.import_source {
+            Some(repository) => repository.clone(),
+            None => checkout
+                .as_ref()
+                .ok_or("--import without a source requires a Git checkout")?
+                .to_str()
+                .ok_or("checkout path must be UTF-8")?
+                .to_string(),
+        };
+        let transport = GitTransport::discover(&client)?;
+        let caos_cli::source_trees::ImportedContent { commit, metadata } =
+            caos_cli::source_trees::prepare_import(
+                &transport,
                 name,
-                conversation_protocol::v3::Mode::Commit,
-                commit.clone(),
-            );
-            if let Some((path, bytes)) = metadata {
-                seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
-            }
-            args.turn.base = Some(commit.to_string());
-            if args.from_commit.is_some() {
-                args.from_commit = Some(commit.to_string());
-            }
-        } else {
-            return Err("--import requires a Git checkout".into());
+                &repository,
+                args.import_revision
+                    .as_deref()
+                    .or(args.turn.base.as_deref()),
+            )?;
+        seed.put_oid(
+            name,
+            conversation_protocol::v3::Mode::Commit,
+            commit.clone(),
+        );
+        if let Some((path, bytes)) = metadata {
+            seed.put(&path, conversation_protocol::v3::Mode::Blob, bytes);
+        }
+        args.turn.base = Some(commit.to_string());
+        if args.from_commit.is_some() {
+            args.from_commit = Some(commit.to_string());
         }
     }
     args.turn.initial_content = Some(
