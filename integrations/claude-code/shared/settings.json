@@ -1,4 +1,8 @@
 {
+  "env": {
+    "MCP_TIMEOUT": "120000",
+    "MCP_TOOL_TIMEOUT": "600000"
+  },
   "permissions": {
     "deny": [
       "Edit",

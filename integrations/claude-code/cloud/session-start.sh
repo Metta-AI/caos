@@ -98,6 +98,29 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
+# Say that a registry is coming, BEFORE doing anything that takes time
+# ---------------------------------------------------------------------------
+# Claude Code spawns the caos tool server in PARALLEL with this hook, not after
+# it, and that server's first `tools/list` lands within a second -- while this
+# hook is still adding the remote. Without a claim already on disk, the server
+# sees nobody working, resolves the tools itself, and the warm below duplicates
+# it: measured at 8.5s and 8.2s side by side, colliding on a push of the same
+# object. `mcp serve` waits for this file instead (`ensure_resolved`).
+#
+# So it is written HERE, first, rather than by the warm that eventually fills
+# the cache -- a claim taken when the warm starts is taken far too late to be
+# seen. The deadline it carries bounds a hook that dies without its trap.
+#
+# Removed on EVERY exit, including the paths below that decide not to warm at
+# all: a marker left behind makes the next server in this checkout wait out its
+# whole budget for a hook that is long gone.
+if [ "$have_repo" = 1 ] && marker_dir="$(git rev-parse --absolute-git-dir 2>/dev/null)"; then
+    warm_marker="$marker_dir/caos-cc-warming"
+    printf '%s\n' "$(( $(date +%s) + 180 ))" > "$warm_marker"
+    trap 'rm -f "$warm_marker"' EXIT
+fi
+
+# ---------------------------------------------------------------------------
 # The remote, FIRST
 # ---------------------------------------------------------------------------
 # The one thing a session's first tool call cannot survive is a missing `caos`

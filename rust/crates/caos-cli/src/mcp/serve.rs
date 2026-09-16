@@ -32,11 +32,9 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-/// The pause between `warm`'s resolve attempts. `mcp serve` itself no longer
-/// retries -- it serves the registry `warm` cached, or resolves ONCE inline when
-/// there is none (see `ensure_resolved`) -- but `warm`, which runs in the
-/// session-start hook before the client starts, still retries through the setup
-/// race until it succeeds or the hook's `timeout` stops it.
+/// The pause between resolve attempts, and between polls of `warm`'s cache.
+/// Both `warm` and `serve` retry on it: the two start TOGETHER rather than one
+/// after the other, so both have to survive the same cold start.
 const RESOLVE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
@@ -60,13 +58,15 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
-    // The registry `mcp warm` cached in the session-start hook, BEFORE the client
-    // started -- the whole point of warm, and now the whole story: with it,
-    // `tools/list` is answered from the first read. Without it (a dev checkout,
-    // or a warm that could not finish), the first `tools/list` or `caos_status`
-    // resolves ONCE, inline (`ensure_resolved`). Either way the answer is
-    // whatever resolution concludes -- no background retry loop, no timed hold,
-    // no `tools/list_changed` correcting it later.
+    // An OPPORTUNISTIC read of the registry `mcp warm` cached, which is empty
+    // far more often than it looks: warm does not run before this process, it
+    // runs BESIDE it, and measurement puts serve 0.6s AHEAD of warm rather than
+    // behind it. So this read is a fast path for the second session in a
+    // checkout, not the mechanism -- `ensure_resolved` re-reads the same cache
+    // on the first request, which is where the handoff actually happens.
+    //
+    // The comment that used to sit here said warm ran "BEFORE the client
+    // started" and built the rest of the design on it. It was never true.
     if let Ok(t) = t {
         if let Some(tools) = read_cached_registry(t, &options) {
             publish(&registry, tools);
@@ -87,16 +87,21 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     Ok(())
 }
 
-/// Resolve the tools once, up front, and leave them in the on-disk cache that
-/// the `mcp serve` spawned moments later reads at startup.
+/// Resolve the tools and leave them in the on-disk cache `mcp serve` reads.
 ///
 /// This is what lets a session be ready on TURN ONE. `mcp serve` cannot answer
 /// `initialize` and go build an image before the client's first `tools/list`, so
 /// without a cache that first `tools/list` blocks on the resolve -- fine once the
 /// step is built, but the first time in a tree it is a rustc compile measured in
-/// minutes. Run from the session-start hook, which BLOCKS until it returns, this
-/// moves the resolve to before Claude Code is even launched, so the list `cc
-/// serve` answers is already known and instant.
+/// minutes.
+///
+/// IT DOES NOT RUN BEFORE THE CLIENT. It runs from the session-start hook, and
+/// Claude Code spawns the tool server in parallel with that hook rather than
+/// after it -- measured, serve was 0.6s AHEAD. So this is not a resolve that
+/// happens "first"; it is one of two resolves racing, and what makes it useful
+/// is that serve WAITS for it ([`ensure_resolved`]) instead of duplicating it.
+/// Before that wait existed both ran to completion side by side, 8.5s and 8.2s,
+/// and fought over pushing the same object.
 ///
 /// NON-FATAL by contract. It always returns `Ok`, because the hook must not fail
 /// a session over a cold cache: a warm that cannot reach the server yet, or a
@@ -117,6 +122,10 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     // resolve is returning fast failures -- exactly the setup-race case worth
     // retrying through.
     const WARM_ATTEMPTS: u32 = 120;
+    // Claimed for the hook's own cap (`timeout -k 10 150` in session-start.sh),
+    // so the marker cannot outlive the warm that owns it even when the warm is
+    // killed rather than returning.
+    let _marker = WarmMarker::claim(t, 150);
     let mut last = "not started".to_string();
     for attempt in 0..WARM_ATTEMPTS {
         if attempt > 0 {
@@ -173,6 +182,73 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
 /// this path from the git directory without one having to tell the other.
 fn registry_cache_path(t: &GitTransport) -> std::path::PathBuf {
     t.git_dir().join("caos-cc-registry.json")
+}
+
+/// The file held while a session-start hook is preparing this checkout, so
+/// `serve` can tell "a registry is coming" from "nobody is producing one".
+///
+/// CLAIMED BY THE HOOK, not by `warm`, and that distinction is the whole
+/// mechanism. `serve`'s first `tools/list` arrives within a second of the
+/// process starting -- before `warm` runs, and in the cloud before the hook has
+/// even finished adding the remote and unshallowing. A marker taken when warm
+/// STARTS is therefore taken too late to be seen: measured, serve asked, found
+/// no marker, and resolved alone exactly as it did before the marker existed.
+/// The hook knows a warm is coming long before it starts one, so it says so
+/// first (`integrations/claude-code/cloud/session-start.sh`).
+///
+/// `warm` claims it too, for a `caos mcp warm` run outside a hook.
+///
+/// Without it, waiting for the cache is a guess with no good answer. `serve` does
+/// NOT follow `warm`; the two start together and serve usually starts FIRST --
+/// measured at 0.6s ahead, after which both resolved the same step concurrently
+/// (8.5s and 8.2s), collided pushing the same object, and one of them ate a
+/// failed push and a retry. A fixed wait would have been wrong in both
+/// directions: too short to cover warm, and pure delay in a checkout where no
+/// warm is running at all (`integrations/claude-code/cli/run` starts a bare
+/// serve, and a serve that idled there before resolving would be slower than
+/// having no cache at all).
+///
+/// It carries the unix time by which warm will have given up, so a warm that is
+/// KILLED -- the hook's `timeout -k` does exactly that -- cannot leave a marker
+/// that makes every later serve wait for a process that is gone.
+fn warm_marker_path(t: &GitTransport) -> std::path::PathBuf {
+    t.git_dir().join("caos-cc-warming")
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Claim the marker for `for_secs`, and hand back a guard that removes it.
+struct WarmMarker(std::path::PathBuf);
+
+impl WarmMarker {
+    fn claim(t: &GitTransport, for_secs: u64) -> Self {
+        let path = warm_marker_path(t);
+        let _ = std::fs::write(&path, format!("{}\n", now_secs() + for_secs));
+        WarmMarker(path)
+    }
+}
+
+impl Drop for WarmMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Is a `warm` still working on this checkout? False for a marker whose deadline
+/// has passed, because a killed warm leaves its marker behind.
+fn warm_in_flight(t: &GitTransport) -> bool {
+    let Ok(text) = std::fs::read_to_string(warm_marker_path(t)) else {
+        return false;
+    };
+    text.trim()
+        .parse::<u64>()
+        .map(|deadline| now_secs() < deadline)
+        .unwrap_or(false)
 }
 
 /// The cache the previous function's path holds, IF it is for the step this
@@ -254,28 +330,92 @@ fn status_declaration() -> Value {
 /// the caller reads a settled registry. This is what `tools/list` and
 /// `caos_status` call before answering when `warm` left no cache.
 ///
-/// Idempotent and single-shot: a registry that already holds tools (from the
-/// cache or a prior resolve) or a recorded failure is left alone. The handler
-/// loop is single-threaded, so no two requests race this. It BLOCKS the caller
-/// for exactly one resolution -- a `caos` server round trip, and at most a cold
-/// image build -- rather than a fixed hold; there is no retry, because `warm`
-/// already retried through the setup race before the client ever started, and a
-/// resolve that fails here fails for a reason `caos_status` then names.
-fn ensure_resolved(options: &TurnOptions, registry: &Registry) {
+/// Idempotent: a registry that already holds tools is left alone. The handler
+/// loop is single-threaded, so no two requests race this.
+///
+/// It does three things in order, and the ORDER is the fix for two measured
+/// failures:
+///
+/// 1. RE-READ the on-disk cache. `serve` reads it once at startup, and at that
+///    moment `warm` -- which starts at the same time, usually a moment later --
+///    has not written it yet. A startup-only read can therefore never see the
+///    cache it exists to consume.
+/// 2. WAIT while a `warm` is in flight, instead of resolving in parallel with
+///    it. Measured without this: serve and warm resolved the same step
+///    concurrently (8.5s and 8.2s), pushed the same object at the same time, and
+///    one of them took a failed push plus a retry for it. Waiting turns a race
+///    into a handoff and costs nothing, because the session is blocked on the
+///    hook that runs warm anyway.
+/// 3. RESOLVE, retried. The previous version resolved exactly once and recorded
+///    whatever came back forever -- so a single `ensure_server_reachable` timing
+///    out decided the whole session. That is not a hypothetical: the probe's
+///    budget is 5s and a cold dial from a cloud container measures 0.9-1.7s,
+///    close enough that it fails intermittently. One cold dial must not be the
+///    thing that answers "does caos work here".
+///
+/// A recorded failure is no longer sticky for the CACHE either: a later call
+/// re-reads it, so a warm that lands after serve gave up still wins.
+fn ensure_resolved(t: Option<&GitTransport>, options: &TurnOptions, registry: &Registry) {
     if let Ok(found) = registry.lock() {
-        if !found.tools.is_empty() || found.status.is_some() {
+        if !found.tools.is_empty() {
             return;
         }
     }
-    let outcome = resolve_once(options);
-    if let Ok(mut found) = registry.lock() {
-        match outcome {
-            Ok(tools) => {
-                found.tools = tools;
-                found.status = None;
+
+    // How long to wait on a warm. Bounded well inside any plausible MCP startup
+    // timeout, because the cost of overrunning it is the whole server being
+    // dropped -- strictly worse than answering with `caos_status` alone.
+    // `MCP_TIMEOUT` is raised in the shipped settings to give this room.
+    const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+    const RESOLVE_ATTEMPTS: u32 = 3;
+
+    if let Some(t) = t {
+        let deadline = std::time::Instant::now() + WARM_WAIT;
+        let mut waited = false;
+        loop {
+            if let Some(tools) = read_cached_registry(t, options) {
+                if waited {
+                    eprintln!("caos mcp serve: took the registry the warm just cached");
+                }
+                publish(registry, tools);
+                return;
             }
-            Err(reason) => found.status = Some(reason),
+            if !warm_in_flight(t) || std::time::Instant::now() >= deadline {
+                break;
+            }
+            if !waited {
+                waited = true;
+                eprintln!(
+                    "caos mcp serve: a warm is resolving; waiting for it rather than \
+                           resolving alongside it"
+                );
+            }
+            std::thread::sleep(RESOLVE_FAST_INTERVAL);
         }
+    }
+
+    let mut last = String::new();
+    for attempt in 0..RESOLVE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(RESOLVE_FAST_INTERVAL);
+            // The warm may have finished while we were failing.
+            if let Some(t) = t {
+                if let Some(tools) = read_cached_registry(t, options) {
+                    publish(registry, tools);
+                    return;
+                }
+            }
+        }
+        match resolve_once(options) {
+            Ok(tools) => {
+                publish(registry, tools);
+                return;
+            }
+            Err(reason) => last = reason,
+        }
+    }
+    if let Ok(mut found) = registry.lock() {
+        found.status = Some(last);
     }
 }
 
@@ -606,7 +746,7 @@ fn handle(
         // predictable. It can block for one resolution -- a server round trip,
         // at most a cold build -- but never for a retry loop.
         "tools/list" => {
-            ensure_resolved(options, registry);
+            ensure_resolved(t.ok(), options, registry);
             Some(tools_list_reply(id, registry))
         }
         // A workspace we could not open is the model's problem to report, not
@@ -675,7 +815,7 @@ fn call(
         // Resolve first, so a status called before any `tools/list` (a client
         // that opens with a diagnostic) still reports what happened rather than
         // "not resolved yet" -- the unreachable-server case names the server here.
-        ensure_resolved(options, registry);
+        ensure_resolved(Some(t), options, registry);
         return Ok(status_result(registry));
     }
     let args = params
