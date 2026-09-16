@@ -63,7 +63,7 @@ const GREP_HELP: &str = "Search the conversation tree, including code references
 
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
-/// tool takes. History tools in `githist.rs` use the same builder with `@git`.
+/// tool takes. A std entry that declares `@git` gets the same builder.
 pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
     let (doc, args, git) = parse_help(&format!("built-in {name}"), help);
     TreeTool {
@@ -104,8 +104,8 @@ pub fn grep_declaration() -> Value {
 /// Reserved built-in tool names a tree tool may not shadow: the model's
 /// primitives (including the repair path for a broken tool edit — bash and
 /// the file tools) must stay stable whatever the tree carries, and the
-/// built-in history tools (`log`/`show`/`diff` — see `githist.rs`) are
-/// standard, not project-defined.
+/// history tools (`log`/`show`/`diff`, std entries the harness DEPends on)
+/// are standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
     "bash",
     "grep",
@@ -363,14 +363,25 @@ pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
 /// `help` its curried IMAGE carries — read the same way a tree tool's help is,
 /// so a built-in std tool and a project caos-tools tool are one mechanism, just
 /// sourced differently. `dir` is the materialized arg-tree path
-/// (`/cas/args/<name>-image`): a curry with only a base is the tool's ready
-/// ArgTree, whose `help` entry is the blob the tool's `.caos-expr` bound.
+/// (`/cas/args/<name>-image`).
 ///
-/// `None` when the image carries no `help` — treated as a configuration error by
-/// the caller, since the harness itself curried the image.
+/// THE HELP IS AT `args/help`, not `help`. That path is the curry node's own
+/// layout — `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`) — and the
+/// tool's `.caos-expr` binds `--help=` like any other argument. Looking at the
+/// top level finds nothing, which is exactly what happened: `registry` skipped
+/// a tool it could not describe, so every std tool silently vanished from the
+/// registry and the harness offered six tools where it meant to offer thirteen.
+///
+/// `None` when the image carries no `help` — a configuration error, since the
+/// harness itself curried the image, and its callers now say so.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
-    let help_path = format!("{dir}/help");
+    let args = format!("{dir}/args");
+    if !Path::new(&args).exists() {
+        return Ok(None);
+    }
+    caos(["get", &args])?;
+    let help_path = format!("{args}/help");
     if !Path::new(&help_path).exists() {
         return Ok(None);
     }

@@ -30,8 +30,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then_catching, run_worker, scratch,
-    secret, Arg,
+    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
+    run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -60,6 +60,27 @@ struct Config {
     merge_image: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
+    /// Drain this request's declared calls and STOP -- do not call the model,
+    /// do not terminate the request.
+    ///
+    /// For a harness that drives the model ITSELF and wants only the tools:
+    /// `caos mcp` records the call Claude Code is about to make, runs this to
+    /// execute it, and hands the observation back. Without it the step would
+    /// answer a model that already answered.
+    ///
+    /// Distinct from `Cancelling`/`drain`, which CANCELS pending calls rather
+    /// than running them, and ends the request.
+    ///
+    /// The value is the id of the call the run was made FOR, checked against
+    /// the record once the queue is empty. It also separates one dispatch from
+    /// the next: every other argument is the same for every call of a request,
+    /// so without it a second call would name the first's ArgTree and be
+    /// answered from the memo.
+    tools_only: Option<String>,
+    /// Describe the tools and stop, writing the registry as JSON. A harness
+    /// that drives the model itself has to publish these declarations to it,
+    /// and they belong to the step that implements them.
+    list_tools: bool,
     merge_refs: Option<String>,
     model: String,
     base_url: String,
@@ -82,9 +103,22 @@ impl Config {
         } else {
             image_arg("run-and-update-ref-image")?
         };
+        let tools_only = read_arg_opt("tools-only")?;
+        let list_tools = read_arg_opt("list-tools")?.is_some();
+        // Neither of those modes reaches the model, so neither may DEMAND what
+        // a model call takes. The key especially: `caos mcp` runs Claude Code's
+        // tools for a session whose model is Claude Code's own, and requiring
+        // an Anthropic key of it would refuse a turn over a call nothing makes.
+        let answers_model = tools_only.is_none() && !list_tools;
         Ok(Self {
-            api_key: secret("anthropic-api-key")?,
-            system: read_arg("system")?,
+            api_key: match answers_model {
+                true => secret("anthropic-api-key")?,
+                false => secret("anthropic-api-key").unwrap_or_default(),
+            },
+            system: match answers_model {
+                true => read_arg("system")?,
+                false => String::new(),
+            },
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             merge_image: image_arg("merge-image")?,
@@ -93,17 +127,29 @@ impl Config {
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
                 .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
+            tools_only,
+            list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
-            model: read_arg("model")?,
+            model: match answers_model {
+                true => read_arg("model")?,
+                false => String::new(),
+            },
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            conversation: read_arg_opt("conversation")?
-                .ok_or_else(|| "llm-step requires --conversation".to_string())?,
+            // A listing describes tools, which no conversation owns.
+            conversation: match (read_arg_opt("conversation")?, list_tools) {
+                (Some(conversation), _) => conversation,
+                (None, true) => String::new(),
+                (None, false) => return Err("llm-step requires --conversation".to_string()),
+            },
         })
     }
 }
 
 fn run() -> Result<(), String> {
     let cfg = Config::read()?;
+    if cfg.list_tools {
+        return list_tools(&cfg);
+    }
     let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
     let request = Oid::parse(&run_text, "conversation request")?;
     let request_head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
@@ -349,6 +395,14 @@ fn resume(
         if !round.pending.is_empty() {
             continue;
         }
+        // The queue is empty. A step would answer the model here; a tools-only
+        // run is finished, and leaves the request RUNNING for the next call.
+        // Its result is the conversation as it now stands, not a terminal one.
+        if let Some(call) = &cfg.tools_only {
+            require_completed_call(state, request, call)?;
+            let head = state.head().clone();
+            return forward_result(&head);
+        }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
         let previous = state.head().clone();
@@ -362,6 +416,32 @@ fn resume(
             &previous,
             current.round,
         );
+    }
+}
+
+/// Check that the call a tools-only run was dispatched for actually ran.
+///
+/// The run drains whatever is pending, so an empty queue is not on its own
+/// evidence that this call was among it -- a caller whose declaration lost a
+/// race, or that named a call from another round, would otherwise be handed a
+/// result with nothing of its own in it.
+fn require_completed_call(
+    state: &mut progress::State,
+    request: &Oid,
+    call: &str,
+) -> Result<(), String> {
+    let view = state.conversation()?;
+    let record = require_request(&view, request)?;
+    let round = round_state(&view, &record)?.declaring_round;
+    match view.tool(request, round, call)? {
+        Some(tool) if tool.is_terminal() => Ok(()),
+        Some(tool) => Err(format!(
+            "call {call} of request {request} is {:?}, not complete",
+            tool.status
+        )),
+        None => Err(format!(
+            "request {request} round {round} declares no call {call}"
+        )),
     }
 }
 
@@ -1378,9 +1458,46 @@ fn launch_tree_evaluation(
             ("tool-git", Arg::Lit(if git { "1" } else { "" })),
         ],
     )?;
-    let dispatched = eval_then_catching(ws, name, Arg::Hash(&me));
+    // The tool's ArgTree. Normally the SERVER evaluates the tool path for us (a
+    // worker cannot), then runs `me` with the result bound as `--result`. But
+    // that server-side walk refuses a `:@@=` locator, so when the CLIENT
+    // resolved this tool for us (`caos mcp serve`'s dispatch_call, for a tool
+    // that reaches such a locator) we skip the walk and run `me` with the tree
+    // it handed us bound as `--result` -- byte-identical to what the eval would
+    // have bound, so the re-entry cannot tell the difference.
+    let dispatched = match client_tool_tree(name)? {
+        Some(tree) => {
+            let task = prepare_request(
+                Arg::Hash(&me),
+                &[("in", Arg::Path(ws)), ("result", Arg::Hash(&tree))],
+            )?;
+            run_request_then(&task, None)
+        }
+        None => eval_then_catching(ws, name, Arg::Hash(&me)),
+    };
     timing::phase(&format!("tool dispatch {name}"));
     dispatched
+}
+
+/// The client-resolved ArgTree for tool `name`, if `caos mcp serve` handed one
+/// in for THIS tool (`--client-tool-name` / `--client-tool-tree`). The name
+/// guards it: a tools-only run drives one call, but a bare tree with no owner
+/// would be used for whatever tool happened to evaluate, so the two args travel
+/// together and only the matching tool consumes them. `None` (evaluate
+/// server-side) for every tool the client did not resolve -- the built-ins and
+/// any `:@=`-only project tool, which the server walk handles unchanged.
+fn client_tool_tree(name: &str) -> Result<Option<String>, String> {
+    match read_arg_opt("client-tool-name")? {
+        Some(owner) if owner == name => {
+            let tree = arg("client-tool-tree");
+            if Path::new(&tree).exists() {
+                Ok(Some(cas_hash(&tree)?))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn launch_evaluated_tool(
@@ -2845,6 +2962,23 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
         },"required":["path"]}
     }));
     Ok(registry)
+}
+
+/// Write the tool registry as JSON and stop.
+///
+/// A harness that drives the model itself (`caos mcp`) has to publish these
+/// declarations to it. Nothing here reads a conversation: a listing describes
+/// what the step CAN run, and is asked for before there is a conversation to
+/// run it in. Repository tools a source tree defines under `caos-tools/` are
+/// reached through the generic `run_tool`, not enumerated here.
+fn list_tools(cfg: &Config) -> Result<(), String> {
+    let registry = registry(cfg)?;
+    let dir = scratch("llm-step-tools")?;
+    let file = dir.join("tools.json");
+    let json = serde_json::to_vec(&registry)
+        .map_err(|error| format!("encoding the tool registry: {error}"))?;
+    fs::write(&file, json).map_err(|error| format!("writing {}: {error}", file.display()))?;
+    caos(["put", path(&file), "/cas/out"])
 }
 
 fn with_source_tree(mut declaration: Value) -> Value {
