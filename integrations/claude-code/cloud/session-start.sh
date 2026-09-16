@@ -128,8 +128,16 @@ if [ -n "${CAOS_IROH_TICKET:-}" ]; then
         pkill -f "connect-tcp --addr 127.0.0.1:$port " 2>/dev/null
 
         log "opening the iroh tunnel on :$port"
-        (dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
-            >/tmp/caos-tunnel.log 2>&1 &)
+        # `setsid`, not `( ... & )`. A bare background job is only ORPHANED --
+        # reparented to init, but still in the hook's PROCESS GROUP -- and Claude
+        # Code tears that group down when the SessionStart hook returns, so the
+        # tunnel that `warm` (below) just used dies before the session's first
+        # turn and every tool call gets "connection refused" on a port nothing is
+        # bound to. Measured: warm caches its tools, then turn 1 cannot reach the
+        # server. `setsid` puts the connector in its OWN session, so the group
+        # teardown does not reach it; `</dev/null` frees it from the hook's stdin.
+        setsid dumbpipe connect-tcp --addr "127.0.0.1:$port" "$CAOS_IROH_TICKET" \
+            </dev/null >/tmp/caos-tunnel.log 2>&1 &
         # Bounded wait: the first tool call would otherwise race the tunnel and
         # fail with a connection error that says nothing about why.
         for _ in $(seq 1 20); do
