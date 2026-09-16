@@ -160,10 +160,7 @@ impl Drop for Watch {
 
 /// `GET /status/<arg_tree>`, or None when the server has nothing to show.
 fn fetch(server: &str, arg_tree: &str) -> Result<Option<String>, String> {
-    let body = crate::http_get(&format!(
-        "{}/status/{arg_tree}",
-        server.trim_end_matches('/')
-    ))?;
+    let body = crate::server_get(server, &format!("/status/{arg_tree}"))?;
     let text = String::from_utf8_lossy(&body).trim().to_string();
     Ok((text != "null" && !text.is_empty()).then_some(text))
 }

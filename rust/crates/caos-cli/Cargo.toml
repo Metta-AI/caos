@@ -16,6 +16,10 @@ path = "src/bin/caos-cli.rs"
 
 [dependencies]
 caos = { path = "../caos" }
+# The `caos://` ticket transport (design/iroh-transport.md), installed into
+# `caos` at startup. Depended on HERE and not there: `caos` is also the worker
+# binary, and cargo would unify the feature into every worker image.
+caos-iroh = { path = "../caos-iroh" }
 conversation-protocol = { path = "../conversation-protocol", features = ["git-cli"] }
 serde_json = "1"
 tempfile = "3"

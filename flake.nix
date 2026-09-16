@@ -657,26 +657,39 @@ sandbox = false''
           CARGO_PROFILE = "dev";
           CARGO_PROFILE_DEV_DEBUG = "line-tables-only";
         };
+        # `caos-iroh` comes along for the ride, and has to: a `caos://` remote is
+        # served by `git-remote-caos`, which git execs BY NAME off PATH, and
+        # `caos-cli` shells out to git for every push and fetch. A client with
+        # one and not the other reaches the server itself and then fails inside
+        # git with `'remote-caos' is not a git command`.
+        cliPackages = "--package caos-cli --package caos-iroh --bins";
         nativeCliArtifacts = craneLib.buildDepsOnly (
-          nativeArgs
-          // { cargoExtraArgs = "--package caos-cli --bin caos-cli"; }
+          nativeArgs // { cargoExtraArgs = cliPackages; }
         );
         # Installed under both names: `caos` is what a person types (`caos talk`),
         # `caos-cli` stays for scripts and docs that spell it out. (No collision
         # with the worker-side `caos` binary — that one is baked into images and
         # never lands on a host PATH.)
+        # `git-remote-caos` sits in the SAME directory as the binary it serves,
+        # which is how it gets found: `caos-cli` puts its own directory on PATH
+        # before shelling out to git (`ensure_helper_on_path`), so the helper
+        # travels with the client through a nix profile, a copy, or a devShell,
+        # with nothing to configure. `caos-iroh` joins them for `caos-iroh
+        # ticket` and for debugging a connection by hand.
         caos-cli-bin =
           if pkgs.stdenv.hostPlatform.isLinux then
             pkgs.runCommand "caos-cli-bin" { } ''
               mkdir -p $out/bin
-              cp ${workspaceBins}/bin/caos-cli $out/bin/caos-cli
+              for tool in caos-cli git-remote-caos caos-iroh; do
+                cp ${workspaceBins}/bin/$tool $out/bin/$tool
+              done
             ''
           else
             craneLib.buildPackage (
               nativeArgs
               // {
                 cargoArtifacts = nativeCliArtifacts;
-                cargoExtraArgs = "--package caos-cli --bin caos-cli";
+                cargoExtraArgs = cliPackages;
                 pname = "caos-cli-bin";
                 doCheck = false;
               }
@@ -704,6 +717,14 @@ sandbox = false''
               --set-default CAOS_REV ${caosRev} \
               --set-default CAOS_HARNESS_SOURCE ${self.outPath} \
               --run 'export CAOS_INVOKED_AS="$0"'
+          done
+          # UNWRAPPED, and symlinks rather than wrappers: neither reads CAOS_REV,
+          # and `git-remote-caos` is found by git through the wrapped binary's own
+          # directory anyway (see `caos-cli-bin`). These are here so a person can
+          # type `caos-iroh ticket`, and so a `caos://` remote works in a shell
+          # that has only this package.
+          for name in git-remote-caos caos-iroh; do
+            ln -s ${caos-cli-bin}/bin/$name $out/bin/$name
           done
         '';
 
@@ -800,6 +821,13 @@ sandbox = false''
         #   caosd reset  stop and wipe CAOS_DATA state for a clean slate.
         #   caosd logs   follow the running stack's logs (Ctrl-C returns; the stack
         #                keeps running).
+        #   caosd up --iroh  also answer `caos://` clients (design/
+        #                iroh-transport.md), so a client anywhere reaches this
+        #                stack with a TICKET and no address. Off by default: it
+        #                makes the stack reachable from outside this machine.
+        #   caosd ticket that ticket — the whole of what a client configures
+        #                (`git remote add caos <ticket>`). Stable across
+        #                restarts; needs a stack brought up with --iroh.
         # NO std-build AND NO std-check, and both went for the same reason.
         # Publishing is not separable from bring-up any more: `stack/serve`
         # publishes and then starts the seeder with the tree that publish
@@ -1095,7 +1123,7 @@ sandbox = false''
 
             usage() {
               echo "caosd ($CAOS_REV)"
-              echo "usage: caosd [up|down|reset|logs|image-cleanup|version]"
+              echo "usage: caosd [up [--iroh]|down|reset|logs|ticket|image-cleanup|version]"
             }
 
             case "''${1:-up}" in
@@ -1104,6 +1132,81 @@ sandbox = false''
               exit 0
               ;;
             up)
+              # REACHABLE BY TICKET ONLY IF ASKED. `caosd up --iroh` (or
+              # CAOS_IROH=yes) adds the `caos://` listener
+              # (design/iroh-transport.md), which publishes this machine's
+              # endpoint and answers anyone holding the ticket. Off by default
+              # because bringing a local stack up should not also put it on the
+              # internet; on, it persists its key under CAOS_DATA so one ticket
+              # keeps working — `caosd ticket` prints it.
+              IROH=''${CAOS_IROH:-no}
+              if [ "''${2:-}" = --iroh ]; then IROH=yes; fi
+              # THE UDP PORT IS PUBLISHED, and it has to be: a client reaches
+              # this listener directly or pays a relay round trip on every
+              # request — measured at 0.4 ms against 174 ms, which turned a
+              # cached run from 38 ms into 4.6 s. The listener binds a FIXED port
+              # so the addresses in its ticket stay put (caos_iroh::DEFAULT_PORT);
+              # forwarding that port is what makes those addresses reachable from
+              # outside this container. Only when asked for, so an ordinary `up`
+              # opens nothing.
+              # AN ARRAY, so "no port" is NO ARGUMENT rather than an empty one: a
+              # quoted empty string here is an argument `docker run` rejects, and
+              # leaving it unquoted is a word-splitting bug shellcheck fails the
+              # build over. Not `[ … ] && …` either — under `set -e` a false test
+              # as the last command in its scope exits the script (AGENTS.md).
+              iroh_publish=()
+              if [ "$IROH" = yes ]; then iroh_publish=(-p 11204:11204/udp); fi
+
+              # WHAT TO PUT IN THE TICKET ON TOP of what the listener finds for
+              # itself, which in a container is only its address on the container
+              # network — unroutable from anywhere, the host included (rootless
+              # podman's network is user-mode: `/proc/net/route` on the host has
+              # no entry for it). The address that reaches it is THIS machine's,
+              # with the port published above, and only something out here knows
+              # that.
+              #
+              # THIS MACHINE'S OWN ADDRESSES, which it knows as a local fact and
+              # the container cannot: loopback (a client here, through the
+              # published port) plus whatever the kernel says is assigned to this
+              # host (a client on the LAN, or anywhere at all when that address is
+              # public — a server on a VPS needs no configuration for this to
+              # work). Nothing is inferred about the outside world; the listener
+              # keeps the relay's view of its public address separately.
+              #
+              # PURE BASH, because this command is coreutils and bash and that is
+              # all (see runtimeInputs) — reading `/proc/net/fib_trie`, where a
+              # `|-- <addr>` line followed by `/32 host LOCAL` is an address this
+              # machine answers to. No /proc (macOS) simply yields none, and
+              # loopback still covers the local client, since the engine forwards
+              # the published port there too.
+              IROH_ADVERTISE="127.0.0.1:11204"
+              if [ "$IROH" = yes ] && [ -r /proc/net/fib_trie ]; then
+                candidate=""
+                while read -r line; do
+                  case "$line" in
+                    *"|-- "*) candidate=''${line##*|-- } ;;
+                    *"/32 host LOCAL"*)
+                      # Skipped: loopback (already there) and DUPLICATES — this
+                      # file lists every address once per routing table, so a
+                      # plain append would name each of them twice.
+                      case "$candidate" in
+                        127.*|"") ;;
+                        *)
+                          case " $IROH_ADVERTISE " in
+                            *" $candidate:11204 "*) ;;
+                            *) IROH_ADVERTISE="$IROH_ADVERTISE $candidate:11204" ;;
+                          esac
+                          ;;
+                      esac
+                      candidate=""
+                      ;;
+                  esac
+                done < /proc/net/fib_trie
+              fi
+              # Anything else the operator wants in the ticket — a forwarded
+              # public address, say. Added last; the rest is not a guess.
+              IROH_ADVERTISE="$IROH_ADVERTISE ''${CAOS_IROH_ADVERTISE:-}"
+
               # ONE container runs the whole daemon group (design/
               # one-stack-image.md), and it BUILDS WHAT IT RUNS: its entrypoint
               # is `stack/bootstrap`, which binds a persistent nix store, does
@@ -1174,7 +1277,7 @@ sandbox = false''
                 --network-alias caos-redis \
                 --cap-add SYS_ADMIN \
                 --security-opt apparmor=unconfined \
-                -p 9090:80 -p "$REGISTRY_PORT:5000" \
+                -p 9090:80 -p "$REGISTRY_PORT:5000" "''${iroh_publish[@]}" \
                 -v "$CAOS_DATA/stack:/state" \
                 -v caos-vol-mounted-nix:/mounted-nix \
                 -v /var/run/docker.sock:/var/run/docker.sock \
@@ -1192,6 +1295,8 @@ sandbox = false''
                 -e CAOS_STACK_REDIS=yes \
                 -e CAOS_STACK_RUNNERD=yes \
                 -e CAOS_STACK_SEEDER=yes \
+                -e CAOS_STACK_IROH="$IROH" \
+                -e CAOS_STACK_IROH_ADVERTISE="$IROH_ADVERTISE" \
                 -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                 -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
                 -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
@@ -1237,6 +1342,22 @@ sandbox = false''
               # `docker logs` would interleave them); serve's own output is the
               # container's.
               tail -n +1 -f "$CAOS_DATA"/stack/logs/*.log
+              ;;
+            ticket)
+              # What a client needs to reach this stack, and the whole of it:
+              # `git remote add caos <ticket>` in any worktree
+              # (design/iroh-transport.md).
+              #
+              # READ FROM THE FILE the listener published, rather than computed
+              # here. Two reasons: this command carries no build products by
+              # design (see `up`), so it has no `caos-iroh` to run; and the
+              # listener's own state is the only place the answer can come from
+              # without a second implementation to disagree with it.
+              ticket="$CAOS_DATA/stack/iroh/ticket"
+              if [ ! -e "$ticket" ]; then
+                die "no ticket here. Bring the stack up with 'caosd up --iroh' (or CAOS_IROH=yes)"
+              fi
+              cat "$ticket"
               ;;
             image-cleanup)
               shift

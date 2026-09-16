@@ -61,6 +61,15 @@ Every script here runs with it, and two constructs quietly break under it.
   a previous build, and the other can be missing entirely — so you read a stale
   binary and blame the code. Build one output per invocation. (`--refresh` is not
   needed: nix picks up dirty-tree edits fine.)
+- **`nix build` sees only git-TRACKED files, so a new crate must be `git add`ed
+  before it builds.** "nix picks up dirty-tree edits fine" is about edits to
+  tracked files; an untracked one is simply not in the flake source. The failure
+  lands nowhere near the cause: cargo dies inside `caos-workspace-deps` with
+  `failed to load manifest for workspace member .../crates/<new>` … `No such
+  file or directory`, naming a file that is right there in your checkout. Worse,
+  adding a crate re-keys the deps bake, so you wait out a full dependency
+  compile to be told this. `git add` the crate (staging is enough, no commit)
+  the moment `Cargo.toml`'s `members` grows.
 
 # Workers
 

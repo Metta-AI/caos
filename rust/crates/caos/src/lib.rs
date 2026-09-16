@@ -219,10 +219,7 @@ pub fn fetch_status(
 ) -> Result<Option<String>, String> {
     let base = t.server_url()?;
     let query = if all { "?all=1" } else { "" };
-    let body = http_get(&format!(
-        "{}/status/{arg_tree}{query}",
-        base.trim_end_matches('/')
-    ))?;
+    let body = server_get(&base, &format!("/status/{arg_tree}{query}"))?;
     let text = String::from_utf8_lossy(&body).trim().to_string();
     Ok((text != "null" && !text.is_empty()).then_some(text))
 }
@@ -436,28 +433,23 @@ impl Transport for HttpTransport {
     fn put_object(&self, kind: &str, content: &[u8]) -> Result<gix::ObjectId, String> {
         let mut body = format!("{kind} {}\0", content.len()).into_bytes();
         body.extend_from_slice(content);
-
-        let url = format!("{}/object/", self.base.trim_end_matches('/'));
-        let response = minreq::post(&url)
-            .with_body(body)
-            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-            .send()
-            .map_err(|e| format!("POST {url}: {e}"))?;
-        if !(200..300).contains(&response.status_code) {
-            return Err(format!(
-                "POST {url}: server returned {} {}",
-                response.status_code, response.reason_phrase
-            ));
-        }
-        let body = response
-            .as_str()
-            .map_err(|e| format!("POST {url}: invalid response: {e}"))?;
-        parse_oid(body)
+        let answer = server_call(
+            &self.base,
+            &ServerRequest {
+                method: "POST",
+                path: "/object/",
+                headers: &[],
+                body: Some(&body),
+                timeout_secs: None,
+            },
+        )?;
+        let text = std::str::from_utf8(&answer)
+            .map_err(|e| format!("POST /object/: invalid response: {e}"))?;
+        parse_oid(text)
     }
 
     fn get_object(&self, hash: &str) -> Result<(String, Vec<u8>), String> {
-        let url = format!("{}/object/{hash}", self.base.trim_end_matches('/'));
-        let serialized = http_get(&url)?;
+        let serialized = server_get(&self.base, &format!("/object/{hash}"))?;
         let (kind, content) = parse_object(&serialized)?;
         Ok((kind.to_string(), content.to_vec()))
     }
@@ -465,17 +457,22 @@ impl Transport for HttpTransport {
     fn has_object(&self, hash: &str) -> Result<bool, String> {
         // HEAD, so a 37 MB binary costs a status line to ask about. The server
         // answers 200 or 404 with no body.
-        let url = format!("{}/object/{hash}", self.base.trim_end_matches('/'));
-        let response = minreq::head(&url)
-            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-            .send()
-            .map_err(|e| format!("HEAD {url}: {e}"))?;
-        match response.status_code {
+        let response = server_request(
+            &self.base,
+            &ServerRequest {
+                method: "HEAD",
+                path: &format!("/object/{hash}"),
+                headers: &[],
+                body: None,
+                timeout_secs: None,
+            },
+        )?;
+        match response.status {
             200..=299 => Ok(true),
             404 => Ok(false),
             code => Err(format!(
-                "HEAD {url}: server returned {code} {}",
-                response.reason_phrase
+                "HEAD /object/{hash}: server returned {code} {}",
+                response.reason
             )),
         }
     }
@@ -554,16 +551,23 @@ impl GitTransport {
         const TIMEOUT_SECS: u64 = 5;
 
         let url = self.server_url()?;
-        minreq::get(url.trim_end_matches('/'))
-            .with_timeout(TIMEOUT_SECS)
-            .send()
-            .map(|_| ())
-            .map_err(|error| {
-                format!(
-                    "cannot reach the CAOS server at {url}: {error}\n\
-                     check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
-                )
-            })
+        server_request(
+            &url,
+            &ServerRequest {
+                method: "GET",
+                path: "/",
+                headers: &[],
+                body: None,
+                timeout_secs: Some(TIMEOUT_SECS),
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "cannot reach the CAOS server at {url}: {error}\n\
+                 check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
+            )
+        })
     }
 
     /// Run Git in this transport's bound working tree and return stdout.
@@ -640,14 +644,16 @@ impl Transport for GitTransport {
                 return Ok((object.kind.to_string(), object.data.clone()));
             }
         }
-        let url = format!("{}/object/{hash}", self.server_url()?.trim_end_matches('/'));
-        let serialized = http_get(&url)?;
+        let server = self.server_url()?;
+        let serialized = server_get(&server, &format!("/object/{hash}"))?;
         let (kind, content) = parse_object(&serialized)?;
         // Write it into the local repo so the next ask — and the next run — is
         // a local hit. put_object validates that the bytes hash to `hash`.
         let stored = self.put_object(kind, content)?;
         if stored != oid {
-            return Err(format!("{url} returned an object hashing to {stored}"));
+            return Err(format!(
+                "{server} returned an object hashing to {stored}, not {hash}"
+            ));
         }
         Ok((kind.to_string(), content.to_vec()))
     }
@@ -1028,14 +1034,17 @@ impl GitTransport {
         let Ok(server) = self.server_url() else {
             return false;
         };
-        if !server.starts_with("http://") && !server.starts_with("https://") {
-            return false;
-        }
-        let url = format!("{}/object/{hash}", server.trim_end_matches('/'));
-        minreq::head(&url)
-            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-            .send()
-            .is_ok_and(|response| (200..300).contains(&response.status_code))
+        server_request(
+            &server,
+            &ServerRequest {
+                method: "HEAD",
+                path: &format!("/object/{hash}"),
+                headers: &[],
+                body: None,
+                timeout_secs: None,
+            },
+        )
+        .is_ok_and(|response| (200..300).contains(&response.status))
     }
 
     /// Can git walk everything reachable from `hash` in THIS repo?
@@ -1126,30 +1135,26 @@ impl GitTransport {
         let mut body = format!("{kind} {}\0", content.len()).into_bytes();
         body.extend_from_slice(content);
         let server = self.server_url()?;
-        // The `caos` remote IS the server (README), so this is normally an HTTP
-        // URL. Say so plainly when it is not: a bare-repo remote can serve git
-        // but has no `/object` endpoint, and minreq's own complaint
-        // ("redirected to an absolute url with an invalid protocol") names
-        // neither the cause nor the requirement.
-        if !server.starts_with("http://") && !server.starts_with("https://") {
-            return Err(format!(
-                "cannot hand objects to the `{CAOS_REMOTE}` remote {server:?}: completing a push \
-                 whose local graph is incomplete needs the remote to be an HTTP caos server \
-                 (its `/object` endpoint), not a plain git remote"
-            ));
-        }
-        let url = format!("{}/object/", server.trim_end_matches('/'));
-        let response = minreq::post(&url)
-            .with_body(body)
-            .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-            .send()
-            .map_err(|e| format!("POST {url}: {e}"))?;
-        if !(200..300).contains(&response.status_code) {
-            return Err(format!(
-                "POST {url}: server returned {} {}",
-                response.status_code, response.reason_phrase
-            ));
-        }
+        // Says which requirement this is, on top of whatever the transport
+        // itself reports: a `caos` remote that is a plain git URL serves git
+        // perfectly well and has no `/object` endpoint at all, and that is the
+        // one failure worth explaining rather than relaying.
+        server_call(
+            &server,
+            &ServerRequest {
+                method: "POST",
+                path: "/object/",
+                headers: &[],
+                body: Some(&body),
+                timeout_secs: None,
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "cannot hand objects to the `{CAOS_REMOTE}` remote: completing a push whose local \
+                 graph is incomplete needs the server's `/object` endpoint. {error}"
+            )
+        })?;
         Ok(())
     }
 
@@ -1277,27 +1282,154 @@ pub fn server_url() -> Result<String, String> {
         .map_err(|_| format!("{SERVER_ENV} must be set to the caos server URL"))
 }
 
-/// HTTP GET returning the raw response body. Non-2xx responses are errors.
-fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    let response = minreq::get(url)
-        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
+/// Scheme of the iroh ticket transport (design/iroh-transport.md). A server
+/// named this way is reached by TICKET rather than by address.
+pub const TICKET_SCHEME: &str = "caos://";
+
+/// One request to the caos server, independent of how it travels.
+pub struct ServerRequest<'a> {
+    pub method: &'a str,
+    /// Absolute path and query, `/object/<hash>` style, joined onto the base.
+    pub path: &'a str,
+    pub headers: &'a [(&'a str, String)],
+    pub body: Option<&'a [u8]>,
+    /// Wall-clock cap, for the few callers that would rather fail than wait.
+    /// None for the rest — `GET /run` blocks for as long as the work takes.
+    pub timeout_secs: Option<u64>,
+}
+
+/// What came back. The status is kept rather than turned into an error here, so
+/// each caller decides what a 404 means (absent, for `has_object`; a failure,
+/// for a fetch).
+pub struct ServerResponse {
+    pub status: u16,
+    pub reason: String,
+    pub body: Vec<u8>,
+}
+
+/// A transport for [`TICKET_SCHEME`] URLs, installed at runtime.
+///
+/// INSTALLED RATHER THAN LINKED, and that is a deliberate constraint on this
+/// crate rather than an abstraction for its own sake. The implementation is
+/// `caos-iroh`, whose dependency tree is iroh, quinn and tokio; this crate is
+/// also the worker's `/bin/caos`, baked setuid into every worker image. Cargo
+/// unifies features across workspace members in one `cargo build --workspace`,
+/// so *depending* on that crate — however carefully gated — would put a QUIC
+/// stack in every worker image. A host binary installs one; a worker never does,
+/// and never needs to, since the server it is handed is always an address on the
+/// docker network.
+pub trait TicketTransport: Send + Sync {
+    fn request(&self, base: &str, request: &ServerRequest) -> Result<ServerResponse, String>;
+}
+
+static TICKET_TRANSPORT: std::sync::OnceLock<Box<dyn TicketTransport>> = std::sync::OnceLock::new();
+
+/// Install the transport for `caos://` servers. Call once, early, from a host
+/// binary's `main`. A second call is ignored, so two entry points into the same
+/// process cannot fight over it.
+pub fn install_ticket_transport(transport: Box<dyn TicketTransport>) {
+    let _ = TICKET_TRANSPORT.set(transport);
+}
+
+/// Perform `request` against the caos server at `base`, over whichever transport
+/// the base URL names.
+///
+/// THE ONE PLACE that knows how to reach the server, which is what lets a second
+/// transport exist at all: every `/object`, `/run`, `/status`, `/sub-run` and
+/// `/trace/child` call in this crate goes through here.
+pub fn server_request(base: &str, request: &ServerRequest) -> Result<ServerResponse, String> {
+    let base = base.trim_end_matches('/');
+    // THE WORLD TAG GOES ON EVERY REQUEST, whichever transport carries it, and
+    // it is stamped HERE rather than per-branch for that reason. A request
+    // without it is allowed through (`caos_world`: git's own traffic and health
+    // probes have none), so a transport that forgot to stamp it would not fail —
+    // it would silently let a host client drive a test stack, which is the exact
+    // crossing the tag exists to prevent.
+    let mut headers: Vec<(&str, String)> =
+        vec![(caos_world::WORLD_HEADER, caos_world::WORLD.to_string())];
+    headers.extend(request.headers.iter().map(|(n, v)| (*n, v.clone())));
+    let request = &ServerRequest {
+        headers: &headers,
+        ..*request
+    };
+
+    if base.starts_with(TICKET_SCHEME) {
+        let transport = TICKET_TRANSPORT.get().ok_or_else(|| {
+            format!(
+                "the caos server is a ticket ({TICKET_SCHEME}…) and this build has no transport \
+                 for it: git reaches such a server through `git-remote-caos`, but this binary \
+                 cannot. Point it at the server's HTTP URL"
+            )
+        })?;
+        return transport.request(base, request);
+    }
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err(format!(
+            "the caos server {base:?} is neither an HTTP URL nor a ticket ({TICKET_SCHEME}…): a \
+             plain git remote serves git, but has no `/object` or `/run` endpoint"
+        ));
+    }
+
+    let url = format!("{base}{}", request.path);
+    let mut http = match request.method {
+        "GET" => minreq::get(&url),
+        "HEAD" => minreq::head(&url),
+        "POST" => minreq::post(&url),
+        other => return Err(format!("unsupported method {other}")),
+    };
+    for (name, value) in request.headers {
+        http = http.with_header(*name, value);
+    }
+    if let Some(body) = request.body {
+        http = http.with_body(body.to_vec());
+    }
+    if let Some(seconds) = request.timeout_secs {
+        http = http.with_timeout(seconds);
+    }
+    let response = http
         .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        // Surface the server's response body — for the server a 500
-        // carries the worker's failure output, which is what you actually need.
-        let body = response.as_str().unwrap_or("").trim();
+        .map_err(|e| format!("{} {url}: {e}", request.method))?;
+    Ok(ServerResponse {
+        status: response.status_code as u16,
+        reason: response.reason_phrase.clone(),
+        body: response.into_bytes(),
+    })
+}
+
+/// A request whose non-2xx answer is an error, with the server's body attached.
+///
+/// That body matters: for `/run` a 500 carries the worker's failure output,
+/// which is the thing you actually need to read.
+fn server_call(base: &str, request: &ServerRequest) -> Result<Vec<u8>, String> {
+    let response = server_request(base, request)?;
+    if !(200..300).contains(&response.status) {
+        let body = String::from_utf8_lossy(&response.body);
+        let body = body.trim();
         let detail = if body.is_empty() {
             String::new()
         } else {
             format!(":\n{body}")
         };
         return Err(format!(
-            "GET {url}: server returned {} {}{detail}",
-            response.status_code, response.reason_phrase
+            "{} {base}{}: server returned {} {}{detail}",
+            request.method, request.path, response.status, response.reason
         ));
     }
-    Ok(response.into_bytes())
+    Ok(response.body)
+}
+
+/// GET `<base><path>`, returning the raw body. Non-2xx responses are errors.
+fn server_get(base: &str, path: &str) -> Result<Vec<u8>, String> {
+    server_call(
+        base,
+        &ServerRequest {
+            method: "GET",
+            path,
+            headers: &[],
+            body: None,
+            timeout_secs: None,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3295,27 +3427,17 @@ pub fn caos_trace_child(t: &dyn Transport, name: &str, arg_tree: &str) -> Result
     }
     let nonce = std::env::var(JOB_NONCE_ENV)
         .map_err(|_| "trace-child is available only inside a running worker".to_string())?;
-    let url = format!("{}/trace/child", t.server_url()?.trim_end_matches('/'));
     let body = serde_json::json!({"req": arg_tree, "nonce": nonce, "name": name}).to_string();
-    let response = minreq::post(&url)
-        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-        .with_header("content-type", "application/json")
-        .with_timeout(5)
-        .with_body(body)
-        .send()
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    if !(200..300).contains(&response.status_code) {
-        let detail = response.as_str().unwrap_or("").trim();
-        return Err(format!(
-            "POST {url}: server returned {}{}",
-            response.status_code,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        ));
-    }
+    server_call(
+        &t.server_url()?,
+        &ServerRequest {
+            method: "POST",
+            path: "/trace/child",
+            headers: &[("content-type", "application/json".to_string())],
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(5),
+        },
+    )?;
     Ok(())
 }
 
@@ -4553,8 +4675,7 @@ fn resolve_reader_image(
 }
 
 fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
-    let url = run_url(base, arg_tree);
-    request_compute_url(&url, secrets)
+    request_compute_url(base, &run_path(arg_tree), secrets)
 }
 
 /// Run an already-prepared request without a secret-store header.
@@ -4591,86 +4712,60 @@ pub fn caos_resolve_image(args: &[String]) -> Result<(), String> {
     if image.contains('&') || image.contains('#') {
         return Err(format!("image reference cannot contain & or #: {image:?}"));
     }
-    let base = server_url()?;
-    let url = format!("{}/resolve-image?image={image}", base.trim_end_matches('/'));
-    let response = minreq::get(&url)
-        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-        .send()
-        .map_err(|error| format!("GET {url}: {error}"))?;
-    if !(200..300).contains(&response.status_code) {
-        let detail = response.as_str().unwrap_or("").trim();
-        return Err(format!(
-            "GET {url}: server returned {}{}",
-            response.status_code,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        ));
-    }
-    println!("{}", response.as_str().map_err(|e| e.to_string())?.trim());
+    let body = server_get(&server_url()?, &format!("/resolve-image?image={image}"))?;
+    let reference =
+        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+    println!("{}", reference.trim());
     Ok(())
 }
 
 /// The one shape every compute path uses. `req` is the query param's historical
 /// name; its value is the ArgTree hash.
-fn run_url(base: &str, arg_tree: &str) -> String {
-    format!("{}/run?req={arg_tree}", base.trim_end_matches('/'))
+fn run_path(arg_tree: &str) -> String {
+    format!("/run?req={arg_tree}")
 }
 
 /// Ask the server to start `arg_tree` with the current in-flight job's
 /// un-hashed context. The response acknowledges admission only; the sub-run
 /// continues on a server thread after this call returns.
 fn request_sub_run(base: &str, arg_tree: &str, nonce: &str) -> Result<(), String> {
-    let url = format!("{}/sub-run", base.trim_end_matches('/'));
     let body = serde_json::json!({"req": arg_tree, "nonce": nonce}).to_string();
-    let response = minreq::post(&url)
-        .with_header(caos_world::WORLD_HEADER, caos_world::WORLD)
-        .with_header("content-type", "application/json")
-        .with_timeout(5)
-        .with_body(body)
-        .send()
-        .map_err(|error| format!("POST {url}: {error}"))?;
-    if !(200..300).contains(&response.status_code) {
-        let detail = response.as_str().unwrap_or("").trim();
-        return Err(if detail.is_empty() {
-            format!("POST {url}: server returned {}", response.status_code)
-        } else {
-            format!(
-                "POST {url}: server returned {}: {detail}",
-                response.status_code
-            )
-        });
-    }
+    server_call(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: "/sub-run",
+            headers: &[("content-type", "application/json".to_string())],
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(5),
+        },
+    )?;
     Ok(())
 }
 
 /// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
 /// [`SECRETS_HEADER`] header when non-empty (design/secrets.md) — out of band
 /// from the content-addressed ArgTree in the URL.
-fn request_compute_url(url: &str, secrets: &str) -> Result<(String, String), String> {
-    let mut request = minreq::get(url).with_header(caos_world::WORLD_HEADER, caos_world::WORLD);
-    if !secrets.is_empty() {
-        request = request.with_header(SECRETS_HEADER, secrets);
-    }
-    let response = request.send().map_err(|e| format!("GET {url}: {e}"))?;
-    if !(200..300).contains(&response.status_code) {
-        // Surface the server's response body — a 500 carries the worker's
-        // failure output, which is what you actually need.
-        let body = response.as_str().unwrap_or("").trim();
-        let detail = if body.is_empty() {
-            String::new()
-        } else {
-            format!(":\n{body}")
-        };
-        return Err(format!(
-            "GET {url}: server returned {} {}{detail}",
-            response.status_code, response.reason_phrase
-        ));
-    }
-    let text = String::from_utf8(response.into_bytes())
-        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+fn request_compute_url(base: &str, path: &str, secrets: &str) -> Result<(String, String), String> {
+    let headers = if secrets.is_empty() {
+        Vec::new()
+    } else {
+        vec![(SECRETS_HEADER, secrets.to_string())]
+    };
+    // NO TIMEOUT, deliberately: this is the call that waits for the work. A run
+    // takes as long as the worker does.
+    let body = server_call(
+        base,
+        &ServerRequest {
+            method: "GET",
+            path,
+            headers: &headers,
+            body: None,
+            timeout_secs: None,
+        },
+    )?;
+    let text =
+        String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
         .trim()
         .split_once(' ')
@@ -4959,15 +5054,73 @@ gpgsig -----BEGIN PGP SIGNATURE-----
     }
 
     #[test]
-    fn all_compute_paths_share_one_url_shape() {
-        // A trailing slash on the base must not double up in the path.
+    fn all_compute_paths_share_one_request_shape() {
         assert_eq!(
-            run_url("http://caos/", &"a".repeat(40)),
-            format!("http://caos/run?req={}", "a".repeat(40))
+            run_path(&"a".repeat(40)),
+            format!("/run?req={}", "a".repeat(40))
         );
-        assert_eq!(
-            run_url("http://caos", &"a".repeat(40)),
-            run_url("http://caos/", &"a".repeat(40))
+    }
+
+    /// Records what the funnel hands a ticket transport, so the dispatch can be
+    /// tested without a server. Installed once for this process — the other
+    /// tests use `http://` bases, which never reach it.
+    struct Recorder;
+
+    /// base, method, path, headers.
+    #[allow(clippy::type_complexity)]
+    static RECORDED: std::sync::Mutex<Vec<(String, String, String, Vec<(String, String)>)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    impl TicketTransport for Recorder {
+        fn request(&self, base: &str, request: &ServerRequest) -> Result<ServerResponse, String> {
+            RECORDED.lock().unwrap().push((
+                base.to_string(),
+                request.method.to_string(),
+                request.path.to_string(),
+                request
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect(),
+            ));
+            Ok(ServerResponse {
+                status: 200,
+                reason: "OK".to_string(),
+                body: b"recorded".to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_ticket_base_reaches_the_installed_transport_with_no_doubled_slash() {
+        install_ticket_transport(Box::new(Recorder));
+        // A trailing slash on the base must not double up against the path,
+        // whichever transport carries it.
+        let body = server_get(&format!("{TICKET_SCHEME}endpointaaa.0011/"), "/object/abc")
+            .expect("the recorder answers");
+        assert_eq!(body, b"recorded");
+        let recorded = RECORDED.lock().unwrap();
+        let (base, method, path, headers) = recorded.last().expect("one call");
+        assert_eq!(base, &format!("{TICKET_SCHEME}endpointaaa.0011"));
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/object/abc");
+        // The world tag rides on this transport too. A missing one is ACCEPTED by
+        // the server, so nothing else would notice its absence — and what it
+        // would let through is a host client driving a test stack.
+        assert!(
+            headers.iter().any(|(name, value)| name
+                == caos_world::WORLD_HEADER
+                && value == caos_world::WORLD),
+            "no world header: {headers:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_is_neither_http_nor_a_ticket_says_so() {
+        let error = server_get("git@example.com:repo.git", "/object/abc").expect_err("refused");
+        assert!(
+            error.contains("neither an HTTP URL nor a ticket"),
+            "{error}"
         );
     }
 

@@ -86,6 +86,25 @@
 #                             publishing it.
 #   CAOS_RUNNER_SLOTS         the general pool's concurrency
 #   CAOS_PENDING_TIMEOUT_SECS how long a job waits for a runner to exist
+#   CAOS_STACK_IROH           "yes" to answer `caos://` clients as well
+#                             (design/iroh-transport.md): an iroh endpoint that
+#                             splices HTTP streams to this server and serves git
+#                             from its object database, so a client anywhere
+#                             reaches it with a TICKET and no address. Default
+#                             off — it makes this stack reachable from outside
+#                             the machine, which is a choice, not a default.
+#   CAOS_STACK_IROH_STATE     dir holding its `key`, `token` and published
+#                             `ticket` (default $CAOS_STACK_STATE/iroh). Keeping
+#                             it is what keeps one ticket valid across restarts.
+#   CAOS_STACK_IROH_ADVERTISE space-separated host:port addresses to put in the
+#                             ticket INSTEAD of the ones the endpoint finds for
+#                             itself. REQUIRED IN PRACTICE for a listener in a
+#                             container: it discovers only its own address on the
+#                             container network, which nothing outside can route
+#                             to, while the address that reaches it is the host's
+#                             with the published port. A client that cannot use
+#                             any of these falls back to the relay and works,
+#                             slowly — one round trip to the relay per request.
 #
 # Passed through to runnerd untouched, because they are the caller's business:
 # DOCKER_HOST (which engine), CAOS_DOCKER_NETWORK (which netns workers join),
@@ -302,6 +321,41 @@ start_runnerd() { # <log-name> <slots> <require>
 
 if [ "$CAOS_STACK_RUNNERD" = yes ]; then
   start_runnerd runnerd "${CAOS_RUNNER_SLOTS:-8}" ""
+fi
+
+# --- caos-iroh: the same server, reachable by ticket -------------------------
+# A member like any other, so it shares the group's lifetime and its log, and
+# `caosd logs` shows the ticket it published.
+#
+# It needs BOTH halves of this stack's surface: `--to` for the HTTP API (the
+# server is already up, checked above) and `--git-dir` for git, which it serves
+# by spawning `git upload-pack`/`receive-pack` on the same repo the server uses.
+# That is not a way around the server's protections — they are git config on the
+# repo (see design/iroh-transport.md).
+#
+# NOT WAITED FOR, unlike the members above. Binding an endpoint means reaching a
+# relay, so it takes seconds and can fail on a machine with no route out — and
+# nothing else here depends on it. Blocking bring-up on it would make every
+# local stack pay for a capability it is not using. (It is still a MEMBER, so if
+# it ever exits the group goes down and says so: a stack that has stopped
+# answering its ticket while claiming to be up is the failure worth being loud
+# about, and SPEC's reliability principle asks for exactly that.)
+if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
+  IROH_STATE=${CAOS_STACK_IROH_STATE:-$CAOS_STACK_STATE/iroh}
+  mkdir -p "$IROH_STATE"
+  # An ARRAY built by word-splitting on purpose: the variable carries zero or
+  # more addresses, and each needs its own flag.
+  iroh_advertise=()
+  for addr in ${CAOS_STACK_IROH_ADVERTISE:-}; do
+    iroh_advertise+=(--advertise "$addr")
+  done
+  # The server this script started, as a host:port — `SERVER_URL` above is the
+  # same address in URL form, on the default port.
+  start caos-iroh "$CAOS_STACK_BIN/caos-iroh" serve \
+    --state "$IROH_STATE" \
+    --to "127.0.0.1:80" \
+    --git-dir "$CAOS_STACK_STATE/git" \
+    "${iroh_advertise[@]}"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -

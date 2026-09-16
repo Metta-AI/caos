@@ -23,6 +23,10 @@ use caos::{prog_name, GitTransport};
 mod tui;
 
 fn main() -> ExitCode {
+    ensure_helper_on_path();
+    caos::install_ticket_transport(Box::new(IrohTransport {
+        client: std::sync::OnceLock::new(),
+    }));
     let args: Vec<String> = std::env::args().collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,4 +171,117 @@ fn usage(args: &[String]) -> String {
          {prog} status [--all] <arg tree hash>\n  \
          {prog} secrets [--check]"
     )
+}
+
+/// Teach this binary to reach a `caos://` server.
+///
+/// The transport is INSTALLED rather than linked into `caos` itself, because
+/// that crate is also the worker's setuid `/bin/caos` and cargo unifies features
+/// across workspace members — a dependency there would bake iroh, quinn and
+/// tokio into every worker image. A host binary is the right place to pay for
+/// it, and this is the host binary.
+///
+/// Lazy in the useful sense: the client is built on the first `caos://` request,
+/// so an ordinary HTTP-remote run never binds an endpoint or starts a runtime.
+struct IrohTransport {
+    client: std::sync::OnceLock<Result<caos_iroh::http::HttpClient, String>>,
+}
+
+impl caos::TicketTransport for IrohTransport {
+    fn request(
+        &self,
+        base: &str,
+        request: &caos::ServerRequest,
+    ) -> Result<caos::ServerResponse, String> {
+        // Set CAOS_IROH_TRACE to see each request and how long it took. A ticket
+        // server is remote by definition, so "which call is slow" is the first
+        // question about any run that feels wrong, and it is invisible otherwise.
+        let trace = std::env::var_os("CAOS_IROH_TRACE").is_some();
+        if trace {
+            eprintln!("caos-iroh: -> {} {}", request.method, request.path);
+        }
+        let started = std::time::Instant::now();
+        let answer = self.send(base, request);
+        if trace {
+            match &answer {
+                Ok(response) => eprintln!(
+                    "caos-iroh: <- {} {} {} in {:.3}s ({} bytes)",
+                    request.method,
+                    request.path,
+                    response.status,
+                    started.elapsed().as_secs_f64(),
+                    response.body.len()
+                ),
+                Err(error) => eprintln!(
+                    "caos-iroh: <- {} {} failed in {:.3}s: {error}",
+                    request.method,
+                    request.path,
+                    started.elapsed().as_secs_f64()
+                ),
+            }
+        }
+        answer
+    }
+}
+
+impl IrohTransport {
+    fn send(
+        &self,
+        base: &str,
+        request: &caos::ServerRequest,
+    ) -> Result<caos::ServerResponse, String> {
+        let client = self
+            .client
+            .get_or_init(caos_iroh::http::HttpClient::new)
+            .as_ref()
+            .map_err(String::clone)?;
+        let response = client.request(
+            base,
+            request.method,
+            request.path,
+            request.headers,
+            request.body,
+            request.timeout_secs.map(std::time::Duration::from_secs),
+        )?;
+        Ok(caos::ServerResponse {
+            status: response.status,
+            reason: response.reason,
+            body: response.body,
+        })
+    }
+}
+
+/// Put this binary's own directory on PATH, so `git` can find
+/// `git-remote-caos`.
+///
+/// A `caos://` remote is served by a helper git execs BY NAME off PATH, and
+/// `caos-cli` shells out to git for every push and fetch — so a client that can
+/// reach a ticket server itself, while the git it drives cannot, fails halfway
+/// through a run with `git: 'remote-caos' is not a git command`. Which is what
+/// happened the first time this was tried end to end.
+///
+/// Derived from `current_exe` rather than baked in at build time, so it holds for
+/// a cargo target directory, a nix store path and a copied-out binary alike —
+/// the helper always ships beside the client.
+///
+/// APPENDED, not prepended: this is about adding a name nothing else provides,
+/// not about winning over the user's own tools. A directory already on PATH is
+/// left where it is.
+fn ensure_helper_on_path() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else {
+        return;
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if std::env::split_paths(&path).any(|entry| entry == dir) {
+        return;
+    }
+    let mut entries: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+    entries.push(dir.to_path_buf());
+    if let Ok(joined) = std::env::join_paths(entries) {
+        // SAFETY: called once at the top of main, before any thread is spawned.
+        unsafe { std::env::set_var("PATH", joined) };
+    }
 }

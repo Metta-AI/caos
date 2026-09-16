@@ -1,0 +1,61 @@
+[package]
+name = "caos-iroh"
+version = "0.1.0"
+edition = "2021"
+
+# The `caos://` transport: reach a caos server by TICKET rather than by address,
+# over an iroh QUIC connection. Two ends, both here:
+#
+# * `caos-iroh serve` runs beside the server (a stack member) and answers
+#   incoming streams — HTTP ones by splicing to the server's port, git ones by
+#   spawning `git upload-pack`/`receive-pack` on its object database.
+# * `git-remote-caos` is the git remote helper, so `url = caos://<ticket>` in a
+#   worktree's `.git/config` is all the configuration a client needs. No local
+#   port, no daemon, no shared state between worktrees.
+#
+# A SEPARATE CRATE, and deliberately not a feature on `caos`: cargo unifies
+# features across workspace members in one `cargo build --workspace`, so an
+# iroh feature on that crate would link a QUIC stack into the setuid `/bin/caos`
+# baked into every worker image. Only host-side consumers (this crate's bins,
+# and later caos-cli's transport) depend on this one.
+[lib]
+name = "caos_iroh"
+path = "src/lib.rs"
+
+# The listener and the pipe: the server side, plus a stdio splice used to drive
+# the transport from `git-remote-ext` and to debug a connection by hand.
+[[bin]]
+name = "caos-iroh"
+path = "src/bin/caos-iroh.rs"
+
+# The git remote helper. Named for git's discovery rule: a `caos://` URL makes
+# git exec `git-remote-caos` off PATH (gitremote-helpers(7)).
+[[bin]]
+name = "git-remote-caos"
+path = "src/bin/git-remote-caos.rs"
+
+[dev-dependencies]
+# The git-service test makes a throwaway repo. Already in the workspace lock
+# (caos-cli uses it), so anchoring it costs no new vendored crate.
+tempfile = "3"
+
+[dependencies]
+# `default-features = false` + `tls-ring`: the same crypto backend the workspace
+# already vendors for minreq's https-rustls, and it drops metrics/portmapper/
+# apple-datapath, none of which this transport reads.
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+# The ticket encoding (endpoint id + relay/direct hints) that `caos://` carries.
+iroh-tickets = "1"
+# iroh is async, so the two bins are the only async programs in this tree. The
+# feature list is explicit rather than "full": rt for the runtime, io-util for
+# the copies, io-std for the helper's stdio, net for the HTTP forward, process
+# for spawning git, time for the online timeout.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "io-std",
+    "net",
+    "process",
+    "time",
+] }

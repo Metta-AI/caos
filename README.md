@@ -442,6 +442,28 @@ fetched, so there is nothing else to configure:
 git remote add caos http://localhost:9090
 ```
 
+A server on another machine can be named by TICKET instead of by address, with
+no DNS, VPN or open port anywhere (design/iroh-transport.md). Bring it up with
+`caosd up --iroh`, ask it for the string, and paste that in as the remote:
+
+```bash
+caosd ticket                        # on the server's machine
+git remote add caos caos://<ticket> # in any worktree, on any machine
+```
+
+Everything then works as above — `git fetch`/`push` through the
+`git-remote-caos` helper, and the object and compute API over the same
+connection. The ticket is a bearer capability: anyone holding it can drive that
+server, and it stays valid across restarts.
+
+`--iroh` publishes UDP 11204 and puts this machine's own addresses in the
+ticket, which is what lets a client reach the stack
+directly instead of through a relay — the difference between ~100 ms and ~4.6 s
+for a cached run, since every request is a round trip. Clients on other machines
+get that too when one of those addresses reaches this machine; add another (a
+forwarded port on a router, say) with `CAOS_IROH_ADVERTISE=<ip>:11204` to
+put that address in the ticket. Without it they still work, relayed.
+
 ### The CAS and `/cas`
 
 `/cas` is a **worker** thing — there's no CAS on the host. Inside a worker the
