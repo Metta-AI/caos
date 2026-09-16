@@ -3652,7 +3652,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_preserve_disk_contents_git_revisions_and_provenance() {
+    fn imports_require_commits_and_preserve_git_revisions_and_provenance() {
         use conversation_protocol::v3::Mode;
         let (root, transport, base) = fixture("attach-host");
         let (other_root, other, other_base) = fixture("attach-other");
@@ -3748,42 +3748,25 @@ mod tests {
         )
         .unwrap_err()
         .contains("checkout root"));
-        let disk_tree = source_trees::import_source(
+        let conversation_before = conversation_head(&transport, "attached").unwrap();
+        assert!(source_trees::import_source(
             &transport,
             "attached",
             "local",
             other.work_dir().to_str().unwrap(),
             None,
         )
-        .unwrap();
-        let store = open_store(&transport).unwrap();
-        let imported = store
-            .read_commit(&oid(&disk_tree, "disk").unwrap())
-            .unwrap();
-        assert_eq!(imported.parents, vec![oid(&local_head, "parent").unwrap()]);
-        let disk = conversation_protocol::v3::tree::Snapshot::new(&store, imported.tree);
-        assert_eq!(disk.read("src/staged.txt").unwrap().unwrap(), b"disk");
-        assert_eq!(disk.entry("link").unwrap().unwrap().mode, Mode::Link);
+        .unwrap_err()
+        .contains("uncommitted changes"));
         assert_eq!(
-            disk.entry("src/public.txt").unwrap().unwrap().mode,
-            Mode::Executable
+            conversation_head(&transport, "attached").unwrap(),
+            conversation_before
         );
-        assert!(!disk.exists("src/private.txt").unwrap());
-        assert!(!disk.exists("local-only").unwrap());
         assert_eq!(
             std::fs::read(other.work_dir().join(".git/index")).unwrap(),
             source_index
         );
         assert_eq!(git(other.work_dir(), &["rev-parse", "HEAD"]), local_head);
-        assert_eq!(
-            disk.read("source_tree").unwrap().unwrap(),
-            b"uncommitted work\n"
-        );
-        assert!(disk
-            .list("")
-            .unwrap()
-            .iter()
-            .all(|entry| entry.name != ".git"));
         assert_eq!(
             source_trees::import_source(
                 &transport,
@@ -3842,7 +3825,7 @@ mod tests {
             "attached",
             "imports/project/base",
             other.work_dir().to_str().unwrap(),
-            None,
+            Some(&local_head),
         )
         .unwrap();
         let store = open_store(&transport).unwrap();
@@ -3870,7 +3853,7 @@ mod tests {
                 .unwrap()
                 .oid
                 .to_string(),
-            disk_tree
+            local_head
         );
         // Sibling imports own independent provenance, even from different remotes.
         git(
@@ -3887,7 +3870,7 @@ mod tests {
             "attached",
             "imports/project/other",
             other.work_dir().to_str().unwrap(),
-            None,
+            Some(&local_head),
         )
         .unwrap();
         let head = oid(
@@ -3937,7 +3920,7 @@ mod tests {
             "attached",
             "imports/project/conflict",
             other.work_dir().to_str().unwrap(),
-            None
+            Some(&local_head)
         )
         .unwrap_err()
         .contains("provenance"));

@@ -386,7 +386,9 @@ the object machinery through a one-way dependency. Their difference is the
   - `import-image` — get a docker image into caos, printing its hash;
   - `tui` — interactive conversations, with a bundled harness independent of
     target repositories. It starts without code; `caos tui --import imports/repo/base`
-    imports the checkout at that path. Ctrl+O browses code entries; the agent
+    imports the launching checkout's clean HEAD at that conversation path.
+    Use `--base <revision>` to select a commit explicitly.
+    Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
     remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
     one PR, and `/checkout <gitlink> [directory]` exports code for local editing;

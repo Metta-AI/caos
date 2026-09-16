@@ -45,7 +45,8 @@ worker images; the full test suite uses its own stack.
 
 
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
-`--import <path>` imports a commit snapshot of disk content; `--base HEAD` excludes disk changes. Outside a checkout, it starts
+`--import <path>` imports its clean HEAD, while `--base <revision>` selects an
+existing commit and excludes disk changes. Outside a checkout, it starts
 without code and defaults to `http://localhost:9090`; `--server` overrides it.
 The harness and object database live under `$XDG_DATA_HOME/caos/clients`
 (default `~/.local/share/caos/clients`), independently of attached repositories.
@@ -101,7 +102,7 @@ worker, so they take neither.
 caos tui $W                  continue the most recent conversation
 caos tui $W --username alice use alice's active conversation list
 caos tui $W --new            start a fresh conversation
-caos tui $W --import imports/caos/base  load this checkout at imports/caos/base
+caos tui $W --import imports/caos/base  load this checkout's clean HEAD at imports/caos/base
 caos tui $W --server URL     use a specific server
 caos tui $W --from 5ec3751   branch from a completed turn
 caos tui --list-archived     list archived conversation IDs and titles
@@ -198,12 +199,14 @@ are no shell commands or controls that apply edits.
 
 On a source-tree entry, `o` selects the source for tool descriptions and local
 edit submission. Checkout and publication take explicit paths. Use `/import <path> <source> [revision]` to import
-a Git checkout's disk snapshot at an unused path. An unchanged checkout reuses
-HEAD; changes become a child commit. A URL or explicit revision imports that
-commit instead. Local imports require a checkout root with a HEAD; linked
-worktrees work, but plain directories, individual files, and subdirectory
-snapshots are not supported. Untracked files honor Git ignore rules; tracked
-files remain included. The source index, branches, and files stay unchanged. Each import's
+an existing commit at an unused path. A local source accepts a hash or ref;
+without one, it imports HEAD and rejects staged, unstaged, or untracked changes,
+including dirty submodules. Ignored files do not prevent importing HEAD. An
+explicit revision excludes uncommitted changes. A Git URL requires a full
+commit hash, supplied as the revision or in a pinned Git locator.
+Local imports require a checkout root with a HEAD; linked worktrees work, but
+plain directories and individual files are not supported.
+The source index, branches, and files stay unchanged. Each import's
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
@@ -234,9 +237,9 @@ that message alone. Title generation runs concurrently with the agent turn, so
 it does not depend on the turn succeeding. Failure leaves the fallback in
 place, and later messages make no title calls. Using `/title` before the first prompt keeps that explicit title instead.
 
-The launcher starts without code. `--import imports/caos/base` snapshots the
-checkout's current disk contents as a gitlink at that path. Add `--base HEAD`
-or another revision to exclude disk changes and import that commit.
+The launcher starts without code. `--import imports/caos/base` imports the
+checkout's clean HEAD as a gitlink at that path. Add `--base <revision>` to
+select an existing commit even when the checkout is dirty.
 `/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
 require the previous build; this version does not migrate them implicitly.
 
