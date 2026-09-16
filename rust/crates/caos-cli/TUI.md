@@ -45,11 +45,9 @@ worker images; the full test suite uses its own stack.
 
 
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
-`--import <path>` starts a new conversation with its clean HEAD, while `--base <revision>` selects an
-existing commit and excludes disk changes. `--import <path> <source> [revision]`
-also accepts another local repository or a Git URL; URLs require a full commit
-hash. Outside a checkout, it starts without code unless an import source is
-supplied, and defaults to `http://localhost:9090`; `--server` overrides it.
+`--import <path>` imports its clean HEAD, while `--base <revision>` selects an
+existing commit and excludes disk changes. Outside a checkout, it starts
+without code and defaults to `http://localhost:9090`; `--server` overrides it.
 The harness and object database live under `$XDG_DATA_HOME/caos/clients`
 (default `~/.local/share/caos/clients`), independently of attached repositories.
 
@@ -241,9 +239,7 @@ place, and later messages make no title calls. Using `/title` before the first p
 
 The launcher starts without code. `--import imports/caos/base` imports the
 checkout's clean HEAD as a gitlink at that path. Add `--base <revision>` to
-select an existing commit even when the checkout is dirty. Use
-`--import imports/caos/base <source> [revision]` for another repository;
-a Git URL requires a full commit hash.
+select an existing commit even when the checkout is dirty.
 `/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
 require the previous build; this version does not migrate them implicitly.
 

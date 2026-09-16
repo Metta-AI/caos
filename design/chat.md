@@ -113,13 +113,9 @@ result/bin/caos tui \
 
 The worker paths resolve in the client harness, independently of target code.
 A fresh conversation can start empty and import code afterward. The optional
-`--import <conversation-path> [<source> [<revision>]]` flag starts a new conversation using the same
-commit-only rules as `/import`. Omitting the source imports the launching
-checkout; `--base <revision>` selects a revision for that shorthand.
-For example, `--import imports/repo/base /path/to/repo main` imports a local
-branch, and `--import imports/repo/base https://github.com/owner/repo.git <full-commit-hash>`
-imports a pinned remote commit. An explicit source also works when launching
-outside a Git checkout.
+`--import <conversation-path>` flag imports the launching checkout's clean
+HEAD; adding `--base <revision>` selects an existing commit and excludes
+uncommitted changes.
 
 Credentials, server configuration, caches, and checkout destinations stay on the
 client machine. The agent's host-side requests are communicated as concrete TUI

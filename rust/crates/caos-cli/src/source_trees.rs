@@ -155,17 +155,20 @@ pub fn prepare_import(
             return Err("local imports require a Git checkout root".into());
         }
         let source = local.canonicalize().map_err(|e| e.to_string())?;
+        // Validate this directory itself; discovering Git from a plain
+        // subdirectory would silently import its enclosing repository.
+        let git_dir = if source.join(".git").exists() {
+            ".git"
+        } else {
+            "."
+        };
+        crate::host_git::capture_required(
+            "git",
+            &["rev-parse", "--resolve-git-dir", git_dir],
+            &source,
+        )
+        .map_err(|_| "local imports require a Git checkout root or bare repository")?;
         if revision.is_none() {
-            let checkout = GitTransport::discover(&source)
-                .map_err(|_| "local imports require a Git checkout root")?;
-            if checkout
-                .work_dir()
-                .canonicalize()
-                .map_err(|e| e.to_string())?
-                != source
-            {
-                return Err("local imports require a Git checkout root, not a subdirectory".into());
-            }
             // Include staged edits, untracked files and dirty submodules even
             // when the checkout's status configuration normally hides them.
             let status = crate::host_git::capture_required(
