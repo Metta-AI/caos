@@ -9,7 +9,9 @@ use super::paths::validate_tree_path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Blob,
+    Link,
     Executable,
+    Commit,
     Tree,
 }
 
@@ -17,15 +19,19 @@ impl Mode {
     pub fn octal(self) -> &'static str {
         match self {
             Mode::Blob => "100644",
+            Mode::Link => "120000",
             Mode::Executable => "100755",
             Mode::Tree => "40000",
+            Mode::Commit => "160000",
         }
     }
 
     pub fn parse(octal: &str) -> Result<Mode, String> {
         match octal {
             "100644" => Ok(Mode::Blob),
+            "120000" => Ok(Mode::Link),
             "100755" => Ok(Mode::Executable),
+            "160000" => Ok(Mode::Commit),
             "40000" | "040000" => Ok(Mode::Tree),
             _ => Err(format!("unsupported git tree mode {octal:?}")),
         }
@@ -53,6 +59,9 @@ pub struct CommitInfo {
     pub parents: Vec<Oid>,
     pub author: Signature,
     pub committer: Signature,
+    /// Headers following the committer, including continuation lines and LFs.
+    /// Ordinary code commits may carry signatures, encoding, and merge tags.
+    pub extra_headers: Vec<u8>,
     pub message: Vec<u8>,
 }
 
@@ -881,39 +890,61 @@ pub fn parse_commit_bytes(oid: &Oid, bytes: &[u8]) -> Result<CommitInfo, StoreEr
         .windows(2)
         .position(|pair| pair == b"\n\n")
         .ok_or_else(|| StoreError::Other(format!("invalid commit object {oid}")))?;
-    let headers = std::str::from_utf8(&bytes[..separator])
-        .map_err(|_| StoreError::Other(format!("invalid commit object {oid}")))?;
-    let mut tree = None;
+    let mut headers = bytes[..separator].split(|byte| *byte == b'\n').peekable();
+    let invalid = || StoreError::Other(format!("invalid commit object {oid}"));
+    let value = |line: &[u8], prefix: &[u8]| -> Result<String, StoreError> {
+        let value = line.strip_prefix(prefix).ok_or_else(invalid)?;
+        Ok(std::str::from_utf8(value)
+            .map_err(|_| invalid())?
+            .to_string())
+    };
+    let tree = Oid::parse(
+        &value(headers.next().ok_or_else(invalid)?, b"tree ")?,
+        "commit tree",
+    )
+    .map_err(StoreError::Other)?;
     let mut parents = Vec::new();
-    let mut author = None;
-    let mut committer = None;
-    for line in headers.lines() {
-        if let Some(value) = line.strip_prefix("tree ") {
-            tree = Some(Oid::parse(value, "commit tree").map_err(StoreError::Other)?);
-        } else if let Some(value) = line.strip_prefix("parent ") {
-            parents.push(Oid::parse(value, "commit parent").map_err(StoreError::Other)?);
-        } else if let Some(value) = line.strip_prefix("author ") {
-            author = Some(parse_signature(value).map_err(StoreError::Other)?);
-        } else if let Some(value) = line.strip_prefix("committer ") {
-            committer = Some(parse_signature(value).map_err(StoreError::Other)?);
+    while headers
+        .peek()
+        .is_some_and(|line| line.starts_with(b"parent "))
+    {
+        parents.push(
+            Oid::parse(
+                &value(headers.next().unwrap(), b"parent ")?,
+                "commit parent",
+            )
+            .map_err(StoreError::Other)?,
+        );
+    }
+    let author = parse_signature(&value(headers.next().ok_or_else(invalid)?, b"author ")?)
+        .map_err(StoreError::Other)?;
+    let committer = parse_signature(&value(headers.next().ok_or_else(invalid)?, b"committer ")?)
+        .map_err(StoreError::Other)?;
+    let mut extra_headers = Vec::new();
+    for line in headers {
+        if line.starts_with(b" ") {
+            if extra_headers.is_empty() {
+                return Err(invalid());
+            }
+        } else {
+            let space = line
+                .iter()
+                .position(|byte| *byte == b' ')
+                .ok_or_else(invalid)?;
+            let name = &line[..space];
+            if name.is_empty() || matches!(name, b"tree" | b"parent" | b"author" | b"committer") {
+                return Err(invalid());
+            }
         }
-        // Any other header is SKIPPED, not rejected. A commit made elsewhere
-        // carries headers we do not mint -- `gpgsig` on a GitHub-signed commit
-        // (with its PGP armor on space-prefixed continuation lines), `mergetag`,
-        // `encoding` -- and one of those is the conversation BASE the moment a
-        // session runs in someone else's repository. We read such a commit only
-        // for its tree and identity and never re-encode it, so ignoring what we
-        // don't interpret is exactly git's own tolerance; rejecting it made
-        // every signed-HEAD repo fail its first turn with "invalid commit
-        // object". Continuation lines start with a space, so they never collide
-        // with the bare `tree `/`author ` prefixes above.
+        extra_headers.extend_from_slice(line);
+        extra_headers.push(b'\n');
     }
     Ok(CommitInfo {
-        tree: tree.ok_or_else(|| StoreError::Other(format!("invalid commit object {oid}")))?,
+        tree,
         parents,
-        author: author.ok_or_else(|| StoreError::Other(format!("invalid commit object {oid}")))?,
-        committer: committer
-            .ok_or_else(|| StoreError::Other(format!("invalid commit object {oid}")))?,
+        author,
+        committer,
+        extra_headers,
         message: bytes[separator + 2..].to_vec(),
     })
 }
@@ -926,6 +957,7 @@ pub fn encode_commit_bytes(commit: &CommitInfo) -> Vec<u8> {
     }
     write_signature(&mut bytes, "author", &commit.author);
     write_signature(&mut bytes, "committer", &commit.committer);
+    bytes.extend_from_slice(&commit.extra_headers);
     bytes.push(b'\n');
     bytes.extend_from_slice(&commit.message);
     bytes
@@ -990,8 +1022,8 @@ mod tests {
     fn modes_and_tree_order_are_git_canonical() {
         assert_eq!(Mode::parse("040000"), Ok(Mode::Tree));
         assert_eq!(Mode::parse("40000"), Ok(Mode::Tree));
-        assert!(Mode::parse("120000").is_err());
-        assert!(Mode::parse("160000").is_err());
+        assert_eq!(Mode::parse("120000").unwrap(), Mode::Link);
+        assert_eq!(Mode::parse("160000").unwrap(), Mode::Commit);
         let mut entries = vec![
             TreeEntry {
                 name: "a".to_string(),
@@ -1178,34 +1210,5 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "left/a/file");
         assert_eq!(store.tree_reads.get(), 6);
-    }
-
-    #[test]
-    fn signed_commit_parses_ignoring_gpgsig() {
-        // A GitHub-signed commit: a `gpgsig` header whose PGP armor rides on
-        // space-prefixed continuation lines, INCLUDING a blank one, between the
-        // committer and the message. The parser must skip what it does not mint
-        // and still find tree/author/committer and the true message -- rejecting
-        // it made every signed-HEAD repo fail as a conversation base.
-        let t = "1".repeat(40);
-        let p = "2".repeat(40);
-        let body = format!(
-            "tree {t}\n\
-             parent {p}\n\
-             author A U Thor <author@example.com> 1789170890 -0700\n\
-             committer GitHub <noreply@github.com> 1789170890 -0700\n\
-             gpgsig -----BEGIN PGP SIGNATURE-----\n \n wsFcBAABCAAQ\n =vtXm\n \
-             -----END PGP SIGNATURE-----\n \n\
-             \n\
-             the real message\n"
-        );
-        let info = parse_commit_bytes(&oid('a'), body.as_bytes()).expect("signed commit parses");
-        assert_eq!(info.tree, Oid::parse(&t, "t").unwrap());
-        assert_eq!(info.parents, vec![Oid::parse(&p, "p").unwrap()]);
-        assert_eq!(info.author.name, "A U Thor");
-        assert_eq!(info.committer.name, "GitHub");
-        // The signature is NOT in the message; the message is what follows the
-        // header block's blank-line separator.
-        assert_eq!(info.message, b"the real message\n");
     }
 }

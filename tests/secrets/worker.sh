@@ -126,7 +126,7 @@ echo '.caos-secrets/' > .gitignore
 commit "secrets fixtures"
 test_run_id="$(date +%s%N)-$$-$RANDOM"
 git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
-  || fail "pushing workspace to caos"
+  || fail "pushing source_tree to caos"
 
 # --- the store (git-ignored, per-user, NOT committed) ------------------------
 mkdir -p .caos-secrets

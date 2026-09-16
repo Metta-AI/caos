@@ -37,3 +37,6 @@ sha1 = "0.10"
 minreq = { version = "2", default-features = false, features = ["https-rustls"] }
 # std/llm-stub (the test-fixture HTTP server; the same dep the caos server uses)
 tiny_http = "0.12"
+
+# worker-common (writable file projections)
+xattr = "1"

@@ -2,9 +2,9 @@
 # tests/bash-tool — a WORKER test: no client, no repo.
 #
 # Exercises the bounded bash tool (std/bash-tool, design/agent-harness.md): a
-# command over a workspace tree with only the *declared* paths materialized.
+# command over a source tree with only the *declared* paths materialized.
 # Asserts: a targeted read touches only its declared path and the result tree
-# round-trips the workspace identically; an undeclared touch fails with EACCES
+# round-trips the source tree identically; an undeclared touch fails with EACCES
 # and a structured `denied` retry hint; writes stage back correctly with
 # untouched placeholder subtrees intact by hash; a failing command is a VALUE
 # ({exit, stdout, stderr, tree}), never a run error; and the exec bit survives.
@@ -44,7 +44,7 @@ req() { # <cmd> [paths] -> a /cas path
 case "$stage" in
 
 start)
-  echo "== targeted read: declared path only; workspace round-trips by hash ==" >&2
+  echo "== targeted read: declared path only; source_tree round-trips by hash ==" >&2
   caos run-then "$(req 'cat a/one.txt' 'a/one.txt')" \
     --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next read)"
   ;;

@@ -702,6 +702,7 @@ sandbox = false''
             makeWrapper ${caos-cli-bin}/bin/caos-cli $out/bin/$name \
               --argv0 $name \
               --set-default CAOS_REV ${caosRev} \
+              --set-default CAOS_HARNESS_SOURCE ${self.outPath} \
               --run 'export CAOS_INVOKED_AS="$0"'
           done
         '';

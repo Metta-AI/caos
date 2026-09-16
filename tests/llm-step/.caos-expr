@@ -1,7 +1,7 @@
 # tests/llm-step, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
-# A WORKER TEST. Durable event recording, ordered tool replay, workspace
+# A WORKER TEST. Durable event recording, ordered tool replay, source tree
 # mutation, interjections on both sides of dispatch, and running or queued
 # request interruption are all llm-step's, and all observable on the
 # conversation ref. worker-common.sh curries the turns and polls.

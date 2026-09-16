@@ -22,6 +22,10 @@ use caos_cli::TurnPhase;
 pub(super) const ACTIVITY_INDICATORS: [&str; 4] = ["·", "✦", "✽", "✦"];
 
 pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
+    if app.browser_visible() {
+        super::filesystem::render(app, frame);
+        return;
+    }
     let state = app.selected();
     let areas = layout(state, app.view == View::Chat, frame.area());
 
@@ -36,7 +40,6 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
             areas.content,
         ),
         View::Activity => render_activity_browser(state, frame, areas.content),
-        View::Diff => render_diff(state, frame, areas.content),
         View::Tools => render_tools(state, frame, areas.content),
         View::Help => render_help(app, frame, areas.content),
     }
@@ -48,13 +51,14 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
         app.view,
         !app.selection_locked
             && app.palette.is_none()
-            && state.publish_base.is_none()
+            && state.publish_plan.is_none()
             && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
+    render_publication_plan(app, frame);
     render_screen_selection(app, frame);
 }
 
@@ -161,6 +165,10 @@ struct Areas {
     footer: Rect,
 }
 
+pub(super) fn composer_width(state: &ConversationState, area: Rect) -> u16 {
+    layout(state, false, area).composer.width.saturating_sub(2)
+}
+
 fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -177,12 +185,15 @@ fn layout(state: &ConversationState, show_commands: bool, area: Rect) -> Areas {
     let composer_width = body[1].width.saturating_sub(2);
     let input_height = composer_visual_height(&state.composer, composer_width).clamp(1, 8) as u16;
     let command_height = if show_commands {
-        state.composer.completion_count(&state.workspace_names()) as u16
+        state.composer.completion_count() as u16
     } else {
         0
     };
-    let notice_height = if state.command_error.is_some() || state.publish_base.is_some() {
-        3
+    let notice_height = if let Some(error) = state.command_error.as_deref() {
+        let lines = Paragraph::new(error)
+            .wrap(Wrap { trim: false })
+            .line_count(composer_width);
+        lines.clamp(1, 12) as u16 + 2
     } else if state.reference_notice.is_some() {
         4
     } else {
@@ -222,33 +233,6 @@ fn render_notice(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         );
         return;
     }
-    if let Some(prompt) = state.publish_base.as_ref() {
-        let branch = if prompt.input.is_empty() {
-            Span::styled(
-                format!("origin/{} (default)", prompt.default_base),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            Span::styled(prompt.input.clone(), Style::default().fg(Color::Cyan))
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::raw("Base branch: "), branch])).block(
-                Block::default()
-                    .title(" Publish PR — Ctrl+P confirms, Esc cancels ")
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .borders(Borders::ALL),
-            ),
-            area,
-        );
-        frame.set_cursor_position(Position::new(
-            area.x
-                .saturating_add(14)
-                .saturating_add(prompt.input.cell_width())
-                .min(area.right().saturating_sub(2)),
-            area.y.saturating_add(1),
-        ));
-        return;
-    }
     if let Some(reference) = state.reference_notice.as_ref() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -279,7 +263,7 @@ pub(super) fn reference_copy_at(
     row: u16,
 ) -> Option<String> {
     let state = app.selected();
-    if state.command_error.is_some() || state.publish_base.is_some() || app.palette.is_some() {
+    if state.command_error.is_some() || app.palette.is_some() {
         return None;
     }
     let reference = state.reference_notice.as_ref()?;
@@ -328,7 +312,7 @@ pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) 
 }
 
 fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
-    if !state.running && !state.publishing {
+    if !state.running && !state.publishing && !state.source_tree_operation {
         return (area, None);
     }
     let split = Layout::default()
@@ -362,7 +346,13 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         ),
         Span::styled(
             format!("  {}", state.title),
-            Style::default().add_modifier(Modifier::BOLD),
+            if state.has_placeholder_title() {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            },
         ),
     ]);
     let mut metadata = Vec::new();
@@ -381,7 +371,6 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
         push_metadata(
             match app.view {
                 View::Activity => "activity",
-                View::Diff => "changes",
                 View::Tools => "tools",
                 View::Help => "help",
                 View::Chat => unreachable!("chat is omitted from the header"),
@@ -405,8 +394,14 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
     }
     push_metadata(
         state
-            .selected_workspace_diff()
-            .map(|workspace| format!("ws {} {}", workspace.name, short_hash(&workspace.head)))
+            .selected_source_tree_diff()
+            .map(|source_tree| {
+                format!(
+                    "source {} {}",
+                    source_tree.name,
+                    short_hash(&source_tree.head)
+                )
+            })
             .or_else(|| {
                 state
                     .current_hash()
@@ -476,7 +471,16 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 Line::from(vec![
                     Span::raw(indent),
                     Span::styled(format!("{mark} "), Style::default().fg(color)),
-                    Span::raw(title),
+                    Span::styled(
+                        title,
+                        if state.has_placeholder_title() {
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw(format!("{indent}  ")),
@@ -540,9 +544,9 @@ fn render_live_activity(
     frame: &mut Frame<'_>,
     area: Rect,
 ) {
-    // A publish runs a real agent turn, so a tool in flight names the work
-    // more precisely than the generic publishing verb.
-    let (verb, summary) = if let Some(activity) = state.running_activity() {
+    let (verb, summary) = if state.source_tree_operation {
+        ("Importing", state.status.as_str())
+    } else if let Some(activity) = state.running_activity() {
         (activity.running_verb(), activity.running_summary())
     } else if state.publishing {
         ("Publishing", state.status.as_str())
@@ -564,7 +568,7 @@ fn render_live_activity(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
-            Span::styled("  Ctrl+T expands", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Palette: activity", Style::default().fg(Color::DarkGray)),
         ]))
         .block(Block::default().title(" Activity ").borders(Borders::ALL)),
         area,
@@ -1279,68 +1283,6 @@ fn activity_mark(state: ActivityState) -> (&'static str, Color) {
     }
 }
 
-fn render_diff(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
-    let mut lines = Vec::new();
-    if state.workspaces.len() > 1 {
-        lines.push(Line::from(
-            state
-                .workspaces
-                .iter()
-                .enumerate()
-                .flat_map(|(index, workspace)| {
-                    let separator = (index > 0).then(|| Span::raw(" "));
-                    let name =
-                        if state.selected_workspace.as_deref() == Some(workspace.name.as_str()) {
-                            Span::styled(
-                                format!("[{}]", workspace.name),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        } else {
-                            Span::raw(workspace.name.clone())
-                        };
-                    separator.into_iter().chain(std::iter::once(name))
-                })
-                .collect::<Vec<_>>(),
-        ));
-    }
-    let text = if state.workspaces.is_empty() {
-        "This conversation has no workspace."
-    } else {
-        match state.selected_workspace_diff() {
-            Some(diff) if !diff.patch.is_empty() => diff.patch.as_str(),
-            Some(_) => "No workspace changes in this conversation.",
-            None => "Choose a workspace with /workspace use <name>.",
-        }
-    };
-    lines.extend(text.lines().map(|line| {
-        let color = if line.starts_with('+') && !line.starts_with("+++") {
-            Color::Green
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            Color::Red
-        } else if line.starts_with("@@") {
-            Color::Cyan
-        } else {
-            Color::Reset
-        };
-        Line::styled(line, Style::default().fg(color))
-    }));
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let scroll = paragraph_scroll(&paragraph, area, &state.scroll);
-    let title = if state.selected_workspace_is_published() {
-        " Workspace diff · Published "
-    } else {
-        " Workspace diff "
-    };
-    frame.render_widget(
-        paragraph
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .scroll((scroll, 0)),
-        area,
-    );
-}
-
 fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
     let mut lines = vec![
         Line::styled(
@@ -1349,8 +1291,8 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::raw("  read, ls, write, edit  — inline workspace operations"),
-        Line::raw("  bash                  — commands in the workspace sandbox"),
+        Line::raw("  read, ls, write, edit  — inline source tree operations"),
+        Line::raw("  bash                  — commands in the source tree sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
         Line::raw(""),
         Line::styled(
@@ -1408,7 +1350,7 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
         paragraph
             .block(
                 Block::default()
-                    .title(" Tools (Ctrl+T returns) ")
+                    .title(" Tools (Esc returns) ")
                     .borders(Borders::ALL),
             )
             .scroll((scroll, 0)),
@@ -1424,6 +1366,20 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
     };
     let mut lines = vec![
         Line::styled(
+            "Copying text",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw("  Drag to request a copy. Over SSH, your terminal may ignore the request."),
+        Line::raw("  iTerm2: Settings > General > Selection >"),
+        Line::raw("  enable 'Applications in terminal may access clipboard'."),
+        Line::raw(
+            "  Manual copy: Ctrl+Y, drag text, then Cmd+C (macOS) or your terminal's Copy action.",
+        ),
+        Line::raw("  Escape resumes the chat."),
+        Line::raw(""),
+        Line::styled(
             "Keyboard shortcuts",
             Style::default()
                 .fg(Color::Cyan)
@@ -1431,7 +1387,9 @@ fn render_help(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ),
         Line::raw("  Ctrl+Shift+P    open the command palette"),
         Line::raw(format!("  {send_shortcut:<16}send the prompt")),
-        Line::raw("  Enter/Ctrl+J    insert a newline"),
+        Line::raw("  Enter          run a slash command at the end; otherwise newline"),
+        Line::raw("  Shift+Enter/Ctrl+J  insert a newline"),
+        Line::raw("  Up/Down         move lines; recall sent prompts at the first/last line"),
         Line::raw("  Ctrl+A/Ctrl+E   move to the start/end of the line"),
         Line::raw("  Ctrl+W          delete the previous word"),
         Line::raw("  Ctrl+K          delete to the end of the line"),
@@ -1497,20 +1455,10 @@ fn render_composer(
     } else {
         Vec::new()
     };
-    let workspaces = if view == View::Chat {
-        state
-            .composer
-            .workspace_completion(&state.workspace_names())
-            .map(|completion| completion.values)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     let block = Block::default().borders(Borders::TOP | Borders::BOTTOM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let command_height =
-        (commands.len() + models.len() + workspaces.len()).min(inner.height as usize) as u16;
+    let command_height = (commands.len() + models.len()).min(inner.height as usize) as u16;
     let composer_height = inner.height.saturating_sub(command_height);
     let composer_area = Rect::new(
         inner.x.saturating_add(2),
@@ -1544,7 +1492,6 @@ fn render_composer(
     render_command_menu(
         &commands,
         &models,
-        &workspaces,
         state.composer.command_selection,
         frame,
         command_area,
@@ -1559,7 +1506,7 @@ fn render_composer(
     }
 }
 
-fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
+pub(super) fn composer_visual_ranges(text: &str, width: u16) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let mut ranges = Vec::new();
     let mut logical_start = 0;
@@ -1595,7 +1542,7 @@ fn composer_visual_height(composer: &super::Composer, width: u16) -> usize {
     ranges.len().max(row + 1)
 }
 
-fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
+pub(super) fn composer_cursor(composer: &super::Composer, width: u16) -> (usize, usize) {
     let width = width.max(1);
     let ranges = composer_visual_ranges(&composer.text, width);
     let row = ranges
@@ -1640,7 +1587,6 @@ fn composer_lines(composer: &super::Composer, width: u16) -> Vec<Line<'_>> {
 fn render_command_menu(
     commands: &[&Command],
     models: &[&str],
-    workspaces: &[String],
     selected: usize,
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1671,25 +1617,8 @@ fn render_command_menu(
         };
         Line::styled(format!("{marker}{model}"), style)
     });
-    let workspace_lines = workspaces.iter().enumerate().map(|(index, completion)| {
-        let index = index + commands.len() + models.len();
-        let marker = if index == selected { "> " } else { "  " };
-        let style = if index == selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        Line::styled(format!("{marker}{completion}"), style)
-    });
     frame.render_widget(
-        Paragraph::new(
-            command_lines
-                .chain(model_lines)
-                .chain(workspace_lines)
-                .collect::<Vec<_>>(),
-        ),
+        Paragraph::new(command_lines.chain(model_lines).collect::<Vec<_>>()),
         area,
     );
 }
@@ -1697,7 +1626,7 @@ fn render_command_menu(
 fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let footer = if app.selection_locked {
         Line::styled(
-            " Selection lock: redraws paused, ^Y/Esc resumes",
+            " Manual copy: drag text, then use terminal Copy (Cmd+C on macOS); ^Y/Esc resumes",
             Style::default().fg(Color::Black).bg(Color::Cyan),
         )
     } else if app.selected().running
@@ -1709,21 +1638,19 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             "^S"
         };
         Line::raw(format!(
-            " Agent running: {send_shortcut} interject  Esc stop  ^T activity  ^Up/Dn switch  ^C quit"
+            " Agent running: {send_shortcut} interject  Esc stop  ^O files  ^Up/Dn switch  ^C quit"
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
-    } else if app.selected().publish_base.is_some() {
-        Line::raw(
-            " Publish PR: type base branch  Backspace edits  ^U clears  ^P confirms  Esc cancels",
-        )
+    } else if app.selected().publish_plan.is_some() {
+        Line::raw(" Publication: Enter confirms  Esc cancels")
     } else if app.focus() == Focus::List {
         Line::raw(
             " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
         )
     } else if app.view == View::Activity {
         Line::raw(
-            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  ^T/Esc return  ^Up/Dn chat  ^C quit",
+            " Activity: Up/Dn select  PgUp/PgDn/wheel detail  Esc return  ^Up/Dn chat  ^C quit",
         )
     } else if app.view == View::Help {
         Line::raw(" Help: Ctrl+H/Esc returns  ^C quit")
@@ -1739,15 +1666,21 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  ^L checkout  ^P PR  ^Q changes  ^T activity  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  /checkout  /pr  ^O files  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
-    if let Some(chars) = app.copied_chars {
+    if let Some((chars, outcome)) = app.copy_notice {
         let noun = if chars == 1 { "char" } else { "chars" };
+        let notice = match outcome {
+            super::CopyOutcome::Copied => format!(" Copied {chars} {noun} "),
+            super::CopyOutcome::Requested => {
+                format!(" Copy requested: {chars} {noun} (^Y manual, ^H help) ")
+            }
+        };
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!(" {chars} {noun} copied "),
+                notice,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -1767,6 +1700,78 @@ pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &S
 pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
     scroll.resolve(line_count.saturating_sub(visible))
+}
+
+fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
+    let Some(prompt) = &app.selected().publish_plan else {
+        return;
+    };
+    let area = frame
+        .area()
+        .centered(Constraint::Percentage(90), Constraint::Length(17));
+    frame.render_widget(Clear, area);
+    let mut lines = Vec::new();
+    if prompt.loading {
+        lines.push(Line::from("Loading publication preview…"));
+    } else if let Some(target) = &prompt.target {
+        lines.push(Line::from(format!(
+            "Source: {}  {}",
+            target.source_tree,
+            short_hash(&target.head)
+        )));
+        lines.push(Line::from(format!("Repository: {}", target.repository)));
+        lines.push(Line::from(format!("Branch: {}", target.branch)));
+        if !prompt.branch_only {
+            lines.push(Line::from(format!(
+                "PR base: {}  {}",
+                target.base_branch,
+                target
+                    .base_commit
+                    .as_deref()
+                    .map(short_hash)
+                    .unwrap_or_default()
+            )));
+        }
+        lines.push(Line::from(""));
+        if let Some(path) = &target.base_import {
+            lines.push(Line::from("The source does not contain this PR base."));
+            lines.push(Line::from(format!("Import to: {path}")));
+            lines.push(Line::from(
+                "Enter imports the base and asks the agent to merge or rebase it and test.",
+            ));
+            lines.push(Line::from(
+                "Nothing is published. Run /pr again after reviewing the result.",
+            ));
+        } else {
+            lines.push(Line::from(if prompt.branch_only {
+                "Enter pushes this commit without creating a PR."
+            } else {
+                "Enter pushes this commit and opens or updates its PR."
+            }));
+        }
+    }
+    if let Some(error) = &prompt.error {
+        lines.push(Line::styled(
+            error.as_str(),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    lines.push(Line::from(
+        "Esc cancels. To change the target, run the command again.",
+    ));
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(if prompt.branch_only {
+                    " Publish branch "
+                } else {
+                    " Publish PR "
+                })
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
 }
 
 #[cfg(test)]

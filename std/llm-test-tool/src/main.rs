@@ -10,8 +10,8 @@ use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    AsyncRecord, AsyncStatus, Block, DeclaredCall, Identity, IdentityKind, RequestOutcome,
-    RequestRecord, RequestStatus, Role, ToolStatus, TranscriptEntry,
+    AsyncRecord, Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TaskStatus,
+    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -34,14 +34,14 @@ enum ToolCommand {
         repo: PathBuf,
         id: String,
         title: String,
-        workspaces: Vec<(String, Oid)>,
+        source_trees: Vec<(String, Oid)>,
     },
     Turn {
         repo: PathBuf,
         id: String,
         user: String,
         title: String,
-        workspaces: Vec<(String, Oid)>,
+        source_trees: Vec<(String, Oid)>,
         head: Option<Oid>,
         actor: String,
         text: String,
@@ -104,7 +104,7 @@ enum ToolCommand {
         request: Oid,
         timeout_secs: u64,
     },
-    Workspace {
+    SourceTree {
         repo: PathBuf,
         head: Oid,
         name: String,
@@ -146,7 +146,6 @@ enum ToolCommand {
         head: Oid,
         validate: bool,
         started_tool: Option<(Oid, String)>,
-        present_path: Option<String>,
     },
 }
 
@@ -207,12 +206,12 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let repo = args.repo()?;
             let id = args.required("--id")?;
             let title = args.required("--title")?;
-            let workspaces = args.workspaces()?;
+            let source_trees = args.source_trees()?;
             ToolCommand::Root {
                 repo,
                 id,
                 title,
-                workspaces,
+                source_trees,
             }
         }
         "turn" => {
@@ -229,13 +228,13 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let secret_hash = args.oid("--secret-hash", "secret hash")?;
             let model = args.required("--model")?;
             let configuration = args.oid("--configuration", "model configuration")?;
-            let workspaces = args.workspaces()?;
+            let source_trees = args.source_trees()?;
             ToolCommand::Turn {
                 repo,
                 id,
                 user,
                 title,
-                workspaces,
+                source_trees,
                 head,
                 actor,
                 text,
@@ -311,7 +310,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 .transpose()?
                 .unwrap_or(120),
         },
-        "workspace" => ToolCommand::Workspace {
+        "source-tree" => ToolCommand::SourceTree {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
             name: args.required("--name")?,
@@ -357,7 +356,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let validate = args.flag("--validate");
             let request = args.take("--request")?;
             let started_tool = args.take("--started-tool")?;
-            let present_path = args.take("--present-path")?;
             let started_tool = match (request, started_tool) {
                 (None, None) => None,
                 (Some(request), Some(tool)) => Some((parse_oid(&request, "request")?, tool)),
@@ -372,7 +370,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 head,
                 validate,
                 started_tool,
-                present_path,
             }
         }
         _ => return Err(ToolError::new(format!("unknown subcommand {command:?}"))),
@@ -429,16 +426,16 @@ impl Arguments {
         true
     }
 
-    fn workspaces(&mut self) -> Result<Vec<(String, Oid)>, ToolError> {
-        let mut workspaces = Vec::new();
-        while let Some(value) = self.take("--workspace")? {
+    fn source_trees(&mut self) -> Result<Vec<(String, Oid)>, ToolError> {
+        let mut source_trees = Vec::new();
+        while let Some(value) = self.take("--source-tree")? {
             let (name, commit) = value
                 .split_once('=')
-                .ok_or_else(|| ToolError::new("--workspace must be <name>=<commit>"))?;
-            paths::validate_workspace_name(name).map_err(ToolError::new)?;
-            workspaces.push((name.to_string(), parse_oid(commit, "workspace commit")?));
+                .ok_or_else(|| ToolError::new("--source tree must be <name>=<commit>"))?;
+            paths::validate_source_tree_name(name).map_err(ToolError::new)?;
+            source_trees.push((name.to_string(), parse_oid(commit, "source tree commit")?));
         }
-        Ok(workspaces)
+        Ok(source_trees)
     }
 
     fn finish(self) -> Result<(), ToolError> {
@@ -479,10 +476,10 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             repo,
             id,
             title,
-            workspaces,
+            source_trees,
         } => {
             let mut store = open(&repo)?;
-            let head = conversation_root(&mut store, id, title, workspaces)?;
+            let head = conversation_root(&mut store, id, title, source_trees)?;
             println!("head {head}");
         }
         ToolCommand::Turn {
@@ -490,7 +487,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             id,
             user,
             title,
-            workspaces,
+            source_trees,
             head,
             actor,
             text,
@@ -502,7 +499,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             id,
             user,
             title,
-            workspaces,
+            source_trees,
             head,
             actor,
             text,
@@ -536,13 +533,13 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             let view = Conversation::open(&store, &head)?;
             let id = view.identity()?.id;
             let request_record = view
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             let round = request_record.round;
             let status = request_status_name(&request_record.status);
             drop(view);
             let message_id = client_key()?;
-            let transition = Transition::RequestInterject {
+            let transition = Transition::TurnInterject {
                 request: request.clone(),
                 entry: TranscriptEntry {
                     message_id: message_id.clone(),
@@ -554,7 +551,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                     model: None,
                     blocks: vec![Block::Text { text }],
                     proposal: None,
-                    workspace_resolution: None,
+                    source_tree_resolution: None,
                 },
                 payloads: Vec::new(),
             };
@@ -610,17 +607,17 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             let new = append(
                 &mut store,
                 &head,
-                Transition::RequestEscape {
+                Transition::TurnEscape {
                     request: request.clone(),
                     reason: None,
                 },
             )?;
             let request_record = Conversation::open(&store, &new)?
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             let interrupted = matches!(
                 request_record.outcome,
-                Some(RequestOutcome::Idle {
+                Some(TurnOutcome::Idle {
                     interrupted: true,
                     ..
                 })
@@ -685,8 +682,8 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let view = Conversation::open(&store, &head)?;
             let record = match id {
-                Some(id) => view.request(&id)?,
-                None => view.active_request()?,
+                Some(id) => view.turn(&id)?,
+                None => view.active_turn()?,
             };
             match record {
                 Some(record) => write_record(&record.encode())?,
@@ -699,14 +696,17 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             request,
             timeout_secs,
         } => wait_terminal(&repo, &refname, &request, timeout_secs)?,
-        ToolCommand::Workspace { repo, head, name } => {
+        ToolCommand::SourceTree { repo, head, name } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let workspace = Conversation::open(&store, &head)?
-                .workspace(&name)?
+            let source_tree = Conversation::open(&store, &head)?
+                .source_tree(&name)?
                 .ok_or_else(|| ToolError::code(4))?;
-            println!("commit {}", workspace.commit);
-            println!("initial {}", workspace.initial);
+            println!("commit {}", source_tree.commit);
+            println!(
+                "initial {}",
+                Conversation::open(&store, &head)?.reference_start(&name)?
+            );
         }
         ToolCommand::Transcript { repo, head } => {
             let store = open(&repo)?;
@@ -736,7 +736,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let view = Conversation::open(&store, &head)?;
             let record = view
-                .request(&request)?
+                .turn(&request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             for round in 0..record.round {
                 for tool in view.tools(&request, round)? {
@@ -755,7 +755,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             store.ensure_local(&head)?;
             let path = format!(
                 "{}/observation.json",
-                paths::tool_payload_dir(request.as_str(), round, &id)
+                paths::call_payload_dir(request.as_str(), round, &id)
             );
             let bytes = Conversation::open(&store, &head)?.payload(&path)?;
             std::io::stdout().write_all(&bytes).map_err(|error| {
@@ -792,7 +792,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 Transition::AsyncStart {
                     record: AsyncRecord {
                         task,
-                        status: AsyncStatus::Pending,
+                        status: TaskStatus::Pending,
                         target_ref,
                         result: None,
                         reason: None,
@@ -816,7 +816,6 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             head,
             validate,
             started_tool,
-            present_path,
         } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
@@ -824,7 +823,7 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 validate_spine(&store, &head, &mut HashSet::new())
                     .map_err(|error| ToolError::new(error.to_string()))?;
             }
-            parents(&store, head, started_tool.as_ref(), present_path.as_deref())?;
+            parents(&store, head, started_tool.as_ref())?;
         }
     }
     Ok(())
@@ -835,7 +834,7 @@ struct TurnInput {
     id: String,
     user: String,
     title: String,
-    workspaces: Vec<(String, Oid)>,
+    source_trees: Vec<(String, Oid)>,
     head: Option<Oid>,
     actor: String,
     text: String,
@@ -882,17 +881,17 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
     let view = Conversation::open(&store, &head)?;
     let conversation = view.identity()?.id;
     let record = view
-        .request(&input.request)?
+        .turn(&input.request)?
         .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?;
     let latest_message = newest_user_message(&view)?;
     drop(view);
 
     let mut at = head.clone();
-    if record.status == RequestStatus::Queued {
+    if record.status == TurnStatus::Queued {
         at = append(
             &mut store,
             &at,
-            Transition::RequestClaim {
+            Transition::TurnClaim {
                 request: input.request.clone(),
                 latest_message,
             },
@@ -901,7 +900,7 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
 
     let view = Conversation::open(&store, &at)?;
     let round = view
-        .request(&input.request)?
+        .turn(&input.request)?
         .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?
         .round;
     let ordinal = view.transcript_len()?;
@@ -924,7 +923,7 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
             arguments: format!("{dir}/{payload_name}"),
         }],
         proposal: None,
-        workspace_resolution: None,
+        source_tree_resolution: None,
     };
     let new = append(
         &mut store,
@@ -990,7 +989,12 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
     let creating = input.head.is_none();
     let prior = match input.head {
         Some(head) => head,
-        None => conversation_root(&mut store, input.id.clone(), input.title, input.workspaces)?,
+        None => conversation_root(
+            &mut store,
+            input.id.clone(),
+            input.title,
+            input.source_trees,
+        )?,
     };
     let (human, _) = append_user_message(&mut store, &prior, input.actor, input.text)?;
     let request = prepare_turn_request(
@@ -1048,13 +1052,10 @@ fn conversation_root(
     store: &mut GitStore,
     id: String,
     title: String,
-    workspaces: Vec<(String, Oid)>,
+    source_trees: Vec<(String, Oid)>,
 ) -> Result<Oid, ToolError> {
     let genesis = ensure_genesis(store)?;
-    let workspaces = workspaces
-        .into_iter()
-        .map(|(name, commit)| (name, (commit, None)))
-        .collect::<BTreeMap<_, _>>();
+    let source_trees = source_trees.into_iter().collect::<BTreeMap<_, _>>();
     let transition = Transition::ConversationRoot {
         identity: Identity {
             id,
@@ -1062,18 +1063,16 @@ fn conversation_root(
             owner: None,
         },
         title,
-        workspaces,
-        files_seed: None,
+        content: Some({
+            let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+            for (name, commit) in source_trees {
+                content.put_oid(&name, conversation_protocol::v3::Mode::Commit, commit);
+            }
+            content.build(store)?
+        }),
     };
     let applied = apply(store, None, &transition)?;
-    mint(
-        store,
-        &genesis,
-        &applied.tree,
-        transition.kind(),
-        &signature(),
-    )
-    .map_err(ToolError::new)
+    mint(store, &genesis, &applied, transition.kind(), &signature()).map_err(ToolError::new)
 }
 
 fn append_user_message(
@@ -1097,7 +1096,7 @@ fn append_user_message(
             model: None,
             blocks: vec![Block::Text { text }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         },
         payloads: Vec::new(),
     };
@@ -1112,23 +1111,23 @@ fn admit_request(
     configuration: String,
 ) -> Result<Oid, ToolError> {
     let view = Conversation::open(store, head)?;
-    let request_workspaces = view.workspaces_tree()?;
+
     drop(view);
-    let record = RequestRecord {
+    let record = TurnRecord {
         id: request.clone(),
         request_head: head.clone(),
-        request_workspaces,
+
         model,
         configuration,
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,
     };
-    append(store, head, Transition::RequestAdmit { record })
+    append(store, head, Transition::TurnAdmit { record })
 }
 
 fn prepare_turn_request(
@@ -1192,7 +1191,9 @@ fn prepare_turn_request(
             let (mode, kind) = match entry.mode {
                 Mode::Blob => ("100644", "blob"),
                 Mode::Executable => ("100755", "blob"),
+                Mode::Link => ("120000", "blob"),
                 Mode::Tree => ("040000", "tree"),
+                Mode::Commit => ("160000", "commit"),
             };
             (
                 entry.name,
@@ -1390,9 +1391,8 @@ fn signature() -> conversation_protocol::v3::Signature {
 }
 
 fn append(store: &mut GitStore, head: &Oid, transition: Transition) -> Result<Oid, ToolError> {
-    let parent_tree = store.read_commit(head).map_err(String::from)?.tree;
-    let applied = apply(store, Some(&parent_tree), &transition)?;
-    mint(store, head, &applied.tree, transition.kind(), &signature()).map_err(ToolError::new)
+    let applied = apply(store, Some(head), &transition)?;
+    mint(store, head, &applied, transition.kind(), &signature()).map_err(ToolError::new)
 }
 
 fn client_key() -> Result<String, ToolError> {
@@ -1420,13 +1420,13 @@ fn text_blocks(blocks: &[Block]) -> String {
         .join("\n\n")
 }
 
-fn request_status_name(status: &RequestStatus) -> &'static str {
+fn request_status_name(status: &TurnStatus) -> &'static str {
     match status {
-        RequestStatus::Queued => "queued",
-        RequestStatus::Running => "running",
-        RequestStatus::Cancelling => "cancelling",
-        RequestStatus::Idle => "idle",
-        RequestStatus::Failed => "failed",
+        TurnStatus::Queued => "queued",
+        TurnStatus::Running => "running",
+        TurnStatus::Cancelling => "cancelling",
+        TurnStatus::Idle => "idle",
+        TurnStatus::Failed => "failed",
     }
 }
 
@@ -1450,16 +1450,16 @@ fn wait_terminal(
                 };
                 seen = Some(head.clone());
                 let view = Conversation::open(&store, &head)?;
-                if let Some(record) = view.request(request)? {
+                if let Some(record) = view.turn(request)? {
                     match record.status {
-                        RequestStatus::Idle => {
+                        TurnStatus::Idle => {
                             println!("head {head}");
                             println!("status idle");
                             return Ok(());
                         }
-                        RequestStatus::Failed => {
+                        TurnStatus::Failed => {
                             let error = match record.outcome {
-                                Some(RequestOutcome::Failed { error }) => {
+                                Some(TurnOutcome::Failed { error }) => {
                                     let (ordinal, message_id) =
                                         paths::parse_transcript_entry_path(&error)?;
                                     let (found, entry) =
@@ -1482,9 +1482,7 @@ fn wait_terminal(
                             println!("error {error}");
                             return Err(ToolError::code(1));
                         }
-                        RequestStatus::Queued
-                        | RequestStatus::Running
-                        | RequestStatus::Cancelling => {}
+                        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling => {}
                     }
                 }
             }
@@ -1498,7 +1496,6 @@ fn parents(
     store: &GitStore,
     mut current: Oid,
     started_tool: Option<&(Oid, String)>,
-    present_path: Option<&str>,
 ) -> Result<(), ToolError> {
     let mut found_started_tool = started_tool.is_none();
     loop {
@@ -1515,26 +1512,18 @@ fn parents(
             )));
         }
         let kind = Kind::parse_message(&info.message)?;
-        if let Some(path) = present_path {
-            let present = Conversation::open(store, &current)?
-                .snapshot()
-                .read(path)?
-                .is_some();
-            println!("{current} {} {present}", kind.as_str());
-        } else {
-            println!("{current} {}", kind.as_str());
-        }
+        println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
             let (request, id) = started_tool.expect("checked as present");
             let view = Conversation::open(store, &current)?;
             let request_record = view
-                .request(request)?
+                .turn(request)?
                 .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
             for round in 0..request_record.round {
                 if view
                     .tools(request, round)?
                     .iter()
-                    .any(|tool| tool.id == *id && tool.status == ToolStatus::Started)
+                    .any(|tool| tool.id == *id && tool.status == CallStatus::Started)
                 {
                     found_started_tool = true;
                     break;
@@ -1566,7 +1555,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_repeated_workspaces_and_defaults() {
+    fn parses_repeated_source_trees_and_defaults() {
         let command = parse_args(vec![
             "root".to_string(),
             "--repo".to_string(),
@@ -1575,16 +1564,16 @@ mod tests {
             "conversation".to_string(),
             "--title".to_string(),
             "Title".to_string(),
-            "--workspace".to_string(),
+            "--source-tree".to_string(),
             format!("main={}", "a".repeat(40)),
-            "--workspace".to_string(),
+            "--source-tree".to_string(),
             format!("docs={}", "b".repeat(40)),
         ])
         .unwrap();
-        let ToolCommand::Root { workspaces, .. } = command else {
+        let ToolCommand::Root { source_trees, .. } = command else {
             panic!("wrong command")
         };
-        assert_eq!(workspaces.len(), 2);
+        assert_eq!(source_trees.len(), 2);
 
         let command = parse_args(vec![
             "wait-terminal".to_string(),
@@ -1624,7 +1613,7 @@ mod tests {
             "test-model".to_string(),
             "--configuration".to_string(),
             "f".repeat(40),
-            "--workspace".to_string(),
+            "--source-tree".to_string(),
             format!("main={}", "a".repeat(40)),
         ])
         .unwrap();
@@ -1632,9 +1621,9 @@ mod tests {
             command,
             ToolCommand::Turn {
                 head: None,
-                workspaces,
+                source_trees,
                 ..
-            } if workspaces.len() == 1
+            } if source_trees.len() == 1
         ));
 
         let command = parse_args(vec![
@@ -1661,17 +1650,14 @@ mod tests {
             "b".repeat(40),
             "--started-tool".to_string(),
             "toolu_01".to_string(),
-            "--present-path".to_string(),
-            ".caos/tools/request/0000/toolu_01.json".to_string(),
         ])
         .unwrap();
         assert!(matches!(
             command,
             ToolCommand::Parents {
                 started_tool: Some((_, ref id)),
-                present_path: Some(ref path),
                 ..
-            } if id == "toolu_01" && path == ".caos/tools/request/0000/toolu_01.json"
+            } if id == "toolu_01"
         ));
     }
 }

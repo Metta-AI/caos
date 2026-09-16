@@ -31,6 +31,9 @@
 #                            container has one to bind. Unset means the caller
 #                            has already arranged /nix (the dev placement's
 #                            image does it in its own worker before we run).
+#   CAOS_CACHE_NAMESPACE     override the result-cache prefix. Defaults to this
+#                            build's own identity (see below); a caller sets it
+#                            only to make two stacks share answers deliberately.
 set -euo pipefail
 
 fail() { echo "stack/bootstrap: $*" >&2; exit 1; }
@@ -93,19 +96,42 @@ for b in server runnerd core-seeder-runner caos-cli caos; do
 done
 echo "stack/bootstrap: inputs $inputs" >&2
 
+# ---- this build's cache namespace -------------------------------------------
+# THE RESULT CACHE MUST CARRY WHICH BUILD ANSWERED, because the ArgTree cannot.
+# The five seeded entries key on `{base: docker://seeded…, in: <source>}` —
+# checked-in text and nothing else — while the binary they answer WITH rides only
+# in the seeder's result. So a rebuilt `caos` leaves those keys unmoved, and
+# `run_work_request` reads redis BEFORE it dispatches to any runner: the fresh
+# seed record is never asked, the previous deploy's flake-builder delta comes
+# back, and every std entry bases on it. The whole tree is then consistently
+# stale, which is why nothing disagrees and why `caosd reset` looked like the
+# fix — it wiped the cache.
+#
+# The inputs' nix out path IS that identity: it covers the daemons, the client,
+# and the binary composed into every worker image, and being input-addressed it
+# holds still across rebuilds of an unchanged tree. Derived exactly as
+# dev/stack-up does, so a host stack and a dev stack agree on what a build is.
+#
+# ONLY `caos:result:` takes the prefix. Everything expensive is keyed by content
+# and stays shared across builds: the registry's `flake-<H>`, `deps-<D>` and
+# `clean-<name>-` tags, the nix store, and the `caos:image:`/`caos:layer:`
+# conversion memos.
+ns=$(basename "$inputs")
+
 # ---- hand over --------------------------------------------------------------
 # `exec`, so serve is this process: it supervises the group and dies with it,
 # and there is no extra shell between it and whatever started this container.
 #
-# What we set is what only we can know — where the inputs are, and that the
-# publish runs from this tree. Everything else about the placement (which redis,
-# which registry, which engine, which netns) is the caller's and reaches serve
-# through the environment we inherit.
+# What we set is what only we can know — where the inputs are, which build they
+# are, and that the publish runs from this tree. Everything else about the
+# placement (which redis, which registry, which engine, which netns) is the
+# caller's and reaches serve through the environment we inherit.
 export CAOS_STACK_BIN="$inputs/bin"
 export CAOS_STACK_PUBLISH=yes
 export CAOS_STACK_PUBLISH_SCRIPT="$tree/stack/build-builtins.sh"
 export CAOS_CLI="$inputs/bin/caos-cli"
 export CAOS_BUILTIN_BINS="$inputs"
+export CAOS_CACHE_NAMESPACE="${CAOS_CACHE_NAMESPACE:-${ns%%-*}}"
 CAOS_BUILTIN_IMAGES="$(echo "$inputs"/images/*)"
 export CAOS_BUILTIN_IMAGES
 exec bash "$tree/stack/serve"

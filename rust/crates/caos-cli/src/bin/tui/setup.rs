@@ -5,9 +5,9 @@
 //! the store, prove it loads through the same loader every turn uses, and
 //! continue straight into the UI — no relaunch.
 //!
-//! A store that exists but fails to LOAD is not handled here on purpose: that
-//! is an existing configuration broken, and a setup prompt would hide the
-//! actual error (see [`caos_cli::model_secret_missing`]).
+//! Existing specs and value files are checked locally. Reader expressions are
+//! resolved when preparing a request; opening the UI does not build workers.
+//! Invalid local configuration is reported rather than replaced by a key prompt.
 
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +33,7 @@ pub(crate) fn ensure_model_secret(
     transport: &GitTransport,
     turn: &TurnOptions,
 ) -> Result<(), String> {
-    if !model_secret_missing(transport)? {
+    if !model_secret_missing()? {
         return Ok(());
     }
     let cols = terminal_size().map(|(cols, _)| cols).unwrap_or(80);
@@ -79,7 +79,7 @@ fn read_key(
         output,
         &format!(
             "No Anthropic API key is configured, so conversations cannot run.\n\
-             caos keeps the key in `{SECRETS_DIR}/` — a git-ignored, per-checkout store — as the\n\
+             caos keeps the key in `{SECRETS_DIR}/` — a git-ignored local store — as the\n\
              `{MODEL_API_SECRET}` secret granted only to the conversation workers (README, Secrets).\n\n\
              Paste an API key (sk-ant-…), or enter the path to a file that holds one.\n\
              Press Enter on an empty line to abort.\n"

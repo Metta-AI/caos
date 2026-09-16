@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The suite, as a job on the DEV STACK: deepen the workspace so every test's
+# The suite, as a job on the DEV STACK: deepen the source tree so every test's
 # DEPS become mounts, fan out one job per tests/<name>, assemble the report.
 #
 # WHERE THIS RUNS is the whole point. `caos-tools/test` stands a dev stack up
@@ -19,7 +19,7 @@
 # delegates its continuation rather than blocking on a run (design/map-then.md).
 #
 #   suite      (default) resolve the deep-deps image through its sentinel and
-#              run it over the WORKSPACE
+#              run it over the SOURCE TREE
 #   fanout     the `then` of that: --result is the deepened tree, so each test's
 #              deps are at tests/<name>/DEEP-DEPS/<mount> and the wrappers can
 #              be built — one job per tests/<name>
@@ -89,9 +89,9 @@ deepen)
   ;;
 
 fanout)
-  # `--result` is the DEEPENED workspace, so a test's own `DEPS` have already
+  # `--result` is the DEEPENED source tree, so a test's own `DEPS` have already
   # become `tests/<name>/DEEP-DEPS/<mount>` — which is what a test's
-  # `.caos-expr` names its dependencies by. `--ws` is the workspace as it
+  # `.caos-expr` names its dependencies by. `--ws` is the source tree as it
   # arrived, used only to enumerate which tests exist.
   caos get /cas/args/ws
   caos get /cas/args/ws/tests
@@ -158,7 +158,7 @@ fanout)
     # child IS the tree rather than a wrapper around it.
     #
     # There used to be a wrapper here, because some tests were handed things
-    # from outside — the client, the salt, a workspace, an api key. None is
+    # from outside — the client, the salt, a source tree, an api key. None is
     # handed in any more: the first two are curried onto the map image and
     # passed when dev/run-test calls the test's ArgTree, and the last two turned
     # out to be things the tests could DECLARE (`../../rust`, `../../std`) or

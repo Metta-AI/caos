@@ -39,7 +39,7 @@ printf 'not this one\n' > "$SRC/decoy.txt"
 
 # THE CONSUMER STORY, in miniature: a repo that is NOT caos pins caos by locator
 # and curries its own worker onto caos' std/bash. Nothing of caos is committed
-# here — the pin is the whole dependency. (It pins this workspace, whose commit
+# here — the pin is the whole dependency. (It pins this source tree, whose commit
 # the client already holds; that is not a shortcut but the point of pinning by
 # content — see the memo assertion at the end.)
 cat > "$SRC/tool/.caos-expr" <<EXPR

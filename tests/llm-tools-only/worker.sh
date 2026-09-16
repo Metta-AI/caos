@@ -76,7 +76,7 @@ new_llm_conversation tools-only "$STUB_PORT" "$ws" \
 admit_turn "read the greeting, then write a file"
 
 stage "a read the harness declared, run by the step"
-declare_call toolu_read read '{"file-path":"greeting.txt"}'
+declare_call toolu_read read '{"source_tree":"main","file-path":"greeting.txt"}'
 read_round=$round
 run_tools_only toolu_read
 $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
@@ -86,8 +86,8 @@ grep -qF "hello tools" /tmp/read.observation || fail "the read did not return th
 [ "$(request_status)" = running ] \
   || fail "a tools-only run left the request $(request_status), not running"
 
-stage "a second call, in its own run, mutating the workspace"
-declare_call toolu_write bash '{"cmd":"echo written > out.txt","paths":[]}'
+stage "a second call, in its own run, mutating the source tree"
+declare_call toolu_write bash '{"cmd":"echo written > main/out.txt","paths":["main"]}'
 write_round=$round
 [ "$write_round" != "$read_round" ] || fail "the second call declared the same round"
 run_tools_only toolu_write
@@ -97,12 +97,12 @@ $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
 grep -qF 'exit: 0' /tmp/write.observation \
   || fail "the bash call did not report a successful exit"
 
-workspace=$(workspace_commit "$head")
-fetch_code "$workspace" "fetching the workspace the tools produced"
+workspace=$(source_tree_commit "$head" main)
+fetch_code "$workspace" "fetching the source tree the tools produced"
 [ "$(git show "$workspace:out.txt")" = written ] \
-  || fail "the workspace does not carry the file the tool wrote"
+  || fail "the source tree does not carry the file the tool wrote"
 [ "$(git show "$workspace:greeting.txt")" = "hello tools" ] \
-  || fail "the workspace lost the file it started with"
+  || fail "the source tree lost the file it started with"
 
 stage "the request is still the harness's to end"
 [ "$(request_status)" = running ] \

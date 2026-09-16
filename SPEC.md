@@ -314,7 +314,7 @@ Tools are workers that the llm can call directly
 
 ## Declaring a tool
 
-A tool is a directory in `caos-tools` with a `.caos-expr` that returns an arg tree that includes a `help` that has a string value. The string describes how the tool should be called. The tool is run an ordinary caos job over the workspace tree. It has TWO callers and one contract: an agent's tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by hand. Both build the same ArgTree, so a tool cannot behave differently depending on who invoked it
+A tool is a directory in `caos-tools` with a `.caos-expr` that returns an arg tree that includes a `help` that has a string value. The string describes how the tool should be called. The tool is run an ordinary caos job over the source tree. It has TWO callers and one contract: an agent's tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by hand. Both build the same ArgTree, so a tool cannot behave differently depending on who invoked it
 
 The `help` string is a JAVADOC comment, and it is authored as a HERE-STRING in
 the expression itself (design/caos-expr.md):
@@ -356,18 +356,18 @@ turned into an arg the model cannot use.
 
 Every parameter is declared to the model as a string, because every arg
 reaches the script as a blob whatever JSON type it left the model as. A tool
-with no `@param` tags takes no parameters: the workspace tree IS its input.
+with no `@param` tags takes no parameters: the source tree IS its input.
 
 ## Invocation
 
-- The job is `curry(<tool arg tree>, <declared args>)` run with the workspace
+- The job is `curry(<tool arg tree>, <declared args>)` run with the source tree
   tree as `--in`, where `<tool arg tree>` is what evaluating
   `caos-tools/<name>` yields
 - The two callers reach that evaluation differently, and must land on the same
   ArgTree: `caos-cli run-tool` evaluates directly (a client may block), while
   an agent's worker tail-calls `eval-path-then` and curries in the callback
   (design/map-then.md). A hand-run and an agent call are then one cache entry
-- Tools are discovered fresh from the CURRENT workspace on every LLM round and
+- Tools are discovered fresh from the CURRENT source tree on every LLM round and
   resolved again at INVOCATION time, so an agent that edits a tool sees the
   change on its next call, within the same turn
 - `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
@@ -419,55 +419,54 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
 # Merging and conflict resolution
 
-An agent resolves a git merge from inside a conversation. The obstacle is
-that git's "resolve in the working tree, then `git add` to the index, then
-`git commit`" ceremony has no place to live: there is no index, and a
-conversation advances by whole commits, not staged files. Caos collapses the
-ceremony — resolving a conflict is just producing the next commit — and
-provides two tools:
+An agent merges into a selected source tree using
+`merge --theirs=<ref|hash>`, then resolves conflicts by producing ordinary
+source tree commits. There is no index or staging step in the worker.
 
-- `merge --theirs=<ref|hash>` — three-way merge the given commit into the
-  conversation head. A git-bearing SUB-RUN, not in-process (below).
+[Chat v3](design/chat.md) defines the conversation and source tree histories,
+their refs, reconciliation, and publication. Conversation commits hold
+protocol state; source tree commits hold code. They are connected by hashes
+in conversation records, never by parent edges.
 
-`read`/`ls` default to the current workspace but accept a `root` — a commit,
-tree, or blob hash — to read/list as of another revision (below). A bare blob
-`root` with no path reads that object directly (what a standalone `read-oid`
-once did).
+File tools, grep, and bash start at the conversation root and traverse
+commit-valued source-tree entries. Bash can edit ordinary conversation files
+and several source trees together. Source-tree directories preserve commit
+identity through `mv` and `cp -a`; changes produce child code commits.
+Repository tools are addressed with `run_tool` and one conversation-relative
+path. Git operations such as merge still name their target source tree.
+
+The TUI uses a separate harness checkout and explicit worker image arguments.
+Attached repositories provide code, instructions, and tool schemas.
+See [Chat](design/chat.md) for storage, reconciliation, and publication.
 
 ## Tools thread a commit, not a tree
 
-To let `merge` record `theirs` as an ancestor, a tool's unit of work is a
-COMMIT, not a bare tree: the step loop threads a workspace commit through the
-call queue, and every tool is `commit -> (commit, result)`.
+Code mutations retain their input commit as a parent; merge retains both
+inputs. Filesystem tools pin a conversation snapshot and preserve each
+contained source tree's commit boundary.
 
 - **Read-only tools** (`read`, `ls`, `grep`) return the input
   commit UNCHANGED — no new object, no no-op commit.
-- **Mutations** (`write`, `edit`, `bash`, tree tools) return a single-parent
-  commit `commit(new tree, parent = input commit)`.
+- **Mutations** (`write`, `edit`, `bash`) create a single-parent
+  code commit for each changed source tree. Ordinary conversation-file
+  changes stay in the conversation tree.
 - **`merge`** returns a two-parent commit `commit(merged tree, parents =
   [input commit, theirs])` — the only tool that fills a second parent, but
   otherwise an ordinary tool with the ordinary signature.
 
-Reachability does the rest. A merge commit `M` carries both its parents, so
-anyone who has `M` has `ours` and `theirs`; the sole requirement is that `M`
-be reachable from the conversation head. That is automatic: the step commit a
-round mints hangs the round's FINAL workspace commit off itself (as a second
-parent — the first-parent spine and the transcript walk are untouched), and
-that workspace commit chains back through the round's per-mutation commits —
-`M` among them — to the head. So `theirs` is wired in with no note, no
-sidecar, no turn-ending special case; `merge` is not privileged, it just
-returns the commit it built.
+A tool's proposal is reconciled against the selected source tree pointer using
+the rules in [Chat v3](design/chat.md). Accepted source tree commits
+preserve the mutation and merge ancestry. Equal trees do not make that
+ancestry redundant. Read-only proposals leave the source tree unchanged.
 
-This makes commits per MUTATION (reads stay free). Publication preserves these
-commits along with the conversation-event spine, so the PR branch records the
-prompts, tool calls, results, and workspace mutations that produced its tip.
-Caching is unaffected — sub-runs key on their input TREE, not on commits.
+Publication preserves the selected source tree's code history. Conversation
+records (prompts, tool calls, and results) stay on the conversation branch;
+publishing them is deferred.
 
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the
-  workspace commit threaded into the call — the head plus whatever this turn
-  already did, so no earlier edit is cut out.
+  selected source tree commit at dispatch, including earlier accepted edits.
 - The merge is index-free and worktree-free: `git merge-tree --write-tree
   <ours> <theirs>` is a pure `(commit, commit) -> (tree, conflict report)`,
   which memoizes like any other job and needs no materialized working copy
@@ -488,35 +487,23 @@ Caching is unaffected — sub-runs key on their input TREE, not on commits.
   both-whole-trees op — the one place laziness can't help), runs `merge-tree`,
   writes `.caos/conflicts`, and `put-commit`s the two-parent commit as its
   result.
-- Clean merge → `M`'s tree is the merged workspace and the merge is done.
+- Clean merge → `M`'s tree is the merged source tree and the merge is done.
 - Conflicts → `M`'s tree carries inline conflict markers in the text files
   (what the agent edits), plus a reserved `.caos/conflicts` file (below). The
   agent resolves over subsequent turns; each resolution is an ordinary
   mutation commit on top of `M`.
 
-## Resolving `--theirs` (the ref snapshot)
+## Resolving `--theirs`
 
-The model says "merge in `main`", but a ref name only exists in the user's git
-repo — the merge worker, mid-turn on the compute network, has no refs, and the
-model doesn't know hashes. So `--theirs` is resolved on the CLIENT, at turn
-START — the only place the refs live and the only moment the client is in the
-loop (a tool call three rounds deep cannot reach back into the repo):
+The normal client does not publish a map of local branch names to workers.
+Import the desired Git revision explicitly, then pass its full commit hash to
+`merge`. The selected source-tree path identifies `ours`; `theirs` identifies
+an immutable commit already available in CAOS. Importing a newer branch tip
+does not merge it automatically.
 
-- The client resolves a small, curated set of refs to hashes — `HEAD`'s
-  upstream, `main`/`master`, the `origin` default — `ensure_pushed`es their
-  closures (onto the CONTENT-ADDRESSED `refs/caos/req/<hash>`, exactly as
-  `--head:commit` is pushed; NO semantic ref like `main` is ever written to the
-  shared server, so users never contend for a name), and curries a
-  name→hash MAP into the llm-step worker as an ordinary blob arg.
-- The `merge` tool resolves `--theirs` against that map: a known ref name → its
-  snapshotted hash; a bare hash → used directly; anything else → an is_error
-  tool_result listing the available names. `ours` is never named — it is the
-  threaded workspace commit.
-
-**Snapshot semantics**, deliberately: "merge in `main`" merges `main` as it was
-when the turn started, so the merge is deterministic and immune to `main`
-moving mid-turn. `ensure_pushed` negotiates against the server, so an unmoved
-`main` re-pushes nothing — the steady-state cost is the delta since last time.
+A custom harness may supply a `merge-refs` map for named targets. Those names
+resolve to the supplied snapshot, not live remote refs. Without that map,
+names such as `main` and `origin/main` are unavailable; commit hashes still work.
 
 ## `.caos/conflicts`
 
@@ -542,43 +529,31 @@ The agent resolves a path by editing the file (removing markers) or fixing
 the entry, then DELETING that path's rows from `.caos/conflicts`. That
 deletion IS the per-path `git add` — an explicit "this one's done"
 assertion, trusted exactly as git trusts `add` (no re-scan). An empty
-`.caos/conflicts` means done; the agent need not remove the file (inline tools
-have no delete — `bash rm` does, for a clean mid-conversation checkout).
+`.caos/conflicts` means resolution is done. Recording an edited source tree
+removes its empty ledger and prunes the `.caos` directory if empty. Bash and
+inline edits share this rule. Unchanged commits, unresolved entries, other
+metadata, and ordinary conversation files are preserved.
 
-`.caos/conflicts` is workspace state: it lives in the workspace tree `ws` the
-tools thread, so it rides into `M` and every mutation commit on top of it for
-free — it is part of `ws` like any file. This does NOT collide with
-`.caos/step.json`, which shares the `.caos/` name but never the same place:
-step.json exists ONLY in a step-commit tree (`mint_step` injects it), never in
-`ws`; conflicts exists ONLY in `ws`. They meet in one `.caos/` directory only
-inside a step tree, and the harness tells them apart by FILENAME. So four small
-local rules, no "persistence exemption":
+`.caos/conflicts` lives in the source tree, alongside the code. Inline
+file tools can edit it; compute tools receive it with the rest of the
+source tree. Conversation protocol files live in a separate tree, so no
+step metadata needs to be injected or preserved in the source tree.
 
-- **Inline tools** refuse `.caos/step.json` specifically, not all of `.caos/`,
-  so `.caos/conflicts` is editable like any file (deleting a path's rows is an
-  `edit`).
-- **`mint_step`** PRESERVES an existing `.caos/` when it injects `step.json`
-  (symlinking `.caos/conflicts` in alongside), rather than assuming `.caos/` is
-  absent.
-- **Compute tools** (`bash`/build/test) see `ws` as-is, `.caos/conflicts`
-  included — it is workspace state. (A build run mid-merge keys on a tree that
-  still carries the file, so it won't cache-hit the post-resolution build;
-  negligible, and only during resolution.)
-- **Publish** (the tui's PR flow) requires the conversation TIP to have no
-  `.caos/` entry after the guard below. Earlier merge commits remain in the
-  published history with their conflict scaffolding, but the PR's final tree
-  cannot carry even a leftover empty `.caos/conflicts`.
+Publication rejects any `.caos` content in the final source tree, including
+an empty `.caos/conflicts` or empty `.caos` directory. The check
+distinguishes unresolved conflicts from completed cleanup and does not rewrite
+the published commit. Earlier commits retain their conflict scaffolding.
 
 Both `.caos/conflicts` and the inline markers sit in the diff the whole time,
 so a mid-merge head is fully reviewable.
 
 ## Reading by hash (`read`/`ls` with `root`)
 
-Both file readers default to the current workspace but accept a `root` — a
+Both file readers default to the conversation root but accept a `root` — a
 commit, tree, or blob hash — to read/list as of another revision. A commit or
 tree `root` navigates its tree by path; a bare blob `root` (no path) reads that
 object directly. This is load-bearing, not a convenience: the stage oids in
-`.caos/conflicts` name content that is NOT reachable through any workspace path
+`.caos/conflicts` name content that is NOT reachable through any source tree path
 — the base (stage 1), and either side of a modify/delete, binary, or type
 conflict, none of which appear at the path. Without a by-hash read the agent
 cannot see what it is choosing between. It began as a standalone `read-oid`
@@ -597,23 +572,21 @@ revision (and made the history tools' hashes readable the same way).
   remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
   actually leaves the conversation.
 
-## Conversation branch exchange
+## Publication
 
-The TUI publishes a complete conversation by pointing
-`refs/heads/caos/<conversation-id>` directly at its validated event head. A
-branch-only publication does not open a PR or run PR-base preparation; it is a
-sharing mechanism for the transcript and workspace history already present.
+The [conversation publication flow](design/chat.md) publishes one named gitlink
+with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
+branch name. The base is explicit; an omitted URL comes from unambiguous import
+provenance. Directory ordering guides review, not publication. Publish earlier
+PRs first, then name their remote branches as later PR bases.
 
-Loading `<remote>/caos/<conversation-id>` or a GitHub PR whose head has that
-shape imports the exact first-parent event spine into the canonical CAOS
-conversation ref and indexes it for the current user. The imported head may
-create an absent conversation or fast-forward an existing copy. A stale import
-leaves a newer canonical head in place, and divergent history under the same ID
-is refused rather than force-pushed.
+The client previews the exact source commit and destination before confirmation.
+If the source does not contain the fetched base tip, it offers to import that
+base and send the agent a merge/rebase and test request. This action publishes
+nothing; run `/pr` again after integration. Successful pushes and PR operations
+are recorded as CAOS transcript entries. No snapshot has a special working or
+sealed state.
 
-## Caveat
-
-Per-mutation commits mean real, sometimes marker-bearing, non-building commits
-land in the published conversation history. Only the validated branch tip is
-promised to be ready for review; an intermediate commit (a mid-resolution merge
-commit especially) is NOT safe to cherry-pick or check out in isolation.
+Per-mutation commits remain in the published source tree history. Only the
+previewed PR tip is checked for unresolved conflicts and reserved state;
+intermediate commits may contain conflict markers or fail to build.

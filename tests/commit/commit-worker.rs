@@ -78,7 +78,7 @@ fn finish() -> Result<(), String> {
     caos(["get-hash", parent, "/cas/head-parent"])?;
     read_commit("/cas/head-parent")?;
 
-    // The child turn: same workspace tree, the head as parent, the tool's
+    // The child turn: same source tree, the head as parent, the tool's
     // output as the turn text. Minting it at /cas/out makes `commit <hash>`
     // this run's result.
     let message = format!("turn: tool said {tool_out}");

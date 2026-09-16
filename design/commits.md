@@ -5,7 +5,7 @@
 Values used to be `blob | tree | promise`, with commits peeled to trees at
 every boundary (`resolve_ref`, ref args). A commit is now a value in its own
 right — groundwork for an agent harness where each conversation turn *is* a
-commit: message = the turn's text, tree = workspace state, parent = the
+commit: message = the turn's text, tree = source tree state, parent = the
 previous turn. An llm-step worker receives the conversation head commit as an
 arg, executes tool calls as run-then sub-runs, and mints step/turn commits.
 

@@ -105,15 +105,40 @@ if remote_tip "$queued_ref" >/dev/null; then
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
-echo "== a conversation-shaped base is refused ==" >&2
 mkdir -p .caos-secrets
 printf '.caos-secrets/\n' >> .git/info/exclude
+echo "== stale and mismatched model readers fail before admission ==" >&2
+for reader in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
+  printf '%s\n' \
+    'name=anthropic-api-key' \
+    'value=test-key' \
+    'entropy=0123456789abcdef0123456789abcdef' \
+    "reader=$reader" > .caos-secrets/anthropic-api-key
+  # Another credential still marks the selected worker. Its hash must not
+  # disguise the missing grant for the model key.
+  printf '%s\n' \
+    'name=unrelated-key' \
+    'value=unrelated-value' \
+    'entropy=abcdef0123456789abcdef0123456789' \
+    'reader=DEEP-DEPS/llm-step' > .caos-secrets/unrelated-key
+  if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>reader.err; then
+    fail "chat admitted a model key with reader=$reader"
+  fi
+  grep -qF 'not granted to this worker' reader.err || fail "reader error is unclear"
+  grep -qF 'reader=DEEP-DEPS/llm-step' reader.err || fail "reader error omits the selected image"
+  if remote_tip "$queued_ref" >/dev/null; then
+    fail "reader failure partially admitted a conversation"
+  fi
+  [ ! -e stub/request-1.json ] || fail "reader failure reached the LLM"
+done
+rm .caos-secrets/unrelated-key
 printf '%s\n' \
   'name=anthropic-api-key' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' \
-  > .caos-secrets/anthropic-api-key
+  'reader=DEEP-DEPS/llm-step' > .caos-secrets/anthropic-api-key
+
+echo "== a conversation-shaped base is refused ==" >&2
 fake_output=$($TOOL root --repo "$PWD" --id "${test_id}-fake-base" --title fake)
 fake_base=${fake_output#head }
 if "$CAOS_CLI" chat "$bad_conv" -m "hello" --base "$fake_base" "${opts[@]}" 2>base.err; then
@@ -169,7 +194,7 @@ for _ in $(seq 1 150); do
 done
 [ "$recovered" -eq 1 ] || fail "worker did not finish after client disconnect"
 
-echo "== canonical refs, title, spine, workspace, and request isolation ==" >&2
+echo "== canonical refs, title, spine, source_tree, and request isolation ==" >&2
 conversation_prefix=${ref%/head}
 git ls-remote --refs caos "$conversation_prefix/*" > conversation.refs
 [ "$(wc -l < conversation.refs)" -eq 1 ] \
@@ -192,17 +217,16 @@ done < talk.parents
 [ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
   || fail "conversation spine did not end at G3"
 
-workspace_output=$($TOOL workspace --repo "$PWD" --head "$tip" --name main)
-workspace=${workspace_output%%$'\n'*}
-workspace=${workspace#commit }
-git -c fetch.negotiationAlgorithm=noop fetch -q caos "$workspace" \
-  || fail "fetching main workspace"
-[ "$(git show "$workspace:notes/todo.txt")" = "hello notes" ] \
-  || fail "completed conversation lost its base workspace"
+source_tree_output=$($TOOL source-tree --repo "$PWD" --head "$tip" --name code/dirty)
+source_tree=${source_tree_output%%$'\n'*}
+source_tree=${source_tree#commit }
+git -c fetch.negotiationAlgorithm=noop fetch -q caos "$source_tree" \
+  || fail "fetching main source_tree"
+[ "$(git show "$source_tree:notes/todo.txt")" = "hello notes" ] \
+  || fail "completed conversation lost its base source_tree"
 
-request_path=$(git ls-tree -r --name-only "$tip" .caos/requests | grep '\.json$' | tail -1)
-[ -n "$request_path" ] || fail "admission request record is missing"
-admission=$($TOOL read --repo "$PWD" --head "$tip" --path "$request_path")
+admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
+admission=$($TOOL request --repo "$PWD" --head "$admitted")
 request=$(jq -r .id <<<"$admission")
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \

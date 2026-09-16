@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 # Shared glue for the Rust workers: thin wrappers over the `caos` CLI plus the
-# bits of std file I/O every worker repeats. No Rust dependencies, so workers
-# still build to tiny static binaries.
+# bits of file I/O every worker repeats.
 
 [lib]
 name = "worker_common"
 path = "src/lib.rs"
+
+[dependencies]
+xattr = "1"

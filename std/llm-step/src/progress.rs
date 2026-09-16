@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, Stdio};
 
-use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Applied, Transition};
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::tree::encode_commit_bytes;
 use conversation_protocol::v3::view::Conversation;
@@ -153,18 +153,16 @@ impl State<GitStore> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
         let kind = transition.kind();
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        if ordinal.is_some() {
+        let applied = apply(&mut self.store, Some(expected), &transition)?;
+        if applied.ordinal.is_some() {
             return Err("subagent.spawn unexpectedly appended a transcript entry".to_string());
         }
         let signature = inherited_signature(&self.store, expected)?;
         let candidate = mint(
             &mut self.store,
             expected,
-            &tree,
+            &applied,
             transition.kind(),
             &signature,
         )?;
@@ -346,63 +344,7 @@ impl<S: RefStore> State<S> {
         expected: &Oid,
         transition: Transition,
     ) -> Result<TryAppend, String> {
-        if &self.head != expected {
-            return Ok(TryAppend::HeadChanged(self.head.clone()));
-        }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let transition =
-            retarget_transcript_transition(&self.store, &parent_info.tree, transition)?;
-        let Applied { tree, ordinal } =
-            apply(&mut self.store, Some(&parent_info.tree), &transition)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let candidate = mint(
-            &mut self.store,
-            expected,
-            &tree,
-            transition.kind(),
-            &signature,
-        )?;
-        let pushed = self
-            .store
-            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!("push {}", transition.kind().as_str()));
-        if pushed.is_ok() {
-            self.head = candidate.clone();
-            self.known_valid.insert(candidate.clone());
-            self.fresh_after_append = true;
-            return Ok(TryAppend::Appended(Appended {
-                commit: candidate.clone(),
-                head: candidate,
-                ordinal,
-            }));
-        }
-
-        let push_error = pushed.unwrap_err();
-        let observed = self
-            .store
-            .fetch_ref_value(&self.refname)
-            .map_err(|read_error| {
-                format!(
-                    "pushing {} failed ({push_error}); rereading it also failed: {read_error}",
-                    self.refname
-                )
-            })?
-            .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
-        self.head = observed.clone();
-        self.fresh_after_append = false;
-        self.validate()?;
-        if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
-            return Ok(TryAppend::Appended(Appended {
-                commit: candidate,
-                head: observed,
-                ordinal,
-            }));
-        }
-        if &observed != expected {
-            Ok(TryAppend::HeadChanged(observed))
-        } else {
-            Err(push_error)
-        }
+        self.try_append_many_at(expected, vec![transition])
     }
 
     pub fn try_append_pair_at(
@@ -411,54 +353,68 @@ impl<S: RefStore> State<S> {
         first: Transition,
         second: Transition,
     ) -> Result<TryAppend, String> {
+        self.try_append_many_at(expected, vec![first, second])
+    }
+
+    pub fn try_append_many_at(
+        &mut self,
+        expected: &Oid,
+        transitions: Vec<Transition>,
+    ) -> Result<TryAppend, String> {
         if &self.head != expected {
             return Ok(TryAppend::HeadChanged(self.head.clone()));
         }
-        let parent_info = self.store.read_commit(expected).map_err(String::from)?;
-        let first = retarget_transcript_transition(&self.store, &parent_info.tree, first)?;
-        let Applied {
-            tree: first_tree,
-            ordinal,
-        } = apply(&mut self.store, Some(&parent_info.tree), &first)?;
-        let signature = inherited_signature(&self.store, expected)?;
-        let first_candidate = mint(
-            &mut self.store,
-            expected,
-            &first_tree,
-            first.kind(),
-            &signature,
-        )?;
-
-        let second = retarget_transcript_transition(&self.store, &first_tree, second)?;
-        let Applied {
-            tree: second_tree,
-            ordinal: second_ordinal,
-        } = apply(&mut self.store, Some(&first_tree), &second)?;
-        let second_signature = inherited_signature(&self.store, &first_candidate)?;
-        let candidate = mint(
-            &mut self.store,
-            &first_candidate,
-            &second_tree,
-            second.kind(),
-            &second_signature,
-        )?;
+        if transitions.is_empty() {
+            return Err("an append needs a transition".into());
+        }
+        let mut candidate = expected.clone();
+        let mut ordinal = None;
+        let mut intermediate = Vec::new();
+        let mut kinds = Vec::new();
+        for transition in transitions {
+            let parent = self.store.read_commit(&candidate).map_err(String::from)?;
+            let transition = retarget_transcript_transition(&self.store, &parent.tree, transition)?;
+            let applied = apply(&mut self.store, Some(&candidate), &transition)?;
+            let signature = inherited_signature(&self.store, &candidate)?;
+            candidate = mint(
+                &mut self.store,
+                &candidate,
+                &applied,
+                transition.kind(),
+                &signature,
+            )?;
+            ordinal = ordinal.or(applied.ordinal);
+            kinds.push(transition.kind().as_str());
+            intermediate.push(candidate.clone());
+        }
         let pushed = self
             .store
             .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase(&format!(
-            "push {}+{}",
-            first.kind().as_str(),
-            second.kind().as_str()
-        ));
+        crate::timing::phase(&format!("push {}", kinds.join("+")));
+        if pushed.is_ok() {
+            self.known_valid.extend(intermediate);
+        }
+        self.finish_append(expected, candidate, ordinal, pushed)
+    }
+
+    // A failed response is ambiguous: the push may have landed, and another
+    // writer may already have advanced past it. Single and paired appends use
+    // the same reread, validation, and ancestry check before retrying.
+    fn finish_append(
+        &mut self,
+        expected: &Oid,
+        candidate: Oid,
+        ordinal: Option<u64>,
+        pushed: Result<(), String>,
+    ) -> Result<TryAppend, String> {
         if pushed.is_ok() {
             self.head = candidate.clone();
-            self.known_valid.insert(first_candidate);
             self.known_valid.insert(candidate.clone());
             self.fresh_after_append = true;
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate.clone(),
                 head: candidate,
-                ordinal: ordinal.or(second_ordinal),
+                ordinal,
             }));
         }
 
@@ -480,7 +436,7 @@ impl<S: RefStore> State<S> {
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate,
                 head: observed,
-                ordinal: ordinal.or(second_ordinal),
+                ordinal,
             }));
         }
         if &observed != expected {
@@ -518,9 +474,6 @@ impl<S: RefStore> State<S> {
                     .as_ref()
                     == Some(record)
             }
-            Transition::SubagentApply { child, application } => view
-                .child(child)?
-                .is_some_and(|record| record.applications.contains(application)),
             _ => false,
         };
         Ok(joined.then(|| Appended {
@@ -534,7 +487,6 @@ impl<S: RefStore> State<S> {
 fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
     observed.id == expected.id
         && observed.initial_head == expected.initial_head
-        && observed.initial_workspace == expected.initial_workspace
         && observed.request == expected.request
         && observed.relay == expected.relay
         && observed.spawn_intent == expected.spawn_intent
@@ -557,7 +509,7 @@ fn retarget_transcript_transition(
     let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
     match &mut transition {
         Transition::MessageAppend { entry, payloads }
-        | Transition::RequestInterject {
+        | Transition::TurnInterject {
             entry, payloads, ..
         }
         | Transition::ModelComplete {
@@ -607,7 +559,6 @@ fn parent_chain_contains(store: &dyn ObjectStore, tip: &Oid, needle: &Oid) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use conversation_protocol::v3::apply::{client_signature, mint};
     use conversation_protocol::v3::oid::ensure_genesis;
@@ -619,6 +570,7 @@ mod tests {
         objects: MemoryStore,
         head: Oid,
         race_once: bool,
+        lost_ack: bool,
         pushes: usize,
     }
 
@@ -649,6 +601,16 @@ mod tests {
                 return Err("stale expected head".to_string());
             }
             self.head = new.cloned().ok_or("test ref deletion is unsupported")?;
+            if self.lost_ack {
+                self.head = append_object(
+                    &mut self.objects,
+                    &self.head,
+                    Transition::TitleSet {
+                        title: "concurrent title".to_string(),
+                    },
+                )?;
+                return Err("simulated lost push acknowledgement".to_string());
+            }
             Ok(())
         }
     }
@@ -666,7 +628,7 @@ mod tests {
                 text: text.to_string(),
             }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         }
     }
 
@@ -675,10 +637,9 @@ mod tests {
         parent: &Oid,
         transition: Transition,
     ) -> Result<Oid, String> {
-        let parent_tree = store.read_commit(parent).map_err(String::from)?.tree;
-        let applied = apply(store, Some(&parent_tree), &transition)?;
+        let applied = apply(store, Some(parent), &transition)?;
         let signature = inherited_signature(store, parent)?;
-        mint(store, parent, &applied.tree, transition.kind(), &signature)
+        mint(store, parent, &applied, transition.kind(), &signature)
     }
 
     fn root(store: &mut MemoryStore) -> Result<Oid, String> {
@@ -690,14 +651,13 @@ mod tests {
                 owner: None,
             },
             title: "test".to_string(),
-            workspaces: BTreeMap::new(),
-            files_seed: None,
+            content: None,
         };
         let applied = apply(store, None, &transition)?;
         mint(
             store,
             &genesis,
-            &applied.tree,
+            &applied,
             transition.kind(),
             &client_signature("test", "test@example.invalid", 1),
         )
@@ -711,6 +671,7 @@ mod tests {
             objects,
             head: root.clone(),
             race_once: true,
+            lost_ack: true,
             pushes: 0,
         };
         let mut state = State::from_store(
@@ -741,49 +702,53 @@ mod tests {
 
     #[test]
     fn append_pair_mints_two_commits_with_one_push() {
-        let mut objects = MemoryStore::new();
-        let root = root(&mut objects).unwrap();
-        let store = RacingStore {
-            objects,
-            head: root.clone(),
-            race_once: false,
-            pushes: 0,
-        };
-        let mut state = State::from_store(
-            store,
-            "refs/caos/v3/conversations/conversation/head".to_string(),
-            root.clone(),
-        )
-        .unwrap();
-
-        let appended = state
-            .try_append_pair_at(
-                &root,
-                Transition::MessageAppend {
-                    entry: entry("11111111111111111111111111111111", "first"),
-                    payloads: Vec::new(),
-                },
-                Transition::MessageAppend {
-                    entry: entry("22222222222222222222222222222222", "second"),
-                    payloads: Vec::new(),
-                },
+        for lost_ack in [false, true] {
+            let mut objects = MemoryStore::new();
+            let root = root(&mut objects).unwrap();
+            let store = RacingStore {
+                objects,
+                head: root.clone(),
+                race_once: false,
+                lost_ack,
+                pushes: 0,
+            };
+            let mut state = State::from_store(
+                store,
+                "refs/caos/v3/conversations/conversation/head".to_string(),
+                root.clone(),
             )
             .unwrap();
-        let TryAppend::Appended(appended) = appended else {
-            panic!("pair append lost an uncontended race");
-        };
 
-        assert_eq!(state.store().pushes, 1);
-        assert_eq!(appended.commit, *state.head());
-        assert_eq!(appended.ordinal, Some(0));
-        let info = state.store().read_commit(state.head()).unwrap();
-        let first = info.parents.first().expect("terminal parent");
-        assert_eq!(
-            state.store().read_commit(first).unwrap().parents,
-            vec![root]
-        );
-        assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
-        assert!(state.take_fresh_after_append());
-        assert!(!state.take_fresh_after_append());
+            let appended = state
+                .try_append_pair_at(
+                    &root,
+                    Transition::MessageAppend {
+                        entry: entry("11111111111111111111111111111111", "first"),
+                        payloads: Vec::new(),
+                    },
+                    Transition::MessageAppend {
+                        entry: entry("22222222222222222222222222222222", "second"),
+                        payloads: Vec::new(),
+                    },
+                )
+                .unwrap();
+            let TryAppend::Appended(appended) = appended else {
+                panic!("pair append lost an uncontended race");
+            };
+
+            assert_eq!(state.store().pushes, 1);
+            assert_eq!(appended.head, *state.head());
+            assert_eq!(appended.commit == *state.head(), !lost_ack);
+            assert_eq!(appended.ordinal, Some(0));
+            let info = state.store().read_commit(&appended.commit).unwrap();
+            let first = info.parents.first().expect("terminal parent");
+            assert_eq!(
+                state.store().read_commit(first).unwrap().parents,
+                vec![root]
+            );
+            assert_eq!(state.conversation().unwrap().transcript_len().unwrap(), 2);
+            assert_eq!(state.take_fresh_after_append(), !lost_ack);
+            assert!(!state.take_fresh_after_append());
+        }
     }
 }

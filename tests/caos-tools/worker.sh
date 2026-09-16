@@ -3,7 +3,7 @@
 # tests/caos-tools — a WORKER test, in dev/worker-test (it needs git).
 #
 # Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
-# discovers them per round from the CURRENT workspace — each is a DIRECTORY
+# discovers them per round from the CURRENT source tree — each is a DIRECTORY
 # whose `.caos-expr` binds the javadoc `help` (description as free text,
 # `@param` tags as the parameters) — and at INVOCATION time asks the server to
 # EVALUATE that expression, then curries the model's args onto the ArgTree it
@@ -14,7 +14,7 @@
 # the script at /cas/args/<name>, while a missing required arg comes back as an
 # is_error tool_result WITHOUT a sub-run — and, at the other end of that
 # spectrum, a tool whose sub-run DIES (no result at all) also coming back as an
-# is_error tool_result, over an unchanged workspace, with the queued calls and
+# is_error tool_result, over an unchanged source tree, with the queued calls and
 # turn carrying on.
 #
 # NOTHING HERE WAS EVER THE CLIENT'S. The tools run in workers, llm-step is a
@@ -27,12 +27,12 @@ caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1
 # shellcheck disable=SC1090
 source /cas/args/common
 
-stage "stage the tooled workspace"
+stage "stage the tooled source_tree"
 llm_test_setup
 
 # The image the fixture tools name. A tool is a DIRECTORY carrying a
 # `.caos-expr` (SPEC, "Tools"), and that expression names the image it runs on
-# — here by `:hash=`, because this fixture workspace holds no std to name by
+# — here by `:hash=`, because this fixture source tree holds no std to name by
 # path. `--bash` is this TEST's mount, already evaluated to an image.
 bash_img=$(caos hash /cas/args/bash)
 
@@ -81,13 +81,13 @@ cp /tmp/ws/caos-tools/hello/worker.sh /tmp/ws/caos-tools/undocumented/worker.sh
 printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
   > /tmp/ws/caos-tools/undocumented/.caos-expr
 
-ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled workspace")
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled source_tree")
 
 stage "script the stub LLM (edit; bad call; dead sub-run; good call; end)"
 # All calls share one response and run in order. The missing arg must be
 # answered in place, and the dead sub-run must preserve the bash-edited
-# workspace, so the final valid hello call can still run the v2 script.
-R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{},"name":"hello","type":"tool_use"},{"id":"toolu_03","input":{},"name":"boom","type":"tool_use"},{"id":"toolu_04","input":{"word":"banana","suffix":"-split"},"name":"hello","type":"tool_use"}]'
+# source tree, so the final valid hello call can still run the v2 script.
+R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -107,8 +107,11 @@ assistant_transcript=$(transcript_text "$head")
 grep -qF 'tools done' <<<"$assistant_transcript" \
   || fail "terminal assistant event"
 
-stage "registration: hello advertised with its description; bash not shadowed"
-grep -qF '"name":"hello"' /tmp/stub/request-1.json || fail "hello not registered"
+stage "registration: repository schemas describe path-addressed tools"
+jq -r .system /tmp/stub/request-1.json > /tmp/repository-context
+jq -e '[.tools[].name] | index("run_tool") != null and index("hello") == null' /tmp/stub/request-1.json >/dev/null \
+  || fail "repository tools were not routed through run_tool"
+grep -qF '"name":"hello"' /tmp/repository-context || fail "hello not registered"
 grep -qF 'Say hello from the tree.' /tmp/stub/request-1.json \
   || fail "description not used"
 [ "$(grep -oF '"name":"bash"' /tmp/stub/request-1.json | wc -l)" = 1 ] \
@@ -126,17 +129,11 @@ echo "  ok: hello registered; impostor bash and the no-help directory ignored" >
 # macro writes them in.
 stage "@param: declared as a schema, required marked, doc carried"
 grep -qF '"word":{"description":"The word to echo.","type":"string"}' \
-  /tmp/stub/request-1.json || fail "@param word not declared as a string property"
+  /tmp/repository-context || fail "@param word not declared as a string property"
 grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' \
-  /tmp/stub/request-1.json || fail "@param [suffix] not declared"
-grep -qF '"required":["word"]' /tmp/stub/request-1.json \
+  /tmp/repository-context || fail "@param [suffix] not declared"
+grep -qF '"required":["word"]' /tmp/repository-context \
   || fail "required args wrong: [name] must be optional, a bare name required"
-# A tool with no @param tags advertises only the optional workspace selector
-# and no `required` key, which the API rejects as an empty array.
-jq -e '.tools[] | select(.name == "boom") | .input_schema |
-  .type == "object" and (.properties | keys) == ["workspace"] and
-  .properties.workspace.type == "string" and (has("required") | not)' \
-  /tmp/stub/request-1.json >/dev/null || fail "an argument-less tool's schema changed shape"
 echo "  ok: word required, suffix optional, boom unchanged" >&2
 
 stage "@param: a bad call is an is_error result, not a worker error"
@@ -151,7 +148,7 @@ stage "a tool whose SUB-RUN dies is an is_error result, not a dead turn"
 # the turn completed — this proves it completed THROUGH the failure.)
 [ -e /tmp/stub/request-2.json ] \
   || fail "the turn died on the failing tool instead of continuing"
-grep -qF 'the `boom` tool failed to run' /tmp/stub/request-2.json \
+grep -qF 'the `run_tool` tool failed to run' /tmp/stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
 [ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 2 ] \
   || fail "the validation and sub-run failures were not both marked is_error"
@@ -159,20 +156,19 @@ grep -qF 'the `boom` tool failed to run' /tmp/stub/request-2.json \
 # that the queue continued, the bash edit survived the failed sub-run, and the
 # declared args reached the script at /cas/args/<name>.
 grep -qF 'hello-from-tree-v2 word=banana-split' /tmp/stub/request-2.json \
-  || fail "the queued tool lost its args or the edited workspace"
+  || fail "the queued tool lost its args or the edited source_tree"
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/caos-tools.records
-bash_workspace=$(jq -r 'select(.id == "toolu_01") | .workspace_resolution.output' \
-  /tmp/caos-tools.records)
-assert_oid "$bash_workspace" "bash-adopted workspace"
-jq -e --arg workspace "$bash_workspace" \
-  'select(.id == "toolu_04") | .task != null and .input_workspace == $workspace' \
+bash_source_tree=$(source_tree_commit "$head")
+assert_oid "$bash_source_tree" "bash-adopted source_tree"
+jq -e --arg source_tree "$bash_source_tree" \
+  'select(.id == "toolu_04") | .task != null and .input_commit == $source_tree' \
   /tmp/caos-tools.records >/dev/null \
   || fail "later hello call did not start from the bash edit"
-final_workspace=$(workspace_commit "$head")
-fetch_code "$final_workspace" "fetching final workspace"
-case "$(git show "$final_workspace:caos-tools/hello/worker.sh")" in
+final_source_tree=$(source_tree_commit "$head")
+fetch_code "$final_source_tree" "fetching final source_tree"
+case "$(git show "$final_source_tree:caos-tools/hello/worker.sh")" in
   *hello-from-tree-v2*) ;;
-  *) fail "the failed sub-run lost the earlier workspace edit" ;;
+  *) fail "the failed sub-run lost the earlier source_tree edit" ;;
 esac
 echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
 

@@ -3,9 +3,14 @@
 mod mcp;
 pub use mcp::cli_mcp;
 
+pub mod filesystem;
+pub mod host_git;
+pub mod publication;
+pub mod source_trees;
+
 #[cfg(test)]
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 #[cfg(test)]
 use std::process::Command;
@@ -25,21 +30,22 @@ use conversation_protocol::v3::apply::{
 use conversation_protocol::v3::ids;
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
-
-pub use conversation_protocol::v3::records::RequestStatus;
+pub use conversation_protocol::v3::records::TurnStatus;
 use conversation_protocol::v3::records::{
     Block, Descriptor, Evidence, Identity, IdentityKind, Proposal, PublicationRecord,
-    PublicationStatus, RequestOutcome, RequestRecord, Role, ToolResult as ProtocolToolResult,
-    TranscriptEntry, WorkspaceResolution,
+    PublicationStatus, Role, SourceTreeResolution, ToolResult as ProtocolToolResult,
+    TranscriptEntry, TurnOutcome as ProtocolTurnOutcome, TurnRecord,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    reconcile, validate_spine, GitStore, Kind, ObjectStore, Oid, RefUpdate, Signature,
+    reconcile, validate_spine, GitStore, ObjectStore, Oid, RefUpdate, Signature,
 };
 
+#[cfg(test)]
+use conversation_protocol::v3::Kind;
+
 const MAX_APPEND_ATTEMPTS: usize = 32;
-const MAX_REQUEST_SPINE_WALK: usize = 4096;
 const MAX_FETCH_REFS: usize = 200;
 pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
@@ -53,9 +59,10 @@ pub const LLM_STEP_ARG: &str = "llm-step";
 /// The one-shot call that titles a conversation, named the same way.
 pub const LLM_CALL_ARG: &str = "llm-call";
 const AUTO_NAME_PREFIX: &str = "talk-";
-const MERGE_REF_CANDIDATES: &[&str] = &["main", "master"];
+
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
-const DEFAULT_SYSTEM: &str = "You are a coding agent operating on a git workspace. Use the \
+const DEFAULT_SYSTEM: &str =
+    "You are a coding agent operating on a conversation filesystem. Use the \
     available tools for file access, builds, tests, and edits. Keep responses concise.";
 
 #[cfg(test)]
@@ -71,7 +78,9 @@ pub struct TurnOptions {
     pub model: Option<String>,
     pub base_url: Option<String>,
     pub username: Option<String>,
-    pub workspace: Option<String>,
+    pub source_tree: Option<String>,
+    /// Explicit content imports. Absent or empty starts without code.
+    pub initial_content: Option<String>,
     /// The `--llm-step:<type>=<value>` argument, verbatim — resolved lazily by
     /// [`resolve_cli_image_arg`], so a broken locator is reported where it is
     /// used rather than at parse time.
@@ -173,10 +182,12 @@ pub struct TurnOutcome {
 pub enum ConversationRole {
     Human,
     Agent,
+    System,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceDiff {
+pub struct SourceTreeDiff {
+    pub base_name: Option<String>,
     pub name: String,
     pub base_commit: String,
     pub head: String,
@@ -188,7 +199,7 @@ pub struct ConversationSnapshot {
     pub id: String,
     pub head: String,
     pub title: String,
-    pub status: RequestStatus,
+    pub status: TurnStatus,
     pub request: Option<String>,
     pub interrupted: bool,
     pub error: Option<String>,
@@ -207,27 +218,29 @@ pub struct ConversationTurn {
 pub struct ConversationReplay {
     pub turns: Vec<ConversationTurn>,
     pub activity: Vec<TurnEvent>,
+    /// User messages sent to this conversation, excluding history inherited by a fork.
+    pub has_own_user_messages: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConversationLoad {
     pub snapshot: ConversationSnapshot,
     pub replay: ConversationReplay,
-    pub workspaces: Vec<WorkspaceDiff>,
+    pub source_trees: Vec<SourceTreeDiff>,
     pub publications: Vec<PublicationSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationSummary {
     pub id: String,
-    pub workspace: String,
+    pub source_tree: String,
     pub planned_head: String,
     pub status: PublicationStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedBranch {
-    pub workspace: String,
+    pub source_tree: String,
     pub branch: String,
     pub head: String,
     pub publication: String,
@@ -349,9 +362,8 @@ fn mint_transition(
     transition: &Transition,
     signature: &Signature,
 ) -> Result<Oid, String> {
-    let parent_tree = Conversation::open(store, parent)?.tree().clone();
-    let applied = apply(store, Some(&parent_tree), transition)?;
-    mint(store, parent, &applied.tree, transition.kind(), signature)
+    let applied = apply(store, Some(parent), transition)?;
+    mint(store, parent, &applied, transition.kind(), signature)
 }
 
 fn push_cas(
@@ -382,6 +394,7 @@ fn push_cas(
 enum Step {
     Done(String),
     Mint(Transition),
+    MintMany(Vec<Transition>),
 }
 
 fn append_transition(
@@ -396,11 +409,16 @@ fn append_transition(
         let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
             return Err(format!("no conversation {id:?}"));
         };
-        let transition = match step(&mut store, &head)? {
+        let transitions = match step(&mut store, &head)? {
             Step::Done(result) => return Ok(result),
-            Step::Mint(transition) => transition,
+            Step::Mint(transition) => vec![transition],
+            Step::MintMany(transitions) => transitions,
         };
-        let candidate = mint_transition(&mut store, &head, &transition, &signature("CAOS")?)?;
+        let mut candidate = head.clone();
+        let signature = signature("CAOS")?;
+        for transition in transitions {
+            candidate = mint_transition(&mut store, &candidate, &transition, &signature)?;
+        }
         if push_cas(&store, refname, Some(&head), &candidate)? {
             let _ = update_local_cache(t, refname, candidate.as_str());
             return Ok(candidate.to_string());
@@ -425,6 +443,50 @@ fn spine_contains(store: &GitStore, mut head: Oid, needle: &Oid) -> Result<bool,
     }
 }
 
+fn system_entry(id: &str, message_id: String, text: String) -> TranscriptEntry {
+    TranscriptEntry {
+        message_id,
+        conversation: id.to_string(),
+        role: Role::System,
+        actor: "caos".to_string(),
+        request: None,
+        round: None,
+        model: None,
+        blocks: vec![Block::Text { text }],
+        proposal: None,
+        source_tree_resolution: None,
+    }
+}
+
+fn append_system_notice(
+    t: &GitTransport,
+    id: &str,
+    message_id: &str,
+    text: &str,
+) -> Result<(), String> {
+    append_transition(
+        t,
+        id,
+        &refs::head_ref(id)?,
+        "recording client action",
+        |store, head| {
+            let view = Conversation::open(store, head)?;
+            if view
+                .transcript(0, view.transcript_len()?)?
+                .iter()
+                .any(|(_, _, entry)| entry.message_id == message_id)
+            {
+                return Ok(Step::Done(head.to_string()));
+            }
+            Ok(Step::Mint(Transition::MessageAppend {
+                entry: system_entry(id, message_id.into(), text.into()),
+                payloads: Vec::new(),
+            }))
+        },
+    )?;
+    Ok(())
+}
+
 fn user_entry(
     id: &str,
     username: &str,
@@ -432,7 +494,7 @@ fn user_entry(
     message: &str,
     request: Option<Oid>,
     proposal: Option<Proposal>,
-    workspace_resolution: Option<WorkspaceResolution>,
+    source_tree_resolution: Option<SourceTreeResolution>,
 ) -> TranscriptEntry {
     TranscriptEntry {
         message_id: message_id.to_string(),
@@ -446,47 +508,28 @@ fn user_entry(
             text: message.to_string(),
         }],
         proposal,
-        workspace_resolution,
+        source_tree_resolution,
     }
 }
 
-fn default_workspace_name(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
-    if options.base.is_some() {
-        return Ok("main".to_string());
-    }
-    if let Ok(value) = t.git_capture(&["symbolic-ref", "refs/remotes/origin/HEAD"], None) {
-        if let Some(name) = value.trim().strip_prefix("refs/remotes/origin/") {
-            paths::validate_workspace_name(name)?;
-            return Ok(name.to_string());
-        }
-    }
-    if let Ok(value) = t.git_capture(&["symbolic-ref", "--short", "HEAD"], None) {
-        let name = value.trim();
-        if paths::validate_workspace_name(name).is_ok() {
-            return Ok(name.to_string());
-        }
-    }
-    Ok("main".to_string())
-}
-
-fn select_workspace(
+fn select_source_tree(
     conversation: &Conversation<'_>,
     requested: Option<&str>,
 ) -> Result<String, String> {
-    let names = conversation.workspace_names()?;
+    let names = conversation.source_tree_names()?;
     if let Some(name) = requested {
         if names.iter().any(|existing| existing == name) {
             return Ok(name.to_string());
         }
         return Err(format!(
-            "workspace {name:?} does not exist; available workspaces: {}",
+            "source tree {name:?} does not exist; available source trees: {}",
             available_names(&names)
         ));
     }
     match names.as_slice() {
         [name] => Ok(name.clone()),
         _ => Err(format!(
-            "choose a workspace; available workspaces: {}",
+            "choose a source tree; available source trees: {}",
             available_names(&names)
         )),
     }
@@ -542,7 +585,7 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     let is_ancestor = mark.elapsed();
     if is_conversation {
         return Err(format!(
-            "conversation commit {commit} cannot be used as a workspace"
+            "conversation commit {commit} cannot be used as a source tree"
         ));
     }
 
@@ -560,6 +603,91 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     pushed
 }
 
+fn mint_conversation_root(
+    t: &GitTransport,
+    store: &mut GitStore,
+    options: &TurnOptions,
+    id: &str,
+    title: &str,
+    signature: &Signature,
+) -> Result<Oid, String> {
+    let content = if let Some(content) = &options.initial_content {
+        let content = oid(content, "initial content")?;
+        store.ensure_local(&content)?;
+        Some(content)
+    } else if let Some(base) = &options.base {
+        let commit = oid(base, "initial code")?;
+        ensure_code_commit(t, store, &commit)?;
+        let mut tree = conversation_protocol::v3::tree::TreeBuilder::from(None);
+        tree.put_oid(
+            "code/dirty",
+            conversation_protocol::v3::Mode::Commit,
+            commit,
+        );
+        Some(tree.build(store)?)
+    } else {
+        None
+    };
+    let genesis = ensure_genesis(store)?;
+    let transition = Transition::ConversationRoot {
+        identity: Identity {
+            id: id.into(),
+            kind: IdentityKind::Root,
+            owner: None,
+        },
+        title: title.into(),
+        content,
+    };
+    let tree = apply(store, None, &transition)?;
+    mint(store, &genesis, &tree, transition.kind(), signature)
+}
+
+/// Create a durable conversation before its first message, so attachments and
+/// conversation-owned files do not require a seed source tree or an LLM request.
+pub fn create_conversation(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    title: &str,
+) -> Result<String, String> {
+    let user = resolve_username(t, options.username.as_deref())?;
+    let refname = refs::head_ref(id)?;
+    let mut store = open_store(t)?;
+    if store.read_ref(&refname)?.is_some() {
+        return Err(format!("conversation {id:?} already exists"));
+    }
+    let head = mint_conversation_root(t, &mut store, options, id, title, &signature(&user)?)?;
+    let updates = [
+        RefUpdate {
+            refname: refname.clone(),
+            expected: None,
+            new: Some(head.clone()),
+        },
+        RefUpdate {
+            refname: refs::active_membership_ref(&user, id)?,
+            expected: None,
+            new: Some(head.clone()),
+        },
+        RefUpdate {
+            refname: refs::archived_membership_ref(&user, id)?,
+            expected: None,
+            new: None,
+        },
+    ];
+    if let Err(error) = store.push(&updates) {
+        let Some(remote) = store.fetch_ref(&refname)? else {
+            return Err(error);
+        };
+        validate_cached(&store, &remote)?;
+        if !spine_contains(&store, remote.clone(), &head)? {
+            return Err(error);
+        }
+        repair_creation_membership(&store, &user, id, &remote)?;
+    }
+    update_local_cache(t, &refname, head.as_str())?;
+    Ok(head.to_string())
+}
+
 struct PreparedRequest {
     request: String,
     configuration: String,
@@ -572,13 +700,26 @@ fn prepare_queued_request_detail(
     queued_head: &str,
 ) -> Result<PreparedRequest, String> {
     let store = conversation_secret_store(t)?;
-    let configuration = resolve_llm(t, options, id, &store)?;
+    let configuration = resolve_llm(t, options, id, queued_head, &store)?;
     let request = prepare_client_request_with_store(
         t,
         &configuration,
         &[format!("--head:commit={queued_head}")],
         &store,
     )?;
+    if !caos::client_request_has_secret(t, &request, &store, MODEL_API_SECRET)? {
+        let reader = options
+            .llm_step
+            .as_deref()
+            .and_then(image_arg_reader)
+            .map(|path| format!("reader={path}"))
+            .unwrap_or_else(|| "a reader= entry for the selected --llm-step image".to_string());
+        return Err(format!(
+            "{MODEL_API_SECRET} is configured but is not granted to this worker. \
+             Update .caos-secrets/{MODEL_API_SECRET} to include {reader}, \
+             then resend your message."
+        ));
+    }
     Ok(PreparedRequest {
         request,
         configuration,
@@ -654,14 +795,14 @@ fn validate_proposal_inputs(
     match (proposal, proposal_base) {
         (None, None) => Ok(()),
         (Some(proposal), Some(base)) => {
-            oid(proposal, "submitted workspace commit")?;
-            oid(base, "submitted workspace base")?;
+            oid(proposal, "submitted source tree commit")?;
+            oid(base, "submitted source tree base")?;
             t.git_capture(&["cat-file", "-e", &format!("{proposal}^{{commit}}")], None)?;
             t.git_capture(&["cat-file", "-e", &format!("{base}^{{commit}}")], None)?;
-            reject_reserved_caos(t, proposal, "submitted workspace")
+            reject_reserved_caos(t, proposal, "submitted source tree")
         }
-        (Some(_), None) => Err("a workspace proposal requires its checkout base".to_string()),
-        (None, Some(_)) => Err("a workspace proposal base requires a proposal".to_string()),
+        (Some(_), None) => Err("a source tree proposal requires its checkout base".to_string()),
+        (None, Some(_)) => Err("a source tree proposal base requires a proposal".to_string()),
     }
 }
 
@@ -764,31 +905,15 @@ where
         }
 
         let parent = match &observed {
-            None => {
-                let base = oid(&resolve_base(t, options)?, "conversation base")?;
-                ensure_code_commit(t, &mut store, &base)?;
-                reject_reserved_caos(t, base.as_str(), "base workspace")?;
-                let workspace_name = default_workspace_name(t, options)?;
-                let genesis = oid(G3, "v3 genesis")?;
-                let root_transition = Transition::ConversationRoot {
-                    identity: Identity {
-                        id: id.to_string(),
-                        kind: IdentityKind::Root,
-                        owner: None,
-                    },
-                    title: default_title(message),
-                    workspaces: BTreeMap::from([(workspace_name, (base, None))]),
-                    files_seed: None,
-                };
-                let root_tree = apply(&mut store, None, &root_transition)?.tree;
-                mint(
-                    &mut store,
-                    &genesis,
-                    &root_tree,
-                    root_transition.kind(),
-                    &signature,
-                )?
-            }
+            None => mint_conversation_root(
+                t,
+                &mut store,
+                options,
+                id,
+                &default_title(message),
+                &signature,
+            )?,
+
             Some(observed) => observed.clone(),
         };
         let outcome = build_message_candidate(
@@ -917,7 +1042,7 @@ where
     P: FnMut(),
 {
     let parent_view = Conversation::open(store, parent)?;
-    let active = parent_view.active_request()?;
+    let active = parent_view.active_turn()?;
     if active.is_none() && !admit_when_idle {
         return Err(format!(
             "conversation {id:?} is no longer active; submit again to start a new turn"
@@ -927,10 +1052,10 @@ where
     let mut resolution = None;
     let mut conflict = None;
     let proposal_target = if proposal.is_some() {
-        let name = select_workspace(&parent_view, options.workspace.as_deref())?;
+        let name = select_source_tree(&parent_view, options.source_tree.as_deref())?;
         let current = parent_view
-            .workspace(&name)?
-            .map(|workspace| workspace.commit);
+            .source_tree(&name)?
+            .map(|source_tree| source_tree.commit);
         Some((name, current))
     } else {
         None
@@ -938,25 +1063,25 @@ where
     drop(parent_view);
     if let (Some(proposal), Some(base)) = (proposal, proposal_base) {
         let (name, current) = proposal_target.expect("proposal target was selected");
-        let base = oid(base, "submitted workspace base")?;
-        let proposal = oid(proposal, "submitted workspace commit")?;
+        let base = oid(base, "submitted source tree base")?;
+        let proposal = oid(proposal, "submitted source tree commit")?;
         ensure_code_commit(t, store, &base)?;
         ensure_code_commit(t, store, &proposal)?;
         let reconciled = reconcile(store, &base, &proposal, current.as_ref(), signature)?;
         if let Some(output) = reconciled.new_pointer() {
             t.ensure_pushed(output.as_str())?;
         }
-        if let WorkspaceResolution::Conflict { merge, .. } = &reconciled {
+        if let SourceTreeResolution::Conflict { merge, .. } = &reconciled {
             let paths = merge
                 .as_ref()
                 .and_then(|merge| merge.conflict_paths.as_ref())
                 .cloned()
                 .unwrap_or_default();
             conflict = Some(if paths.is_empty() {
-                "submitted workspace conflicts with the conversation".to_string()
+                "submitted source tree conflicts with the conversation".to_string()
             } else {
                 format!(
-                    "submitted workspace conflicts with the conversation at {}",
+                    "submitted source tree conflicts with the conversation at {}",
                     paths.join(", ")
                 )
             });
@@ -964,7 +1089,7 @@ where
         proposal_record = Some(Proposal {
             base,
             commit: proposal,
-            workspace_name: name,
+            source_tree_name: name,
         });
         resolution = Some(reconciled);
     }
@@ -979,7 +1104,7 @@ where
         resolution,
     );
     let transition = match &active {
-        Some(active) => Transition::RequestInterject {
+        Some(active) => Transition::TurnInterject {
             request: active.id.clone(),
             entry,
             payloads: Vec::new(),
@@ -1003,10 +1128,10 @@ where
     let prepared = prepare(t, options, id, message_commit.as_str())?;
     let request = oid(&prepared.request, "prepared request")?;
     let view = Conversation::open(store, &message_commit)?;
-    let record = RequestRecord {
+    let record = TurnRecord {
         id: request.clone(),
         request_head: message_commit.clone(),
-        request_workspaces: view.workspaces_tree()?,
+
         model: options
             .model
             .clone()
@@ -1015,7 +1140,7 @@ where
         round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
-        status: RequestStatus::Queued,
+        status: TurnStatus::Queued,
         latest_message: None,
         escape_reason: None,
         outcome: None,
@@ -1025,7 +1150,7 @@ where
     let admitted = mint_transition(
         store,
         &message_commit,
-        &Transition::RequestAdmit { record },
+        &Transition::TurnAdmit { record },
         &admission_signature,
     )?;
     Ok(MessageCandidate {
@@ -1068,25 +1193,19 @@ pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
     let refname = refs::head_ref(id)?;
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_request()? else {
-            let newest = newest_request(store, &view)?;
+        let Some(request) = view.active_turn()? else {
+            let newest = view.latest_turn()?;
             if newest.is_some_and(|record| {
-                matches!(
-                    record.status,
-                    RequestStatus::Cancelling | RequestStatus::Idle
-                )
+                matches!(record.status, TurnStatus::Cancelling | TurnStatus::Idle)
             }) {
                 return Ok(Step::Done(head.to_string()));
             }
             return Err(format!("conversation {id:?} has no active request"));
         };
-        if matches!(
-            request.status,
-            RequestStatus::Cancelling | RequestStatus::Idle
-        ) {
+        if matches!(request.status, TurnStatus::Cancelling | TurnStatus::Idle) {
             return Ok(Step::Done(head.to_string()));
         }
-        Ok(Step::Mint(Transition::RequestEscape {
+        Ok(Step::Mint(Transition::TurnEscape {
             request: request.id,
             reason: None,
         }))
@@ -1125,73 +1244,36 @@ fn text_blocks(blocks: &[Block]) -> String {
     text.join("\n\n")
 }
 
-fn newest_request(
-    store: &GitStore,
-    conversation: &Conversation<'_>,
-) -> Result<Option<RequestRecord>, String> {
-    for ordinal in (0..conversation.transcript_len()?).rev() {
-        let (_, entry) = conversation
-            .transcript_entry(ordinal)?
-            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
-        if matches!(entry.role, Role::Assistant | Role::System) {
-            if let Some(request) = entry.request {
-                return conversation.request(&request);
-            }
-        }
-    }
-    let requests = conversation
-        .request_ids()?
-        .into_iter()
-        .map(|id| {
-            conversation
-                .request(&id)?
-                .ok_or_else(|| format!("request {id} disappeared"))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut current = conversation.commit().cloned();
-    for _ in 0..MAX_REQUEST_SPINE_WALK {
-        let Some(commit) = current else {
-            return Ok(None);
-        };
-        if let Some(record) = requests.iter().find(|record| record.request_head == commit) {
-            return Ok(Some(record.clone()));
-        }
-        if commit.as_str() == G3 {
-            return Ok(None);
-        }
-        current = store
-            .read_commit(&commit)
-            .map_err(String::from)?
-            .parents
-            .first()
-            .cloned();
-    }
-    Ok(None)
+fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSnapshot, String> {
+    snapshot_from(&Conversation::open(store, head)?, id, head)
 }
 
-fn snapshot_at(store: &GitStore, id: &str, head: &Oid) -> Result<ConversationSnapshot, String> {
-    let conversation = Conversation::open(store, head)?;
-    let active = conversation.active_request()?;
+fn snapshot_from(
+    conversation: &Conversation<'_>,
+    id: &str,
+    head: &Oid,
+) -> Result<ConversationSnapshot, String> {
+    let active = conversation.active_turn()?;
     let newest = if active.is_none() {
-        newest_request(store, &conversation)?
+        conversation.latest_turn()?
     } else {
         None
     };
     let record = active.as_ref().or(newest.as_ref());
     let status = record
         .map(|record| record.status)
-        .unwrap_or(RequestStatus::Idle);
+        .unwrap_or(TurnStatus::Idle);
     let interrupted = active.is_none()
         && matches!(
             newest.as_ref().and_then(|record| record.outcome.as_ref()),
-            Some(RequestOutcome::Idle {
+            Some(ProtocolTurnOutcome::Idle {
                 interrupted: true,
                 ..
             })
         );
     let error = match record.and_then(|record| record.outcome.as_ref()) {
-        Some(RequestOutcome::Failed { error }) => {
-            transcript_text_at_path(&conversation, error.as_str())?
+        Some(ProtocolTurnOutcome::Failed { error }) => {
+            transcript_text_at_path(conversation, error.as_str())?
         }
         _ => None,
     };
@@ -1220,13 +1302,24 @@ fn transcript_text_at_path(
     Ok(Some(text_blocks(&entry.blocks)))
 }
 
+#[cfg(test)]
 fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String> {
-    let conversation = Conversation::open(store, head)?;
+    replay_from(store, head, &Conversation::open(store, head)?)
+}
+
+fn replay_from(
+    store: &GitStore,
+    head: &Oid,
+    conversation: &Conversation<'_>,
+) -> Result<ConversationReplay, String> {
     let transcript = conversation.transcript(0, conversation.transcript_len()?)?;
+    let conversation_id = conversation.identity()?.id;
+    let mut has_own_user_messages = false;
     let mut turns = Vec::new();
     let mut request_order = Vec::new();
     let mut assistant_entries: HashMap<(Oid, u64), TranscriptEntry> = HashMap::new();
     for (_, _, entry) in transcript {
+        has_own_user_messages |= entry.role == Role::User && entry.conversation == conversation_id;
         if let (Some(request), Some(round)) = (&entry.request, entry.round) {
             if entry.role == Role::Assistant {
                 assistant_entries.insert((request.clone(), round), entry.clone());
@@ -1241,7 +1334,7 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
         let (author, role) = match entry.role {
             Role::User => (entry.actor.clone(), ConversationRole::Human),
             Role::Assistant => ("assistant".to_string(), ConversationRole::Agent),
-            Role::System => ("CAOS".to_string(), ConversationRole::Agent),
+            Role::System => ("CAOS".to_string(), ConversationRole::System),
         };
         turns.push(ConversationTurn {
             commit: String::new(),
@@ -1280,7 +1373,7 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
 
     let mut activity = Vec::new();
     for request in request_order {
-        let Some(record) = conversation.request(&request)? else {
+        let Some(record) = conversation.turn(&request)? else {
             return Err(format!("transcript names missing request {request}"));
         };
         for round in 0..record.round {
@@ -1306,13 +1399,24 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
                     round,
                     tool_use_id: call_id.clone(),
                     name: call_name.clone(),
-                    summary: tool_call_summary(call_name, &args),
+                    summary: {
+                        let text = tool_call_summary(call_name, &args);
+                        match conversation
+                            .tool(&request, round, call_id)?
+                            .and_then(|tool| tool.source_tree_name)
+                        {
+                            Some(name) if conversation.source_tree_names()?.len() > 1 => {
+                                format!("[{name}] {text}")
+                            }
+                            _ => text,
+                        }
+                    },
                     step_commit: request.to_string(),
                 });
                 if let Some(tool) = conversation.tool(&request, round, call_id)? {
                     if tool.is_terminal() {
                         let (is_error, content) =
-                            protocol_tool_result(&conversation, tool.result.as_ref())?;
+                            protocol_tool_result(conversation, tool.result.as_ref())?;
                         activity.push(TurnEvent::ToolResult {
                             request: request.to_string(),
                             round,
@@ -1326,7 +1430,11 @@ fn replay_at(store: &GitStore, head: &Oid) -> Result<ConversationReplay, String>
             }
         }
     }
-    Ok(ConversationReplay { turns, activity })
+    Ok(ConversationReplay {
+        turns,
+        activity,
+        has_own_user_messages,
+    })
 }
 
 fn protocol_tool_result(
@@ -1359,13 +1467,13 @@ fn protocol_tool_result(
     }
 }
 
-fn workspace_diff(
+fn source_tree_diff(
     t: &GitTransport,
     store: &GitStore,
     name: &str,
     initial: &Oid,
     commit: &Oid,
-) -> Result<WorkspaceDiff, String> {
+) -> Result<SourceTreeDiff, String> {
     store.ensure_local(initial)?;
     store.ensure_local(commit)?;
     let patch = t.git_capture(
@@ -1381,7 +1489,8 @@ fn workspace_diff(
         ],
         None,
     )?;
-    Ok(WorkspaceDiff {
+    Ok(SourceTreeDiff {
+        base_name: None,
         name: name.to_string(),
         base_commit: initial.to_string(),
         head: commit.to_string(),
@@ -1389,60 +1498,19 @@ fn workspace_diff(
     })
 }
 
-fn publication_summaries(store: &GitStore, head: &Oid) -> Result<Vec<PublicationSummary>, String> {
-    let mut records: BTreeMap<String, PublicationRecord> = Conversation::open(store, head)?
-        .publications()?
+fn publication_summaries(
+    conversation: &Conversation<'_>,
+) -> Result<Vec<PublicationSummary>, String> {
+    Ok(conversation
+        .publications_by_creation()?
         .into_iter()
-        .map(|record| (record.id.clone(), record))
-        .collect();
-    let mut ordered = Vec::with_capacity(records.len());
-    let mut cursor = head.clone();
-    while cursor.as_str() != G3 && !records.is_empty() {
-        let info = store.read_commit(&cursor).map_err(String::from)?;
-        let parent = info
-            .parents
-            .first()
-            .cloned()
-            .ok_or_else(|| format!("conversation commit {cursor} has no parent"))?;
-        if Kind::parse_message(&info.message)? == Kind::PublicationPending {
-            let conversation = Conversation::open(store, &cursor)?;
-            let parent_ids = if parent.as_str() == G3 {
-                HashSet::new()
-            } else {
-                Conversation::open(store, &parent)?
-                    .publications()?
-                    .into_iter()
-                    .map(|record| record.id)
-                    .collect()
-            };
-            let introduced: Vec<String> = conversation
-                .publications()?
-                .into_iter()
-                .map(|record| record.id)
-                .filter(|id| !parent_ids.contains(id))
-                .collect();
-            if introduced.len() != 1 {
-                return Err(format!(
-                    "publication.pending commit {cursor} introduced {} records",
-                    introduced.len()
-                ));
-            }
-            let id = &introduced[0];
-            if let Some(record) = records.remove(id) {
-                ordered.push(PublicationSummary {
-                    id: record.id,
-                    workspace: record.workspace_name,
-                    planned_head: record.planned_head.to_string(),
-                    status: record.status,
-                });
-            }
-        }
-        cursor = parent;
-    }
-    if !records.is_empty() {
-        return Err("publication records have no publication.pending commit".to_string());
-    }
-    Ok(ordered)
+        .map(|record| PublicationSummary {
+            id: record.id,
+            source_tree: record.source_tree_name,
+            planned_head: record.planned_head.to_string(),
+            status: record.status,
+        })
+        .collect())
 }
 
 pub fn conversation_load(t: &GitTransport, id: &str) -> Result<Option<ConversationLoad>, String> {
@@ -1479,32 +1547,37 @@ fn load_at(
     head: &Oid,
 ) -> Result<ConversationLoad, String> {
     let conversation = Conversation::open(store, head)?;
-    let mut workspaces = Vec::new();
-    for (name, workspace) in conversation.workspaces()? {
-        workspaces.push(workspace_diff(
-            t,
-            store,
-            &name,
-            &workspace.initial,
-            &workspace.commit,
-        )?);
+    let mut source_trees = Vec::new();
+    for (name, source_tree) in conversation.source_trees()? {
+        let base = match conversation.previous_reference(&name)? {
+            Some((_, commit)) => commit,
+            None => conversation.reference_start(&name)?,
+        };
+        let mut diff = source_tree_diff(t, store, &name, &base, &source_tree.commit)?;
+        diff.base_name = conversation
+            .previous_reference(&name)?
+            .map(|(path, _)| path);
+        source_trees.push(diff);
     }
     Ok(ConversationLoad {
-        snapshot: snapshot_at(store, id, head)?,
-        replay: replay_at(store, head)?,
-        workspaces,
-        publications: publication_summaries(store, head)?,
+        snapshot: snapshot_from(&conversation, id, head)?,
+        replay: replay_from(store, head, &conversation)?,
+        source_trees: {
+            source_trees.reverse();
+            source_trees
+        },
+        publications: publication_summaries(&conversation)?,
     })
 }
 
 fn failure_reason(snapshot: &ConversationSnapshot) -> String {
     snapshot.error.clone().unwrap_or_else(|| {
         let status = match snapshot.status {
-            RequestStatus::Queued => "queued",
-            RequestStatus::Running => "running",
-            RequestStatus::Cancelling => "cancelling",
-            RequestStatus::Idle => "idle",
-            RequestStatus::Failed => "failed",
+            TurnStatus::Queued => "queued",
+            TurnStatus::Running => "running",
+            TurnStatus::Cancelling => "cancelling",
+            TurnStatus::Idle => "idle",
+            TurnStatus::Failed => "failed",
         };
         format!("conversation request ended {status}")
     })
@@ -1837,7 +1910,8 @@ fn summary_for_advertised_id(
         .get(id)
         .map(|(_, head)| head)
         .ok_or_else(|| "canonical head is absent".to_string())?;
-    validate_cached(store, head)?;
+    // Sidebar summaries read metadata only. Validate the full history when the
+    // conversation is opened or changed, not for every unopened sidebar entry.
     summary_at_head(store, id, head)
 }
 
@@ -1906,7 +1980,11 @@ fn group_child_conversations(
 
 fn warn_skipped_conversation(id: &str, error: &str) {
     if first_skip_warning(&format!("{id}: {error}")) {
-        eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+        if error.starts_with("unsupported conversation format") {
+            eprintln!("note: conversation {id:?} is preserved but unavailable: {error}");
+        } else {
+            eprintln!("warning: skipping malformed conversation {id:?}: {error}");
+        }
     }
 }
 
@@ -2094,51 +2172,7 @@ pub fn compare_and_set_conversation_title(
     Ok(matched)
 }
 
-fn normalize_repository_identity(url: &str) -> Result<String, String> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err("origin has an empty URL".to_string());
-    }
-    let mut normalized = if let Some(scp) = url.strip_prefix("git@") {
-        let (host, path) = scp
-            .split_once(':')
-            .ok_or_else(|| format!("invalid origin URL {url:?}"))?;
-        if host.is_empty() || path.is_empty() {
-            return Err(format!("invalid origin URL {url:?}"));
-        }
-        format!("https://{host}/{path}")
-    } else {
-        url.to_string()
-    };
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    if let Some(without_suffix) = normalized.strip_suffix(".git") {
-        normalized = without_suffix.to_string();
-    }
-    while normalized.ends_with('/') {
-        normalized.pop();
-    }
-    if let Some((scheme, rest)) = normalized.split_once("://") {
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if authority.is_empty() {
-            return Err(format!("invalid origin URL {url:?}"));
-        }
-        let authority = match authority.rsplit_once('@') {
-            Some((user, host)) => format!("{user}@{}", host.to_ascii_lowercase()),
-            None => authority.to_ascii_lowercase(),
-        };
-        normalized = if path.is_empty() {
-            format!("{scheme}://{authority}")
-        } else {
-            format!("{scheme}://{authority}/{path}")
-        };
-    }
-    if normalized.is_empty() {
-        return Err(format!("invalid origin URL {url:?}"));
-    }
-    Ok(normalized)
-}
+pub use conversation_protocol::v3::source_trees::normalize_repository_identity;
 
 pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
     let url = t
@@ -2149,16 +2183,38 @@ pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
 
 fn reject_publish_caos(t: &GitTransport, commit: &Oid) -> Result<(), String> {
     let listing = t.git_capture(
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit.as_str(),
+            "--",
+            ".caos",
+        ],
+        None,
+    )?;
+    if listing.lines().any(|path| path == paths::CONFLICTS_LEDGER) {
+        let contents = t.git_capture(
+            &["show", &format!("{commit}:{}", paths::CONFLICTS_LEDGER)],
+            None,
+        )?;
+        return Err(if contents.trim().is_empty() {
+            "the source tree has an empty `.caos/conflicts` file; remove it with bash before publishing (the removal is committed automatically)".into()
+        } else {
+            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata".into()
+        });
+    }
+    let root = t.git_capture(
         &["ls-tree", "--name-only", commit.as_str(), "--", ".caos"],
         None,
     )?;
-    if listing.trim().is_empty() {
+    if root.trim().is_empty() {
         Ok(())
     } else {
-        Err(
-            "the workspace carries `.caos/` state; resolve and remove `.caos/conflicts` first"
-                .to_string(),
-        )
+        Err(format!(
+            "the source tree contains reserved `.caos` content; record a cleaned source-tree edit before publishing:\n{}",
+            if listing.trim().is_empty() { ".caos/ (empty directory)" } else { listing.trim_end() }
+        ))
     }
 }
 
@@ -2170,7 +2226,7 @@ fn same_publication_intent(left: &PublicationRecord, right: &PublicationRecord) 
         && left.repository == right.repository
         && left.refname == right.refname
         && left.expected_old == right.expected_old
-        && left.workspace_name == right.workspace_name
+        && left.source_tree_name == right.source_tree_name
 }
 
 fn append_publication_pending(
@@ -2196,10 +2252,11 @@ fn append_publication_pending(
                 result = Some(existing);
                 return Ok(Step::Done(head.to_string()));
             }
-            result = Some(pending.clone());
-            Ok(Step::Mint(Transition::PublicationPending {
+            let transitions = vec![Transition::PublicationPending {
                 record: pending.clone(),
-            }))
+            }];
+            result = Some(pending.clone());
+            Ok(Step::MintMany(transitions))
         },
     )?;
     Ok(result.expect("publication append always records a result"))
@@ -2277,13 +2334,33 @@ fn append_publication_terminal(
             terminal.status = outcome.status;
             terminal.evidence = Some(outcome.evidence.clone());
             terminal.observed = outcome.observed.clone();
-            result = Some(terminal);
-            Ok(Step::Mint(Transition::PublicationTerminal {
+            let mut transitions = vec![Transition::PublicationTerminal {
                 publication: publication.to_string(),
                 status: outcome.status,
                 evidence: outcome.evidence.clone(),
                 observed: outcome.observed.clone(),
-            }))
+            }];
+            if outcome.status == PublicationStatus::Complete {
+                transitions.push(Transition::MessageAppend {
+                    entry: system_entry(
+                        id,
+                        format!("push-{publication}"),
+                        format!(
+                            "Published {} ({}) to {} branch {}.",
+                            terminal.source_tree_name,
+                            terminal.planned_head,
+                            terminal.repository,
+                            terminal
+                                .refname
+                                .strip_prefix("refs/heads/")
+                                .unwrap_or(&terminal.refname),
+                        ),
+                    ),
+                    payloads: Vec::new(),
+                });
+            }
+            result = Some(terminal);
+            Ok(Step::MintMany(transitions))
         },
     )?;
     Ok(result.expect("publication append always records a result"))
@@ -2340,29 +2417,40 @@ fn push_publication(origin: &GitStore, pending: &PublicationRecord) -> Publicati
     unreachable!("the last attempt always returns an outcome")
 }
 
-pub fn publish_workspace_branch(
+pub fn publish_source_tree_branch(
     t: &GitTransport,
     id: &str,
-    workspace: Option<&str>,
+    source_tree: Option<&str>,
+    repository: &str,
 ) -> Result<PublishedBranch, String> {
-    publish_workspace_branch_inner(t, id, workspace, None)
+    publish_source_tree_branch_inner(t, id, source_tree, None, repository, None)
 }
 
-/// Publish exactly the workspace that completed PR preparation.
-pub fn publish_prepared_workspace_branch(
+/// Publish exactly the selected commit.
+pub fn publish_prepared_source_tree_branch(
     t: &GitTransport,
     id: &str,
-    workspace: &str,
+    source_tree: &str,
     prepared_head: &str,
+    repository: &str,
 ) -> Result<PublishedBranch, String> {
-    publish_workspace_branch_inner(t, id, Some(workspace), Some(prepared_head))
+    publish_source_tree_branch_inner(
+        t,
+        id,
+        Some(source_tree),
+        Some(prepared_head),
+        repository,
+        None,
+    )
 }
 
-fn publish_workspace_branch_inner(
+fn publish_source_tree_branch_inner(
     t: &GitTransport,
     id: &str,
-    workspace: Option<&str>,
+    source_tree: Option<&str>,
     prepared_head: Option<&str>,
+    repository_url: &str,
+    preview: Option<&source_trees::PublicationTarget>,
 ) -> Result<PublishedBranch, String> {
     refs::validate_conversation_id(id)?;
     let mut store = open_store(t)?;
@@ -2370,18 +2458,24 @@ fn publish_workspace_branch_inner(
         return Err(format!("no conversation {id:?}"));
     };
     let conversation = Conversation::open(&store, &head)?;
-    let workspace = select_workspace(&conversation, workspace)?;
+    let source_tree = select_source_tree(&conversation, source_tree)?;
     let record = conversation
-        .workspace(&workspace)?
-        .ok_or_else(|| format!("workspace {workspace:?} disappeared"))?;
+        .source_tree(&source_tree)?
+        .ok_or_else(|| format!("source tree {source_tree:?} disappeared"))?;
     let planned_head = record.commit;
     if prepared_head.is_some_and(|prepared| prepared != planned_head.as_str()) {
         return Err(format!(
-            "workspace {workspace:?} changed after PR preparation; prepare it again before publishing"
+            "source tree {source_tree:?} changed since the publication preview; review it again before publishing"
         ));
     }
-    let initial = record.initial;
+    let initial = conversation.reference_start(&source_tree)?;
     let publications = conversation.publications()?;
+    let branch = preview
+        .map(|target| target.branch.clone())
+        .unwrap_or_else(|| source_tree.clone());
+    conversation_protocol::v3::source_trees::validate_repository(repository_url)?;
+    conversation_protocol::v3::source_trees::validate_branch(&branch)?;
+    let repository = normalize_repository_identity(repository_url)?;
     drop(conversation);
 
     store.ensure_local(&planned_head)?;
@@ -2389,11 +2483,14 @@ fn publish_workspace_branch_inner(
     reject_publish_caos(t, &planned_head)?;
     ensure_code_commit(t, &mut store, &planned_head)?;
 
-    let repository = origin_repository(t)?;
-    let branch = format!("caos/{id}");
     let branch_ref = format!("refs/heads/{branch}");
-    let origin = GitStore::open(t.work_dir(), Some("origin"))?;
+    let origin = GitStore::open(t.work_dir(), Some(repository_url))?;
     let expected_old = origin.read_ref(&branch_ref)?;
+    if preview.is_some_and(|target| {
+        target.remote_head.as_deref() != expected_old.as_ref().map(Oid::as_str)
+    }) {
+        return Err("remote branch changed since the preview; review again".into());
+    }
     for previous in publications {
         if previous.status == PublicationStatus::Pending
             && previous.repository == repository
@@ -2414,7 +2511,7 @@ fn publish_workspace_branch_inner(
         origin.ensure_local(old)?;
         if !conversation_protocol::v3::CodeOps::is_ancestor(&origin, old, &planned_head)? {
             return Err(format!(
-                "publishing workspace {workspace:?} would not fast-forward {branch}: remote {old} is not an ancestor of {planned_head}; merge the remote changes first",
+                "publishing source tree {source_tree:?} would not fast-forward {branch}: remote {old} is not an ancestor of {planned_head}; merge the remote changes first",
             ));
         }
     }
@@ -2446,7 +2543,7 @@ fn publish_workspace_branch_inner(
         repository,
         refname: branch_ref.clone(),
         expected_old: expected_old.clone(),
-        workspace_name: workspace.clone(),
+        source_tree_name: source_tree.clone(),
         status: PublicationStatus::Pending,
         evidence: None,
         observed: None,
@@ -2454,7 +2551,7 @@ fn publish_workspace_branch_inner(
     let joined = append_publication_pending(t, id, &conversation_ref, &pending)?;
     if joined.status != PublicationStatus::Pending {
         return Ok(PublishedBranch {
-            workspace,
+            source_tree,
             branch,
             head: planned_head.to_string(),
             publication,
@@ -2473,7 +2570,7 @@ fn publish_workspace_branch_inner(
     let outcome = push_publication(&origin, &pending);
     let terminal = append_publication_terminal(t, id, &conversation_ref, &publication, &outcome)?;
     Ok(PublishedBranch {
-        workspace,
+        source_tree,
         branch,
         head: planned_head.to_string(),
         publication,
@@ -2495,129 +2592,6 @@ pub fn publication_diagnostic(
         .publication(publication)?
         .ok_or_else(|| format!("publication {publication:?} does not exist"))?;
     Ok(record.evidence.and_then(|evidence| evidence.diagnostic))
-}
-
-pub fn create_workspace(
-    t: &GitTransport,
-    id: &str,
-    name: &str,
-    commit: &str,
-) -> Result<String, String> {
-    paths::validate_workspace_name(name)?;
-    let commit = oid(commit, "workspace commit")?;
-    let refname = refs::head_ref(id)?;
-    ensure_code_commit(t, &mut open_store(t)?, &commit)?;
-    reject_reserved_caos(t, commit.as_str(), "workspace")?;
-    append_transition(t, id, &refname, "creating a workspace", |store, head| {
-        if let Some(existing) = Conversation::open(store, head)?.workspace(name)? {
-            if existing.commit == commit && existing.initial == commit && existing.origin.is_none()
-            {
-                return Ok(Step::Done(head.to_string()));
-            }
-            return Err(format!("workspace {name:?} already exists"));
-        }
-        Ok(Step::Mint(Transition::WorkspaceCreate {
-            name: name.to_string(),
-            commit: commit.clone(),
-            origin: None,
-        }))
-    })
-}
-
-pub fn rollback_workspace(
-    t: &GitTransport,
-    id: &str,
-    name: &str,
-    commit: &str,
-) -> Result<String, String> {
-    let commit = oid(commit, "workspace rollback commit")?;
-    let refname = refs::head_ref(id)?;
-    ensure_code_commit(t, &mut open_store(t)?, &commit)?;
-    let mut authorized_preimage = None;
-    append_transition(
-        t,
-        id,
-        &refname,
-        "rolling back a workspace",
-        |store, head| {
-            let conversation = Conversation::open(store, head)?;
-            let workspace = conversation
-                .workspace(name)?
-                .ok_or_else(|| format!("workspace {name:?} does not exist"))?;
-            if workspace.commit == commit {
-                return Ok(Step::Done(head.to_string()));
-            }
-            match &authorized_preimage {
-                None => authorized_preimage = Some(workspace.commit.clone()),
-                Some(preimage) if preimage != &workspace.commit => {
-                    return Err(format!("workspace {name:?} changed while rolling it back"))
-                }
-                Some(_) => {}
-            }
-            if !conversation_protocol::v3::CodeOps::is_ancestor(store, &workspace.initial, &commit)?
-            {
-                return Err(format!(
-                    "workspace rollback {commit} does not descend from its initial {}",
-                    workspace.initial
-                ));
-            }
-            if !workspace_was_named(store, head, name, &commit)? {
-                return Err(format!(
-                    "workspace {name:?} has never named commit {commit}"
-                ));
-            }
-            Ok(Step::Mint(Transition::WorkspaceRollback {
-                name: name.to_string(),
-                commit: commit.clone(),
-            }))
-        },
-    )
-}
-
-fn workspace_was_named(
-    store: &GitStore,
-    head: &Oid,
-    name: &str,
-    commit: &Oid,
-) -> Result<bool, String> {
-    let mut current = head.clone();
-    loop {
-        let view = Conversation::open(store, &current)?;
-        if view
-            .workspace(name)?
-            .is_some_and(|workspace| workspace.commit == *commit)
-        {
-            return Ok(true);
-        }
-        let parent = view.parent().cloned().expect("conversation has one parent");
-        if parent.as_str() == G3 {
-            return Ok(false);
-        }
-        current = parent;
-    }
-}
-
-pub fn remove_workspace(t: &GitTransport, id: &str, name: &str) -> Result<String, String> {
-    let refname = refs::head_ref(id)?;
-    let mut authorized_preimage = None;
-    append_transition(t, id, &refname, "removing a workspace", |store, head| {
-        let Some(workspace) = Conversation::open(store, head)?.workspace(name)? else {
-            if authorized_preimage.is_some() {
-                return Ok(Step::Done(head.to_string()));
-            }
-            return Err(format!("workspace {name:?} does not exist"));
-        };
-        match &authorized_preimage {
-            None => authorized_preimage = Some(workspace.commit),
-            Some(preimage) if preimage != &workspace.commit => {
-                return Err(format!("workspace {name:?} changed while removing it"))
-            }
-            Some(_) => {}
-        }
-        Ok(Step::Mint(Transition::WorkspaceRemove {
-            name: name.to_string(),
-        }))
-    })
 }
 
 fn validate_conversation_title(title: &str) -> Result<&str, String> {
@@ -2686,6 +2660,7 @@ fn resolve_llm(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
+    queued_head: &str,
     store: &[ClientSecret],
 ) -> Result<String, String> {
     let system = match (&options.system, &options.system_file) {
@@ -2697,11 +2672,8 @@ fn resolve_llm(
             return Err("--system and --system-file are mutually exclusive".into())
         }
     };
-    let merge_refs = snapshot_merge_refs(t)?;
+    let _ = oid(queued_head, "queued conversation")?;
     let mut config = vec![format!("--system={system}"), format!("--conversation={id}")];
-    if !merge_refs.is_empty() {
-        config.push(format!("--merge-refs={merge_refs}"));
-    }
     config.push(format!(
         "--model={}",
         options.model.as_deref().unwrap_or(DEFAULT_MODEL)
@@ -2753,10 +2725,9 @@ pub fn image_arg_reader(argument: &str) -> Option<&str> {
     }
 }
 
-pub fn model_secret_missing(t: &GitTransport) -> Result<bool, String> {
-    Ok(build_secret_store(t)?
-        .iter()
-        .all(|secret| secret.name() != MODEL_API_SECRET))
+pub fn model_secret_missing() -> Result<bool, String> {
+    caos::local_secret_present(std::path::Path::new(caos::SECRETS_DIR), MODEL_API_SECRET)
+        .map(|present| !present)
 }
 
 fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {
@@ -2769,10 +2740,10 @@ pub fn ensure_conversation_secret(t: &GitTransport) -> Result<(), String> {
     conversation_secret_store(t).map(drop)
 }
 
-fn request_is_active(status: RequestStatus) -> bool {
+fn request_is_active(status: TurnStatus) -> bool {
     matches!(
         status,
-        RequestStatus::Queued | RequestStatus::Running | RequestStatus::Cancelling
+        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
     )
 }
 
@@ -2840,15 +2811,15 @@ pub fn run_chat_turn(
         if snapshot.head != last_head {
             last_head = snapshot.head.clone();
             emit(TurnEvent::Status(match snapshot.status {
-                RequestStatus::Queued => "queued".to_string(),
-                RequestStatus::Running => "agent running".to_string(),
-                RequestStatus::Cancelling => "cancelling".to_string(),
-                RequestStatus::Idle => "idle".to_string(),
-                RequestStatus::Failed => "failed".to_string(),
+                TurnStatus::Queued => "queued".to_string(),
+                TurnStatus::Running => "agent running".to_string(),
+                TurnStatus::Cancelling => "cancelling".to_string(),
+                TurnStatus::Idle => "idle".to_string(),
+                TurnStatus::Failed => "failed".to_string(),
             }));
         }
         match snapshot.status {
-            RequestStatus::Idle => {
+            TurnStatus::Idle => {
                 return Ok(TurnOutcome {
                     conversation: id.to_string(),
                     short_commit: short_hash(&snapshot.head).to_string(),
@@ -2856,7 +2827,7 @@ pub fn run_chat_turn(
                     interrupted: snapshot.interrupted,
                 })
             }
-            RequestStatus::Failed => return Err(failure_reason(&snapshot)),
+            TurnStatus::Failed => return Err(failure_reason(&snapshot)),
             _ => {}
         }
         if let Some(rx) = &request_result {
@@ -3010,10 +2981,10 @@ pub fn describe_tool_set(
         match fetch_validated_head(t, &store, id)? {
             Some((_, head)) => {
                 let conversation = Conversation::open(&store, &head)?;
-                let name = select_workspace(&conversation, options.workspace.as_deref())?;
+                let name = select_source_tree(&conversation, options.source_tree.as_deref())?;
                 let commit = conversation
-                    .workspace(&name)?
-                    .expect("selected workspace exists")
+                    .source_tree(&name)?
+                    .expect("selected source tree exists")
                     .commit;
                 store.ensure_local(&commit)?;
                 commit.to_string()
@@ -3115,29 +3086,7 @@ fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, Strin
         .ok_or_else(|| format!("cannot resolve conversation base {rev:?}"))
 }
 
-fn snapshot_merge_refs(t: &GitTransport) -> Result<String, String> {
-    let mut store = open_store(t)?;
-    let genesis = ensure_genesis(&mut store)?;
-    let mut lines = String::new();
-    for name in MERGE_REF_CANDIDATES {
-        let candidate = format!("{name}^{{commit}}");
-        let Ok(hash) = t.git_capture(&["rev-parse", "--verify", "--quiet", &candidate], None)
-        else {
-            continue;
-        };
-        let hash = hash.trim();
-        let hash = oid(hash, "merge ref")?;
-        if conversation_protocol::v3::CodeOps::is_ancestor(&store, &genesis, &hash)? {
-            continue;
-        }
-        t.ensure_pushed(hash.as_str())?;
-        lines.push_str(name);
-        lines.push(' ');
-        lines.push_str(hash.as_str());
-        lines.push('\n');
-    }
-    Ok(lines)
-}
+// Git terminates config output; remove only that delimiter, preserving path whitespace.
 
 fn update_local_cache(t: &GitTransport, refname: &str, hash: &str) -> Result<(), String> {
     t.git_capture(&["update-ref", refname, hash], None)
@@ -3208,7 +3157,7 @@ fn parse_cli_args(args: &[String], positional_message: bool) -> Result<LineArgs,
             "--new" if positional_message => parsed.new = true,
             "--log" => parsed.log = true,
             "--base" => parsed.options.base = Some(next(&mut index)?),
-            "--workspace" => parsed.options.workspace = Some(next(&mut index)?),
+            "--source-tree" => parsed.options.source_tree = Some(next(&mut index)?),
             "--system" => parsed.options.system = Some(next(&mut index)?),
             "--system-file" => parsed.options.system_file = Some(next(&mut index)?),
             "--model" => parsed.options.model = Some(next(&mut index)?),
@@ -3413,18 +3362,46 @@ mod tests {
             &repo,
             &["remote", "add", "origin", origin.to_str().unwrap()],
         );
-        std::fs::write(repo.join("workspace"), "base\n").unwrap();
-        git(&repo, &["add", "workspace"]);
+        std::fs::write(repo.join("source_tree"), "base\n").unwrap();
+        git(&repo, &["add", "source_tree"]);
         git(&repo, &["commit", "--quiet", "-m", "base"]);
         let base = git(&repo, &["rev-parse", "HEAD"]);
         let transport = GitTransport::discover(&repo).unwrap();
         (root, transport, base)
     }
 
-    fn options() -> TurnOptions {
+    fn fixture_reference(
+        t: &GitTransport,
+        id: &str,
+        name: &str,
+        commit: Option<&str>,
+    ) -> Result<String, String> {
+        let commit = commit
+            .map(|value| oid(value, "fixture commit"))
+            .transpose()?;
+        if let Some(commit) = &commit {
+            ensure_code_commit(t, &mut open_store(t)?, commit)?;
+        }
+        append_transition(t, id, &refs::head_ref(id)?, "fixture edit", |_, _| {
+            Ok(Step::Mint(Transition::reference(
+                name.into(),
+                commit.clone(),
+            )))
+        })
+    }
+
+    fn options(transport: &GitTransport) -> TurnOptions {
+        let mut store = open_store(transport).unwrap();
+        let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+        content.put_oid(
+            "main",
+            conversation_protocol::v3::Mode::Commit,
+            oid(&git(transport.work_dir(), &["rev-parse", "HEAD"]), "head").unwrap(),
+        );
         TurnOptions {
-            username: Some("Alice".to_string()),
-            ..TurnOptions::default()
+            username: Some("Alice".into()),
+            initial_content: Some(content.build(&mut store).unwrap().to_string()),
+            ..Default::default()
         }
     }
 
@@ -3433,16 +3410,20 @@ mod tests {
             transport.work_dir(),
             &["checkout", "--quiet", "--detach", base],
         );
-        std::fs::write(transport.work_dir().join("workspace"), contents).unwrap();
-        git(transport.work_dir(), &["add", "workspace"]);
+        std::fs::write(transport.work_dir().join("source_tree"), contents).unwrap();
+        git(transport.work_dir(), &["add", "source_tree"]);
         git(transport.work_dir(), &["commit", "--quiet", "-m", message]);
         git(transport.work_dir(), &["rev-parse", "HEAD"])
+    }
+
+    fn publishing_repository(transport: &GitTransport) -> String {
+        git(transport.work_dir(), &["remote", "get-url", "origin"])
     }
 
     fn create_idle_conversation(transport: &GitTransport, id: &str, base: &str) {
         submit_message_inner_with(
             transport,
-            &options(),
+            &options(transport),
             id,
             "start",
             false,
@@ -3452,6 +3433,71 @@ mod tests {
         )
         .unwrap();
         interrupt_request(transport, id).unwrap();
+    }
+
+    #[test]
+    fn filesystem_previews_adjacent_boundaries_and_ordinary_content() {
+        use conversation_protocol::v3::tree::{Mode, TreeBuilder};
+        let (root, t, base) = fixture("filesystem");
+        let repo = t.work_dir();
+        std::fs::write(repo.join("source_tree"), "first change\n").unwrap();
+        std::fs::write(repo.join("deleted"), "remove me\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "first"]);
+        let first = git(repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("source_tree"), "second change\n").unwrap();
+        std::fs::remove_file(repo.join("deleted")).unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "--quiet", "-m", "second"]);
+        let second = git(repo, &["rev-parse", "HEAD"]);
+        let mut store = open_store(&t).unwrap();
+        let mut content = TreeBuilder::from(None);
+        for (path, commit) in [
+            ("feature/00-base", &base),
+            ("feature/01-first", &first),
+            ("feature/dirty", &second),
+        ] {
+            content.put_oid(path, Mode::Commit, oid(commit, "commit").unwrap());
+        }
+        content.put_oid(
+            "memories/note",
+            Mode::Blob,
+            store.write_blob(b"remember this").unwrap(),
+        );
+        let tree = content.build(&mut store).unwrap().to_string();
+        let rows = filesystem::list(&t, &tree, "feature").unwrap();
+        assert_eq!(
+            rows.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["dirty", "01-first", "00-base"]
+        );
+        let preview = filesystem::preview(&t, &tree, "feature").unwrap();
+        assert!(preview.title.contains("01-first"));
+        assert!(preview.text.contains("-first change"));
+        assert!(preview.text.contains("+second change"));
+        let file = filesystem::preview(&t, &tree, "feature/dirty/source_tree").unwrap();
+        assert!(file.text.contains("+second change"));
+        assert!(!file.text.contains("-base"));
+        let deleted = filesystem::list(&t, &tree, "feature/dirty").unwrap();
+        assert!(deleted
+            .iter()
+            .any(|e| e.name == "deleted" && e.change == '-'));
+        assert!(filesystem::preview(&t, &tree, "feature/dirty/deleted")
+            .unwrap()
+            .text
+            .contains("-remove me"));
+        assert_eq!(
+            filesystem::preview(&t, &tree, "feature/00-base/source_tree")
+                .unwrap()
+                .text,
+            "base\n"
+        );
+        assert_eq!(
+            filesystem::preview(&t, &tree, "memories/note")
+                .unwrap()
+                .text,
+            "remember this"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3493,7 +3539,7 @@ mod tests {
                                 "push",
                                 "--quiet",
                                 "origin",
-                                &format!("{planned}:refs/heads/caos/retry-talk"),
+                                &format!("{planned}:refs/heads/main"),
                             ],
                         );
                     }
@@ -3501,10 +3547,21 @@ mod tests {
                 }));
             });
             assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                publish_workspace_branch(&transport, "retry-talk", None)
+                publish_source_tree_branch(
+                    &transport,
+                    "retry-talk",
+                    None,
+                    &publishing_repository(&transport),
+                )
             }))
             .is_err());
-            let retry = publish_workspace_branch(&transport, "retry-talk", None).unwrap();
+            let retry = publish_source_tree_branch(
+                &transport,
+                "retry-talk",
+                None,
+                &publishing_repository(&transport),
+            )
+            .unwrap();
             assert_eq!(retry.status, PublicationStatus::Complete);
             let head = conversation_head(&transport, "retry-talk")
                 .unwrap()
@@ -3539,14 +3596,678 @@ mod tests {
     }
 
     #[test]
-    fn publication_fast_forwards_but_rejects_divergent_workspaces() {
+    fn empty_conversations_accept_messages_and_later_attachments() {
+        let (root, transport, base) = fixture("empty-launch");
+        let options = TurnOptions {
+            initial_content: None,
+            ..options(&transport)
+        };
+        let head = create_conversation(&transport, &options, "empty", "New conversation").unwrap();
+        let load = conversation_load(&transport, "empty").unwrap().unwrap();
+        assert!(load.source_trees.is_empty());
+        assert!(create_conversation(&transport, &options, "empty", "duplicate").is_err());
+        submit_message_inner_with(
+            &transport,
+            &options,
+            "empty",
+            "plan first",
+            false,
+            None,
+            None,
+            |_, _, _, _| Ok(base.clone()),
+        )
+        .unwrap();
+        interrupt_request(&transport, "empty").unwrap();
+        fixture_reference(&transport, "empty", "code", Some(&base)).unwrap();
+        assert_eq!(
+            conversation_load(&transport, "empty")
+                .unwrap()
+                .unwrap()
+                .source_trees
+                .len(),
+            1
+        );
+        let store = open_store(&transport).unwrap();
+        assert!(spine_contains(
+            &store,
+            oid(
+                &conversation_head(&transport, "empty").unwrap().unwrap(),
+                "head"
+            )
+            .unwrap(),
+            &oid(&head, "root").unwrap()
+        )
+        .unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn imports_preserve_disk_contents_git_revisions_and_provenance() {
+        use conversation_protocol::v3::Mode;
+        let (root, transport, base) = fixture("attach-host");
+        let (other_root, other, other_base) = fixture("attach-other");
+        let other_head = commit_file(&other, &other_base, "other repository\n", "other");
+        git(
+            other.work_dir(),
+            &["push", "--quiet", "origin", "HEAD:refs/heads/main"],
+        );
+        git(
+            &other_root.join("origin.git"),
+            &["symbolic-ref", "HEAD", "refs/heads/main"],
+        );
+        create_idle_conversation(&transport, "attached", &base);
+        let repository = other_root.join("origin.git").to_str().unwrap().to_string();
+        source_trees::import_source(&transport, "attached", "api", &repository, Some("main"))
+            .unwrap();
+        let replay = conversation_load(&transport, "attached")
+            .unwrap()
+            .unwrap()
+            .replay;
+        let notice = replay.turns.last().unwrap();
+        assert_eq!(notice.role, ConversationRole::System);
+        assert_eq!(notice.message, format!("Imported at api: {other_head}"));
+        assert!(!notice.commit.is_empty());
+        let local_head = commit_file(&other, &other_head, "unpushed work\n", "local work");
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "clean",
+                other.work_dir().to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            local_head
+        );
+        // Linked worktrees have a .git file rather than a .git directory.
+        let linked = other_root.join("linked");
+        git(
+            other.work_dir(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "linked",
+                linked.to_str().unwrap(),
+                None
+            )
+            .unwrap(),
+            local_head
+        );
+        std::fs::write(other.work_dir().join("source_tree"), "uncommitted work\n").unwrap();
+        std::fs::write(other.work_dir().join(".git/info/exclude"), "local-only\n").unwrap();
+        std::fs::write(other.work_dir().join("local-only"), "not imported").unwrap();
+        std::fs::create_dir(other.work_dir().join("src")).unwrap();
+        std::fs::write(other.work_dir().join("src/public.txt"), "public").unwrap();
+        std::fs::write(
+            other.work_dir().join("src/private.txt"),
+            "excluded by ancestor",
+        )
+        .unwrap();
+        std::fs::write(
+            other.work_dir().join(".gitignore"),
+            "src/private.txt\nsource_tree\n",
+        )
+        .unwrap();
+        std::fs::write(other.work_dir().join("src/staged.txt"), "staged").unwrap();
+        git(other.work_dir(), &["add", "src/staged.txt"]);
+        std::fs::write(other.work_dir().join("src/staged.txt"), "disk").unwrap();
+        std::os::unix::fs::symlink("source_tree", other.work_dir().join("link")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            other.work_dir().join("src/public.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let source_index = std::fs::read(other.work_dir().join(".git/index")).unwrap();
+        assert!(source_trees::import_source(
+            &transport,
+            "attached",
+            "subdir",
+            other.work_dir().join("src").to_str().unwrap(),
+            None,
+        )
+        .unwrap_err()
+        .contains("checkout root"));
+        let disk_tree = source_trees::import_source(
+            &transport,
+            "attached",
+            "local",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let store = open_store(&transport).unwrap();
+        let imported = store
+            .read_commit(&oid(&disk_tree, "disk").unwrap())
+            .unwrap();
+        assert_eq!(imported.parents, vec![oid(&local_head, "parent").unwrap()]);
+        let disk = conversation_protocol::v3::tree::Snapshot::new(&store, imported.tree);
+        assert_eq!(disk.read("src/staged.txt").unwrap().unwrap(), b"disk");
+        assert_eq!(disk.entry("link").unwrap().unwrap().mode, Mode::Link);
+        assert_eq!(
+            disk.entry("src/public.txt").unwrap().unwrap().mode,
+            Mode::Executable
+        );
+        assert!(!disk.exists("src/private.txt").unwrap());
+        assert!(!disk.exists("local-only").unwrap());
+        assert_eq!(
+            std::fs::read(other.work_dir().join(".git/index")).unwrap(),
+            source_index
+        );
+        assert_eq!(git(other.work_dir(), &["rev-parse", "HEAD"]), local_head);
+        assert_eq!(
+            disk.read("source_tree").unwrap().unwrap(),
+            b"uncommitted work\n"
+        );
+        assert!(disk
+            .list("")
+            .unwrap()
+            .iter()
+            .all(|entry| entry.name != ".git"));
+        assert_eq!(
+            source_trees::import_source(
+                &transport,
+                "attached",
+                "pinned",
+                other.work_dir().to_str().unwrap(),
+                Some(&other_head)
+            )
+            .unwrap(),
+            other_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.work_dir().join("source_tree")).unwrap(),
+            "uncommitted work\n"
+        );
+        let plain = other_root.join("plain folder");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("note.txt"), "notes").unwrap();
+        for source in [&plain, &plain.join("note.txt")] {
+            let error = source_trees::import_source(
+                &transport,
+                "attached",
+                "notes",
+                source.to_str().unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("local imports require a Git checkout root"));
+        }
+        // Local-only origins are not portable conversation metadata.
+        assert!(
+            source_trees::local_import_metadata("imports/local/base", other.work_dir())
+                .unwrap()
+                .is_none()
+        );
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/team/project.git",
+            ],
+        );
+        git(
+            other.work_dir(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        // This URL cannot be fetched: provenance discovery must stay offline.
+        source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/base",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let store = open_store(&transport).unwrap();
+        let imported_head = oid(
+            &conversation_head(&transport, "attached").unwrap().unwrap(),
+            "import",
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &imported_head).unwrap();
+        let metadata = view
+            .snapshot()
+            .read("imports/project/base.source.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&metadata).unwrap(),
+            json!({
+                "repository": "https://example.invalid/team/project.git", "default_branch": "main"
+            })
+        );
+        assert_eq!(
+            view.snapshot()
+                .entry("imports/project/base")
+                .unwrap()
+                .unwrap()
+                .oid
+                .to_string(),
+            disk_tree
+        );
+        // Sibling imports own independent provenance, even from different remotes.
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/other.git",
+            ],
+        );
+        source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/other",
+            other.work_dir().to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let head = oid(
+            &conversation_head(&transport, "attached").unwrap().unwrap(),
+            "siblings",
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &head).unwrap();
+        assert_eq!(
+            view.snapshot()
+                .read("imports/project/base.source.json")
+                .unwrap()
+                .unwrap(),
+            metadata
+        );
+        let other_metadata: serde_json::Value = serde_json::from_slice(
+            &view
+                .snapshot()
+                .read("imports/project/other.source.json")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            other_metadata["repository"],
+            "https://example.invalid/other.git"
+        );
+        // A user file at this import's sidecar path is still never overwritten.
+        append_transition(
+            &transport,
+            "attached",
+            &refs::head_ref("attached").unwrap(),
+            "fixture metadata",
+            |_, _| {
+                Ok(Step::Mint(Transition::FilesApply {
+                    files: vec![(
+                        "imports/project/conflict.source.json".into(),
+                        Some((Mode::Blob, b"notes".to_vec())),
+                    )],
+                }))
+            },
+        )
+        .unwrap();
+        let before = conversation_head(&transport, "attached").unwrap().unwrap();
+        assert!(source_trees::import_source(
+            &transport,
+            "attached",
+            "imports/project/conflict",
+            other.work_dir().to_str().unwrap(),
+            None
+        )
+        .unwrap_err()
+        .contains("provenance"));
+        assert_eq!(
+            conversation_head(&transport, "attached").unwrap().unwrap(),
+            before
+        );
+        git(
+            other.work_dir(),
+            &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        );
+        let (_, bytes) =
+            source_trees::local_import_metadata("imports/other/base", other.work_dir())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            json!({"repository": "https://example.invalid/other.git"})
+        );
+        git(
+            other.work_dir(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://user:secret@example.invalid/repo.git",
+            ],
+        );
+        assert!(
+            source_trees::local_import_metadata("imports/private/base", other.work_dir())
+                .unwrap()
+                .is_none()
+        );
+        let before = conversation_head(&transport, "attached").unwrap().unwrap();
+        assert!(source_trees::import_source(
+            &transport,
+            "attached",
+            "api",
+            &repository,
+            Some("main")
+        )
+        .is_err());
+        assert_eq!(
+            conversation_head(&transport, "attached").unwrap().unwrap(),
+            before
+        );
+        let load = conversation_load(&transport, "attached").unwrap().unwrap();
+        let api = load
+            .source_trees
+            .iter()
+            .find(|ws| ws.name == "api")
+            .unwrap();
+        assert_eq!(api.head, other_head);
+        assert!(load.source_trees.iter().any(|tree| tree.name == "main"));
+        assert!(!load
+            .source_trees
+            .iter()
+            .any(|tree| tree.name.starts_with("api/")));
+        let store = open_store(&transport).unwrap();
+        use conversation_protocol::v3::CodeOps;
+        let remote = GitStore::open(&root.join("remote.git"), None).unwrap();
+        remote
+            .read_commit(&oid(&other_head, "attached").unwrap())
+            .unwrap();
+        assert_eq!(
+            store
+                .tree_of(&oid(&other_head, "attached").unwrap())
+                .unwrap(),
+            remote
+                .tree_of(&oid(&other_head, "attached").unwrap())
+                .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other_root).unwrap();
+    }
+
+    #[test]
+    fn directory_stack_publishes_previewed_commits_and_rejects_changes() {
+        let (root, transport, base) = fixture("directory-stack");
+        git(
+            transport.work_dir(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{base}:refs/heads/main"),
+            ],
+        );
+        create_idle_conversation(&transport, "stack", &base);
+        let repository = root.join("origin.git").to_str().unwrap().to_string();
+        let one = commit_file(&transport, &base, "first change\n", "first");
+        let two = commit_file(&transport, &one, "second change\n", "second");
+        fixture_reference(&transport, "stack", "feature/00-base", Some(&base)).unwrap();
+        fixture_reference(&transport, "stack", "feature/apples", Some(&one)).unwrap();
+        fixture_reference(&transport, "stack", "feature/dirty", Some(&two)).unwrap();
+        fixture_reference(&transport, "stack", "imports/repo/base", Some(&base)).unwrap();
+        let write_metadata = |path: &str, value: Option<Vec<u8>>| {
+            append_transition(
+                &transport,
+                "stack",
+                &refs::head_ref("stack").unwrap(),
+                "import provenance",
+                |_, _| {
+                    Ok(Step::Mint(Transition::FilesApply {
+                        files: vec![(
+                            path.into(),
+                            value
+                                .clone()
+                                .map(|bytes| (conversation_protocol::v3::Mode::Blob, bytes)),
+                        )],
+                    }))
+                },
+            )
+            .unwrap();
+        };
+        write_metadata(
+            "imports/repo/base.source.json",
+            Some(br#"{"repository":"https://example.com/repo","default_branch":"main"}"#.to_vec()),
+        );
+        assert_eq!(
+            source_trees::publication_provenance(&transport, "stack", "feature/apples")
+                .unwrap()
+                .unwrap(),
+            "https://example.com/repo"
+        );
+        fixture_reference(&transport, "stack", "imports/other/base", Some(&base)).unwrap();
+        write_metadata(
+            "imports/other/base.source.json",
+            Some(br#"{"repository":"https://example.com/other","default_branch":"main"}"#.to_vec()),
+        );
+        assert!(
+            source_trees::publication_provenance(&transport, "stack", "feature/apples")
+                .unwrap()
+                .is_none()
+        );
+        // A legacy policy file cannot supply or override an explicit destination.
+        write_metadata(
+            "feature/.base-url",
+            Some(b"https://wrong.example/repo\nwrong\n".to_vec()),
+        );
+        assert!(source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            None
+        )
+        .unwrap_err()
+        .contains("unambiguous"));
+        assert!(source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "missing",
+            Some("main"),
+            Some(&repository)
+        )
+        .is_err());
+        // Repository inference is independent of the metadata's default branch.
+        let remote_url = format!("file://{repository}");
+        for (path, branch) in [
+            ("imports/repo/base.source.json", "main"),
+            ("imports/other/base.source.json", "develop"),
+        ] {
+            write_metadata(
+                path,
+                Some(
+                    serde_json::json!({"repository": remote_url, "default_branch": branch})
+                        .to_string()
+                        .into_bytes(),
+                ),
+            );
+        }
+        let inferred = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(inferred.repository, remote_url);
+        assert_eq!(inferred.base_branch, "main");
+        let content_head = conversation_head(&transport, "stack").unwrap();
+        let first = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            content_head
+        );
+        assert_eq!(first.head, one);
+        assert_eq!(first.repository, repository);
+        source_trees::publish_target(&transport, "stack", &first, &base).unwrap();
+
+        // The explicit base wins even for a later sibling; a single PR is not an implicit stack.
+        let independent = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert_eq!(independent.base_branch, "main");
+        assert_eq!(independent.base_commit.as_deref(), Some(base.as_str()));
+        let second = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("feature/apples"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert_eq!(second.base_commit.as_deref(), Some(one.as_str()));
+        source_trees::publish_target(&transport, "stack", &second, &one).unwrap();
+        assert_eq!(
+            git(
+                &root.join("origin.git"),
+                &["rev-parse", "refs/heads/feature/apples"]
+            ),
+            one
+        );
+        assert_eq!(
+            git(
+                &root.join("origin.git"),
+                &["rev-parse", "refs/heads/feature/dirty"]
+            ),
+            two
+        );
+
+        // A preview never authorizes different content or a changed remote branch.
+        assert!(source_trees::publish_target(&transport, "stack", &first, &base).is_err());
+        let fresh = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/apples",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        fixture_reference(&transport, "stack", "feature/apples", Some(&two)).unwrap();
+        assert!(source_trees::publish_target(&transport, "stack", &fresh, &base).is_err());
+
+        // A moved base needs an explicit import/agent handoff, never a push.
+        let advanced = commit_file(&transport, &base, "remote advance\n", "remote");
+        git(
+            transport.work_dir(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{advanced}:refs/heads/main"),
+            ],
+        );
+        let plan = source_trees::prepare_publication(
+            &transport,
+            "stack",
+            "feature/dirty",
+            Some("main"),
+            Some(&repository),
+        )
+        .unwrap();
+        assert!(plan.base_import.is_some());
+        assert!(
+            source_trees::publish_target(&transport, "stack", &plan, &advanced)
+                .unwrap_err()
+                .contains("does not contain")
+        );
+        let message = source_trees::import_publication_base(&transport, "stack", &plan).unwrap();
+        assert!(message.contains(&advanced));
+        assert!(message.contains("feature/dirty"));
+        assert!(message.contains("Do not publish"));
+        let imported_head = conversation_head(&transport, "stack").unwrap();
+        assert_eq!(
+            source_trees::import_publication_base(&transport, "stack", &plan).unwrap(),
+            message
+        );
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            imported_head
+        );
+        let load = conversation_load(&transport, "stack").unwrap().unwrap();
+        assert!(load
+            .source_trees
+            .iter()
+            .any(|entry| Some(&entry.name) == plan.base_import.as_ref() && entry.head == advanced));
+        assert_eq!(
+            git(
+                &root.join("origin.git"),
+                &["rev-parse", "refs/heads/feature/dirty"]
+            ),
+            two
+        );
+        let next_base = commit_file(
+            &transport,
+            &advanced,
+            "another remote advance\n",
+            "new remote",
+        );
+        git(
+            transport.work_dir(),
+            &[
+                "push",
+                "--quiet",
+                "origin",
+                &format!("{next_base}:refs/heads/main"),
+            ],
+        );
+        assert!(
+            source_trees::import_publication_base(&transport, "stack", &plan)
+                .unwrap_err()
+                .contains("base changed")
+        );
+        assert_eq!(
+            conversation_head(&transport, "stack").unwrap(),
+            imported_head
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_fast_forwards_but_rejects_divergent_source_trees() {
         let (root, transport, base) = fixture("publish-advance");
         create_idle_conversation(&transport, "advance-talk", &base);
-        publish_workspace_branch(&transport, "advance-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let next = commit_file(&transport, &base, "updated\n", "updated");
         submit_message_inner_with(
             &transport,
-            &options(),
+            &options(&transport),
             "advance-talk",
             "use the edit",
             false,
@@ -3556,45 +4277,106 @@ mod tests {
         )
         .unwrap();
         interrupt_request(&transport, "advance-talk").unwrap();
-        let published = publish_workspace_branch(&transport, "advance-talk", None).unwrap();
+        let published = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(published.status, PublicationStatus::Complete);
         assert_eq!(published.head, next);
+        let source_head = conversation_head(&transport, "advance-talk")
+            .unwrap()
+            .unwrap();
+        fork_conversation(&transport, "Alice", "forked-talk", "fork", &source_head).unwrap();
+        let forked = publish_source_tree_branch(
+            &transport,
+            "forked-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
+        assert_eq!(forked.branch, "main");
+        assert_eq!(
+            git(&root.join("origin.git"), &["rev-parse", "refs/heads/main"]),
+            next
+        );
 
-        let side = commit_file(&transport, &base, "side workspace\n", "side");
-        create_workspace(&transport, "advance-talk", "side", &side).unwrap();
-        let error = publish_workspace_branch(&transport, "advance-talk", Some("side")).unwrap_err();
+        let side = commit_file(&transport, &base, "side source tree\n", "side");
+        fixture_reference(&transport, "advance-talk", "side", Some(&side)).unwrap();
+        let side_publication = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            Some("side"),
+            &publishing_repository(&transport),
+        )
+        .unwrap();
+        assert_eq!(side_publication.status, PublicationStatus::Complete);
+        assert_eq!(side_publication.branch, "side");
+        // An outside writer can still advance a source tree's own branch. Preserve it.
+        git(
+            &root.join("origin.git"),
+            &["update-ref", "refs/heads/side", &next],
+        );
+        let error = publish_source_tree_branch(
+            &transport,
+            "advance-talk",
+            Some("side"),
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert!(error.contains("would not fast-forward"), "{error}");
         assert_eq!(
-            git(
-                &root.join("origin.git"),
-                &["rev-parse", "refs/heads/caos/advance-talk"]
-            ),
+            git(&root.join("origin.git"), &["rev-parse", "refs/heads/main"]),
             next
         );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn workspace_branch_publication_records_each_attempt_and_never_creates_a_local_branch() {
+    fn source_tree_branch_publication_records_each_attempt_and_never_creates_a_local_branch() {
         let (root, transport, base) = fixture("publish-branch");
         create_idle_conversation(&transport, "publish-talk", &base);
-        let branch_ref = "refs/heads/caos/publish-talk";
+        let branch_ref = "refs/heads/main";
+        let local_before = git(
+            transport.work_dir(),
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+            ],
+        );
 
         let before = conversation_head(&transport, "publish-talk").unwrap();
-        let error =
-            publish_prepared_workspace_branch(&transport, "publish-talk", "main", &"0".repeat(40))
-                .unwrap_err();
-        assert!(error.contains("changed after PR preparation"), "{error}");
+        let error = publish_prepared_source_tree_branch(
+            &transport,
+            "publish-talk",
+            "main",
+            &"0".repeat(40),
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("changed since the publication preview"),
+            "{error}"
+        );
         assert_eq!(
             conversation_head(&transport, "publish-talk").unwrap(),
             before
         );
         assert!(git(&root.join("origin.git"), &["for-each-ref", branch_ref]).is_empty());
 
-        let first =
-            publish_prepared_workspace_branch(&transport, "publish-talk", "main", &base).unwrap();
-        assert_eq!(first.workspace, "main");
-        assert_eq!(first.branch, "caos/publish-talk");
+        let first = publish_prepared_source_tree_branch(
+            &transport,
+            "publish-talk",
+            "main",
+            &base,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
+        assert_eq!(first.source_tree, "main");
+        assert_eq!(first.branch, "main");
         assert_eq!(first.head, base);
         assert_eq!(first.status, PublicationStatus::Complete);
         assert_eq!(first.observed.as_deref(), Some(base.as_str()));
@@ -3602,21 +4384,30 @@ mod tests {
             git(&root.join("origin.git"), &["rev-parse", branch_ref]),
             base
         );
-        assert!(
-            !Command::new("git")
-                .args(["rev-parse", "--verify", "--quiet", branch_ref])
-                .current_dir(transport.work_dir())
-                .status()
-                .unwrap()
-                .success(),
-            "publication created a local branch"
+        assert_eq!(
+            git(
+                transport.work_dir(),
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads"
+                ]
+            ),
+            local_before
         );
 
         let store = open_store(&transport).unwrap();
         let (_, first_head) = fetch_validated_head(&transport, &store, "publish-talk")
             .unwrap()
             .unwrap();
-        let complete = Conversation::open(&store, &first_head).unwrap();
+        let notice = Conversation::open(&store, &first_head).unwrap();
+        assert_eq!(notice.kind(), Some(Kind::MessageAppend));
+        let replay = replay_at(&store, &first_head).unwrap();
+        let last = replay.turns.last().unwrap();
+        assert_eq!(last.role, ConversationRole::System);
+        assert!(last.message.contains("Published main"));
+        let terminal_head = notice.parent().unwrap().clone();
+        let complete = Conversation::open(&store, &terminal_head).unwrap();
         assert_eq!(complete.kind(), Some(Kind::PublicationTerminal));
         let first_record = complete.publication(&first.publication).unwrap().unwrap();
         assert_eq!(first_record.planned_head.as_str(), base);
@@ -3637,7 +4428,13 @@ mod tests {
         drop(complete);
         drop(store);
 
-        let second = publish_workspace_branch(&transport, "publish-talk", None).unwrap();
+        let second = publish_source_tree_branch(
+            &transport,
+            "publish-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(second.status, PublicationStatus::Complete);
         assert_ne!(second.publication, first.publication);
         let store = open_store(&transport).unwrap();
@@ -3654,7 +4451,7 @@ mod tests {
             Some(base.as_str())
         );
         assert_eq!(conversation.publications().unwrap().len(), 2);
-        let summaries = publication_summaries(&store, &second_head).unwrap();
+        let summaries = publication_summaries(&conversation).unwrap();
         assert_eq!(summaries[0].id, second.publication);
         assert_eq!(summaries[1].id, first.publication);
         std::fs::remove_dir_all(root).unwrap();
@@ -3664,9 +4461,15 @@ mod tests {
     fn publication_preserves_a_remote_commit_present_before_publish() {
         let (root, transport, base) = fixture("publish-existing-drift");
         create_idle_conversation(&transport, "existing-drift-talk", &base);
-        publish_workspace_branch(&transport, "existing-drift-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "existing-drift-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let teammate = commit_file(&transport, &base, "teammate change\n", "teammate");
-        let branch_ref = "refs/heads/caos/existing-drift-talk";
+        let branch_ref = "refs/heads/main";
         git(
             transport.work_dir(),
             &[
@@ -3676,7 +4479,13 @@ mod tests {
                 &format!("{teammate}:{branch_ref}"),
             ],
         );
-        let error = publish_workspace_branch(&transport, "existing-drift-talk", None).unwrap_err();
+        let error = publish_source_tree_branch(
+            &transport,
+            "existing-drift-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert!(error.contains("would not fast-forward"), "{error}");
         assert_eq!(
             git(&root.join("origin.git"), &["rev-parse", branch_ref]),
@@ -3686,12 +4495,18 @@ mod tests {
     }
 
     #[test]
-    fn workspace_branch_publication_records_remote_drift_without_overwriting_it() {
+    fn source_tree_branch_publication_records_remote_drift_without_overwriting_it() {
         let (root, transport, base) = fixture("publish-conflict");
         create_idle_conversation(&transport, "conflict-talk", &base);
-        publish_workspace_branch(&transport, "conflict-talk", None).unwrap();
+        publish_source_tree_branch(
+            &transport,
+            "conflict-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         let unrelated = commit_file(&transport, &base, "unrelated\n", "unrelated");
-        let branch_ref = "refs/heads/caos/conflict-talk";
+        let branch_ref = "refs/heads/main";
         git(
             transport.work_dir(),
             &[
@@ -3721,7 +4536,13 @@ mod tests {
             }));
         });
 
-        let published = publish_workspace_branch(&transport, "conflict-talk", None).unwrap();
+        let published = publish_source_tree_branch(
+            &transport,
+            "conflict-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap();
         assert_eq!(published.status, PublicationStatus::Conflict);
         assert_eq!(published.observed.as_deref(), Some(unrelated.as_str()));
         assert_eq!(
@@ -3751,7 +4572,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_branch_publication_rejects_reserved_state_before_recording() {
+    fn source_tree_branch_publication_rejects_reserved_state_before_recording() {
         let (root, transport, base) = fixture("publish-conflicts-guard");
         git(
             transport.work_dir(),
@@ -3760,13 +4581,13 @@ mod tests {
         std::fs::create_dir_all(transport.work_dir().join(".caos")).unwrap();
         std::fs::write(
             transport.work_dir().join(".caos/conflicts"),
-            "100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2\tworkspace\n",
+            "100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 2\tsource_tree\n",
         )
         .unwrap();
         git(transport.work_dir(), &["add", ".caos/conflicts"]);
         git(
             transport.work_dir(),
-            &["commit", "--quiet", "-m", "conflicted workspace"],
+            &["commit", "--quiet", "-m", "conflicted source tree"],
         );
         let conflicted = git(transport.work_dir(), &["rev-parse", "HEAD"]);
         create_idle_conversation(&transport, "guard-talk", &conflicted);
@@ -3774,10 +4595,16 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let error = publish_workspace_branch(&transport, "guard-talk", None).unwrap_err();
+        let error = publish_source_tree_branch(
+            &transport,
+            "guard-talk",
+            None,
+            &publishing_repository(&transport),
+        )
+        .unwrap_err();
         assert_eq!(
             error,
-            "the workspace carries `.caos/` state; resolve and remove `.caos/conflicts` first"
+            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata"
         );
         assert_eq!(
             conversation_head(&transport, "guard-talk")
@@ -3799,6 +4626,63 @@ mod tests {
                 .unwrap(),
             None
         );
+        // Publication also rejects legacy metadata, including an actual empty tree.
+        use conversation_protocol::v3::tree::TreeBuilder;
+        use conversation_protocol::v3::Mode;
+        let mut store = open_store(&transport).unwrap();
+        let base_tree = oid(
+            &git(
+                transport.work_dir(),
+                &["rev-parse", &format!("{base}^{{tree}}")],
+            ),
+            "tree",
+        )
+        .unwrap();
+        let empty = TreeBuilder::from(None).build(&mut store).unwrap();
+        for (name, content, expected) in [
+            ("empty-ledger", Some(""), "empty `.caos/conflicts` file"),
+            ("other-state", None, "reserved `.caos` content"),
+            ("empty-directory", None, ".caos/ (empty directory)"),
+        ] {
+            let mut tree = TreeBuilder::from(Some(base_tree.clone()));
+            tree.put_oid(".caos", Mode::Tree, empty.clone());
+            if let Some(content) = content {
+                tree.put(".caos/conflicts", Mode::Blob, content.as_bytes().to_vec());
+            } else if name == "other-state" {
+                tree.put(".caos/format", Mode::Blob, b"protocol".to_vec());
+            }
+            let tree = if name == "empty-directory" {
+                // TreeBuilder prunes empty directories; construct the Git entry directly.
+                let mut raw = b"40000 .caos\0".to_vec();
+                raw.extend(
+                    (0..40)
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&empty.as_str()[i..i + 2], 16).unwrap()),
+                );
+                oid(
+                    &transport.put_object("tree", &raw).unwrap().to_string(),
+                    "tree",
+                )
+                .unwrap()
+            } else {
+                tree.build(&mut store).unwrap()
+            };
+            let commit = git(
+                transport.work_dir(),
+                &["commit-tree", tree.as_str(), "-p", &base, "-m", name],
+            );
+            create_idle_conversation(&transport, name, &commit);
+            fixture_reference(&transport, name, "main", Some(&commit)).unwrap();
+            let result = source_trees::prepare_publication(
+                &transport,
+                name,
+                "main",
+                None,
+                Some(&publishing_repository(&transport)),
+            );
+            let error = result.unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3815,9 +4699,9 @@ mod tests {
     }
 
     #[test]
-    fn creation_interjection_idle_submit_and_workspace_transitions_validate() {
+    fn creation_interjection_idle_submit_and_source_tree_transitions_validate() {
         let (root, transport, base) = fixture("conversation");
-        let options = options();
+        let options = options(&transport);
         let prepared = |_: &GitTransport, _: &TurnOptions, _: &str, _: &str| Ok(base.clone());
         assert_eq!(
             submit_message_inner_with(
@@ -3837,9 +4721,9 @@ mod tests {
         std::fs::write(&ref_lock, "another reader").unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         std::fs::remove_file(ref_lock).unwrap();
-        assert_eq!(load.snapshot.status, RequestStatus::Queued);
+        assert_eq!(load.snapshot.status, TurnStatus::Queued);
         assert_eq!(load.replay.turns[0].message, "hello");
-        assert_eq!(load.workspaces[0].name, "main");
+        assert_eq!(load.source_trees[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
         let store = open_store(&transport).unwrap();
         let first_message = store.read_commit(&head).unwrap().parents[0].to_string();
@@ -3850,7 +4734,10 @@ mod tests {
             let commit = store.read_commit(&cursor).unwrap();
             assert_eq!(commit.parents.len(), 1, "every commit has one parent");
             if commit.parents[0].as_str() == G3 {
-                assert_eq!(commit.message, b"conversation.root\n");
+                assert_eq!(
+                    Kind::parse_message(&commit.message).unwrap(),
+                    Kind::ConversationRoot
+                );
                 break;
             }
             assert_ne!(commit.parents[0].as_str(), base);
@@ -3901,7 +4788,7 @@ mod tests {
         assert_eq!(
             Conversation::open(&store, &active_head)
                 .unwrap()
-                .active_request()
+                .active_turn()
                 .unwrap()
                 .unwrap()
                 .interjections
@@ -3952,8 +4839,8 @@ mod tests {
         git(transport.work_dir(), &["add", "other"]);
         git(transport.work_dir(), &["commit", "--quiet", "-m", "other"]);
         let other = git(transport.work_dir(), &["rev-parse", "HEAD"]);
-        create_workspace(&transport, "talk-1", "other", &other).unwrap();
-        remove_workspace(&transport, "talk-1", "other").unwrap();
+        fixture_reference(&transport, "talk-1", "other", Some(&other)).unwrap();
+        fixture_reference(&transport, "talk-1", "other", None).unwrap();
         let summaries =
             list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
         assert_eq!(summaries[0].title, "hello");
@@ -3961,9 +4848,9 @@ mod tests {
     }
 
     #[test]
-    fn proposal_direct_conflict_and_rollback_follow_workspace_preimages() {
+    fn proposal_direct_conflict_and_rollback_follow_source_tree_preimages() {
         let (root, transport, base) = fixture("proposal");
-        let options = options();
+        let options = options(&transport);
         submit_message_inner_with(
             &transport,
             &options,
@@ -3996,13 +4883,13 @@ mod tests {
             .unwrap();
         let conversation = Conversation::open(&store, &head).unwrap();
         assert_eq!(
-            conversation.workspace("main").unwrap().unwrap().commit,
+            conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
         let (_, entry) = conversation.transcript_entry(1).unwrap().unwrap();
         assert!(matches!(
-            entry.workspace_resolution,
-            Some(WorkspaceResolution::Direct { .. })
+            entry.source_tree_resolution,
+            Some(SourceTreeResolution::Direct { .. })
         ));
         drop(conversation);
         interrupt_request(&transport, "proposal-talk").unwrap();
@@ -4018,7 +4905,7 @@ mod tests {
             |_, _, _, _| panic!("conflicting proposals are not admitted"),
         )
         .unwrap_err();
-        assert!(error.contains("workspace"), "{error}");
+        assert!(error.contains("source_tree"), "{error}");
         assert!(error.contains("conflicting proposal recorded"));
         let store = open_store(&transport).unwrap();
         let (_, conflict_head) = fetch_validated_head(&transport, &store, "proposal-talk")
@@ -4026,28 +4913,28 @@ mod tests {
             .unwrap();
         let conversation = Conversation::open(&store, &conflict_head).unwrap();
         assert_eq!(
-            conversation.workspace("main").unwrap().unwrap().commit,
+            conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
         let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
         assert!(matches!(
-            entry.workspace_resolution,
-            Some(WorkspaceResolution::Conflict { .. })
+            entry.source_tree_resolution,
+            Some(SourceTreeResolution::Conflict { .. })
         ));
         drop(conversation);
 
-        rollback_workspace(&transport, "proposal-talk", "main", &base).unwrap();
+        fixture_reference(&transport, "proposal-talk", "main", Some(&base)).unwrap();
         let load = conversation_load(&transport, "proposal-talk")
             .unwrap()
             .unwrap();
-        assert_eq!(load.workspaces[0].head, base);
+        assert_eq!(load.source_trees[0].head, base);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn active_request_proposals_move_directly_and_record_conflicts() {
         let (root, transport, base) = fixture("active-proposal");
-        let options = options();
+        let options = options(&transport);
         let request = "a".repeat(40);
         submit_message_inner_with(
             &transport,
@@ -4082,13 +4969,13 @@ mod tests {
             .unwrap();
         let conversation = Conversation::open(&store, &direct_head).unwrap();
         assert_eq!(
-            conversation.workspace("main").unwrap().unwrap().commit,
+            conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
         let (_, entry) = conversation.transcript_entry(1).unwrap().unwrap();
         assert!(matches!(
-            entry.workspace_resolution,
-            Some(WorkspaceResolution::Direct { .. })
+            entry.source_tree_resolution,
+            Some(SourceTreeResolution::Direct { .. })
         ));
         drop(conversation);
         drop(store);
@@ -4104,7 +4991,7 @@ mod tests {
             |_, _, _, _| panic!("conflicting interjections do not prepare a request"),
         )
         .unwrap_err();
-        assert!(error.contains("workspace"), "{error}");
+        assert!(error.contains("source_tree"), "{error}");
         assert!(error.contains("conflicting proposal recorded"));
 
         let store = open_store(&transport).unwrap();
@@ -4113,13 +5000,13 @@ mod tests {
             .unwrap();
         let conversation = Conversation::open(&store, &conflict_head).unwrap();
         assert_eq!(
-            conversation.workspace("main").unwrap().unwrap().commit,
+            conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
         let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
         assert!(matches!(
-            entry.workspace_resolution,
-            Some(WorkspaceResolution::Conflict { .. })
+            entry.source_tree_resolution,
+            Some(SourceTreeResolution::Conflict { .. })
         ));
         drop(conversation);
         drop(store);
@@ -4130,7 +5017,7 @@ mod tests {
     #[test]
     fn fork_and_title_cas_preserve_source_and_manual_renames() {
         let (root, transport, base) = fixture("fork-title");
-        let options = options();
+        let options = options(&transport);
         submit_message_inner_with(
             &transport,
             &options,
@@ -4150,10 +5037,11 @@ mod tests {
         let store = open_store(&transport).unwrap();
         let fork_oid = oid(&fork, "fork").unwrap();
         let view = Conversation::open(&store, &fork_oid).unwrap();
-        assert_eq!(view.parent().unwrap().as_str(), source);
-        assert_eq!(
-            view.kind(),
-            Some(conversation_protocol::v3::Kind::ConversationFork)
+        assert!(
+            matches!(view.identity().unwrap().kind, IdentityKind::Fork { source: ref parent } if parent.as_str() == source)
+        );
+        assert!(
+            spine_contains(&store, fork_oid.clone(), &oid(&source, "source").unwrap()).unwrap()
         );
         assert!(validate_spine(&store, &fork_oid, &mut HashSet::new()).is_ok());
 
@@ -4177,7 +5065,7 @@ mod tests {
     #[test]
     fn lost_submit_cas_rebuilds_on_the_winner_without_stale_parentage() {
         let (root, transport, _base) = fixture("lost-cas");
-        let options = options();
+        let options = options(&transport);
         submit_message_inner_with(
             &transport,
             &options,
@@ -4244,9 +5132,9 @@ mod tests {
     }
 
     #[test]
-    fn fresh_conversations_seed_the_same_named_workspace() {
-        let (root, transport, base) = fixture("same-workspace");
-        let options = options();
+    fn fresh_conversations_seed_the_same_named_source_tree() {
+        let (root, transport, base) = fixture("same-source-tree");
+        let options = options(&transport);
         for (id, request) in [("one", "a".repeat(40)), ("two", "b".repeat(40))] {
             submit_message_inner_with(
                 &transport,
@@ -4260,9 +5148,9 @@ mod tests {
             )
             .unwrap();
             let load = conversation_load(&transport, id).unwrap().unwrap();
-            assert_eq!(load.workspaces.len(), 1);
-            assert_eq!(load.workspaces[0].name, "main");
-            assert_eq!(load.workspaces[0].base_commit, base);
+            assert_eq!(load.source_trees.len(), 1);
+            assert_eq!(load.source_trees[0].name, "main");
+            assert_eq!(load.source_trees[0].base_commit, base);
         }
         std::fs::remove_dir_all(root).unwrap();
     }

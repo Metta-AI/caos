@@ -12,7 +12,7 @@ llm_test_setup
 rm -rf /tmp/ws
 mkdir -p /tmp/ws
 echo "hello" > /tmp/ws/greeting.txt
-ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
+ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
 P1='[{"text":"Part one.","type":"text"}]'
 P2='[{"text":"Part two.","type":"text"}]'
@@ -24,7 +24,7 @@ printf '{"content":%s,"stop_reason":"end_turn"}' "$P3" > /tmp/stub/response-3.js
 start_stub /tmp/stub
 
 new_llm_conversation max-tokens "$STUB_PORT" "$ws" \
-  "You are a coding agent operating on a git workspace."
+  "You are a coding agent operating on a git source_tree."
 dispatch_turn "write me a long answer"
 wait_turn || fail "the max-tokens turn never reached a terminal head"
 
@@ -35,7 +35,7 @@ while read -r _ role _ _ encoded; do
 done < <($TOOL transcript --repo /tmp/repo --head "$head")
 [ "$assistant_text" = "$want" ] \
   || fail "terminal assistant entry did not concatenate all partials"
-[ "$(workspace_commit "$head")" = "$base" ] || fail "toolless turn changed main"
+[ "$(source_tree_commit "$head")" = "$base" ] || fail "toolless turn changed main"
 
 grep -qF '"max_tokens":64000' /tmp/stub/request-1.json || fail "max_tokens not sent"
 grep -qF '{"content":"write me a long answer","role":"user"}]' /tmp/stub/request-1.json \

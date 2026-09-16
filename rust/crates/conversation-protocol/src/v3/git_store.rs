@@ -23,6 +23,12 @@ pub struct RefUpdate {
     pub new: Option<Oid>,
 }
 
+pub enum HistoryQuery {
+    Log { count: usize },
+    Show,
+    Diff { from: Oid },
+}
+
 pub struct GitStore {
     dir: PathBuf,
     git_dir: PathBuf,
@@ -322,6 +328,74 @@ impl GitStore {
         } else {
             Err(self.output_error("git push", &output))
         }
+    }
+
+    /// Resolve ancestry syntax against an explicit commit, never ambient refs.
+    pub fn ancestor_revision(&self, base: &Oid, suffix: &str) -> Result<Oid, String> {
+        if !suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'^' | b'~'))
+        {
+            return Err(format!("invalid ancestry suffix {suffix:?}"));
+        }
+        self.ensure_local(base)?;
+        let output = self.output(&[
+            "rev-parse",
+            "--verify",
+            &format!("{base}{suffix}^{{commit}}"),
+        ])?;
+        if !output.status.success() {
+            return Err(self.output_error("git rev-parse", &output));
+        }
+        Oid::parse_line(&output.stdout, "resolved revision")
+    }
+
+    /// Read history using the same local object store as reconciliation.
+    /// Paths are literal, and external diff/textconv programs are disabled.
+    pub fn history(
+        &self,
+        head: &Oid,
+        query: HistoryQuery,
+        path: Option<&str>,
+    ) -> Result<String, String> {
+        self.ensure_local(head)?;
+        let count;
+        let from;
+        let mut arguments = vec!["--no-pager", "--literal-pathspecs", "-c", "color.ui=false"];
+        match query {
+            HistoryQuery::Log { count: limit } => {
+                count = format!("--max-count={limit}");
+                arguments.extend([
+                    "log",
+                    "--first-parent",
+                    "--abbrev=12",
+                    "--format=%h  %aI  %an  %s",
+                    &count,
+                ]);
+            }
+            HistoryQuery::Show => arguments.extend([
+                "show",
+                "--format=fuller",
+                "--root",
+                "--diff-merges=first-parent",
+                "--no-ext-diff",
+                "--no-textconv",
+            ]),
+            HistoryQuery::Diff { from: base } => {
+                self.ensure_local(&base)?;
+                from = base.to_string();
+                arguments.extend(["diff", "--no-ext-diff", "--no-textconv", &from]);
+            }
+        }
+        arguments.extend([head.as_str(), "--"]);
+        if let Some(path) = path.filter(|p| !p.is_empty()) {
+            arguments.push(path);
+        }
+        let output = self.output(&arguments)?;
+        if !output.status.success() {
+            return Err(self.output_error("reading Git history", &output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     pub fn git_version(&self) -> Result<String, String> {
@@ -719,6 +793,10 @@ impl CodeOps for GitStore {
         if ancestor == descendant {
             return Ok(true);
         }
+        // Gitlinks do not bring their target commits into a conversation fetch.
+        // Raw Git needs both histories locally, just as read_commit does.
+        self.ensure_local(ancestor)?;
+        self.ensure_local(descendant)?;
         let output = self.output(&[
             "merge-base",
             "--is-ancestor",
@@ -747,6 +825,7 @@ impl CodeOps for GitStore {
             parents: vec![base.clone()],
             author: base_commit.author.clone(),
             committer: base_commit.committer.clone(),
+            extra_headers: Vec::new(),
             message: message.to_vec(),
         };
         let ours_head = self
@@ -798,6 +877,7 @@ impl CodeOps for GitStore {
             parents: parents.to_vec(),
             author: signature.clone(),
             committer: signature.clone(),
+            extra_headers: Vec::new(),
             message: message.as_bytes().to_vec(),
         })
         .map_err(String::from)
@@ -824,7 +904,7 @@ mod tests {
     use crate::v3::fixtures::golden;
     use crate::v3::oid::{ensure_genesis, g3};
     use crate::v3::reconcile::{reconcile, RECONCILE_MESSAGE};
-    use crate::v3::records::WorkspaceResolution;
+    use crate::v3::records::SourceTreeResolution;
     use crate::v3::tree::{canonical_tree_order, Mode, Snapshot, TreeBuilder};
     use crate::v3::validate_spine;
 
@@ -994,6 +1074,7 @@ mod tests {
                 parents: parents.to_vec(),
                 author: signature(),
                 committer: signature(),
+                extra_headers: Vec::new(),
                 message: message.as_bytes().to_vec(),
             })
             .expect("write commit")
@@ -1043,6 +1124,7 @@ mod tests {
             parents: Vec::new(),
             author: signature(),
             committer: signature(),
+            extra_headers: Vec::new(),
             message: b"round trip\n".to_vec(),
         };
         let commit = store.write_commit(&commit_info).expect("write commit");
@@ -1088,6 +1170,7 @@ mod tests {
             parents: Vec::new(),
             author: signature(),
             committer: signature(),
+            extra_headers: Vec::new(),
             message: b"loose commit\n".to_vec(),
         };
         let commit_bytes = encode_commit_bytes(&commit_info);
@@ -1468,7 +1551,12 @@ mod tests {
                 oid: lazy_blob.clone(),
             }])
             .expect("write lazy tree");
-        let lazy_commit = write_commit(&mut first_store, &lazy_tree, &[], "lazy\n");
+        let lazy_commit = write_commit(
+            &mut first_store,
+            &lazy_tree,
+            std::slice::from_ref(&fetched_commit),
+            "lazy\n",
+        );
         let fetched_ref = "refs/caos/test/fetched";
         let lazy_ref = "refs/caos/test/lazy";
         first_store
@@ -1481,7 +1569,7 @@ mod tests {
                 RefUpdate {
                     refname: lazy_ref.to_string(),
                     expected: None,
-                    new: Some(lazy_commit),
+                    new: Some(lazy_commit.clone()),
                 },
             ])
             .expect("push refs");
@@ -1499,6 +1587,13 @@ mod tests {
         assert!(second_store.has_local(&fetched_tree).unwrap());
         assert!(second_store.has_local(&fetched_blob).unwrap());
         assert!(!second_store.has_local(&lazy_blob).unwrap());
+        assert!(!second_store.has_local(&lazy_commit).unwrap());
+        assert!(second_store
+            .is_ancestor(&fetched_commit, &lazy_commit)
+            .unwrap());
+        assert!(!second_store
+            .is_ancestor(&lazy_commit, &fetched_commit)
+            .unwrap());
         assert_eq!(second_store.read_blob(&lazy_blob).unwrap(), b"lazy blob\n");
         assert!(second_store.has_local(&lazy_blob).unwrap());
     }
@@ -1529,7 +1624,21 @@ mod tests {
         init(&repository, false);
         let mut store = GitStore::open(&repository, None).expect("open git store");
         let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
-        let base = write_commit(&mut store, &base_tree, &[], "base\n");
+        // GitHub's signed commits are ordinary source tree inputs. Keep their
+        // headers and object identity through reads, writes, and merges.
+        let base_bytes = format!(
+            "tree {base_tree}\nauthor Git Store <git-store@example.com> 1700000000 +0000\n\
+             committer Git Store <git-store@example.com> 1700000000 +0000\n\
+             encoding UTF-8\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n signed data\n \
+             -----END PGP SIGNATURE-----\n\nbase\n"
+        )
+        .into_bytes();
+        let base = store.write_object(ObjectKind::Commit, &base_bytes).unwrap();
+        let base_info = store.read_commit(&base).expect("read signed code commit");
+        assert_eq!(encode_commit_bytes(&base_info), base_bytes);
+        assert_eq!(store.write_commit(&base_info).unwrap(), base);
+        assert_eq!(base, hash_object(&repository, "commit", &base_bytes));
+        assert_eq!(store.tree_of(&base).unwrap(), base_tree);
         let ours_tree = update_tree(&mut store, Some(&base_tree), "ours.txt", b"ours\n");
         let ours = write_commit(
             &mut store,
@@ -1560,6 +1669,44 @@ mod tests {
             Some(b"theirs\n".to_vec())
         );
 
+        let merge = write_commit(
+            &mut store,
+            &merge_tree,
+            &[ours.clone(), theirs.clone()],
+            "merge\n",
+        );
+        assert_eq!(store.ancestor_revision(&merge, "^2").unwrap(), theirs);
+        assert_eq!(store.ancestor_revision(&merge, "~2").unwrap(), base);
+        assert!(store.ancestor_revision(&base, "^").is_err());
+        assert!(store.ancestor_revision(&base, ":shared.txt").is_err());
+        for _ in 0..2 {
+            let log = store
+                .history(&merge, HistoryQuery::Log { count: 20 }, None)
+                .unwrap();
+            assert_eq!(log.lines().count(), 3);
+            assert!(log.lines().next().unwrap().ends_with("merge"));
+            let diff = store
+                .history(&merge, HistoryQuery::Diff { from: ours.clone() }, None)
+                .unwrap();
+            assert!(diff.contains("+theirs"));
+            assert!(!diff.contains("+ours"));
+            let show = store
+                .history(&merge, HistoryQuery::Show, Some("theirs.txt"))
+                .unwrap();
+            assert!(show.contains("+theirs"));
+            assert!(store
+                .history(&base, HistoryQuery::Show, None)
+                .unwrap()
+                .contains("+base"));
+            assert!(
+                store
+                    .history(&merge, HistoryQuery::Log { count: 20 }, Some("*.txt"))
+                    .unwrap()
+                    .is_empty(),
+                "pathspecs must be literal"
+            );
+        }
+
         let conflict_ours_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"ours\n");
         let conflict_ours = write_commit(
             &mut store,
@@ -1586,7 +1733,7 @@ mod tests {
 
         assert_eq!(
             reconcile(&mut store, &base, &theirs, Some(&base), &signature()).unwrap(),
-            WorkspaceResolution::Direct {
+            SourceTreeResolution::Direct {
                 current: base.clone(),
                 output: theirs.clone(),
             }
@@ -1594,7 +1741,7 @@ mod tests {
 
         let merged = reconcile(&mut store, &base, &theirs, Some(&ours), &signature()).unwrap();
         let merged_output = match merged {
-            WorkspaceResolution::Merged { merge, output, .. } => {
+            SourceTreeResolution::Merged { merge, output, .. } => {
                 assert_eq!(merge.output, Some(output.clone()));
                 assert!(merge.implementation.starts_with("git-merge-tree/"));
                 output
@@ -1615,7 +1762,7 @@ mod tests {
                 &signature()
             )
             .unwrap(),
-            WorkspaceResolution::Conflict { merge: Some(_), .. }
+            SourceTreeResolution::Conflict { merge: Some(_), .. }
         ));
 
         let root_tree = store.write_tree(&[]).unwrap();
@@ -1648,7 +1795,7 @@ mod tests {
                 &signature()
             )
             .unwrap(),
-            WorkspaceResolution::Merged { .. }
+            SourceTreeResolution::Merged { .. }
         ));
 
         let equal_tree = update_tree(&mut store, Some(&base_tree), "equal.txt", b"equal\n");
@@ -1664,19 +1811,42 @@ mod tests {
             std::slice::from_ref(&base),
             "equal proposal\n",
         );
-        assert_eq!(
-            reconcile(
-                &mut store,
-                &base,
-                &equal_proposal,
-                Some(&equal_current),
-                &signature()
-            )
-            .unwrap(),
-            WorkspaceResolution::AlreadyApplied {
-                current: equal_current,
-                candidate: Some(equal_proposal),
-            }
+        let output = match reconcile(
+            &mut store,
+            &base,
+            &equal_proposal,
+            Some(&equal_current),
+            &signature(),
+        )
+        .unwrap()
+        {
+            SourceTreeResolution::Merged { output, .. } => output,
+            other => panic!("equal trees must retain both histories: {other:?}"),
+        };
+        assert_eq!(store.tree_of(&output).unwrap(), equal_tree);
+        assert!(store.is_ancestor(&equal_current, &output).unwrap());
+        assert!(store.is_ancestor(&equal_proposal, &output).unwrap());
+
+        // A merge can add ancestry without changing the source tree.
+        let upstream = write_commit(
+            &mut store,
+            &base_tree,
+            std::slice::from_ref(&base),
+            "upstream metadata\n",
         );
+        let proposal = write_commit(
+            &mut store,
+            &ours_tree,
+            &[ours.clone(), upstream.clone()],
+            "merge upstream\n",
+        );
+        let output =
+            match reconcile(&mut store, &ours, &proposal, Some(&ours), &signature()).unwrap() {
+                SourceTreeResolution::Direct { output, .. } => output,
+                other => panic!("merge ancestry must advance the source tree: {other:?}"),
+            };
+        assert_eq!(output, proposal);
+        assert_eq!(store.tree_of(&output).unwrap(), ours_tree);
+        assert!(store.is_ancestor(&upstream, &output).unwrap());
     }
 }

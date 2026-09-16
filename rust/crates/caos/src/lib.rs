@@ -18,6 +18,8 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
+pub mod gitlinks;
+
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Read, Write};
@@ -98,7 +100,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // edits included), so an edited tool runs edited.
     let (_, ws) = t
         .ingest_path(".")?
-        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+        .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
     let store = build_secret_store(t)?;
     let (kind, arg_tree) = eval::eval_path(t, &ws.to_string(), &dir, &store)?;
     if kind != "tree" {
@@ -639,33 +641,40 @@ impl GitTransport {
 
 impl Transport for GitTransport {
     fn put_object(&self, kind: &str, content: &[u8]) -> Result<gix::ObjectId, String> {
-        match kind {
-            "blob" => self
-                .repo
-                .write_blob(content)
-                .map(|id| id.detach())
-                .map_err(|e| format!("writing blob: {e}")),
-            "tree" => {
-                // Validate the canonical tree encoding, then write it as a real
-                // tree object so its hash is a genuine git tree hash.
-                let tree = gix::objs::TreeRef::from_bytes(content, self.repo.object_hash())
-                    .map_err(|e| format!("invalid tree: {e}"))?;
-                self.repo
-                    .write_object(&tree)
+        let write = |repo: &gix::Repository| {
+            match kind {
+                "blob" => repo
+                    .write_blob(content)
                     .map(|id| id.detach())
-                    .map_err(|e| format!("writing tree: {e}"))
+                    .map_err(|e| format!("writing blob: {e}")),
+                "tree" => {
+                    // Validate the canonical tree encoding, then write it as a real
+                    // tree object so its hash is a genuine git tree hash.
+                    let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
+                        .map_err(|e| format!("invalid tree: {e}"))?;
+                    repo.write_object(&tree)
+                        .map(|id| id.detach())
+                        .map_err(|e| format!("writing tree: {e}"))
+                }
+                "commit" => {
+                    // Validate the commit encoding, then store the raw bytes (not a
+                    // re-encoding), so the hash matches the bytes exactly — the same
+                    // rule the server's `post_object` applies.
+                    gix::objs::CommitRef::from_bytes(content, repo.object_hash())
+                        .map_err(|e| format!("invalid commit: {e}"))?;
+                    gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+                        .map_err(|e| format!("writing commit: {e}"))
+                }
+                other => Err(format!("cannot store object of kind {other}")),
             }
-            "commit" => {
-                // Validate the commit encoding, then store the raw bytes (not a
-                // re-encoding), so the hash matches the bytes exactly — the same
-                // rule the server's `post_object` applies.
-                gix::objs::CommitRef::from_bytes(content, self.repo.object_hash())
-                    .map_err(|e| format!("invalid commit: {e}"))?;
-                gix::objs::Write::write_buf(&self.repo.objects, gix::object::Kind::Commit, content)
-                    .map_err(|e| format!("writing commit: {e}"))
-            }
-            other => Err(format!("cannot store object of kind {other}")),
-        }
+        };
+        write(&self.repo).or_else(|original| {
+            // Fetches can add more packfiles than this long-lived handle's
+            // fixed slotmap can hold. Reopen against the current disk state
+            // before failing a write, as get_object already does for reads.
+            let repo = gix::open(&self.git_dir).map_err(|_| original)?;
+            write(&repo)
+        })
     }
 
     fn get_object(&self, hash: &str) -> Result<(String, Vec<u8>), String> {
@@ -1293,7 +1302,7 @@ impl GitTransport {
     /// on (see [`Self::fetch_object`]'s noop rationale). A single tip the server
     /// certainly has is ACKed in the first round, so the negotiation stays
     /// single-round *and* the pack stays minimal — without it, a turn fetch in
-    /// a repo with real history re-downloads the whole workspace closure every
+    /// a repo with real history re-downloads the whole source tree closure every
     /// turn (measured: ~10s of index-pack CPU per turn on a large repo).
     #[cfg(test)]
     pub(crate) fn fetch_object_negotiated(&self, hash: &str, tip: &str) -> Result<(), String> {
@@ -1665,6 +1674,16 @@ fn write_file(target: &Path, hash: &str, kind: &str, data: &[u8]) -> Result<(), 
     let exec = xattr::get(target, EXEC_XATTR)
         .map(|v| v.is_some())
         .unwrap_or(false);
+    write_file_with_mode(target, hash, kind, data, exec)
+}
+
+fn write_file_with_mode(
+    target: &Path,
+    hash: &str,
+    kind: &str,
+    data: &[u8],
+    exec: bool,
+) -> Result<(), String> {
     atomically(target, |tmp| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -2019,6 +2038,12 @@ pub fn put_commit(t: &dyn Transport, src: &str, dst: &str) -> Result<(), String>
 /// to a path's identity: a worker minting a commit needs its parent's *hash*
 /// (for the `parent` line), and an unfetched placeholder's xattr is unreadable
 /// to the unprivileged worker directly.
+pub fn cas_kind(path: &str) -> Result<(), String> {
+    let target = validate_descendant(&cas_dir(), path)?;
+    println!("{}", result_kind(&target)?);
+    Ok(())
+}
+
 pub fn cas_hash(path: &str) -> Result<(), String> {
     let cas = cas_dir();
     let target = validate_descendant(&cas, path)?;
@@ -2086,6 +2111,7 @@ enum Body {
     Link(Vec<u8>),
     /// A directory: its encoded tree bytes and its children.
     Dir(Vec<u8>, Vec<Hashed>),
+    Commit(Vec<u8>, Box<Hashed>),
 }
 
 /// The git tree entry for a real symlink at `path`: a blob holding the link
@@ -2188,11 +2214,15 @@ fn hash_path(cas_real: Option<&Path>, path: &Path) -> Result<Hashed, String> {
             .write_to(&mut buf)
             .map_err(|e| format!("encoding tree for {}: {e}", path.display()))?;
         let oid = hash_bytes("tree", &buf)?;
-        return Ok(Hashed {
-            mode: EntryKind::Tree.into(),
-            oid,
-            body: Body::Dir(buf, children),
-        });
+        return gitlinks::commit(
+            cas_real,
+            path,
+            Hashed {
+                mode: EntryKind::Tree.into(),
+                oid,
+                body: Body::Dir(buf, children),
+            },
+        );
     }
 
     if ft.is_file() {
@@ -2238,6 +2268,11 @@ fn send(t: &dyn Transport, h: &Hashed) -> Result<(), String> {
             let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
             refuse_if_leaks(&data, &path.display().to_string())?;
             t.put_object("blob", &data)?
+        }
+        Body::Commit(encoded, tree) => {
+            send(t, tree)?;
+            refuse_if_leaks(encoded, "a commit")?;
+            t.put_object("commit", encoded)?
         }
         Body::Dir(encoded, children) => {
             for child in children {
@@ -2825,52 +2860,7 @@ fn resolve_base_with_store(
     }
 }
 
-/// A parsed `:@@=` locator — a git tree named by WHERE to fetch it, pinned by a
-/// content hash (design/flake-inputs.md). The syntax is nix's flake-reference
-/// grammar, borrowed as a STRING FORMAT only (no nix ever runs): a scheme + an
-/// optional `?rev=<sha>&dir=<subpath>` query.
-///
-/// The pin is what makes a URL — a *name* — behave like content: `rev` (a
-/// full-length commit sha) is MANDATORY for a git fetch, and the client resolves
-/// `url@rev → oid` at eval time so the oid, never the URL, enters the arg tree /
-/// cache key. A `path:` names a plain local directory instead (hashed live, like
-/// `:@=`), so it carries no rev. [`resolve_remote_arg`] is the resolution these
-/// fields drive.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct GitRef {
-    /// The fetch URL — everything before `?`: `git+https://…`, `git+ssh://…`,
-    /// `git+file://…`, `github:owner/repo`, or `path:<dir>`.
-    pub url: String,
-    /// The pinned commit sha: `Some` (and 40-hex) for a git fetch, `None` for a
-    /// `path:` plain directory.
-    pub rev: Option<String>,
-    /// The subtree within the fetched repo to descend into (`dir=`), if given.
-    pub dir: Option<String>,
-}
-
-impl GitRef {
-    /// A `path:` locator names a plain local directory — no git fetch, no rev —
-    /// resolved by ingesting the tree, like a `:@=` path.
-    pub fn is_plain_dir(&self) -> bool {
-        self.url.starts_with("path:")
-    }
-
-    /// The URL to hand `git fetch`. The locator's scheme is nix's, which prefixes
-    /// a transport with `git+` and abbreviates GitHub — neither of which git
-    /// itself understands, so the `git+` comes off and `github:o/r` expands to
-    /// the HTTPS URL it stands for. This is the ONE place the sugar is undone:
-    /// the parsed `url` stays exactly what the caller wrote, so an error message
-    /// quotes their locator rather than something normalized behind their back.
-    pub fn fetch_url(&self) -> String {
-        if let Some(rest) = self.url.strip_prefix("git+") {
-            return rest.to_string();
-        }
-        if let Some(rest) = self.url.strip_prefix("github:") {
-            return format!("https://github.com/{rest}");
-        }
-        self.url.clone()
-    }
-}
+pub use git_locator::{parse_git_ref, GitRef};
 
 /// Resolve a `--name:@@=<ref>` argument to the `(mode, oid)` of the tree (or
 /// blob) it names, fetching from another repo if that is what the locator says.
@@ -3015,186 +3005,6 @@ fn eval_locator_on_server(
         base.trim_end_matches('/')
     );
     request_compute_url(&url, &secret_store_header(store))
-}
-
-/// Parse a `:@@=` locator value into a [`GitRef`], validating the
-/// content-addressing invariant: a git fetch MUST pin a commit (`rev=<40-hex>`),
-/// a mutable `ref=` (branch/tag) is rejected, and a `path:` takes no rev. The
-/// scheme chooses the meaning — never sniffed from the value's shape. Pure
-/// string logic (unit-tested); [`resolve_remote_arg`] does the fetching.
-pub(crate) fn parse_git_ref(value: &str) -> Result<GitRef, String> {
-    let (url, query) = value.split_once('?').unwrap_or((value, ""));
-    if url.is_empty() {
-        return Err(format!("git ref {value:?} has no scheme/url"));
-    }
-    // A git fetch (rev mandatory) vs a plain local directory (no rev). The
-    // scheme decides — chosen by the operator, not guessed.
-    let is_git_fetch = url.starts_with("git+") || url.starts_with("github:");
-    let is_plain_dir = url.starts_with("path:");
-    if !is_git_fetch && !is_plain_dir {
-        return Err(format!(
-            "git ref {value:?}: unknown scheme; use git+https://…, git+ssh://…, \
-             git+file://…, github:owner/repo, or path:<dir>"
-        ));
-    }
-
-    let (mut rev, mut dir, mut has_ref) = (None, None, false);
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair
-            .split_once('=')
-            .ok_or_else(|| format!("git ref {value:?}: query part {pair:?} is not key=value"))?;
-        match k {
-            "rev" if rev.replace(v.to_string()).is_some() => {
-                return Err(format!("git ref {value:?}: rev given twice"))
-            }
-            "dir" if dir.replace(v.to_string()).is_some() => {
-                return Err(format!("git ref {value:?}: dir given twice"))
-            }
-            "rev" | "dir" => {}
-            "ref" => has_ref = true,
-            other => {
-                return Err(format!(
-                    "git ref {value:?}: unknown query key {other:?} (use rev=, dir=)"
-                ))
-            }
-        }
-    }
-
-    if is_git_fetch {
-        // A mutable ref (branch/tag) is not content; and a git fetch with no pin
-        // at all is not content-addressed. Both are rejected — that rejection is
-        // the whole point of making rev mandatory.
-        if has_ref {
-            return Err(format!(
-                "git ref {value:?}: a `ref=` (branch/tag) is mutable; pin a commit with `rev=`"
-            ));
-        }
-        match &rev {
-            None => {
-                return Err(format!(
-                    "git ref {value:?}: a remote ref must pin a commit — add `rev=<40-hex sha>`"
-                ))
-            }
-            Some(r) if !is_hex_hash(r) => {
-                return Err(format!(
-                    "git ref {value:?}: rev must be a full-length commit sha, got {r:?}"
-                ))
-            }
-            Some(_) => {}
-        }
-    } else if rev.is_some() {
-        // path: is a live local directory, so a rev is meaningless.
-        return Err(format!(
-            "git ref {value:?}: a `path:` names a local directory and takes no `rev=`"
-        ));
-    }
-
-    Ok(GitRef {
-        url: url.to_string(),
-        rev,
-        dir,
-    })
-}
-
-#[cfg(test)]
-mod git_ref_tests {
-    use super::{parse_git_ref, GitRef};
-
-    fn r(url: &str, rev: Option<&str>, dir: Option<&str>) -> GitRef {
-        GitRef {
-            url: url.to_string(),
-            rev: rev.map(String::from),
-            dir: dir.map(String::from),
-        }
-    }
-    const SHA: &str = "0123456789abcdef0123456789abcdef01234567"; // 40 hex
-
-    #[test]
-    fn git_https_with_rev_and_dir() {
-        let v = format!("git+https://github.com/o/repo?rev={SHA}&dir=std/deep-deps");
-        assert_eq!(
-            parse_git_ref(&v).unwrap(),
-            r(
-                "git+https://github.com/o/repo",
-                Some(SHA),
-                Some("std/deep-deps")
-            )
-        );
-    }
-
-    #[test]
-    fn git_ssh_and_file_and_github_take_a_rev() {
-        for url in [
-            "git+ssh://git@github.com/o/repo",
-            "git+file:///abs/repo",
-            "github:o/repo",
-        ] {
-            let v = format!("{url}?rev={SHA}");
-            assert_eq!(parse_git_ref(&v).unwrap(), r(url, Some(SHA), None));
-        }
-    }
-
-    #[test]
-    fn path_is_a_plain_dir_with_no_rev() {
-        let g = parse_git_ref("path:./some/dir").unwrap();
-        assert_eq!(g, r("path:./some/dir", None, None));
-        assert!(g.is_plain_dir());
-        // dir= is still allowed on a path: (a subtree of the local dir).
-        assert_eq!(
-            parse_git_ref("path:./x?dir=sub").unwrap(),
-            r("path:./x", None, Some("sub"))
-        );
-    }
-
-    #[test]
-    fn a_git_fetch_must_pin_a_commit() {
-        // no rev at all
-        assert!(parse_git_ref("git+https://h/r")
-            .unwrap_err()
-            .contains("must pin a commit"));
-        assert!(parse_git_ref("git+https://h/r?dir=x")
-            .unwrap_err()
-            .contains("must pin a commit"));
-    }
-
-    #[test]
-    fn a_mutable_ref_is_rejected() {
-        let e = parse_git_ref("git+https://h/r?ref=main").unwrap_err();
-        assert!(e.contains("mutable"), "{e}");
-        // even alongside a rev, a ref= is refused (ambiguous, and invites drift).
-        let v = format!("git+https://h/r?ref=main&rev={SHA}");
-        assert!(parse_git_ref(&v).unwrap_err().contains("mutable"));
-    }
-
-    #[test]
-    fn rev_must_be_a_full_sha() {
-        assert!(parse_git_ref("git+https://h/r?rev=abc123")
-            .unwrap_err()
-            .contains("full-length commit sha"));
-    }
-
-    #[test]
-    fn path_rejects_a_rev() {
-        let v = format!("path:./x?rev={SHA}");
-        assert!(parse_git_ref(&v).unwrap_err().contains("takes no `rev=`"));
-    }
-
-    #[test]
-    fn unknown_scheme_or_query_key() {
-        assert!(parse_git_ref("https://h/r?rev=x")
-            .unwrap_err()
-            .contains("unknown scheme"));
-        let v = format!("git+https://h/r?rev={SHA}&frob=1");
-        assert!(parse_git_ref(&v).unwrap_err().contains("unknown query key"));
-    }
-
-    #[test]
-    fn malformed_query_and_dupes() {
-        let v = format!("git+https://h/r?rev={SHA}&dir");
-        assert!(parse_git_ref(&v).unwrap_err().contains("not key=value"));
-        let v = format!("git+https://h/r?rev={SHA}&rev={SHA}");
-        assert!(parse_git_ref(&v).unwrap_err().contains("rev given twice"));
-    }
 }
 
 /// Resolve curry layers, build the args tree, bundle + push the request, and run
@@ -3981,7 +3791,7 @@ fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// which is what makes a caller's dependencies its own declared edges rather
 /// than whatever an ambient library happens to hold.
 ///
-/// The descent starts at the WORKSPACE ROOT, not at the named directory. It used
+/// The descent starts at the SOURCE_TREE ROOT, not at the named directory. It used
 /// to ingest only that directory and evaluate it in isolation, which quietly made
 /// the local operator weaker than the remote one:
 ///
@@ -4044,7 +3854,7 @@ pub fn resolve_cli_image_with_store(
     // (design/caos-expr.md).
     let (_, ws) = t
         .ingest_path(".")?
-        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
+        .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
     // Descend THROUGH evaluation: each `.caos-expr` from the root down is
     // applied, and `image` is looked up in what the one above it produced. A
     // tree with no `.caos-expr` (a plain flake dir, a git-docker image)
@@ -4449,6 +4259,23 @@ impl ClientSecret {
     }
 }
 
+/// Check local configuration without evaluating reader expressions or building
+/// worker images. Grants are resolved when preparing an actual request.
+pub fn local_secret_present(dir: &Path, name: &str) -> Result<bool, String> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let mut present = false;
+    for (file_name, path) in local_secret_files(dir)? {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
+        let spec = parse_local_secret_spec(&file_name, &text)?;
+        resolve_local_secret_value(&file_name, &path, spec.value)?;
+        present |= spec.name == name;
+    }
+    Ok(present)
+}
+
 /// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
 /// each reader resolved HERE (via eval-path, against the store's pinned tree)
 /// to a partial arg tree of name → oid — so the server only subset-matches,
@@ -4530,6 +4357,50 @@ fn client_secret_hash(
     }
     let material = caos_world::secret_hash_material(&pairs);
     Ok(Some(hash_bytes("blob", &material)?.to_string()))
+}
+
+/// Check the same reader and isolation conditions used by server injection.
+/// Callers that require a credential can reject a prepared request before
+/// admitting durable work. Merely having a secret in the store, or a hash from
+/// some other secret in the request, does not authorize this credential.
+pub fn client_request_has_secret(
+    t: &dyn Transport,
+    request: &str,
+    store: &[ClientSecret],
+    name: &str,
+) -> Result<bool, String> {
+    let entries = fetch_tree_entries(t, request)?
+        .ok_or_else(|| format!("request {request} is not an ArgTree"))?
+        .into_iter()
+        .map(|entry| {
+            (
+                String::from_utf8_lossy(entry_name(&entry)).into_owned(),
+                entry.oid.to_string(),
+            )
+        })
+        .collect();
+    request_has_secret(&entries, store, name)
+}
+
+fn request_has_secret(
+    entries: &std::collections::BTreeMap<String, String>,
+    store: &[ClientSecret],
+    name: &str,
+) -> Result<bool, String> {
+    if !store.iter().any(|secret| {
+        secret.name == name
+            && secret
+                .readers
+                .iter()
+                .any(|reader| reader_subset(reader, entries))
+    }) {
+        return Ok(false);
+    }
+    let Some(digest) = client_secret_hash(store, entries)? else {
+        return Ok(false);
+    };
+    let expected = hash_bytes("blob", digest.as_bytes())?.to_string();
+    Ok(entries.get(caos_world::SECRET_HASH_ARG) == Some(&expected))
 }
 
 /// A stable in-process identity for a secret store: everything about it that can
@@ -4628,7 +4499,7 @@ fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> 
     }
     let (_, oid) = t
         .ingest_path(".")?
-        .ok_or_else(|| "this transport cannot ingest the workspace tree for secrets".to_string())?;
+        .ok_or_else(|| "this transport cannot ingest the source tree for secrets".to_string())?;
     Ok(oid.to_string())
 }
 
@@ -4957,6 +4828,7 @@ pub fn prog_name(args: &[String]) -> &str {
 #[cfg(test)]
 mod git_transport_tests {
     use super::*;
+    use std::process::Command;
 
     struct ObjectTransport {
         object: Option<(&'static str, Vec<u8>)>,
@@ -5017,6 +4889,210 @@ mod git_transport_tests {
     }
 
     #[test]
+    fn projected_commits_preserve_identity_and_ancestry_through_file_operations() {
+        // Isolate the CAS env from other parallel unit tests.
+        const CHILD: &str = "CAOS_PROJECTION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = TestDir::new("projection");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "git_transport_tests::projected_commits_preserve_identity_and_ancestry_through_file_operations", "--nocapture"])
+                .env(CHILD, "1").env(CAS_DIR_ENV, dir.path().join("cas"))
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = TestDir::new("projection-repo");
+        init_repo(dir.path());
+        std::fs::write(
+            dir.path().join("code"),
+            "original
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("run"),
+            "#!/bin/sh
+",
+        )
+        .unwrap();
+        set_mode(&dir.path().join("run"), 0o755).unwrap();
+        std::os::unix::fs::symlink("code", dir.path().join("link")).unwrap();
+        git(dir.path(), &["add", "."]);
+        git(dir.path(), &["commit", "-qm", "base"]);
+        let base = git(dir.path(), &["rev-parse", "HEAD"]);
+        let t = GitTransport::discover(dir.path()).unwrap();
+        let (_, raw) = t.get_object(base.trim()).unwrap();
+        let signed = String::from_utf8(raw).unwrap().replacen(
+            "
+
+",
+            "
+gpgsig -----BEGIN PGP SIGNATURE-----
+ fixture
+ -----END PGP SIGNATURE-----
+
+",
+            1,
+        );
+        let base = t
+            .put_object("commit", signed.as_bytes())
+            .unwrap()
+            .to_string();
+        let cas = cas_dir();
+        std::fs::create_dir_all(&cas).unwrap();
+        let original = cas.join("original");
+        get_hash(&t, &base, original.to_str().unwrap()).unwrap();
+        let root = dir.path().join("conversation");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&original, root.join("dirty")).unwrap();
+        std::fs::write(root.join("memory"), "remember").unwrap();
+        let (_, tree) = store(&t, Some(&cas), &root).unwrap();
+        let (kind, resolved) = eval::eval_path(&t, &tree.to_string(), "dirty/code", &[]).unwrap();
+        assert_eq!(kind, "blob");
+        assert_eq!(t.get_object(&resolved).unwrap().0, "blob");
+        assert_eq!(
+            eval::eval_path(&t, &tree.to_string(), "dirty", &[]).unwrap(),
+            ("commit".into(), base.clone())
+        );
+        let projection = dir.path().join("projection");
+        // Model the harness's writable directory metadata; put itself does
+        // not materialize editable files.
+        let source = cas.join(format!("checkout-{base}"));
+        get_hash(&t, &base, source.to_str().unwrap()).unwrap();
+        std::fs::create_dir(&projection).unwrap();
+        let project_fixture = |name: &str| {
+            let directory = projection.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for name in ["code", "run"] {
+                std::fs::copy(dir.path().join(name), directory.join(name)).unwrap();
+            }
+            std::os::unix::fs::symlink("code", directory.join("link")).unwrap();
+            xattr::set(&directory, "user.caos.commit", base.as_bytes()).unwrap();
+        };
+        project_fixture("dirty");
+        std::fs::write(projection.join("memory"), "remember").unwrap();
+        assert_eq!(store(&t, Some(&cas), &projection).unwrap().1, tree);
+        project_fixture("copy");
+        std::fs::rename(projection.join("copy"), projection.join("review")).unwrap();
+        std::fs::write(
+            projection.join("dirty/code"),
+            "edited
+",
+        )
+        .unwrap();
+        std::fs::write(projection.join("memory"), "updated").unwrap();
+        let (_, changed) = store(&t, Some(&cas), &projection).unwrap();
+        let (_, bytes) = t.get_object(&changed.to_string()).unwrap();
+        let entries = gix::objs::TreeRef::from_bytes(&bytes, gix::hash::Kind::Sha1).unwrap();
+        let entry = |name: &[u8]| entries.entries.iter().find(|e| e.filename == name).unwrap();
+        assert_eq!(
+            entry(b"review").oid.to_string(),
+            base,
+            "copied and renamed boundaries preserve the exact signed commit"
+        );
+        assert_eq!(
+            entry(b"dirty").mode.kind(),
+            gix::objs::tree::EntryKind::Commit
+        );
+        let (_, edited) = t.get_object(&entry(b"dirty").oid.to_string()).unwrap();
+        let edited = String::from_utf8(edited).unwrap();
+        assert!(edited.contains(&format!(
+            "parent {base}
+"
+        )));
+        assert!(
+            !edited.contains("gpgsig"),
+            "new content must not retain the old signature"
+        );
+        let resolved = cas.join("resolved");
+        gitlinks::resolve(
+            &t,
+            &changed.to_string(),
+            "dirty/run",
+            resolved.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert!(gitlinks::resolve(
+            &t,
+            &changed.to_string(),
+            "../code",
+            resolved.to_str().unwrap()
+        )
+        .is_err());
+        assert!(projection.join("dirty/link").is_symlink());
+        // Clearing or deleting a resolved ledger cleans only source-tree metadata.
+        let metadata = projection.join("dirty/.caos");
+        std::fs::create_dir(&metadata).unwrap();
+        std::fs::write(metadata.join("conflicts"), "unresolved code\n").unwrap();
+        let (_, unresolved) = store(&t, Some(&cas), &projection).unwrap();
+        let (_, unresolved) = eval::eval_path(&t, &unresolved.to_string(), "dirty", &[]).unwrap();
+        assert_eq!(
+            git(
+                dir.path(),
+                &["show", &format!("{unresolved}:.caos/conflicts")]
+            ),
+            "unresolved code\n"
+        );
+        let (_, raw) = t.get_object(&unresolved).unwrap();
+        let merge = String::from_utf8(raw).unwrap().replacen(
+            &format!("parent {base}\n"),
+            &format!("parent {base}\nparent {}\n", entry(b"dirty").oid),
+            1,
+        );
+        let merge = t
+            .put_object("commit", merge.as_bytes())
+            .unwrap()
+            .to_string();
+        get_hash(
+            &t,
+            &merge,
+            cas.join(format!("checkout-{merge}")).to_str().unwrap(),
+        )
+        .unwrap();
+        xattr::set(
+            projection.join("dirty"),
+            "user.caos.commit",
+            merge.as_bytes(),
+        )
+        .unwrap();
+        let (_, unchanged) = store(&t, Some(&cas), &projection).unwrap();
+        assert_eq!(
+            eval::eval_path(&t, &unchanged.to_string(), "dirty", &[])
+                .unwrap()
+                .1,
+            merge
+        );
+
+        // Ordinary conversation files are outside this cleanup rule.
+        std::fs::create_dir(projection.join(".caos")).unwrap();
+        std::fs::write(projection.join(".caos/conflicts"), "").unwrap();
+        for remove_ledger in [false, true] {
+            if remove_ledger {
+                std::fs::remove_file(metadata.join("conflicts")).unwrap();
+            } else {
+                std::fs::write(metadata.join("conflicts"), "").unwrap();
+            }
+            let (_, cleaned) = store(&t, Some(&cas), &projection).unwrap();
+            let (_, source) = eval::eval_path(&t, &cleaned.to_string(), "dirty", &[]).unwrap();
+            assert!(git(dir.path(), &["ls-tree", &source, "--", ".caos"]).is_empty());
+            assert_eq!(
+                git(dir.path(), &["rev-parse", &format!("{source}^")]).trim(),
+                merge
+            );
+            assert!(eval::eval_path(&t, &cleaned.to_string(), ".caos/conflicts", &[]).is_ok());
+        }
+        std::fs::write(metadata.join("conflicts"), "").unwrap();
+        std::fs::write(metadata.join("other"), "keep").unwrap();
+        let (_, retained) = store(&t, Some(&cas), &projection).unwrap();
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/conflicts", &[]).is_err());
+        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/other", &[]).is_ok());
+    }
+
+    #[test]
     fn all_compute_paths_share_one_url_shape() {
         // A trailing slash on the base must not double up in the path.
         assert_eq!(
@@ -5074,6 +5150,34 @@ mod git_transport_tests {
         let expected_head = commit_file(&repo, "tracked", "temporary repo\n", "initial");
 
         let transport = GitTransport::discover(&nested).unwrap();
+
+        // Fetches may create packs after the transport was opened. Exceed
+        // gix's initial 32 slots, then exercise writing with the same handle.
+        let git_input = |args: &[&str], input: &[u8]| {
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), input).unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+        for index in 0..40 {
+            let hash = git_input(
+                &["hash-object", "-w", "--stdin"],
+                format!("pack {index}").as_bytes(),
+            );
+            git_input(&["pack-objects", ".git/objects/pack/pack"], hash.as_bytes());
+        }
+        let blob = transport.put_object("blob", b"after fetch").unwrap();
+        assert_eq!(
+            transport.get_object(&blob.to_string()).unwrap().1,
+            b"after fetch"
+        );
 
         assert_eq!(transport.work_dir(), repo.canonicalize().unwrap());
         assert_eq!(
@@ -5202,6 +5306,29 @@ mod local_secret_tests {
     }
 
     #[test]
+    fn presence_checks_local_specs_and_values_without_evaluating_readers() {
+        let dir = std::env::temp_dir().join(format!(
+            "secret-presence-{}",
+            super::fresh_entropy().unwrap()
+        ));
+        assert!(!super::local_secret_present(&dir, "api-key").unwrap());
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("token");
+        std::fs::write(
+            &file,
+            "name=api-key\nvalue=test-value\nreader=missing-worker\n",
+        )
+        .unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").unwrap());
+        assert!(!super::local_secret_present(&dir, "other").unwrap());
+        std::fs::write(&file, "name=api-key\nvalue:@=missing.value\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::write(&file, "not a spec\n").unwrap();
+        assert!(super::local_secret_present(&dir, "api-key").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn entropy_maintenance_can_parse_a_spec_before_its_value_is_complete() {
         let spec = parse_local_secret_spec("token", "reader=DEEP-DEPS/tool\n").unwrap();
         assert!(spec.value.is_none());
@@ -5240,7 +5367,9 @@ mod local_secret_tests {
 
 #[cfg(test)]
 mod memo_tests {
-    use super::{eval::Memo, store_key, ClientSecret};
+    use super::{
+        client_secret_hash, eval::Memo, hash_bytes, request_has_secret, store_key, ClientSecret,
+    };
 
     fn secret(name: &str, value: &str, entropy: &str, reader: &[(&str, &str)]) -> ClientSecret {
         ClientSecret {
@@ -5252,6 +5381,57 @@ mod memo_tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()],
         }
+    }
+
+    #[test]
+    fn required_secret_checks_reader_and_isolation_before_dispatch() {
+        let image = "a".repeat(40);
+        let other_image = "b".repeat(40);
+        let mut entries = std::collections::BTreeMap::from([
+            ("base".to_string(), image.clone()),
+            ("extra".to_string(), "c".repeat(40)),
+        ]);
+        let store = vec![secret(
+            "model-key",
+            "private",
+            "entropy",
+            &[("base", &image)],
+        )];
+        // Matching the image alone must not authorize an old, unmarked request.
+        assert!(!request_has_secret(&entries, &store, "model-key").unwrap());
+        let digest = client_secret_hash(&store, &entries).unwrap().unwrap();
+        entries.insert(
+            caos_world::SECRET_HASH_ARG.to_string(),
+            hash_bytes("blob", digest.as_bytes()).unwrap().to_string(),
+        );
+        assert!(request_has_secret(&entries, &store, "model-key").unwrap());
+        assert!(!request_has_secret(&entries, &store, "other-key").unwrap());
+
+        let wrong_reader = vec![secret(
+            "model-key",
+            "private",
+            "entropy",
+            &[("base", &other_image)],
+        )];
+        assert!(!request_has_secret(&entries, &wrong_reader, "model-key").unwrap());
+        let mut absent_reader = secret("model-key", "private", "entropy", &[]);
+        absent_reader.readers.clear();
+        assert!(!request_has_secret(&entries, &[absent_reader], "model-key").unwrap());
+
+        let rotated = vec![secret(
+            "model-key",
+            "replacement",
+            "entropy",
+            &[("base", &image)],
+        )];
+        assert!(request_has_secret(&entries, &rotated, "model-key").unwrap());
+        let changed_identity = vec![secret(
+            "model-key",
+            "private",
+            "new entropy",
+            &[("base", &image)],
+        )];
+        assert!(!request_has_secret(&entries, &changed_identity, "model-key").unwrap());
     }
 
     /// The claim `store_key`'s doc comment makes: a store keys an evaluation by

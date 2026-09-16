@@ -7,7 +7,7 @@
 #
 # The merge worker (SPEC "Merging and conflict resolution"). The caos runner
 # execs us as /worker with the args materialized under /cas/args:
-#   ours   (:commit=)  the workspace commit to merge into (the current side)
+#   ours   (:commit=)  the source tree commit to merge into (the current side)
 #   theirs (:commit=)  the commit to merge in
 # We three-way merge them and write a single result: a two-parent commit M =
 # (merged tree, parents [ours, theirs]). On conflict the merged tree carries

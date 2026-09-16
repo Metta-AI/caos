@@ -30,8 +30,6 @@ use std::io::Read;
 
 use serde_json::{json, Value};
 
-use std::collections::BTreeMap;
-
 use caos::{GitTransport, Transport};
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::canonical::canonical_bytes;
@@ -39,8 +37,8 @@ use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::oid::{Oid, G3};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    Block, DeclaredCall, Identity, IdentityKind, RequestOutcome, RequestRecord, RequestStatus,
-    Role, TranscriptEntry,
+    Block, DeclaredCall, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome, TurnRecord,
+    TurnStatus,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::tree::Signature;
@@ -48,10 +46,9 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{CodeOps, ObjectStore};
 
 use crate::{
-    conversation_ref, default_title, default_workspace_name, ensure_code_commit,
-    fetch_validated_head, mint_transition, oid, open_store, push_cas, reject_reserved_caos,
-    resolve_base, resolve_username, signature, update_local_cache, TurnOptions, LLM_STEP_ARG,
-    MAX_APPEND_ATTEMPTS,
+    conversation_ref, default_title, ensure_code_commit, fetch_validated_head, mint_transition,
+    oid, open_store, push_cas, reject_reserved_caos, resolve_base, resolve_username, signature,
+    update_local_cache, TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
 /// Conversation ids for recorded sessions live under one component so they are
@@ -165,7 +162,7 @@ fn run_tool(
     let mut declaration: Option<(Oid, Oid, u64)> = None;
     append(t, &id, |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_request()? else {
+        let Some(request) = view.active_turn()? else {
             return Err(format!(
                 "no active request in {id:?}: a tool call arrived before this session's prompt"
             ));
@@ -193,7 +190,7 @@ fn run_tool(
                 arguments: format!("{dir}/{payload_name}"),
             }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         };
         declaration = Some((request.id.clone(), request.request_head.clone(), round));
         Ok(Some(mint_transition(
@@ -294,11 +291,10 @@ fn tools_configuration(
     // serve resolver retries; this did not). So it retries, still bounded:
     // enough to outlast tunnel bringup, never enough to hang the prompt.
     wait_server_reachable(t)?;
-    let mut config = vec![format!("--conversation={id}")];
-    let merge_refs = crate::snapshot_merge_refs(t)?;
-    if !merge_refs.is_empty() {
-        config.push(format!("--merge-refs={merge_refs}"));
-    }
+    // A host no longer snapshots merge refs into the turn: main's history and
+    // merge tools resolve against the conversation's own Git store, so a ref
+    // snapshot passed from here would be a second, staler source of truth.
+    let config = vec![format!("--conversation={id}")];
     let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
@@ -635,7 +631,7 @@ fn record_prompt(
                 text: prompt.to_string(),
             }],
             proposal: None,
-            workspace_resolution: None,
+            source_tree_resolution: None,
         };
         let message = mint_transition(
             &mut store,
@@ -663,19 +659,15 @@ fn record_prompt(
             "request",
         )?;
         cc_timing("prepare_request", phase.elapsed());
-        let view = Conversation::open(&store, &message)?;
-        let workspaces = view.workspaces_tree()?;
-        drop(view);
-        let record = RequestRecord {
+        let record = TurnRecord {
             id: request.clone(),
             request_head: message.clone(),
-            request_workspaces: workspaces,
             model: CLAUDE_CODE_MODEL.to_string(),
             configuration: configuration.clone(),
             round: 0,
             calls: Vec::new(),
             interjections: Vec::new(),
-            status: RequestStatus::Queued,
+            status: TurnStatus::Queued,
             latest_message: None,
             escape_reason: None,
             outcome: None,
@@ -684,13 +676,13 @@ fn record_prompt(
         let admitted = mint_transition(
             &mut store,
             &message,
-            &Transition::RequestAdmit { record },
+            &Transition::TurnAdmit { record },
             &admission,
         )?;
         let claimed = mint_transition(
             &mut store,
             &admitted,
-            &Transition::RequestClaim {
+            &Transition::TurnClaim {
                 request,
                 latest_message: message_id,
             },
@@ -725,8 +717,13 @@ fn root_commit(
     let phase = std::time::Instant::now();
     ensure_code_commit(t, store, &base)?;
     cc_timing("ensure_code_commit", phase.elapsed());
-    reject_reserved_caos(t, base.as_str(), "base workspace")?;
-    let workspace = default_workspace_name(t, options)?;
+    reject_reserved_caos(t, base.as_str(), "base code")?;
+    // Seed the base as the conversation's `code/dirty` source tree -- the shape
+    // `mint_conversation_root` builds for the tui, so a recorded session and a
+    // hand-driven one carry code the same way.
+    let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
+    content.put_oid("code/dirty", conversation_protocol::v3::Mode::Commit, base);
+    let content = content.build(store)?;
     let genesis = oid(G3, "v3 genesis")?;
     let root = Transition::ConversationRoot {
         identity: Identity {
@@ -735,11 +732,10 @@ fn root_commit(
             owner: None,
         },
         title: default_title(prompt),
-        workspaces: BTreeMap::from([(workspace, (base, None))]),
-        files_seed: None,
+        content: Some(content),
     };
-    let tree = apply(store, None, &root)?.tree;
-    mint(store, &genesis, &tree, root.kind(), signature)
+    let applied = apply(store, None, &root)?;
+    mint(store, &genesis, &applied, root.kind(), signature)
 }
 
 /// Tell a caos workspace tool which conversation it is working in.
@@ -868,7 +864,7 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
     append(t, &id, move |store, head| {
         let _ = &conversation;
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_request()? else {
+        let Some(request) = view.active_turn()? else {
             // Nothing to close. A Stop for a turn that opened no request is
             // not an error: an interrupted session can leave one behind.
             return Ok(None);
@@ -894,7 +890,7 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
                     text: message.clone(),
                 }],
                 proposal: None,
-                workspace_resolution: None,
+                source_tree_resolution: None,
             };
             at = mint_transition(
                 store,
@@ -914,9 +910,9 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
         let terminal = mint_transition(
             store,
             &at,
-            &Transition::RequestTerminal {
+            &Transition::TurnTerminal {
                 request: request.id.clone(),
-                outcome: RequestOutcome::Idle {
+                outcome: TurnOutcome::Idle {
                     result,
                     interrupted: false,
                 },
@@ -946,7 +942,7 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
     let conversation = id.clone();
     append(t, &id, move |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_request()? else {
+        let Some(request) = view.active_turn()? else {
             return Ok(None);
         };
         let ordinal = view.transcript_len()?;
@@ -974,7 +970,7 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
                         text: error.clone(),
                     }],
                     proposal: None,
-                    workspace_resolution: None,
+                    source_tree_resolution: None,
                 },
                 payloads: Vec::new(),
             },
@@ -983,9 +979,9 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
         let terminal = mint_transition(
             store,
             &recorded,
-            &Transition::RequestTerminal {
+            &Transition::TurnTerminal {
                 request: request.id,
-                outcome: RequestOutcome::Failed {
+                outcome: TurnOutcome::Failed {
                     error: paths::transcript_entry_path(ordinal, &message_id),
                 },
             },

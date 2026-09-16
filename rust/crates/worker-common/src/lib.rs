@@ -28,6 +28,8 @@
 //! change. The latter is what a worker with mutable loop state wants — config
 //! rides along untouched, and only the state is unbound and rebound.
 
+pub mod files;
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -323,7 +325,7 @@ fn str_refs(args: &[String]) -> Vec<&str> {
 }
 
 /// Run `caos`, inheriting stdio; error on failure. Slice form behind [`caos`].
-fn caos_argv(args: &[&str]) -> Result<(), String> {
+pub fn caos_argv(args: &[&str]) -> Result<(), String> {
     let status = Command::new("caos")
         .args(args)
         .status()
@@ -358,7 +360,7 @@ fn caos_capture(args: &[&str]) -> Result<String, String> {
 /// A parsed git commit, as a worker sees one: the tree it snapshots, its
 /// parents, its author's name, and its message. In caos a commit is a
 /// first-class value — e.g. an agent conversation head, where the message is a
-/// turn's text, the tree the workspace state, and the parent the previous
+/// turn's text, the tree the source tree state, and the parent the previous
 /// turn. The author name is how the agent harness tells its own turn commits
 /// (author `caos-agent`) apart from everything else when walking a
 /// conversation (see `design/agent-harness.md`).
@@ -371,6 +373,10 @@ pub struct Commit {
 
 /// The git hash recorded on a CAS path (`caos hash`) — e.g. a commit-valued
 /// arg's own id, which becomes the `parent` of the commit minted from it.
+pub fn cas_kind(cas_path: &str) -> Result<String, String> {
+    caos_capture(&["kind", cas_path])
+}
+
 pub fn cas_hash(cas_path: &str) -> Result<String, String> {
     caos_capture(&["hash", cas_path])
 }

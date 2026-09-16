@@ -70,10 +70,10 @@ Each worker creates a throwaway local repository and points its `origin` at
 
 - Read one ref by fetching that exact source ref into `FETCH_HEAD`. Protocol v2
   communicates the exact prefix to upload-pack; shallow, tree-filtered fetches
-  avoid downloading the conversation workspace or its history.
+  avoid downloading the conversation source tree or its history.
 - Store event objects through the ordinary content-addressed object API, then
   fetch the candidate object into the scratch Git repository so it can serve as
-  a push refspec source without downloading its workspace closure.
+  a push refspec source without downloading its source tree closure.
 - Append with `git push --force-with-lease=<ref>:<observed> <new>:<ref>`.
 - Create or modify several refs as one operation with `git push --atomic`, one
   explicit lease per ref, and one refspec per update.
@@ -81,7 +81,7 @@ Each worker creates a throwaway local repository and points its `origin` at
   successful if the desired object is visible, as a lost race if the head
   changed, and as an infrastructure failure if the observed head is unchanged.
 
-The server does not enforce first-parent ancestry, workspace-tree continuity,
+The server does not enforce first-parent ancestry, source-tree-tree continuity,
 or conversation namespaces. The clients continue to enforce those invariants
 because they consume the protocol.
 
@@ -138,5 +138,5 @@ CAOS; administrator-owned hooks are left untouched.
   ref validation, or repair policy.
 - Concurrent appends still resolve through explicit leases and retries, and
   multi-ref updates remain atomic.
-- The workspace test suite, flake source lint, and relevant Nix builds pass for
+- The source tree test suite, flake source lint, and relevant Nix builds pass for
   each layer.
