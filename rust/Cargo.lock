@@ -304,6 +304,7 @@ name = "caos-iroh"
 version = "0.1.0"
 dependencies = [
  "iroh",
+ "iroh-relay",
  "iroh-tickets",
  "tempfile",
  "tokio",
@@ -2280,6 +2281,7 @@ dependencies = [
  "reqwest",
  "rustls 0.23.45",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "serde",
  "serde_bytes",
  "strum",

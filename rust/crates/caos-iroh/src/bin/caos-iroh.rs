@@ -40,8 +40,7 @@ use caos_iroh::{
     load_or_create_secret, load_or_create_token, splice, Server, Service, Ticket, ALPN,
     ONLINE_TIMEOUT,
 };
-use iroh::endpoint::presets;
-use iroh::{Endpoint, SecretKey};
+use iroh::SecretKey;
 
 const USAGE: &str = "\
 usage:
@@ -180,7 +179,7 @@ async fn serve(options: Options) -> Result<(), String> {
         git_dir: options.git_dir.clone(),
         token,
     });
-    let mut builder = Endpoint::builder(presets::N0)
+    let mut builder = caos_iroh::endpoint_builder()
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()]);
     // A FIXED PORT, so the addresses this endpoint advertises are the same ones

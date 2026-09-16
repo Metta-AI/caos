@@ -43,7 +43,17 @@ tempfile = "3"
 # `default-features = false` + `tls-ring`: the same crypto backend the workspace
 # already vendors for minreq's https-rustls, and it drops metrics/portmapper/
 # apple-datapath, none of which this transport reads.
-iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+iroh = { version = "1", default-features = false, features = [
+    "tls-ring",
+    "platform-verifier",
+] }
+# For `CaTlsConfig::system()`: `iroh` re-exports RelayConfig and RelayMap but
+# not that, and reaching a relay through a TLS-intercepting proxy needs it — see
+# `bind_endpoint`. Already in Cargo.lock as a transitive entry of iroh, so
+# naming it vendors nothing new.
+iroh-relay = { version = "1", default-features = false, features = [
+    "platform-verifier",
+] }
 # The ticket encoding (endpoint id + relay/direct hints) that `caos://` carries.
 iroh-tickets = "1"
 # iroh is async, so the two bins are the only async programs in this tree. The

@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "NotebookEdit",
+      "Monitor"
+    ],
+    "allow": [
+      "mcp__caos"
+    ]
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__caos__.*",
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CAOS_BIN:-caos}\" mcp hook --llm-step:@=std/llm-step" }
+        ]
+      }
+    ]
+  }
+}

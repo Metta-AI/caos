@@ -133,6 +133,34 @@ const CLOSE_TIMEOUT: Duration = Duration::from_millis(25);
 /// unstable-ticket behaviour back.
 pub const DEFAULT_PORT: u16 = 11204;
 
+/// The endpoint builder both ends use, with the two settings a restricted
+/// network needs.
+///
+/// ONE PLACE, because the client and the listener need these equally and a
+/// setting applied to one of them is a failure that only shows up in the
+/// placement nobody tests.
+///
+/// * **The OS trust store, not the copy of Mozilla's roots iroh compiles in.**
+///   Where egress goes through a TLS-intercepting proxy — a Claude Code cloud
+///   container is one — the relay presents that proxy's certificate, which
+///   chains to a CA only the system knows about. A default build reaches NO
+///   relay there ("Failed to connect to the home relay") on a host where curl
+///   and git work perfectly, which reads as iroh being broken rather than as a
+///   trust decision. This changes the RELAY HOP ONLY: payloads stay end-to-end
+///   encrypted between endpoint keys, so the relay could not read them before
+///   and cannot now.
+/// * **The proxy the environment names**, rather than attempting a direct
+///   connection such a network will not permit.
+///
+/// Both come from `integrations/claude-code/cloud`, where they were first
+/// carried as a patch against dumbpipe; they are the part of that patch worth
+/// keeping.
+pub fn endpoint_builder() -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0)
+        .ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
+        .proxy_from_env()
+}
+
 /// Could `addr` be reached from another machine?
 ///
 /// Used to decide which of the addresses an endpoint DISCOVERED about itself
@@ -281,7 +309,7 @@ impl Client {
     /// listener authenticates the token, not the caller's identity, so there is
     /// no client key to store, lose, or have to enroll with a server.
     pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = endpoint_builder()
             .bind()
             .await
             .map_err(|e| format!("binding an iroh endpoint: {e}"))?;

@@ -1386,6 +1386,7 @@ sandbox = false''
           # The workspace stamped for the TEST world — what dev/stack-up builds
           # a dev stack from, so a host client cannot drive it (and vice versa).
           caos-test-world = testWorkspaceBins;
+
           # The two stack-bring-up aggregates (see `stackInputs`): one nix
           # build each, and both are handed to the same build-builtins.
           caos-stack-inputs = stackInputs "caos-stack-inputs" workspaceBins;
