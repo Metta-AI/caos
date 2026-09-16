@@ -91,9 +91,11 @@ CLI=/caos-run/bin/caos-cli
 install -m 755 "$CLI" ./.caos-test-cli || fail "staging the tested client"
 git add -f ./.caos-test-cli || fail "tracking the tested client"
 
-# The suite. `--test-salt` re-keys every per-test job on the dev stack and
-# nothing else, so the compile and the std publish stay hits — CAOS_SALT cannot
-# do that, since it threads into every sub-run.
+# The suite. `--test-salt` re-keys every per-test job on the dev stack, and —
+# via dev/cli-test, which exports it as the inner client's CAOS_SALT — the
+# requests a client test makes. Nothing ABOVE a test moves, so the compile and
+# the std publish stay hits. CAOS_SALT cannot be used for this: set here it
+# threads into every sub-run, scaffolding included.
 args=()
 if [ -e /cas/args/test-salt ]; then
   caos get /cas/args/test-salt

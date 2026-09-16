@@ -56,6 +56,41 @@ export CAOS_CLI
 # already points at the stack under test. Nothing to flip.
 : "${CAOS_SERVER_URL:?dev/cli-test needs CAOS_SERVER_URL from the runner}"
 
+# THE RUN'S SALT, RE-POINTED AT --test-salt. The test below drives a CLIENT, and
+# a client reads its salt from CAOS_SALT — which `caos runner` sets from the
+# job's ArgTree `salt` entry, so what arrives here is the SUITE's salt, empty
+# under a plain `--test-salt`. Without this, `--test-salt` re-runs a client
+# test's SCRIPT against requests it has already made, which answer from the memo.
+#
+# WHY THAT IS FATAL FOR A CLIENT TEST AND NOT A WORKER TEST. A client test's
+# subject IS the round trip — forming a request, pushing it, having it run — and
+# `ensure_pushed` asks before pushing (`HEAD /object/<argtree>`, returning on a
+# hit), so an ArgTree the server already holds means no push is formed at all.
+# tests/push-closure exists to prove a client can push a request whose base it
+# cannot read; on an unchanged tree it was passing without ever pushing. A worker
+# test dispatches through the server, which supplies the salt from this job's
+# ArgTree, and its inner work is usually a build the primary gate wants
+# memoized — so those stay opt-in, folded into the payload by the tests that need
+# it (tests/rust-worker says why).
+#
+# HERE, NOT IN EACH TEST, and here rather than higher up: salt threads DOWN, so
+# re-pointing it at the test boundary leaves everything above — the dev stack's
+# bring-up, the client compile, the std publish — a cache hit, while CAOS_SALT at
+# the top takes all of it cold. Measured on one client test, unchanged tree:
+# `--test-salt` alone 10.4s, with this 14.1s, CAOS_SALT 61.3s.
+#
+# APPENDED, NOT ASSIGNED, and only when non-empty. An empty `--test-salt` must
+# leave an outer CAOS_SALT alone or the primary gate stops reaching client tests;
+# and with both set, a fixed --test-salt beside a fresh CAOS_SALT would otherwise
+# pin the inner requests and silently un-cold the run. A test that mints its own
+# salt (tests/tracing, tests/cargo-self) exports over this afterwards, which is
+# what it wants: a novel value per invocation, not per --test-salt.
+if [ -e /cas/args/test-salt ]; then
+  caos get /cas/args/test-salt || fail "reading --test-salt"
+  test_salt=$(cat /cas/args/test-salt)
+  if [ -n "$test_salt" ]; then export CAOS_SALT="${CAOS_SALT-}$test_salt"; fi
+fi
+
 # NO ALTERNATE OBJECT STORE, and if a push here ever dies unable to read an
 # object, this is the first place to look. There used to be one; CLAUDE.md is
 # explicit that it HID object-availability bugs, and tests/push-closure had to
