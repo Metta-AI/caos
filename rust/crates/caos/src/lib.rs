@@ -648,6 +648,80 @@ impl GitTransport {
     fn git_capture_stderr(&self, args: &[&str]) -> Result<String, String> {
         git_capture_stderr_in(args, &self.work_dir)
     }
+
+    /// Run `body` with this checkout holding the only claim on pushing `hash`.
+    ///
+    /// SINGLE-FLIGHT, because a push is expensive and `ensure_pushed` is
+    /// check-then-act: two processes probe, both miss, and both send the whole
+    /// closure. That is the same shape as the server's cache read-then-write
+    /// (AGENTS.md), and it costs the same way — except the duplicated unit here
+    /// is a git push, so in a repository of any size the loser spends minutes
+    /// sending objects the winner is sending at the same moment, over the same
+    /// link, each halving the other's bandwidth.
+    ///
+    /// It is not merely wasteful: git REJECTS the loser. Two `receive-pack`
+    /// runs migrating the same objects out of quarantine collide, and the second
+    /// dies `unable to migrate objects to permanent storage` — reproduced with
+    /// two concurrent pushes of one 120 MB commit, where the loser transferred
+    /// the entire pack before being rejected. `push_closure`'s retry then makes
+    /// it correct, which is why this was invisible: the only symptom is the time.
+    /// Measured in a cloud session against a 415 MB repository: 148s spent on a
+    /// push whose objects another process had already delivered.
+    ///
+    /// Processes, not threads, so the claim is a file. Bounded, and a stale claim
+    /// is ignored rather than honoured — a killed pusher must not park every
+    /// later one — and if the wait runs out we push anyway, which is exactly the
+    /// behaviour this replaces.
+    fn with_push_claim<T>(&self, hash: &str, body: impl FnOnce() -> T) -> T {
+        /// Long enough to cover a large first push over a relayed path (measured:
+        /// 300 MB in 4m56s), because waiting out the winner is strictly cheaper
+        /// than racing it — the waiter's own push becomes a probe that skips.
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+        const STEP: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let path = self.git_dir.join(format!("caos-push-{hash}.claim"));
+        let deadline = std::time::Instant::now() + WAIT;
+        let mut held = false;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {
+                    held = true;
+                    break;
+                }
+                // Someone else is pushing this. Wait for them rather than joining
+                // in -- unless the claim is old enough that its owner is gone.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|at| at.elapsed().unwrap_or_default() > WAIT)
+                        .unwrap_or(true);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        timing::record(
+                            "push-claim-expired",
+                            &format!("{hash}: waited {}s for another pusher", WAIT.as_secs()),
+                        );
+                        break;
+                    }
+                    std::thread::sleep(STEP);
+                }
+                // A claim we cannot create is not a reason to refuse the push.
+                Err(_) => break,
+            }
+        }
+        let outcome = body();
+        if held {
+            let _ = std::fs::remove_file(&path);
+        }
+        outcome
+    }
 }
 
 impl Transport for GitTransport {
@@ -790,8 +864,24 @@ impl Transport for GitTransport {
             PUSHES_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
-        PUSHES_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.push_closure(hash)
+        // RE-PROBE INSIDE THE CLAIM, which is the half of single-flighting that
+        // actually saves the work: the waiter's answer to "does the server hold
+        // it" was computed before the winner's push and is stale by exactly the
+        // thing it needs to know. Sound here for the same reason the first probe
+        // is (see above) and NOT sound for a commit, which is why
+        // `push_commit_closure` takes the claim without re-probing.
+        self.with_push_claim(hash, || {
+            if self.server_holds(hash) {
+                PUSHES_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                timing::record(
+                    "push-avoided",
+                    &format!("{hash}: another process delivered it while we waited"),
+                );
+                return Ok(());
+            }
+            PUSHES_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.push_closure(hash)
+        })
     }
 
     /// Always pushes: see the trait method, and the probe's note above.
@@ -801,7 +891,12 @@ impl Transport for GitTransport {
     /// no-op update, and the ref it leaves behind is the negotiation base that
     /// makes a descendant's push a delta.
     fn push_commit_closure(&self, hash: &str) -> Result<(), String> {
-        self.push_closure(hash)
+        // The claim, but no re-probe: a commit the server holds may still be
+        // missing its parents (gitlinks are not traversed — see the note on
+        // `ensure_pushed`), so "the server has it" does not mean "we can skip".
+        // Serialising is still worth it — two concurrent pushes of one commit
+        // reject each other — it just cannot become a skip.
+        self.with_push_claim(hash, || self.push_closure(hash))
     }
 
     fn ingest_path(
@@ -1157,11 +1252,39 @@ impl GitTransport {
                     .unwrap_or("no object summary")
                     .trim()
                     .to_string();
-                timing::record("push", &format!("{hash} in {elapsed:.1}s: {summary}"));
+                // The transport condition, from the helper's own trace. A RELAYED
+                // push is the cloud's permanent condition -- measured at ~1 MB/s
+                // against 49 MB/s direct -- so whether a push was relayed is most
+                // of what its duration means.
+                let path = stderr
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.trim().strip_prefix("caos-iroh: path "))
+                    .map(|path| format!(" over {path}"))
+                    .unwrap_or_default();
+                timing::record("push", &format!("{hash} in {elapsed:.1}s{path}: {summary}"));
                 Ok(())
             }
             Err(error) => {
-                timing::record("push-failed", &format!("{hash} after {elapsed:.1}s"));
+                // WITH THE REASON. A failed push that records only its duration
+                // says the one thing already obvious from the next line's
+                // duration, and withholds the only thing that identifies the
+                // fault: a 148s failure in a cloud session was indistinguishable
+                // from a timeout, a rejection and a dropped connection, and the
+                // container was gone before anyone could ask.
+                //
+                // Newlines collapsed because a journal line is a line -- git's
+                // failure text is several, and the tail reader splits on them.
+                let reason: String = error
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                timing::record(
+                    "push-failed",
+                    &format!("{hash} after {elapsed:.1}s: {reason}"),
+                );
                 Err(error)
             }
         }
@@ -1394,6 +1517,20 @@ impl GitTransport {
 fn git_capture_stderr_in(args: &[&str], cwd: &Path) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
+        // TRACE ON, unconditionally, for the one command whose stderr we keep.
+        //
+        // `git-remote-caos` is a separate process and cannot reach the phase
+        // journal, so the only channel it has is git's stderr -- which this
+        // function is already collecting and, until now, was discarding on
+        // success and quoting only on failure. Under the trace it names the PATH
+        // (relayed or direct) and the bytes it moved in each direction, which is
+        // the difference between "the push failed" and "the push failed after
+        // moving 12 MB over a relayed path".
+        //
+        // It costs three lines of text that no one sees unless something is
+        // being diagnosed. That is cheap next to the alternative, which is a
+        // cloud container that no longer exists.
+        .env("CAOS_IROH_TRACE", "1")
         .current_dir(cwd)
         .output()
         .map_err(|e| format!("running git {}: {e}", args.join(" ")))?;
