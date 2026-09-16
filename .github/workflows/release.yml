@@ -1,0 +1,216 @@
+# Publish the caos Claude Code client.
+#
+# The release carries five assets, which together are everything a machine that
+# has never seen caos needs:
+#
+#   caos-x86_64-linux      the client, statically linked
+#   dumbpipe-x86_64-linux  the iroh tunnel, patched to use the OS trust store
+#   claude-settings.json   the hooks and the deny list
+#   mcp.json               the tool server declaration
+#   install.sh             fetches the client and puts it in place
+#
+# WHY A RELEASE AND NOT A BUILD IN THE CONSUMER. A Claude Code cloud VM has a
+# five-minute setup budget and a filesystem snapshot; compiling there spends the
+# budget and, worse, anything built after the snapshot is never cached. A curl
+# of a static binary costs seconds and lands in the snapshot. It is also the
+# only way to reach a repository that is not this one -- there is no source
+# there to build.
+#
+# GitHub is already on the cloud environment's Trusted allowlist, so consuming
+# this needs no network-policy change at all.
+name: release
+
+# Builds AND releases on every push: the release is how an unauthenticated
+# machine gets the binary at all, so gating it on a tag meant no cloud session
+# could be tested without minting a version first. A tag names itself; a branch
+# build is named `build-<commit>`, by the commit alone.
+#
+# `caos/**` is excluded deliberately: the tui publishes each conversation to
+# `caos/<conversation-id>` (rust/crates/caos-cli/TUI.md), so building those
+# would fire a job per published conversation.
+on:
+  push:
+    branches-ignore: ["caos/**"]
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  client:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `nix build .#caos-cli` is the same build a developer runs; nothing about
+      # the artifact is release-specific.
+      #
+      # No general nix cache. magic-nix-cache now requires a FlakeHub account
+      # and failed with "Unable to authenticate to FlakeHub", caching nothing;
+      # cache.nixos.org already serves everything the client build needs, since
+      # those derivations are stock nixpkgs. The TUNNEL is the exception and is
+      # cached on its own below.
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build the client
+        run: nix build .#caos-cli
+
+      # The iroh tunnel, patched to use the OS trust store
+      # (integrations/claude-code/cloud/dumbpipe-system-certs.patch). Built here rather than
+      # taken from n0's releases, because n0's compiles in Mozilla's roots and
+      # a cloud container's egress is a TLS-intercepting proxy -- the stock
+      # binary cannot reach any relay there.
+      #
+      # A separate `nix build` invocation on purpose: two installables with two
+      # `-o` flags do NOT produce two symlinks, and the one you read can be a
+      # previous build or missing entirely.
+      #
+      # CACHED BY ITS DERIVATION PATH, because nothing else can cache it. It is
+      # a PATCHED, STATIC build, so it exists in no upstream cache and gets
+      # compiled from source -- iroh and its whole dependency tree -- which cost
+      # about seven minutes of every run. The drv path is a complete identity
+      # for the build (sources, patch, toolchain, nixpkgs), it costs a second to
+      # compute, and the artifact is one 8 MB file, so caching the OUTPUT is
+      # both smaller and more precise than caching /nix/store.
+      - name: Identify the tunnel build
+        id: tunnel
+        run: |
+          set -euo pipefail
+          drv="$(nix eval --raw .#dumbpipe-caos.drvPath)"
+          echo "key=tunnel-${drv##*/}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        id: tunnel-cache
+        with:
+          path: tunnel/dumbpipe
+          key: ${{ steps.tunnel.outputs.key }}
+
+      - name: Build the tunnel
+        if: steps.tunnel-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          nix build .#dumbpipe-caos -o result-dumbpipe
+          mkdir -p tunnel
+          install -m 0755 result-dumbpipe/bin/dumbpipe tunnel/dumbpipe
+
+      # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
+      # the real binary elsewhere in the store. The wrapper is not distributable
+      # -- it names /nix/store paths that do not exist anywhere else -- so what
+      # ships is the inner executable, which is static and depends on nothing.
+      - name: Stage the assets
+        id: stage
+        run: |
+          set -euo pipefail
+          # A tag names itself. A branch build is named by its COMMIT and
+          # nothing else -- `build-<12 hex>`.
+          #
+          # The branch name is deliberately absent. It was in this name once,
+          # as `<branch>-<sha>`, and `-` is legal in a branch name, so `cc` and
+          # `cc-conversations` produced tags no parse could tell apart. A
+          # consumer that wants a branch asks GitHub which commits are on it
+          # and looks each one up here; that is an exact question with an exact
+          # answer, where parsing a name back apart never was.
+          if [ "${{ github.ref_type }}" = tag ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="build-$(git rev-parse HEAD | cut -c1-12)"
+          fi
+          wrapper="$(readlink -f result/bin/caos-cli)"
+          inner="$(grep -o '/nix/store/[^"]*caos-cli-bin/bin/caos-cli' "$wrapper" | tail -1)"
+          test -n "$inner" || { echo "could not find the inner binary in $wrapper" >&2; exit 1; }
+          # `file` says "static-pie linked" for this binary and `ldd` says
+          # "statically linked" -- accept either, and fail loudly rather than
+          # publish something that needs an interpreter the target lacks.
+          file "$inner" | grep -qE 'static-pie linked|statically linked' \
+            || { echo "$inner is not static:"; file "$inner"; exit 1; } >&2
+
+          mkdir -p dist
+          install -m 0755 "$inner" dist/caos-x86_64-linux
+          # From `tunnel/`, which is either this run's build or the cache hit
+          # that replaced it. pkgsStatic produces the executable itself, so
+          # there is no wrapper to unwrap as there is for the client.
+          install -m 0755 tunnel/dumbpipe dist/dumbpipe-x86_64-linux
+          file dist/dumbpipe-x86_64-linux | grep -qE 'static-pie linked|statically linked' \
+            || { echo "the tunnel is not static:"; file dist/dumbpipe-x86_64-linux; exit 1; } >&2
+          # The patch is the whole reason we build our own, and an unpatched
+          # binary is indistinguishable from a patched one until it meets an
+          # intercepting proxy. rustls-native-certs puts these markers in;
+          # n0's build has none of them.
+          for marker in SSL_CERT_FILE SSL_CERT_DIR; do
+            grep -aq "$marker" dist/dumbpipe-x86_64-linux \
+              || { echo "the tunnel does not read the OS trust store ($marker absent)"; exit 1; } >&2
+          done
+          cp integrations/claude-code/shared/settings.json dist/claude-settings.json
+          cp integrations/claude-code/shared/mcp.json      dist/mcp.json
+          # Copied, not stamped. install.sh resolves the build from its --base
+          # and reports that; a tag baked in here could only ever disagree.
+          install -m 0755 integrations/claude-code/cloud/install.sh dist/install.sh
+
+          # Prove the thing we are about to publish actually runs, rather than
+          # discovering it from a cloud VM that cannot say why.
+          #
+          # ASSERT THE OUTPUT, NOT THE EXIT CODE. `caos` with no arguments
+          # prints its usage and exits NON-ZERO -- that is its contract -- so
+          # under `set -euo pipefail` running it as a bare command fails the
+          # step for a binary that is working perfectly.
+          banner="$(./dist/caos-x86_64-linux 2>&1 || true)"
+          case "$banner" in
+            *"usage:"*) printf '%s\n' "$banner" | head -1 ;;
+            *) echo "no usage banner from the built client:"; printf '%s\n' "$banner"; exit 1 ;;
+          esac
+          mcp="$(./dist/caos-x86_64-linux mcp 2>&1 || true)"
+          case "$mcp" in
+            *"mcp hook"*|*"mcp serve"*) echo "mcp subcommands present" ;;
+            *) echo "the built client has no \`mcp\` surface:"; printf '%s\n' "$mcp"; exit 1 ;;
+          esac
+          dp="$(./dist/dumbpipe-x86_64-linux --help 2>&1 || true)"
+          case "$dp" in
+            *"dumb pipe"*) echo "tunnel runs" ;;
+            *) echo "the built tunnel does not run:"; printf '%s\n' "$dp" | head -3; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Every build, so a branch push can be inspected without cutting a
+      # release for it.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caos-client-${{ steps.stage.outputs.tag }}
+          path: dist/
+
+      # EVERY build is a release, because a release is the only place GitHub
+      # will serve a file to an unauthenticated machine. Actions artifacts
+      # (above) need a token to download and they expire, so a cloud VM cannot
+      # use them; the binary is not in git; and building in the VM was the
+      # thing this exists to avoid. "Release" here is a file host, not a
+      # promise about a name -- the name is the commit.
+      #
+      # No tag has to exist first: the action creates `tag_name` at this
+      # commit, and `stage` has already computed it as `build-<commit>`.
+      #
+      # Branch builds are prereleases, so `latest` keeps meaning the newest
+      # real version rather than whichever branch pushed most recently. Nothing
+      # resolves through `latest` any more -- install.sh asks for a build by
+      # commit -- so this costs nothing and stops one branch's push from
+      # silently becoming everyone's default.
+      # `target_commitish` IS NOT OPTIONAL, whatever the name suggests. The
+      # Releases API creates a missing tag at the DEFAULT BRANCH's head unless
+      # told otherwise, so without it `build-<commit>` named one commit and
+      # pointed at another -- every tag published before this landed on
+      # whatever main's head happened to be (build-897eebb571ff points at a
+      # main merge from four days earlier, and three other tags share one
+      # commit). Nothing read the target, so nothing broke; the moment anything
+      # resolves a build tag to a commit, it gets the wrong tree. install.sh
+      # checks the name against the target for exactly that reason.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.stage.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.stage.outputs.tag }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          files: |
+            dist/caos-x86_64-linux
+            dist/dumbpipe-x86_64-linux
+            dist/claude-settings.json
+            dist/mcp.json
+            dist/install.sh
