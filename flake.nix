@@ -599,6 +599,10 @@ sandbox = false''
           name = "caos-stack";
           tag = "latest";
           contents = [ hostStackRoot ] ++ stackUserland;
+          # Bootstrap imports this database into the persistent store. Without
+          # it, nix can replace its own live libraries while substituting paths
+          # it considers invalid, leaving the build hook unable to load libcurl.
+          includeNixDB = true;
           config = {
             # bash EXPLICITLY, not the script's `#!/usr/bin/env bash` shebang:
             # /usr/bin/env comes from the caos additions, which the
