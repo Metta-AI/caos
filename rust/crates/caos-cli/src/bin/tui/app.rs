@@ -37,7 +37,7 @@ mod publication;
 use publication::PublishPrompt;
 #[path = "input_history.rs"]
 mod input_history;
-use input_history::InputHistory;
+use input_history::{InputHistory, InputLog};
 
 const NEW_CONVERSATION_TITLE: &str = "New conversation";
 
@@ -1029,6 +1029,7 @@ struct ConversationState {
     tool_set: Option<Result<ToolSetDescription, String>>,
     composer: Composer,
     input_history: Option<InputHistory>,
+    input_log: InputLog,
     status: String,
     command_error: Option<String>,
     reference_notice: Option<ReferenceNotice>,
@@ -1078,6 +1079,7 @@ impl ConversationState {
             tool_set: None,
             composer: Composer::default(),
             input_history: None,
+            input_log: InputLog::default(),
             status,
             command_error: None,
             reference_notice: None,
@@ -1764,6 +1766,7 @@ pub(crate) enum MouseAction {
 
 pub(crate) struct App {
     repo_dir: PathBuf,
+    input_log_dir: Option<PathBuf>,
     user: String,
     conversations: Vec<ConversationState>,
     selected: usize,
@@ -1902,6 +1905,7 @@ impl App {
             let _ = states[selected].reload(&transport, &args.user);
         }
         let mut app = Self {
+            input_log_dir: Some(super::launcher::input_history_dir(&repo_dir, &args.user)?),
             repo_dir,
             user: args.user,
             conversations: states,
@@ -2231,13 +2235,13 @@ impl App {
         if raw.is_empty() {
             return;
         }
+        self.remember_input(raw);
         if let Some((command, arguments)) = parse_command(raw) {
             if !command.action.submits_message() {
                 if command.takes_argument == arguments.is_empty() {
                     self.selected_mut()
                         .show_command_error(format!("usage: {}", command.usage));
                 } else {
-                    self.selected_mut().input_history = None;
                     self.selected_mut().composer.take_message();
                     self.run_local_command(command, arguments);
                 }
@@ -4416,6 +4420,7 @@ mod tests {
         (
             App {
                 repo_dir: PathBuf::from("."),
+                input_log_dir: None,
                 user: "tester".to_string(),
                 conversations,
                 selected: 0,
@@ -7668,7 +7673,7 @@ mod tests {
         );
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.selected().composer.text, "unfinished draft");
+        assert_eq!(app.selected().composer.text, "/title");
 
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
