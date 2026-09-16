@@ -19,6 +19,7 @@
 //! `get` expand a placeholder later.
 
 pub mod gitlinks;
+pub mod timing;
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -641,6 +642,12 @@ impl GitTransport {
     pub fn git_capture(&self, args: &[&str], index: Option<&Path>) -> Result<String, String> {
         git_capture_in(args, index, &self.work_dir)
     }
+
+    /// Run Git in this transport's bound working tree and return its STDERR,
+    /// which is where progress and summary lines land.
+    fn git_capture_stderr(&self, args: &[&str]) -> Result<String, String> {
+        git_capture_stderr_in(args, &self.work_dir)
+    }
 }
 
 impl Transport for GitTransport {
@@ -760,9 +767,30 @@ impl Transport for GitTransport {
         // not create either: an object the server got that way stops being a
         // negotiation base for a later delta push. It was never one — the
         // client could not read its graph, which is why it went that route.
-        if self.server_holds(hash) {
+        // COUNTED, not logged one line per call. "The server already had it" is
+        // the common answer -- a single resolve takes this branch a dozen or more
+        // times -- and a journal line each would push the one expensive push out
+        // of any readable tail. The count is what carries the information (it
+        // proves the cheap path was taken), and [`push_counts`] reports it
+        // alongside the phases that enclose these calls.
+        //
+        // A SLOW probe is still logged individually, because it stops being
+        // routine: this is one `HEAD /object/<hash>` round trip, so a slow one
+        // is a statement about the transport, not about the object.
+        let started = std::time::Instant::now();
+        let held = self.server_holds(hash);
+        let probe = started.elapsed().as_secs_f64();
+        if probe >= 0.5 {
+            timing::record(
+                "slow-object-probe",
+                &format!("{hash}: {probe:.1}s to ask whether the server holds it"),
+            );
+        }
+        if held {
+            PUSHES_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
+        PUSHES_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.push_closure(hash)
     }
 
@@ -1106,7 +1134,37 @@ impl GitTransport {
 
     fn push_req_ref(&self, hash: &str) -> Result<(), String> {
         let refspec = format!("{hash}:refs/caos/req/{hash}");
-        self.run_git(&["push", "--quiet", CAOS_REMOTE, &refspec])
+        // NOT `--quiet`, because what this push COST is the question it is most
+        // often asked. git's own progress lines are the only place the answer
+        // exists -- `Total N (delta D), reused R` says whether the server's
+        // advertisement was used as a negotiation base or whether we just
+        // shipped the entire history again, and no timing alone distinguishes
+        // those. `--porcelain` keeps stdout machine-shaped; the counts are on
+        // stderr either way, which `git_capture_in` already collects.
+        //
+        // Progress is forced on because stderr is a pipe here, and git suppresses
+        // it when not on a terminal -- without this the summary line is simply
+        // absent and the measurement silently reports nothing.
+        let started = std::time::Instant::now();
+        let outcome =
+            self.git_capture_stderr(&["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
+        let elapsed = started.elapsed().as_secs_f64();
+        match outcome {
+            Ok(stderr) => {
+                let summary = stderr
+                    .lines()
+                    .find(|line| line.starts_with("Total "))
+                    .unwrap_or("no object summary")
+                    .trim()
+                    .to_string();
+                timing::record("push", &format!("{hash} in {elapsed:.1}s: {summary}"));
+                Ok(())
+            }
+            Err(error) => {
+                timing::record("push-failed", &format!("{hash} after {elapsed:.1}s"));
+                Err(error)
+            }
+        }
     }
 
     /// Does the server already hold `hash`? One `HEAD /object/<hash>` — a status
@@ -1329,6 +1387,23 @@ impl GitTransport {
 /// Run `git` in `cwd` and return its stdout; error on failure. With `index` set,
 /// `GIT_INDEX_FILE` points at a throwaway index (so `git add` / `write-tree` do
 /// not touch the real one). The path-ingestion plumbing.
+/// Run git and hand back its STDERR on success, where git writes progress and
+/// summary lines. [`git_capture_in`] collects stderr too but keeps it only for
+/// the failure message, so a caller that wants to measure a SUCCESSFUL command
+/// has nowhere to read from.
+fn git_capture_stderr_in(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("running git {}: {e}", args.join(" ")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        return Err(format!("git {} failed: {}", args.join(" "), stderr.trim()));
+    }
+    Ok(stderr)
+}
+
 fn git_capture_in(args: &[&str], index: Option<&Path>, cwd: &Path) -> Result<String, String> {
     let mut command = std::process::Command::new("git");
     command.args(args).current_dir(cwd);
@@ -1432,7 +1507,56 @@ pub fn install_ticket_transport(transport: Box<dyn TicketTransport>) {
 /// THE ONE PLACE that knows how to reach the server, which is what lets a second
 /// transport exist at all: every `/object`, `/run`, `/status`, `/sub-run` and
 /// `/trace/child` call in this crate goes through here.
+/// How many times `ensure_pushed` found the object already on the server, and
+/// how many times it had to send it. See the note in `ensure_pushed`.
+static PUSHES_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PUSHES_SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `(already on the server, actually pushed)` so far in this process, for a
+/// phase line to report. The ratio is the answer to "did we re-send a repo the
+/// server already had".
+pub fn push_counts() -> (usize, usize) {
+    (
+        PUSHES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        PUSHES_SENT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub fn server_request(base: &str, request: &ServerRequest) -> Result<ServerResponse, String> {
+    // The FIRST request of a process is always recorded, and the rest only when
+    // they are slow. That asymmetry is the measurement: over a ticket the first
+    // request pays the whole dial -- relay lookup, TLS, QUIC handshake -- and
+    // every later one rides the open connection, so an average hides exactly the
+    // cost that matters. It is also the cost that decided a session: a 5s
+    // reachability probe is a budget on THIS number, and nothing recorded it.
+    static FIRST_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    const SLOW: f64 = 2.0;
+
+    let started = std::time::Instant::now();
+    let answer = server_request_inner(base, request);
+    let elapsed = started.elapsed().as_secs_f64();
+    let first = !FIRST_DONE.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if first || elapsed >= SLOW || answer.is_err() {
+        let outcome = match &answer {
+            Ok(response) => format!("{} ({} bytes)", response.status, response.body.len()),
+            Err(error) => format!("failed: {error}"),
+        };
+        timing::record(
+            if first {
+                "server-request-first"
+            } else {
+                "server-request"
+            },
+            &format!(
+                "{} {} in {elapsed:.1}s -> {outcome}",
+                request.method, request.path
+            ),
+        );
+    }
+    answer
+}
+
+fn server_request_inner(base: &str, request: &ServerRequest) -> Result<ServerResponse, String> {
     let base = base.trim_end_matches('/');
     // THE WORLD TAG GOES ON EVERY REQUEST, whichever transport carries it, and
     // it is stamped HERE rather than per-branch for that reason. A request

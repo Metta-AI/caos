@@ -441,6 +441,18 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
         .map_err(|error| format!("parsing the tool registry: {error}"))?;
     // The run-list phase includes pushing the workspace closure to the server,
     // so a big number there is usually the push, not the worker's own work.
+    let (held, sent) = caos::push_counts();
+    caos::timing::record(
+        "declarations",
+        &format!(
+            "resolve-llm-step {:.1}s, workspace-prep {:.1}s, run-list-tools {:.1}s (total {:.1}s) \
+             [objects: {held} already on the server, {sent} pushed]",
+            resolve_step.as_secs_f64(),
+            workspace_prep.as_secs_f64(),
+            run_list.as_secs_f64(),
+            total.elapsed().as_secs_f64(),
+        ),
+    );
     if let Ok(mut slot) = DISCOVERY_TIMING.lock() {
         let breakdown = crate::code_commit_timing()
             .map(|b| format!(" [{b}]"))

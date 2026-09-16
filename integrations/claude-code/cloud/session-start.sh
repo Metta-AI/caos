@@ -19,6 +19,15 @@ set -uo pipefail
 
 log() { printf 'caos: %s\n' "$*" >&2; }
 
+# EVERY LINE IS STAMPED with seconds since this hook started, because the gap
+# this hook sits in -- Claude Code launching to the session's first turn -- was
+# measured at 65s and could not be attributed to any step inside it. The hook's
+# own steps, Claude Code's startup and its MCP connect all overlap in that
+# window, so the only way to tell them apart is for each side to say when it ran.
+# This is that side; `caos::timing` is the other.
+hook_started="$(date +%s)"
+step() { log "[+$(($(date +%s) - hook_started))s] $*"; }
+
 base=""
 for arg in "$@"; do
     case "$arg" in
@@ -106,7 +115,7 @@ if [ -n "$server" ] && [ "$have_repo" = 1 ]; then
             log "caos remote already set; leaving it (wanted $shown)"
         fi
     else
-        git remote add caos "$server" && log "caos remote -> $shown"
+        git remote add caos "$server" && step "caos remote -> $shown"
     fi
 elif [ -z "$server" ]; then
     log "no CAOS_SERVER_URL; leaving the remote alone"
@@ -132,10 +141,12 @@ fi
 # configuration would drive a step from a different tree than itself, the one
 # pairing that cannot go quiet. Both are a no-op when nothing moved.
 if [ -n "$base" ]; then
+    step "refreshing the client"
     if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
 fi
+step "client refresh done"
 
 # ---------------------------------------------------------------------------
 # Unshallow the checkout -- LAST, because it is the slowest and gates only the
@@ -155,10 +166,11 @@ fi
 # repo pays a one-time full-history fetch here rather than failing later.
 if [ "$have_repo" = 1 ] \
     && [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
-    log "unshallowing the checkout so caos can push its history"
+    step "unshallowing the checkout so caos can push its history"
     git fetch --unshallow --quiet 2>/dev/null \
         || log "could not unshallow; a repo the server has not seen may fail to resolve"
 fi
+step "unshallow done"
 
 # ---------------------------------------------------------------------------
 # Warm the tool registry -- LAST, after the checkout is complete enough to push
@@ -190,7 +202,7 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
     fi
     if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
         locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
-        log "warming the caos tool registry for the first turn"
+        step "warming the caos tool registry for the first turn"
         # Its output goes to a FILE, not the hook's own stdout/stderr, and this
         # is not tidiness: Claude Code holds the session at "starting" until this
         # hook's output stream reaches EOF, so a warm that inherited that stream
@@ -212,9 +224,12 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
             >/tmp/caos-warm.log 2>&1 \
             || log "could not warm the tools in time; mcp serve will resolve in the background"
         while IFS= read -r line; do log "warm: $line"; done < /tmp/caos-warm.log
+        step "warm done"
     else
         log "no build record; leaving the tools to mcp serve's background resolve"
     fi
 fi
+
+step "hook done"
 
 exit 0

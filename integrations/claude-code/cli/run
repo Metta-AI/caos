@@ -38,8 +38,25 @@ export CAOS_BIN
 # The output is captured rather than piped into `grep -q`: grep exits at its
 # first match and closes the pipe, the server takes SIGPIPE, and under
 # `pipefail` that pipeline reports failure for a probe that in fact SUCCEEDED.
+# The argv comes OUT OF mcp.json rather than being spelled again here, because
+# a probe with its own copy of it tests a command the session never runs. That
+# is not hypothetical: mcp.json said `cc serve` for as long as the verb has been
+# `mcp serve`, and this probe -- which spelled `mcp serve` itself -- passed every
+# time while every session it launched got "error connecting to caos". The cloud
+# path could not catch it either; its `caos-serve` wrapper ignores argv and execs
+# the verb it wants.
+mcp_config="$here/../shared/mcp.json"
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is needed to read $mcp_config (nix run nixpkgs#jq, or add it to the flake)." >&2
+    exit 1
+fi
+mapfile -t serve_args < <(jq -r '.mcpServers.caos.args[]' "$mcp_config")
+if [ "${#serve_args[@]}" = 0 ]; then
+    echo "no .mcpServers.caos.args in $mcp_config" >&2
+    exit 1
+fi
 probe="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-    | "$CAOS_BIN" mcp serve --llm-step:@=std/llm-step || true)"
+    | "$CAOS_BIN" "${serve_args[@]}" || true)"
 case "$probe" in
     *caos_session*) ;;
     *)

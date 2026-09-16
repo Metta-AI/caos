@@ -122,15 +122,35 @@ pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
         if attempt > 0 {
             std::thread::sleep(RESOLVE_FAST_INTERVAL);
         }
+        // TIMED, because the probe has a fixed budget and the question a failed
+        // attempt raises is whether the dial was slow or the server was absent.
+        // Those want opposite fixes and the message alone cannot tell them apart.
+        let probe = std::time::Instant::now();
         if let Err(error) = t.ensure_server_reachable() {
-            last = format!("server not reachable: {error}");
+            last = format!(
+                "server not reachable after {:.1}s: {error}",
+                probe.elapsed().as_secs_f64()
+            );
+            eprintln!(
+                "caos mcp warm: attempt {} did not cache: {last}",
+                attempt + 1
+            );
             continue;
         }
         match declarations(t, options) {
             Ok(found) if !found.is_empty() => {
                 write_cached_registry(t, options, &found);
+                // WHERE the wait went, in the hook's own log. `declarations`
+                // measures its phases into a per-PROCESS static that only
+                // `serve`'s diagnostics read -- so a warm that took a minute
+                // reported the minute and threw the breakdown away, and the one
+                // session state where you need it (a slow start you are trying
+                // to explain) is the one with no `serve` resolve to print it.
+                let breakdown = super::discovery_timing()
+                    .map(|timing| format!(": {timing}"))
+                    .unwrap_or_default();
                 eprintln!(
-                    "caos mcp warm: cached {} tools for the first turn (attempt {})",
+                    "caos mcp warm: cached {} tools for the first turn (attempt {}){breakdown}",
                     found.len(),
                     attempt + 1
                 );
@@ -369,6 +389,20 @@ fn diagnostics() -> String {
     // is separate). Blank until a resolve has run.
     if let Some(timing) = super::discovery_timing() {
         d.push_str(&format!("tool discovery: {timing}\n"));
+    }
+    // The CROSS-PROCESS phase journal, which is the only way this session can
+    // see what the other caos processes did. `mcp hook` fires per prompt and
+    // pays the conversation-base push; `mcp warm` resolves the tools. Neither
+    // can print to a transcript, and a cloud session has no shell to go looking
+    // with -- so they write here and this reads it back.
+    let phases = caos::timing::tail(25);
+    if phases.is_empty() {
+        d.push_str("phase journal: empty\n");
+    } else {
+        d.push_str("phase journal (most recent last, times relative to the newest):\n");
+        for line in phases {
+            d.push_str(&format!("  {line}\n"));
+        }
     }
     // The warm step's own log: session-start runs `mcp warm` before the client
     // starts, and this is where it says whether it resolved and cached the

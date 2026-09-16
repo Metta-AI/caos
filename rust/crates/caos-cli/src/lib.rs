@@ -592,13 +592,23 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     let mark = Instant::now();
     let pushed = t.ensure_pushed(commit.as_str());
     let ensure_pushed = mark.elapsed();
+    let breakdown = format!(
+        "ensure-local {:.1}s, is-ancestor {:.1}s, ensure-pushed {:.1}s",
+        ensure_local.as_secs_f64(),
+        is_ancestor.as_secs_f64(),
+        ensure_pushed.as_secs_f64(),
+    );
+    // Recorded to the journal as well as the static, because the process that
+    // pays this is usually `mcp hook` -- which has no `declarations` later to
+    // read the static out, so until now the most expensive measurement caos
+    // takes was computed once per prompt and discarded every time.
+    let (held, sent) = caos::push_counts();
+    caos::timing::record(
+        "code-commit",
+        &format!("{breakdown} [objects: {held} already on the server, {sent} pushed]"),
+    );
     if let Ok(mut slot) = CODE_COMMIT_TIMING.lock() {
-        *slot = Some(format!(
-            "ensure-local {:.1}s, is-ancestor {:.1}s, ensure-pushed {:.1}s",
-            ensure_local.as_secs_f64(),
-            is_ancestor.as_secs_f64(),
-            ensure_pushed.as_secs_f64(),
-        ));
+        *slot = Some(breakdown);
     }
     pushed
 }
