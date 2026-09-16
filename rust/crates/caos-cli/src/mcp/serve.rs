@@ -332,6 +332,24 @@ fn diagnostics() -> String {
     // Where the env came from, stamped once at setup.
     d.push_str("env stamp (/usr/local/share/caos/setup-stamp):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
+    // WHAT THE ENVIRONMENT NAMED, before what the repo got. A missing `caos`
+    // remote is nearly always one of these two lines: nothing named a server, or
+    // the variable that names one has moved and the environment still sets the
+    // old one. That failure is otherwise explained only in a hook log, which a
+    // cloud session cannot read -- this tool is the surface it has.
+    d.push_str(&format!(
+        "CAOS_SERVER_URL: {}\n",
+        match std::env::var("CAOS_SERVER_URL") {
+            Ok(url) => redact_secrets(&url),
+            Err(_) => "<unset>".to_string(),
+        }
+    ));
+    if std::env::var_os("CAOS_IROH_TICKET").is_some() {
+        d.push_str(
+            "CAOS_IROH_TICKET: set, and nothing reads it \
+             -- set CAOS_SERVER_URL to the ticket instead\n",
+        );
+    }
     // The remote the client dials -- present means session-start added it.
     // REDACTED, because a `caos://` remote is the capability itself and this
     // output is quoted verbatim by a model.
@@ -814,5 +832,25 @@ mod redaction_tests {
     fn an_http_remote_is_left_alone() {
         let line = "caos remote: http://localhost:9090";
         assert_eq!(redact_secrets(line), line);
+    }
+}
+
+#[cfg(test)]
+mod env_diagnostic_tests {
+    /// The status text must NAME the variable that moved, because a cloud
+    /// session cannot read the hook's log and this tool is all it has. A
+    /// misconfigured environment reported only as "no caos remote" sends whoever
+    /// is debugging it looking at the repository instead of the env.
+    #[test]
+    fn the_diagnostics_mention_both_server_variables() {
+        let source = include_str!("serve.rs");
+        assert!(
+            source.contains("CAOS_SERVER_URL: {}"),
+            "the status text no longer reports CAOS_SERVER_URL"
+        );
+        assert!(
+            source.contains("CAOS_IROH_TICKET: set, and nothing reads it"),
+            "the status text no longer names the variable that moved"
+        );
     }
 }

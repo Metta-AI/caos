@@ -26,7 +26,20 @@ for arg in "$@"; do
     esac
 done
 
+# ONE NAME, because there is one thing to name: a ticket IS a server URL
+# (design/iroh-transport.md), so `CAOS_IROH_TICKET` would be a second spelling
+# of `CAOS_SERVER_URL` — and two names for one value is how an environment ends
+# up setting the one nothing reads.
+#
+# It was briefly accepted as an alias, for environments configured against the
+# old tunnel, and that is the mistake this note exists to not repeat: the fix
+# for a variable that moved is to SAY SO, loudly, in the place the session can
+# see, not to keep answering to both.
 server="${CAOS_SERVER_URL:-}"
+if [ -z "$server" ] && [ -n "${CAOS_IROH_TICKET:-}" ]; then
+    log "CAOS_IROH_TICKET is set, and nothing reads it any more."
+    log "Set CAOS_SERVER_URL to this server's ticket instead ('caosd ticket' prints it)."
+fi
 
 # Which environment is this? Printed first, every session, so that a stale
 # snapshot announces itself instead of being mistaken for a broken fix.
@@ -38,15 +51,25 @@ else
 fi
 
 # A ticket IS a server URL now (design/iroh-transport.md), so there is nothing
-# to bring up and nothing to point at a local port: `caos://…` in
-# CAOS_SERVER_URL is handled by the client itself and by `git-remote-caos`,
-# which the installer puts beside it. What used to be here — a dumbpipe
-# connector on :19090, a liveness poll, a pkill for the one holding the port,
-# and `setsid` so Claude Code's teardown of the hook's process group would not
-# take it with it — is all gone with the process it babysat.
-if [ -n "${CAOS_IROH_TICKET:-}" ] && [ -z "$server" ]; then
-    log "CAOS_IROH_TICKET is set, which this client no longer reads."
-    log "Set CAOS_SERVER_URL to the server's caos:// ticket instead ('caosd ticket' prints it)."
+# to bring up and nothing to point at a local port: `caos://…` is handled by the
+# client itself and by `git-remote-caos`, which the installer puts beside it.
+# What used to be here — a dumbpipe connector on :19090, a liveness poll, a
+# pkill for the one holding the port, and `setsid` so Claude Code's teardown of
+# the hook's process group would not take it with it — is all gone with the
+# process it babysat.
+#
+# SAY WHICH SERVER, and say it by prefix: a `caos://` URL ends in the token that
+# authorizes driving that server, and these lines are read back by whoever is
+# debugging a session.
+#
+# The truncation is only right for a ticket: `${x%.*}` on `http://10.0.0.5:9090`
+# would cut the address instead.
+shown="$server"
+case "$server" in
+    caos://*) shown="${server%.*}…" ;;
+esac
+if [ -n "$server" ]; then
+    log "server $shown"
 fi
 
 # ---------------------------------------------------------------------------
@@ -80,15 +103,15 @@ fi
 if [ -n "$server" ] && [ "$have_repo" = 1 ]; then
     if current="$(git remote get-url caos 2>/dev/null)"; then
         if [ "$current" != "$server" ]; then
-            log "caos remote already set to $current; leaving it (wanted $server)"
+            log "caos remote already set; leaving it (wanted $shown)"
         fi
     else
-        git remote add caos "$server" && log "caos remote -> $server"
+        git remote add caos "$server" && log "caos remote -> $shown"
     fi
 elif [ -z "$server" ]; then
     log "no CAOS_SERVER_URL; leaving the remote alone"
 else
-    log "$PWD is not a git repository; nothing to point at $server"
+    log "$PWD is not a git repository; nothing to point at $shown"
 fi
 
 
