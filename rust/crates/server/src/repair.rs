@@ -181,11 +181,10 @@ struct IntegrityMemo {
     closure: HashSet<(gix::ObjectId, ClosureKind)>,
 }
 
-/// Validate a ref target. Mutable commit refs include the commit's source tree
-/// tree, but not its parents. This keeps startup repair from scanning unrelated
-/// ordinary history. Content-addressed request/result refs only need their named
-/// object to be readable; traversing every request source tree would turn startup
-/// repair into a scan of unrelated immutable history.
+/// Select a recovery snapshot by its current tree, without rewinding a ref
+/// merely because older history is damaged. The server checks every stored
+/// object's connectivity after ref recovery and refuses to serve missing history.
+/// Content-addressed request/result refs only need their named object here.
 fn intact_ref_target(
     repo: &gix::Repository,
     id: gix::ObjectId,

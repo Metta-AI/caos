@@ -164,6 +164,12 @@ fn main() {
     // where every push came back `403` from the inner server, which reads as an
     // auth problem and is really a missing config.
     git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
+    // Validate every incoming object in Git's quarantine, including objects
+    // outside the updated refs. Keep even small pushes packed so migration
+    // exposes a complete pack at once, not unordered loose commits.
+    git(&["-C", &git_dir, "config", "receive.fsckObjects", "true"]);
+    git(&["-C", &git_dir, "config", "receive.shallowUpdate", "false"]);
+    git(&["-C", &git_dir, "config", "receive.unpackLimit", "1"]);
     git(&[
         "-C",
         &git_dir,
@@ -273,6 +279,14 @@ fn main() {
              and {dropped} broken ref(s)"
         );
     }
+
+    // Older servers accepted individual commits without their dependencies.
+    // Check all objects, including unreferenced ones, before trusting existence
+    // as proof of closure. Never delete history to make an upgrade pass.
+    verify_object_closure(&git_dir).unwrap_or_else(|error| {
+        eprintln!("fatal: object store has incomplete history; restore the missing objects before restarting: {error}");
+        std::process::exit(1);
+    });
 
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
@@ -391,6 +405,63 @@ fn run_required_git(args: &[&str]) -> Result<(), String> {
         "{last} (still held after {}s — a crashed writer's stale lock file?)",
         GIT_LOCK_WAIT_STEPS as u64 * GIT_LOCK_WAIT_STEP.as_millis() as u64 / 1000
     ))
+}
+
+fn verify_object_closure(git_dir: &str) -> Result<(), String> {
+    match std::fs::read(std::path::Path::new(git_dir).join("shallow")) {
+        Ok(bytes) if !bytes.is_empty() => {
+            return Err("server repository must not be shallow".into())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    use std::process::{Command, Stdio};
+    let git = || {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .args(["-c", "core.commitGraph=false", "-C", git_dir]);
+        command
+    };
+    // fsck --connectivity-only starts from refs and misses orphan commits.
+    // Make every stored object a root, without reading every blob's payload.
+    let mut objects = git()
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("enumerating stored objects: {error}"))?;
+    let walk = git()
+        .args([
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--missing=error",
+            "--stdin",
+        ])
+        .stdin(objects.stdout.take().expect("piped object list"))
+        .output();
+    // Check both processes: a failed enumeration must not look like an empty
+    // store, and a failed walk must not be hidden by a successful enumeration.
+    let listed = objects
+        .wait_with_output()
+        .map_err(|error| format!("enumerating stored objects: {error}"))?;
+    let walked = walk.map_err(|error| format!("checking object closure: {error}"))?;
+    if !walked.status.success() || !listed.status.success() {
+        return Err(format!(
+            "{}{}",
+            String::from_utf8_lossy(&listed.stderr),
+            String::from_utf8_lossy(&walked.stderr)
+        ));
+    }
+    Ok(())
 }
 
 fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {

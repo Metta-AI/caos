@@ -1,8 +1,9 @@
 # Git import endpoint
 
 `POST /git/import` makes an exact remote commit and its complete ancestor
-history readable through CAOS's object API. Git fetches directly into the
-server's existing bare repository, avoiding a worker checkout and re-upload.
+history readable through CAOS's object API. Git fetches into a private staging
+repository on the server, avoiding a worker checkout and re-upload. Only
+verified objects enter the shared object store.
 
 ## Request and execution
 
@@ -17,17 +18,21 @@ The server:
 2. Locks `$GIT_DIR/caos-imports/<sha256(source)>/lock`, serializing imports
    from that URL across server processes sharing the object store.
 3. Returns `{"commit": H}` immediately if `H.complete` exists in that directory.
-4. Fetches H directly into `$GIT_DIR`, targeting the URL and exact hash:
-   `git --git-dir=<server-repo> fetch <source> <H>`. This requests H's
-   ancestors, trees and blobs, without fetching every branch. Tags and
-   recursive submodule fetching are disabled; no partial-clone filter is used.
-5. Rejects incomplete ancestor history, verifies H is a commit, and reads every
-   reachable commit, tree and blob through the server's object-storage code.
-6. Writes and flushes `H.complete`, then returns `{"commit": H}`.
+4. Fetches H into a private bare repository under that directory. Its object
+   store reads existing server objects through an alternate, but all writes
+   stay private. The fetch requests H's ancestors, trees and blobs. Tags,
+   recursive submodule fetching, and partial-clone filters are disabled.
+5. Rejects incomplete ancestor history, verifies H is a commit, and walks H
+   plus every received object as roots. It reads their complete closure through
+   the object-storage code, including surplus objects unrelated to H. Git's
+   pack checks alone can exempt parents of remote-declared shallow commits.
+6. Publishes the verified pack, then its index, and flushes both. Readers see
+   the new objects together. The live object API must be able to read H.
+7. Writes and flushes `H.complete`, then returns `{"commit": H}`.
 
-Each import uses a separate shallow-boundary file so a shallow upstream cannot
-change the shared repository's boundary. A failed fetch or verification writes
-no completion marker; the same request can be retried. Verification currently
+The private repository also isolates shallow boundaries. A failed fetch or
+verification leaves no new objects visible in the shared store and writes no
+completion marker; the same request can be retried. Verification currently
 walks the full requested history on every new completion, including overlaps
 with earlier imports.
 
@@ -45,11 +50,10 @@ import can reuse an earlier import's content without transferring it again.
 See Git's [fetch negotiation options](https://git-scm.com/docs/git-fetch) and
 [packfile negotiation](https://git-scm.com/docs/pack-protocol#_packfile_negotiation).
 
-CAOS may contain commits whose parents, trees or blobs are missing. Advertising
-one as complete could cause the remote to omit objects we still need. The
-endpoint therefore supplies `--negotiation-tip=<commit>` only for completed
-imports from the same source URL. With no completed imports for that URL, it
-sets `fetch.negotiationAlgorithm=noop` and skips negotiation.
+Stored commits have their complete ancestor history and ordinary tree contents.
+The endpoint supplies `--negotiation-tip=<commit>` only for completed
+imports from the same source URL, limiting negotiation to relevant histories.
+With no completed imports for that URL, it sets `fetch.negotiationAlgorithm=noop` and skips negotiation.
 
 | Already present in CAOS | Effect on this import |
 | --- | --- |
@@ -76,3 +80,21 @@ credentials, like other objects already in the store.
 Implementation: [endpoint](../rust/crates/server/src/import.rs),
 [Git command and credential setup](../rust/crates/git-locator/src/import.rs).
 Caller behavior: [agent imports](agent-github.md#importing).
+
+## Object-store invariant
+
+Every admitted commit has its tree and all parents in the store. Ordinary tree
+entries have their objects too. Gitlinks are separate history references:
+pushing a containing tree sends neither the target commit nor its ancestors.
+
+The object API checks dependency presence and type before writing an owner.
+Clients upload dependencies first. Git pushes validate incoming objects in
+quarantine, reject client shallow declarations, and keep even small transfers
+packed, so publication cannot expose a child before its parents. Imports use
+the staging and publication steps above.
+
+At startup, the server checks connectivity of every existing object, including
+unreferenced commits, and refuses shallow or incomplete stores. This establishes
+the invariant for repositories written by older versions as well as after
+crash recovery. Missing objects must be restored before restarting; this check
+never deletes commits to hide missing history. Automatic GC remains disabled.
