@@ -28,12 +28,24 @@ import (
 )
 
 const (
-	hostAttr     = "caosd-prod"
-	dataLabel    = "caos-data"
-	imds         = "http://169.254.169.254"
-	irohPort     = 11204
-	defaultFlake = "github:Metta-AI/caos"
+	hostAttr  = "caosd-prod"
+	dataLabel = "caos-data"
+	imds      = "http://169.254.169.254"
+	irohPort  = 11204
 )
+
+// defaultFlake is the flake this binary was BUILT from, injected by the flake
+// itself (-X main.defaultFlake=path:${self}). Without it the default was a
+// branch name baked in by hand, so
+//
+//	nix run git+...?ref=my-branch#deploy-caosd-prod
+//
+// fetched the driver from my-branch and then built the host from main --
+// silently, and fatally if main has no nixosConfigurations yet. The ref had to
+// be repeated as an argument to get the obvious behaviour. Now the driver and
+// the host config it applies always come from the same revision, and an
+// argument is only needed to deliberately build from somewhere ELSE.
+var defaultFlake = "github:Metta-AI/caos"
 
 // run executes argv and returns its stdout, failing with the command's own
 // stderr as the diagnostic. Explicit argv: no quoting, no word splitting.

@@ -1393,6 +1393,9 @@ sandbox = false''
             # flake attribute is the role it deploys. mainProgram is what makes
             # `nix run ...#deploy-caosd-prod` find it.
             meta.mainProgram = "caos-deploy";
+            # Bake in the flake this driver came from, so `nix run <ref>#...`
+            # applies the host config from <ref> rather than from main.
+            ldflags = [ "-X main.defaultFlake=path:${self}" ];
             vendorHash = "sha256-1+bSEs1daOIaXWddfmkEOsxcyn/zBzB/0T29YGw+RCw=";
           };
 
