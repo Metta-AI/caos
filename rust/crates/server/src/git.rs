@@ -25,9 +25,8 @@
 //! We translate our [`Request`] into that environment, feed the body, and parse
 //! its stdout back into a [`Response`].
 //!
-//! Receive-pack (push) is only honoured when the served repo has
-//! `http.receivepack=true`; the current mounted repo doesn't, so push is rejected
-//! for now — fetch round-trips work, which is all this slice validates.
+//! Pushes must supply complete history. Reject shallow boundaries before Git
+//! handles the pack: its fsck intentionally exempts parents at those boundaries.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -76,6 +75,27 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         }
     }
 
+    let prefix = if path == "/git-receive-pack" && method == "POST" {
+        // Git compresses upload-pack negotiation, not receive-pack requests.
+        // Refuse an encoded push rather than bypassing boundary validation.
+        if !content_encoding.is_empty() && content_encoding != "identity" {
+            return request.respond(
+                Response::from_string("encoded Git pushes are not supported")
+                    .with_status_code(StatusCode(415)),
+            );
+        }
+        match read_push_commands(request.as_reader()) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                return request.respond(
+                    Response::from_string(error.to_string()).with_status_code(StatusCode(400)),
+                )
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // GIT_PROJECT_ROOT is the repo itself: with PATH_INFO carrying only the
     // service suffix (`/info/refs`, …), the repo path before it is empty, so
     // http-backend resolves the repo to GIT_PROJECT_ROOT directly.
@@ -102,7 +122,8 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     // stdin fully before we read stdout can't deadlock.
     let mut stdin = child.stdin.take().expect("piped stdin");
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let _ = std::io::copy(request.as_reader(), &mut stdin);
+    let mut body = std::io::Cursor::new(prefix).chain(request.as_reader());
+    let _ = std::io::copy(&mut body, &mut stdin);
     drop(stdin);
 
     // Parse only the CGI header block off the front of stdout; everything past the
@@ -116,6 +137,37 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     let result = request.respond(Response::new(StatusCode(status), headers, body, None, None));
     let _ = child.wait();
     result
+}
+
+/// Read only receive-pack's command packets, leaving the pack itself streaming.
+/// A shallow declaration can appear anywhere before the command flush, even
+/// when the incomplete commit is not one of the refs being updated.
+fn read_push_commands(mut input: impl Read) -> std::io::Result<Vec<u8>> {
+    let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
+    let mut prefix = Vec::new();
+    loop {
+        let mut header = [0; 4];
+        input.read_exact(&mut header)?;
+        let length = std::str::from_utf8(&header)
+            .ok()
+            .and_then(|text| usize::from_str_radix(text, 16).ok())
+            .ok_or_else(|| invalid("invalid Git command packet"))?;
+        prefix.extend_from_slice(&header);
+        if length == 0 {
+            return Ok(prefix);
+        }
+        if length < 4 || prefix.len() + length - 4 > 16 * 1024 * 1024 {
+            return Err(invalid("invalid or oversized Git command list"));
+        }
+        let start = prefix.len();
+        prefix.resize(start + length - 4, 0);
+        input.read_exact(&mut prefix[start..])?;
+        if prefix[start..].starts_with(b"shallow ") {
+            return Err(invalid(
+                "shallow pushes are not accepted; send complete history",
+            ));
+        }
+    }
 }
 
 /// Read just the CGI header block from the front of `stdout` — up to the first

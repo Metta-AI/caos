@@ -50,11 +50,10 @@ import can reuse an earlier import's content without transferring it again.
 See Git's [fetch negotiation options](https://git-scm.com/docs/git-fetch) and
 [packfile negotiation](https://git-scm.com/docs/pack-protocol#_packfile_negotiation).
 
-CAOS may contain commits whose parents, trees or blobs are missing. Advertising
-one as complete could cause the remote to omit objects we still need. The
-endpoint therefore supplies `--negotiation-tip=<commit>` only for completed
-imports from the same source URL. With no completed imports for that URL, it
-sets `fetch.negotiationAlgorithm=noop` and skips negotiation.
+Stored commits have their complete ancestor history and ordinary tree contents.
+The endpoint supplies `--negotiation-tip=<commit>` only for completed
+imports from the same source URL, limiting negotiation to relevant histories.
+With no completed imports for that URL, it sets `fetch.negotiationAlgorithm=noop` and skips negotiation.
 
 | Already present in CAOS | Effect on this import |
 | --- | --- |
@@ -81,3 +80,21 @@ credentials, like other objects already in the store.
 Implementation: [endpoint](../rust/crates/server/src/import.rs),
 [Git command and credential setup](../rust/crates/git-locator/src/import.rs).
 Caller behavior: [agent imports](agent-github.md#importing).
+
+## Object-store invariant
+
+Every admitted commit has its tree and all parents in the store. Ordinary tree
+entries have their objects too. Gitlinks are separate history references:
+pushing a containing tree sends neither the target commit nor its ancestors.
+
+The object API checks dependency presence and type before writing an owner.
+Clients upload dependencies first. Git pushes validate incoming objects in
+quarantine, reject client shallow declarations, and keep even small transfers
+packed, so publication cannot expose a child before its parents. Imports use
+the staging and publication steps above.
+
+At startup, the server checks connectivity of every existing object, including
+unreferenced commits, and refuses shallow or incomplete stores. This establishes
+the invariant for repositories written by older versions as well as after
+crash recovery. Missing objects must be restored before restarting; this check
+never deletes commits to hide missing history. Automatic GC remains disabled.

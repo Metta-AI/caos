@@ -56,6 +56,7 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             // tree object (so its hash is a genuine git tree hash).
             let tree = gix::objs::TreeRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid tree: {err}")))?;
+            validate_tree_dependencies(&repo, &tree)?;
             repo.write_object(&tree)
                 .map_err(|err| HttpError::new(500, format!("failed to write tree: {err}")))?
                 .detach()
@@ -64,8 +65,12 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             // Validate the commit encoding, then store the *raw* bytes (rather
             // than re-encoding the parsed form), so the hash is exactly what the
             // client computed over the bytes it sent.
-            gix::objs::CommitRef::from_bytes(content, repo.object_hash())
+            let commit = gix::objs::CommitRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid commit: {err}")))?;
+            require_object(&repo, commit.tree(), gix::object::Kind::Tree)?;
+            for parent in commit.parents() {
+                require_object(&repo, parent, gix::object::Kind::Commit)?;
+            }
             gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
                 .map_err(|err| HttpError::new(500, format!("failed to write commit: {err}")))?
         }
@@ -77,6 +82,49 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
         }
     };
     Ok(format!("{}\n", sync_loose_object(config, id)).into_bytes())
+}
+
+/// Dependencies must precede their owner. Startup checks the existing store,
+/// and Git transfers validate packs before publishing them, so checking direct
+/// edges here preserves complete history without walking it on every write.
+fn require_object(
+    repo: &gix::Repository,
+    id: gix::ObjectId,
+    expected: gix::object::Kind,
+) -> Result<(), HttpError> {
+    let object = repo.find_header(id).map_err(|_| {
+        HttpError::new(
+            400,
+            format!("missing {expected} dependency {id}; upload dependencies first"),
+        )
+    })?;
+    if object.kind() != expected {
+        return Err(HttpError::new(
+            400,
+            format!("dependency {id} is {}, expected {expected}", object.kind()),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tree_dependencies(
+    repo: &gix::Repository,
+    tree: &gix::objs::TreeRef<'_>,
+) -> Result<(), HttpError> {
+    for entry in &tree.entries {
+        // A gitlink names a commit in a separate history; Git does not include
+        // that history in the containing tree's closure.
+        if entry.mode.is_commit() {
+            continue;
+        }
+        let kind = if entry.mode.is_tree() {
+            gix::object::Kind::Tree
+        } else {
+            gix::object::Kind::Blob
+        };
+        require_object(repo, entry.oid.to_owned(), kind)?;
+    }
+    Ok(())
 }
 
 /// Force a just-written loose object to disk, returning the id unchanged.
@@ -169,6 +217,16 @@ pub(crate) fn store_git_tree(
 ) -> Result<gix::ObjectId, String> {
     entries.sort();
     let repo = config.repo.to_thread_local();
+    for entry in &entries {
+        if !entry.mode.is_commit() {
+            let kind = if entry.mode.is_tree() {
+                gix::object::Kind::Tree
+            } else {
+                gix::object::Kind::Blob
+            };
+            require_object(&repo, entry.oid, kind).map_err(|error| error.message)?;
+        }
+    }
     let tree = gix::objs::Tree { entries };
     let id = match repo.write_object(&tree) {
         Ok(id) => id.detach(),
