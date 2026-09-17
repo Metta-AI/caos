@@ -145,13 +145,16 @@ Rules:
 - `dir=` selects a subtree within the repo.
 
 Why commit-then-path (not a bare subtree hash): **GitHub only serves *commits***
-(`allowReachableSHA1InWant`), so `git fetch --depth 1 <url> <rev>` is the
+(`allowReachableSHA1InWant`), so `git fetch <url> <rev>` is the
 fetchable granularity; `dir` selects within it. The commit is also the pin.
 
-Resolution (stage 4, client, eval time): `git fetch --depth 1 <url> <rev>` →
+Resolution (stage 4, client, eval time): `git fetch <url> <rev>` →
 verify rev → peel → descend `dir` → ingest closure → **the oid is the arg
 entry**, byte-for-byte as if from a local `:@=`. URL/rev are fetch coordinates
 and provenance (trace), never part of the key.
+
+Fetch complete ancestry so the caller's repository stays non-shallow. CAOS
+rejects shallow transfer declarations, even on a later tree-only push.
 
 Parser safety (verified against current code): the token is whitespace-free;
 `split_once('=')` takes the **first** `=`, so `?rev=…&dir=…` survives in the
@@ -172,7 +175,7 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
   the time a worker sees a `:@@=` arg it is an ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
   worker.
 - **Pin, fetch, then select** — the order is the content-addressing argument.
-  `git fetch --depth 1 <url> <rev>` (the granularity a host will serve), peel the
+  `git fetch <url> <rev>` (the granularity a host will serve), peel the
   commit to its tree, descend `dir=`. A `path:` skips the fetch and ingests a
   live local directory, exactly as `:@=` does.
 - **Wired in three places, each behaving like its `:@=` sibling** — that is the
@@ -199,7 +202,7 @@ any ordinary repo. The difference is the alternate, not the command.
 Fixed with `-c core.alternateRefsCommand=true` (a command that prints nothing)
 on **this fetch only**. Alternate tips are an EXCLUSION set, so dropping them
 makes the check verify our closure and only ours — stricter, not looser — which
-is safe precisely because a `--depth 1` fetch is self-contained. Do NOT copy it
+is safe because the fetch requests a complete, self-contained history. Do NOT copy it
 to `fetch_object_negotiated`: a chat commit's history may legitimately live in
 an alternate, and there the tips are doing real work.
 

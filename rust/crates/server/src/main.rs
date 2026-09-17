@@ -263,7 +263,12 @@ fn main() {
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
-    let repo = match gix::open(&git_dir) {
+    // Packed uploads accumulate while automatic repacking is disabled. gix
+    // fixes its slot capacity at open time; its client default (at least 32)
+    // cannot accommodate a running server. Reserve its supported maximum.
+    let options = gix::open::Options::default()
+        .object_store_slots(gix::odb::store::init::Slots::Given((1 << 15) - 1));
+    let repo = match gix::open_opts(&git_dir, options) {
         Ok(repo) => repo.into_sync(),
         Err(err) => {
             eprintln!("fatal: cannot open git repo at {git_dir}: {err}");
