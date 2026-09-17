@@ -20,6 +20,7 @@
 
 pub mod gitlinks;
 pub mod import_git;
+pub mod push_git;
 pub mod timing;
 
 use std::ffi::OsStr;
@@ -911,32 +912,15 @@ impl Transport for GitTransport {
         if self.have_commit(rev) {
             return Ok(Some(()));
         }
-        // `--depth 1`: we want ONE commit's tree, not a repo's history. That is
-        // also the granularity a host will serve — GitHub answers a sha in a
-        // want only when it is reachable (`uploadpack.allowReachableSHA1InWant`),
-        // which is exactly why the locator pins a COMMIT and selects within it
-        // with `dir=` rather than naming a subtree hash (design/flake-inputs.md).
+        // Fetch complete history so resolving a locator does not make the
+        // caller's repository shallow. The server rejects shallow transfers,
+        // including their boundary declarations on later tree-only pushes.
+        // No tags or FETCH_HEAD: these objects remain an unreferenced cache.
         //
-        // `--no-tags` and `--no-write-fetch-head` keep a foreign repo from
-        // leaving anything behind in the caller's: nothing is referenced, so the
-        // objects are ordinary unreachable ones the next `git gc` may drop —
-        // re-fetching them is a cache miss, never a correctness problem.
-        //
-        // `core.alternateRefsCommand=true` (a command that prints nothing) is
-        // load-bearing, and cost a debugging session. git's post-fetch
-        // connectivity check runs `rev-list --not --all --alternate-refs`, so it
-        // walks the tips of every ALTERNATE object store as well — and a repo
-        // whose alternate holds a deliberate SUBSET (the test harness points the
-        // client at exactly that, tests/lib/run-test.sh) then dies with
-        // `missing blob object <x>` naming an object that has nothing to do with
-        // the fetch, blamed on the fetch. Dropping those tips makes the check
-        // verify OUR closure and only ours, which is stricter, not looser.
-        //
-        // Narrow to this fetch on purpose: alternate tips are an exclusion set,
-        // so suppressing them is only safe when the fetched closure stands
-        // alone. It does here (`--depth 1` — a commit and its tree), and it does
-        // NOT for `fetch_object_negotiated`, where a chat commit's history may
-        // legitimately live in an alternate.
+        // Request the full closure without negotiating against unrelated local
+        // or alternate tips. Suppressing alternate refs is safe here because
+        // this fetch stands alone; it is not appropriate for history fetches
+        // that intentionally rely on an alternate.
         self.run_git(&[
             "-c",
             "core.alternateRefsCommand=true",
@@ -946,8 +930,6 @@ impl Transport for GitTransport {
             "--quiet",
             "--no-tags",
             "--no-write-fetch-head",
-            "--depth",
-            "1",
             url,
             rev,
         ])

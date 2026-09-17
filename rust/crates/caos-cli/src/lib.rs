@@ -32,9 +32,9 @@ use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
 pub use conversation_protocol::v3::records::TurnStatus;
 use conversation_protocol::v3::records::{
-    Block, Descriptor, Evidence, Identity, IdentityKind, Proposal, PublicationRecord,
-    PublicationStatus, Role, SourceTreeResolution, ToolResult as ProtocolToolResult,
-    TranscriptEntry, TurnOutcome as ProtocolTurnOutcome, TurnRecord,
+    Block, Descriptor, Identity, IdentityKind, Proposal, PublicationRecord, PublicationStatus,
+    Role, SourceTreeResolution, ToolResult as ProtocolToolResult, TranscriptEntry,
+    TurnOutcome as ProtocolTurnOutcome, TurnRecord,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -2192,40 +2192,7 @@ pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
 }
 
 fn reject_publish_caos(t: &GitTransport, commit: &Oid) -> Result<(), String> {
-    let listing = t.git_capture(
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            commit.as_str(),
-            "--",
-            ".caos",
-        ],
-        None,
-    )?;
-    if listing.lines().any(|path| path == paths::CONFLICTS_LEDGER) {
-        let contents = t.git_capture(
-            &["show", &format!("{commit}:{}", paths::CONFLICTS_LEDGER)],
-            None,
-        )?;
-        return Err(if contents.trim().is_empty() {
-            "the source tree has an empty `.caos/conflicts` file; remove it with bash before publishing (the removal is committed automatically)".into()
-        } else {
-            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata".into()
-        });
-    }
-    let root = t.git_capture(
-        &["ls-tree", "--name-only", commit.as_str(), "--", ".caos"],
-        None,
-    )?;
-    if root.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the source tree contains reserved `.caos` content; record a cleaned source-tree edit before publishing:\n{}",
-            if listing.trim().is_empty() { ".caos/ (empty directory)" } else { listing.trim_end() }
-        ))
-    }
+    git_locator::publish::reject_caos(commit.as_str(), |args| t.git_capture(args, None))
 }
 
 fn same_publication_intent(left: &PublicationRecord, right: &PublicationRecord) -> bool {
@@ -2272,52 +2239,7 @@ fn append_publication_pending(
     Ok(result.expect("publication append always records a result"))
 }
 
-struct PublicationOutcome {
-    status: PublicationStatus,
-    evidence: Evidence,
-    observed: Option<Oid>,
-}
-
-impl PublicationOutcome {
-    fn new(
-        status: PublicationStatus,
-        kind: &str,
-        diagnostic: Option<String>,
-        observed: Option<Oid>,
-    ) -> Self {
-        Self {
-            status,
-            evidence: Evidence {
-                kind: kind.to_string(),
-                diagnostic,
-            },
-            observed,
-        }
-    }
-
-    fn from_observation(
-        pending: &PublicationRecord,
-        observed: Option<Oid>,
-        diagnostic: String,
-        lease_rejected: bool,
-    ) -> Self {
-        let (status, kind) = if observed.as_ref() == Some(&pending.planned_head) {
-            (PublicationStatus::Complete, "ref-converged")
-        } else if observed == pending.expected_old {
-            (PublicationStatus::Uncertain, "ambiguous")
-        } else {
-            (
-                PublicationStatus::Conflict,
-                if lease_rejected {
-                    "lease-rejected"
-                } else {
-                    "ref-drift"
-                },
-            )
-        };
-        Self::new(status, kind, Some(diagnostic), observed)
-    }
-}
+use conversation_protocol::v3::publication::Outcome as PublicationOutcome;
 
 fn append_publication_terminal(
     t: &GitTransport,

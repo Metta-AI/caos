@@ -2,8 +2,10 @@
 
 mod async_work;
 mod githist;
+mod github;
 mod import_source;
 mod progress;
+mod publish_source;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -59,6 +61,7 @@ struct Config {
     bash_image: String,
     grep_image: Option<String>,
     merge_image: Option<String>,
+    github_source: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
@@ -123,6 +126,7 @@ impl Config {
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             merge_image: image_arg("merge-image")?,
+            github_source: image_arg("github-source")?,
             std_tool_images: STD_TOOLS
                 .iter()
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
@@ -296,6 +300,9 @@ fn callback(
     timing::phase(&format!("tool wait {tool}"));
 
     if read_arg_opt("tool-eval")?.is_some() {
+        if tool == "github" {
+            return github::evaluated(cfg, state, request, request_head, round, &id);
+        }
         if Path::new(&arg("error")).exists() {
             let error = read_arg("error")?;
             let block = failed_run_block(&id, &tool, &error);
@@ -1054,6 +1061,10 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "publish_source" {
+                publish_source::execute(state, &site)?;
+                return Ok(true);
+            }
             if existing.name == "import_source" {
                 import_source::execute(state, &site)?;
                 return Ok(true);
@@ -1068,6 +1079,9 @@ fn drive_call(
         return Ok(true);
     }
 
+    if call.name == "github" {
+        return github::start(cfg, state, &site);
+    }
     if call.name == subagents::SPAWN_TOOL {
         return spawn_agent_call(cfg, state, &site);
     }
@@ -1076,6 +1090,10 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
+        return Ok(true);
+    }
+    if call.name == "publish_source" {
+        publish_source::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == "import_source" {
@@ -1614,6 +1632,9 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
+    if call.name == "github" {
+        return github::dispatch(request, round, call, record);
+    }
     let commit = record
         .input_commit
         .as_ref()
@@ -1679,6 +1700,7 @@ fn callback_result(
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
+        "github" => github::result(record),
         subagents::WAIT_TOOL => wait_callback_block(state, record),
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -2948,6 +2970,9 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     let mut registry = vec![bash_tool()];
     registry.extend(tools::declarations());
+    registry.push(with_source_tree(tools::tree_tool_declaration(
+        &tools::builtin_tool("publish_source", publish_source::HELP),
+    )));
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
@@ -2959,6 +2984,9 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
         registry.push(with_source_tree(merge_tool()));
     }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
+    if cfg.github_source.is_some() {
+        registry.push(github::declaration());
+    }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
@@ -4303,6 +4331,125 @@ mod tests {
             let imported = Oid::parse(expected["commit"].as_str().unwrap(), "import").unwrap();
             import_source::attach(&mut state, &site, "imports/base", &imported, expected).unwrap();
             assert!(import_source::pin(&mut state, &site, &first)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn publication_pin_keeps_commit_and_lease_across_source_edits_and_restart() {
+        use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
+        for rejected in [false, true] {
+            let args = json!({"source_tree":"feature/lower","repository":"https://example.com/repo.git","branch":"topic"});
+            let golden = golden_with_first("publish_source", args.clone()).unwrap();
+            let call = Call {
+                id: "first".into(),
+                name: "publish_source".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let store = ImportStore {
+                objects: golden.store,
+                head: golden.head.clone(),
+                race: None,
+                lost_ack: true,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/conversation/head".into(),
+                golden.head,
+            )
+            .unwrap();
+            let commit = Oid::parse(&"a".repeat(40), "source").unwrap();
+            let old = Oid::parse(&"b".repeat(40), "old").unwrap();
+            let descriptor = Descriptor {
+                source_base: old.clone(),
+                source_head: commit.clone(),
+                target_base: old.clone(),
+                policy: "preserve".into(),
+                implementation: "caos/server-push".into(),
+                commit_policy: "preserve".into(),
+            };
+            let conversation = state.conversation().unwrap().identity().unwrap().id;
+            let key = publish_source::invocation(&conversation, &site).unwrap()[..32].to_string();
+            let id = ids::publication_id(
+                &conversation,
+                &key,
+                &ids::projection_id(&descriptor.to_value()).unwrap(),
+                &commit,
+                "https://example.com/repo.git",
+                "refs/heads/topic",
+                Some(&old),
+            )
+            .unwrap();
+            let pending = PublicationRecord {
+                id,
+                key,
+                descriptor,
+                planned_head: commit.clone(),
+                expected_old: Some(old.clone()),
+                repository: "https://example.com/repo.git".into(),
+                refname: "refs/heads/topic".into(),
+                source_tree_name: "feature/lower".into(),
+                status: PublicationStatus::Pending,
+                evidence: None,
+                observed: None,
+            };
+            let (saved, _) = publish_source::pin(&mut state, &site, &pending)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved, pending);
+            let newer = Oid::parse(&"c".repeat(40), "newer source").unwrap();
+            state
+                .append(Transition::FilesApply {
+                    files: vec![(
+                        "feature/lower".into(),
+                        Some((Mode::Commit, newer.encode_line())),
+                    )],
+                })
+                .unwrap();
+            state.reload().unwrap();
+            let mut competing = pending.clone();
+            competing.planned_head = newer.clone();
+            competing.expected_old = None;
+            let (recovered, fresh) = publish_source::pin(&mut state, &site, &competing)
+                .unwrap()
+                .unwrap();
+            assert!(!fresh);
+            assert_eq!(recovered, pending);
+            let outcome = if rejected {
+                conversation_protocol::v3::publication::Outcome::new(
+                    PublicationStatus::Conflict,
+                    "validation-rejected",
+                    Some("Invalid source".into()),
+                    None,
+                )
+            } else {
+                conversation_protocol::v3::publication::Outcome::from_observation(
+                    &pending,
+                    Some(commit.clone()),
+                    "lost push acknowledgement".into(),
+                    false,
+                )
+            };
+            publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();
+            let view = state.conversation().unwrap();
+            assert_eq!(
+                view.source_tree("feature/lower").unwrap().unwrap().commit,
+                newer
+            );
+            let receipt = view.publication(&pending.id).unwrap().unwrap();
+            assert_eq!(
+                receipt.status,
+                if rejected {
+                    PublicationStatus::Conflict
+                } else {
+                    PublicationStatus::Complete
+                }
+            );
+            assert_eq!(receipt.planned_head, commit);
+            assert_eq!(receipt.expected_old, Some(old));
+            assert!(publish_source::pin(&mut state, &site, &competing)
                 .unwrap()
                 .is_none());
         }

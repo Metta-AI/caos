@@ -83,7 +83,11 @@ def main():
         cert, key = root / "cert.pem", root / "key.pem"
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", str(key), "-out", str(cert))
         observations = []
-        fault = {"fail": False}
+        fault = {"fail": False, "lost_push": False, "race": None}
+        published = root / "published.git"
+        run("git", "init", "--bare", "-q", str(published))
+        run("git", "--git-dir", str(published), "config", "http.receivepack", "true")
+        run("git", "--git-dir", str(origin), "config", "http.receivepack", "true")
         surplus = {}
         def packet(data):
             return f"{len(data) + 4:04x}".encode() + data
@@ -139,7 +143,16 @@ def main():
                 # Protocol v2 supplies explicit negotiation requests.
                 if self.headers.get("Git-Protocol"):
                     git_env["HTTP_GIT_PROTOCOL"] = self.headers["Git-Protocol"]
+                pushing = path.endswith("/git-receive-pack")
+                if pushing and fault["race"]:
+                    branch, old = fault["race"]
+                    fault["race"] = None
+                    run("git", "--git-dir", str(published), "update-ref", "refs/heads/" + branch, old)
                 response = subprocess.check_output(["git", "http-backend"], input=body, env=git_env)
+                if pushing and fault["lost_push"]:
+                    fault["lost_push"] = False
+                    self.close_connection = True
+                    return
                 headers, payload = response.split(b"\r\n\r\n", 1)
                 observations.append((path, body, len(payload), authorized))
                 self.send_response(200)
@@ -184,11 +197,11 @@ def main():
         private = f"https://localhost:{remote_port}/private.git"
         def payload(commit, source=public):
             return {"source":source, "commit":commit}
-        def call(data, credential=None, expected=200):
+        def call(data, credential=None, expected=200, endpoint="/git/import"):
             headers = {"Content-Type":"application/json"}
             if credential:
                 headers["X-Caos-Git-Token"] = credential
-            request = urllib.request.Request(base + "/git/import", json.dumps(data).encode(), headers)
+            request = urllib.request.Request(base + endpoint, json.dumps(data).encode(), headers)
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     status, body = response.status, response.read()
@@ -244,6 +257,12 @@ def main():
             checks = git_commands.read_text()[len(commands):].splitlines()
             assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(second[0])
+            # Imported commits have no refs. Clients must still be able to
+            # fetch them before any conversation or branch has been created.
+            consumer = root / "consumer"
+            run("git", "init", "-q", str(consumer))
+            run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
+            assert run("git", "-C", str(consumer), "rev-parse", "FETCH_HEAD") == second[0]
             assert list((odb / "objects/pack").glob("*.pack"))
             before = len(observations)
             commands = git_commands.read_text()
@@ -460,6 +479,97 @@ def main():
                     invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
                     assert token.encode() not in invalid.stdout + invalid.stderr
+            # Pushes use a separate empty remote: object transfer comes from
+            # the server, including code ancestry, without a worker checkout.
+            destination = f"https://localhost:{remote_port}/published.git"
+            def push(commit, branch="topic", old=None, dest=destination, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old},
+                            endpoint="/git/push", **kwargs)
+            def remote_head(branch):
+                return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
+            git_commands.write_text("")
+            assert push(first[0])["status"] == "complete"
+            assert "rev-list" not in git_commands.read_text().splitlines(), "push re-walked stored object closure"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
+            assert remote_head("topic") == second[0]
+            # Equal destination converges even after a lost acknowledgement.
+            assert push(second[0], old=first[0])["kind"] == "ref-converged"
+            assert push(third[0], old=first[0])["status"] == "conflict"
+            push(first[0], old=second[0], expected=422)
+            assert remote_head("topic") == second[0]
+            push("e" * 40, branch="missing", expected=422)
+            for branch in ["", "-x", "../main", "topic:other", "topic*", "topic.lock"]:
+                push(first[0], branch=branch, expected=400)
+            call({"destination":destination, "commit":first[0], "branch":"missing-lease"},
+                 endpoint="/git/push", expected=400)
+            # The receiver's lease catches movement after the initial lookup.
+            fault["race"] = ("topic", first[0])
+            assert push(third[0], old=second[0])["status"] == "conflict"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
+            fault["lost_push"] = True
+            assert push(third[0], old=second[0])["status"] == "complete"
+            assert remote_head("topic") == third[0]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                outcomes = list(pool.map(lambda _: push(fourth[0], old=third[0]), range(4)))
+            assert all(r["status"] == "complete" for r in outcomes)
+            assert remote_head("topic") == fourth[0]
+            assert run("git", "--git-dir", str(published), "rev-list", "--count", fourth[0]) == "4"
+
+            def source_commit(tree, parent=None):
+                args = ["git", "--git-dir", str(origin), "commit-tree", tree, "-m", "publication fixture"]
+                if parent: args += ["-p", parent]
+                head = run(*args, env=env)
+                call(payload(head))
+                return head
+            empty = run("git", "--git-dir", str(origin), "mktree", input=b"")
+            reserved = run("git", "--git-dir", str(origin), "mktree", input=f"040000 tree {empty}\t.caos\n".encode())
+            push(source_commit(reserved), branch="reserved", expected=422)
+            marker = run("git", "--git-dir", str(origin), "hash-object", "-w", "--stdin", input=b"<<<<<<< ours\nconflict\n=======\nother\n>>>>>>> theirs\n")
+            marked_tree = run("git", "--git-dir", str(origin), "mktree", input=f"100644 blob {marker}\tfile\n".encode())
+            marked = source_commit(marked_tree, first[0])
+            push(marked, branch="markers", expected=422)
+            # Past conflicted commits are retained; the current tip must be clean.
+            clean = source_commit(first[1], marked)
+            assert push(clean, branch="resolved")["status"] == "complete"
+            genesis_env = dict(env, GIT_AUTHOR_NAME="caos", GIT_AUTHOR_EMAIL="caos@caos",
+                               GIT_COMMITTER_NAME="caos", GIT_COMMITTER_EMAIL="caos@caos",
+                               GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000")
+            genesis = run("git", "--git-dir", str(origin), "commit-tree", empty,
+                          input=b"caos-conversation-genesis-v3\n", env=genesis_env)
+            assert genesis == "a2519b3360c5b1ded9a8cb7e5869d32901eae743"
+            conversation = source_commit(empty, genesis)
+            push(conversation, branch="conversation", expected=422)
+            assert push(first[0], branch="code-after-conversation")["status"] == "complete"
+            push(first[0], branch="private-test", dest=private, credential="wrong-token", expected=502)
+            assert push(first[0], branch="private-test", dest=private, credential=token)["status"] == "complete"
+            if cli:
+                receipt = json.loads(run(cli, "push-git", destination, second[0], "cli", "--expected=absent", env=cli_env))
+                assert receipt["commit"] == second[0] and receipt["status"] == "complete"
+                assert remote_head("cli") == second[0]
+                rejected = json.loads(run(cli, "push-git", destination, first[0], "cli",
+                                          "--expected=" + second[0], env=cli_env))
+                assert rejected["status"] == "conflict" and rejected["kind"] == "validation-rejected"
+                assert remote_head("cli") == second[0]
+                for extra in [[], ["--expected=main"], ["--expected=absent", "--expected=absent"]]:
+                    invalid = subprocess.run([cli, "push-git", destination, second[0], "cli", *extra], env=cli_env, capture_output=True)
+                    assert invalid.returncode != 0
+            # Small uploads now stay packed too. The live reader must discover
+            # more packs than gix's default capacity of 32 without a restart.
+            for index in range(40):
+                packed = advance()
+                run("git", "--git-dir", str(origin), "push", "-q", base,
+                    packed[0] + f":refs/heads/pack-growth-{index}")
+                for oid in packed:
+                    object_request(oid)
+            assert len(list((odb / "objects/pack").glob("*.pack"))) > 32
+            # Commit staging must also work once its live-store alternate
+            # contains more than 32 packs.
+            staged_tip = advance(packed[0])
+            for kind, oid in [("blob", staged_tip[2]), ("tree", staged_tip[1]), ("commit", staged_tip[0])]:
+                post_from_origin(kind, oid)
+            print("git-push: creation, fast-forward, stale and racing leases, lost responses, duplicate requests, guards and CLI PASS")
             stop(server); server = None
             server = start()
             visible(posted_child[0])

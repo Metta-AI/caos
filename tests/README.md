@@ -16,8 +16,13 @@ conversation="${test_run_id}-tools"
 
 The git-import suite entry runs a private HTTPS Git remote and a separate
 server, checking exact-commit imports, authentication, complete history,
-incremental transfers and retries. It needs no external service.
+incremental transfers and retries. It also checks leased pushes, lost replies,
+concurrent updates, code-history preservation and publication guards. It needs no external service.
 
 The llm-import entry exercises agent-driven importing in an empty conversation,
 including provenance, readable history, occupied destinations, and invalid
 sources. Pinning and replay are also covered by llm-step's unit tests.
+
+The github entry exercises the packaged CLI and stack extension, secret grants,
+invocation replay and the agent callback using version/help commands. It requires
+no GitHub account and makes no external writes.
