@@ -32,6 +32,8 @@ SRC=/tmp/remote-ref-src
 rm -rf "$SRC"; mkdir -p "$SRC/payload" "$SRC/tool"
 git init -q "$SRC"
 git -C "$SRC" config uploadpack.allowReachableSHA1InWant true
+git -C "$SRC" -c user.email=test@caos -c user.name=caos commit --allow-empty -qm remote-ref-parent
+PARENT=$(git -C "$SRC" rev-parse HEAD)
 # The same BYTES as ./payload, reached the other way. Two files and a subtree, so
 # the run below covers a subtree, a blob and the whole root in one container.
 printf 'from another repo\n' > "$SRC/payload/note.txt"
@@ -69,6 +71,9 @@ bound=$(git cat-file -p "$node" | awk '$4=="args"{print $3}')
   || fail "the bound arg is not the source repo's own tree:
 $(git cat-file -p "$bound")"
 echo "  ok: the ArgTree carries the foreign repo's oid, and no URL" >&2
+[ "$(git rev-parse --is-shallow-repository)" = false ] \
+  || fail "resolving a locator made the caller shallow"
+git cat-file -e "$PARENT^{commit}" || fail "the locator fetch omitted ancestor history"
 
 args=(--base:@=DEEP-DEPS/bash --worker1:@=test/check.sh
       "--tree:@@=$REPO?rev=$SHA&dir=payload"
