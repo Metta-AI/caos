@@ -1,0 +1,3 @@
+BIN=run --base:@=DEEP-DEPS/cargo --cmd=build --tree:@=DEEP-DEPS/rust
+IMAGE=run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
+curry --base=$IMAGE --built=$BIN --fixture:@=fixture.py
