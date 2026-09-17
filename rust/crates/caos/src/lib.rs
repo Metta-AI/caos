@@ -397,9 +397,9 @@ pub trait Transport {
 
     /// Is this object already stored? Cheap — no content crosses the wire.
     ///
-    /// This is what makes `store` prune: a tree the store already holds is a
-    /// tree whose whole subgraph it holds (git's closure invariant), so the
-    /// walk stops there and nothing below it is read or sent.
+    /// The server stores dependencies before owners, so a hit lets `store`
+    /// prune the ordinary object graph. Gitlinks name separate histories and
+    /// must be ensured as separate roots.
     fn has_object(&self, hash: &str) -> Result<bool, String>;
 
     /// Ensure the server's repo holds the object graph reachable from `hash`.
@@ -407,20 +407,6 @@ pub trait Transport {
     /// it (under a content-addressed `refs/caos/req/<hash>`) so a subsequent
     /// compute can read it.
     fn ensure_pushed(&self, _hash: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Push a COMMIT and its closure, skipping the `ensure_pushed` probe.
-    ///
-    /// A commit needs its own path because holding a commit does not imply
-    /// holding its parents: it arrives as a gitlink child of an ArgTree, and
-    /// git reachability does not traverse gitlinks. Anything that walks
-    /// history — the `log`/`show`/`diff` tools — reads those parents by hash
-    /// and fails on the server that never received them.
-    ///
-    /// Default: the same no-op as [`Transport::ensure_pushed`], since a worker
-    /// pushes nothing.
-    fn push_commit_closure(&self, _hash: &str) -> Result<(), String> {
         Ok(())
     }
 
@@ -832,19 +818,10 @@ impl Transport for GitTransport {
         // expression dispatches lands here, so a resolution that is nothing but
         // cache hits was paying that advertisement a dozen times over.
         //
-        // Sound for a TREE or a BLOB, because the server holding one means it
-        // holds everything under it: it arrived either by `git push`, which
-        // packs and connectivity-checks the whole reachable graph, or by
-        // `hand_over_graph`, which posts a tree's children before the tree.
-        //
-        // NOT SOUND FOR A COMMIT, which is why `:commit=` args go through
-        // [`Transport::push_commit_closure`] instead. A commit reaches the
-        // server as a GITLINK child of an ArgTree, and git reachability does
-        // not traverse gitlinks (design/commits.md) — so the server can hold
-        // the commit while holding none of its parents, and this probe would
-        // skip the push that would have sent them. The failure is loud rather
-        // than silent — `/run` names the object it cannot read — but it lands
-        // in a worker, far from here.
+        // The server admits objects only after their dependencies, and verifies
+        // complete history before publishing a Git transfer. Presence therefore
+        // certifies closure for commits as well as ordinary trees and blobs.
+        // Gitlinks are separate roots and are ensured by resolve_commit_arg.
         //
         // What is given up is the REF, which `hand_over_graph`'s raw posts do
         // not create either: an object the server got that way stops being a
@@ -876,9 +853,8 @@ impl Transport for GitTransport {
         // RE-PROBE INSIDE THE CLAIM, which is the half of single-flighting that
         // actually saves the work: the waiter's answer to "does the server hold
         // it" was computed before the winner's push and is stale by exactly the
-        // thing it needs to know. Sound here for the same reason the first probe
-        // is (see above) and NOT sound for a commit, which is why
-        // `push_commit_closure` takes the claim without re-probing.
+        // thing it needs to know. The server's closure invariant makes this
+        // sound for commits, trees, and blobs, just like the first probe.
         self.with_push_claim(hash, || {
             if self.server_holds(hash) {
                 PUSHES_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -891,21 +867,6 @@ impl Transport for GitTransport {
             PUSHES_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.push_closure(hash)
         })
-    }
-
-    /// Always pushes: see the trait method, and the probe's note above.
-    ///
-    /// The cost is one `git push` per DISTINCT commit argument, not per call —
-    /// the ref is `refs/caos/req/<oid>`, so a re-push of the same commit is a
-    /// no-op update, and the ref it leaves behind is the negotiation base that
-    /// makes a descendant's push a delta.
-    fn push_commit_closure(&self, hash: &str) -> Result<(), String> {
-        // The claim, but no re-probe: a commit the server holds may still be
-        // missing its parents (gitlinks are not traversed — see the note on
-        // `ensure_pushed`), so "the server has it" does not mean "we can skip".
-        // Serialising is still worth it — two concurrent pushes of one commit
-        // reject each other — it just cannot become a skip.
-        self.with_push_claim(hash, || self.push_closure(hash))
     }
 
     fn ingest_path(
@@ -1166,18 +1127,8 @@ impl GitTransport {
 }
 
 impl GitTransport {
-    /// Push `hash` under its content-addressed request ref. The single network
-    /// step of [`Transport::ensure_pushed`], split out so the fallback below can
-    /// reuse it per-child.
-    /// Push `hash` and everything reachable from it, WITHOUT the
-    /// `server_holds` probe.
-    ///
-    /// Separated from [`Transport::ensure_pushed`] because the probe is
-    /// sound only when holding an object implies holding its closure, and
-    /// for a COMMIT it does not: a commit reaches the server as a gitlink
-    /// child of an ArgTree, and git reachability does not traverse
-    /// gitlinks, so its parents come with it only if something else sent
-    /// them.
+    /// Push an object and its reachable graph under its content-addressed
+    /// request ref. Callers perform the server-presence probe first.
     fn push_closure(&self, hash: &str) -> Result<(), String> {
         // Content-addressed ref: clobber-free across clients, idempotent (a
         // re-push of the same content is a no-op), and it persists as the
@@ -1410,21 +1361,12 @@ impl GitTransport {
     /// curry's base is a BLOB naming the hash, leaving the unwrapped runner-pool
     /// image reachable from nothing.
     ///
-    /// The invariant that makes this sound — and makes FETCHING the missing
-    /// objects the wrong fix — is that **the client learns an oid in exactly two
-    /// ways**: it computed it (so it holds the object) or the server handed it
-    /// back (so the server holds it). There is no third source. So an object we
-    /// cannot read is one the server already has, and nothing needs to move;
-    /// downloading it merely to upload nothing would tax every cold clone.
-    ///
-    /// Per child: push it whole when its graph is readable — one negotiated,
-    /// delta-compressed push, which is what the git transport is for and what
-    /// carries the big ingested trees — else recurse. Then hand over this one
-    /// object's bytes, which `POST /object` stores with no connectivity check
-    /// (the same endpoint a worker's `caos` uses).
+    /// Walk ordinary tree entries so locally available children arrive first.
+    /// Commits are posted as supplied: Git on the server rejects incomplete
+    /// history. This fallback does not assemble missing commit ancestry.
     fn hand_over_graph(&self, hash: &str) -> Result<(), String> {
         let Some((kind, content)) = self.read_local(hash)? else {
-            return Ok(()); // not ours to send: it came from the server
+            return Ok(()); // The server validates dependencies before storing the owner.
         };
         if kind == "tree" {
             let tree = gix::objs::TreeRef::from_bytes(&content, self.repo.object_hash())
@@ -3185,9 +3127,8 @@ fn resolve_commit_arg(
         })?
     };
     // Gitlinks aren't reachability-traversed, so push the commit's own closure.
-    // NOT `ensure_pushed`: its probe would skip the push whenever the server
-    // already holds this commit as a gitlink, leaving the parents behind.
-    t.push_commit_closure(&oid.to_string())?;
+    // Pushing the containing ArgTree sends neither this commit nor its history.
+    t.ensure_pushed(&oid.to_string())?;
     Ok(oid)
 }
 

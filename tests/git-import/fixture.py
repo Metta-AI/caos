@@ -43,6 +43,7 @@ def wait_for(predicate):
 def main():
     binary = str(Path(sys.argv[1]).resolve())
     cli = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
+    host_cli = str(Path(sys.argv[3]).resolve()) if len(sys.argv) > 3 else None
     port = int(os.environ.get("CAOS_IMPORT_TEST_PORT", "0"))
     remote_port = int(os.environ.get("GIT_IMPORT_TEST_PORT", "0"))
     if not port:
@@ -204,6 +205,25 @@ def main():
                 status, body = error.code, error.read()
             assert status == expected, (oid, status, body)
             return body
+        def post_object(kind, content, expected=200):
+            raw = f"{kind} {len(content)}\0".encode() + content
+            oid = hashlib.sha1(raw).hexdigest()
+            request = urllib.request.Request(base + "/object/", raw)
+            try:
+                with urllib.request.urlopen(request) as response:
+                    status, body = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status, body = error.code, error.read()
+            assert status == expected, (status, body)
+            if status == 200:
+                assert body.decode().strip() == oid
+                assert object_request(oid) == raw
+            else:
+                object_request(oid, expected=404)
+            return oid
+        def post_from_origin(kind, oid, expected=200):
+            raw = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", kind, oid])
+            assert post_object(kind, raw, expected) == oid
         def visible(commit):
             closure = run("git", "--git-dir", str(origin), "rev-list", "--objects", "--no-object-names", commit).splitlines()
             for oid in closure:
@@ -256,9 +276,80 @@ def main():
             server = start()
             assert call(payload(fifth[0]))["commit"] == fifth[0]
             visible(fifth[0])
-            commit_bytes = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", "commit", first[0]])
-            malformed = commit_bytes.replace(b"\nauthor ", b"\nparent " + b"2" * 40 + b"\nauthor ", 1)
+            # The object API admits dependencies before their owners, including
+            # every merge parent; rejection must leave no readable commit.
+            posted_parent = advance()
+            posted_child = advance(posted_parent[0])
+            post_from_origin("commit", posted_child[0], expected=400)
+            post_from_origin("tree", posted_child[1], expected=400)
+            post_from_origin("blob", posted_child[2])
+            post_from_origin("tree", posted_child[1])
+            post_from_origin("commit", posted_child[0], expected=400)
+            post_from_origin("blob", posted_parent[2])
+            post_from_origin("tree", posted_parent[1])
+            post_from_origin("commit", posted_parent[0])
+            post_from_origin("commit", posted_child[0])
+            child_bytes = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", "commit", posted_child[0]])
+            post_object("commit", child_bytes.replace(posted_parent[0].encode(), posted_child[2].encode()), expected=400)
+            post_object("commit", child_bytes.replace(posted_child[1].encode(), posted_child[2].encode()), expected=400)
+            extra_parent = advance()
+            merge = child_bytes.replace(
+                b"parent " + posted_parent[0].encode() + b"\n",
+                b"parent " + posted_parent[0].encode() + b"\nparent " + extra_parent[0].encode() + b"\n")
+            post_object("commit", merge, expected=400)
+            post_from_origin("blob", extra_parent[2])
+            post_from_origin("tree", extra_parent[1])
+            post_from_origin("commit", extra_parent[0])
+            post_object("commit", merge)
+            # Git must also walk through existing objects: checking just the
+            # new commit's direct links misses an old tree with an absent blob.
+            broken_tree = b"100644 missing\0" + bytes.fromhex("3" * 40)
+            broken_tree_oid = run("git", "--git-dir", str(odb), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
+            post_object("commit", child_bytes.replace(posted_child[1].encode(), broken_tree_oid.encode()), expected=400)
+            (odb / "objects" / broken_tree_oid[:2] / broken_tree_oid[2:]).unlink()
+            assert not list((odb / "caos-commit-checks").iterdir())
+            # Gitlinks are separate histories: an absent target is allowed and
+            # neither ordinary Git nor the object API uploads its commit.
+            absent = "1" * 40
+            gitlink = post_object("tree", b"160000 source\0" + bytes.fromhex(absent))
+            object_request(absent, expected=404)
+            assert not run("git", "--git-dir", str(odb), "for-each-ref")
+            # A normal push publishes complete commits; malformed additional
+            # objects and shallow histories are rejected in Git's quarantine.
+            pushed = advance(posted_child[0])
+            run("git", "--git-dir", str(origin), "push", base, pushed[0] + ":refs/caos/test/closure")
+            visible(pushed[0])
+            assert run("git", "--git-dir", str(odb), "config", "receive.fsckObjects") == "true"
+            run("git", "--git-dir", str(origin), "push", base, ":refs/caos/test/closure")
+            # A pack's surplus, unreferenced commits must also have parents.
+            malformed = child_bytes.replace(posted_parent[0].encode(), ("2" * 40).encode())
             malformed_oid = run("git", "--git-dir", str(origin), "hash-object", "-t", "commit", "-w", "--stdin", input=malformed)
+            new_blob = run("git", "--git-dir", str(origin), "hash-object", "-w", "--stdin", input=b"surplus pack test")
+            pack = subprocess.check_output(["git", "--git-dir", str(origin), "pack-objects", "--stdout"],
+                input=f"{new_blob}\n{malformed_oid}\n".encode())
+            update = f"{'0' * 40} {new_blob} refs/caos/test/surplus\0report-status\n".encode()
+            request = urllib.request.Request(base + "/git-receive-pack",
+                f"{len(update) + 4:04x}".encode() + update + b"0000" + pack,
+                {"Content-Type": "application/x-git-receive-pack-request"})
+            with urllib.request.urlopen(request) as response:
+                assert b"unpack ok" not in response.read()
+            object_request(malformed_oid, expected=404)
+            object_request(new_blob, expected=404)
+            shallow = b"shallow " + malformed_oid.encode() + b"\n"
+            shallow_packet = f"{len(shallow) + 4:04x}".encode() + shallow
+            update_packet = f"{len(update) + 4:04x}".encode() + update
+            for prefix in [shallow_packet + update_packet, update_packet + shallow_packet]:
+                request = urllib.request.Request(base + "/git-receive-pack",
+                    prefix + b"0000" + pack,
+                    {"Content-Type": "application/x-git-receive-pack-request"})
+                try:
+                    urllib.request.urlopen(request)
+                    raise AssertionError("shallow surplus commit accepted")
+                except urllib.error.HTTPError as error:
+                    assert error.code == 400
+                object_request(malformed_oid, expected=404)
+                object_request(new_blob, expected=404)
+
             # A remote can declare an unrelated surplus commit shallow. Git may
             # accept its pack and omit that unused boundary from the final shallow
             # file. Checking every received root must still reject its missing parent.
@@ -274,6 +365,40 @@ def main():
             object_request(surplus_good[0], expected=404)
             object_request(malformed_oid, expected=404)
 
+            if host_cli:
+                client = root / "client"
+                run("git", "init", "-q", str(client))
+                run("git", "-C", str(client), "remote", "add", "caos", base)
+                # New local parent and child, both using a tree whose file blob
+                # exists only on the server. A Git pack cannot read that blob.
+                local_tree = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", "tree", posted_child[1]])
+                run("git", "-C", str(client), "hash-object", "-w", "-t", "tree", "--stdin", input=local_tree)
+                parent_bytes = child_bytes.replace(b"parent " + posted_parent[0].encode() + b"\n", b"").replace(b"fixture", b"local parent")
+                local_parent = run("git", "-C", str(client), "hash-object", "-w", "-t", "commit", "--stdin", input=parent_bytes)
+                local_child_bytes = child_bytes.replace(posted_parent[0].encode(), local_parent.encode()).replace(b"fixture", b"local child")
+                local_child = run("git", "-C", str(client), "hash-object", "-w", "-t", "commit", "--stdin", input=local_child_bytes)
+                image = "--base:docker=example.invalid/test@sha256:" + "a" * 64
+                # The client does not repair an incomplete commit upload by
+                # walking its local parents. Rejection must publish neither.
+                refused = subprocess.run([host_cli, "prepare-request", image, "--source:commit=" + local_child],
+                    cwd=client, capture_output=True)
+                assert refused.returncode != 0
+                assert b"incomplete commit history" in refused.stderr, refused.stderr
+                object_request(local_parent, expected=404)
+                object_request(local_child, expected=404)
+                # Explicitly uploading the parent first makes the same child
+                # valid even though the client still lacks the tree's blob.
+                run(host_cli, "prepare-request", image, "--source:commit=" + local_parent, cwd=client)
+                run(host_cli, "prepare-request", image, "--source:commit=" + local_child, cwd=client)
+                object_request(local_parent)
+                object_request(local_child)
+                bad_child = run("git", "-C", str(client), "hash-object", "-w", "-t", "commit", "--stdin", input=malformed)
+                refused = subprocess.run([host_cli, "prepare-request", image, "--source:commit=" + bad_child],
+                    cwd=client, capture_output=True)
+                assert refused.returncode != 0
+                assert b"incomplete commit history" in refused.stderr, refused.stderr
+                object_request(bad_child, expected=404)
+
             shallow_parent = advance()
             shallow_tip = advance(shallow_parent[0])
             (origin / "shallow").write_text(shallow_tip[0] + "\n")
@@ -282,6 +407,10 @@ def main():
             object_request(shallow_parent[0], expected=404)
             assert not list((odb / "caos-imports").glob("*/incoming"))
             assert not (odb / "shallow").exists()
+            rejected = subprocess.run(["git", "--git-dir", str(origin), "push", base,
+                shallow_tip[0] + ":refs/caos/test/shallow"], capture_output=True)
+            assert rejected.returncode != 0
+            object_request(shallow_tip[0], expected=404)
             (origin / "shallow").unlink()
             call(payload(shallow_tip[0]))
             visible(shallow_tip[0])
@@ -296,7 +425,8 @@ def main():
             object_request(noncommit[1], expected=404)
             assert not (odb / "FETCH_HEAD").exists()
             assert not (odb / "shallow").exists()
-            assert not run("git", "--git-dir", str(odb), "for-each-ref")
+            refs = run("git", "--git-dir", str(odb), "for-each-ref", "--format=%(refname)").splitlines()
+            assert all(host_cli and ref.startswith("refs/caos/req/") for ref in refs), refs
             for p in [odb / "config", root / "server.log", *list((odb / "caos-imports").glob("*/*"))]:
                 assert token.encode() not in p.read_bytes(), f"credential leaked to {p.name}"
             if cli:
@@ -312,7 +442,24 @@ def main():
                     invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
                     assert token.encode() not in invalid.stdout + invalid.stderr
-            print("git-import: exact commits, HTTPS credentials, full history, quarantined imports, packs, reuse, concurrency and retry PASS")
+            stop(server); server = None
+            server = start()
+            visible(posted_child[0])
+            # Upgrades cannot silently trust orphan objects from older servers.
+            stop(server); server = None
+            legacy_parent_bytes = child_bytes.replace(b"parent " + posted_parent[0].encode() + b"\n", b"").replace(b"fixture", b"legacy parent")
+            legacy_parent = run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=legacy_parent_bytes)
+            broken_bytes = child_bytes.replace(posted_parent[0].encode(), legacy_parent.encode()).replace(b"fixture", b"legacy child")
+            broken = run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=broken_bytes)
+            # A cached commit graph must not conceal a missing commit object.
+            run("git", "--git-dir", str(odb), "commit-graph", "write", "--stdin-commits", input=(broken + "\n").encode())
+            (odb / "objects" / legacy_parent[:2] / legacy_parent[2:]).unlink()
+            refused = subprocess.run([binary], env=dict(os.environ,
+                SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb)), capture_output=True, timeout=30)
+            assert refused.returncode != 0, "server accepted legacy incomplete history"
+            assert b"restore the missing objects" in refused.stderr, refused.stderr
+            assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken) == "commit"
+            print("git-import: complete history, upload ordering, quarantined imports/pushes, commit rejection, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
         finally:
             stop(server)
             remote.shutdown(); remote.server_close(); thread.join()
