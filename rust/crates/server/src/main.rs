@@ -43,6 +43,7 @@
 
 mod compute;
 mod git;
+mod import;
 mod repair;
 mod runner;
 mod secrets;
@@ -617,6 +618,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
         }
+        Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/sub-run" => {
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;
