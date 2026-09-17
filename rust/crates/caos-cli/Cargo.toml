@@ -36,3 +36,6 @@ unicode-width = "0.2"
 # renderer's diff.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dependencies.git-locator]
+path = "../git-locator"

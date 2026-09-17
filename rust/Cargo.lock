@@ -282,6 +282,7 @@ dependencies = [
  "caos",
  "caos-iroh",
  "conversation-protocol",
+ "git-locator",
  "libc",
  "ratatui-core",
  "ratatui-crossterm",
@@ -3853,6 +3854,7 @@ version = "0.1.0"
 dependencies = [
  "caos-eval",
  "caos-world",
+ "conversation-protocol",
  "git-locator",
  "gix",
  "minreq",

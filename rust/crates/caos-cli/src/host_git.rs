@@ -119,33 +119,7 @@ pub fn validate_pr_source_tree(target: &str, head: &str, cwd: &Path) -> Result<(
         return Err("source commit and PR base have no shared history; check the source path, repository, and base branch".into());
     }
     require_success("git merge-base", ancestry)?;
-    let markers = command_output(
-        "git",
-        &[
-            "grep",
-            "-I",
-            "-n",
-            "-e",
-            "^<<<<<<< ",
-            "-e",
-            "^=======$",
-            "-e",
-            "^>>>>>>> ",
-            head,
-            "--",
-        ],
-        cwd,
-    )?;
-    if markers.status.success() {
-        return Err(format!(
-            "unresolved merge markers:\n{}",
-            String::from_utf8_lossy(&markers.stdout).trim_end()
-        ));
-    }
-    if markers.status.code() != Some(1) {
-        require_success("git grep", markers)?;
-    }
-    Ok(())
+    git_locator::publish::reject_markers(head, |args| command_output("git", args, cwd))
 }
 
 pub fn find_or_open_source_tree_pr_in(
