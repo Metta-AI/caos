@@ -1,10 +1,19 @@
 # Agent publication and PR stacks
 
-Publication uses the merged Git import infrastructure. Source commits and stack
-boundaries stay in conversation gitlinks. The server pushes code; a small
-GitHub worker runs `gh`. The agent composes those operations.
+Importing is implemented. Publication builds on it in three steps:
 
-## Push directly from the server
+| Step | What ships | Remaining work |
+| --- | --- | --- |
+| Branches | Server push endpoint, `caos push-git`, and `publish_source` in [#247](https://github.com/Metta-AI/caos/pull/247). | Merge the branch-publication implementation. |
+| PRs | The same PR includes the general `github` tool and `std/github` worker. | Validate creating, updating and reviewing a PR through the agent. |
+| Stacks | The worker includes `gh-stack`. Source gitlinks already carry stack boundaries. | Validate publication, linking, updates and landing of a dependent stack. |
+
+The GitHub worker is tested for execution, secret grants and retry handling.
+Live PR creation and stack linking remain to be exercised. Those follow-ups
+should start with agent instructions and integration tests; the operations
+below use the existing tools.
+
+## Branches
 
 Publication has three layers, matching imports:
 
@@ -69,7 +78,7 @@ publication call. Never silently replace E with the latest remote value.
 On an uncertain outcome, inspect before continuing. A recorded successful
 publication remains successful even if another writer later advances the branch.
 
-## Run GitHub CLI in a worker
+## PRs
 
 `std/github` contains Git, `gh`, and the pinned `github/gh-stack` v0.1.1
 extension. It is registered as a built-in tool, available without a project-defined `caos-tools` entry.
@@ -90,7 +99,7 @@ child worker does not alter the agent’s own reader identity. Use an isolated t
 GitHub configuration and disable prompts. Install the extension in the image.
 The worker needs no source checkout or local branches for the operations below.
 
-### Fresh reads and writes that are not replayed
+### Invocation recovery
 
 Identical GitHub commands can observe different remote state, and comments
 must not be posted again when a worker retries. The harness therefore binds
@@ -119,7 +128,36 @@ it. If reconciliation cannot establish the outcome, leave it uncertain rather
 than repeat the write. Failure of a multi-step command can leave partial changes.
 The tool's exit status and transcript must not claim that nothing happened.
 
-## Publish a PR or stack
+### PR workflow
+
+For a single PR:
+
+1. Integrate required updates and test the chosen source gitlink.
+2. Call `publish_source` with its path, repository and remote branch. Continue
+   after a confirmed push.
+3. Find an open PR with `gh pr list --head <branch>`; select explicitly if
+   several match. If absent, use `gh pr create --repo <repository>
+   --head <branch> --base <base> --title <title> --body-file -`, passing the
+   body through the tool's stdin. Supply these arguments explicitly so
+   creation needs no local repository.
+4. Check the PR's URL, head commit and base with `gh pr view <url> --json ...`,
+   and retain the result in the conversation.
+
+Later source edits advance the same branch through `publish_source`, updating
+the existing PR. Preserve human-edited titles and descriptions unless an edit
+was requested; use `gh pr edit` for requested metadata or base changes. Use
+`gh pr view`, `gh pr checks`, and `gh api` to read discussion, review threads
+and checks, and the corresponding CLI/API calls for requested replies.
+Create ready-for-review PRs by default. A failed PR creation leaves the
+successful branch push intact; recovery follows the invocation rules above.
+
+The PR follow-up should exercise this through the actual agent in a test
+repository: publish and open a PR, advance its head, preserve an edited body,
+read and answer review feedback, and reconcile an interrupted operation
+before proceeding. Keep repeatable failure cases in automated fixtures.
+This needs no additional server endpoint or tool for each PR action.
+
+## Stacks
 
 Keep boundaries as ordinary source gitlinks:
 
@@ -129,30 +167,14 @@ feature/01-core     -> A   parent H
 feature/02-tests    -> B   parent A
 ```
 
-Create B by copying A with `cp -a` and editing the copy. Names help navigation;
-Git ancestry establishes that B includes A. There is no required stack
-manifest or second local branch database. Publication receipts record the
-source/destination mapping, and GitHub holds PR URLs, bases and stack membership.
+Create B by copying A with `cp -a` and editing the copy. Git ancestry establishes
+that B includes A. Publication receipts map each gitlink's published commit to
+a remote branch; GitHub holds PR URLs, bases and stack membership.
 
-For each layer, from bottom to top:
-
-1. Inspect its intended base and PR scope, integrate any required updates, and
-   test the selected source. For an upper layer, verify it contains the exact
-   lower-layer commit being published. Updating from main remains an explicit
-   import and merge, outside the push endpoint.
-2. Call `publish_source` with the source path, repository and remote branch.
-   Proceed only after a confirmed push. If another layer changed during the
-   process, integrate its newly published commit before proceeding.
-3. Use `gh pr list` to find the existing PR by repository and head branch.
-   Create a missing PR with explicit `--repo`, `--head`, `--base`, title and
-   body. Existing PRs retain human-edited titles and descriptions unless an
-   edit was requested. Multiple matches require choosing explicitly.
-4. Verify the remote head, PR URL and base and record the result. PR creation
-   failure leaves the successful branch push intact.
-
-A single PR targets the chosen mainline branch. Each later PR targets the
-previous layer's published branch. Create ready-for-review PRs by default.
-Initial stacks use branches in one GitHub repository; cross-fork stacks can follow.
+Run the PR workflow bottom to top. The first PR targets the chosen mainline
+branch; each later PR targets the preceding layer's branch. Before publishing
+an upper layer, verify that it contains the exact lower commit just published.
+Initial stacks use branches in one GitHub repository.
 
 Once the PRs exist, link their URLs in order:
 
@@ -162,11 +184,16 @@ GH_REPO=owner/repo gh stack link --base main \
   https://github.com/owner/repo/pull/124
 ```
 
-Use PR URLs, because branch arguments can cause local pushes and PR creation.
-`link` needs no local stack tracking, but can change PR bases. Check the
-resulting bases and membership after it runs, including when it exits with
-warnings. If native stacks are unavailable, retain the correctly chained PRs
-and report that linking was unavailable.
+With `GH_REPO`, an explicit `--base`, and existing PR URLs, the pinned
+[`link` implementation](https://github.com/github/gh-stack/blob/v0.1.1/cmd/link.go)
+can use GitHub's API without a checkout or local stack tracking. Branch
+arguments take a different path that can push local branches and create PRs.
+The worker receives command arguments and PR identifiers; it does not fetch
+the source tree.
+
+`link` can change PR bases. Check the resulting bases and membership even when
+it exits with warnings. If GitHub stacks are unavailable, retain the correctly
+chained PRs and report that linking was unavailable.
 
 There is no atomic transaction spanning several pushes, PRs and stack linking.
 Record each completed step and reconcile the remainder after a partial failure;
@@ -192,11 +219,28 @@ members. Restructuring requires explicit GitHub stack changes and, when code
 dependencies change, new source commits. Do not treat another `link` call as a
 rebase or a replacement of the entire stack.
 
-Commands such as `gh stack submit`, `sync` and `rebase` require local branches
-and tracking metadata. Supporting them would require reconstructing those
-branches from gitlinks and importing all rewritten heads back into CAOS.
-Defer that adapter and force-push support. Normal publication does not merge
-PRs into main; landing is a separate requested operation.
+### What we reuse and what remains
+
+Use `gh-stack` for GitHub's stack membership operations. The agent composes
+CAOS's existing copy, merge, test and publish operations to maintain code
+dependencies. This requires no separate stack manifest or persistent local
+branch database.
+
+[`gh stack submit`, `sync` and `rebase`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands)
+operate on local branches and tracking state; rebasing also needs a worktree
+for code and conflicts. A bare repo containing branch refs alone would not
+make those workflows fit. Defer that adapter and history rewrites.
+
+The stack follow-up should exercise a two-layer stack in a test repository:
+publish and link it, change the lower layer and propagate upward, append a
+third layer, then land a lower PR and update the survivors. Include partial
+failure and unavailable-stack cases. Verify the actual pinned extension with
+no source checkout; version/help tests do not establish this.
+
+Start with that workflow and its tests. If an operation is missing, add the
+smallest helper it needs after checking `gh`, `gh stack` and `gh api`.
+Reordering, dropping and rebasing arbitrary layers can follow once there is
+a concrete need. Landing remains a separately requested action.
 
 ## Interfaces and compatibility
 

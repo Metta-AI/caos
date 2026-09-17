@@ -1,7 +1,8 @@
-# Importing and PRs
+# Importing and publishing
 
-Imports use three layers: the server endpoint, `caos import-git`, and the
-agent's `import_source` tool. Publication uses the server and a GitHub worker. Separate merge drafts remain a follow-up.
+Imports are implemented through the server endpoint, `caos import-git`, and
+the agent's `import_source` tool. Publication proceeds through branches, PRs
+and stacks. Separate merge drafts remain a follow-up.
 
 ## Importing
 
@@ -60,13 +61,22 @@ stay out of URLs, Git config, saved arguments, provenance, and logs. Automatic
 GitHub credentials apply only to `github.com` on the default HTTPS port.
 Public imports need no token. Importing needs neither `gh` nor another worker.
 
-## PRs
+## Publishing
 
-The [publication design](agent-publish.md) describes the server push endpoint,
-agent tools, invocation recovery and gitlink-based stacks. The agent pushes
-exact code commits with a lease, creates PRs through std/github, and links
-existing PR URLs with gh stack link. No local stack branches are needed.
-The TUI's /pr and /publish-branch commands are removed.
+The [publication design](agent-publish.md) separates the remaining work:
+
+- **Branches:** `POST /git/push`, `caos push-git` and `publish_source` push
+  exact code commits from the server with a lease. These are implemented in
+  [#247](https://github.com/Metta-AI/caos/pull/247).
+- **PRs:** that PR also supplies the general `github` tool and `std/github`
+  worker. Next, validate the agent's create, update and review workflow using
+  `gh`, with explicit repositories and branch names.
+- **Stacks:** keep code boundaries in gitlinks, publish bottom to top, and
+  use `gh stack link` with existing PR URLs. Validate linking, propagation
+  and landing without a source checkout in the GitHub worker.
+
+The TUI's `/pr` and `/publish-branch` commands are removed. The follow-ups
+start with workflow instructions and integration tests using these tools.
 
 ### Merges
 
