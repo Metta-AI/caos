@@ -26,7 +26,10 @@ import urllib.request
 
 
 def run(*args, **kwargs):
-    return subprocess.check_output(args, stderr=subprocess.PIPE, **kwargs).decode().strip()
+    try:
+        return subprocess.check_output(args, stderr=subprocess.PIPE, **kwargs).decode().strip()
+    except subprocess.CalledProcessError as error:
+        raise AssertionError(f"{args}: {error.stderr.decode(errors='replace')}") from error
 
 
 def wait_for(predicate):
@@ -55,7 +58,7 @@ def main():
         git_bin.mkdir()
         git_shim = git_bin / "git"
         git_shim.write_text("#!/bin/sh\nfor arg do\n"
-            'case "$arg" in ls-remote|fetch|cat-file|rev-list)\n'
+            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index)\n'
             "printf '%s\\n' \"$arg\" >> " + shlex.quote(str(git_commands)) + "; break;;\n"
             "esac\ndone\nexec " + shlex.quote(shutil.which("git")) + ' "$@"\n')
         git_shim.chmod(0o755)
@@ -80,6 +83,9 @@ def main():
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", str(key), "-out", str(cert))
         observations = []
         fault = {"fail": False}
+        surplus = {}
+        def packet(data):
+            return f"{len(data) + 4:04x}".encode() + data
 
         class Remote(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -92,6 +98,21 @@ def main():
             def serve(self):
                 path, _, query = self.path.partition("?")
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if path.startswith("/surplus.git/"):
+                    if self.command == "GET":
+                        payload = (packet(b"# service=git-upload-pack\n") + b"0000"
+                            + packet(surplus["tip"].encode() + b" refs/heads/main\0shallow\n")
+                            + packet(b"shallow " + surplus["bad"].encode() + b"\n") + b"0000")
+                        content_type = "application/x-git-upload-pack-advertisement"
+                    else:
+                        payload = packet(b"NAK\n") + surplus["pack"]
+                        content_type = "application/x-git-upload-pack-result"
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 private = path.startswith("/private.git/")
                 expected = "Basic " + base64.b64encode(("x-access-token:" + token).encode()).decode()
                 authorized = self.headers.get("Authorization") == expected
@@ -175,6 +196,14 @@ def main():
             assert token.encode() not in body
             assert status == expected, (status, body)
             return json.loads(body) if status == 200 else body
+        def object_request(oid, expected=200):
+            try:
+                with urllib.request.urlopen(base + "/object/" + oid) as response:
+                    status, body = response.status, response.read()
+            except urllib.error.HTTPError as error:
+                status, body = error.code, error.read()
+            assert status == expected, (oid, status, body)
+            return body
         def visible(commit):
             closure = run("git", "--git-dir", str(origin), "rev-list", "--objects", "--no-object-names", commit).splitlines()
             for oid in closure:
@@ -227,19 +256,31 @@ def main():
             server = start()
             assert call(payload(fifth[0]))["commit"] == fifth[0]
             visible(fifth[0])
-            # Commit presence alone cannot certify missing trees and blobs.
-            partial = advance()
-            commit_bytes = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", "commit", partial[0]])
-            run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=commit_bytes)
-            replacement = "refs/replace/" + partial[0]
-            run("git", "--git-dir", str(odb), "update-ref", replacement, first[0])
-            call(payload(partial[0]))
-            visible(partial[0])
-            run("git", "--git-dir", str(odb), "update-ref", "-d", replacement)
+            commit_bytes = subprocess.check_output(["git", "--git-dir", str(origin), "cat-file", "commit", first[0]])
+            malformed = commit_bytes.replace(b"\nauthor ", b"\nparent " + b"2" * 40 + b"\nauthor ", 1)
+            malformed_oid = run("git", "--git-dir", str(origin), "hash-object", "-t", "commit", "-w", "--stdin", input=malformed)
+            # A remote can declare an unrelated surplus commit shallow. Git may
+            # accept its pack and omit that unused boundary from the final shallow
+            # file. Checking every received root must still reject its missing parent.
+            surplus_good = advance()
+            object_ids = run("git", "--git-dir", str(origin), "rev-list",
+                "--objects", "--no-object-names", surplus_good[0]).splitlines()
+            surplus.update(tip=surplus_good[0], bad=malformed_oid,
+                pack=subprocess.check_output(["git", "--git-dir", str(origin), "pack-objects", "--stdout"],
+                    input=("\n".join(object_ids + [malformed_oid]) + "\n").encode()))
+            commands_before = git_commands.read_text()
+            call(payload(surplus_good[0], f"https://localhost:{remote_port}/surplus.git"), expected=502)
+            assert "show-index" in git_commands.read_text()[len(commands_before):], "surplus fixture did not reach staged pack verification"
+            object_request(surplus_good[0], expected=404)
+            object_request(malformed_oid, expected=404)
+
             shallow_parent = advance()
             shallow_tip = advance(shallow_parent[0])
             (origin / "shallow").write_text(shallow_tip[0] + "\n")
             call(payload(shallow_tip[0]), expected=502)
+            object_request(shallow_tip[0], expected=404)
+            object_request(shallow_parent[0], expected=404)
+            assert not list((odb / "caos-imports").glob("*/incoming"))
             assert not (odb / "shallow").exists()
             (origin / "shallow").unlink()
             call(payload(shallow_tip[0]))
@@ -250,7 +291,9 @@ def main():
                 call(payload(commit), expected=400)
             call({"source": public, "revision": "main"}, expected=400)
             call(dict(payload(first[0]), invocation="a" * 64), expected=400)
-            call(payload(second[1]), expected=502)
+            noncommit = advance()
+            call(payload(noncommit[1]), expected=502)
+            object_request(noncommit[1], expected=404)
             assert not (odb / "FETCH_HEAD").exists()
             assert not (odb / "shallow").exists()
             assert not run("git", "--git-dir", str(odb), "for-each-ref")
@@ -269,7 +312,7 @@ def main():
                     invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
                     assert token.encode() not in invalid.stdout + invalid.stderr
-            print("git-import: exact commits, HTTPS credentials, full history, packs, reuse, concurrency and retry PASS")
+            print("git-import: exact commits, HTTPS credentials, full history, quarantined imports, packs, reuse, concurrency and retry PASS")
         finally:
             stop(server)
             remote.shutdown(); remote.server_close(); thread.join()

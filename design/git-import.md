@@ -1,8 +1,9 @@
 # Git import endpoint
 
 `POST /git/import` makes an exact remote commit and its complete ancestor
-history readable through CAOS's object API. Git fetches directly into the
-server's existing bare repository, avoiding a worker checkout and re-upload.
+history readable through CAOS's object API. Git fetches into a private staging
+repository on the server, avoiding a worker checkout and re-upload. Only
+verified objects enter the shared object store.
 
 ## Request and execution
 
@@ -17,17 +18,21 @@ The server:
 2. Locks `$GIT_DIR/caos-imports/<sha256(source)>/lock`, serializing imports
    from that URL across server processes sharing the object store.
 3. Returns `{"commit": H}` immediately if `H.complete` exists in that directory.
-4. Fetches H directly into `$GIT_DIR`, targeting the URL and exact hash:
-   `git --git-dir=<server-repo> fetch <source> <H>`. This requests H's
-   ancestors, trees and blobs, without fetching every branch. Tags and
-   recursive submodule fetching are disabled; no partial-clone filter is used.
-5. Rejects incomplete ancestor history, verifies H is a commit, and reads every
-   reachable commit, tree and blob through the server's object-storage code.
-6. Writes and flushes `H.complete`, then returns `{"commit": H}`.
+4. Fetches H into a private bare repository under that directory. Its object
+   store reads existing server objects through an alternate, but all writes
+   stay private. The fetch requests H's ancestors, trees and blobs. Tags,
+   recursive submodule fetching, and partial-clone filters are disabled.
+5. Rejects incomplete ancestor history, verifies H is a commit, and walks H
+   plus every received object as roots. It reads their complete closure through
+   the object-storage code, including surplus objects unrelated to H. Git's
+   pack checks alone can exempt parents of remote-declared shallow commits.
+6. Publishes the verified pack, then its index, and flushes both. Readers see
+   the new objects together. The live object API must be able to read H.
+7. Writes and flushes `H.complete`, then returns `{"commit": H}`.
 
-Each import uses a separate shallow-boundary file so a shallow upstream cannot
-change the shared repository's boundary. A failed fetch or verification writes
-no completion marker; the same request can be retried. Verification currently
+The private repository also isolates shallow boundaries. A failed fetch or
+verification leaves no new objects visible in the shared store and writes no
+completion marker; the same request can be retried. Verification currently
 walks the full requested history on every new completion, including overlaps
 with earlier imports.
 
