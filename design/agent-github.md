@@ -1,6 +1,6 @@
 # Importing and PRs
 
-Ship imports as three layers: the server endpoint, `caos import-git`, and the
+Imports use three layers: the server endpoint, `caos import-git`, and the
 agent's `import_source` tool. PR publication and merge drafts come later.
 
 ## Importing
@@ -32,21 +32,12 @@ Provenance records the repository, requested revision, commit, observation
 time, and default branch when known. For `origin/main`, choose the repository
 from the selected source's provenance and import `main` at a fresh path.
 
-The server fetches H and its complete history directly into its existing bare
-Git repository. Nothing checks out the repository in a worker. The endpoint
-accepts only a full commit hash and handles neither ref resolution nor
+The [server endpoint](git-import.md) fetches H and its full history directly
+into the existing bare Git repository. It uses verified complete imports as
+negotiation tips; standalone trees and blobs may still be downloaded again.
+A completion marker for the same URL and H skips fetch and verification.
+The endpoint handles object availability; callers handle ref resolution and
 conversation state.
-
-A lock serializes imports from the same repository. Only previously verified
-complete imports supply Git's negotiation tips: a commit already in the object
-store may still lack trees, blobs, or parents. A completion marker for the
-repository and H lets repeated requests skip both fetching and verification.
-Failed transfers can be retried with the same input.
-
-Those markers certify object availability. They are neither permissions nor
-GC roots: imported hashes remain readable through the object API without
-remote credentials, and automatic GC is currently disabled. Future GC must
-retain imported commits explicitly.
 
 Supply the token through the existing secret store:
 
