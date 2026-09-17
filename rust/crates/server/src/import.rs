@@ -4,7 +4,6 @@ use crate::{Config, HttpError};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
@@ -22,27 +21,12 @@ pub(crate) fn endpoint(
     config: &Config,
     request: &mut tiny_http::Request,
 ) -> Result<Vec<u8>, HttpError> {
-    let tokens: Vec<_> = request
-        .headers()
-        .iter()
-        .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
-        .map(|h| h.value.as_str().to_owned())
-        .collect();
-    if tokens.len() > 1 {
-        return Err(HttpError::new(400, "duplicate Git token header"));
-    }
-    let mut body = Vec::new();
-    request.as_reader().take(16385).read_to_end(&mut body)?;
-    if body.len() > 16384 {
-        return Err(HttpError::new(400, "import request too large"));
-    }
-    let mut input: Input =
-        serde_json::from_slice(&body).map_err(|_| HttpError::new(400, "invalid import request"))?;
+    let (mut input, token): (Input, _) = crate::remote_git::input(request)?;
     if !git_locator::import::commit(&input.commit) {
         return Err(HttpError::new(400, "import requires a full commit hash"));
     }
     input.commit.make_ascii_lowercase();
-    let token = tokens.first().map(String::as_str);
+    let token = token.as_deref();
     // Validate credentials and URL even on a cache hit.
     git_locator::import::git(&input.source, token).map_err(|e| HttpError::new(400, e))?;
 
