@@ -167,15 +167,125 @@ jobs:
       # commit). Nothing read the target, so nothing broke; the moment anything
       # resolves a build tag to a commit, it gets the wrong tree. install.sh
       # checks the name against the target for exactly that reason.
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.stage.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ steps.stage.outputs.tag }}
-          prerelease: ${{ github.ref_type != 'tag' }}
-          files: |
+      # THE TAG IS THE COMMIT POINT. GitHub creates `tag_name` when a release
+      # is PUBLISHED, not while it is a draft — a draft lives at
+      # `releases/tag/untagged-…` and `ls-remote` shows nothing for it. So this
+      # uploads into a draft and publishes only once every asset is there,
+      # which makes a `build-<commit>` tag MEAN a release that can install a
+      # client.
+      #
+      # IT DID NOT MEAN THAT BEFORE. The releases API 500s intermittently — the
+      # body is GitHub's "Unicorn!" page — and the old single step created the
+      # tag and uploaded in one action, so a 500 part-way left the tag pointing
+      # at a partial release. Measured over 60 runs: 7 failures across four
+      # branches, `build-5cd8461c1be0` carrying only mcp.json and
+      # `build-8e6d41fe3c8a` missing both binaries, each 404ing on
+      # `caos-x86_64-linux`.
+      #
+      # That is worse than a red job, because install.sh walks back to the
+      # newest build tag AT OR BEFORE a commit precisely so that a slightly
+      # older client beats no client — and it selects on the tag existing. A
+      # half-published tag is chosen and then 404s, defeating the fallback
+      # exactly when it is needed.
+      #
+      # `gh` rather than softprops/action-gh-release: the retry below is the
+      # point, and a `uses:` step cannot be retried in place.
+      #
+      # GH_TOKEN is the job's own GITHUB_TOKEN, which is also what stops the
+      # publish from looping: a tag pushed by GITHUB_TOKEN does not start
+      # another workflow run, and this workflow triggers on `tags: ["*"]`.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.stage.outputs.tag }}
+          PRERELEASE: ${{ github.ref_type != 'tag' }}
+        run: |
+          set -euo pipefail
+
+          assets=(
             dist/caos-x86_64-linux
             dist/git-remote-caos-x86_64-linux
             dist/claude-settings.json
             dist/mcp.json
             dist/install.sh
+          )
+
+          # DELETE THE DRAFT UNLESS WE PUBLISHED IT. A draft carries no tag, so
+          # an abandoned one is invisible to install.sh — but leaving it would
+          # make the next run's create fail on a name that is already taken.
+          # `--cleanup-tag` covers the re-run case below, where the release we
+          # are replacing was published and does own a tag.
+          published=no
+          cleanup() {
+            if [ "$published" = no ]; then
+              echo "publish did not complete — removing the draft so no tag claims a partial release" >&2
+              gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          # Names the assets a complete release must carry, so "is this one
+          # already good?" and "did the upload land?" ask the same question.
+          missing() { # <release-tag> ; prints the basenames it does not have
+            local have
+            have="$(gh release view "$1" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            local a
+            for a in "${assets[@]}"; do
+              if ! printf '%s\n' "$have" | grep -qxF "$(basename "$a")"; then
+                printf '%s ' "$(basename "$a")"
+              fi
+            done
+          }
+
+          # A re-run, or a tag pushed twice, finds the release already there.
+          # LEAVE A COMPLETE ONE ALONE. Deleting first and rebuilding would mean
+          # a re-run against a persistent outage ends with no release where a
+          # working one stood — turning a green retry into a regression. An
+          # INCOMPLETE one is replaced, which is the case worth re-running for.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gap="$(missing "$TAG")"
+            if [ -z "$gap" ]; then
+              echo "$TAG already carries every asset — nothing to do" >&2
+              published=yes
+              exit 0
+            fi
+            echo "a release for $TAG exists but is missing: $gap — replacing it" >&2
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          flags=(--draft --target "$GITHUB_SHA" --title "$TAG" --notes "")
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${flags[@]}"
+
+          # RETRY, because the failure this is here for is a 500 on GitHub's
+          # side and the next attempt usually works — every one of the seven
+          # observed failures passed on a manual re-run. `--clobber` so a
+          # partially-uploaded attempt is replaced rather than colliding.
+          uploaded=no
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "${assets[@]}" --clobber; then
+              uploaded=yes
+              break
+            fi
+            echo "upload attempt $attempt failed; retrying" >&2
+            sleep $((attempt * 5))
+          done
+          if [ "$uploaded" = no ]; then
+            echo "every upload attempt failed" >&2
+            exit 1
+          fi
+
+          # VERIFY BEFORE PUBLISHING, rather than trusting the exit status. The
+          # upload reports per-asset and has been seen to fail the step with
+          # every asset present (run 35272990761) and to succeed-looking with
+          # binaries missing; the release's own asset list is the fact.
+          gap="$(missing "$TAG")"
+          if [ -n "$gap" ]; then
+            echo "assets missing after upload: $gap" >&2
+            exit 1
+          fi
+
+          # The tag comes into existence here, with every asset already in place.
+          gh release edit "$TAG" --draft=false
+          published=yes
+          echo "published $TAG with ${#assets[@]} assets" >&2
