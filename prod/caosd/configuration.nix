@@ -1,10 +1,16 @@
-# The caos host: a machine whose job is to run `caosd up --iroh`.
+# The caosd-prod host: a machine whose job is to run `caosd up --iroh`.
 #
-# Built to be reproducible from the repo alone:
-#   sudo nixos-rebuild switch --flake github:Metta-AI/caos#caos-dev
+# Apply it with the deploy driver, NOT with nixos-rebuild:
 #
-# Nothing here is specific to one instance. The public address comes from IMDS
-# at boot and the data disk is found by label, so a fresh machine needs no edit.
+#   nix run github:Metta-AI/caos#deploy-caosd-prod
+#
+# `nixos-rebuild switch --flake ...#caosd-prod` cannot work on its own: this
+# role leaves caos.advertiseAddress undefined because it differs per machine,
+# so a bare rebuild fails on that option. prod/caosd/deploy reads it off the
+# host and layers it on with extendModules -- see prod/README.md.
+#
+# Nothing here is specific to one instance: the address is supplied at deploy
+# time and the data disk is found by label, so a fresh machine needs no edit.
 
 {
   config,
