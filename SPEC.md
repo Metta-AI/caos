@@ -228,8 +228,10 @@ Run `time result/bin/caos-cli run-tool caos-test`
     - Every stored commit has its full ancestor history and ordinary tree
       contents. Gitlinks name separate histories, which are imported separately.
       Object uploads require dependencies first; Git transfers are verified
-      before their objects become visible. Startup rejects pre-existing
-      incomplete history rather than silently accepting or deleting it.
+      before their objects become visible. The publication check validates new
+      objects and checks links into the existing store by type, without walking
+      that stored history again. Startup rejects pre-existing incomplete history
+      rather than silently accepting or deleting it.
 - shall listen on port 80 and respond to requests:
     - Git push/pull requests are routed to git to handle against the repo
     - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack travels alongside it, not inside the hashed tree). The result is the hash of the WorkResult

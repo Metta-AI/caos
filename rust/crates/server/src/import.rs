@@ -125,33 +125,10 @@ pub(crate) fn endpoint(
         if run(&["cat-file", "-t", &input.commit], None)?.trim() != "commit" {
             return Err(failure("remote object is not a commit"));
         }
-        // A remote may send surplus objects. Validate every received root,
-        // not only H: a shallow exemption for an unrelated commit must never
-        // smuggle incomplete history into the shared store.
-        let mut roots = format!("{}\n", input.commit);
-        for index in incoming.indexes()? {
-            for line in run(&["show-index"], Some(&index))?.lines() {
-                let oid = line
-                    .split_whitespace()
-                    .nth(1)
-                    .filter(|oid| git_locator::import::commit(oid))
-                    .ok_or_else(|| failure("invalid imported pack index"))?;
-                roots.push_str(oid);
-                roots.push('\n');
-            }
-        }
-        let roots_path = incoming.path.join("roots");
-        fs::write(&roots_path, roots)?;
-        let closure = run(
-            &[
-                "rev-list",
-                "--objects",
-                "--no-object-names",
-                "--missing=error",
-                "--stdin",
-            ],
-            Some(&roots_path),
-        )?;
+        // Every received object must be checked, including surplus roots. A
+        // fresh index-pack has no remote shallow exemptions. Its strict check
+        // verifies links into the live store by type, then stops there: startup
+        // and checked publication guarantee those objects' transitive closure.
         let staged = Config {
             git_dir: incoming.path.to_string_lossy().into_owned(),
             repo: gix::open(&incoming.path)
@@ -159,10 +136,31 @@ pub(crate) fn endpoint(
                 .into_sync(),
             ..config.clone()
         };
-        for oid in closure.lines() {
-            crate::storage::get_object(&staged, oid)
-                .map_err(|_| failure("imported object not readable in staging"))?;
+        for index in incoming.indexes()? {
+            let pack = index.with_extension("pack");
+            run(
+                &[
+                    "index-pack",
+                    "--strict",
+                    "--threads=1",
+                    &pack.to_string_lossy(),
+                ],
+                None,
+            )?;
+            // Exercise the same reader used by the live API, only for received
+            // objects. Walking their existing ancestors would undo the boundary.
+            for line in run(&["show-index"], Some(&index))?.lines() {
+                let oid = line
+                    .split_whitespace()
+                    .nth(1)
+                    .filter(|oid| git_locator::import::commit(oid))
+                    .ok_or_else(|| failure("invalid imported pack index"))?;
+                crate::storage::get_object(&staged, oid)
+                    .map_err(|_| failure("imported object not readable in staging"))?;
+            }
         }
+        crate::storage::get_object(&staged, &input.commit)
+            .map_err(|_| failure("imported commit not readable in staging"))?;
         incoming.publish(&config.git_dir)?;
         // Exercise the live handle after pack publication, before certifying H.
         crate::storage::get_object(config, &input.commit)
