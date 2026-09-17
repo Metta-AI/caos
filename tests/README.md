@@ -23,6 +23,6 @@ The llm-import entry exercises agent-driven importing in an empty conversation,
 including provenance, readable history, occupied destinations, and invalid
 sources. Pinning and replay are also covered by llm-step's unit tests.
 
-The github entry exercises the packaged CLI, secret grants and invocation
-replay using the version command. It requires
+The github entry exercises the packaged CLI and stack extension, secret grants,
+invocation replay and the agent callback using version/help commands. It requires
 no GitHub account and makes no external writes.
