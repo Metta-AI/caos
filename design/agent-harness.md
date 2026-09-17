@@ -360,22 +360,11 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   and freezes redraws for native terminal text selection. `/checkout <gitlink>
   [directory]` checks out the named code commit as a detached HEAD in a clean
   local checkout. `Ctrl+H` opens the keyboard and slash-command reference.
-  `/pr <gitlink> <base-remote-branch> [remote-URL]` previews one PR; Enter
-  confirms. The URL is explicit or inferred from matching import provenance.
-  Publication pushes the exact code commit, using the gitlink path as the branch
-  name, then opens or reuses its PR through `gh`. The agent tests the code before
-  this client operation. Source and base must share history. If the latest base is not an ancestor,
-  Enter instead imports the base and sends an integration request to the agent;
-  the user runs `/pr` again afterward to review publication. Changed content, remote drift, conflict markers,
-  unrelated histories, and reserved `.caos` state stop publication. Merely
-  opening, running, switching, or publishing conversations never mutates the
-  checkout. `/publish-branch` pushes the same full-history branch without PR
-  creation, while `/load` imports a `remote/caos/<conversation>` branch or
-  GitHub PR back into the canonical server-side conversation. Imports preserve
-  the ID and event spine, allow only first-parent advancement, and reject
-  divergent ID collisions. Progress remains one completed API round at a time,
-  and a running turn is not cancellable until the server/runner protocol grows
-  cancellation.
+  Publication uses the agent's publish_source and github tools. The
+  server pushes the selected code commit; the GitHub worker handles PRs and
+  stacks. See [publication](agent-publish.md) for frozen inputs, leases and
+  recovery. The TUI's /pr and /publish-branch are removed. Publishing source
+  commits never mutates the local checkout.
 
 ### Superseded protocol detail
 
