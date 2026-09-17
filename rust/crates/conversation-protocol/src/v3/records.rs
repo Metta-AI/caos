@@ -679,8 +679,7 @@ impl TryFrom<RawCallRecord> for CallRecord {
 
     fn try_from(raw: RawCallRecord) -> Result<Self, Self::Error> {
         let (files, files_outcome) = if raw.status == CallStatus::Started {
-            if raw.task.is_none()
-                || raw.result.is_some()
+            if raw.result.is_some()
                 || raw.source_tree_resolution.is_some()
                 || raw.files.is_some()
                 || raw.files_outcome.is_some()
@@ -755,8 +754,7 @@ impl CallRecord {
             return Err("tool source_tree_resolution requires source_tree_name".to_string());
         }
         if self.status == CallStatus::Started {
-            if self.task.is_none()
-                || self.result.is_some()
+            if self.result.is_some()
                 || self.source_tree_resolution.is_some()
                 || !self.files.is_empty()
                 || self.files_outcome.is_some()

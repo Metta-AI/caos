@@ -3022,7 +3022,18 @@ pub fn describe_tool_set(
         else {
             continue;
         };
-        if kind != "tree" || ["bash", "grep", "read", "ls", "write", "edit"].contains(&name) {
+        if kind != "tree"
+            || [
+                "bash",
+                "grep",
+                "read",
+                "ls",
+                "write",
+                "edit",
+                "import_source",
+            ]
+            .contains(&name)
+        {
             continue;
         }
         let Ok(expr) = t.git_capture(&["show", &format!("{hash}:.caos-expr")], None) else {

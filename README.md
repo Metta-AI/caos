@@ -858,7 +858,12 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
 
 ### Remote Git imports
 
-Workers can call caos import-git <https-url> <commit> to import an exact commit
+Workers can call `caos import-git <https-url> <commit>` to import an exact commit
 and its complete history directly into the server's object store. It prints
 the commit hash. Use --github-token-file=PATH for private repositories.
 Resolve branch names before calling; retry with the same hash.
+
+The agent's import_source tool also accepts branch names and defaults to the
+remote's default branch. It saves the resolved hash in conversation progress
+before invoking import-git, then attaches the snapshot and provenance at the
+requested unused path. Use /import for local checkouts.
