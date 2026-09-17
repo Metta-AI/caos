@@ -289,9 +289,15 @@ fn reconstruct(
                 calls: record.calls,
             })
         }
-        Kind::ToolStart => Ok(Transition::ToolStart {
-            record: tool_change(kind, child_snapshot, changes)?.1,
-        }),
+        Kind::ToolStart => {
+            let (_, record) = tool_change(kind, child_snapshot, changes)?;
+            let directory =
+                paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+            Ok(Transition::ToolStart {
+                payloads: payload_changes(kind, child_snapshot, changes, &directory)?,
+                record,
+            })
+        }
         Kind::ToolComplete => {
             let (_, record) = tool_change(kind, child_snapshot, changes)?;
             let payload_dir =
