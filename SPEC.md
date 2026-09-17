@@ -370,7 +370,7 @@ with no `@param` tags takes no parameters: the source tree IS its input.
 - Tools are discovered fresh from the CURRENT source tree on every LLM round and
   resolved again at INVOCATION time, so an agent that edits a tool sees the
   change on its next call, within the same turn
-- `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
+- `bash`, `grep`, `read`, `ls`, `write`, `edit` and `import_source` are reserved. A
   `caos-tools/bash/` is ignored, not registered — the model's primitives,
   including the repair path for a broken tool edit, stay stable whatever the
   tree carries
@@ -463,31 +463,32 @@ Publication preserves the selected source tree's code history. Conversation
 records (prompts, tool calls, and results) stay on the conversation branch;
 publishing them is deferred.
 
-## Remote Git imports
+## Agent remote imports
 
-`POST /git/import` imports an HTTPS Git revision directly into the server's
-bare object store, preserving its commit, trees, blobs, and full history.
-Its JSON input contains `source`, optional `revision`, a 64-hex `invocation`,
-and `secret_scope`. An omitted revision selects the remote default branch.
-Authenticated calls supply `X-Caos-Git-Token` and the caller's existing
-`secret-hash` scope; token values never enter Git objects or import records.
+`import_source(source, revision?, into)` is a reserved inline `std/llm-step`
+tool, available in empty conversations. HTTPS only; use `/import` for local
+checkouts. Existing `/import` and startup `--import` behavior stays supported.
 
-The server durably pins the resolved commit before fetching. Retries resume
-that commit or replay the completed result; new invocations observe the remote
-again. Completed imports supply negotiation tips, and an already completed
-commit needs no new fetch or history check. Local paths and shallow imports
-are rejected.
+The inline handler calls `caos import-git`, which posts to `/git/import`.
+The server resolves the branch (default branch if omitted) or full commit H,
+durably pins H to the invocation before transfer, then fetches H's complete
+history and trees directly into its bare object store. Pending records survive
+failed transfers; complete records replay without ref lookup. New invocations
+observe the remote again. Only completed imports in the same repository and
+secret scope supply negotiation tips. No shallow import or import worker.
 
-The response includes the commit hash and provenance. The endpoint does not
-edit conversations or create import refs. Automatic GC remains disabled;
-future GC must retain imported commits because gitlinks do not root them.
+The invocation uses the conversation request, declaring round, tool-call ID,
+parameters and existing secret-hash scope. A granted `/secret/github-token`
+is passed by file to the command for `github.com` on the default HTTPS port,
+then in a sensitive HTTP header. Other hosts receive no automatic GitHub token. Git uses
+request-scoped credentials; no token enters Git objects, arguments, records,
+URLs, logs or shared configuration. Public imports need no token.
 
-`caos import-git <https-url> [revision]` calls this endpoint and prints the
-commit hash, or provenance with `--json`. A supplied `--invocation=<64-hex>`
-reuses an observation; omitting it starts a fresh call.
-`--github-token-file=<path>` forwards the granted token in a sensitive header.
-The command reads the credential scope from `/cas/args/secret-hash` and does
-not attach the imported commit to a conversation.
+The handler conditionally attaches a gitlink and `.source.json` provenance at
+a free path in the same transition as its tool result. Retries add neither a
+second attachment nor a second result. Imports never overwrite or merge code.
+The server does not edit conversations. Automatic GC remains disabled; future
+GC must retain imported commits because conversation gitlinks do not root them.
 
 ## `merge --theirs=<commit>`
 
@@ -522,8 +523,8 @@ not attach the imported commit to a conversation.
 ## Resolving `--theirs`
 
 The normal client does not publish a map of local branch names to workers.
-Import the desired Git revision explicitly, then pass its full commit hash to
-`merge`. The selected source-tree path identifies `ours`; `theirs` identifies
+Use `import_source` to import the desired HTTPS remote revision, then pass its
+full commit hash to `merge`. The selected source-tree path identifies `ours`; `theirs` identifies
 an immutable commit already available in CAOS. Importing a newer branch tip
 does not merge it automatically.
 

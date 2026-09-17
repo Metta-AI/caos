@@ -2,8 +2,8 @@
 
 A conversation has one filesystem. It holds messages and protocol metadata under
 `.caos/`, ordinary files such as notes and memories, and references to code.
-The agent works in this filesystem; the TUI handles importing from the user's
-machine, exporting local checkouts, and publishing to a remote repository.
+The agent imports HTTPS repositories into this filesystem. The TUI imports
+local checkouts, exports code for local editing, and publishes to remotes.
 
 | Name | Meaning |
 | --- | --- |
@@ -134,6 +134,28 @@ retain their cursor and pasted content while browsing. History comes from the
 saved conversation, so it remains available after reopening the TUI. Messages
 from other participants, the agent, and CAOS are excluded.
 
+## Agent remote imports
+
+Ask the agent to import an HTTPS repository. `import_source` accepts its URL,
+an optional branch/ref or full commit hash, and an unused destination. It is
+available in an empty conversation. An omitted revision selects the remote's
+default branch. The result is an unchanged gitlink plus `.source.json` with
+repository, requested revision, commit, observation time and default branch
+when known. Reading or merging that snapshot needs no new remote fetch.
+
+The inline handler calls `caos import-git`; `POST /git/import` fetches directly
+into the server's bare object store. Its durable invocation record pins the
+resolved commit before transfer and distinguishes pending from complete.
+Retries resume or replay that commit; new calls observe the remote again.
+Complete imports supply Git negotiation tips within their repository and
+secret scope. The server preserves full tree and history and does not edit
+conversation state.
+
+The handler atomically records its result and attaches the gitlink/provenance
+only if both paths remain free. Replays do not add another result. Imports do
+not merge into existing code. Local paths still use `/import` below.
+See [agent-github.md](agent-github.md#importing) for credential and retry details.
+
 ## Importing code with `/import`
 
 The user enters this in the TUI:
@@ -161,8 +183,8 @@ The client then:
    `CAOS`.
 
 The activity box shows `Importing…` while this runs. After it finishes, the user
-sends a message to continue the agent. Asking the agent to import in prose does
-not execute the TUI command; it should respond with the exact command to enter.
+sends a message to continue the agent. For local paths, asking the agent in prose does not execute the TUI command;
+it responds with the exact command to enter. HTTPS imports use its inline tool.
 
 To select a local commit explicitly, supply a hash or ref. A Git URI requires a
 full commit hash; branch names, short hashes, and an omitted revision are

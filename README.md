@@ -389,8 +389,9 @@ the object machinery through a one-way dependency. Their difference is the
     imports the launching checkout's clean HEAD at that conversation path.
     Add a source and revision to select another repository or commit; Git URLs
     require a full commit hash. Ctrl+O browses code entries; the agent
-    organizes them through ordinary file operations. `/import` adds local or
-    remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
+    organizes them through ordinary file operations. Ask the agent to import
+    HTTPS repositories by branch, ref or full commit. `/import` still adds
+    local or pinned remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
     one PR, and `/checkout <gitlink> [directory]` exports code for local editing;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
@@ -856,7 +857,30 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   (content-addressed, so they dedup). A deployment that does not need indefinite
   result retention should define a policy and run `git gc`.
 
-### Remote Git imports from workers
+### Agent remote Git imports
+
+Ask the agent to import an HTTPS repository, optionally naming a branch or full
+commit. It uses `import_source` even in an empty conversation and attaches an
+unchanged snapshot at a free path. Omitting the revision uses the remote default
+branch. Each new call sees the remote again. Importing does not merge code.
+Use `/import imports/repo/base /path/to/repo [revision]` for local checkouts.
+
+Public imports need no token. For private GitHub repositories, grant `github-token`
+to the actual llm-step path in the harness tree:
+
+```text
+# .caos-secrets/github-token
+name=github-token
+value:@=.github-token-value
+reader=std/llm-step
+```
+
+Keep the value file ignored and run `caos secrets` to initialize entropy.
+Relative value paths are relative to the secret file's directory. If llm-step
+is under a different harness path, use that path as the reader. Credentials
+travel through the secret mount and a sensitive header, never in the source URL.
+The inline tool forwards this secret only to `github.com` on the default HTTPS
+port; other HTTPS hosts are imported without it.
 
 `caos import-git <https-url> [revision]` is the reusable worker-side operation.
 `--github-token-file=<path>` supplies a credential; `--invocation=<id>` supplies
