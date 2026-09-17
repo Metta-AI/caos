@@ -87,8 +87,13 @@ Every admitted commit has its tree and all parents in the store. Ordinary tree
 entries have their objects too. Gitlinks are separate history references:
 pushing a containing tree sends neither the target commit nor its ancestors.
 
-The object API checks dependency presence and type before writing an owner.
-Clients upload dependencies first. Git pushes validate incoming objects in
+The object API checks tree dependencies before writing a tree. For a posted
+commit, it stages the raw bytes in a private repository and asks Git to walk
+its full ancestor and tree closure before publishing it. This Git check runs
+only for commit objects, not for blobs or tree entries with gitlink mode.
+Incomplete commits are rejected; the client does not assemble missing ancestry.
+Clients must upload dependencies first. The existing tree fallback still handles
+requests referencing objects held only by the server. Git pushes validate incoming objects in
 quarantine, reject client shallow declarations, and keep even small transfers
 packed, so publication cannot expose a child before its parents. Imports use
 the staging and publication steps above.

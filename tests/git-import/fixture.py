@@ -301,6 +301,13 @@ def main():
             post_from_origin("tree", extra_parent[1])
             post_from_origin("commit", extra_parent[0])
             post_object("commit", merge)
+            # Git must also walk through existing objects: checking just the
+            # new commit's direct links misses an old tree with an absent blob.
+            broken_tree = b"100644 missing\0" + bytes.fromhex("3" * 40)
+            broken_tree_oid = run("git", "--git-dir", str(odb), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
+            post_object("commit", child_bytes.replace(posted_child[1].encode(), broken_tree_oid.encode()), expected=400)
+            (odb / "objects" / broken_tree_oid[:2] / broken_tree_oid[2:]).unlink()
+            assert not list((odb / "caos-commit-checks").iterdir())
             # Gitlinks are separate histories: an absent target is allowed and
             # neither ordinary Git nor the object API uploads its commit.
             absent = "1" * 40
@@ -371,6 +378,17 @@ def main():
                 local_child_bytes = child_bytes.replace(posted_parent[0].encode(), local_parent.encode()).replace(b"fixture", b"local child")
                 local_child = run("git", "-C", str(client), "hash-object", "-w", "-t", "commit", "--stdin", input=local_child_bytes)
                 image = "--base:docker=example.invalid/test@sha256:" + "a" * 64
+                # The client does not repair an incomplete commit upload by
+                # walking its local parents. Rejection must publish neither.
+                refused = subprocess.run([host_cli, "prepare-request", image, "--source:commit=" + local_child],
+                    cwd=client, capture_output=True)
+                assert refused.returncode != 0
+                assert b"incomplete commit history" in refused.stderr, refused.stderr
+                object_request(local_parent, expected=404)
+                object_request(local_child, expected=404)
+                # Explicitly uploading the parent first makes the same child
+                # valid even though the client still lacks the tree's blob.
+                run(host_cli, "prepare-request", image, "--source:commit=" + local_parent, cwd=client)
                 run(host_cli, "prepare-request", image, "--source:commit=" + local_child, cwd=client)
                 object_request(local_parent)
                 object_request(local_child)
@@ -378,7 +396,7 @@ def main():
                 refused = subprocess.run([host_cli, "prepare-request", image, "--source:commit=" + bad_child],
                     cwd=client, capture_output=True)
                 assert refused.returncode != 0
-                assert b"absent locally and on the server" in refused.stderr, refused.stderr
+                assert b"incomplete commit history" in refused.stderr, refused.stderr
                 object_request(bad_child, expected=404)
 
             shallow_parent = advance()
@@ -441,7 +459,7 @@ def main():
             assert refused.returncode != 0, "server accepted legacy incomplete history"
             assert b"restore the missing objects" in refused.stderr, refused.stderr
             assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken) == "commit"
-            print("git-import: complete history, upload ordering, quarantined imports/pushes, client fallback, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
+            print("git-import: complete history, upload ordering, quarantined imports/pushes, commit rejection, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
         finally:
             stop(server)
             remote.shutdown(); remote.server_close(); thread.join()

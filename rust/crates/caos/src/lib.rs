@@ -1361,60 +1361,36 @@ impl GitTransport {
     /// curry's base is a BLOB naming the hash, leaving the unwrapped runner-pool
     /// image reachable from nothing.
     ///
-    /// Upload dependencies before owners, checking absent local objects on the
-    /// server. A client can know hashes from remote locators as well as from
-    /// CAOS, so local absence alone is not evidence of server presence.
+    /// Walk ordinary tree entries so locally available children arrive first.
+    /// Commits are posted as supplied: Git on the server rejects incomplete
+    /// history. This fallback does not assemble missing commit ancestry.
     fn hand_over_graph(&self, hash: &str) -> Result<(), String> {
-        enum Step {
-            Visit(String),
-            Post(String, String, Vec<u8>),
-        }
-        let mut pending = vec![Step::Visit(hash.to_string())];
-        let mut complete = std::collections::HashSet::new();
-        while let Some(step) = pending.pop() {
-            let hash = match step {
-                Step::Post(hash, kind, content) => {
-                    self.post_object_http(&kind, &content)?;
-                    complete.insert(hash);
+        let Some((kind, content)) = self.read_local(hash)? else {
+            return Ok(()); // The server validates dependencies before storing the owner.
+        };
+        if kind == "tree" {
+            let tree = gix::objs::TreeRef::from_bytes(&content, self.repo.object_hash())
+                .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+            for entry in tree.entries {
+                // Gitlinks are not reachability-traversed, so a commit arg's
+                // closure never rode in this push anyway (`resolve_commit_arg`
+                // ships it separately).
+                if entry.mode.is_commit() {
                     continue;
                 }
-                Step::Visit(hash) => hash,
-            };
-            if complete.contains(&hash) {
-                continue;
+                let child = entry.oid.to_string();
+                if self.graph_readable(&child) {
+                    // `ensure_pushed`, not the raw push: a child ref is subject
+                    // to the same create race as any other, and skipping its
+                    // retry turned a concurrent suite into "cannot lock ref …:
+                    // reference already exists".
+                    self.ensure_pushed(&child)?;
+                } else {
+                    self.hand_over_graph(&child)?;
+                }
             }
-            if self.server_holds(&hash) {
-                complete.insert(hash);
-                continue;
-            }
-            let Some((kind, content)) = self.read_local(&hash)? else {
-                return Err(format!("object {hash} is absent locally and on the server"));
-            };
-            if self.graph_readable(&hash) {
-                self.ensure_pushed(&hash)?;
-                complete.insert(hash);
-                continue;
-            }
-            let mut children = Vec::new();
-            if kind == "tree" {
-                let tree = gix::objs::TreeRef::from_bytes(&content, self.repo.object_hash())
-                    .map_err(|e| format!("malformed tree {hash}: {e}"))?;
-                children.extend(
-                    tree.entries
-                        .into_iter()
-                        .filter(|entry| !entry.mode.is_commit())
-                        .map(|entry| entry.oid.to_string()),
-                );
-            } else if kind == "commit" {
-                let commit = gix::objs::CommitRef::from_bytes(&content, self.repo.object_hash())
-                    .map_err(|e| format!("malformed commit {hash}: {e}"))?;
-                children.push(commit.tree().to_string());
-                children.extend(commit.parents().map(|parent| parent.to_string()));
-            }
-            pending.push(Step::Post(hash, kind, content));
-            pending.extend(children.into_iter().map(Step::Visit));
         }
-        Ok(())
+        self.post_object_http(&kind, &content)
     }
 
     /// Hand the server ONE object's bytes over the HTTP object API, in the

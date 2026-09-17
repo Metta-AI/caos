@@ -65,12 +65,9 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
             // Validate the commit encoding, then store the *raw* bytes (rather
             // than re-encoding the parsed form), so the hash is exactly what the
             // client computed over the bytes it sent.
-            let commit = gix::objs::CommitRef::from_bytes(content, repo.object_hash())
+            gix::objs::CommitRef::from_bytes(content, repo.object_hash())
                 .map_err(|err| HttpError::new(400, format!("invalid commit: {err}")))?;
-            require_object(&repo, commit.tree(), gix::object::Kind::Tree)?;
-            for parent in commit.parents() {
-                require_object(&repo, parent, gix::object::Kind::Commit)?;
-            }
+            validate_commit_with_git(config, content)?;
             gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
                 .map_err(|err| HttpError::new(500, format!("failed to write commit: {err}")))?
         }
@@ -82,6 +79,88 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
         }
     };
     Ok(format!("{}\n", sync_loose_object(config, id)).into_bytes())
+}
+
+/// Validate only posted commit objects with Git, before publishing their bytes.
+/// A gitlink's mode is a reference, not an object type: Git deliberately does
+/// not traverse those entries. The candidate commit itself must be the root.
+fn validate_commit_with_git(config: &Config, content: &[u8]) -> Result<(), HttpError> {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Staged(PathBuf);
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "cannot remove commit validation directory {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    let root = std::path::Path::new(&config.git_dir).join("caos-commit-checks");
+    std::fs::create_dir_all(&root)?;
+    let staged = loop {
+        let path = root.join(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => break Staged(path),
+            // Another process, or a directory left by an earlier crashed one.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let repo = gix::init_bare(&staged.0).map_err(|error| {
+        HttpError::new(
+            500,
+            format!("creating commit validation repository: {error}"),
+        )
+    })?;
+    let objects = std::fs::canonicalize(std::path::Path::new(&config.git_dir).join("objects"))?;
+    std::fs::create_dir_all(staged.0.join("objects/info"))?;
+    std::fs::write(
+        staged.0.join("objects/info/alternates"),
+        format!("{}\n", objects.display()),
+    )?;
+    let id = gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+        .map_err(|error| HttpError::new(500, format!("staging commit: {error}")))?;
+    // Walk the complete closure: index-pack --strict trusts objects already
+    // present, whereas an old tree could itself reference a missing blob.
+    let mut command = std::process::Command::new("git");
+    command.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    let output = command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .args(["-c", "core.commitGraph=false", "--git-dir"])
+        .arg(&staged.0)
+        .args([
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--missing=error",
+            &id.to_string(),
+            "--",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(HttpError::new(
+            400,
+            "incomplete commit history; upload its tree and parents first",
+        ));
+    }
+    Ok(())
 }
 
 /// Dependencies must precede their owner. Startup checks the existing store,
