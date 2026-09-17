@@ -175,55 +175,59 @@ fn import(config: &Config, body: &[u8], token: Option<&str>) -> Result<Vec<u8>, 
         }
         tips.sort();
         tips.dedup();
-        let mut args = vec![
-            "fetch".to_string(),
-            "--no-tags".into(),
-            "--no-write-fetch-head".into(),
-            "--no-auto-maintenance".into(),
-            "--no-recurse-submodules".into(),
-            "--no-filter".into(),
-        ];
-        if tips.is_empty() {
-            // noop sends no local refs; unlike a made-up negotiation tip it also
-            // works in an empty repository.
-            args.splice(
-                0..0,
-                ["-c".into(), "fetch.negotiationAlgorithm=noop".into()],
-            );
-        } else {
-            args.extend(tips.iter().map(|tip| format!("--negotiation-tip={tip}")));
-        }
-        args.extend(["--".into(), input.source.clone(), record.commit.clone()]);
-        // A shallow upstream must not write the server's shared shallow file.
-        // Start every attempt with a private empty boundary list, then refuse
-        // any boundary the remote returned instead of certifying partial history.
-        File::create(&shallow_path)?;
-        git.run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
-        match fs::read(&shallow_path) {
-            Ok(bytes) if !bytes.is_empty() => {
-                return Err(failure("remote did not supply complete ancestor history"))
+        // A completed import already certifies this immutable closure. The
+        // new invocation still resolved the remote, but need not reread history.
+        if !tips.contains(&record.commit) {
+            let mut args = vec![
+                "fetch".to_string(),
+                "--no-tags".into(),
+                "--no-write-fetch-head".into(),
+                "--no-auto-maintenance".into(),
+                "--no-recurse-submodules".into(),
+                "--no-filter".into(),
+            ];
+            if tips.is_empty() {
+                // noop sends no local refs; unlike a made-up negotiation tip it also
+                // works in an empty repository.
+                args.splice(
+                    0..0,
+                    ["-c".into(), "fetch.negotiationAlgorithm=noop".into()],
+                );
+            } else {
+                args.extend(tips.iter().map(|tip| format!("--negotiation-tip={tip}")));
             }
-            Ok(_) => {
-                fs::remove_file(&shallow_path)?;
+            args.extend(["--".into(), input.source.clone(), record.commit.clone()]);
+            // A shallow upstream must not write the server's shared shallow file.
+            // Start every attempt with a private empty boundary list, then refuse
+            // any boundary the remote returned instead of certifying partial history.
+            File::create(&shallow_path)?;
+            git.run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            match fs::read(&shallow_path) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    return Err(failure("remote did not supply complete ancestor history"))
+                }
+                Ok(_) => {
+                    fs::remove_file(&shallow_path)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        // rev-list walks all ancestors AND trees/blobs; mere commit existence is
-        // not completion. Read every object through the live storage handle too.
-        if git.run(&["cat-file", "-t", &record.commit])?.trim() != "commit" {
-            return Err(failure("remote revision is not a commit"));
-        }
-        let closure = git.run(&[
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            &record.commit,
-            "--",
-        ])?;
-        for oid in closure.lines() {
-            crate::storage::get_object(config, oid)
-                .map_err(|_| failure("imported object not visible through object storage"))?;
+            // rev-list walks all ancestors AND trees/blobs; mere commit existence is
+            // not completion. Read every object through the live storage handle too.
+            if git.run(&["cat-file", "-t", &record.commit])?.trim() != "commit" {
+                return Err(failure("remote revision is not a commit"));
+            }
+            let closure = git.run(&[
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                &record.commit,
+                "--",
+            ])?;
+            for oid in closure.lines() {
+                crate::storage::get_object(config, oid)
+                    .map_err(|_| failure("imported object not visible through object storage"))?;
+            }
         }
         record.complete = true;
         save(&record_path, &record)?;

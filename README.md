@@ -865,7 +865,7 @@ unchanged snapshot at a free path. Omitting the revision uses the remote default
 branch. Each new call sees the remote again. Importing does not merge code.
 Use `/import imports/repo/base /path/to/repo [revision]` for local checkouts.
 
-Public imports need no token. For private repositories, grant `github-token`
+Public imports need no token. For private GitHub repositories, grant `github-token`
 to the actual llm-step path in the harness tree:
 
 ```text
@@ -879,6 +879,8 @@ Keep the value file ignored and run `caos secrets` to initialize entropy.
 Relative value paths are relative to the secret file's directory. If llm-step
 is under a different harness path, use that path as the reader. Credentials
 travel through the secret mount and a sensitive header, never in the source URL.
+The inline tool forwards this secret only to `github.com` on the default HTTPS
+port; other HTTPS hosts are imported without it.
 
 `caos import-git <https-url> [revision]` is the reusable worker-side operation.
 `--github-token-file=<path>` supplies a credential; `--invocation=<id>` supplies

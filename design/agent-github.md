@@ -42,13 +42,13 @@ For an import of `main`:
 3. The server resolves `refs/heads/main` to H using `git ls-remote` and durably
    records H in the invocation's state before fetching. A supplied full commit
    hash is already H. A retry uses the recorded H.
-4. Git fetches H directly into the existing object store, transferring its
+4. Reuse an earlier completed import of H in this repository/credential scope.
+   Otherwise Git fetches H into the existing object store, transferring its
    trees, blobs, and ancestor commits. There is no checkout. Fetch complete
    history, without shallow or blob filters. A shallow upstream is rejected;
    request-local shallow bookkeeping cannot alter the shared repository.
-5. The server verifies that H's history and trees are available through
-   `/object`, then records the completed result. Only completed imports supply
-   negotiation tips for future fetches.
+5. For a fetched H, verify its history and trees through `/object`. Record the
+   completed result. Only completed imports supply future negotiation tips.
 6. The endpoint returns H and provenance. The inline handler attaches the
    gitlink and records the tool result in the conversation; the server does
    not edit it.
@@ -75,7 +75,7 @@ credential scope as
 [negotiation tips](https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt---negotiation-tipltcommitglobgt),
 instead of advertising unrelated CAOS refs. Git handles avoiding repeat transfers.
 A new import still contacts the remote to observe its current tip. If it is
-still H, Git reuses the existing objects without downloading the history again;
+still H, reuse its completed import without another fetch or history walk;
 if it advanced, Git negotiates the missing objects. With no prior import,
 negotiate without local tips. No separate branch-tip cache is needed.
 
@@ -105,7 +105,9 @@ reader=std/llm-step
 
 Keep the value file ignored and initialize its entropy with `caos secrets`.
 The existing grant mechanism mounts the token at `/secret/github-token` in
-`std/llm-step`. The inline handler passes that file to the new command:
+`std/llm-step`. For `github.com` on the default HTTPS port, the inline handler
+passes that file to the new command. Other HTTPS hosts receive no automatic
+GitHub token:
 
 ```sh
 caos import-git https://github.com/owner/repo.git main \

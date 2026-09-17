@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import shutil
 import socket
 import ssl
@@ -44,6 +45,16 @@ def main():
     token = "fixture-credential-never-in-import-state"
     with tempfile.TemporaryDirectory(prefix="caos-import-", dir=os.environ.get("TMPDIR")) as temp:
         root = Path(temp)
+        # Record server-side Git operations without logging arguments or secrets.
+        git_commands = root / "git-commands"
+        git_bin = root / "git-bin"
+        git_bin.mkdir()
+        git_shim = git_bin / "git"
+        git_shim.write_text("#!/bin/sh\nfor arg do\n"
+            'case "$arg" in ls-remote|fetch|cat-file|rev-list)\n'
+            "printf '%s\\n' \"$arg\" >> " + shlex.quote(str(git_commands)) + "; break;;\n"
+            "esac\ndone\nexec " + shlex.quote(shutil.which("git")) + ' "$@"\n')
+        git_shim.chmod(0o755)
         origin = root / "origin.git"
         run("git", "init", "--bare", "-q", str(origin))
         run("git", "--git-dir", str(origin), "config", "uploadpack.allowAnySHA1InWant", "true")
@@ -131,7 +142,7 @@ def main():
         log = open(root / "server.log", "wb")
         odb = root / "server.git"
         def start():
-            process = subprocess.Popen([binary], env=dict(os.environ, SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb), GIT_SSL_CAINFO=str(cert)), stdout=log, stderr=log, start_new_session=True)
+            process = subprocess.Popen([binary], env=dict(os.environ, PATH=str(git_bin) + os.pathsep + os.environ["PATH"], SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb), GIT_SSL_CAINFO=str(cert)), stdout=log, stderr=log, start_new_session=True)
             def ready():
                 if process.poll() is not None:
                     raise AssertionError((root / "server.log").read_text())
@@ -194,7 +205,9 @@ def main():
             assert any(second[0].encode() in body for body in fetches), "complete prior import was not a negotiation tip"
             pack_count = len(list((odb / "objects/pack").glob("*.pack")))
             before_same = len(observations)
+            before_git = len(git_commands.read_text().splitlines())
             assert call(payload("same-tip"))["commit"] == third[0]
+            assert git_commands.read_text().splitlines()[before_git:] == ["ls-remote"], "completed history was fetched or verified again"
             same_tip_requests = len(observations) - before_same
             assert len(list((odb / "objects/pack").glob("*.pack"))) == pack_count, "unchanged tip transferred another pack"
             assert call(payload("exact", revision=first[0]))["commit"] == first[0]

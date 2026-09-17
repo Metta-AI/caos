@@ -36,6 +36,17 @@ fn parameters(call: &Call) -> Result<(&str, Option<&str>, &str), String> {
     Ok((source, revision, into))
 }
 
+// The mounted secret is a GitHub credential, not a credential for every
+// HTTPS repository the model can name. Explicit CLI callers choose their token.
+fn is_github_remote(source: &str) -> bool {
+    source
+        .strip_prefix("https://")
+        .and_then(|url| url.split_once('/'))
+        .is_some_and(|(host, _)| {
+            host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("github.com:443")
+        })
+}
+
 fn free_destination(view: &Conversation<'_>, into: &str) -> Result<(), String> {
     for name in [into.to_string(), format!("{into}.source.json")] {
         // entry refuses traversal through a gitlink, file or symlink as well.
@@ -70,7 +81,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         command.arg(revision);
     }
     command.args([format!("--invocation={invocation}"), "--json".into()]);
-    if Path::new("/secret/github-token").exists() {
+    if is_github_remote(source) && Path::new("/secret/github-token").exists() {
         command.arg("--github-token-file=/secret/github-token");
     }
     let output = command
@@ -155,6 +166,26 @@ pub(super) fn attach<S: progress::RefStore>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_github_credentials_stay_on_github() {
+        for source in [
+            "https://github.com/owner/repo",
+            "https://GitHub.com:443/owner/repo",
+        ] {
+            assert!(is_github_remote(source), "{source}");
+        }
+        for source in [
+            "https://example.com/repo",
+            "https://github.com.evil.example/repo",
+            "https://github.com:444/repo",
+            "https://github.com@evil.example/repo",
+            "https://localhost:5003/repo",
+            "http://github.com/owner/repo",
+        ] {
+            assert!(!is_github_remote(source), "{source}");
+        }
+    }
+
     #[test]
     fn rejects_bad_arguments_before_transfer() {
         for input in [

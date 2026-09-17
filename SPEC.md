@@ -479,7 +479,8 @@ secret scope supply negotiation tips. No shallow import or import worker.
 
 The invocation uses the conversation request, declaring round, tool-call ID,
 parameters and existing secret-hash scope. A granted `/secret/github-token`
-is passed by file to the command, then in a sensitive HTTP header. Git uses
+is passed by file to the command for `github.com` on the default HTTPS port,
+then in a sensitive HTTP header. Other hosts receive no automatic GitHub token. Git uses
 request-scoped credentials; no token enters Git objects, arguments, records,
 URLs, logs or shared configuration. Public imports need no token.
 
