@@ -463,6 +463,25 @@ Publication preserves the selected source tree's code history. Conversation
 records (prompts, tool calls, and results) stay on the conversation branch;
 publishing them is deferred.
 
+## Remote Git imports
+
+`POST /git/import` imports an HTTPS Git revision directly into the server's
+bare object store, preserving its commit, trees, blobs, and full history.
+Its JSON input contains `source`, optional `revision`, a 64-hex `invocation`,
+and `secret_scope`. An omitted revision selects the remote default branch.
+Authenticated calls supply `X-Caos-Git-Token` and the caller's existing
+`secret-hash` scope; token values never enter Git objects or import records.
+
+The server durably pins the resolved commit before fetching. Retries resume
+that commit or replay the completed result; new invocations observe the remote
+again. Completed imports supply negotiation tips, and an already completed
+commit needs no new fetch or history check. Local paths and shallow imports
+are rejected.
+
+The response includes the commit hash and provenance. The endpoint does not
+edit conversations or create import refs. Automatic GC remains disabled;
+future GC must retain imported commits because gitlinks do not root them.
+
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the

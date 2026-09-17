@@ -13,3 +13,9 @@ conversation="${test_run_id}-tools"
 ```
 
 `CAOS_SALT` controls caching; it is not a state namespace.
+
+For deterministic remote-import endpoint and credential coverage, run
+`python3 dev/test-remote-import.py /path/to/server` with Git and openssl.
+The fixture serves HTTPS Git locally, interrupts transfers, restarts the server,
+and checks pinned replay, object visibility and credential isolation. Reserve
+its ports first (defaults 9093 and 5003, overridable in the script).
