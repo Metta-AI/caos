@@ -13,3 +13,7 @@ conversation="${test_run_id}-tools"
 ```
 
 `CAOS_SALT` controls caching; it is not a state namespace.
+
+The git-import suite entry runs a private HTTPS Git remote and a separate
+server, checking exact-commit imports, authentication, complete history,
+incremental transfers and retries. It needs no external service.

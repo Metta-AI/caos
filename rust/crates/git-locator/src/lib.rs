@@ -1,4 +1,6 @@
 //! Shared parser for pinned Git locators and local directory locators.
+
+pub mod import;
 /// A parsed `:@@=` locator — a git tree named by WHERE to fetch it, pinned by a
 /// content hash (design/flake-inputs.md). The syntax is nix's flake-reference
 /// grammar, borrowed as a STRING FORMAT only (no nix ever runs): a scheme + an

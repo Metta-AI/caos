@@ -463,6 +463,25 @@ Publication preserves the selected source tree's code history. Conversation
 records (prompts, tool calls, and results) stay on the conversation branch;
 publishing them is deferred.
 
+## Remote Git imports
+
+POST /git/import accepts only source (an HTTPS repository URL) and commit
+(a full commit hash), with an optional X-Caos-Git-Token header. It imports that
+exact commit, trees, blobs, and complete ancestor history directly into the
+server's bare object store and returns {"commit": H}. Branch names, local
+paths, and shallow imports are rejected. Callers resolve refs and persist
+their chosen commit before invoking the endpoint.
+
+Completed imports supply negotiation tips. A completion marker for the
+repository and commit avoids fetching or checking history again. This is an
+object-availability operation: a cache hit does not recheck remote access,
+just as reading an available hash through the object API does not.
+Token values never enter Git objects or completion markers.
+
+The endpoint does not edit conversations or create import refs. Automatic GC
+remains disabled; future GC must retain imported commits because gitlinks
+and completion markers do not root them.
+
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the

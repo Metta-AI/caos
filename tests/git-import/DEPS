@@ -1,0 +1,4 @@
+../../std/cargo cargo
+../../std/flake-builder flake-builder
+../../flake.lock flake.lock
+../../rust rust
