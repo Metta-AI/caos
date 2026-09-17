@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real HTTPS Git + running CAOS server regression test (no external service).
 Requires Python 3, Git and openssl.
-Usage: python3 dev/test-remote-import.py /path/to/server
+Usage: python3 dev/test-remote-import.py /path/to/server [/path/to/caos]
 Ports default to 9093/5003; override CAOS_IMPORT_TEST_PORT/GIT_IMPORT_TEST_PORT.
 """
 import base64
@@ -305,6 +305,32 @@ def main():
             assert not (odb / "FETCH_HEAD").exists()
             assert not (odb / "shallow").exists()
             assert not run("git", "--git-dir", str(odb), "for-each-ref"), "imports created refs"
+            if len(sys.argv) > 2:
+                # Exercise secret-file -> sensitive header -> credential helper.
+                # This standalone fixture owns /cas only inside its test container.
+                cas = Path("/cas")
+                assert not cas.exists(), "run CLI fixture in an empty test container"
+                cas.mkdir()
+                try:
+                    arguments_dir = root / "args"
+                    arguments_dir.mkdir()
+                    (arguments_dir / "secret-hash").write_text("c" * 40)
+                    token_file = root / "token"
+                    token_file.write_text(token + "\n")
+                    cli_env = dict(os.environ, CAOS_SERVER_URL=base)
+                    cli = str(Path(sys.argv[2]).resolve())
+                    run(cli, "put", str(arguments_dir), str(cas / "args"), env=cli_env)
+                    arguments = [cli, "import-git", private, first[0], "--invocation=" + "d" * 64, "--github-token-file=" + str(token_file)]
+                    assert run(*arguments, env=cli_env) == first[0]
+                    # Rotating only the value must not change an invocation key.
+                    token_file.write_text("rotated-but-same-scope")
+                    assert run(*arguments, env=cli_env) == first[0]
+                    public_result = json.loads(run(cli, "import-git", public, "--json", env=cli_env))
+                    assert public_result["complete"]
+                    result = subprocess.run([cli, "import-git", "/tmp/repo"], env=cli_env, capture_output=True)
+                    assert result.returncode and token.encode() not in result.stderr
+                finally:
+                    shutil.rmtree(cas)
             for name, value in [("gc.auto", "0"), ("receive.autogc", "false"), ("maintenance.geometric-repack.enabled", "false"), ("core.fsync", "objects,reference"), ("core.fsyncMethod", "batch")]:
                 assert run("git", "--git-dir", str(odb), "config", name) == value
             for p in [odb / "config", root / "server.log", *list((odb / "caos-imports").glob("*/*.json"))]:

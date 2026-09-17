@@ -482,6 +482,13 @@ The response includes the commit hash and provenance. The endpoint does not
 edit conversations or create import refs. Automatic GC remains disabled;
 future GC must retain imported commits because gitlinks do not root them.
 
+`caos import-git <https-url> [revision]` calls this endpoint and prints the
+commit hash, or provenance with `--json`. A supplied `--invocation=<64-hex>`
+reuses an observation; omitting it starts a fresh call.
+`--github-token-file=<path>` forwards the granted token in a sensitive header.
+The command reads the credential scope from `/cas/args/secret-hash` and does
+not attach the imported commit to a conversation.
+
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the

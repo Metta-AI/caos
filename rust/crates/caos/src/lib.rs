@@ -19,6 +19,7 @@
 //! `get` expand a placeholder later.
 
 pub mod gitlinks;
+pub mod import_git;
 pub mod timing;
 
 use std::ffi::OsStr;

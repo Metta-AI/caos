@@ -855,3 +855,11 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   remain visible to receive-pack negotiation; they still accumulate
   (content-addressed, so they dedup). A deployment that does not need indefinite
   result retention should define a policy and run `git gc`.
+
+### Remote Git imports from workers
+
+`caos import-git <https-url> [revision]` is the reusable worker-side operation.
+`--github-token-file=<path>` supplies a credential; `--invocation=<id>` supplies
+64 hexadecimal characters for durable replay. Omitting it starts a new import.
+The command uses `/cas/args/secret-hash` for credential isolation and prints the commit hash;
+`--json` includes provenance. It does not attach code to a conversation.
