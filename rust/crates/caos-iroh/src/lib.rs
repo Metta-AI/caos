@@ -322,8 +322,21 @@ impl Client {
     /// talks to a listener over loopback and needs no network at all; and (in
     /// time) a long-lived client that keeps one endpoint across several servers.
     pub async fn connect_on(endpoint: Endpoint, ticket: &Ticket) -> Result<Self, String> {
+        // `CAOS_IROH_RELAY_ONLY` drops the ticket's IP hints, leaving the relay as
+        // the only way to the server. It exists because relay-only is the CLOUD's
+        // permanent condition and nothing on a developer's machine reproduces it:
+        // a ticket names private addresses, a container on the same host reaches
+        // them directly at 49 MB/s, and a container across the internet cannot
+        // reach them at all. A bug that only appears on the relayed path -- a
+        // large push dying partway -- is otherwise unreproducible outside a cloud
+        // session, which is the worst place to debug one.
+        let mut addr = ticket.addr.clone();
+        if std::env::var_os("CAOS_IROH_RELAY_ONLY").is_some() {
+            addr = EndpointAddr::from(addr.id);
+            eprintln!("caos-iroh: CAOS_IROH_RELAY_ONLY: ignoring the ticket's addresses");
+        }
         let connection = endpoint
-            .connect(ticket.addr.clone(), ALPN)
+            .connect(addr, ALPN)
             .await
             .map_err(|e| format!("connecting to {}: {e}", ticket.addr.id.fmt_short()))?;
         let client = Self {

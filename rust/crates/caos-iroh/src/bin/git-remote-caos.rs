@@ -97,22 +97,35 @@ fn read_command() -> Result<String, String> {
 /// message here rather than as an unexplained hangup inside git's protocol.
 fn connect(ticket: &Ticket, service: &str) -> Result<(), String> {
     let service = Service::parse(service)?;
-    // NO WIRE VERSION IS ASKED FOR, and deliberately not read from
-    // `GIT_PROTOCOL`: git does not set that for a helper's `connect`, so anything
-    // there is the user's shell talking, not git. Measured — `git -c
-    // protocol.version=2 ls-remote` over this transport still reads a v0
-    // advertisement, because git offers v2 to a helper only over
-    // `stateless-connect` (its own docs: experimental, internal use only).
+    // WE VOLUNTEER v2 FOR FETCHES, because git will not ask for it here and
+    // cannot be made to: `GIT_PROTOCOL` is unset in a helper's environment for
+    // `connect` at every client version (measured), and git offers a helper v2
+    // only through `stateless-connect` — "experimental; for internal use only".
     //
-    // Asking for v2 anyway WOULD work, which is worth knowing before anyone
-    // writes `stateless-connect`: git discovers the version from the server's
-    // first pkt-line, so it copes with a server that volunteers v2 even when
-    // configured for v0 (measured: `-c protocol.version=0` with the listener
-    // told `version=2` negotiated v2 and succeeded). Not done here, because the
-    // version is the CLIENT's to choose — a person who set `protocol.version`
-    // means it — and the gain is small on this server, whose fetch
-    // advertisements `uploadpack.hideRefs` already trims.
-    let git_protocol: Option<&str> = None;
+    // It works anyway, because the version is discovered from the service's
+    // FIRST PKT-LINE rather than requested: tell the listener `version=2` and
+    // the client reads `version 2` and switches. Measured safe for a client that
+    // asked for something else — `protocol.version` 0, 1, 2 and unset all
+    // negotiated v2 and returned correct refs.
+    //
+    // THE REASON IS `push.negotiate`, not the advertisement. An earlier version
+    // of this comment declined to volunteer v2 on the grounds that the gain was
+    // small because `uploadpack.hideRefs` already trims what a fetch advertises.
+    // That weighed the wrong thing. `push.negotiate` runs a `fetch
+    // --negotiate-only`, which EXISTS ONLY IN v2, and it is the only way this
+    // client can discover that the server already holds a commit's history when
+    // no ref points at it — which is the normal state here, since request refs
+    // are pruned after ten minutes. Without it a push falls back to excluding
+    // what the advertisement names, finds nothing, and re-sends the whole
+    // closure: measured 318 objects against 3 for one commit on top of history
+    // the server already had.
+    //
+    // Fetch only. `receive-pack` has no v2 at all, so a push stays v0 and the
+    // negotiation that precedes it is what this unlocks.
+    let git_protocol = match service {
+        Service::GitUploadPack => Some("version=2"),
+        Service::GitReceivePack | Service::Http => None,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
