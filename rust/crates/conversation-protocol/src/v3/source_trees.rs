@@ -99,3 +99,10 @@ pub fn normalize_repository_identity(url: &str) -> Result<String, String> {
     }
     Ok(normalized)
 }
+
+/// HTTPS-only agent import surface; client imports retain their existing rules.
+pub fn validate_remote_import(source: &str, revision: Option<&str>) -> Result<(), String> {
+    git_locator::import::remote(source)?;
+    git_locator::import::revision(revision)?;
+    Ok(())
+}
