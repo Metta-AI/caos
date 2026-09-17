@@ -28,7 +28,7 @@ const MAX_ENTRIES: usize = 1_000;
 
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
-    matches!(name, "read" | "ls" | "write" | "edit")
+    matches!(name, "read" | "ls" | "write" | "edit" | "import_source")
 }
 
 /// Help text for the built-in tools, authored exactly like a caos-tools
@@ -85,6 +85,7 @@ pub fn declarations() -> Vec<Value> {
         ("ls", LS_HELP),
         ("write", WRITE_HELP),
         ("edit", EDIT_HELP),
+        ("import_source", crate::import_source::HELP),
     ]
     .iter()
     .map(|(name, help)| builtin_declaration(name, help))
@@ -107,6 +108,7 @@ pub fn grep_declaration() -> Value {
 /// history tools (`log`/`show`/`diff`, std entries the harness DEPends on)
 /// are standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
+    "import_source",
     "bash",
     "grep",
     "read",
@@ -1009,7 +1011,7 @@ mod tests {
     #[test]
     fn read_and_ls_are_inline_and_reserved() {
         // Routed in-process (no sub-run) and shadow-proof against a tree tool.
-        for t in ["read", "ls"] {
+        for t in ["read", "ls", "import_source"] {
             assert!(is_inline(t));
             assert!(RESERVED_TOOLS.contains(&t));
             assert!(declarations().iter().any(|d| d["name"] == t));

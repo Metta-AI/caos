@@ -1292,6 +1292,7 @@ fn render_tools(state: &ConversationState, frame: &mut Frame<'_>, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::raw("  read, ls, write, edit  — inline source tree operations"),
+        Line::raw("  import_source         — import an HTTPS Git snapshot"),
         Line::raw("  bash                  — commands in the source tree sandbox"),
         Line::raw("  grep                  — cached regular-expression search"),
         Line::raw(""),

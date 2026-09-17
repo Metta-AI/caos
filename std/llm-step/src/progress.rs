@@ -469,7 +469,17 @@ impl<S: RefStore> State<S> {
             Transition::AsyncStart { record } => {
                 view.async_task(&record.task)?.as_ref() == Some(record)
             }
-            Transition::ToolStart { record } | Transition::ToolComplete { record, .. } => {
+            Transition::ToolStart { record, payloads } => {
+                let directory =
+                    paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+                view.tool(&record.request, record.round, &record.id)?
+                    .as_ref()
+                    == Some(record)
+                    && payloads.iter().all(|(name, bytes)| {
+                        view.payload(&format!("{directory}/{name}")).as_ref() == Ok(bytes)
+                    })
+            }
+            Transition::ToolComplete { record, .. } => {
                 view.tool(&record.request, record.round, &record.id)?
                     .as_ref()
                     == Some(record)

@@ -87,6 +87,35 @@ pub fn git(source: &str, token: Option<&str>) -> Result<std::process::Command, S
     Ok(cmd)
 }
 
+pub fn revision(value: Option<&str>) -> Result<String, String> {
+    let Some(value) = value else {
+        return Ok("HEAD".into());
+    };
+    if commit(value) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    if value.is_empty()
+        || value == "@"
+        || value.starts_with('-')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .bytes()
+            .any(|b| b <= b' ' || b == 127 || b"~^:?*[\\".contains(&b))
+        || value
+            .split('/')
+            .any(|p| p.is_empty() || p.starts_with('.') || p.ends_with(".lock"))
+    {
+        return Err("invalid remote revision".into());
+    }
+    Ok(if value == "HEAD" || value.starts_with("refs/") {
+        value.into()
+    } else {
+        format!("refs/heads/{value}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
