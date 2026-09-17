@@ -1248,9 +1248,34 @@ impl GitTransport {
         // Progress is forced on because stderr is a pipe here, and git suppresses
         // it when not on a terminal -- without this the summary line is simply
         // absent and the measurement silently reports nothing.
+        // NEGOTIATE, BUT ONLY FOR A COMMIT. `push.negotiate` runs a `fetch
+        // --negotiate-only` first, so the server can say which of this history it
+        // already holds and the pack carries only the rest. That is the ONLY
+        // mechanism that works here, because the alternative — excluding what the
+        // server advertises — needs a ref pointing into the history, and request
+        // refs are pruned after ten minutes (`spawn_request_ref_pruner`). So a
+        // session that pushes a commit a day after the last one finds nothing to
+        // exclude and re-sends the whole closure: 318 objects against 3, measured.
+        //
+        // Decided by OBJECT TYPE rather than by which caller asked, because the
+        // expensive push is `ensure_code_commit`'s and it comes through
+        // `ensure_pushed` like any tree — scoping by call path would miss exactly
+        // the case this is for. A tree or blob has no history to find common
+        // ancestors in, so negotiating one buys nothing and costs a round trip.
+        //
+        // `protocol.version=2` is asked for explicitly: `--negotiate-only`
+        // requires v2, and while it is git's default since 2.26 a client that set
+        // it otherwise would silently get `warning: push negotiation failed;
+        // proceeding anyway` and the full closure back.
+        let negotiate = self.is_commit_object(hash);
+        let mut args: Vec<&str> = Vec::new();
+        if negotiate {
+            args.extend(["-c", "protocol.version=2", "-c", "push.negotiate=true"]);
+        }
+        args.extend(["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
+
         let started = std::time::Instant::now();
-        let outcome =
-            self.git_capture_stderr(&["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
+        let outcome = self.git_capture_stderr(&args);
         let elapsed = started.elapsed().as_secs_f64();
         match outcome {
             Ok(stderr) => {
@@ -1329,6 +1354,18 @@ impl GitTransport {
             },
         )
         .is_ok_and(|response| (200..300).contains(&response.status))
+    }
+
+    /// Is `hash` a COMMIT in the local object store?
+    ///
+    /// Read from the odb rather than shelled out, and false for anything it
+    /// cannot answer: the only caller uses it to decide whether to negotiate, so
+    /// an uncertain answer must mean "don't", which is today's behaviour.
+    fn is_commit_object(&self, hash: &str) -> bool {
+        parse_oid(hash)
+            .ok()
+            .and_then(|oid| self.repo.find_object(oid).ok())
+            .is_some_and(|object| object.kind == gix::object::Kind::Commit)
     }
 
     /// Can git walk everything reachable from `hash` in THIS repo?
