@@ -855,3 +855,10 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   remain visible to receive-pack negotiation; they still accumulate
   (content-addressed, so they dedup). A deployment that does not need indefinite
   result retention should define a policy and run `git gc`.
+
+### Remote Git imports
+
+Workers can call caos import-git <https-url> <commit> to import an exact commit
+and its complete history directly into the server's object store. It prints
+the commit hash. Use --github-token-file=PATH for private repositories.
+Resolve branch names before calling; retry with the same hash.
