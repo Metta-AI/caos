@@ -150,7 +150,7 @@ jobs:
       # thing this exists to avoid. "Release" here is a file host, not a
       # promise about a name -- the name is the commit.
       #
-      # No tag has to exist first: the action creates `tag_name` at this
+      # No tag has to exist first: publishing creates `tag_name` at this
       # commit, and `stage` has already computed it as `build-<commit>`.
       #
       # Branch builds are prereleases, so `latest` keeps meaning the newest
@@ -158,24 +158,138 @@ jobs:
       # resolves through `latest` any more -- install.sh asks for a build by
       # commit -- so this costs nothing and stops one branch's push from
       # silently becoming everyone's default.
-      # `target_commitish` IS NOT OPTIONAL, whatever the name suggests. The
-      # Releases API creates a missing tag at the DEFAULT BRANCH's head unless
-      # told otherwise, so without it `build-<commit>` named one commit and
-      # pointed at another -- every tag published before this landed on
-      # whatever main's head happened to be (build-897eebb571ff points at a
-      # main merge from four days earlier, and three other tags share one
-      # commit). Nothing read the target, so nothing broke; the moment anything
+      #
+      # `--target` IS NOT OPTIONAL, whatever the name suggests. The Releases
+      # API creates a missing tag at the DEFAULT BRANCH's head unless told
+      # otherwise, so without it `build-<commit>` named one commit and pointed
+      # at another -- every tag published before this landed on whatever
+      # main's head happened to be (build-897eebb571ff points at a main merge
+      # from four days earlier, and three other tags share one commit).
+      # Nothing read the target, so nothing broke; the moment anything
       # resolves a build tag to a commit, it gets the wrong tree. install.sh
       # checks the name against the target for exactly that reason.
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.stage.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          name: ${{ steps.stage.outputs.tag }}
-          prerelease: ${{ github.ref_type != 'tag' }}
-          files: |
-            dist/caos-x86_64-linux
-            dist/git-remote-caos-x86_64-linux
-            dist/claude-settings.json
-            dist/mcp.json
-            dist/install.sh
+      #
+      # THIS IS `gh`, NOT softprops/action-gh-release, AND THE ORDER OF THE
+      # FOUR STEPS BELOW IS THE POINT. The action created a prerelease
+      # PUBLISHED, then uploaded the five assets concurrently with one attempt
+      # each. On 2026-09-17 the upload endpoint answered a run of pushes with
+      # 5xx bodies ("Error creating asset temp dir", "Error saving asset", an
+      # HTML error page) and every push to main for an afternoon left a LIVE
+      # tag carrying one or two of the five assets. That is the worst state
+      # there is for install.sh: it resolves the build by tag, finds it, and
+      # dies on a 404 for the binary -- where NO tag would have made it fall
+      # back to the newest build before the commit and carry on.
+      #
+      # So: create the release as a DRAFT (no tag yet, invisible to
+      # install.sh), upload each asset with retries, PROVE all five are
+      # attached, and only then publish. A failure anywhere leaves a draft,
+      # which is nothing, and a re-run of the job finds that draft and
+      # finishes it. Uploads go one at a time: the concurrent burst was what
+      # met the failing endpoint, and 60 MB in series is seconds.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Nothing but the answer on stdout: `lookup` reads it as a value.
+          GH_NO_UPDATE_NOTIFIER: 1
+          TAG: ${{ steps.stage.outputs.tag }}
+          PRERELEASE: ${{ github.ref_type != 'tag' }}
+        run: |
+          set -euo pipefail
+          assets="caos-x86_64-linux git-remote-caos-x86_64-linux claude-settings.json mcp.json install.sh"
+
+          # Up to five attempts, 5s/10s/20s/40s apart: the failures this
+          # exists for lasted minutes, not milliseconds.
+          retry() { # <what> <command...>
+            local what=$1 attempt delay=5
+            shift
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" = 5 ]; then
+                echo "$what: giving up after $attempt attempts" >&2
+                return 1
+              fi
+              echo "$what: attempt $attempt failed, retrying in ${delay}s" >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
+
+          # ABSENT IS NOT BROKEN. `gh release view` exits non-zero for both a
+          # release that does not exist and an API that is down, and the
+          # first is the normal case on every fresh push -- retrying it five
+          # times would spend the whole budget learning nothing. Prints the
+          # draft state of an existing release, `absent` for none, and fails
+          # only on an error that is not "not found". Drafts count: gh looks
+          # them up too, which is what lets a re-run finish an earlier
+          # attempt's draft instead of stacking a second one beside it.
+          lookup() {
+            local out err
+            err="$(mktemp)"
+            if out="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>"$err")"; then
+              rm -f "$err"
+              printf '%s\n' "$out"
+              return 0
+            fi
+            if grep -q "release not found" "$err"; then
+              rm -f "$err"
+              echo absent
+              return 0
+            fi
+            cat "$err" >&2
+            rm -f "$err"
+            return 1
+          }
+
+          # A tag push names an existing tag, and the API ignores --target
+          # for one; a branch push's tag does not exist yet and is created at
+          # --target when the draft is published, which is what install.sh's
+          # name-against-target check relies on.
+          ensure_release() {
+            local state
+            state="$(lookup)" || return 1
+            case "$state" in
+              absent)
+                gh release create "$TAG" --draft --prerelease="$PRERELEASE" \
+                  --target "$GITHUB_SHA" --title "$TAG" \
+                  --notes "Built from $GITHUB_SHA by the release workflow."
+                ;;
+              *) echo "release $TAG exists (draft: $state); uploading into it" ;;
+            esac
+          }
+          retry "ensure release $TAG" ensure_release
+
+          # --clobber replaces an asset an earlier attempt did upload, so a
+          # re-run over a partial release converges instead of failing on
+          # `already_exists`.
+          for a in $assets; do
+            retry "upload $a" gh release upload "$TAG" "dist/$a" --clobber
+          done
+
+          # PROVE the release carries every asset before it becomes visible.
+          # A "successful" upload whose asset is not on the release is exactly
+          # the kind of thing the endpoint did that day, and this is the only
+          # place it can be caught before a cloud VM finds it.
+          all_present() {
+            local have a missing=""
+            have="$(gh release view "$TAG" --json assets --jq '.assets[].name')" || return 1
+            for a in $assets; do
+              if ! grep -qxF "$a" <<< "$have"; then missing="$missing $a"; fi
+            done
+            if [ -n "$missing" ]; then
+              echo "release $TAG is missing:$missing" >&2
+              return 1
+            fi
+          }
+          retry "check the assets of $TAG" all_present
+
+          # Publishing is what creates the tag. `--draft=false` on a release
+          # that is already published (a re-run) changes nothing.
+          retry "publish $TAG" gh release edit "$TAG" --draft=false
+          published() {
+            local state
+            state="$(lookup)" || return 1
+            [ "$state" = false ] || { echo "release $TAG is still $state" >&2; return 1; }
+          }
+          retry "confirm $TAG is published" published
+          echo "release ready at https://github.com/$GH_REPO/releases/tag/$TAG"
