@@ -1378,6 +1378,24 @@ sandbox = false''
       in
       {
         packages = {
+          # `nix run github:Metta-AI/caos#deploy-caosd-prod` on a fresh box.
+          # Go rather than shell: this program's job is quoting a nix
+          # expression and branching on host facts, which is precisely where
+          # `set -euo pipefail` scripts go wrong (CLAUDE.md lists the three
+          # constructs). It reuses caos/w for the error policy via a relative
+          # `replace`, so src is the repo root with modRoot below it.
+          deploy-caosd-prod = pkgs.buildGoModule {
+            pname = "deploy-caosd-prod";
+            version = "0.1.0";
+            src = ./.;
+            modRoot = "prod/caosd/deploy";
+            # The module is `caos-deploy`, so go names the binary that; the
+            # flake attribute is the role it deploys. mainProgram is what makes
+            # `nix run ...#deploy-caosd-prod` find it.
+            meta.mainProgram = "caos-deploy";
+            vendorHash = "sha256-1+bSEs1daOIaXWddfmkEOsxcyn/zBzB/0T29YGw+RCw=";
+          };
+
           # `nix build` (no attr) yields the PINNED host tools: caos-cli,
           # caos, caosd, and (on Linux) caos-runnerd in one result/bin. This is the
           # explicit build step — its `caosd` bakes the exact server/runnerd/
@@ -1469,5 +1487,29 @@ sandbox = false''
           ];
         };
       }
-    );
+    )
+    # nixosConfigurations is NOT per-system, so it cannot live inside
+    # eachDefaultSystem above -- it is merged alongside it. These are machine
+    # ROLES, named <daemon>-<environment>: a fresh box becomes one with
+    #
+    #   sudo nixos-rebuild switch --flake github:Metta-AI/caos#caosd-prod
+    #
+    # Each host takes its binaries from THIS flake's outputs, so the running
+    # stack and the checkout are the same revision by construction, pinned by
+    # flake.lock -- no separate `nix build`, no second lockfile to drift.
+    // {
+      nixosConfigurations.caosd-prod = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          "${nixpkgs}/nixos/modules/virtualisation/amazon-image.nix"
+          ./prod/caosd/configuration.nix
+          {
+            networking.hostName = "caosd-prod";
+            caos.package = self.packages.x86_64-linux.caos-tools;
+            # caos.advertiseAddress is deliberately NOT set here: it differs
+            # per machine, so deploy.sh reads it off the host and layers it on.
+          }
+        ];
+      };
+    };
 }
