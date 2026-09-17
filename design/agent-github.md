@@ -32,8 +32,8 @@ Provenance records the repository, requested revision, commit, observation
 time, and default branch when known. For `origin/main`, choose the repository
 from the selected source's provenance and import `main` at a fresh path.
 
-The [server endpoint](git-import.md) fetches H and its full history directly
-into the existing bare Git repository. It uses verified complete imports as
+The [server endpoint](git-import.md) fetches H and its full history into private
+staging, verifies them, and publishes the complete pack into the server store. It uses verified complete imports as
 negotiation tips; standalone trees and blobs may still be downloaded again.
 A completion marker for the same URL and H skips fetch and verification.
 The endpoint handles object availability; callers handle ref resolution and
