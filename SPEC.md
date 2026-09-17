@@ -500,6 +500,9 @@ The endpoint does not edit conversations or create import refs. Automatic GC
 remains disabled; future GC must retain imported commits because gitlinks
 and completion markers do not root them.
 
+See [Git import endpoint](design/git-import.md) for the request flow and
+limits of commit-based fetch negotiation.
+
 ## `merge --theirs=<commit>`
 
 - Takes exactly one commit arg (`theirs`). The other side (`ours`) is the
