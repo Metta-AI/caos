@@ -82,8 +82,9 @@ pub(crate) fn post_object(config: &Config, body: &[u8]) -> Result<Vec<u8>, HttpE
 }
 
 /// Validate only posted commit objects with Git, before publishing their bytes.
-/// A gitlink's mode is a reference, not an object type: Git deliberately does
-/// not traverse those entries. The candidate commit itself must be the root.
+/// Only the candidate goes into the pack. Git checks its links by type against
+/// the live store without traversing existing history. Startup and checked
+/// ingestion certify that stored objects already have their full closure.
 fn validate_commit_with_git(config: &Config, content: &[u8]) -> Result<(), HttpError> {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,34 +131,43 @@ fn validate_commit_with_git(config: &Config, content: &[u8]) -> Result<(), HttpE
     )?;
     let id = gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
         .map_err(|error| HttpError::new(500, format!("staging commit: {error}")))?;
-    // Walk the complete closure: index-pack --strict trusts objects already
-    // present, whereas an old tree could itself reference a missing blob.
-    let mut command = std::process::Command::new("git");
-    command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
-    let output = command
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_GRAFT_FILE", "/dev/null")
-        .args(["-c", "core.commitGraph=false", "--git-dir"])
-        .arg(&staged.0)
-        .args([
-            "rev-list",
-            "--objects",
-            "--quiet",
-            "--missing=error",
-            &id.to_string(),
-            "--",
-        ])
+    let git = || {
+        let mut command = std::process::Command::new("git");
+        command.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .args(["-c", "core.commitGraph=false", "--git-dir"])
+            .arg(&staged.0);
+        command
+    };
+    // Without --revs, pack-objects packs exactly the supplied OID, not its
+    // ancestry. Keep both the pack and its index private until validation ends.
+    let roots = staged.0.join("roots");
+    std::fs::write(&roots, format!("{id}\n"))?;
+    let pack = staged.0.join("commit.pack");
+    let packed = git()
+        .args(["pack-objects", "--stdout", "--threads=1"])
+        .stdin(std::fs::File::open(&roots)?)
+        .stdout(std::fs::File::create(&pack)?)
         .output()?;
-    if !output.status.success() {
+    if !packed.status.success() {
+        return Err(HttpError::new(500, "could not pack staged commit"));
+    }
+    let checked = git()
+        .args(["index-pack", "--strict", "--threads=1"])
+        .arg(&pack)
+        .output()?;
+    if !checked.status.success() {
         return Err(HttpError::new(
             400,
-            "incomplete commit history; upload its tree and parents first",
+            "invalid or incomplete commit history; upload its tree and parents first",
         ));
     }
     Ok(())

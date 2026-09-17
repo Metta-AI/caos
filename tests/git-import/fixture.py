@@ -59,7 +59,7 @@ def main():
         git_bin.mkdir()
         git_shim = git_bin / "git"
         git_shim.write_text("#!/bin/sh\nfor arg do\n"
-            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index)\n'
+            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index|pack-objects|index-pack)\n'
             "printf '%s\\n' \"$arg\" >> " + shlex.quote(str(git_commands)) + "; break;;\n"
             "esac\ndone\nexec " + shlex.quote(shutil.which("git")) + ' "$@"\n')
         git_shim.chmod(0o755)
@@ -239,7 +239,10 @@ def main():
             except urllib.error.HTTPError as error:
                 assert error.code == 404
             run("git", "--git-dir", str(odb), "config", "fetch.unpackLimit", "1")
+            commands = git_commands.read_text()
             assert call(payload(second[0])) == {"commit": second[0]}
+            checks = git_commands.read_text()[len(commands):].splitlines()
+            assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(second[0])
             assert list((odb / "objects/pack").glob("*.pack"))
             before = len(observations)
@@ -248,7 +251,10 @@ def main():
             assert len(observations) == before, "completed import contacted remote"
             assert git_commands.read_text() == commands, "completed history was verified again"
             third = advance(second[0])
+            commands = git_commands.read_text()
             assert call(payload(third[0]))["commit"] == third[0]
+            checks = git_commands.read_text()[len(commands):].splitlines()
+            assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(third[0])
             fetches = [body for _, body, _, _ in observations[before:] if b"want " in body]
             assert any(second[0].encode() in body for body in fetches), "missing negotiation tip"
@@ -301,12 +307,24 @@ def main():
             post_from_origin("tree", extra_parent[1])
             post_from_origin("commit", extra_parent[0])
             post_object("commit", merge)
-            # Git must also walk through existing objects: checking just the
-            # new commit's direct links misses an old tree with an absent blob.
-            broken_tree = b"100644 missing\0" + bytes.fromhex("3" * 40)
-            broken_tree_oid = run("git", "--git-dir", str(odb), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
-            post_object("commit", child_bytes.replace(posted_child[1].encode(), broken_tree_oid.encode()), expected=400)
-            (odb / "objects" / broken_tree_oid[:2] / broken_tree_oid[2:]).unlink()
+            # Prove validation stops at stored commits AND stored trees. Hide
+            # objects beyond that boundary only during this isolated test, then
+            # restore them: production relies on startup validation and no GC.
+            # A recursive history/tree walk would fail while they are absent.
+            grandchild = child_bytes.replace(posted_parent[0].encode(), posted_child[0].encode()).replace(b"fixture", b"boundary probe")
+            hidden = [odb / "objects" / oid[:2] / oid[2:]
+                for oid in [posted_parent[0], posted_child[2]]]
+            saved = [path.read_bytes() for path in hidden]
+            commands = git_commands.read_text()
+            try:
+                for path in hidden:
+                    path.unlink()
+                post_object("commit", grandchild)
+            finally:
+                for path, data in zip(hidden, saved):
+                    path.write_bytes(data)
+            checks = git_commands.read_text()[len(commands):].splitlines()
+            assert checks == ["pack-objects", "index-pack"], checks
             assert not list((odb / "caos-commit-checks").iterdir())
             # Gitlinks are separate histories: an absent target is allowed and
             # neither ordinary Git nor the object API uploads its commit.
@@ -361,7 +379,7 @@ def main():
                     input=("\n".join(object_ids + [malformed_oid]) + "\n").encode()))
             commands_before = git_commands.read_text()
             call(payload(surplus_good[0], f"https://localhost:{remote_port}/surplus.git"), expected=502)
-            assert "show-index" in git_commands.read_text()[len(commands_before):], "surplus fixture did not reach staged pack verification"
+            assert "index-pack" in git_commands.read_text()[len(commands_before):], "surplus fixture did not reach staged pack verification"
             object_request(surplus_good[0], expected=404)
             object_request(malformed_oid, expected=404)
 
@@ -445,8 +463,18 @@ def main():
             stop(server); server = None
             server = start()
             visible(posted_child[0])
-            # Upgrades cannot silently trust orphan objects from older servers.
+            # Trusting existing OIDs requires auditing old stores at startup,
+            # including orphan trees whose ordinary children are missing.
             stop(server); server = None
+            broken_tree = b"100644 missing\0" + bytes.fromhex("3" * 40)
+            broken_tree_oid = run("git", "--git-dir", str(odb), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
+            refused = subprocess.run([binary], env=dict(os.environ,
+                SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb)), capture_output=True, timeout=30)
+            assert refused.returncode != 0, "server trusted legacy incomplete tree"
+            assert b"restore the missing objects" in refused.stderr, refused.stderr
+            assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken_tree_oid) == "tree"
+            (odb / "objects" / broken_tree_oid[:2] / broken_tree_oid[2:]).unlink()
+            # Upgrades cannot silently trust orphan commits either.
             legacy_parent_bytes = child_bytes.replace(b"parent " + posted_parent[0].encode() + b"\n", b"").replace(b"fixture", b"legacy parent")
             legacy_parent = run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=legacy_parent_bytes)
             broken_bytes = child_bytes.replace(posted_parent[0].encode(), legacy_parent.encode()).replace(b"fixture", b"legacy child")
@@ -459,7 +487,7 @@ def main():
             assert refused.returncode != 0, "server accepted legacy incomplete history"
             assert b"restore the missing objects" in refused.stderr, refused.stderr
             assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken) == "commit"
-            print("git-import: complete history, upload ordering, quarantined imports/pushes, commit rejection, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
+            print("git-import: complete history, upload ordering, quarantined imports/pushes, commit rejection, bounded validation, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
         finally:
             stop(server)
             remote.shutdown(); remote.server_close(); thread.join()
