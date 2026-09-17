@@ -188,6 +188,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         store,
         &mut head,
         Transition::ToolStart {
+            payloads: Vec::new(),
             record: started_bash.clone(),
         },
         &signature,
