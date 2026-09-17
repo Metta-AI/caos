@@ -3853,6 +3853,7 @@ version = "0.1.0"
 dependencies = [
  "caos-eval",
  "caos-world",
+ "git-locator",
  "gix",
  "minreq",
  "serde",
