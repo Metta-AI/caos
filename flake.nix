@@ -1495,7 +1495,10 @@ sandbox = false''
     # eachDefaultSystem above -- it is merged alongside it. These are machine
     # ROLES, named <daemon>-<environment>: a fresh box becomes one with
     #
-    #   sudo nixos-rebuild switch --flake github:Metta-AI/caos#caosd-prod
+    #   nix run github:Metta-AI/caos#deploy-caosd-prod
+    #
+    # and NOT with a bare `nixos-rebuild switch --flake ...#caosd-prod`, which
+    # fails on the per-machine caos.advertiseAddress the driver supplies.
     #
     # Each host takes its binaries from THIS flake's outputs, so the running
     # stack and the checkout are the same revision by construction, pinned by
