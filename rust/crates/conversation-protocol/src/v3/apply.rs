@@ -56,6 +56,7 @@ pub enum Transition {
     },
     ToolStart {
         record: CallRecord,
+        payloads: Vec<(String, Vec<u8>)>,
     },
     ToolComplete {
         record: CallRecord,
@@ -372,12 +373,12 @@ pub fn apply(
             put_request(&mut events, &record);
             ordinal = Some(next);
         }
-        Transition::ToolStart { record } => {
+        Transition::ToolStart { record, payloads } => {
             let conversation = parent(store, parent_head)?;
             canonical_shape(record, "tool")?;
             let request = require_request_running_or_cancelling(&conversation, &record.request)?;
-            if record.status != CallStatus::Started || record.task.is_none() {
-                return Err("tool.start requires started status and task".to_string());
+            if record.status != CallStatus::Started {
+                return Err("tool.start requires started status".to_string());
             }
             if conversation
                 .tool(&record.request, record.round, &record.id)?
@@ -387,6 +388,8 @@ pub fn apply(
             }
             validate_current_call(&request, record)?;
             validate_tool_source_tree(&conversation, record)?;
+            validate_new_tool_payloads(&conversation, record, payloads)?;
+            put_tool_payloads(&mut events, record, payloads)?;
             put_tool(&mut events, record);
         }
         Transition::ToolComplete {

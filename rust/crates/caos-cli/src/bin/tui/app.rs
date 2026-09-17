@@ -936,7 +936,8 @@ const COMMANDS: [Command; 13] = [
     Command {
         name: "/import",
         usage: "/import <path> <source> [revision]",
-        description: "import a Git checkout or revision at a conversation path",
+        description:
+            "import local Git code (clean HEAD by default); ask the agent for HTTPS imports",
         action: AppAction::Import,
         takes_argument: true,
     },
@@ -4599,21 +4600,29 @@ mod tests {
         }
     }
 
-    fn wait_for_pending_submission(app: &mut App, id: u64) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while app
-            .selected()
-            .pending_submissions
-            .iter()
-            .any(|pending| pending.id == id)
-        {
-            app.drain_messages();
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for pending submission {id}"
+    fn wait_for_interjection_refresh(app: &mut App) {
+        // SubmissionCommitted is an intermediate acknowledgement. The same
+        // thread still fetches into the repo before sending its final refresh;
+        // deleting the fixture after that acknowledgement races those writes.
+        let mut messages = Vec::new();
+        loop {
+            let message = app
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("timed out waiting for interjection refresh");
+            let finished = matches!(
+                message,
+                UiMessage::InterjectionRefreshed { .. } | UiMessage::InterjectionFailed { .. }
             );
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            messages.push(message);
+            if finished {
+                break;
+            }
         }
+        for message in messages {
+            app.tx.send(message).unwrap();
+        }
+        app.drain_messages();
     }
 
     fn rendered_main_pane(terminal: &Terminal<TestBackend>) -> Vec<String> {
@@ -6941,7 +6950,7 @@ mod tests {
         assert!(app.selected().local_turn);
         assert!(app.selected().command_error.is_none());
 
-        wait_for_pending_submission(&mut app, 0);
+        wait_for_interjection_refresh(&mut app);
         assert_eq!(app.selected().status, "running a tool");
         assert_eq!(app.selected().turn_phase, TurnPhase::Model);
         assert!(app.selected().activities.is_empty());

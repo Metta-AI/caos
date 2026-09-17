@@ -386,7 +386,9 @@ the object machinery through a one-way dependency. Their difference is the
   - `import-image` — get a docker image into caos, printing its hash;
   - `tui` — interactive conversations, with a bundled harness independent of
     target repositories. It starts without code; `caos tui --import imports/repo/base`
-    imports the checkout at that path. Ctrl+O browses code entries; the agent
+    imports the launching checkout's clean HEAD at that conversation path.
+    Add a source and revision to select another repository or commit; Git URLs
+    require a full commit hash. Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
     remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
     one PR, and `/checkout <gitlink> [directory]` exports code for local editing;
@@ -853,3 +855,15 @@ To get the whole tree on disk instead, `caos-cli get <hash> <path>`.
   remain visible to receive-pack negotiation; they still accumulate
   (content-addressed, so they dedup). A deployment that does not need indefinite
   result retention should define a policy and run `git gc`.
+
+### Remote Git imports
+
+Workers can call `caos import-git <https-url> <commit>` to import an exact commit
+and its complete history directly into the server's object store. It prints
+the commit hash. Use --github-token-file=PATH for private repositories.
+Resolve branch names before calling; retry with the same hash.
+
+The agent's import_source tool also accepts branch names and defaults to the
+remote's default branch. It saves the resolved hash in conversation progress
+before invoking import-git, then attaches the snapshot and provenance at the
+requested unused path. Use /import for local checkouts.

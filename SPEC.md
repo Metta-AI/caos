@@ -370,7 +370,7 @@ with no `@param` tags takes no parameters: the source tree IS its input.
 - Tools are discovered fresh from the CURRENT source tree on every LLM round and
   resolved again at INVOCATION time, so an agent that edits a tool sees the
   change on its next call, within the same turn
-- `bash`, `grep`, `read`, `ls`, `write` and `edit` are reserved. A
+- `bash`, `grep`, `read`, `ls`, `write`, `edit`, and `import_source` are reserved. A
   `caos-tools/bash/` is ignored, not registered — the model's primitives,
   including the repair path for a broken tool edit, stay stable whatever the
   tree carries
@@ -462,6 +462,46 @@ ancestry redundant. Read-only proposals leave the source tree unchanged.
 Publication preserves the selected source tree's code history. Conversation
 records (prompts, tool calls, and results) stay on the conversation branch;
 publishing them is deferred.
+
+The worker command `caos import-git <https-url> <commit>` posts that exact
+commit to /git/import and prints its hash. It optionally reads a token file
+specified by --github-token-file=PATH and forwards it in a sensitive header.
+Ref resolution, provenance, and conversation attachment belong to callers.
+
+The inline `import_source(source, revision?, into)` tool resolves a remote
+revision in the agent container. Before importing objects it records the
+commit and provenance as an import.json payload in tool.start. Inline starts
+may omit a compute task; ordinary dispatched starts still name their task.
+A resumed call uses the saved hash, and concurrent attempts accept the first
+persisted observation. A new tool call observes the remote again.
+
+After import, the tool atomically adds the gitlink, sibling .source.json
+provenance and completed tool result. It rejects occupied destinations.
+The tool is available in an empty conversation. Local paths use /import.
+Only github.com on the default HTTPS port receives the mounted GitHub token
+automatically.
+
+## Remote Git imports
+
+POST /git/import accepts only source (an HTTPS repository URL) and commit
+(a full commit hash), with an optional X-Caos-Git-Token header. It imports that
+exact commit, trees, blobs, and complete ancestor history directly into the
+server's bare object store and returns {"commit": H}. Branch names, local
+paths, and shallow imports are rejected. Callers resolve refs and persist
+their chosen commit before invoking the endpoint.
+
+Completed imports supply negotiation tips. A completion marker for the
+repository and commit avoids fetching or checking history again. This is an
+object-availability operation: a cache hit does not recheck remote access,
+just as reading an available hash through the object API does not.
+Token values never enter Git objects or completion markers.
+
+The endpoint does not edit conversations or create import refs. Automatic GC
+remains disabled; future GC must retain imported commits because gitlinks
+and completion markers do not root them.
+
+See [Git import endpoint](design/git-import.md) for the request flow and
+limits of commit-based fetch negotiation.
 
 ## `merge --theirs=<commit>`
 

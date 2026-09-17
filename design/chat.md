@@ -2,8 +2,8 @@
 
 A conversation has one filesystem. It holds messages and protocol metadata under
 `.caos/`, ordinary files such as notes and memories, and references to code.
-The agent works in this filesystem; the TUI handles importing from the user's
-machine, exporting local checkouts, and publishing to a remote repository.
+The agent imports HTTPS repositories into this filesystem. The TUI imports
+local checkouts, exports code for local editing, and publishes to remotes.
 
 | Name | Meaning |
 | --- | --- |
@@ -113,8 +113,13 @@ result/bin/caos tui \
 
 The worker paths resolve in the client harness, independently of target code.
 A fresh conversation can start empty and import code afterward. The optional
-`--import <conversation-path>` flag imports the launching checkout; adding
-`--base <revision>` imports that revision instead of disk changes.
+`--import <conversation-path> [<source> [<revision>]]` flag starts a new conversation using the same
+commit-only rules as `/import`. Omitting the source imports the launching
+checkout; `--base <revision>` selects a revision for that shorthand.
+For example, `--import imports/repo/base /path/to/repo main` imports a local
+branch, and `--import imports/repo/base https://github.com/owner/repo.git <full-commit-hash>`
+imports a pinned remote commit. An explicit source also works when launching
+outside a Git checkout.
 
 Credentials, server configuration, caches, and checkout destinations stay on the
 client machine. The agent's host-side requests are communicated as concrete TUI
@@ -129,6 +134,27 @@ retain their cursor and pasted content while browsing. History comes from the
 saved conversation, so it remains available after reopening the TUI. Messages
 from other participants, the agent, and CAOS are excluded.
 
+## Agent remote imports
+
+Ask the agent to import an HTTPS repository. `import_source` accepts its URL,
+an optional branch/ref or full commit hash, and an unused destination. It is
+available in an empty conversation. An omitted revision selects the remote's
+default branch. The result is an unchanged gitlink plus `.source.json` with
+repository, requested revision, commit, observation time and default branch
+when known. Reading or merging that snapshot needs no new remote fetch.
+
+The inline handler resolves the remote revision and saves its hash and
+provenance in the conversation's tool.start payload before transfer.
+It then calls caos import-git with that exact hash. POST /git/import accepts
+only the repository URL and commit; it fetches directly into the server's
+bare object store. Retries reuse the conversation's saved hash. The server's
+completion markers certify full history and allow object reuse.
+
+The handler atomically records its result and attaches the gitlink/provenance
+only if both paths remain free. Replays do not add another result. Imports do
+not merge into existing code. Local paths still use `/import` below.
+See [agent-github.md](agent-github.md#importing) for credential and retry details.
+
 ## Importing code with `/import`
 
 The user enters this in the TUI:
@@ -139,12 +165,13 @@ The user enters this in the TUI:
 
 The client then:
 
-1. Reads the Git checkout's disk contents into a Git tree. This includes tracked
-   edits and untracked files allowed by Git's ignore rules, preserves executable
-   bits and symlinks, and excludes `.git`.
-2. Reuses HEAD's exact commit if the tree is unchanged. Otherwise, creates a
-   synthetic commit with the snapshot tree and HEAD as its parent. Call the
-   resulting commit `ST_0`.
+1. Resolves the supplied local revision (a commit hash or ref) to a commit.
+   Without a revision, uses the checkout's current `HEAD` and rejects staged
+   edits, unstaged edits, untracked files, and dirty submodules. Ignored files
+   do not make the checkout dirty.
+2. Uses that exact existing commit as `ST_0`. Imports never snapshot disk
+   changes or create synthetic code commits. An explicit revision can be
+   imported from a dirty checkout; its uncommitted changes are excluded.
 3. Imports the required Git objects and history into CAOS. The source checkout's
    files, index, and branches stay unchanged.
 4. Creates a `C` adding a gitlink at `imports/repo/base` pointing to `ST_0`.
@@ -155,15 +182,16 @@ The client then:
    `CAOS`.
 
 The activity box shows `Importing…` while this runs. After it finishes, the user
-sends a message to continue the agent. Asking the agent to import in prose does
-not execute the TUI command; it should respond with the exact command to enter.
+sends a message to continue the agent. For local paths, asking the agent in prose does not execute the TUI command;
+it responds with the exact command to enter. HTTPS imports use its inline tool.
 
-To import a particular commit instead of local disk changes, supply a revision.
-A repository URL imports the requested revision, or its default branch:
+To select a local commit explicitly, supply a hash or ref. A Git URI requires a
+full commit hash; branch names, short hashes, and an omitted revision are
+rejected. Pinned locators such as `git+https://…?rev=<full-commit-hash>` also work:
 
 ```text
 /import imports/repo/base /absolute/path/to/repo main
-/import imports/repo/base https://github.com/owner/repo.git main
+/import imports/repo/base https://github.com/owner/repo.git <full-commit-hash>
 ```
 
 Local imports require a Git checkout root with an existing HEAD; linked worktrees

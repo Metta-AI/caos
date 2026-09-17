@@ -32,9 +32,10 @@
             pkgs.bash
             pkgs.coreutils
             pkgs.gitMinimal
+            pkgs.cacert
           ];
           config = {
-            Env = [ "PATH=/bin" ];
+            Env = [ "PATH=/bin" "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
           };
         };
     in

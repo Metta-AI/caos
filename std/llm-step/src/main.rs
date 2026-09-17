@@ -2,6 +2,7 @@
 
 mod async_work;
 mod githist;
+mod import_source;
 mod progress;
 mod source_trees;
 mod subagents;
@@ -1053,6 +1054,10 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "import_source" {
+                import_source::execute(state, &site)?;
+                return Ok(true);
+            }
             if existing.name == subagents::WAIT_TOOL {
                 dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
             } else {
@@ -1071,6 +1076,10 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
+        return Ok(true);
+    }
+    if call.name == "import_source" {
+        import_source::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == async_work::TOOL_NAME {
@@ -1152,6 +1161,7 @@ fn drive_call(
             match state.try_append_at(
                 &expected,
                 Transition::ToolStart {
+                    payloads: Vec::new(),
                     record: record.clone(),
                 },
             )? {
@@ -1586,6 +1596,7 @@ fn launch_evaluated_tool(
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
+            payloads: Vec::new(),
             record: started.clone(),
         },
     )? {
@@ -2340,6 +2351,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
+            payloads: Vec::new(),
             record: started.clone(),
         },
     )? {
@@ -3618,6 +3630,10 @@ mod tests {
     }
 
     fn golden_two_calls() -> Result<Golden, String> {
+        golden_with_first("read", json!({"file-path":"files/a"}))
+    }
+
+    fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
         let mut store = MemoryStore::new();
         let root = root_with(&mut store, BTreeMap::new())?;
         let user = append_memory(
@@ -3674,7 +3690,7 @@ mod tests {
         );
         let response = vec![
             json!({"type":"text", "text":"I will inspect it."}),
-            json!({"type":"tool_use", "id":"first", "name":"read", "input":{"file-path":"files/a"}}),
+            json!({"type":"tool_use", "id":"first", "name":first_name, "input":first_input}),
             json!({"type":"tool_use", "id":"second", "name":"ls", "input":{"path":"files"}}),
         ];
         let head = append_memory(
@@ -3696,7 +3712,7 @@ mod tests {
                         },
                         Block::ToolUse {
                             id: "first".to_string(),
-                            name: "read".to_string(),
+                            name: first_name.to_string(),
                             arguments: first_args,
                         },
                         Block::ToolUse {
@@ -3715,7 +3731,7 @@ mod tests {
                     ),
                     (
                         "args-first.json".to_string(),
-                        canonical_bytes(&json!({"file-path":"files/a"}))?,
+                        canonical_bytes(&first_input)?,
                     ),
                     (
                         "args-second.json".to_string(),
@@ -3725,7 +3741,7 @@ mod tests {
                 calls: vec![
                     DeclaredCall {
                         id: "first".to_string(),
-                        name: "read".to_string(),
+                        name: first_name.to_string(),
                     },
                     DeclaredCall {
                         id: "second".to_string(),
@@ -4193,5 +4209,166 @@ mod tests {
         assert_eq!(lookup_theirs(Some(&refs), Some("origin/main")).unwrap(), b);
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
+    }
+    struct ImportStore {
+        objects: MemoryStore,
+        head: Oid,
+        race: Option<Transition>,
+        lost_ack: bool,
+    }
+    conversation_protocol::delegate_object_store!(ImportStore, objects);
+    impl progress::RefStore for ImportStore {
+        fn fetch_ref_value(&mut self, _: &str) -> Result<Option<Oid>, String> {
+            Ok(Some(self.head.clone()))
+        }
+        fn push_ref_value(
+            &mut self,
+            _: &str,
+            expected: Option<&Oid>,
+            new: Option<&Oid>,
+        ) -> Result<(), String> {
+            if let Some(race) = self.race.take() {
+                self.head = append_memory(&mut self.objects, &self.head, race)?;
+                return Err("concurrent writer".into());
+            }
+            if expected != Some(&self.head) {
+                return Err("stale head".into());
+            }
+            self.head = new.unwrap().clone();
+            if self.lost_ack {
+                self.lost_ack = false;
+                return Err("lost acknowledgement".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn import_pin_survives_lost_ack_restart_and_a_competing_observation() {
+        for competing in [false, true] {
+            let args = json!({"source":"https://example.com/repo.git","revision":"main","into":"imports/base"});
+            let golden = golden_with_first("import_source", args.clone()).unwrap();
+            let call = Call {
+                id: "first".into(),
+                name: "import_source".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let first = json!({"commit":"a".repeat(40)});
+            let second = json!({"commit":"b".repeat(40)});
+            let mut record = site.stub(None);
+            record.status = CallStatus::Started;
+            let race = competing.then(|| Transition::ToolStart {
+                record,
+                payloads: vec![(
+                    "import.json".into(),
+                    canonical_payload_bytes(&second).unwrap(),
+                )],
+            });
+            let store = ImportStore {
+                objects: golden.store,
+                head: golden.head.clone(),
+                race,
+                lost_ack: true,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/conversation/head".into(),
+                golden.head,
+            )
+            .unwrap();
+            let expected = if competing { &second } else { &first };
+            assert_eq!(
+                import_source::pin(&mut state, &site, &first)
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+            let head = state.head().clone();
+            // Reloading from the persisted head must preserve the first winning observation.
+            state.reload().unwrap();
+            assert_eq!(
+                import_source::pin(&mut state, &site, &json!({"commit":"c".repeat(40)}))
+                    .unwrap()
+                    .as_ref(),
+                Some(expected)
+            );
+            assert_eq!(*state.head(), head);
+            assert!(state
+                .conversation()
+                .unwrap()
+                .source_trees()
+                .unwrap()
+                .is_empty());
+            let imported = Oid::parse(expected["commit"].as_str().unwrap(), "import").unwrap();
+            import_source::attach(&mut state, &site, "imports/base", &imported, expected).unwrap();
+            assert!(import_source::pin(&mut state, &site, &first)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn import_attachment_is_atomic_replayable_and_does_not_overwrite() {
+        for race_path in [
+            None,
+            Some("imports/base"),
+            Some("imports/base.source.json"),
+            Some("imports"),
+        ] {
+            let args = json!({"source":"https://example.com/repo.git","into":"imports/base"});
+            let golden = golden_with_first("import_source", args.clone()).unwrap();
+            let imported = Oid::parse(&"b".repeat(40), "import").unwrap();
+            let race = race_path.map(|path| Transition::FilesApply {
+                files: vec![(path.to_string(), Some((Mode::Blob, b"keep".to_vec())))],
+            });
+            let store = ImportStore {
+                objects: golden.store,
+                head: golden.head.clone(),
+                race,
+                lost_ack: true,
+            };
+            let mut state = progress::State::from_store(
+                store,
+                "refs/conversations/conversation/head".into(),
+                golden.head,
+            )
+            .unwrap();
+            assert!(state
+                .conversation()
+                .unwrap()
+                .source_trees()
+                .unwrap()
+                .is_empty());
+            let call = Call {
+                id: "first".into(),
+                name: "import_source".into(),
+                input: args,
+            };
+            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let provenance = json!({"repository":"https://example.com/repo.git","commit":imported});
+            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
+                .unwrap();
+            let head = state.head().clone();
+            import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
+                .unwrap();
+            assert_eq!(*state.head(), head, "replay added another transition");
+            let view = state.conversation().unwrap();
+            let record = view.tool(&golden.request, 0, "first").unwrap().unwrap();
+            let block: Value =
+                serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
+            if let Some(path) = race_path {
+                assert_eq!(view.snapshot().read(path).unwrap().unwrap(), b"keep");
+                assert_eq!(block["is_error"], true);
+                assert!(record.files.is_empty());
+            } else {
+                assert_eq!(
+                    view.source_tree("imports/base").unwrap().unwrap().commit,
+                    imported
+                );
+                assert!(view.snapshot().exists("imports/base.source.json").unwrap());
+                assert_eq!(record.files.len(), 2);
+            }
+        }
     }
 }
