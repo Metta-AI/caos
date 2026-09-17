@@ -664,9 +664,17 @@ impl GitTransport {
     /// dies `unable to migrate objects to permanent storage` — reproduced with
     /// two concurrent pushes of one 120 MB commit, where the loser transferred
     /// the entire pack before being rejected. `push_closure`'s retry then makes
-    /// it correct, which is why this was invisible: the only symptom is the time.
-    /// Measured in a cloud session against a 415 MB repository: 148s spent on a
-    /// push whose objects another process had already delivered.
+    /// it correct, which is why it stays invisible: the only symptom is time.
+    ///
+    /// WHAT THIS DOES NOT EXPLAIN, so that nobody reads it as settled: a cloud
+    /// session spent 148s on one push of a 415 MB repository and this was the
+    /// suspect, on the evidence that every process logged exactly one
+    /// `push-failed`. That evidence turned out to be a different thing entirely —
+    /// `fatal: bad tree object`, the ordinary unreadable-graph fallback to
+    /// `hand_over_graph` (`tests/push-closure`), which is by design and happens
+    /// once per process for reasons that have nothing to do with concurrency.
+    /// The 148s stall remains unattributed. This function is justified by the
+    /// reproduction above, not by that measurement.
     ///
     /// Processes, not threads, so the claim is a file. Bounded, and a stale claim
     /// is ignored rather than honoured — a killed pusher must not park every
