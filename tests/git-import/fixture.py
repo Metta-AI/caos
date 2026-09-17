@@ -39,6 +39,7 @@ def wait_for(predicate):
 
 def main():
     binary = str(Path(sys.argv[1]).resolve())
+    cli = str(Path(sys.argv[2]).resolve()) if len(sys.argv) > 2 else None
     port = int(os.environ.get("CAOS_IMPORT_TEST_PORT", "0"))
     remote_port = int(os.environ.get("GIT_IMPORT_TEST_PORT", "0"))
     if not port:
@@ -255,6 +256,19 @@ def main():
             assert not run("git", "--git-dir", str(odb), "for-each-ref")
             for p in [odb / "config", root / "server.log", *list((odb / "caos-imports").glob("*/*"))]:
                 assert token.encode() not in p.read_bytes(), f"credential leaked to {p.name}"
+            if cli:
+                token_file = root / "token"
+                token_file.write_text(token)
+                cli_env = dict(os.environ, CAOS_SERVER_URL=base)
+                cli_tip = advance()
+                result = run(cli, "import-git", private, cli_tip[0], "--github-token-file=" + str(token_file), env=cli_env)
+                assert result == cli_tip[0]
+                visible(cli_tip[0])
+                assert run(cli, "import-git", private, cli_tip[0], env=cli_env) == cli_tip[0]
+                for args in [[public], [public, "main"], ["/tmp/repo", cli_tip[0]], [public, cli_tip[0], "--invocation=old"]]:
+                    invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
+                    assert invalid.returncode != 0
+                    assert token.encode() not in invalid.stdout + invalid.stderr
             print("git-import: exact commits, HTTPS credentials, full history, packs, reuse, concurrency and retry PASS")
         finally:
             stop(server)

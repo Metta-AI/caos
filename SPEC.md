@@ -463,6 +463,11 @@ Publication preserves the selected source tree's code history. Conversation
 records (prompts, tool calls, and results) stay on the conversation branch;
 publishing them is deferred.
 
+The worker command caos import-git <https-url> <commit> posts that exact
+commit to /git/import and prints its hash. It optionally reads a token file
+specified by --github-token-file=PATH and forwards it in a sensitive header.
+Ref resolution, provenance, and conversation attachment belong to callers.
+
 ## Remote Git imports
 
 POST /git/import accepts only source (an HTTPS repository URL) and commit

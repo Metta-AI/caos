@@ -10,6 +10,9 @@ caos get /cas/args/built/bin/server
 caos get /cas/args/fixture
 cp /cas/args/built/bin/server /tmp/server
 chmod +x /tmp/server
-python3 /cas/args/fixture /tmp/server > /tmp/report
+caos get /cas/args/built/bin/caos
+cp /cas/args/built/bin/caos /tmp/caos
+chmod +x /tmp/caos
+python3 /cas/args/fixture /tmp/server /tmp/caos > /tmp/report
 cat /tmp/report
 caos put /tmp/report /cas/out
