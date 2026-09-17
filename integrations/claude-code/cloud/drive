@@ -14,27 +14,259 @@
 #   drive -c session_XXXX 'a follow-up'     # inject into an existing session
 #   drive -f prompt.txt                     # read the prompt from a file
 #   drive -c session_XXXX -f prompt.txt     # both
+#   drive --probe                           # dump the cloud env (new session)
+#   drive -c session_XXXX --probe           # dump the env of a running session
+#   drive --env session_XXXX                # read a session's env from OUTSIDE
+#   drive --env https://claude.ai/code/...  # same, from a session URL
+#   drive --env-config                      # LIST cloud environments (id + name)
+#   drive --env-config Caos                 # print an env's setup script + vars
 #
-# Read the result back with the run-log API, not this tool:
+# `--env-config` reads an environment DEFINITION (setup script + env vars) that
+# `--env` cannot: those live behind the claude.ai WEB api, which is cookie-authed
+# rather than OAuth, AND behind Cloudflare. Set $CLAUDE_SESSION_KEY (or
+# $CLAUDE_SESSION_ID) to the browser's `sessionKey` cookie (Chrome DevTools >
+# Application > Cookies > claude.ai > sessionKey -- it is HttpOnly, so it is NOT
+# in document.cookie); the org is discovered from it, or pinned with
+# $CLAUDE_ORG_ID. Requests go through curl-impersonate (a real Chrome TLS
+# fingerprint) so Cloudflare does not serve its bot challenge. The env vars are
+# not secrets ("visible to anyone using this environment"), so they print in full.
+#
+# `--env` reads a session's environment from OUTSIDE the session, over the code
+# API -- no prompt, no in-container shell. It GETs the session object and its
+# provisioning events and prints the environment id and kind, the container
+# Claude Code version, the repo branches, the worker's tool set, the MCP config,
+# the auto summary, and the env_manager_log trace (sandbox alloc, repo clone,
+# mounted-vs-installed client, setup-script run). It reads the account's own
+# OAuth token from ~/.claude/.credentials.json. NOTE: this API does NOT serve the
+# environment DEFINITION -- the setup-script text and env-var VALUES are not
+# exposed to a session-scoped token; for those, `--probe` is the only channel.
+#
+# `--probe` reads the ENVIRONMENT from INSIDE the session, with no dependence on
+# caos being installed or healthy: it asks the session's own Claude Code to
+# report the container. On any env that allows a shell (the default) it dumps
+# env vars, the Claude/MCP config, installed binaries, processes, listening
+# ports and the caos tunnel logs; on an env that denies the shell it falls back
+# to listing the MCP servers, tools, skills and cwd it can see. The answer comes
+# back in the run log, not here.
+#
+# Read a --probe result back with the run-log API, not this tool:
 #   GET https://claude.ai/api ... or, in Claude Code, RemoteTrigger get_run_log.
 set -euo pipefail
 
 session=""
 file=""
+probe=0
+env_read=0
+env_config=0
+session_arg=""
 for ((i = 1; i <= $#; i++)); do
     case "${!i}" in
+        --probe) probe=1 ;;
+        --env) env_read=1 ;;
+        --env-config) env_config=1 ;;
         -c) i=$((i + 1)); session="${!i}" ;;
         -f) i=$((i + 1)); file="${!i}" ;;
         -*) echo "drive: unknown flag ${!i}" >&2; exit 2 ;;
-        *) file=""; prompt="${!i}" ;;
+        # A bare token is a prompt normally, or the session/env for --env*.
+        *) file=""; prompt="${!i}"; session_arg="${!i}" ;;
     esac
 done
 
-# The prompt lands in a temp file whether it came as an argument or a path, so
-# the launch below has exactly one shape to get right.
+# jq is needed by --env/--env-config; prefer a PATH jq, fall back to nix.
+jqf() { if command -v jq >/dev/null 2>&1; then jq "$@"; else nix run nixpkgs#jq -- "$@"; fi; }
+
+if [ "$env_config" = 1 ]; then
+    # Read a cloud ENVIRONMENT DEFINITION (setup script + env vars) from OUTSIDE
+    # any session, over the claude.ai web API. That API is cookie-authed, not the
+    # CLI's OAuth token, so it needs the browser's `sessionKey` cookie value,
+    # passed in $CLAUDE_SESSION_KEY. The org is discovered from the cookie unless
+    # $CLAUDE_ORG_ID pins it. With no argument it LISTS environments (id + name);
+    # with an env id or name it prints that one's config.
+    cookie="${CLAUDE_SESSION_KEY:-${CLAUDE_SESSION_ID:-}}"
+    if [ -z "$cookie" ]; then
+        echo "drive --env-config: set CLAUDE_SESSION_KEY (or CLAUDE_SESSION_ID) to your" >&2
+        echo "  claude.ai 'sessionKey' cookie -- DevTools > Application > Cookies >" >&2
+        echo "  https://claude.ai > sessionKey (HttpOnly, so not in document.cookie)." >&2
+        exit 1
+    fi
+    # claude.ai sits behind Cloudflare, which serves plain curl a JS challenge
+    # ("Just a moment...") -- a 200 whose BODY is the interstitial, not the JSON.
+    # curl-impersonate presents a real Chrome TLS fingerprint and header order, so
+    # it passes the managed challenge without a browser-solved cf_clearance cookie.
+    impersonate() {
+        if command -v curl-impersonate-chrome >/dev/null 2>&1; then
+            curl-impersonate-chrome --impersonate chrome110 "$@"
+        else
+            nix run nixpkgs#curl-impersonate -- --impersonate chrome110 "$@"
+        fi
+    }
+    web() { impersonate --compressed -sS -m 25 -H "Cookie: sessionKey=$cookie" "$@"; }
+    # WHICH ORGS to search: a pinned one, or every org the account belongs to.
+    # An account can have several, and the environment may live in a non-default
+    # one, so taking `.[0]` is a guess that reads the wrong org's environments.
+    if [ -n "${CLAUDE_ORG_ID:-}" ]; then
+        orgs="$CLAUDE_ORG_ID"
+    else
+        orgs="$(web "https://claude.ai/api/organizations" 2>/dev/null | jqf -r '.[].uuid // empty' 2>/dev/null || true)"
+    fi
+    if [ -z "$orgs" ]; then
+        echo "drive --env-config: could not resolve any org (cookie expired?); set CLAUDE_ORG_ID" >&2
+        exit 1
+    fi
+    envs_url() { echo "https://claude.ai/v1/environment_providers/private/organizations/$1/environments"; }
+    arg="$session_arg"
+    if [ -z "$arg" ]; then
+        # List every environment across every org.
+        any=0
+        for o in $orgs; do
+            if web "$(envs_url "$o")?limit=1000" 2>/dev/null \
+                 | jqf -r --arg o "$o" '.environments[]? | "\(.environment_id)   \(.name)   [\(.state)]   org=\($o)"' 2>/dev/null; then any=1; fi
+        done
+        [ "$any" = 1 ] || { echo "drive --env-config: no environments found (cookie expired?)" >&2; exit 1; }
+        exit 0
+    fi
+    # Find the org that holds the env named/ided by arg.
+    found_org=""; eid=""
+    for o in $orgs; do
+        case "$arg" in
+            env_*) key='.environment_id==$v' ;;
+            *)     key='.name==$v' ;;
+        esac
+        match="$(web "$(envs_url "$o")?limit=1000" 2>/dev/null \
+                 | jqf -r --arg v "$arg" ".environments[]? | select($key) | .environment_id" 2>/dev/null | head -1)"
+        if [ -n "$match" ]; then found_org="$o"; eid="$match"; break; fi
+    done
+    if [ -z "$eid" ]; then
+        echo "drive --env-config: no environment matching '$arg' in your org(s) (try: drive --env-config)" >&2
+        exit 1
+    fi
+    detail="$(web "$(envs_url "$found_org")/$eid" 2>/dev/null || true)"
+    if ! printf '%s' "$detail" | jqf -e '.config' >/dev/null 2>&1; then
+        echo "drive --env-config: could not read $eid:" >&2
+        printf '%s' "$detail" | head -c 300 >&2; echo >&2; exit 1
+    fi
+    printf '%s' "$detail" | jqf -r '.config as $c |
+      "name:    \(.name)   id: \(.environment_id)   state: \(.state)",
+      "type:    \($c.environment_type)/\($c.sub_type)   cwd: \($c.cwd)",
+      "network: hosts=\($c.network_config.allowed_hosts)  mcp=\($c.network_config.allow_mcp_servers)",
+      "--- environment variables ---",
+      (($c.environment // {}) | to_entries[] | "  \(.key)=\(.value)"),
+      "--- setup / init script ---",
+      ($c.init_script // "(none)")'
+    exit 0
+fi
+
+if [ "$env_read" = 1 ]; then
+    sid="$(printf '%s' "${session:-$session_arg}" | grep -oE 'session_[A-Za-z0-9]+' | head -1 || true)"
+    if [ -z "$sid" ]; then
+        echo "drive --env: need a session id or a claude.ai/code URL with one" >&2
+        exit 2
+    fi
+    token="$(jqf -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null || true)"
+    if [ -z "$token" ]; then
+        echo "drive --env: no OAuth token in ~/.claude/.credentials.json" >&2
+        exit 1
+    fi
+    api="https://api.anthropic.com/v1/code/sessions/$sid"
+    hdr=(-H "Authorization: Bearer $token"
+         -H "anthropic-beta: oauth-2025-04-20"
+         -H "anthropic-version: 2023-06-01")
+    sess="$(curl -sS -m 20 "${hdr[@]}" "$api" 2>/dev/null || true)"
+    if ! printf '%s' "$sess" | jqf -e '.response_shape' >/dev/null 2>&1; then
+        echo "drive --env: could not read session $sid (token expired? re-login):" >&2
+        printf '%s' "$sess" | head -c 300 >&2; echo >&2
+        exit 1
+    fi
+    printf '%s' "$sess" | jqf -r '.response_shape as $s |
+      "session:        \($s.id)   status: \($s.status)  (\($s.status_bucket))",
+      "title:          \($s.title)",
+      "environment:    \($s.environment_id)  (\($s.environment_kind))",
+      "container cc:   \($s.external_metadata.container_cc_version)",
+      "branches:       \($s.external_metadata.current_branches)",
+      "worker tools:   \(($s.external_metadata.turn_handoff.tools // []) | join(", "))",
+      "config model:   \($s.config.model)   origin: \($s.config.origin)",
+      "config sources: \($s.config.sources)   mcp connectors: \($s.config.mcp_connector_ids)",
+      "summary:        \($s.post_turn_summary.recent_action)",
+      "                \($s.post_turn_summary.status_detail)"'
+    echo "--- provisioning (env_manager_log, oldest first) ---"
+    curl -sS -m 20 "${hdr[@]}" "$api/events" 2>/dev/null \
+      | jqf -r '(.data // .events // []) | map(select(.event_type=="env_manager_log"))
+                | sort_by(.sequence_num|tonumber)[]
+                | "  [\(.payload.data.level)] \(.payload.data.content)"' 2>/dev/null \
+      || echo "  (no env_manager_log events)"
+    exit 0
+fi
+
+# The prompt lands in a temp file whether it came as an argument, a path, or the
+# built-in probe, so the launch below has exactly one shape to get right.
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-if [ -n "$file" ]; then
+if [ "$probe" = 1 ]; then
+    # The probe is a STANDALONE prompt: it names no caos config and assumes
+    # nothing is installed, so it reads a plain cloud env as readily as a caos
+    # one. The embedded script runs in ONE shell call and brackets its output so
+    # the reader can lift it out of the transcript; the no-shell branch keeps the
+    # probe useful on an env whose settings deny Bash (e.g. the caos deny list).
+    cat > "$tmp" <<'PROBE'
+Report the ENVIRONMENT of this cloud container verbatim -- do not summarize or
+interpret, I need the raw facts.
+
+If you have a Bash/shell tool: run the single script below in ONE Bash call and
+paste its entire stdout+stderr, unedited, between the BEGIN/END markers it
+prints.
+
+If you do NOT have a Bash tool: say so plainly, then between markers
+`===== CAOS-ENV-REPORT BEGIN =====` and `===== CAOS-ENV-REPORT END =====`
+report instead (a) every MCP server and every tool you can find (search the tool
+registry broadly, several queries), (b) any skills and connectors, (c) your
+current working directory and model, and (d) anything else observable about the
+environment. Do not stop at the first search.
+
+------------------------------- run this -------------------------------
+{
+echo "===== CAOS-ENV-REPORT BEGIN ====="
+echo "## identity"
+uname -a; echo "user=$(whoami) uid=$(id -u) cwd=$(pwd) HOME=$HOME shell=$SHELL"
+echo "## env (values of SECRET/TOKEN/KEY/PASSWORD/PAT/CRED vars masked)"
+env | sort | awk -F= '{k=$1; v=substr($0,length(k)+2);
+  if (k ~ /SECRET|TOKEN|KEY|PASSWORD|CRED/ || k ~ /(^|_)PAT(_|$)/) printf "%s=<redacted len=%d>\n",k,length(v);
+  else print}'
+echo "## caos + tunnel install"
+ls -la /usr/local/bin 2>/dev/null | grep -iE 'caos|dumbpipe' || echo "(none in /usr/local/bin)"
+for b in caos caos-serve dumbpipe; do printf '%s: ' "$b"; command -v "$b" || echo "(absent)"; done
+caos --version 2>&1 | head -1
+echo "-- build record --"; cat /usr/local/share/caos/build 2>/dev/null || echo "(none)"
+echo "-- setup stamp --"; cat /usr/local/share/caos/setup-stamp 2>/dev/null || echo "(none)"
+echo "## session-start bootstrap (first 40 lines)"
+cat /usr/local/bin/caos-cloud-session-start 2>/dev/null | head -40 || echo "(none)"
+echo "## claude / mcp config"
+for f in "$HOME/.claude/settings.json" "$HOME/.claude.json" "$HOME/.mcp.json" ".claude/settings.json" ".mcp.json"; do
+  echo "-- $f --"
+  if [ -f "$f" ]; then
+    case "$f" in
+      *.claude.json) jq '{mcpServers}' "$f" 2>/dev/null || grep -aA40 mcpServers "$f" || echo "(unreadable)";;
+      *) cat "$f";;
+    esac
+  else echo "(absent)"; fi
+done
+echo "## processes"
+ps -eo pid,ppid,pgid,sess,etime,args 2>/dev/null | grep -iE 'caos|dumbpipe|mcp serve' | grep -v grep || echo "(none)"
+echo "## listening tcp (hex local addr:port, state 0A=LISTEN)"
+awk 'NR>1 && $4=="0A"{print $2}' /proc/net/tcp 2>/dev/null; awk 'NR>1 && $4=="0A"{print $2}' /proc/net/tcp6 2>/dev/null
+echo "## tunnel / warm logs"
+for l in /tmp/caos-tunnel.log /tmp/caos-tunnel2.log /tmp/caos-warm.log; do echo "-- $l --"; cat "$l" 2>/dev/null || echo "(none)"; done
+echo "## caos server reachability"
+url="${CAOS_SERVER_URL:-}"; [ -z "$url" ] && url="$(git config --get remote.caos.url 2>/dev/null || true)"
+echo "caos remote/url: ${url:-<none found>}"
+[ -n "$url" ] && curl -sS -m 8 -o /dev/null -w "  $url -> HTTP %{http_code} in %{time_total}s\n" "$url" 2>&1 || echo "  (no url to probe)"
+echo "===== CAOS-ENV-REPORT END ====="
+} 2>&1
+--------------------------------- end ----------------------------------
+
+Paste everything from `===== CAOS-ENV-REPORT BEGIN =====` through
+`===== CAOS-ENV-REPORT END =====` verbatim, then stop.
+PROBE
+elif [ -n "$file" ]; then
     cat "$file" > "$tmp"
 elif [ -n "${prompt:-}" ]; then
     printf '%s' "$prompt" > "$tmp"
