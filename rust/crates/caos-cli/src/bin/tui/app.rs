@@ -2,7 +2,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 
 use caos::{GitTransport, Transport};
@@ -32,9 +31,6 @@ mod filesystem;
 #[path = "ui.rs"]
 pub(crate) mod ui;
 use filesystem::Browser;
-#[path = "publication.rs"]
-mod publication;
-use publication::PublishPrompt;
 #[path = "input_history.rs"]
 mod input_history;
 use input_history::InputHistory;
@@ -852,8 +848,6 @@ enum AppAction {
     Invite,
     Model,
     Commands,
-    Publish,
-    PublishBranch,
     Reference,
     Title,
     UpdateTree,
@@ -897,7 +891,7 @@ const MODEL_OPTIONS: [&str; 8] = [
     "claude-opus-4-6",
 ];
 
-const COMMANDS: [Command; 13] = [
+const COMMANDS: [Command; 11] = [
     Command {
         name: "/from",
         usage: "/from <commit>",
@@ -947,20 +941,6 @@ const COMMANDS: [Command; 13] = [
         description: "open the searchable command palette",
         action: AppAction::Commands,
         takes_argument: false,
-    },
-    Command {
-        name: "/pr",
-        usage: "/pr <conversation/gitlink> <base-remote-branch> [remote-URL]",
-        description: "preview a PR for this gitlink against an explicit remote branch",
-        action: AppAction::Publish,
-        takes_argument: true,
-    },
-    Command {
-        name: "/publish-branch",
-        usage: "/publish-branch <conversation/gitlink> [remote-URL]",
-        description: "preview a branch push without creating a PR",
-        action: AppAction::PublishBranch,
-        takes_argument: true,
     },
     Command {
         name: "/ref",
@@ -1040,9 +1020,6 @@ struct ConversationState {
     reconciling_request: Option<String>,
     reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
-    publishing: bool,
-    publish_plan: Option<PublishPrompt>,
-    publication_cancel: Option<Arc<AtomicBool>>,
     forking: bool,
     source_tree_operation: bool,
     scroll: ScrollState,
@@ -1089,9 +1066,6 @@ impl ConversationState {
             reconciling_request: None,
             reconcile_after: None,
             turn_phase: TurnPhase::System,
-            publishing: false,
-            publish_plan: None,
-            publication_cancel: None,
             forking: false,
             source_tree_operation: false,
             scroll: ScrollState::default(),
@@ -1383,7 +1357,7 @@ impl ConversationState {
     }
 
     fn is_busy(&self) -> bool {
-        self.running || self.publishing || self.forking || self.source_tree_operation
+        self.running || self.forking || self.source_tree_operation
     }
 
     fn push_error(&mut self, error: impl Into<String>) {
@@ -1510,7 +1484,7 @@ impl ConversationState {
     }
 
     fn sidebar_text(&self, max_cells: u16) -> (String, String) {
-        let detail = if self.running || self.publishing {
+        let detail = if self.running {
             self.running_activity()
                 .map(|activity| {
                     format!("{} {}", activity.running_verb(), activity.running_summary())
@@ -1600,22 +1574,9 @@ enum UiMessage {
         conversation: String,
         result: Result<String, String>,
     },
-    PublicationPlanned {
-        conversation: String,
-        id: u64,
-        result: Result<caos_cli::source_trees::PublicationTarget, String>,
-    },
-    Published {
-        conversation: String,
-        result: Result<String, String>,
-    },
     SourceTreeUpdated {
         conversation: String,
         result: Result<(Result<(), String>, Box<ConversationLoad>), String>,
-    },
-    PublicationBaseImported {
-        conversation: String,
-        result: Result<(String, Box<ConversationLoad>), String>,
     },
     Reconciled {
         conversation: String,
@@ -2035,14 +1996,7 @@ impl App {
         self.view == View::Chat
     }
 
-    pub(crate) fn publication_visible(&self) -> bool {
-        self.selected().publish_plan.is_some()
-    }
-
     pub(crate) fn insert_paste(&mut self, text: &str) {
-        if self.selected().publish_plan.is_some() {
-            return;
-        }
         if self.browser_visible() {
             return;
         }
@@ -2053,16 +2007,6 @@ impl App {
         if self.browser_visible() {
             return self.browser_mouse(mouse, area);
         }
-        if self.selected().publish_plan.is_some() {
-            if mouse.kind == MouseEventKind::ScrollUp {
-                self.handle_publication_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-            }
-            if mouse.kind == MouseEventKind::ScrollDown {
-                self.handle_publication_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-            }
-            return MouseAction::Redraw;
-        }
-
         if self.palette.is_some() {
             return MouseAction::Ignored;
         }
@@ -2253,11 +2197,6 @@ impl App {
         if self.selected().source_tree_operation {
             self.selected_mut()
                 .show_command_error("wait for the source tree operation to finish");
-            return;
-        }
-        if self.selected().publishing {
-            self.selected_mut()
-                .show_command_error("finish publishing before sending another message");
             return;
         }
         let Some(raw) = self.selected_mut().composer.take_message() else {
@@ -2528,8 +2467,6 @@ impl App {
                     .push_info(format!("Model for future turns: {model}"));
             }
             AppAction::From => self.start_from_hash(arguments),
-            AppAction::Publish => self.run_publication(arguments, false),
-            AppAction::PublishBranch => self.run_publication(arguments, true),
             AppAction::Title => self.rename_selected(arguments),
             AppAction::UpdateTree => unreachable!("message command reached local dispatch"),
             AppAction::NewConversation
@@ -2565,9 +2502,6 @@ impl App {
     }
 
     fn interrupt_selected(&mut self) {
-        if let Some(cancel) = &self.selected().publication_cancel {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         if !self.selected().running || self.selected().interrupting {
             return;
         }
@@ -2834,58 +2768,6 @@ impl App {
                         self.finish_title_generation(index, result);
                     }
                 }
-                UiMessage::PublicationPlanned {
-                    conversation,
-                    id,
-                    result,
-                } => {
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        if let Some(prompt) = self.conversations[index]
-                            .publish_plan
-                            .as_mut()
-                            .filter(|prompt| prompt.id == id)
-                        {
-                            prompt.loading = false;
-                            match result {
-                                Ok(target) => prompt.target = Some(target),
-                                Err(error) => prompt.error = Some(error),
-                            }
-                        }
-                    }
-                }
-                UiMessage::Published {
-                    conversation,
-                    result,
-                } => {
-                    let transport = self.transport();
-                    let user = self.user.clone();
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        let state = &mut self.conversations[index];
-                        state.publishing = false;
-                        state.publication_cancel = None;
-                        state.local_turn = false;
-                        let refreshed = transport
-                            .as_ref()
-                            .ok()
-                            .and_then(|transport| state.reload(transport, &user));
-                        if refreshed.is_none() {
-                            state.running = false;
-                            state.active_request = None;
-                            state.remote_head = None;
-                        }
-                        match result {
-                            Ok(message) if refreshed.is_none() => state.push_info(message),
-                            Ok(_) => state.status.clear(),
-                            Err(error) => {
-                                state.sidebar_attention =
-                                    Some("PR failed — open for details".to_string());
-                                state.show_command_error_preserving_status(format!(
-                                    "PR failed: {error}"
-                                ));
-                            }
-                        }
-                    }
-                }
                 UiMessage::SourceTreeUpdated {
                     conversation,
                     result,
@@ -2914,21 +2796,6 @@ impl App {
                                 }
                             }
                             Err(error) => state.show_command_error(error),
-                        }
-                    }
-                }
-                UiMessage::PublicationBaseImported {
-                    conversation,
-                    result,
-                } => {
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        self.conversations[index].source_tree_operation = false;
-                        match result {
-                            Ok((message, load)) => {
-                                self.conversations[index].apply_load(*load, &self.user);
-                                self.send_message(index, message, None, None, None);
-                            }
-                            Err(error) => self.conversations[index].show_command_error(error),
                         }
                     }
                 }
@@ -3349,18 +3216,6 @@ impl App {
             self.handle_browser_key(key);
             return;
         }
-        if self.selected().publish_plan.is_some() {
-            if key
-                .modifiers
-                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
-                && matches!(key.code, KeyCode::Char('p' | 'P'))
-            {
-                self.execute_action(AppAction::Commands);
-            } else {
-                self.handle_publication_key(key);
-            }
-            return;
-        }
         let is_palette = key
             .modifiers
             .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
@@ -3378,7 +3233,7 @@ impl App {
             if self.view == View::Chat && self.selected_mut().dismiss_command_menu() {
                 return;
             }
-            if self.selected().running || self.selected().publishing {
+            if self.selected().running {
                 self.interrupt_selected();
                 return;
             }
@@ -3646,9 +3501,6 @@ impl App {
                 self.start_new_conversation(None);
                 self.focus = Focus::Conversation;
             }
-            AppAction::Publish | AppAction::PublishBranch => {
-                unreachable!("publication requires explicit command arguments")
-            }
             AppAction::Activity => {
                 self.view = if self.view == View::Activity {
                     View::Chat
@@ -3680,7 +3532,6 @@ impl App {
             AppAction::Archive => self.close_selected(),
             AppAction::SelectionLock => self.selection_locked = !self.selection_locked,
             AppAction::Commands => {
-                self.selected_mut().publish_plan = None;
                 self.palette = self.palette.take().is_none().then(CommandPalette::default);
             }
             AppAction::Checkout
@@ -3859,7 +3710,6 @@ impl App {
     }
 
     fn select(&mut self, index: usize) {
-        self.selected_mut().publish_plan = None;
         self.selected = index;
         let needs_load =
             self.selected().source_trees.is_empty() && self.selected().remote_head.is_some();
@@ -4634,6 +4484,20 @@ mod tests {
             .collect()
     }
 
+    fn rendered_screen(app: &App) -> String {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(100)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn rendered_header(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         buffer
@@ -5153,8 +5017,6 @@ mod tests {
                 "/checkout",
                 "/import",
                 "/commands",
-                "/pr",
-                "/publish-branch",
                 "/ref",
                 "/invite",
                 "/model",
@@ -5214,12 +5076,8 @@ mod tests {
 
         assert!(parse_command("/load https://github.com/Metta-AI/caos/pull/34").is_none());
 
-        let (command, arguments) = parse_command("/publish-branch feature/01-change").unwrap();
-        assert_eq!(command.action, AppAction::PublishBranch);
-        assert_eq!(arguments, "feature/01-change");
-        let (command, arguments) = parse_command("/pr feature/01-change main").unwrap();
-        assert_eq!(command.action, AppAction::Publish);
-        assert_eq!(arguments, "feature/01-change main");
+        assert!(parse_command("/pr feature/01-change main").is_none());
+        assert!(parse_command("/publish-branch feature/01-change").is_none());
 
         let (command, arguments) = parse_command("/ref").unwrap();
         assert_eq!(command.action, AppAction::Reference);
@@ -5517,15 +5375,10 @@ mod tests {
 
     #[test]
     fn escape_closes_command_palette_before_interrupting_work() {
-        for (running, publishing) in [(false, false), (true, false), (false, true)] {
+        for running in [false, true] {
             let mut conversation = state("palette-escape");
             conversation.running = running;
-            conversation.publishing = publishing;
             conversation.composer.insert_str("keep this draft");
-            let cancel = Arc::new(AtomicBool::new(false));
-            if publishing {
-                conversation.publication_cancel = Some(cancel.clone());
-            }
             let (mut app, _) = app_with(vec![conversation]);
             app.repo_dir = std::env::temp_dir().join(format!(
                 "missing-caos-palette-escape-test-repo-{}",
@@ -5552,32 +5405,21 @@ mod tests {
             assert_eq!(app.selected().composer.text, "keep this draft");
             assert_eq!(app.selected().status, "ready");
             assert_eq!(app.selected().running, running);
-            assert_eq!(app.selected().publishing, publishing);
             assert!(!app.selected().interrupting);
-            assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
             assert!(!app.should_quit());
 
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert_eq!(app.selected().interrupting, running);
-            assert_eq!(
-                cancel.load(std::sync::atomic::Ordering::Relaxed),
-                publishing
-            );
         }
     }
 
     #[test]
     fn escape_dismisses_slash_completions_before_interrupting_work() {
-        for (running, publishing) in [(true, false), (false, true)] {
+        for running in [true] {
             for draft in ["/", "/model son"] {
                 let mut conversation = state("completion-escape");
                 conversation.running = running;
-                conversation.publishing = publishing;
                 conversation.composer.insert_str(draft);
-                let cancel = Arc::new(AtomicBool::new(false));
-                if publishing {
-                    conversation.publication_cancel = Some(cancel.clone());
-                }
                 let (mut app, _) = app_with(vec![conversation]);
                 app.repo_dir = std::env::temp_dir().join(format!(
                     "missing-caos-completion-escape-test-repo-{}",
@@ -5590,14 +5432,9 @@ mod tests {
                 assert_eq!(app.selected().composer.completion_count(), 0);
                 assert_eq!(app.selected().composer.text, draft);
                 assert!(!app.selected().interrupting);
-                assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
 
                 app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 assert_eq!(app.selected().interrupting, running);
-                assert_eq!(
-                    cancel.load(std::sync::atomic::Ordering::Relaxed),
-                    publishing
-                );
             }
         }
     }
@@ -6723,7 +6560,6 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(app.selected().publish_plan.is_none());
         assert_eq!(git(&["rev-parse", "HEAD"]), base);
         assert!(app.selected().composer.expanded_text().is_empty());
         app.run_checkout(&format!(
@@ -7234,183 +7070,6 @@ mod tests {
             app.selected().remote_head.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         );
-    }
-
-    #[test]
-    fn publishing_gate_keeps_the_draft_and_shows_the_command_error_panel() {
-        let mut conversation = state("talk-1");
-        conversation.publishing = true;
-        conversation.status = "publishing".to_string();
-        conversation.composer.insert_str("do not send yet");
-        let (mut app, _) = app_with(vec![conversation]);
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-
-        assert!(app.selected().publishing);
-        assert_eq!(app.selected().composer.text, "do not send yet");
-        assert!(app.selected().transcript.is_empty());
-        assert_eq!(
-            app.selected().command_error.as_deref(),
-            Some("finish publishing before sending another message")
-        );
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        assert!(rendered_main_pane(&terminal)
-            .join("\n")
-            .contains("finish publishing before sending another message"));
-    }
-
-    fn rendered_screen(app: &App) -> String {
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(app, frame)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content
-            .chunks(100)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn publication_preview_preserves_drafts_and_cannot_be_retargeted() {
-        use caos_cli::source_trees::PublicationTarget;
-        let mut conversation = state("talk-1");
-        conversation.composer.text = "preserve this draft".into();
-        conversation.publish_plan = Some(PublishPrompt {
-            id: 1,
-            loading: false,
-            error: None,
-            branch_only: false,
-            target: Some(PublicationTarget {
-                source_tree: "feature/02-change".into(),
-                head: "a".repeat(40),
-                repository: "https://example.com/repo".into(),
-                branch: "feature/02-change".into(),
-                base_branch: "main".into(),
-                base_commit: Some("b".repeat(40)),
-                remote_head: None,
-                base_import: None,
-            }),
-        });
-        let (mut app, tx) = app_with(vec![conversation]);
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Publish PR"));
-        assert!(rendered.contains("feature/02-change"));
-        assert!(rendered.contains("PR base: main"));
-        app.insert_paste("https://example.com/other");
-        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        assert_eq!(
-            app.selected()
-                .publish_plan
-                .as_ref()
-                .unwrap()
-                .target
-                .as_ref()
-                .unwrap()
-                .repository,
-            "https://example.com/repo"
-        );
-        assert_eq!(app.selected().composer.text, "preserve this draft");
-        app.selected_mut()
-            .publish_plan
-            .as_mut()
-            .unwrap()
-            .target
-            .as_mut()
-            .unwrap()
-            .base_import = Some("imports/pr-base-abc/base".into());
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Enter imports the base"));
-        assert!(rendered.contains("Nothing is published"));
-        assert!(!rendered.contains("Enter pushes"));
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.selected().publish_plan.is_none());
-        tx.send(UiMessage::PublicationPlanned {
-            conversation: "talk-1".into(),
-            id: 1,
-            result: Err("late result".into()),
-        })
-        .unwrap();
-        app.drain_messages();
-        assert!(app.selected().publish_plan.is_none());
-        assert_eq!(app.selected().composer.text, "preserve this draft");
-    }
-
-    #[test]
-    fn publish_stage_statuses_replace_the_generic_publishing_summary() {
-        let mut conversation = state("talk-1");
-        conversation.publishing = true;
-        conversation.status = "fetching the tip of main".to_string();
-        let (mut app, tx) = app_with(vec![conversation]);
-
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Publishing…"));
-        assert!(rendered.contains("fetching the tip of main"));
-
-        tx.send(UiMessage::Turn {
-            conversation: "talk-1".to_string(),
-            event: TurnEvent::Status("pushing branch caos/talk-1".to_string()),
-        })
-        .unwrap();
-        assert!(app.drain_messages());
-        assert_eq!(app.selected().status, "pushing branch caos/talk-1");
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Publishing…"));
-        assert!(rendered.contains("pushing branch caos/talk-1"));
-    }
-
-    #[test]
-    fn publishing_shows_a_running_tool_instead_of_the_generic_verb() {
-        let mut conversation = state("talk-1");
-        conversation.publishing = true;
-        conversation.status = "starting the publication preparation turn".to_string();
-        let (mut app, tx) = app_with(vec![conversation]);
-
-        tx.send(UiMessage::Turn {
-            conversation: "talk-1".to_string(),
-            event: TurnEvent::ToolCall {
-                step_commit: "b".repeat(40),
-                request: "c".repeat(40),
-                round: 1,
-                tool_use_id: "call-1".to_string(),
-                name: "bash".to_string(),
-                summary: "$ cargo test".to_string(),
-            },
-        })
-        .unwrap();
-        assert!(app.drain_messages());
-
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Running…"));
-        assert!(rendered.contains("$ cargo test"));
-        assert!(!rendered.contains("Publishing…"));
-        let (_, detail) = app.selected().sidebar_text(60);
-        assert_eq!(detail, "Running $ cargo test");
-
-        tx.send(UiMessage::Turn {
-            conversation: "talk-1".to_string(),
-            event: TurnEvent::ToolResult {
-                step_commit: "b".repeat(40),
-                request: "c".repeat(40),
-                round: 1,
-                tool_use_id: "call-1".to_string(),
-                is_error: false,
-                content: "ok".to_string(),
-            },
-        })
-        .unwrap();
-        assert!(app.drain_messages());
-
-        let rendered = rendered_screen(&app);
-        assert!(rendered.contains("Publishing…"));
-        assert!(rendered.contains("starting the publication preparation turn"));
-        let (_, detail) = app.selected().sidebar_text(60);
-        assert_eq!(detail, "starting the publication preparation turn");
     }
 
     #[test]
