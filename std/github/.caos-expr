@@ -1,0 +1,10 @@
+HELP=<<END
+Run GitHub CLI with an explicit repository and an invocation identity. Use a new identity for a new observation and retain it on retry. A claimed invocation without a result is uncertain and is never executed again.
+@param repository GitHub owner/repository.
+@param args JSON array of literal arguments to gh.
+@param invocation Unique caller-supplied invocation ID (64 lowercase hexadecimal characters).
+@param [stdin] Standard input, for example a PR body passed with --body-file -.
+END
+RUNNER=run --base:@=DEEP-DEPS/flake-builder --in:@=runner --lock:@=DEEP-DEPS/flake.lock
+WORKER=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/conversation-protocol --dep1:@=DEEP-DEPS/git-locator --output-runner=$RUNNER
+curry --base=$WORKER --help=$HELP

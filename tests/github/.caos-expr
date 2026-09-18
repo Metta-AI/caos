@@ -1,0 +1,1 @@
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
