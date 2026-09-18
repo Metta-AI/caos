@@ -20,6 +20,16 @@
 #   drive --env https://claude.ai/code/...  # same, from a session URL
 #   drive --env-config                      # LIST cloud environments (id + name)
 #   drive --env-config Caos                 # print an env's setup script + vars
+#   drive --env-update Caos --init-script F # replace an env's setup script
+#   drive --env-update Caos --set-env K=V   # set/unset env vars (--unset-env K)
+#   drive --env-create NAME --from Caos     # create (optionally cloning an env)
+#   drive --env-delete NAME                 # delete an environment
+#
+# The --env-update/-create/-delete modes WRITE the environment over the same web
+# API as --env-config (same $CLAUDE_SESSION_KEY cookie). --init-script FILE reads
+# the setup script from FILE; --set-env/--unset-env edit env vars; --rename
+# renames. To toggle Bash in an env, point its setup line at a script that passes
+# `--enable-bash` (install.sh honours it) and re-snapshot the env.
 #
 # `--env-config` reads an environment DEFINITION (setup script + env vars) that
 # `--env` cannot: those live behind the claude.ai WEB api, which is cookie-authed
@@ -58,12 +68,28 @@ file=""
 probe=0
 env_read=0
 env_config=0
+env_update=0
+env_create=0
+env_delete=0
 session_arg=""
+init_script_file=""
+from_env=""
+rename=""
+declare -a set_env=()
+declare -a unset_env=()
 for ((i = 1; i <= $#; i++)); do
     case "${!i}" in
         --probe) probe=1 ;;
         --env) env_read=1 ;;
         --env-config) env_config=1 ;;
+        --env-update) env_update=1 ;;
+        --env-create) env_create=1 ;;
+        --env-delete) env_delete=1 ;;
+        --init-script) i=$((i + 1)); init_script_file="${!i}" ;;
+        --from) i=$((i + 1)); from_env="${!i}" ;;
+        --rename) i=$((i + 1)); rename="${!i}" ;;
+        --set-env) i=$((i + 1)); set_env+=("${!i}") ;;
+        --unset-env) i=$((i + 1)); unset_env+=("${!i}") ;;
         -c) i=$((i + 1)); session="${!i}" ;;
         -f) i=$((i + 1)); file="${!i}" ;;
         -*) echo "drive: unknown flag ${!i}" >&2; exit 2 ;;
@@ -72,80 +98,69 @@ for ((i = 1; i <= $#; i++)); do
     esac
 done
 
-# jq is needed by --env/--env-config; prefer a PATH jq, fall back to nix.
+# jq is needed by the --env* modes; prefer a PATH jq, fall back to nix.
 jqf() { if command -v jq >/dev/null 2>&1; then jq "$@"; else nix run nixpkgs#jq -- "$@"; fi; }
 
-if [ "$env_config" = 1 ]; then
-    # Read a cloud ENVIRONMENT DEFINITION (setup script + env vars) from OUTSIDE
-    # any session, over the claude.ai web API. That API is cookie-authed, not the
-    # CLI's OAuth token, so it needs the browser's `sessionKey` cookie value,
-    # passed in $CLAUDE_SESSION_KEY. The org is discovered from the cookie unless
-    # $CLAUDE_ORG_ID pins it. With no argument it LISTS environments (id + name);
-    # with an env id or name it prints that one's config.
-    cookie="${CLAUDE_SESSION_KEY:-${CLAUDE_SESSION_ID:-}}"
-    if [ -z "$cookie" ]; then
-        echo "drive --env-config: set CLAUDE_SESSION_KEY (or CLAUDE_SESSION_ID) to your" >&2
-        echo "  claude.ai 'sessionKey' cookie -- DevTools > Application > Cookies >" >&2
-        echo "  https://claude.ai > sessionKey (HttpOnly, so not in document.cookie)." >&2
-        exit 1
-    fi
-    # claude.ai sits behind Cloudflare, which serves plain curl a JS challenge
-    # ("Just a moment...") -- a 200 whose BODY is the interstitial, not the JSON.
-    # curl-impersonate presents a real Chrome TLS fingerprint and header order, so
-    # it passes the managed challenge without a browser-solved cf_clearance cookie.
-    impersonate() {
-        if command -v curl-impersonate-chrome >/dev/null 2>&1; then
-            curl-impersonate-chrome --impersonate chrome110 "$@"
-        else
-            nix run nixpkgs#curl-impersonate -- --impersonate chrome110 "$@"
-        fi
-    }
-    web() { impersonate --compressed -sS -m 25 -H "Cookie: sessionKey=$cookie" "$@"; }
-    # WHICH ORGS to search: a pinned one, or every org the account belongs to.
-    # An account can have several, and the environment may live in a non-default
-    # one, so taking `.[0]` is a guess that reads the wrong org's environments.
-    if [ -n "${CLAUDE_ORG_ID:-}" ]; then
-        orgs="$CLAUDE_ORG_ID"
+# --- claude.ai web API, for --env-config / --env-update / --env-create /
+# --env-delete. The environment API is cookie-authed (the browser's sessionKey,
+# NOT the CLI's OAuth token) and Cloudflare-fronted, so requests go through
+# curl-impersonate (a real Chrome TLS fingerprint) to clear the managed
+# challenge -- a plain curl gets a 200 whose body is the "Just a moment..."
+# interstitial -- without a browser-solved cf_clearance cookie.
+_cookie="${CLAUDE_SESSION_KEY:-${CLAUDE_SESSION_ID:-}}"
+web() {
+    if command -v curl-impersonate-chrome >/dev/null 2>&1; then
+        curl-impersonate-chrome --impersonate chrome110 --compressed -sS -m 25 -H "Cookie: sessionKey=$_cookie" "$@"
     else
-        orgs="$(web "https://claude.ai/api/organizations" 2>/dev/null | jqf -r '.[].uuid // empty' 2>/dev/null || true)"
+        nix run nixpkgs#curl-impersonate -- --impersonate chrome110 --compressed -sS -m 25 -H "Cookie: sessionKey=$_cookie" "$@"
     fi
-    if [ -z "$orgs" ]; then
-        echo "drive --env-config: could not resolve any org (cookie expired?); set CLAUDE_ORG_ID" >&2
+}
+require_cookie() {
+    if [ -z "$_cookie" ]; then
+        echo "drive: set CLAUDE_SESSION_KEY (or CLAUDE_SESSION_ID) to your claude.ai" >&2
+        echo "  'sessionKey' cookie -- DevTools > Application > Cookies > claude.ai >" >&2
+        echo "  sessionKey (HttpOnly, so it is not in document.cookie)." >&2
         exit 1
     fi
-    envs_url() { echo "https://claude.ai/v1/environment_providers/private/organizations/$1/environments"; }
-    arg="$session_arg"
-    if [ -z "$arg" ]; then
-        # List every environment across every org.
-        any=0
-        for o in $orgs; do
-            if web "$(envs_url "$o")?limit=1000" 2>/dev/null \
-                 | jqf -r --arg o "$o" '.environments[]? | "\(.environment_id)   \(.name)   [\(.state)]   org=\($o)"' 2>/dev/null; then any=1; fi
-        done
-        [ "$any" = 1 ] || { echo "drive --env-config: no environments found (cookie expired?)" >&2; exit 1; }
-        exit 0
-    fi
-    # Find the org that holds the env named/ided by arg.
-    found_org=""; eid=""
-    for o in $orgs; do
-        case "$arg" in
-            env_*) key='.environment_id==$v' ;;
-            *)     key='.name==$v' ;;
-        esac
-        match="$(web "$(envs_url "$o")?limit=1000" 2>/dev/null \
-                 | jqf -r --arg v "$arg" ".environments[]? | select($key) | .environment_id" 2>/dev/null | head -1)"
-        if [ -n "$match" ]; then found_org="$o"; eid="$match"; break; fi
+}
+# Every org the account belongs to (an env can live in a non-default one, so a
+# single guessed org is wrong), unless $CLAUDE_ORG_ID pins one.
+orgs_all() {
+    if [ -n "${CLAUDE_ORG_ID:-}" ]; then printf '%s\n' "$CLAUDE_ORG_ID"
+    else web "https://claude.ai/api/organizations" 2>/dev/null | jqf -r '.[].uuid // empty' 2>/dev/null; fi
+}
+env_base() { printf 'https://claude.ai/v1/environment_providers/private/organizations/%s' "$1"; }
+# Resolve a name-or-id to "<org><TAB><env_id>" across all orgs; empty if absent.
+env_locate() {
+    local want="$1" o m sel
+    if [ "${want#env_}" != "$want" ]; then sel='.environment_id==$v'; else sel='.name==$v'; fi
+    for o in $(orgs_all); do
+        m="$(web "$(env_base "$o")/environments?limit=1000" 2>/dev/null \
+             | jqf -r --arg v "$want" ".environments[]? | select($sel) | .environment_id" 2>/dev/null | head -1)"
+        [ -n "$m" ] && { printf '%s\t%s\n' "$o" "$m"; return 0; }
     done
-    if [ -z "$eid" ]; then
-        echo "drive --env-config: no environment matching '$arg' in your org(s) (try: drive --env-config)" >&2
-        exit 1
+    return 1
+}
+# Apply --init-script/--set-env/--unset-env/--rename to a full env JSON on stdin.
+env_mutate() {
+    local j kv k v; j="$(cat)"
+    if [ -n "$init_script_file" ]; then
+        j="$(printf '%s' "$j" | jqf --rawfile s "$init_script_file" '.config.init_script=$s')"
     fi
-    detail="$(web "$(envs_url "$found_org")/$eid" 2>/dev/null || true)"
-    if ! printf '%s' "$detail" | jqf -e '.config' >/dev/null 2>&1; then
-        echo "drive --env-config: could not read $eid:" >&2
-        printf '%s' "$detail" | head -c 300 >&2; echo >&2; exit 1
+    if [ "${#set_env[@]}" -gt 0 ]; then
+        for kv in "${set_env[@]}"; do k="${kv%%=*}"; v="${kv#*=}"
+            j="$(printf '%s' "$j" | jqf --arg k "$k" --arg v "$v" '.config.environment[$k]=$v')"; done
     fi
-    printf '%s' "$detail" | jqf -r '.config as $c |
+    if [ "${#unset_env[@]}" -gt 0 ]; then
+        for k in "${unset_env[@]}"; do
+            j="$(printf '%s' "$j" | jqf --arg k "$k" 'del(.config.environment[$k])')"; done
+    fi
+    [ -n "$rename" ] && j="$(printf '%s' "$j" | jqf --arg n "$rename" '.name=$n')"
+    printf '%s' "$j"
+}
+# Pretty-print a full env JSON on stdin.
+env_print() {
+    jqf -r '.config as $c |
       "name:    \(.name)   id: \(.environment_id)   state: \(.state)",
       "type:    \($c.environment_type)/\($c.sub_type)   cwd: \($c.cwd)",
       "network: hosts=\($c.network_config.allowed_hosts)  mcp=\($c.network_config.allow_mcp_servers)",
@@ -153,6 +168,75 @@ if [ "$env_config" = 1 ]; then
       (($c.environment // {}) | to_entries[] | "  \(.key)=\(.value)"),
       "--- setup / init script ---",
       ($c.init_script // "(none)")'
+}
+
+if [ "$env_config" = 1 ]; then
+    require_cookie
+    orgs="$(orgs_all)"
+    [ -n "$orgs" ] || { echo "drive --env-config: could not resolve any org (cookie expired?); set CLAUDE_ORG_ID" >&2; exit 1; }
+    if [ -z "$session_arg" ]; then
+        any=0
+        for o in $orgs; do
+            if web "$(env_base "$o")/environments?limit=1000" 2>/dev/null \
+                 | jqf -r --arg o "$o" '.environments[]? | "\(.environment_id)   \(.name)   [\(.state)]   org=\($o)"' 2>/dev/null; then any=1; fi
+        done
+        [ "$any" = 1 ] || { echo "drive --env-config: no environments found (cookie expired?)" >&2; exit 1; }
+        exit 0
+    fi
+    loc="$(env_locate "$session_arg")" || { echo "drive --env-config: no environment matching '$session_arg'" >&2; exit 1; }
+    o="${loc%%$'\t'*}"; eid="${loc#*$'\t'}"
+    detail="$(web "$(env_base "$o")/environments/$eid" 2>/dev/null || true)"
+    printf '%s' "$detail" | jqf -e '.config' >/dev/null 2>&1 \
+        || { echo "drive --env-config: could not read $eid:" >&2; printf '%s' "$detail" | head -c 300 >&2; echo >&2; exit 1; }
+    printf '%s' "$detail" | env_print
+    exit 0
+fi
+
+if [ "$env_delete" = 1 ]; then
+    require_cookie
+    [ -n "$session_arg" ] || { echo "drive --env-delete: give the name or id to delete" >&2; exit 2; }
+    loc="$(env_locate "$session_arg")" || { echo "drive --env-delete: no environment matching '$session_arg'" >&2; exit 1; }
+    o="${loc%%$'\t'*}"; eid="${loc#*$'\t'}"
+    code="$(web -o /dev/null -w '%{http_code}' -X POST "$(env_base "$o")/environments/$eid/delete" 2>/dev/null)"
+    [ "$code" = 200 ] && echo "deleted $eid" || { echo "drive --env-delete: HTTP $code" >&2; exit 1; }
+    exit 0
+fi
+
+if [ "$env_update" = 1 ]; then
+    require_cookie
+    [ -n "$session_arg" ] || { echo "drive --env-update: give the name or id to update" >&2; exit 2; }
+    loc="$(env_locate "$session_arg")" || { echo "drive --env-update: no environment matching '$session_arg'" >&2; exit 1; }
+    o="${loc%%$'\t'*}"; eid="${loc#*$'\t'}"
+    cur="$(web "$(env_base "$o")/environments/$eid" 2>/dev/null || true)"
+    printf '%s' "$cur" | jqf -e '.config' >/dev/null 2>&1 \
+        || { echo "drive --env-update: could not read $eid:" >&2; printf '%s' "$cur" | head -c 300 >&2; echo >&2; exit 1; }
+    # Update takes name+description+config, NOT kind (the API rejects an extra kind).
+    body="$(printf '%s' "$cur" | env_mutate | jqf '{name, description:(.description // .name), config}')"
+    code="$(printf '%s' "$body" | web -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data @- "$(env_base "$o")/environments/$eid" 2>/dev/null)"
+    [ "$code" = 200 ] || { echo "drive --env-update: HTTP $code" >&2; printf '%s' "$body" | head -c 200 >&2; echo >&2; exit 1; }
+    echo "updated $eid:"
+    web "$(env_base "$o")/environments/$eid" 2>/dev/null | env_print
+    exit 0
+fi
+
+if [ "$env_create" = 1 ]; then
+    require_cookie
+    [ -n "$session_arg" ] || { echo "drive --env-create: give a name (and optionally --from <env> to clone)" >&2; exit 2; }
+    org="${CLAUDE_ORG_ID:-$(orgs_all | head -1)}"
+    if [ -n "$from_env" ]; then
+        loc="$(env_locate "$from_env")" || { echo "drive --env-create: --from '$from_env' not found" >&2; exit 1; }
+        org="${loc%%$'\t'*}"; fid="${loc#*$'\t'}"
+        seed="$(web "$(env_base "$org")/environments/$fid" 2>/dev/null)"
+    else
+        seed='{"config":{"environment_type":"anthropic","sub_type":"ccr","cwd":"/home/user","init_script":"","environment":{},"languages":[{"name":"python","version":"3.11"},{"name":"node","version":"20"}],"network_config":{"allowed_hosts":["*"],"allow_default_hosts":true,"allow_mcp_servers":true}}}'
+    fi
+    rename="$session_arg"   # env_mutate uses $rename to set the new name
+    body="$(printf '%s' "$seed" | env_mutate | jqf '{name, kind:"anthropic_cloud", description:(.description // "created by drive"), config}')"
+    resp="$(printf '%s' "$body" | web -X POST -H 'Content-Type: application/json' --data @- "$(env_base "$org")/cloud/create" 2>/dev/null)"
+    printf '%s' "$resp" | jqf -e '.environment_id' >/dev/null 2>&1 \
+        || { echo "drive --env-create: failed:" >&2; printf '%s' "$resp" | head -c 300 >&2; echo >&2; exit 1; }
+    echo "created $(printf '%s' "$resp" | jqf -r '.environment_id') ($session_arg)"
+    printf '%s' "$resp" | env_print
     exit 0
 fi
 

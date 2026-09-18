@@ -51,9 +51,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
+enable_bash=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
+        # Passed straight through to install.sh, here and in every later session
+        # (baked into the session-start bootstrap below): allow Bash/Read/Grep in
+        # the deny list this env writes, so a session can inspect the container.
+        --enable-bash) enable_bash=yes ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -80,7 +85,7 @@ esac
 # CAOS_SERVER_URL is the one environment variable left, and could not be
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
-args="--no-repo-files --user-config --base=$base"
+args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
 installer="$base/integrations/claude-code/cloud/install.sh"
 
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
@@ -124,6 +129,7 @@ caos --version >&2 2>/dev/null || true
 cat > /usr/local/bin/caos-cloud-session-start <<EOF
 #!/bin/bash
 base="$base"
+enable_bash="$enable_bash"
 EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
@@ -132,7 +138,7 @@ if ! script="$(curl -fsSL "$base/integrations/claude-code/cloud/session-start.sh
     echo "caos: could not fetch $base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
-exec bash -c "$script" caos-cloud-session-start --base="$base"
+exec bash -c "$script" caos-cloud-session-start --base="$base" ${enable_bash:+--enable-bash}
 BOOTSTRAP
 chmod 0755 /usr/local/bin/caos-cloud-session-start
 bash -n /usr/local/bin/caos-cloud-session-start || {

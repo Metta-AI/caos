@@ -39,6 +39,7 @@ PREFIX="${CAOS_PREFIX:-/usr/local}"
 force=""
 repo_files=yes
 user_config=""
+enable_bash=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -46,6 +47,12 @@ for arg in "$@"; do
         # For a cloud environment, where the configuration is user-level and
         # serves every repository: install the client and leave checkouts alone.
         --no-repo-files) repo_files="" ;;
+        # A DIAGNOSTIC toggle: keep Bash/Read/Grep/Glob OUT of the deny list this
+        # run writes, so a session can inspect the container directly. The caos
+        # integration normally denies them so the model works through the caos
+        # tools; --enable-bash trades that for visibility. Flip it by rewriting
+        # the env's setup line (`... --enable-bash`), no repo change or CI needed.
+        --enable-bash) enable_bash=yes ;;
         # A cloud environment's counterpart to the repo files: write the SAME
         # deny list, hooks and server declaration at the USER level, pinned to
         # the commit this run installs. This is the old configure.sh, folded in
@@ -453,7 +460,7 @@ write_user_config() {
         echo "  no tree to pin the step to and the config would be useless." >&2
         exit 1
     fi
-    local raw_settings raw_mcp locator settings servers configured home cfg tmp changed
+    local raw_settings raw_mcp locator settings servers configured home cfg tmp changed settings_prog
     if ! raw_settings="$(curl -fsSL "${url%/*}/claude-settings.json")" \
        || ! raw_mcp="$(curl -fsSL "${url%/*}/mcp.json")"; then
         echo "FATAL: could not fetch the config assets from this build's release" >&2
@@ -474,9 +481,19 @@ write_user_config() {
     # mcp `args` entry it is bare argv. A SessionStart hook is added: the client
     # finds caos through a `caos` git remote an arbitrary checkout lacks, so the
     # remote is added per session from user-level settings.
-    if ! settings="$(printf '%s' "$raw_settings" | jq --arg step "'$locator'" "$unbin"'
+    settings_prog="$unbin"'
             | .hooks.SessionStart =
-            [ { hooks: [ { type: "command", command: "caos-cloud-session-start" } ] } ]')"; then
+            [ { hooks: [ { type: "command", command: "caos-cloud-session-start" } ] } ]'
+    if [ -n "$enable_bash" ]; then
+        # Lift the read/inspect tools out of deny and into allow, so a session can
+        # be driven to dump the container. Edit/Write/NotebookEdit/Monitor stay
+        # denied -- this is for looking, not for the model rewriting the checkout.
+        settings_prog="$settings_prog"'
+            | .permissions.deny  = ((.permissions.deny  // []) - ["Bash","Read","Grep","Glob"])
+            | .permissions.allow = ((.permissions.allow // []) + ["Bash","Read","Grep","Glob"] | unique)'
+        echo "--enable-bash: Bash/Read/Grep/Glob will be allowed this session" >&2
+    fi
+    if ! settings="$(printf '%s' "$raw_settings" | jq --arg step "'$locator'" "$settings_prog")"; then
         echo "FATAL: the settings asset is not the JSON this expects" >&2
         exit 1
     fi

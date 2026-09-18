@@ -29,9 +29,11 @@ hook_started="$(date +%s)"
 step() { log "[+$(($(date +%s) - hook_started))s] $*"; }
 
 base=""
+enable_bash=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}" ;;
+        --enable-bash) enable_bash=yes ;;
     esac
 done
 
@@ -165,7 +167,7 @@ fi
 # pairing that cannot go quiet. Both are a no-op when nothing moved.
 if [ -n "$base" ]; then
     step "refreshing the client"
-    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base"; then
+    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base" ${enable_bash:+--enable-bash}; then
         log "could not refresh the client; carrying on with the installed one"
     fi
 fi
