@@ -263,7 +263,32 @@ fn main() {
 
     // Open the object database once as a thread-safe handle; each request thread
     // takes a cheap local handle from it (see `handle`).
-    let repo = match gix::open(&git_dir) {
+    // Packed uploads accumulate while automatic repacking is disabled. gix
+    // fixes its slot capacity at open time; its client default (at least 32)
+    // cannot accommodate a running server. Reserve its supported maximum.
+    // This is headroom, not pack maintenance: 32,767 is still a hard limit.
+    // TODO: consolidate packs during coordinated downtime, preserving ALL CAS
+    // objects (including unreferenced ones), before this capacity is exhausted.
+    // Do not enable live gc/repack: see the shared-reader constraints above.
+    // Given skips gix's initial scan, so diagnose an already-full store here.
+    let packs = std::fs::read_dir(std::path::Path::new(&git_dir).join("objects/pack"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "idx"))
+                .count()
+        })
+        .unwrap_or(0);
+    if packs >= (1 << 15) - 1 {
+        eprintln!("fatal: object store has {packs} packs; consolidate packs offline, preserving unreferenced CAS objects, before restarting");
+        std::process::exit(1);
+    }
+    if packs >= 30_000 {
+        eprintln!("warning: object store has {packs} packs, approaching the 32767-pack limit; schedule offline consolidation");
+    }
+    let options = gix::open::Options::default()
+        .object_store_slots(gix::odb::store::init::Slots::Given((1 << 15) - 1));
+    let repo = match gix::open_opts(&git_dir, options) {
         Ok(repo) => repo.into_sync(),
         Err(err) => {
             eprintln!("fatal: cannot open git repo at {git_dir}: {err}");
