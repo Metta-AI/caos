@@ -4401,11 +4401,15 @@ mod tests {
                 .unwrap();
             assert_eq!(recovered, pending);
             let outcome = if rejected {
-                conversation_protocol::v3::publication::Outcome::new(
-                    PublicationStatus::Conflict,
-                    "validation-rejected",
-                    Some("Invalid source".into()),
-                    None,
+                publish_source::reconcile(
+                    &recovered,
+                    conversation_protocol::v3::publication::Outcome::new(
+                        PublicationStatus::Conflict,
+                        "validation-rejected",
+                        Some("Source contains ignored files".into()),
+                        None,
+                    ),
+                    || panic!("validation rejection must not observe the remote"),
                 )
             } else {
                 // Git may resend after a lost acknowledgement and report a
@@ -4418,7 +4422,7 @@ mod tests {
                         None,
                         None,
                     ),
-                    Ok(Some(commit.clone())),
+                    || Ok(Some(commit.clone())),
                 )
             };
             publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();

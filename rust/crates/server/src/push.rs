@@ -84,7 +84,7 @@ pub(crate) fn endpoint(
         .truncate(false)
         .read(true)
         .write(true)
-        .open(locks.join(key))?;
+        .open(locks.join(&key))?;
     lock.lock()?;
 
     let receipt =
@@ -109,6 +109,16 @@ pub(crate) fn endpoint(
             Some(1) => return Err(reject("not-fast-forward")),
             _ => return Err(reject("validation-failed")),
         }
+    }
+    if ignored_files(
+        &input.destination,
+        &config.git_dir,
+        &input.commit,
+        &locks.join(format!("{key}.check")),
+    )
+    .map_err(|_| reject("validation-failed"))?
+    {
+        return Err(reject("ignored-files"));
     }
     let lease = format!(
         "--force-with-lease={refname}:{}",
@@ -159,6 +169,85 @@ pub(crate) fn endpoint(
         }
         Err(_) => receipt(PublicationStatus::Uncertain, None, "ambiguous", None),
     }
+}
+
+// The destination lock owns this scratch directory, including leftovers after
+// a crash. Only an index and path list are written: skip-worktree lets Git read
+// nested .gitignore blobs from the index without checking out source files.
+fn ignored_files(
+    destination: &str,
+    git_dir: &str,
+    commit: &str,
+    directory: &std::path::Path,
+) -> Result<bool, HttpError> {
+    use std::fs::{self, File};
+    if directory.exists() {
+        fs::remove_dir_all(directory)?;
+    }
+    fs::create_dir_all(directory.join("work"))?;
+    let directory = fs::canonicalize(directory)?;
+    let result = (|| {
+        let invalid = || HttpError::new(422, "Git ignore validation failed");
+        let run = |args: &[&str], stdin: Option<File>| -> Result<Vec<u8>, HttpError> {
+            let mut command = git_locator::import::git(destination, None).map_err(|_| invalid())?;
+            command
+                .args(["--git-dir", git_dir, "-c", "core.bare=false"])
+                .args(["-c", "core.sparseCheckout=false", "--work-tree"])
+                .arg(directory.join("work"))
+                .env("GIT_INDEX_FILE", directory.join("index"))
+                .args(args);
+            if let Some(input) = stdin {
+                command.stdin(input);
+            }
+            let output = command.output().map_err(|_| invalid())?;
+            if !output.status.success() {
+                return Err(invalid());
+            }
+            Ok(output.stdout)
+        };
+        run(&["read-tree", commit], None)?;
+        // Only regular ignore files may supply patterns. Marking a symlink
+        // skip-worktree would make Git's index fallback parse its link target.
+        let mut patterns = Vec::new();
+        for entry in run(&["ls-files", "--stage", "-z"], None)?
+            .split(|b| *b == 0)
+            .filter(|entry| entry.starts_with(b"100644 ") || entry.starts_with(b"100755 "))
+        {
+            let path = entry
+                .splitn(2, |b| *b == b'\t')
+                .nth(1)
+                .ok_or_else(invalid)?;
+            if path == b".gitignore" || path.ends_with(b"/.gitignore") {
+                patterns.extend_from_slice(path);
+                patterns.push(0);
+            }
+        }
+        if patterns.is_empty() {
+            return Ok(false);
+        }
+        let paths = directory.join("paths");
+        fs::write(&paths, patterns)?;
+        run(
+            &["update-index", "--skip-worktree", "-z", "--stdin"],
+            Some(File::open(paths)?),
+        )?;
+        // Explicit per-directory rules exclude host/global/info/exclude policy.
+        // --cached deliberately checks tracked entries too: this is a publication
+        // rule, stricter than Git's ordinary admission of untracked files.
+        Ok(!run(
+            &[
+                "ls-files",
+                "--cached",
+                "--ignored",
+                "--exclude-per-directory=.gitignore",
+                "-z",
+            ],
+            None,
+        )?
+        .is_empty())
+    })();
+    fs::remove_dir_all(directory)?;
+    result
 }
 
 // Only a per-ref porcelain rejection proves the receiver refused this update.
