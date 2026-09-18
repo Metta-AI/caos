@@ -1203,6 +1203,8 @@ impl Evidence {
                 | "ref-converged"
                 | "ref-drift"
                 | "lease-rejected"
+                | "validation-rejected"
+                | "push-rejected"
                 | "ambiguous"
                 | "operator-resolution"
         ) {
