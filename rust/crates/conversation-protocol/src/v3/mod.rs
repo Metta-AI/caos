@@ -9,6 +9,7 @@ pub mod ids;
 pub mod kinds;
 pub mod oid;
 pub mod paths;
+pub mod publication;
 pub mod reconcile;
 pub mod records;
 pub mod refs;
