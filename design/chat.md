@@ -355,65 +355,15 @@ the user's message. The source path is explicit in both commands.
 Browser selection does not choose checkout or publication targets, and does not
 change the agent's execution context.
 
-## Publishing with `/pr`
+## Publishing
 
-The user enters:
+The agent uses publish_source(source_tree, repository, branch) to publish an
+exact code commit and github(repository, args, stdin?) for PRs and stacks.
+Publication receipts remain in the conversation; source gitlinks do not move.
+The TUI's /pr and /publish-branch commands are removed.
 
-```text
-/pr feature/01-change main
-```
-
-The client:
-
-1. Reads the commit referenced by `feature/01-change`. That path also supplies
-   the proposed remote branch name.
-2. Determines the destination repository from an explicit optional URL or
-   unambiguous import provenance matching the oldest sibling's commit.
-3. Fetches the requested base branch, here `main`, and checks the source commit.
-4. Shows the source path and hash, repository, branch, and base for review.
-5. On Enter, rechecks the selected snapshot and remote state, pushes the exact
-   source commit with its history, and opens or updates the PR using the client's
-   Git and GitHub credentials. Escape cancels.
-6. Records the confirmed push as a `CAOS` message. Successful PR creation or
-   update adds another message with the PR URL, branch, and base.
-
-The full syntax is `/pr <conversation/gitlink> <base-remote-branch> [remote-URL]`.
-The base branch is explicit. The optional remote is a repository URL, not a
-local remote name such as `origin`. Missing or ambiguous provenance requires
-that URL. The preview shows destination metadata, not a full PR diff.
-
-For a stack, publish each boundary in order:
-
-```text
-/pr feature/01-change main
-/pr feature/02-tests feature/01-change
-```
-
-The preceding branch must exist remotely before it can serve as the next base.
-Publication does not squash source history or change the conversation's gitlinks.
-`/publish-branch <conversation/gitlink> [remote-URL]` provides the same preview
-and branch push without a PR or base-branch requirement.
-
-### When the PR base needs integrating
-
-The source and remote base must share Git history. If the source does not contain
-the fetched base tip, the preview offers a different action:
-
-1. On Enter, import that exact base commit under `imports/pr-base-<commit>/base`.
-2. Send a message asking the agent to merge or rebase it into the named source
-   and run checks.
-3. After integration, the user runs `/pr` again to review the result.
-
-That confirmation imports and sends the message; it publishes nothing. A failed
-import sends no message. The handoff preserves the user's draft and stays in the
-original conversation.
-
-Before integrating, the agent checks the full proposed PR scope. Merging upstream
-retains inherited branch changes; moving only a small requested edit onto a new
-base requires deciding which changes to carry over.
-
-Publication rejects changed snapshots, remote drift, unrelated histories,
-conflict markers, and any remaining source-tree `.caos` entry. It never cleans
-files or rewrites the reviewed commit at push time. Interrupted pushes are
-checked against the destination before retrying, and failed PR operations do
-not record a successful PR.
+See [agent publication and stacks](agent-publish.md) for the server endpoint,
+leases, invocation records and stack updates. The agent checks the complete
+PR scope and tests before publication. Integrating upstream retains inherited
+changes; transplanting only a small edit onto a different base is a separate
+operation.

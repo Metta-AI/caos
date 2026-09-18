@@ -377,7 +377,7 @@ with no `@param` tags takes no parameters: the source tree IS its input.
 - Tools are discovered fresh from the CURRENT source tree on every LLM round and
   resolved again at INVOCATION time, so an agent that edits a tool sees the
   change on its next call, within the same turn
-- `bash`, `grep`, `read`, `ls`, `write`, `edit`, and `import_source` are reserved. A
+- `bash`, `grep`, `read`, `ls`, `write`, `edit`, `import_source`, `publish_source`, and `github` are reserved. A
   `caos-tools/bash/` is ignored, not registered — the model's primitives,
   including the repair path for a broken tool edit, stay stable whatever the
   tree carries
@@ -616,24 +616,23 @@ revision (and made the history tools' hashes readable the same way).
   resolution turn (a leftover marker does not compile) — not by a marker
   re-scan, which cannot tell a real marker from a bad resolution.
 - The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
-  remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
+  remaining marker is PUBLISH (the server push endpoint) — the moment work
   actually leaves the conversation.
 
 ## Publication
 
-The [conversation publication flow](design/chat.md) publishes one named gitlink
-with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
-branch name. The base is explicit; an omitted URL comes from unambiguous import
-provenance. Directory ordering guides review, not publication. Publish earlier
-PRs first, then name their remote branches as later PR bases.
+The agent's publish_source(source_tree, repository, branch) records the exact
+source commit and expected remote head before invoking caos push-git.
+POST /git/push validates that code commit and pushes it directly from the
+server's bare repository using an explicit lease and fast-forward check.
+Publication does not edit the source or squash its history.
 
-The client previews the exact source commit and destination before confirmation.
-If the source does not contain the fetched base tip, it offers to import that
-base and send the agent a merge/rebase and test request. This action publishes
-nothing; run `/pr` again after integration. Successful pushes and PR operations
-are recorded as CAOS transcript entries. No snapshot has a special working or
-sealed state.
+github(repository, args, stdin?) runs the general std/github worker.
+Every tool call gets a fresh invocation identity. A Git compare-and-swap claim
+prevents a retried worker from repeating a possibly completed command.
+An unfinished claim is uncertain; inspect GitHub before proceeding.
 
-Per-mutation commits remain in the published source tree history. Only the
-previewed PR tip is checked for unresolved conflicts and reserved state;
-intermediate commits may contain conflict markers or fail to build.
+PR and stack operations compose these tools. Stack boundaries remain gitlinks;
+publish bottom to top and link existing PR URLs with gh stack link.
+The TUI's /pr and /publish-branch are removed; /import remains for local paths.
+See [agent publication](design/agent-publish.md) for mechanics and recovery.
