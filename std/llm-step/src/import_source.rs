@@ -35,6 +35,11 @@ fn is_github_remote(source: &str) -> bool {
     })
 }
 
+pub(super) fn token_file(source: &str) -> Option<&'static str> {
+    (is_github_remote(source) && Path::new("/secret/github-token").exists())
+        .then_some("/secret/github-token")
+}
+
 fn free_destination(view: &Conversation<'_>, into: &str) -> Result<(), String> {
     for name in [into.to_string(), format!("{into}.source.json")] {
         // entry refuses traversal through a gitlink, file or symlink as well.
@@ -58,8 +63,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         into,
     } = &args;
     let revision = revision.as_deref();
-    let token_file = (is_github_remote(source) && Path::new("/secret/github-token").exists())
-        .then_some("/secret/github-token");
+    let token_file = token_file(source);
     if let Err(error) = free_destination(&state.conversation()?, into) {
         return site.fail(state, &error);
     }
