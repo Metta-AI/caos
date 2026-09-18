@@ -244,6 +244,12 @@ def main():
             checks = git_commands.read_text()[len(commands):].splitlines()
             assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(second[0])
+            # Imported commits have no refs. Clients must still be able to
+            # fetch them before any conversation or branch has been created.
+            consumer = root / "consumer"
+            run("git", "init", "-q", str(consumer))
+            run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
+            assert run("git", "-C", str(consumer), "rev-parse", "FETCH_HEAD") == second[0]
             assert list((odb / "objects/pack").glob("*.pack"))
             before = len(observations)
             commands = git_commands.read_text()

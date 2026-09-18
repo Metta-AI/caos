@@ -64,13 +64,14 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     // bytes as pkt-lines and dies with "bad line length character", which the
     // client sees as "the remote end hung up unexpectedly". A small repo's request
     // is never gzipped, so this stayed latent until a real (large) repo hit it.
-    let (mut content_type, mut content_length, mut content_encoding) =
-        (String::new(), String::new(), String::new());
+    let (mut content_type, mut content_length, mut content_encoding, mut git_protocol) =
+        (String::new(), String::new(), String::new(), String::new());
     for header in request.headers() {
         match header.field.as_str().as_str().to_ascii_lowercase().as_str() {
             "content-type" => content_type = header.value.as_str().to_string(),
             "content-length" => content_length = header.value.as_str().to_string(),
             "content-encoding" => content_encoding = header.value.as_str().to_string(),
+            "git-protocol" => git_protocol = header.value.as_str().to_string(),
             _ => {}
         }
     }
@@ -110,6 +111,8 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
         .env("CONTENT_TYPE", &content_type)
         .env("CONTENT_LENGTH", &content_length)
         .env("HTTP_CONTENT_ENCODING", &content_encoding)
+        // Protocol v2 can fetch by hash even when the store advertises no refs.
+        .env("HTTP_GIT_PROTOCOL", &git_protocol)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
