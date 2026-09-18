@@ -6,6 +6,7 @@ Uses ephemeral loopback ports.
 """
 import base64
 import concurrent.futures
+import gzip
 import hashlib
 import http.server
 import json
@@ -59,7 +60,7 @@ def main():
         git_bin.mkdir()
         git_shim = git_bin / "git"
         git_shim.write_text("#!/bin/sh\nfor arg do\n"
-            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index|pack-objects|index-pack)\n'
+            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index|pack-objects|index-pack|push)\n'
             "printf '%s\\n' \"$arg\" >> " + shlex.quote(str(git_commands)) + "; break;;\n"
             "esac\ndone\nexec " + shlex.quote(shutil.which("git")) + ' "$@"\n')
         git_shim.chmod(0o755)
@@ -103,6 +104,8 @@ def main():
             def serve(self):
                 path, _, query = self.path.partition("?")
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
                 if path.startswith("/surplus.git/"):
                     if self.command == "GET":
                         payload = (packet(b"# service=git-upload-pack\n") + b"0000"
@@ -547,6 +550,83 @@ def main():
                 head = run(*args, env=env)
                 call(payload(head))
                 return head
+            # Publication checks the exact snapshot against its own ignore rules.
+            # Files here are intentionally tracked; ordinary git-add admission
+            # would not catch them. The server must neither rewrite nor push them.
+            def ignore_snapshot(files, parent=first[0]):
+                index_env = dict(env, GIT_INDEX_FILE=str(root / "ignore-index"))
+                run("git", "--git-dir", str(origin), "read-tree", "--empty", env=index_env)
+                entries = b""
+                for name, content in files.items():
+                    mode = "100644"
+                    if isinstance(content, tuple):
+                        mode, content = content
+                    blob = run("git", "--git-dir", str(origin), "hash-object", "-w", "--stdin",
+                               input=content.encode())
+                    entries += f"{mode} {blob}\t{name}\0".encode()
+                run("git", "--git-dir", str(origin), "update-index", "-z", "--index-info",
+                    input=entries, env=index_env)
+                tree = run("git", "--git-dir", str(origin), "write-tree", env=index_env)
+                return source_commit(tree, parent)
+
+            cases = [
+                ({"results/out": "generated", ".gitignore": "results/\n"}, True),
+                ({".gitignore": "*.log\n!keep.log\n", "keep.log": "kept"}, False),
+                ({".gitignore": "*.log\n", "sub/.gitignore": "!keep.log\n",
+                  "sub/keep.log": "kept"}, False),
+                ({"sub/.gitignore": "*.tmp\n", "sub/a.tmp": "generated"}, True),
+                ({".gitignore": "sub/\n", "sub/.gitignore": "!keep\n",
+                  "sub/keep": "parent exclusion wins"}, True),
+                ({".gitignore": "*.log\n", "a space/line\nbreak.log": "generated"}, True),
+                ({".gitignore": "*.log\n", "link.log": ("120000", "elsewhere")}, True),
+                ({".gitignore": "cache/\n", "cache": ("120000", "elsewhere")}, False),
+                ({".gitignore": ("120000", "rules"), "rules": "*.log\n", "file.log": "kept"}, False),
+                ({".gitignore": "/root-only\n", "sub/root-only": "kept"}, False),
+                ({".gitignore": "*.tmp\n", "ordinary.txt": "kept"}, False),
+            ]
+            # Host policy and the server's index must not influence the check.
+            (odb / "info").mkdir(exist_ok=True)
+            (odb / "info/exclude").write_text("ordinary.txt\n")
+            global_excludes = root / "server-excludes"
+            global_excludes.write_text("ordinary.txt\n")
+            run("git", "--git-dir", str(odb), "config", "core.excludesFile", str(global_excludes))
+            (odb / "index").write_bytes(b"server index must remain untouched")
+            ignored_head = None
+            for number, (files, ignored) in enumerate(cases):
+                head = ignore_snapshot(files)
+                branch = f"ignore-{number}"
+                git_commands.write_text("")
+                if ignored:
+                    ignored_head = head
+                    assert json.loads(push(head, branch=branch, expected=422))["code"] == "ignored-files"
+                    assert "push" not in git_commands.read_text().splitlines()
+                    assert subprocess.run(["git", "--git-dir", str(published), "show-ref",
+                        "--verify", "--quiet", "refs/heads/" + branch]).returncode == 1
+                else:
+                    try:
+                        assert push(head, branch=branch)["status"] == "complete"
+                    except AssertionError as error:
+                        raise AssertionError(f"ignore case {number}: {files!r}") from error
+                    assert remote_head(branch) == head
+                assert (odb / "index").read_bytes() == b"server index must remain untouched"
+                assert not list((odb / "caos-pushes").glob("*.check"))
+            # Rejected updates leave an existing branch and exact lease intact.
+            assert push(first[0], branch="ignore-update")["status"] == "complete"
+            assert json.loads(push(ignored_head, branch="ignore-update", old=first[0],
+                                   expected=422))["code"] == "ignored-files"
+            assert remote_head("ignore-update") == first[0]
+            if cli:
+                rejected = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
+                                          "--expected=absent", env=cli_env))
+                assert rejected["kind"] == "validation-rejected"
+                assert ".gitignore" in rejected["diagnostic"]
+                assert "no push was attempted" in rejected["diagnostic"]
+            # This is a tip-tree policy, not a history scrub.
+            cleaned = ignore_snapshot({"ordinary.txt": "kept"}, parent=ignored_head)
+            assert push(cleaned, branch="ignore-cleaned")["status"] == "complete"
+            (odb / "index").unlink()
+            (odb / "info/exclude").unlink()
+            run("git", "--git-dir", str(odb), "config", "--unset", "core.excludesFile")
             empty = run("git", "--git-dir", str(origin), "mktree", input=b"")
             reserved = run("git", "--git-dir", str(origin), "mktree", input=f"040000 tree {empty}\t.caos\n".encode())
             assert push(source_commit(reserved), branch="reserved")["status"] == "complete"
@@ -555,7 +635,7 @@ def main():
             marked = source_commit(marked_tree, first[0])
             assert push(marked, branch="markers")["status"] == "complete"
             assert remote_head("markers") == marked
-            # Source policy belongs to the agent; the endpoint transfers exact commits.
+            # Conflict resolution belongs to the agent; the endpoint transfers exact commits.
             clean = source_commit(first[1], marked)
             assert push(clean, branch="resolved")["status"] == "complete"
             genesis_env = dict(env, GIT_AUTHOR_NAME="caos", GIT_AUTHOR_EMAIL="caos@caos",

@@ -5,6 +5,7 @@ pub fn diagnostic(code: &str) -> Option<&'static str> {
         "missing-commit" => "The server does not hold the source commit. Import it before publishing.",
         "missing-expected" => "The server does not hold the expected remote head. Import it before publishing.",
         "not-fast-forward" => "The update is not a fast-forward. Import and merge the remote head before publishing.",
+        "ignored-files" => "The source commit contains files matched by its .gitignore rules. Remove those files or adjust the ignore rules before publishing; no push was attempted.",
         "validation-failed" => "The server could not validate the source commit; no push was attempted.",
         "lease-rejected" => "The remote head does not match the pinned lease. Inspect it before importing and integrating changes.",
         "hook-declined" => "The remote rejected the push: a receive hook declined it. Check repository rules and branch protection.",

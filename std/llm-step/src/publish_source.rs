@@ -3,7 +3,7 @@ use super::*;
 use conversation_protocol::v3::publication::Outcome;
 use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
-pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint pushes the commit unchanged; it does not filter files or apply .gitignore. This does not create a PR or change the source gitlink. Only fast-forward updates are supported: import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR or change the source gitlink. Only fast-forward updates are supported: import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
 @param branch Destination branch name (without refs/heads/).";
 
@@ -172,11 +172,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                         value["diagnostic"].as_str().map(str::to_owned),
                         observed,
                     );
-                    if status == PublicationStatus::Complete {
-                        outcome
-                    } else {
-                        reconcile(&pending, outcome, observe())
-                    }
+                    reconcile(&pending, outcome, observe)
                 }
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
@@ -203,9 +199,16 @@ pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<Stri
 pub(super) fn reconcile(
     pending: &PublicationRecord,
     outcome: Outcome,
-    observed: Result<Option<Oid>, String>,
+    observe: impl FnOnce() -> Result<Option<Oid>, String>,
 ) -> Outcome {
-    match observed {
+    // A local/server validation refusal means no push was attempted. A remote
+    // head that already matches must not hide the rejection or its diagnostic.
+    if outcome.status == PublicationStatus::Complete
+        || outcome.evidence.kind == "validation-rejected"
+    {
+        return outcome;
+    }
+    match observe() {
         Ok(head) if head.as_ref() == Some(&pending.planned_head) => {
             Outcome::new(PublicationStatus::Complete, "ref-converged", None, head)
         }
