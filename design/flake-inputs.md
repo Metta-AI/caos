@@ -145,13 +145,19 @@ Rules:
 - `dir=` selects a subtree within the repo.
 
 Why commit-then-path (not a bare subtree hash): **GitHub only serves *commits***
-(`allowReachableSHA1InWant`), so `git fetch --depth 1 <url> <rev>` is the
+(`allowReachableSHA1InWant`), so `git fetch <url> <rev>` is the
 fetchable granularity; `dir` selects within it. The commit is also the pin.
 
-Resolution (stage 4, client, eval time): `git fetch --depth 1 <url> <rev>` →
+Resolution (stage 4, client, eval time): `git fetch <url> <rev>` →
 verify rev → peel → descend `dir` → ingest closure → **the oid is the arg
 entry**, byte-for-byte as if from a local `:@=`. URL/rev are fetch coordinates
 and provenance (trace), never part of the key.
+
+Fetch with --depth=1 into a temporary bare repository, then pack only the
+root tree and its trees/blobs into the caller's object store. The shallow commit
+and boundary file stay in the temporary repository. This bounds the transfer
+to the snapshot without making later CAOS uploads shallow. Full source-history
+imports use the server import endpoint instead.
 
 Parser safety (verified against current code): the token is whitespace-free;
 `split_once('=')` takes the **first** `=`, so `?rev=…&dir=…` survives in the
@@ -172,7 +178,7 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
   the time a worker sees a `:@@=` arg it is an ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
   worker.
 - **Pin, fetch, then select** — the order is the content-addressing argument.
-  `git fetch --depth 1 <url> <rev>` (the granularity a host will serve), peel the
+  `git fetch <url> <rev>` (the granularity a host will serve), peel the
   commit to its tree, descend `dir=`. A `path:` skips the fetch and ingests a
   live local directory, exactly as `:@=` does.
 - **Wired in three places, each behaving like its `:@=` sibling** — that is the
@@ -182,8 +188,9 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
   evaluator (evaluated if it carries a `.caos-expr`, raw if not — the
   worker-vs-data rule, now factored out as `eval_if_evaluable` and shared).
 - **A rev is a pin, so re-resolving is free.** `fetch_git_ref` returns early when
-  the commit is already local; the test proves it by DELETING the source repo
-  and resolving again.
+  the commit is already local or a previous fetch retained its tree under
+  refs/caos/locator-trees/<commit>. That ref is both a commit-to-tree cache
+  and a GC root. The test deletes the source repository and resolves again.
 
 ### ⚠️ `git fetch` and a partial ALTERNATE object store
 
@@ -191,17 +198,11 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
 — which walks the tips of every **alternate** object store as well. A repo whose
 alternate holds a deliberate SUBSET then fails with `missing blob object <x>`
 naming an object that has nothing to do with the fetch, blamed on the fetch.
-The test harness creates exactly that shape (`dev/cli-test/run-test.sh` points the
-client at `/tmp/seed-git/objects`, "exactly what this test declared"), so
-`tests/remote-ref` failed the first time it ran — on a fetch that succeeds in
-any ordinary repo. The difference is the alternate, not the command.
+The old test harness created this shape; it no longer gives client repositories
+an alternate. Locator fetching now uses a fresh temporary repository, so it
+cannot accidentally walk the caller's alternate tips. Other fetches must decide
+whether alternate history is part of the closure they are completing.
 
-Fixed with `-c core.alternateRefsCommand=true` (a command that prints nothing)
-on **this fetch only**. Alternate tips are an EXCLUSION set, so dropping them
-makes the check verify our closure and only ours — stricter, not looser — which
-is safe precisely because a `--depth 1` fetch is self-contained. Do NOT copy it
-to `fetch_object_negotiated`: a chat commit's history may legitimately live in
-an alternate, and there the tips are doing real work.
 
 ---
 
