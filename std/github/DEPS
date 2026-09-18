@@ -1,0 +1,5 @@
+../rustc rustc
+../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator
+../flake-builder flake-builder
+../../flake.lock flake.lock
