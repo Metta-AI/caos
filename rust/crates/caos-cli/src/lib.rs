@@ -2192,40 +2192,7 @@ pub fn origin_repository(t: &GitTransport) -> Result<String, String> {
 }
 
 fn reject_publish_caos(t: &GitTransport, commit: &Oid) -> Result<(), String> {
-    let listing = t.git_capture(
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            commit.as_str(),
-            "--",
-            ".caos",
-        ],
-        None,
-    )?;
-    if listing.lines().any(|path| path == paths::CONFLICTS_LEDGER) {
-        let contents = t.git_capture(
-            &["show", &format!("{commit}:{}", paths::CONFLICTS_LEDGER)],
-            None,
-        )?;
-        return Err(if contents.trim().is_empty() {
-            "the source tree has an empty `.caos/conflicts` file; remove it with bash before publishing (the removal is committed automatically)".into()
-        } else {
-            "the source tree has unresolved `.caos/conflicts` entries; resolve the listed paths and clear their ledger entries; saving the resolution removes empty merge metadata".into()
-        });
-    }
-    let root = t.git_capture(
-        &["ls-tree", "--name-only", commit.as_str(), "--", ".caos"],
-        None,
-    )?;
-    if root.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the source tree contains reserved `.caos` content; record a cleaned source-tree edit before publishing:\n{}",
-            if listing.trim().is_empty() { ".caos/ (empty directory)" } else { listing.trim_end() }
-        ))
-    }
+    git_locator::publish::reject_caos(commit.as_str(), |args| t.git_capture(args, None))
 }
 
 fn same_publication_intent(left: &PublicationRecord, right: &PublicationRecord) -> bool {
