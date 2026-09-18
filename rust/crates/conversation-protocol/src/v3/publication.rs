@@ -1,4 +1,4 @@
-//! Publication outcomes shared by the host and agent publishers.
+//! Agent publication outcomes and reconciliation.
 use super::{Evidence, Oid, PublicationRecord, PublicationStatus};
 
 pub struct Outcome {
