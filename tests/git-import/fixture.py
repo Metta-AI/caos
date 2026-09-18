@@ -511,6 +511,12 @@ def main():
             rejected = push(first[0], branch="hooked")
             assert rejected["status"] == "conflict" and rejected["kind"] == "push-rejected"
             assert rejected["code"] == "hook-declined"
+            if cli:
+                rejected = json.loads(run(cli, "push-git", destination, first[0], "hooked",
+                    "--expected=absent", env=cli_env))
+                assert rejected["kind"] == "push-rejected"
+                assert "hook declined" in rejected["diagnostic"]
+                assert token not in json.dumps(rejected)
             hook.unlink()
             for branch in ["", "-x", "../main", "topic:other", "topic*", "topic.lock"]:
                 push(first[0], branch=branch, expected=400)
@@ -563,6 +569,22 @@ def main():
             assert push(first[0], branch="code-after-conversation")["status"] == "complete"
             assert push(first[0], branch="private-test", dest=private, credential="wrong-token")["status"] == "uncertain"
             assert push(first[0], branch="private-test", dest=private, credential=token)["status"] == "complete"
+            if cli:
+                receipt = json.loads(run(cli, "push-git", destination, second[0], "cli", "--expected=absent", env=cli_env))
+                assert receipt["commit"] == second[0] and receipt["status"] == "complete"
+                assert remote_head("cli") == second[0]
+                rejected = json.loads(run(cli, "push-git", destination, first[0], "cli",
+                                          "--expected=" + second[0], env=cli_env))
+                assert rejected["status"] == "conflict" and rejected["kind"] == "validation-rejected"
+                assert "not a fast-forward" in rejected["diagnostic"]
+                local_failure = subprocess.run([cli, "push-git", destination, first[0], "local",
+                    "--expected=absent", "--github-token-file=" + str(root / "no-such-token")],
+                    env=cli_env, capture_output=True)
+                assert local_failure.returncode == 1 and not local_failure.stdout
+                assert remote_head("cli") == second[0]
+                for extra in [[], ["--expected=main"], ["--expected=absent", "--expected=absent"]]:
+                    invalid = subprocess.run([cli, "push-git", destination, second[0], "cli", *extra], env=cli_env, capture_output=True)
+                    assert invalid.returncode != 0
             # Small uploads now stay packed too. The live reader must discover
             # more packs than gix's default capacity of 32 without a restart.
             for index in range(40):
@@ -577,6 +599,7 @@ def main():
             staged_tip = advance(packed[0])
             for kind, oid in [("blob", staged_tip[2]), ("tree", staged_tip[1]), ("commit", staged_tip[0])]:
                 post_from_origin(kind, oid)
+            print("git-push: creation, fast-forward, stale and racing leases, lost responses, duplicate requests, guards and CLI PASS")
             stop(server); server = None
             server = start()
             visible(posted_child[0])
