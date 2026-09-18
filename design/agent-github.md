@@ -1,7 +1,8 @@
-# Importing and PRs
+# Importing and publishing
 
-Imports use three layers: the server endpoint, `caos import-git`, and the
-agent's `import_source` tool. PR publication and merge drafts come later.
+Imports are implemented through the server endpoint, `caos import-git`, and
+the agent's `import_source` tool. Publication proceeds through branches, PRs
+and stacks. Separate merge drafts remain a follow-up.
 
 ## Importing
 
@@ -46,6 +47,7 @@ Supply the token through the existing secret store:
 name=github-token
 value:@=.github-token-value
 reader=std/llm-step
+reader=std/github
 ```
 
 Keep the value file ignored and run `caos secrets` to initialize its entropy.
@@ -59,55 +61,26 @@ stay out of URLs, Git config, saved arguments, provenance, and logs. Automatic
 GitHub credentials apply only to `github.com` on the default HTTPS port.
 Public imports need no token. Importing needs neither `gh` nor another worker.
 
-## PRs
+## Publishing
 
-Add `std/github` with Git, `gh`, and a pinned
-[`gh-stack` extension](https://github.com/github/gh-stack). Give it access to
-the same `github-token` secret, exposed to `gh` as `GH_TOKEN`.
+The [publication design](agent-publish.md) separates the remaining work:
 
-Expose a general `gh` operation accepting arguments, repository, stdin, and
-input/output files. Return exit status, stdout, stderr, and requested files.
-Use a small `git_push` helper to publish a selected source commit and its history,
-requiring the remote branch to match an expected head. The server can later
-perform this transfer directly, as it does imports.
+- **Branches:** `POST /git/push`, `caos push-git` and `publish_source` push
+  exact code commits from the server with a lease. Each layer has its own
+  implementation PR.
+- **PRs:** separate PRs add the `std/github` worker and agent `github` tool. Next, validate the agent's create, update and review workflow using
+  `gh`, with explicit repositories and branch names.
+- **Stacks:** keep code boundaries in gitlinks, publish bottom to top, and
+  use `gh stack link` with existing PR URLs. Validate linking, propagation
+  and landing without a source checkout in the GitHub worker.
 
-Create PRs with explicit repository, head, and base. Inspect existing PRs before
-creating duplicates or replacing human-edited metadata. Conversation data and
-merge bookkeeping stay outside published history. Once agent publication works,
-remove `/pr`, `/publish-branch`, and their UI.
-
-### Stacks
-
-Keep each stack boundary as a source gitlink:
-
-```text
-imports/repo/base   -> H
-feature/01-core     -> A   parent H
-feature/02-tests    -> B   parent A
-```
-
-Start each layer by copying the preceding snapshot with `cp -a`, then editing
-the copy. Git ancestry records the dependency. Push A and B to corresponding
-remote branches; the first PR targets `main`, the second targets the first
-branch. If A changes, merge its new commit into B, test, and push.
-
-Link the existing PR URLs in order with
-[`gh stack link`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands#gh-stack-link):
-
-```sh
-GH_REPO=owner/repo gh stack link --base main \
-  https://github.com/owner/repo/pull/123 \
-  https://github.com/owner/repo/pull/124
-```
-
-This needs no local stack branches. Commands such as `push`, `submit`, and
-`rebase` do require local branches and stack metadata. Supporting them would
-mean reconstructing that local repository from gitlinks and returning any
-rewritten commits to CAOS. Use CAOS's copy, edit, and merge operations initially,
-and `link` to publish the relationship. `modify` additionally requires linear
-history, so it cannot restructure stacks containing merge commits.
+The TUI's `/pr` and `/publish-branch` commands are removed. The follow-ups
+start with workflow instructions and integration tests using these tools.
 
 ### Merges
+
+This section is a follow-up proposal. Current merges still use source-tree
+conflict ledgers and the publication guards described in SPEC.md.
 
 Clean merges use the existing merge worker. On conflict, preserve the source O
 and keep the attempt beside it in the conversation:
@@ -138,11 +111,3 @@ is not proof that structural conflicts are resolved. Delegate by copying the
 whole attempt with `cp -a`, harvesting the edited draft, and then finishing.
 Abandoning an attempt leaves the source unchanged. Handle old source-tree
 conflict ledgers before removing their compatibility cleanup.
-
-### Retrying GitHub writes
-
-Use the tool call's durable identity to claim an operation before executing it
-and record its result afterwards. A duplicate attempt must not repeat a started
-write. After a crash or partial success, inspect GitHub before continuing;
-do not automatically retry arbitrary writes. Merge computation remains cached
-by its inputs; draft edits and completion use conditional conversation updates.
