@@ -49,16 +49,12 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>) {
     render_composer(
         state,
         app.view,
-        !app.selection_locked
-            && app.palette.is_none()
-            && state.publish_plan.is_none()
-            && app.focus() == Focus::Conversation,
+        !app.selection_locked && app.palette.is_none() && app.focus() == Focus::Conversation,
         frame,
         areas.composer,
     );
     render_footer(app, frame, areas.footer);
     render_command_palette(app, frame);
-    render_publication_plan(app, frame);
     render_screen_selection(app, frame);
 }
 
@@ -312,7 +308,7 @@ pub(super) fn conversation_at(app: &App, terminal: Rect, column: u16, row: u16) 
 }
 
 fn chat_areas(state: &ConversationState, area: Rect) -> (Rect, Option<Rect>) {
-    if !state.running && !state.publishing && !state.source_tree_operation {
+    if !state.running && !state.source_tree_operation {
         return (area, None);
     }
     let split = Layout::default()
@@ -379,14 +375,9 @@ fn render_header(app: &App, state: &ConversationState, frame: &mut Frame<'_>, ar
             Style::default().fg(Color::Cyan),
         );
     }
-    if state.running || state.publishing {
+    if state.running {
         push_metadata(
-            if state.publishing {
-                "publishing"
-            } else {
-                "running"
-            }
-            .to_string(),
+            "running".to_string(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -459,8 +450,6 @@ fn render_conversations(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 ("*", Color::Yellow)
             } else if state.generating_title {
                 ("~", Color::Magenta)
-            } else if state.publishing {
-                ("^", Color::Cyan)
             } else {
                 (" ", Color::DarkGray)
             };
@@ -548,8 +537,6 @@ fn render_live_activity(
         ("Importing", state.status.as_str())
     } else if let Some(activity) = state.running_activity() {
         (activity.running_verb(), activity.running_summary())
-    } else if state.publishing {
-        ("Publishing", state.status.as_str())
     } else {
         (
             match state.turn_phase {
@@ -1643,8 +1630,6 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
         ))
     } else if app.palette.is_some() {
         Line::raw(" Command palette: type to filter  Up/Dn select  Enter runs  Esc closes")
-    } else if app.selected().publish_plan.is_some() {
-        Line::raw(" Publication: Enter confirms  Esc cancels")
     } else if app.focus() == Focus::List {
         Line::raw(
             " Conversations: Up/Dn select  Enter opens  ^N new  ^Shift+P commands  ^Up/Dn switch  ^C quit",
@@ -1667,7 +1652,7 @@ fn render_footer(app: &App, frame: &mut Frame<'_>, area: Rect) {
             ""
         };
         Line::raw(format!(
-            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  /checkout  /pr  ^O files  ^H help{escape}  ^C quit"
+            " {send_shortcut} send  Enter/^J newline  ^Shift+P commands  /checkout  ^O files  ^H help{escape}  ^C quit"
         ))
     };
     frame.render_widget(Paragraph::new(footer), area);
@@ -1701,78 +1686,6 @@ pub(super) fn paragraph_scroll(paragraph: &Paragraph<'_>, area: Rect, scroll: &S
 pub(super) fn scroll_offset(line_count: usize, height: u16, scroll: &ScrollState) -> u16 {
     let visible = height.saturating_sub(2) as usize;
     scroll.resolve(line_count.saturating_sub(visible))
-}
-
-fn render_publication_plan(app: &App, frame: &mut Frame<'_>) {
-    let Some(prompt) = &app.selected().publish_plan else {
-        return;
-    };
-    let area = frame
-        .area()
-        .centered(Constraint::Percentage(90), Constraint::Length(17));
-    frame.render_widget(Clear, area);
-    let mut lines = Vec::new();
-    if prompt.loading {
-        lines.push(Line::from("Loading publication preview…"));
-    } else if let Some(target) = &prompt.target {
-        lines.push(Line::from(format!(
-            "Source: {}  {}",
-            target.source_tree,
-            short_hash(&target.head)
-        )));
-        lines.push(Line::from(format!("Repository: {}", target.repository)));
-        lines.push(Line::from(format!("Branch: {}", target.branch)));
-        if !prompt.branch_only {
-            lines.push(Line::from(format!(
-                "PR base: {}  {}",
-                target.base_branch,
-                target
-                    .base_commit
-                    .as_deref()
-                    .map(short_hash)
-                    .unwrap_or_default()
-            )));
-        }
-        lines.push(Line::from(""));
-        if let Some(path) = &target.base_import {
-            lines.push(Line::from("The source does not contain this PR base."));
-            lines.push(Line::from(format!("Import to: {path}")));
-            lines.push(Line::from(
-                "Enter imports the base and asks the agent to merge or rebase it and test.",
-            ));
-            lines.push(Line::from(
-                "Nothing is published. Run /pr again after reviewing the result.",
-            ));
-        } else {
-            lines.push(Line::from(if prompt.branch_only {
-                "Enter pushes this commit without creating a PR."
-            } else {
-                "Enter pushes this commit and opens or updates its PR."
-            }));
-        }
-    }
-    if let Some(error) = &prompt.error {
-        lines.push(Line::styled(
-            error.as_str(),
-            Style::default().fg(Color::Red),
-        ));
-    }
-    lines.push(Line::from(
-        "Esc cancels. To change the target, run the command again.",
-    ));
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(if prompt.branch_only {
-                    " Publish branch "
-                } else {
-                    " Publish PR "
-                })
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        area,
-    );
 }
 
 #[cfg(test)]
