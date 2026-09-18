@@ -28,7 +28,10 @@ const MAX_ENTRIES: usize = 1_000;
 
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
-    matches!(name, "read" | "ls" | "write" | "edit" | "import_source")
+    matches!(
+        name,
+        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source"
+    )
 }
 
 /// Help text for the built-in tools, authored exactly like a caos-tools
@@ -109,6 +112,7 @@ pub fn grep_declaration() -> Value {
 /// are standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
     "import_source",
+    "publish_source",
     "bash",
     "grep",
     "read",
