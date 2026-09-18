@@ -119,7 +119,8 @@ checkout; `--base <revision>` selects a revision for that shorthand.
 For example, `--import imports/repo/base /path/to/repo main` imports a local
 branch, and `--import imports/repo/base https://github.com/owner/repo.git <full-commit-hash>`
 imports a pinned remote commit. An explicit source also works when launching
-outside a Git checkout.
+outside a Git checkout. Startup imports appear in conversation history as CAOS
+`Imported at <path>: <commit>` entries, just like `/import`.
 
 Credentials, server configuration, caches, and checkout destinations stay on the
 client machine. The agent's host-side requests are communicated as concrete TUI

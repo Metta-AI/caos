@@ -649,7 +649,19 @@ fn mint_conversation_root(
         content,
     };
     let tree = apply(store, None, &transition)?;
-    mint(store, &genesis, &tree, transition.kind(), signature)
+    let mut head = mint(store, &genesis, &tree, transition.kind(), signature)?;
+    for (name, source) in Conversation::open(store, &head)?.source_trees()? {
+        let notice = Transition::MessageAppend {
+            entry: system_entry(
+                id,
+                format!("import-{head}"),
+                format!("Imported at {name}: {}", source.commit),
+            ),
+            payloads: Vec::new(),
+        };
+        head = mint_transition(store, &head, &notice, signature)?;
+    }
+    Ok(head)
 }
 
 /// Create a durable conversation before its first message, so attachments and
@@ -4681,12 +4693,17 @@ mod tests {
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         std::fs::remove_file(ref_lock).unwrap();
         assert_eq!(load.snapshot.status, TurnStatus::Queued);
-        assert_eq!(load.replay.turns[0].message, "hello");
+        assert_eq!(load.replay.turns[0].role, ConversationRole::System);
+        assert_eq!(
+            load.replay.turns[0].message,
+            format!("Imported at main: {base}")
+        );
+        assert_eq!(load.replay.turns[1].message, "hello");
         assert_eq!(load.source_trees[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
         let store = open_store(&transport).unwrap();
         let first_message = store.read_commit(&head).unwrap().parents[0].to_string();
-        assert_eq!(load.replay.turns[0].commit, first_message);
+        assert_eq!(load.replay.turns[1].commit, first_message);
         assert!(validate_spine(&store, &head, &mut HashSet::new()).is_ok());
         let mut cursor = head.clone();
         loop {
@@ -4780,9 +4797,9 @@ mod tests {
             .unwrap()
             .unwrap()
             .replay;
-        assert_eq!(replay.turns.len(), 3);
-        assert_eq!(replay.turns[0].commit, first_message);
-        assert_eq!(replay.turns[1].commit, active_head.to_string());
+        assert_eq!(replay.turns.len(), 4);
+        assert_eq!(replay.turns[1].commit, first_message);
+        assert_eq!(replay.turns[2].commit, active_head.to_string());
         assert_eq!(
             replay
                 .turns
@@ -4790,7 +4807,7 @@ mod tests {
                 .map(|turn| &turn.commit)
                 .collect::<HashSet<_>>()
                 .len(),
-            3
+            4
         );
 
         interrupt_request(&transport, "talk-1").unwrap();
@@ -4845,7 +4862,7 @@ mod tests {
             conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
-        let (_, entry) = conversation.transcript_entry(1).unwrap().unwrap();
+        let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
         assert!(matches!(
             entry.source_tree_resolution,
             Some(SourceTreeResolution::Direct { .. })
@@ -4875,7 +4892,7 @@ mod tests {
             conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
-        let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
+        let (_, entry) = conversation.transcript_entry(3).unwrap().unwrap();
         assert!(matches!(
             entry.source_tree_resolution,
             Some(SourceTreeResolution::Conflict { .. })
@@ -4931,7 +4948,7 @@ mod tests {
             conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
-        let (_, entry) = conversation.transcript_entry(1).unwrap().unwrap();
+        let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
         assert!(matches!(
             entry.source_tree_resolution,
             Some(SourceTreeResolution::Direct { .. })
@@ -4962,7 +4979,7 @@ mod tests {
             conversation.source_tree("main").unwrap().unwrap().commit,
             oid(&ours, "ours").unwrap()
         );
-        let (_, entry) = conversation.transcript_entry(2).unwrap().unwrap();
+        let (_, entry) = conversation.transcript_entry(3).unwrap().unwrap();
         assert!(matches!(
             entry.source_tree_resolution,
             Some(SourceTreeResolution::Conflict { .. })
@@ -5071,6 +5088,7 @@ mod tests {
             load.replay
                 .turns
                 .iter()
+                .filter(|turn| turn.role == ConversationRole::Human)
                 .map(|turn| turn.message.as_str())
                 .collect::<Vec<_>>(),
             ["start", "winner", "loser"]
