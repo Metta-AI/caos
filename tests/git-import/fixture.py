@@ -460,6 +460,20 @@ def main():
                     invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
                     assert token.encode() not in invalid.stdout + invalid.stderr
+            # Small uploads now stay packed too. The live reader must discover
+            # more packs than gix's default capacity of 32 without a restart.
+            for index in range(40):
+                packed = advance()
+                run("git", "--git-dir", str(origin), "push", "-q", base,
+                    packed[0] + f":refs/heads/pack-growth-{index}")
+                for oid in packed:
+                    object_request(oid)
+            assert len(list((odb / "objects/pack").glob("*.pack"))) > 32
+            # Commit staging must also work once its live-store alternate
+            # contains more than 32 packs.
+            staged_tip = advance(packed[0])
+            for kind, oid in [("blob", staged_tip[2]), ("tree", staged_tip[1]), ("commit", staged_tip[0])]:
+                post_from_origin(kind, oid)
             stop(server); server = None
             server = start()
             visible(posted_child[0])

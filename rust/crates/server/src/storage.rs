@@ -123,14 +123,17 @@ fn validate_commit_with_git(config: &Config, content: &[u8]) -> Result<(), HttpE
             format!("creating commit validation repository: {error}"),
         )
     })?;
+    // Stage the candidate before attaching the live store. Only Git needs
+    // the alternate for validation; this one-object gix handle must not try
+    // to load all of the server's packs into its startup-sized slot table.
+    let id = gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
+        .map_err(|error| HttpError::new(500, format!("staging commit: {error}")))?;
     let objects = std::fs::canonicalize(std::path::Path::new(&config.git_dir).join("objects"))?;
     std::fs::create_dir_all(staged.0.join("objects/info"))?;
     std::fs::write(
         staged.0.join("objects/info/alternates"),
         format!("{}\n", objects.display()),
     )?;
-    let id = gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, content)
-        .map_err(|error| HttpError::new(500, format!("staging commit: {error}")))?;
     let git = || {
         let mut command = std::process::Command::new("git");
         command.env_clear();
