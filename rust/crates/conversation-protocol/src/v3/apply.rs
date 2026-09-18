@@ -900,7 +900,11 @@ fn validate_tool_completion(
         return Err("tool.complete files do not match record.files".to_string());
     }
     apply_files(conversation, builder, files, "tool file path")?;
-    if let Some(resolution) = &record.source_tree_resolution {
+    if let Some(pointer) = record
+        .source_tree_resolution
+        .as_ref()
+        .and_then(SourceTreeResolution::new_pointer)
+    {
         let name = record
             .source_tree_name
             .as_ref()
@@ -912,7 +916,7 @@ fn validate_tool_completion(
             builder,
             name,
             &source_tree.commit,
-            resolution.new_pointer(),
+            Some(pointer),
             "tool source tree pointer update",
         )?;
     }
