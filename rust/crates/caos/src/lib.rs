@@ -20,6 +20,7 @@
 
 pub mod gitlinks;
 pub mod import_git;
+pub mod push_git;
 pub mod timing;
 
 use std::ffi::OsStr;
