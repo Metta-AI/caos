@@ -153,7 +153,7 @@ fn advance<S: progress::RefStore>(
         };
         let record = if record.status == PublicationStatus::Pending {
             let outcome = push(&record)?;
-            retain(state, &record, outcome)?
+            publish_source::retain(state, &record, outcome)?
         } else {
             record
         };
@@ -198,42 +198,6 @@ fn advance<S: progress::RefStore>(
         }
     }
     Err("conversation kept moving while completing stack publication".into())
-}
-
-fn retain<S: progress::RefStore>(
-    state: &mut progress::State<S>,
-    pending: &PublicationRecord,
-    outcome: Outcome,
-) -> Result<PublicationRecord, String> {
-    for _ in 0..32 {
-        state.reload()?;
-        let record = state
-            .conversation()?
-            .publication(&pending.id)?
-            .ok_or("publication disappeared")?;
-        if record.status != PublicationStatus::Pending {
-            return Ok(record);
-        }
-        let head = state.head().clone();
-        if matches!(
-            state.try_append_at(
-                &head,
-                Transition::PublicationTerminal {
-                    publication: record.id,
-                    status: outcome.status,
-                    evidence: outcome.evidence.clone(),
-                    observed: outcome.observed.clone(),
-                }
-            )?,
-            progress::TryAppend::Appended(_)
-        ) {
-            return state
-                .conversation()?
-                .publication(&pending.id)?
-                .ok_or("publication disappeared".into());
-        }
-    }
-    Err("conversation kept moving while saving branch publication".into())
 }
 
 #[cfg(test)]

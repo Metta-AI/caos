@@ -4441,15 +4441,29 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(recovered, pending);
+            for malformed in [
+                b"{\"status\":".as_slice(),
+                br#"{"status":"unknown","kind":"push-success","observed":null}"#,
+                br#"{"status":"complete","observed":null}"#,
+                br#"{"status":"complete","kind":"push-success","observed":"invalid-oid"}"#,
+            ] {
+                for (observed, expected_status) in [
+                    (Ok(Some(commit.clone())), PublicationStatus::Complete),
+                    (Ok(Some(old.clone())), PublicationStatus::Uncertain),
+                    (Ok(Some(newer.clone())), PublicationStatus::Conflict),
+                    (
+                        Err("remote unavailable".into()),
+                        PublicationStatus::Uncertain,
+                    ),
+                ] {
+                    let outcome = publish_source::reconcile(&pending, malformed, || observed);
+                    assert_eq!(outcome.status, expected_status);
+                }
+            }
             let outcome = if rejected {
                 publish_source::reconcile(
                     &recovered,
-                    conversation_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "validation-rejected",
-                        Some("Source contains ignored files".into()),
-                        None,
-                    ),
+                    br#"{"status":"conflict","kind":"validation-rejected","diagnostic":"Source contains ignored files","observed":null}"#,
                     || panic!("validation rejection must not observe the remote"),
                 )
             } else {
@@ -4457,16 +4471,20 @@ mod tests {
                 // rejected old value even though its first push succeeded.
                 publish_source::reconcile(
                     &recovered,
-                    conversation_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "lease-rejected",
-                        None,
-                        None,
-                    ),
+                    br#"{"status":"conflict","kind":"lease-rejected","observed":null}"#,
                     || Ok(Some(commit.clone())),
                 )
             };
-            publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();
+            // Both tools retain the remote result before completing the call.
+            // A restart in between must use that result without pushing again.
+            let outcome = if rejected {
+                publish_source::retain(&mut state, &pending, outcome).unwrap();
+                state.reload().unwrap();
+                None
+            } else {
+                Some(outcome)
+            };
+            publish_source::finish(&mut state, &site, &pending, outcome).unwrap();
             let view = state.conversation().unwrap();
             assert_eq!(
                 view.source_tree("feature/lower").unwrap().unwrap().commit,

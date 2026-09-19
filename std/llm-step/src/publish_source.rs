@@ -200,21 +200,7 @@ pub(super) fn push(pending: &PublicationRecord) -> Result<Outcome, String> {
             ),
             Ok(child) => match child.wait_with_output() {
                 Ok(output) if output.status.success() => {
-                    let value: Value = serde_json::from_slice(&output.stdout)
-                        .map_err(|_| "invalid push-git result")?;
-                    let status: PublicationStatus = serde_json::from_value(value["status"].clone())
-                        .map_err(|_| "invalid push status")?;
-                    let observed: Option<Oid> = serde_json::from_value(value["observed"].clone())
-                        .map_err(|_| "invalid remote head")?;
-                    let outcome = Outcome::new(
-                        status,
-                        value["kind"]
-                            .as_str()
-                            .ok_or("missing publication evidence")?,
-                        value["diagnostic"].as_str().map(str::to_owned),
-                        observed,
-                    );
-                    reconcile(pending, outcome, observe)
+                    reconcile(pending, &output.stdout, observe)
                 }
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
@@ -228,6 +214,16 @@ pub(super) fn push(pending: &PublicationRecord) -> Result<Outcome, String> {
     })
 }
 
+fn parse_outcome(bytes: &[u8]) -> Option<Outcome> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    Some(Outcome::new(
+        serde_json::from_value(value["status"].clone()).ok()?,
+        value["kind"].as_str()?,
+        value["diagnostic"].as_str().map(str::to_owned),
+        serde_json::from_value(value["observed"].clone()).ok()?,
+    ))
+}
+
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {
     ids::protocol_id(
         "external-tool",
@@ -239,9 +235,13 @@ pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<Stri
 
 pub(super) fn reconcile(
     pending: &PublicationRecord,
-    outcome: Outcome,
+    output: &[u8],
     observe: impl FnOnce() -> Result<Option<Oid>, String>,
 ) -> Outcome {
+    let Some(outcome) = parse_outcome(output) else {
+        // The push may have completed despite an unreadable command result.
+        return recovered(pending, observe());
+    };
     // A local/server validation refusal means no push was attempted. A remote
     // head that already matches must not hide the rejection or its diagnostic.
     if outcome.status == PublicationStatus::Complete
@@ -321,12 +321,51 @@ pub(super) fn pin<S: progress::RefStore>(
     Err("conversation kept moving while pinning publication".into())
 }
 
+pub(super) fn retain<S: progress::RefStore>(
+    state: &mut progress::State<S>,
+    pending: &PublicationRecord,
+    outcome: Outcome,
+) -> Result<PublicationRecord, String> {
+    for _ in 0..32 {
+        state.reload()?;
+        let record = state
+            .conversation()?
+            .publication(&pending.id)?
+            .ok_or("publication disappeared")?;
+        if record.status != PublicationStatus::Pending {
+            return Ok(record);
+        }
+        let head = state.head().clone();
+        if matches!(
+            state.try_append_at(
+                &head,
+                Transition::PublicationTerminal {
+                    publication: record.id,
+                    status: outcome.status,
+                    evidence: outcome.evidence.clone(),
+                    observed: outcome.observed.clone(),
+                }
+            )?,
+            progress::TryAppend::Appended(_)
+        ) {
+            return state
+                .conversation()?
+                .publication(&pending.id)?
+                .ok_or("publication disappeared".into());
+        }
+    }
+    Err("conversation kept moving while saving publication".into())
+}
+
 pub(super) fn finish<S: progress::RefStore>(
     state: &mut progress::State<S>,
     site: &CallSite<'_>,
     pending: &PublicationRecord,
     outcome: Option<Outcome>,
 ) -> Result<(), String> {
+    if let Some(outcome) = outcome {
+        retain(state, pending, outcome)?;
+    }
     for _ in 0..32 {
         state.reload()?;
         let view = state.conversation()?;
@@ -336,21 +375,11 @@ pub(super) fn finish<S: progress::RefStore>(
         {
             return Ok(());
         }
-        let mut record = view
+        let record = view
             .publication(&pending.id)?
             .ok_or("publication disappeared")?;
-        let mut transitions = Vec::new();
         if record.status == PublicationStatus::Pending {
-            let out = outcome.as_ref().ok_or("missing publication outcome")?;
-            record.status = out.status;
-            record.evidence = Some(out.evidence.clone());
-            record.observed = out.observed.clone();
-            transitions.push(Transition::PublicationTerminal {
-                publication: record.id.clone(),
-                status: out.status,
-                evidence: out.evidence.clone(),
-                observed: out.observed.clone(),
-            });
+            return Err("missing publication outcome".into());
         }
         let text = serde_json::to_string(&record).map_err(|e| e.to_string())?;
         let block = result_block(
@@ -367,10 +396,10 @@ pub(super) fn finish<S: progress::RefStore>(
             },
             None,
         );
-        transitions.push(tool_complete_transition(tool, &block, Vec::new())?);
+        let transition = tool_complete_transition(tool, &block, Vec::new())?;
         let expected = state.head().clone();
         if matches!(
-            state.try_append_many_at(&expected, transitions)?,
+            state.try_append_at(&expected, transition)?,
             progress::TryAppend::Appended(_)
         ) {
             return Ok(());
