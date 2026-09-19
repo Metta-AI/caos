@@ -1,6 +1,7 @@
 # Agent stacks
 
-A stack is an ordered list of source gitlinks. Git computes merges directly from objects; CAOS records the order and any paused operation. The GitHub worker manages PRs without a source checkout.
+A stack is an ordered list of source gitlinks. Git computes merges directly from objects; CAOS records the order and any paused operation. Publication pushes the stack's branches directly from the
+server.
 
 ```text
 feature/
@@ -62,3 +63,27 @@ proceeds until completion or another conflict. Draft editing commits never becom
 The operation survives turns and worker restarts. Completion checks the original manifest and source pointers, then replaces all stack gitlinks together. A concurrent edit causes a refusal, not an
 overwrite. `{"action":"abort","path":"feature"}` removes the pending attempt and leaves the sources unchanged; the draft remains in conversation history. `status` reports the pointers and pending
 operation.
+
+## Pushing branches
+
+`push_stack` takes `path`, an HTTPS Git `repository` URL, and optional `rewrite`:
+
+```json
+{"path":"feature","repository":"https://github.com/owner/repo.git"}
+```
+
+It pushes one branch per layer, bottom to top. Branch names are the source gitlink paths (`feature/01-core`, `feature/02-ui`); the base gitlink is not pushed. Each upper commit must contain the exact
+lower tip. Finish pending conflicts and restack edited lower layers before pushing.
+
+The tool records all source commits and observed remote heads before the first push. It uses the same `caos push-git` path as `publish_source`: the server transfers its stored objects, and an exact
+expected-head lease prevents overwriting a concurrent branch update. No checkout or GitHub worker is needed.
+
+After rebasing published history, pass `rewrite:true`. This allows non-fast-forward updates while retaining the lease and publication checks, including `.gitignore`. An unchanged push converges on the
+existing branch heads. The remote mainline need not match the stack's base just to push work; importing and rebasing onto updated mainline is a separate decision.
+
+Branch pushes are not one transaction. The tool records each result before proceeding, stops at the first failure or uncertain result, and returns the completed receipts and branches not attempted.
+Recovery skips recorded successful pushes and retains the original commits and leases. Inspect an uncertain result before making a new call, which observes fresh remote heads.
+
+Git receives branches and commit ancestry. The intended stack order stays in the conversation manifest. This operation creates no PRs or GitHub stack membership; those are a separate follow-up.
+
+This implements linear restacking, merge propagation and branch publication. Interactive reorder/squash/drop and rebasing merge commits remain unsupported.

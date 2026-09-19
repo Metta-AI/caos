@@ -47,7 +47,7 @@ fn run() -> Result<(), String> {
         return Err("invocation must be 64 lowercase hexadecimal characters".into());
     }
     let request = own_args_tree()?;
-    let token = secret("github-token")?;
+    let token = secret("github-token")?.trim_end().to_owned();
     let server = std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set")?;
     let mut store = GitStore::scratch("github-invocation", &server)?;
     let refname = format!("refs/caos/github/{invocation}");

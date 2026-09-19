@@ -452,7 +452,7 @@ fn complete<S: progress::RefStore>(
     state: &mut progress::State<S>,
     site: &CallSite<'_>,
     guard: &[Expected],
-    files: Vec<(String, Option<(Mode, Vec<u8>)>)>,
+    files: FileEdits,
     result: Value,
 ) -> Result<(), String> {
     for _ in 0..32 {
@@ -530,6 +530,40 @@ fn complete<S: progress::RefStore>(
         }
     }
     Err("conversation kept moving while saving stack result".into())
+}
+
+/// Source paths in stack order, checked before any publication is pinned.
+pub(super) fn push_sources(
+    view: &Conversation<'_>,
+    path: &str,
+    store: &GitStore,
+) -> Result<Vec<String>, String> {
+    paths::validate_source_tree_name(path)?;
+    if view.snapshot().exists(&format!("{path}/restack"))? {
+        return Err("finish or abort the pending stack update before pushing".into());
+    }
+    let manifest: Manifest = read_json(view, &manifest_path(path))?;
+    if manifest.layers.is_empty() {
+        return Err("a stack needs at least one layer".into());
+    }
+    let mut lower = source(view, &child(path, &manifest.base)?)?;
+    let mut branches = Vec::new();
+    for boundary in &manifest.layers {
+        let branch = child(path, &boundary.name)?;
+        conversation_protocol::v3::source_trees::validate_branch(&branch)?;
+        if branch.starts_with("refs/") {
+            return Err("branch names must omit refs/heads/".into());
+        }
+        let commit = source(view, &branch)?;
+        if boundary.base != lower || !store.is_ancestor(&lower, &commit)? {
+            return Err(format!(
+                "{branch} does not contain the current lower layer; restack before pushing"
+            ));
+        }
+        branches.push(branch);
+        lower = commit;
+    }
+    Ok(branches)
 }
 
 #[cfg(test)]

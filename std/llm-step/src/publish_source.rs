@@ -72,49 +72,21 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     let pending = match pinned(&state.conversation()?, site)? {
         Some(record) => record,
         None => {
-            let view = state.conversation()?;
-            let head = match view.source_tree(&p.source_tree)? {
-                Some(source) => source.commit,
-                None => {
-                    return site.fail(state, "publish_source requires an existing source gitlink")
-                }
-            };
-            let base = view.reference_start(&p.source_tree)?;
             let old = match observe() {
                 Ok(old) => old,
                 Err(error) => return site.fail(state, &error),
             };
-            let id = view.identity()?.id;
-            let descriptor = Descriptor {
-                source_base: base.clone(),
-                source_head: head.clone(),
-                target_base: base,
-                policy: if p.rewrite { "rewrite" } else { "preserve" }.into(),
-                implementation: "caos/server-push".into(),
-                commit_policy: "preserve".into(),
-            };
-            let key = invocation(&id, site)?[..32].to_string();
-            let publication = ids::publication_id(
-                &id,
-                &key,
-                &ids::projection_id(&descriptor.to_value())?,
-                &head,
+            let record = match plan(
+                &state.conversation()?,
+                site,
+                &p.source_tree,
                 &p.repository,
-                &format!("refs/heads/{}", p.branch),
-                old.as_ref(),
-            )?;
-            let record = PublicationRecord {
-                id: publication,
-                key,
-                descriptor,
-                planned_head: head,
-                repository: p.repository.clone(),
-                refname: format!("refs/heads/{}", p.branch),
-                expected_old: old,
-                source_tree_name: p.source_tree.clone(),
-                status: PublicationStatus::Pending,
-                evidence: None,
-                observed: None,
+                &p.branch,
+                old,
+                p.rewrite,
+            ) {
+                Ok(record) => record,
+                Err(error) => return site.fail(state, &error),
             };
             let Some(record) = pin(state, site, &record)? else {
                 return Ok(());
@@ -125,17 +97,81 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     if pending.status != PublicationStatus::Pending {
         return finish(state, site, &pending, None);
     }
-    // An attempt that pinned this intent may send it, including concurrent
-    // attempts that joined the identical transition. The exact lease makes
-    // those pushes converge. Recovery never obtains a fresh source or lease.
-    let outcome = {
+    let outcome = push(&pending)?;
+    finish(state, site, &pending, Some(outcome))
+}
+
+pub(super) fn plan(
+    view: &Conversation<'_>,
+    site: &CallSite<'_>,
+    source_tree: &str,
+    repository: &str,
+    branch: &str,
+    old: Option<Oid>,
+    rewrite: bool,
+) -> Result<PublicationRecord, String> {
+    let head = view
+        .source_tree(source_tree)?
+        .ok_or("publication requires an existing source gitlink")?
+        .commit;
+    let base = view.reference_start(source_tree)?;
+    let id = view.identity()?.id;
+    let descriptor = Descriptor {
+        source_base: base.clone(),
+        source_head: head.clone(),
+        target_base: base,
+        policy: if rewrite { "rewrite" } else { "preserve" }.into(),
+        implementation: "caos/server-push".into(),
+        commit_policy: "preserve".into(),
+    };
+    let key = invocation(&id, site)?[..32].to_string();
+    let publication = ids::publication_id(
+        &id,
+        &key,
+        &ids::projection_id(&descriptor.to_value())?,
+        &head,
+        repository,
+        &format!("refs/heads/{}", branch),
+        old.as_ref(),
+    )?;
+    Ok(PublicationRecord {
+        id: publication,
+        key,
+        descriptor,
+        planned_head: head,
+        repository: repository.into(),
+        refname: format!("refs/heads/{}", branch),
+        expected_old: old,
+        source_tree_name: source_tree.into(),
+        status: PublicationStatus::Pending,
+        evidence: None,
+        observed: None,
+    })
+}
+
+pub(super) fn push(pending: &PublicationRecord) -> Result<Outcome, String> {
+    let branch = pending
+        .refname
+        .strip_prefix("refs/heads/")
+        .ok_or("invalid publication branch")?;
+    let token_file = import_source::token_file(&pending.repository);
+    let token = token_file
+        .map(fs::read_to_string)
+        .transpose()
+        .map_err(|_| "reading GitHub token")?;
+    let token = token.as_deref().map(str::trim_end);
+    let observe = || {
+        git_locator::publish::read_branch(&pending.repository, branch, token)
+            .and_then(|h| h.map(|h| Oid::parse(&h, "remote head")).transpose())
+    };
+    Ok({
         let mut command = std::process::Command::new("caos");
         command
             .args([
                 "push-git",
                 &pending.repository,
                 pending.planned_head.as_str(),
-                &p.branch,
+                branch,
             ])
             .arg(format!(
                 "--expected={}",
@@ -178,7 +214,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                         value["diagnostic"].as_str().map(str::to_owned),
                         observed,
                     );
-                    reconcile(&pending, outcome, observe)
+                    reconcile(pending, outcome, observe)
                 }
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
@@ -186,11 +222,10 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
                     None,
                 ),
-                _ => recovered(&pending, observe()),
+                _ => recovered(pending, observe()),
             },
         }
-    };
-    finish(state, site, &pending, Some(outcome))
+    })
 }
 
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {
