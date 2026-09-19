@@ -17,6 +17,7 @@ pub mod tasks;
 pub mod tree;
 pub use tasks::{TaskRecord, TaskStatus};
 pub mod source_trees;
+pub mod stacks;
 pub mod validate;
 pub mod view;
 

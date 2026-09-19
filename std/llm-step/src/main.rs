@@ -4,9 +4,11 @@ mod async_work;
 mod githist;
 mod github;
 mod import_source;
+mod object_upload;
 mod progress;
 mod publish_source;
 mod source_trees;
+mod stack;
 mod subagents;
 mod timing;
 mod tools;
@@ -1061,6 +1063,10 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "stack" {
+                stack::execute(state, &site)?;
+                return Ok(true);
+            }
             if existing.name == "publish_source" {
                 publish_source::execute(state, &site)?;
                 return Ok(true);
@@ -1079,7 +1085,11 @@ fn drive_call(
         return Ok(true);
     }
 
-    if call.name == "github" {
+    if call.name == "stack" {
+        stack::execute(state, &site)?;
+        return Ok(true);
+    }
+    if matches!(call.name.as_str(), "github") {
         return github::start(cfg, state, &site);
     }
     if call.name == subagents::SPAWN_TOOL {
@@ -1632,7 +1642,7 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
-    if call.name == "github" {
+    if matches!(call.name.as_str(), "github") {
         return github::dispatch(request, round, call, record);
     }
     let commit = record
@@ -2968,7 +2978,7 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 }
 
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
-    let mut registry = vec![bash_tool()];
+    let mut registry = vec![bash_tool(), stack::declaration()];
     registry.extend(tools::declarations());
     let mut publish = with_source_tree(tools::tree_tool_declaration(
         &tools::builtin_tool("publish_source", publish_source::HELP),
@@ -3385,10 +3395,10 @@ mod tests {
     const USER_ID: &str = "11111111111111111111111111111111";
     const ASSISTANT_ID: &str = "22222222222222222222222222222222";
 
-    struct Golden {
-        store: MemoryStore,
-        head: Oid,
-        request: Oid,
+    pub(super) struct Golden {
+        pub(super) store: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) request: Oid,
     }
 
     struct TestDirectory(PathBuf);
@@ -3663,7 +3673,7 @@ mod tests {
         golden_with_first("read", json!({"file-path":"files/a"}))
     }
 
-    fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
+    pub(super) fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
         let mut store = MemoryStore::new();
         let root = root_with(&mut store, BTreeMap::new())?;
         let user = append_memory(
@@ -4240,11 +4250,11 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
-    struct ImportStore {
-        objects: MemoryStore,
-        head: Oid,
-        race: Option<Transition>,
-        lost_ack: bool,
+    pub(super) struct ImportStore {
+        pub(super) objects: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) race: Option<Transition>,
+        pub(super) lost_ack: bool,
     }
     conversation_protocol::delegate_object_store!(ImportStore, objects);
     impl progress::RefStore for ImportStore {
