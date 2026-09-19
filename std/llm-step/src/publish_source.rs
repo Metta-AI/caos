@@ -3,9 +3,10 @@ use super::*;
 use conversation_protocol::v3::publication::Outcome;
 use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
-pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR or change the source gitlink. Only fast-forward updates are supported: import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR or change the source gitlink. Updates default to fast-forward. Set rewrite=true only to publish intentionally rebased history; the exact remote-head lease still prevents overwriting a concurrent change. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
-@param branch Destination branch name (without refs/heads/).";
+@param branch Destination branch name (without refs/heads/).
+@param [rewrite] Allow an intentional history rewrite while retaining the exact remote-head lease.";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,8 @@ struct Parameters {
     source_tree: String,
     repository: String,
     branch: String,
+    #[serde(default)]
+    rewrite: bool,
 }
 
 fn parameters(call: &Call) -> Result<Parameters, String> {
@@ -86,7 +89,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 source_base: base.clone(),
                 source_head: head.clone(),
                 target_base: base,
-                policy: "preserve".into(),
+                policy: if p.rewrite { "rewrite" } else { "preserve" }.into(),
                 implementation: "caos/server-push".into(),
                 commit_policy: "preserve".into(),
             };
@@ -142,6 +145,9 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     .map(Oid::as_str)
                     .unwrap_or("absent")
             ));
+        if pending.descriptor.policy == "rewrite" {
+            command.arg("--rewrite");
+        }
         if let Some(file) = token_file {
             command.arg(format!("--github-token-file={file}"));
         }
