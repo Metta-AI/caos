@@ -4,7 +4,7 @@ use super::*;
 pub(super) fn declaration() -> Value {
     json!({
         "name":"github",
-        "description":"Run GitHub CLI with literal arguments and an explicit owner/repository. Supports issues, comments, PRs and remote stack operations. Every new tool call observes GitHub afresh; retries never repeat an unfinished invocation. After an uncertain write, use a new read call to inspect the outcome; an absent result does not prove an in-flight write failed. For PRs, first publish_source, then find/create a PR with explicit --head and --base; preserve existing human-edited titles/bodies. Create ready PRs unless a draft was requested. For stacks, publish source gitlinks bottom to top, each including the exact published lower commit. Use gh stack link --base <mainline> with existing PR URLs in order; verify bases and membership afterwards. Link can extend a stack, not remove or reorder it. submit/sync/rebase require local branches and are not supported by this worker. Multi-step failures can leave partial changes.",
+        "description":"Run GitHub CLI with literal arguments and an explicit owner/repository. Supports issues, comments, PRs and remote stack operations. Every new tool call observes GitHub afresh; retries never repeat an unfinished invocation. After an uncertain write, use a new read call to inspect the outcome; an absent result does not prove an in-flight write failed. For PRs, first publish_source, then find/create a PR with explicit --head and --base; preserve existing human-edited titles/bodies. Create ready PRs unless a draft was requested. For registered stacks use stack for code updates and submit_stack for publication and PR membership. Use this tool for explicit GitHub metadata changes; verify bases and membership afterwards. submit/sync/rebase require local branches and are not supported by this worker. Multi-step failures can leave partial changes.",
         "input_schema":{"type":"object","additionalProperties":false,"properties":{
             "repository":{"type":"string","description":"GitHub owner/repository."},
             "args":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Arguments after gh, e.g. [\"pr\",\"list\",\"--head\",\"feature/a\",\"--json\",\"url,baseRefName,headRefOid\"]."},
@@ -92,31 +92,52 @@ pub(super) fn evaluated(
 }
 
 fn launch(image: &str, state: &mut progress::State, site: &CallSite<'_>) -> Result<bool, String> {
-    let p: Parameters = match serde_json::from_value(site.call.input.clone()) {
-        Ok(p) => p,
-        Err(error) => {
-            site.fail(state, &format!("invalid github arguments: {error}"))?;
+    let (repository, args, stdin, submission) = if site.call.name == "submit_stack" {
+        let plan = match stack::submission(state, site.call) {
+            Ok(plan) => plan,
+            Err(error) => {
+                site.fail(state, &error)?;
+                return Ok(true);
+            }
+        };
+        (
+            plan.repository.clone(),
+            Vec::new(),
+            None,
+            Some(serde_json::to_string(&plan).map_err(|e| e.to_string())?),
+        )
+    } else {
+        let p: Parameters = match serde_json::from_value(site.call.input.clone()) {
+            Ok(p) => p,
+            Err(error) => {
+                site.fail(state, &format!("invalid github arguments: {error}"))?;
+                return Ok(true);
+            }
+        };
+        if git_locator::github_repository(&p.repository).is_err()
+            || p.args.is_empty()
+            || p.args.iter().any(|a| a.contains('\0'))
+        {
+            site.fail(
+                state,
+                "github requires owner/repository and a nonempty array of literal arguments",
+            )?;
             return Ok(true);
         }
+        (p.repository, p.args, p.stdin, None)
     };
-    if git_locator::github_repository(&p.repository).is_err()
-        || p.args.is_empty()
-        || p.args.iter().any(|a| a.contains('\0'))
-    {
-        site.fail(
-            state,
-            "github requires owner/repository and a nonempty array of literal arguments",
-        )?;
-        return Ok(true);
-    }
     let invocation = publish_source::invocation(&state.conversation()?.identity()?.id, site)?;
-    let args = serde_json::to_string(&p.args).map_err(|e| e.to_string())?;
+    let args = serde_json::to_string(&args).map_err(|e| e.to_string())?;
     let mut bindings = vec![
-        ("repository", Arg::Lit(&p.repository)),
-        ("args", Arg::Lit(&args)),
+        ("repository", Arg::Lit(&repository)),
         ("invocation", Arg::Lit(&invocation)),
     ];
-    if let Some(stdin) = p.stdin.as_deref() {
+    if let Some(submission) = &submission {
+        bindings.push(("submission", Arg::Lit(submission)));
+    } else {
+        bindings.push(("args", Arg::Lit(&args)));
+    }
+    if let Some(stdin) = stdin.as_deref() {
         bindings.push(("stdin", Arg::Lit(stdin)));
     }
     let task = Oid::parse(
@@ -131,7 +152,9 @@ fn launch(image: &str, state: &mut progress::State, site: &CallSite<'_>) -> Resu
         &head,
         Transition::ToolStart {
             record: record.clone(),
-            payloads: Vec::new(),
+            payloads: submission
+                .map(|s| vec![("submission.json".into(), s.into_bytes())])
+                .unwrap_or_default(),
         },
     )? {
         progress::TryAppend::HeadChanged(_) => Ok(true),

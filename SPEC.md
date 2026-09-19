@@ -642,3 +642,6 @@ See [agent publication](design/agent-publish.md) for mechanics and recovery.
 The stack tool registers ordered source gitlinks and their original predecessor boundaries. Rebase replays linear histories with object-level Git merges; merge mode propagates updated predecessors
 without rewriting history. A conflict keeps original pointers unchanged and records a separate editable draft plus the full conflict report. Continue explicitly acknowledges resolution. Completed
 operations replace every source pointer together after checking the original inputs. No .caos/conflicts is introduced by this workflow. See [Agent stacks](design/agent-stacks.md).
+
+The submit_stack tool pins commits and remote-head leases, publishes through the server, finds or creates PRs by branch and links them through GitHub’s stack API. A rebased resubmission explicitly
+enables rewrite; publication still uses the exact lease and all ordinary publication guards. Partial and uncertain external results are reported without blind replay.

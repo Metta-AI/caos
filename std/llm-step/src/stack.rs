@@ -698,3 +698,125 @@ mod tests {
         );
     }
 }
+
+pub(super) fn submit_declaration() -> Value {
+    json!({
+        "name":"submit_stack",
+        "description":"Publish a registered stack from the server, then find or create its PRs by branch and link them through GitHub’s stack API. No source checkout is created. Existing PR titles and bodies are preserved; bases are corrected. All commits and remote-head leases are pinned before publication. Use rewrite=true to resubmit rebased history; the lease still rejects concurrent branch changes. Import the current mainline and restack first. A partial failure can leave lower branches or PRs published; inspect the returned receipts before a new call. New PRs are ready for review unless draft=true.",
+        "input_schema":{"type":"object","additionalProperties":false,"properties":{
+            "path":{"type":"string","description":"Registered stack directory."},
+            "repository":{"type":"string","description":"GitHub owner/repository."},
+            "base_branch":{"type":"string","description":"Remote mainline branch, e.g. main."},
+            "rewrite":{"type":"boolean"},
+            "draft":{"type":"boolean"},
+            "descriptions":{"type":"array","items":{"type":"object","additionalProperties":false,
+                "properties":{"title":{"type":"string"},"body":{"type":"string"}},"required":["title","body"]},
+                "description":"Optional titles and bodies for NEW PRs, in stack order. Defaults to commit subjects and empty bodies."}
+        },"required":["path","repository","base_branch"]}
+    })
+}
+
+pub(super) fn submission(
+    state: &progress::State,
+    call: &Call,
+) -> Result<conversation_protocol::v3::stacks::Submission, String> {
+    use conversation_protocol::v3::stacks::{Publication, Submission};
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Description {
+        title: String,
+        body: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Args {
+        path: String,
+        repository: String,
+        base_branch: String,
+        #[serde(default)]
+        rewrite: bool,
+        #[serde(default)]
+        draft: bool,
+        descriptions: Option<Vec<Description>>,
+    }
+    let args: Args = serde_json::from_value(call.input.clone())
+        .map_err(|e| format!("invalid submit_stack arguments: {e}"))?;
+    paths::validate_source_tree_name(&args.path)?;
+    git_locator::github_repository(&args.repository)?;
+    conversation_protocol::v3::source_trees::validate_branch(&args.base_branch)?;
+    let view = state.conversation()?;
+    if view.snapshot().exists(&format!("{}/restack", args.path))? {
+        return Err("finish or abort the pending stack update before submitting".into());
+    }
+    let manifest: Manifest = read_json(&view, &manifest_path(&args.path))?;
+    if manifest.layers.is_empty() {
+        return Err("a stack needs at least one layer".into());
+    }
+    if args
+        .descriptions
+        .as_ref()
+        .is_some_and(|d| d.len() != manifest.layers.len())
+    {
+        return Err("provide one PR description per layer".into());
+    }
+    let destination = format!("https://github.com/{}.git", args.repository);
+    let token = secret("github-token")?.trim_end().to_owned();
+    let remote = |branch: &str| {
+        git_locator::publish::read_branch(&destination, branch, Some(&token))
+            .and_then(|h| h.map(|h| Oid::parse(&h, "remote head")).transpose())
+    };
+    let mut lower = source(&view, &child(&args.path, &manifest.base)?)?;
+    if remote(&args.base_branch)?.as_ref() != Some(&lower) {
+        return Err("the stack base differs from the remote mainline; import its current tip and restack first".into());
+    }
+    let server = std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set")?;
+    let store = GitStore::scratch_partial(&fresh_name("submit-objects"), &server)?;
+    let mut layers = Vec::new();
+    for (i, boundary) in manifest.layers.iter().enumerate() {
+        let branch = child(&args.path, &boundary.name)?;
+        conversation_protocol::v3::source_trees::validate_branch(&branch)?;
+        if branch == args.base_branch {
+            return Err("a stack branch cannot also be its mainline".into());
+        }
+        let commit = source(&view, &branch)?;
+        if boundary.base != lower || !store.is_ancestor(&lower, &commit)? {
+            return Err(format!(
+                "{branch} does not contain the current lower layer; restack before submitting"
+            ));
+        }
+        let info = store.read_commit(&commit)?;
+        let title = args
+            .descriptions
+            .as_ref()
+            .map(|d| d[i].title.clone())
+            .unwrap_or_else(|| {
+                String::from_utf8_lossy(&info.message)
+                    .lines()
+                    .next()
+                    .unwrap_or(&branch)
+                    .to_owned()
+            });
+        if title.trim().is_empty() {
+            return Err(format!("missing PR title for {branch}"));
+        }
+        layers.push(Publication {
+            expected: remote(&branch)?,
+            branch,
+            commit: commit.clone(),
+            title,
+            body: args
+                .descriptions
+                .as_ref()
+                .map(|d| d[i].body.clone())
+                .unwrap_or_default(),
+        });
+        lower = commit;
+    }
+    Ok(Submission {
+        repository: args.repository,
+        base_branch: args.base_branch,
+        rewrite: args.rewrite,
+        draft: args.draft,
+        layers,
+    })
+}

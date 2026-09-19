@@ -1089,7 +1089,7 @@ fn drive_call(
         stack::execute(state, &site)?;
         return Ok(true);
     }
-    if matches!(call.name.as_str(), "github") {
+    if matches!(call.name.as_str(), "github" | "submit_stack") {
         return github::start(cfg, state, &site);
     }
     if call.name == subagents::SPAWN_TOOL {
@@ -1642,7 +1642,7 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
-    if matches!(call.name.as_str(), "github") {
+    if matches!(call.name.as_str(), "github" | "submit_stack") {
         return github::dispatch(request, round, call, record);
     }
     let commit = record
@@ -1710,7 +1710,7 @@ fn callback_result(
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
-        "github" => github::result(record),
+        "github" | "submit_stack" => github::result(record),
         subagents::WAIT_TOOL => wait_callback_block(state, record),
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -2998,6 +2998,7 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
     if cfg.github_source.is_some() {
         registry.push(github::declaration());
+        registry.push(stack::submit_declaration());
     }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {

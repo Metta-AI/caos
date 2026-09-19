@@ -112,6 +112,7 @@ pub fn grep_declaration() -> Value {
 /// are standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
     "stack",
+    "submit_stack",
     "import_source",
     "publish_source",
     "github",

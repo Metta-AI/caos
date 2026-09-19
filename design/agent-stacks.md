@@ -62,3 +62,24 @@ proceeds until completion or another conflict. Draft editing commits never becom
 The operation survives turns and worker restarts. Completion checks the original manifest and source pointers, then replaces all stack gitlinks together. A concurrent edit causes a refusal, not an
 overwrite. `{"action":"abort","path":"feature"}` removes the pending attempt and leaves the sources unchanged; the draft remains in conversation history. `status` reports the pointers and pending
 operation.
+
+## Submitting and resubmitting
+
+`submit_stack` takes `path`, a GitHub `repository` (`owner/repo`), and `base_branch`. The registered base must match the observed remote mainline, and each layer must contain the exact lower tip.
+
+The agent pins all source commits and remote-head leases before dispatching the GitHub worker. The worker then:
+
+1. Calls `caos push-git` for each branch. The server pushes its stored objects directly; branch names are the source gitlink paths.
+2. Finds an open PR by branch and repository owner. If absent, creates one with an explicit head and base. If present, preserves its title/body and corrects its base when needed.
+3. Creates or extends GitHub stack membership through `gh api`, preserving already-merged entries. Existing unmerged members must remain in the same order.
+
+New PRs are ready for review unless `draft:true` is requested. Optional `descriptions` supplies one `{title,body}` per layer for new PRs; otherwise titles use commit subjects.
+
+Resubmission finds the same PRs. After rebasing published history, pass `rewrite:true`. This enables non-fast-forward updates but retains the exact remote-head lease and the server's publication
+checks, including `.gitignore`. Default publication remains fast-forward only.
+
+Branch pushes and GitHub changes are not one transaction. Results report completed branch pushes and PR URLs before a failure. An unfinished invocation is uncertain and is not blindly repeated;
+inspect remote state before a new submission. A new call observes branches and PRs again and can finish partial progress.
+
+This implements linear restacking, merge propagation and PR submission. It does not implement interactive reorder/squash/drop, rebasing merge commits, or automatically removing/reordering existing
+GitHub stack membership. Use the general GitHub tool for review, comments and landing.

@@ -1,4 +1,5 @@
-//! One external CLI execution per invocation; unfinished claims are uncertain.
+//! External GitHub operations are claimed once; unfinished claims are uncertain.
+mod submit;
 use conversation_protocol::v3::{
     CodeOps, GitStore, Mode, ObjectStore, Oid, RefUpdate, Signature, TreeEntry,
 };
@@ -9,7 +10,9 @@ use std::{
     io::Read,
     process::{Command, Stdio},
 };
-use worker_common::{caos, cas_hash, own_args_tree, path, read_arg, run_worker, scratch, secret};
+use worker_common::{
+    caos, cas_hash, own_args_tree, path, read_arg, read_arg_opt, run_worker, scratch, secret,
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,9 +29,24 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), String> {
     let repository = read_arg("repository")?;
     git_locator::github_repository(&repository)?;
-    let args: Vec<String> =
-        serde_json::from_str(&read_arg("args")?).map_err(|_| "args must be a JSON string array")?;
-    if args.is_empty() || args.iter().any(|a| a.contains('\0')) {
+    let submission = read_arg_opt("submission")?
+        .map(|value| {
+            serde_json::from_str::<conversation_protocol::v3::stacks::Submission>(&value)
+                .map_err(|e| format!("invalid submission: {e}"))
+        })
+        .transpose()?;
+    if submission
+        .as_ref()
+        .is_some_and(|p| p.repository != repository)
+    {
+        return Err("submission repository mismatch".into());
+    }
+    let args: Vec<String> = if submission.is_some() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&read_arg("args")?).map_err(|_| "args must be a JSON string array")?
+    };
+    if submission.is_none() && (args.is_empty() || args.iter().any(|a| a.contains('\0'))) {
         return Err("invalid gh arguments".into());
     }
     let input_arg = worker_common::arg("stdin");
@@ -47,7 +65,7 @@ fn run() -> Result<(), String> {
         return Err("invocation must be 64 lowercase hexadecimal characters".into());
     }
     let request = own_args_tree()?;
-    let token = secret("github-token")?;
+    let token = secret("github-token")?.trim_end().to_owned();
     let server = std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set")?;
     let mut store = GitStore::scratch("github-invocation", &server)?;
     let refname = format!("refs/caos/github/{invocation}");
@@ -71,43 +89,21 @@ fn run() -> Result<(), String> {
         data.join("gh/extensions/gh-stack/gh-stack"),
     )
     .map_err(|e| e.to_string())?;
-    // A file avoids pipe deadlocks for large stdin while gh writes output.
-    let input = dir.join("stdin");
-    fs::write(&input, stdin).map_err(|e| e.to_string())?;
-    let mut cmd = Command::new("timeout");
-    cmd.args(["--kill-after=5", "300", "gh"])
-        .args(&args)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", &dir)
-        .env("GH_CONFIG_DIR", &config)
-        .env("XDG_DATA_HOME", &data)
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
-        .env("GH_REPO", &repository)
-        .env("GH_HOST", "github.com")
-        .env("GH_TOKEN", &token)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_PAGER", "cat")
-        .env("NO_COLOR", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .current_dir(&dir)
-        .stdin(Stdio::from(
-            fs::File::open(&input).map_err(|e| e.to_string())?,
-        ));
-    if let Some(cert) = std::env::var_os("SSL_CERT_FILE") {
-        cmd.env("SSL_CERT_FILE", cert);
-    }
-    let result = match cmd.output() {
-        Ok(output) => {
-            json!({"status":if matches!(output.status.code(), None | Some(124 | 137)) { "uncertain" } else { "complete" },"exit":output.status.code(),
-            "stdout":String::from_utf8_lossy(&output.stdout), "stderr":String::from_utf8_lossy(&output.stderr)})
-        }
-        Err(_) => {
-            json!({"status":"uncertain","exit":null,"stdout":"","stderr":"Could not obtain a GitHub command result; inspect before taking further action."})
-        }
+    let mut backend = Session {
+        dir: dir.clone(),
+        config,
+        data,
+        repository,
+        token,
+    };
+    let result = if let Some(plan) = submission {
+        submit::run(&plan, &mut backend)
+    } else {
+        submit::Backend::gh(
+            &mut backend,
+            &args,
+            std::str::from_utf8(&stdin).map_err(|_| "stdin must be UTF-8")?,
+        )?
     };
     let result_file = dir.join("result.json");
     fs::write(
@@ -140,6 +136,87 @@ fn run() -> Result<(), String> {
         return uncertain();
     }
     worker_common::forward("/cas/github-result", "/cas/out")
+}
+
+struct Session {
+    dir: std::path::PathBuf,
+    config: std::path::PathBuf,
+    data: std::path::PathBuf,
+    repository: String,
+    token: String,
+}
+impl submit::Backend for Session {
+    fn push(
+        &mut self,
+        repository: &str,
+        layer: &conversation_protocol::v3::stacks::Publication,
+        rewrite: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mut command = Command::new("caos");
+        command.args([
+            "push-git",
+            &format!("https://github.com/{repository}.git"),
+            layer.commit.as_str(),
+            &layer.branch,
+        ]);
+        command.arg(format!(
+            "--expected={}",
+            layer.expected.as_ref().map(Oid::as_str).unwrap_or("absent")
+        ));
+        command.arg("--github-token-file=/secret/github-token");
+        if rewrite {
+            command.arg("--rewrite");
+        }
+        let output = command
+            .output()
+            .map_err(|_| "could not obtain branch publication result")?;
+        if !output.status.success() {
+            return Err("could not obtain branch publication result".into());
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|_| "invalid branch publication result".into())
+    }
+
+    fn gh(&mut self, args: &[String], stdin: &str) -> Result<serde_json::Value, String> {
+        // A file avoids deadlocking while gh consumes stdin and writes output.
+        let input = self.dir.join("stdin");
+        fs::write(&input, stdin).map_err(|e| e.to_string())?;
+        let mut cmd = Command::new("timeout");
+        cmd.args(["--kill-after=5", "300", "gh"])
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &self.dir)
+            .env("GH_CONFIG_DIR", &self.config)
+            .env("XDG_DATA_HOME", &self.data)
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1")
+            .env("GH_REPO", &self.repository)
+            .env("GH_HOST", "github.com")
+            .env("GH_TOKEN", &self.token)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_PAGER", "cat")
+            .env("NO_COLOR", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(&self.dir)
+            .stdin(Stdio::from(
+                fs::File::open(&input).map_err(|e| e.to_string())?,
+            ));
+        if let Some(cert) = std::env::var_os("SSL_CERT_FILE") {
+            cmd.env("SSL_CERT_FILE", cert);
+        }
+        Ok(match cmd.output() {
+            Ok(output) => {
+                json!({"status":if matches!(output.status.code(), None | Some(124 | 137)) { "uncertain" } else { "complete" },"exit":output.status.code(),
+            "stdout":String::from_utf8_lossy(&output.stdout), "stderr":String::from_utf8_lossy(&output.stderr)})
+            }
+            Err(_) => {
+                json!({"status":"uncertain","exit":null,"stdout":"","stderr":"Could not obtain a GitHub command result; inspect before taking further action."})
+            }
+        })
+    }
 }
 
 fn commit(store: &mut GitStore, record: &Record, parent: Option<&Oid>) -> Result<Oid, String> {

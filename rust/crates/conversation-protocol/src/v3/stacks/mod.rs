@@ -283,3 +283,23 @@ fn unsigned_headers(headers: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests;
+
+/// Exact publication inputs, pinned before any branch or PR is changed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Submission {
+    pub repository: String,
+    pub base_branch: String,
+    pub rewrite: bool,
+    pub draft: bool,
+    pub layers: Vec<Publication>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Publication {
+    pub branch: String,
+    pub commit: Oid,
+    pub expected: Option<Oid>,
+    pub title: String,
+    pub body: String,
+}
