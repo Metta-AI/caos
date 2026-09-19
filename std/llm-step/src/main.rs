@@ -2,10 +2,14 @@
 
 mod async_work;
 mod githist;
+mod github;
 mod import_source;
+mod object_upload;
 mod progress;
 mod publish_source;
+mod push_stack;
 mod source_trees;
+mod stack;
 mod subagents;
 mod timing;
 mod tools;
@@ -60,6 +64,7 @@ struct Config {
     bash_image: String,
     grep_image: Option<String>,
     merge_image: Option<String>,
+    github_source: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
@@ -124,6 +129,7 @@ impl Config {
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             merge_image: image_arg("merge-image")?,
+            github_source: image_arg("github-source")?,
             std_tool_images: STD_TOOLS
                 .iter()
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
@@ -297,6 +303,9 @@ fn callback(
     timing::phase(&format!("tool wait {tool}"));
 
     if read_arg_opt("tool-eval")?.is_some() {
+        if tool == "github" {
+            return github::evaluated(cfg, state, request, request_head, round, &id);
+        }
         if Path::new(&arg("error")).exists() {
             let error = read_arg("error")?;
             let block = failed_run_block(&id, &tool, &error);
@@ -1055,6 +1064,14 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "stack" {
+                stack::execute(state, &site)?;
+                return Ok(true);
+            }
+            if existing.name == "push_stack" {
+                push_stack::execute(state, &site)?;
+                return Ok(true);
+            }
             if existing.name == "publish_source" {
                 publish_source::execute(state, &site)?;
                 return Ok(true);
@@ -1073,6 +1090,13 @@ fn drive_call(
         return Ok(true);
     }
 
+    if call.name == "stack" {
+        stack::execute(state, &site)?;
+        return Ok(true);
+    }
+    if call.name == "github" {
+        return github::start(cfg, state, &site);
+    }
     if call.name == subagents::SPAWN_TOOL {
         return spawn_agent_call(cfg, state, &site);
     }
@@ -1081,6 +1105,10 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
+        return Ok(true);
+    }
+    if call.name == "push_stack" {
+        push_stack::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == "publish_source" {
@@ -1623,6 +1651,9 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
+    if call.name == "github" {
+        return github::dispatch(request, round, call, record);
+    }
     let commit = record
         .input_commit
         .as_ref()
@@ -1688,6 +1719,7 @@ fn callback_result(
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
+        "github" => github::result(record),
         subagents::WAIT_TOOL => wait_callback_block(state, record),
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -2955,11 +2987,14 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 }
 
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
-    let mut registry = vec![bash_tool()];
+    let mut registry = vec![bash_tool(), stack::declaration(), push_stack::declaration()];
     registry.extend(tools::declarations());
-    registry.push(with_source_tree(tools::tree_tool_declaration(
-        &tools::builtin_tool("publish_source", publish_source::HELP),
+    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
+        "publish_source",
+        publish_source::HELP,
     )));
+    publish["input_schema"]["properties"]["rewrite"]["type"] = json!("boolean");
+    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
@@ -2971,6 +3006,9 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
         registry.push(with_source_tree(merge_tool()));
     }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
+    if cfg.github_source.is_some() {
+        registry.push(github::declaration());
+    }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
@@ -3367,10 +3405,10 @@ mod tests {
     const USER_ID: &str = "11111111111111111111111111111111";
     const ASSISTANT_ID: &str = "22222222222222222222222222222222";
 
-    struct Golden {
-        store: MemoryStore,
-        head: Oid,
-        request: Oid,
+    pub(super) struct Golden {
+        pub(super) store: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) request: Oid,
     }
 
     struct TestDirectory(PathBuf);
@@ -3645,7 +3683,10 @@ mod tests {
         golden_with_first("read", json!({"file-path":"files/a"}))
     }
 
-    fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
+    pub(super) fn golden_with_first(
+        first_name: &str,
+        first_input: Value,
+    ) -> Result<Golden, String> {
         let mut store = MemoryStore::new();
         let root = root_with(&mut store, BTreeMap::new())?;
         let user = append_memory(
@@ -4222,11 +4263,11 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
-    struct ImportStore {
-        objects: MemoryStore,
-        head: Oid,
-        race: Option<Transition>,
-        lost_ack: bool,
+    pub(super) struct ImportStore {
+        pub(super) objects: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) race: Option<Transition>,
+        pub(super) lost_ack: bool,
     }
     conversation_protocol::delegate_object_store!(ImportStore, objects);
     impl progress::RefStore for ImportStore {

@@ -33,6 +33,7 @@ pub struct GitStore {
     dir: PathBuf,
     git_dir: PathBuf,
     remote: Option<String>,
+    partial: bool,
     remote_tip: RefCell<Option<Oid>>,
     batch: RefCell<Option<BatchReader>>,
     batch_dirty: Cell<bool>,
@@ -147,6 +148,25 @@ impl GitStore {
         GitStore::open(&dir, Some("origin"))
     }
 
+    /// A scratch object database whose source contents are fetched on demand.
+    /// Publish source objects through the object API rather than pushing their
+    /// full closure. Conversation pushes do not traverse source gitlinks.
+    pub fn scratch_partial(name: &str, remote_url: &str) -> Result<GitStore, String> {
+        let mut store = Self::scratch(name, remote_url)?;
+        for (key, value) in [
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialclonefilter", "tree:0"),
+        ] {
+            let output = store.output(&["config", key, value])?;
+            if !output.status.success() {
+                return Err(store.output_error("configuring partial clone", &output));
+            }
+        }
+        store.partial = true;
+        Ok(store)
+    }
+
     pub fn open(dir: &Path, remote: Option<&str>) -> Result<GitStore, String> {
         let dir = fs::canonicalize(dir)
             .map_err(|error| format!("resolving Git repository {}: {error}", dir.display()))?;
@@ -154,6 +174,7 @@ impl GitStore {
             git_dir: dir.clone(),
             dir,
             remote: remote.map(str::to_string),
+            partial: false,
             remote_tip: RefCell::new(None),
             batch: RefCell::new(None),
             batch_dirty: Cell::new(false),
@@ -221,6 +242,9 @@ impl GitStore {
             .read_local_ref(refname)?
             .or_else(|| self.remote_tip.borrow().clone());
         let mut arguments = fetch_arguments(tip.as_ref());
+        if self.partial {
+            arguments.push("--filter=tree:0".into());
+        }
         arguments.extend([remote.to_string(), refspec]);
         let argument_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
         let output = self.output(&argument_refs)?;
@@ -249,6 +273,9 @@ impl GitStore {
             .as_deref()
             .ok_or_else(|| "no remote".to_string())?;
         let mut arguments = fetch_arguments(tip);
+        if self.partial {
+            arguments.push("--filter=tree:0".into());
+        }
         arguments.extend([remote.to_string(), oid.to_string()]);
         let argument_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
         let output = self.output(&argument_refs)?;
@@ -785,6 +812,38 @@ impl ObjectStore for GitStore {
 
     fn write_commit(&mut self, commit: &CommitInfo) -> Result<Oid, StoreError> {
         self.write_object(ObjectKind::Commit, &encode_commit_bytes(commit))
+    }
+}
+
+impl super::stacks::StackStore for GitStore {
+    fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, String> {
+        CodeOps::is_ancestor(self, ancestor, descendant)
+    }
+    fn merge_objects(
+        &mut self,
+        base: Option<&Oid>,
+        ours: &Oid,
+        theirs: &Oid,
+    ) -> Result<super::stacks::MergeResult, String> {
+        self.ensure_local(ours)?;
+        self.ensure_local(theirs)?;
+        let explicit_base = base.map(|base| format!("--merge-base={base}"));
+        let mut args = vec!["merge-tree", "--write-tree", "-z", "--messages"];
+        if let Some(base) = &explicit_base {
+            args.push(base);
+        }
+        // With conflicts Git still emits the full message block; requesting
+        // it explicitly is necessary because structural conflicts can have no
+        // unmerged stage rows at all.
+        args.extend([ours.as_str(), theirs.as_str()]);
+        let output = self.output(&args)?;
+        self.batch_dirty.set(true);
+        match output.status.code() {
+            Some(0 | 1) => {
+                super::stacks::git::parse_merge(&output.stdout, !output.status.success())
+            }
+            _ => Err(self.output_error("git merge-tree", &output)),
+        }
     }
 }
 
