@@ -302,7 +302,7 @@ fn callback(
     timing::phase(&format!("tool wait {tool}"));
 
     if read_arg_opt("tool-eval")?.is_some() {
-        if tool == "github" {
+        if matches!(tool.as_str(), "github" | "submit_stack") {
             return github::evaluated(cfg, state, request, request_head, round, &id);
         }
         if Path::new(&arg("error")).exists() {
