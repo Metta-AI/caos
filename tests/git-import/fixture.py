@@ -485,8 +485,8 @@ def main():
             # Pushes use a separate empty remote: object transfer comes from
             # the server, including code ancestry, without a worker checkout.
             destination = f"https://localhost:{remote_port}/published.git"
-            def push(commit, branch="topic", old=None, dest=destination, **kwargs):
-                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old},
+            def push(commit, branch="topic", old=None, dest=destination, rewrite=False, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "rewrite":rewrite},
                             endpoint="/git/push", **kwargs)
             def remote_head(branch):
                 return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
@@ -502,6 +502,12 @@ def main():
             assert push(third[0], old=first[0])["status"] == "conflict"
             assert json.loads(push(first[0], old=second[0], expected=422))["code"] == "not-fast-forward"
             assert remote_head("topic") == second[0]
+            # Rebase publication is opt-in and still uses the exact lease.
+            assert push(first[0], old=second[0], rewrite=True)["status"] == "complete"
+            assert remote_head("topic") == first[0]
+            assert push(third[0], old=second[0], rewrite=True)["status"] == "conflict"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
             assert json.loads(push("e" * 40, branch="missing", expected=422))["code"] == "missing-commit"
             unimported = advance()
             run("git", "--git-dir", str(origin), "push", "-q", str(published),
