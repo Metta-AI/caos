@@ -1,0 +1,4 @@
+../../dev/cli-test cli-test
+../../std/github github
+../../std/llm-step llm-step
+../../std/llm-stub llm-stub

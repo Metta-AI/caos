@@ -3,9 +3,10 @@ use super::*;
 use conversation_protocol::v3::publication::Outcome;
 use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
-pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR or change the source gitlink. Only fast-forward updates are supported: import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR or change the source gitlink. Updates default to fast-forward. Set rewrite=true only to publish intentionally rebased history; the exact remote-head lease still prevents overwriting a concurrent change. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
-@param branch Destination branch name (without refs/heads/).";
+@param branch Destination branch name (without refs/heads/).
+@param [rewrite] Allow an intentional history rewrite while retaining the exact remote-head lease.";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,8 @@ struct Parameters {
     source_tree: String,
     repository: String,
     branch: String,
+    #[serde(default)]
+    rewrite: bool,
 }
 
 fn parameters(call: &Call) -> Result<Parameters, String> {
@@ -69,49 +72,21 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     let pending = match pinned(&state.conversation()?, site)? {
         Some(record) => record,
         None => {
-            let view = state.conversation()?;
-            let head = match view.source_tree(&p.source_tree)? {
-                Some(source) => source.commit,
-                None => {
-                    return site.fail(state, "publish_source requires an existing source gitlink")
-                }
-            };
-            let base = view.reference_start(&p.source_tree)?;
             let old = match observe() {
                 Ok(old) => old,
                 Err(error) => return site.fail(state, &error),
             };
-            let id = view.identity()?.id;
-            let descriptor = Descriptor {
-                source_base: base.clone(),
-                source_head: head.clone(),
-                target_base: base,
-                policy: "preserve".into(),
-                implementation: "caos/server-push".into(),
-                commit_policy: "preserve".into(),
-            };
-            let key = invocation(&id, site)?[..32].to_string();
-            let publication = ids::publication_id(
-                &id,
-                &key,
-                &ids::projection_id(&descriptor.to_value())?,
-                &head,
+            let record = match plan(
+                &state.conversation()?,
+                site,
+                &p.source_tree,
                 &p.repository,
-                &format!("refs/heads/{}", p.branch),
-                old.as_ref(),
-            )?;
-            let record = PublicationRecord {
-                id: publication,
-                key,
-                descriptor,
-                planned_head: head,
-                repository: p.repository.clone(),
-                refname: format!("refs/heads/{}", p.branch),
-                expected_old: old,
-                source_tree_name: p.source_tree.clone(),
-                status: PublicationStatus::Pending,
-                evidence: None,
-                observed: None,
+                &p.branch,
+                old,
+                p.rewrite,
+            ) {
+                Ok(record) => record,
+                Err(error) => return site.fail(state, &error),
             };
             let Some(record) = pin(state, site, &record)? else {
                 return Ok(());
@@ -122,17 +97,81 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     if pending.status != PublicationStatus::Pending {
         return finish(state, site, &pending, None);
     }
-    // An attempt that pinned this intent may send it, including concurrent
-    // attempts that joined the identical transition. The exact lease makes
-    // those pushes converge. Recovery never obtains a fresh source or lease.
-    let outcome = {
+    let outcome = push(&pending)?;
+    finish(state, site, &pending, Some(outcome))
+}
+
+pub(super) fn plan(
+    view: &Conversation<'_>,
+    site: &CallSite<'_>,
+    source_tree: &str,
+    repository: &str,
+    branch: &str,
+    old: Option<Oid>,
+    rewrite: bool,
+) -> Result<PublicationRecord, String> {
+    let head = view
+        .source_tree(source_tree)?
+        .ok_or("publication requires an existing source gitlink")?
+        .commit;
+    let base = view.reference_start(source_tree)?;
+    let id = view.identity()?.id;
+    let descriptor = Descriptor {
+        source_base: base.clone(),
+        source_head: head.clone(),
+        target_base: base,
+        policy: if rewrite { "rewrite" } else { "preserve" }.into(),
+        implementation: "caos/server-push".into(),
+        commit_policy: "preserve".into(),
+    };
+    let key = invocation(&id, site)?[..32].to_string();
+    let publication = ids::publication_id(
+        &id,
+        &key,
+        &ids::projection_id(&descriptor.to_value())?,
+        &head,
+        repository,
+        &format!("refs/heads/{}", branch),
+        old.as_ref(),
+    )?;
+    Ok(PublicationRecord {
+        id: publication,
+        key,
+        descriptor,
+        planned_head: head,
+        repository: repository.into(),
+        refname: format!("refs/heads/{}", branch),
+        expected_old: old,
+        source_tree_name: source_tree.into(),
+        status: PublicationStatus::Pending,
+        evidence: None,
+        observed: None,
+    })
+}
+
+pub(super) fn push(pending: &PublicationRecord) -> Result<Outcome, String> {
+    let branch = pending
+        .refname
+        .strip_prefix("refs/heads/")
+        .ok_or("invalid publication branch")?;
+    let token_file = import_source::token_file(&pending.repository);
+    let token = token_file
+        .map(fs::read_to_string)
+        .transpose()
+        .map_err(|_| "reading GitHub token")?;
+    let token = token.as_deref().map(str::trim_end);
+    let observe = || {
+        git_locator::publish::read_branch(&pending.repository, branch, token)
+            .and_then(|h| h.map(|h| Oid::parse(&h, "remote head")).transpose())
+    };
+    Ok({
         let mut command = std::process::Command::new("caos");
         command
             .args([
                 "push-git",
                 &pending.repository,
                 pending.planned_head.as_str(),
-                &p.branch,
+                branch,
             ])
             .arg(format!(
                 "--expected={}",
@@ -142,6 +181,9 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     .map(Oid::as_str)
                     .unwrap_or("absent")
             ));
+        if pending.descriptor.policy == "rewrite" {
+            command.arg("--rewrite");
+        }
         if let Some(file) = token_file {
             command.arg(format!("--github-token-file={file}"));
         }
@@ -157,34 +199,32 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 None,
             ),
             Ok(child) => match child.wait_with_output() {
-                Ok(output) if output.status.success() => {
-                    let value: Value = serde_json::from_slice(&output.stdout)
-                        .map_err(|_| "invalid push-git result")?;
-                    let status: PublicationStatus = serde_json::from_value(value["status"].clone())
-                        .map_err(|_| "invalid push status")?;
-                    let observed: Option<Oid> = serde_json::from_value(value["observed"].clone())
-                        .map_err(|_| "invalid remote head")?;
-                    let outcome = Outcome::new(
-                        status,
-                        value["kind"]
-                            .as_str()
-                            .ok_or("missing publication evidence")?,
-                        value["diagnostic"].as_str().map(str::to_owned),
-                        observed,
-                    );
-                    reconcile(&pending, outcome, observe)
-                }
+                Ok(output) if output.status.success() => match parse_outcome(&output.stdout) {
+                    Some(outcome) => reconcile(pending, outcome, observe),
+                    // The push process succeeded, so malformed output cannot
+                    // safely be treated as if no remote mutation happened.
+                    None => recovered(pending, observe()),
+                },
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
                     "validation-rejected",
                     Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
                     None,
                 ),
-                _ => recovered(&pending, observe()),
+                _ => recovered(pending, observe()),
             },
         }
-    };
-    finish(state, site, &pending, Some(outcome))
+    })
+}
+
+fn parse_outcome(bytes: &[u8]) -> Option<Outcome> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    Some(Outcome::new(
+        serde_json::from_value(value["status"].clone()).ok()?,
+        value["kind"].as_str()?,
+        value["diagnostic"].as_str().map(str::to_owned),
+        serde_json::from_value(value["observed"].clone()).ok()?,
+    ))
 }
 
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {
@@ -278,6 +318,42 @@ pub(super) fn pin<S: progress::RefStore>(
         }
     }
     Err("conversation kept moving while pinning publication".into())
+}
+
+pub(super) fn retain<S: progress::RefStore>(
+    state: &mut progress::State<S>,
+    pending: &PublicationRecord,
+    outcome: Outcome,
+) -> Result<PublicationRecord, String> {
+    for _ in 0..32 {
+        state.reload()?;
+        let record = state
+            .conversation()?
+            .publication(&pending.id)?
+            .ok_or("publication disappeared")?;
+        if record.status != PublicationStatus::Pending {
+            return Ok(record);
+        }
+        let head = state.head().clone();
+        if matches!(
+            state.try_append_at(
+                &head,
+                Transition::PublicationTerminal {
+                    publication: record.id,
+                    status: outcome.status,
+                    evidence: outcome.evidence.clone(),
+                    observed: outcome.observed.clone(),
+                }
+            )?,
+            progress::TryAppend::Appended(_)
+        ) {
+            return state
+                .conversation()?
+                .publication(&pending.id)?
+                .ok_or("publication disappeared".into());
+        }
+    }
+    Err("conversation kept moving while saving publication".into())
 }
 
 pub(super) fn finish<S: progress::RefStore>(
