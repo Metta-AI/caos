@@ -871,8 +871,9 @@ requested unused path. Use /import for local checkouts.
 ### Publishing and GitHub
 
 Ask the agent to publish a named source tree or a stack. The `publish_source` tool
-pushes the selected code commit directly from the server with an expected-head
-lease. The `github` tool runs GitHub CLI for PRs, comments, issues and linking
-existing PR URLs into stacks. Add `reader=std/github` alongside `reader=std/llm-step`
-in the `github-token` secret. See [publication and stacks](design/agent-publish.md)
-for examples, credentials and retry behavior.
+pushes one branch; `push_stack` pushes the branches in a registered source stack.
+Both push directly from the server with expected-head leases. The `github` tool
+runs GitHub CLI for PRs, comments, issues and linking existing PR URLs into stacks.
+Add `reader=std/github` alongside `reader=std/llm-step`
+in the `github-token` secret. See [GitHub interactions](design/agent-github.md)
+for imports, branch publication, stacks, PRs, credentials and retry behavior.

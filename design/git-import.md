@@ -79,7 +79,7 @@ credentials, like other objects already in the store.
 
 Implementation: [endpoint](../rust/crates/server/src/import.rs),
 [Git command and credential setup](../rust/crates/git-locator/src/import.rs).
-Caller behavior: [agent imports](agent-github.md#importing).
+Caller behavior: [agent imports](agent-import.md). Overview: [GitHub interactions](agent-github.md).
 
 ## Object-store invariant
 

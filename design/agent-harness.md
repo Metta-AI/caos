@@ -360,10 +360,10 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   and freezes redraws for native terminal text selection. `/checkout <gitlink>
   [directory]` checks out the named code commit as a detached HEAD in a clean
   local checkout. `Ctrl+H` opens the keyboard and slash-command reference.
-  Publication uses the agent's publish_source and github tools. The
-  server pushes the selected code commit; the GitHub worker handles PRs and
-  stacks. See [publication](agent-publish.md) for frozen inputs, leases and
-  recovery. The TUI's /pr and /publish-branch are removed. Publishing source
+  Publication uses the agent's publish_source and push_stack tools. The
+  server pushes code commits; the GitHub worker handles PRs and other GitHub
+  metadata. See [GitHub interactions](agent-github.md) for the designs and recovery.
+  The TUI's /pr and /publish-branch are removed. Publishing source
   commits never mutates the local checkout.
 
 ### Superseded protocol detail

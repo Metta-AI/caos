@@ -635,7 +635,7 @@ An unfinished claim is uncertain; inspect GitHub before proceeding.
 PR and stack operations compose these tools. Stack boundaries remain gitlinks;
 publish bottom to top and keep PR membership through GitHub’s stack API.
 The TUI's /pr and /publish-branch are removed; /import remains for local paths.
-See [agent publication](design/agent-publish.md) for mechanics and recovery.
+See [GitHub interactions](design/agent-github.md) for imports, publication, stacks, PRs and recovery.
 
 ## Agent stack updates
 
