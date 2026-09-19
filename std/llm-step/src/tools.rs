@@ -113,6 +113,7 @@ pub fn grep_declaration() -> Value {
 const RESERVED_TOOLS: &[&str] = &[
     "import_source",
     "publish_source",
+    "github",
     "bash",
     "grep",
     "read",
