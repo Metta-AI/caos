@@ -45,7 +45,7 @@ pub(super) fn start(
         site.round,
         &site.call.id,
         &[
-            ("current-tool", Arg::Lit("github")),
+            ("current-tool", Arg::Lit(&site.call.name)),
             ("tool-eval", Arg::Lit("github")),
         ],
     )?;
@@ -176,7 +176,7 @@ pub(super) fn dispatch(
         request,
         round,
         &call.id,
-        &[("current-tool", Arg::Lit("github"))],
+        &[("current-tool", Arg::Lit(&call.name))],
     )?;
     // Let the server assemble the request and attach its secret grant.
     // The worker ignores this immutable definition passed as run-then's input.
