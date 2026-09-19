@@ -111,6 +111,7 @@ pub fn grep_declaration() -> Value {
 /// history tools (`log`/`show`/`diff`, std entries the harness DEPends on)
 /// are standard, not project-defined.
 const RESERVED_TOOLS: &[&str] = &[
+    "stack",
     "import_source",
     "publish_source",
     "github",

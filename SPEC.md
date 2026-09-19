@@ -633,6 +633,12 @@ prevents a retried worker from repeating a possibly completed command.
 An unfinished claim is uncertain; inspect GitHub before proceeding.
 
 PR and stack operations compose these tools. Stack boundaries remain gitlinks;
-publish bottom to top and link existing PR URLs with gh stack link.
+publish bottom to top and keep PR membership through GitHub’s stack API.
 The TUI's /pr and /publish-branch are removed; /import remains for local paths.
 See [agent publication](design/agent-publish.md) for mechanics and recovery.
+
+## Agent stack updates
+
+The stack tool registers ordered source gitlinks and their original predecessor boundaries. Rebase replays linear histories with object-level Git merges; merge mode propagates updated predecessors
+without rewriting history. A conflict keeps original pointers unchanged and records a separate editable draft plus the full conflict report. Continue explicitly acknowledges resolution. Completed
+operations replace every source pointer together after checking the original inputs. No .caos/conflicts is introduced by this workflow. See [Agent stacks](design/agent-stacks.md).

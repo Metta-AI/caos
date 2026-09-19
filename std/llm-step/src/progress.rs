@@ -1,17 +1,13 @@
 //! V3 conversation storage and exact-head append/retry.
 
 use std::collections::HashSet;
-use std::fs;
-use std::process::{Command, Stdio};
 
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::paths;
-use conversation_protocol::v3::tree::encode_commit_bytes;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
     validate_spine, Block, ChildRecord, GitStore, ObjectStore, Oid, RefUpdate, TranscriptEntry,
 };
-use worker_common::{path, scratch};
 
 const MAX_APPEND_ATTEMPTS: usize = 32;
 const MAX_RECOVERY_WALK: usize = 4096;
@@ -73,68 +69,31 @@ impl State<GitStore> {
         let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
         let server =
             std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
-        let store = GitStore::scratch("llm-step-git", server.trim_end_matches('/'))?;
+        let store = GitStore::scratch_partial("llm-step-git", server.trim_end_matches('/'))?;
         let head = store
             .fetch_ref(&refname)?
             .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
         Self::from_store(store, refname, head)
     }
 
-    /// Publish a commit object after its referenced tree and parents are known
-    /// to be present on the server. Unlike a content-addressed ref push, this
-    /// uses the in-process object endpoint and creates no advertised ref.
+    /// Gitlinks do not carry their source objects in a conversation push.
+    /// Publish those objects separately and stop at complete server objects.
     pub fn publish_commit(&mut self, commit: &Oid) -> Result<(), String> {
-        let info = self.store.read_commit(commit).map_err(String::from)?;
-        for object in std::iter::once(&info.tree).chain(&info.parents) {
-            require_server_object(commit, object)?;
-        }
-        let directory = scratch(&crate::fresh_name("publish-commit"))?;
-        let source = directory.join("commit");
-        fs::write(&source, encode_commit_bytes(&info))
-            .map_err(|error| format!("writing {}: {error}", source.display()))?;
-        let target = crate::fresh("published-commit");
-        let output = Command::new("caos")
-            .args(["put-commit", path(&source), &target])
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|error| format!("running caos put-commit: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("caos put-commit exited with {}", output.status));
-        }
-        let published = String::from_utf8(output.stdout)
-            .map_err(|error| format!("caos put-commit stdout is not UTF-8: {error}"))?;
-        let published = Oid::parse(published.trim(), "published commit oid")?;
-        if published != *commit {
-            return Err(format!(
-                "caos put-commit published {published}, expected {commit}"
-            ));
-        }
-        crate::timing::phase("publish commit");
+        self.store.read_commit(commit).map_err(String::from)?;
+        let server = std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set")?;
+        crate::object_upload::upload(
+            &self.store,
+            &server,
+            commit,
+            conversation_protocol::v3::Mode::Commit,
+            &mut HashSet::new(),
+        )?;
+        crate::timing::phase("publish code objects");
         Ok(())
     }
 
-    /// Publish a code commit before a conversation record names it. The ref is
-    /// content-addressed, so an existing equal value is the same publication.
     pub fn push_code(&mut self, commit: &Oid) -> Result<(), String> {
-        self.store.ensure_local(commit)?;
-        self.store.read_commit(commit).map_err(String::from)?;
-        let refname = format!("refs/caos/req/{commit}");
-        let pushed = self.store.push(&[RefUpdate {
-            refname: refname.clone(),
-            expected: None,
-            new: Some(commit.clone()),
-        }]);
-        crate::timing::phase("push code");
-        match pushed {
-            Ok(()) => Ok(()),
-            Err(push_error) => match self.store.fetch_ref(&refname)? {
-                Some(current) if current == *commit => Ok(()),
-                Some(current) => Err(format!(
-                    "content-addressed code ref {refname} names {current}, not {commit}"
-                )),
-                None => Err(push_error),
-            },
-        }
+        self.publish_commit(commit)
     }
 
     pub fn fetch_object(&mut self, oid: &Oid) -> Result<(), String> {
@@ -252,23 +211,6 @@ impl State<GitStore> {
             )),
             (None, None) => Ok(TryAppend::HeadChanged(observed_parent)),
         }
-    }
-}
-
-fn require_server_object(commit: &Oid, object: &Oid) -> Result<(), String> {
-    let base =
-        std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
-    let url = format!("{}/object/{object}", base.trim_end_matches('/'));
-    let response = minreq::head(&url)
-        .with_timeout(30)
-        .send()
-        .map_err(|error| format!("HEAD {url}: {error}"))?;
-    match response.status_code {
-        200..=299 => Ok(()),
-        404 => Err(format!(
-            "cannot publish commit {commit}: server is missing object {object}"
-        )),
-        status => Err(format!("HEAD {url}: {status} {}", response.reason_phrase)),
     }
 }
 
