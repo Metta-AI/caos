@@ -7,8 +7,7 @@ Part of [GitHub interactions](agent-github.md). CAOS publishes branches from the
 `std/github` contains Git, `gh`, and the pinned `github/gh-stack` v0.1.1 extension. It is registered as a built-in tool, available without a project-defined `caos-tools` entry.
 
 The tool is `github(repository, args, stdin?)`. `args` is an argument array passed directly to `gh`; it is never interpolated into a shell command. Return exit status, stdout and stderr through
-ordinary tool results. This covers issues, comments, PR creation/editing and stack operations without separate wrappers for each GitHub action. Initially use stdin for bodies (`--body-file -`);
-commands needing local file attachments can be added when needed.
+ordinary tool results. This covers issues, comments, PR creation/editing and stack operations without separate wrappers for each GitHub action. Pass PR bodies through stdin (`--body-file -`).
 
 The worker sets `GH_REPO` explicitly and reads `GH_TOKEN` from its granted `/secret/github-token`. Use the [shared token setup](agent-github.md#credentials), granting it to both `std/github` and
 `std/llm-step`. The latter uses it for import/push and includes that identity in the model turn’s cache key. The agent carries the GitHub worker source and evaluates it when called, so secret marking

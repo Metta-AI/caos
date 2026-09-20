@@ -349,9 +349,10 @@ a clean Git checkout or an empty/new directory.
 
 The client remembers that destination locally, keyed by server, conversation,
 and gitlink path. A later `/checkout feature/01-change` can reuse it.
-`/update-tree feature/01-change <message>` commits edits in that path's remembered
-checkout, submits them back to that source, and continues the conversation with
-the user's message. The source path is explicit in both commands.
+Commit local edits with Git, then import the checkout at an unused conversation
+path, for example `/import imports/local-edit /absolute/path/to/checkout`.
+Ask the agent to integrate that imported commit into the intended source gitlink.
+The imported snapshot remains separate until that integration.
 
 Browser selection does not choose checkout or publication targets, and does not
 change the agent's execution context.
@@ -359,7 +360,7 @@ change the agent's execution context.
 ## Publishing
 
 The agent uses `publish_source` for one branch, `stack` to update related source histories, `push_stack` to publish their branches, and `github` for PRs and other GitHub operations. Publication
-receipts remain in the conversation; publishing does not move source gitlinks. The TUI's `/pr` and `/publish-branch` commands are removed.
+receipts remain in the conversation; publishing does not move source gitlinks.
 
 [GitHub interactions](agent-github.md) is the entry point for these designs. The agent checks the complete PR scope and tests before publication. Integrating upstream retains inherited changes;
 transplanting only a small edit onto a different base is a separate operation.

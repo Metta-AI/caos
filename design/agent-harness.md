@@ -363,8 +363,7 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   Publication uses the agent's publish_source and push_stack tools. The
   server pushes code commits; the GitHub worker handles PRs and other GitHub
   metadata. See [GitHub interactions](agent-github.md) for the designs and recovery.
-  The TUI's /pr and /publish-branch are removed. Publishing source
-  commits never mutates the local checkout.
+  Publishing source commits never mutates the local checkout.
 
 ### Superseded protocol detail
 

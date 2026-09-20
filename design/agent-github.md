@@ -35,14 +35,13 @@ reader=std/llm-step
 reader=std/github
 ```
 
-Keep the value file ignored and run `caos secrets` to initialize its entropy. `std/llm-step` uses the token for GitHub ref lookup and import/push; `std/github` passes it to `gh` as `GH_TOKEN`.
-
-Import and push commands read `/secret/github-token` through a token-file option and forward it to the server in the sensitive `X-Caos-Git-Token` header. The server does not look up the calling job's
-secrets. Tokens stay out of Git URLs, saved arguments, provenance and logs. Automatic GitHub credentials apply only to `github.com` on the default HTTPS port. Public imports need no token.
+Put the token value in an ignored file and run `caos secrets` to initialize its entropy. `std/llm-step` uses the token for GitHub ref lookup and forwards it to the server for imports and pushes.
+`std/github` passes it to `gh` as `GH_TOKEN`.
 
 ## Local work and recovery
 
-Keep `/import` for local checkouts and `/checkout` and `/update-tree` for local editing. The agent handles remote publication; the TUI's `/pr` and `/publish-branch` commands are removed.
+Use `/checkout` to edit a source locally. Commit the edits with Git, then use `/import` to attach the result at a new conversation path. Ask the agent to integrate that imported commit into the
+intended source. See [local editing](chat.md#viewing-files-and-working-locally) for the commands.
 
 Imports pin the resolved commit for each call. Pushes pin the source commit and expected remote head before sending. GitHub commands record each invocation so a worker retry does not silently repeat a
 write. The linked designs describe each recovery path and what the agent does when the remote outcome is uncertain.

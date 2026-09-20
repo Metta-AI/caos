@@ -2,7 +2,7 @@
 
 Part of [GitHub interactions](agent-github.md). This page describes the agent workflow; [git-import.md](git-import.md) describes the server endpoint and fetch negotiation.
 
-`import_source(source, revision?, into)` runs inline in `std/llm-step`. It accepts an HTTPS repository and a branch, full ref, or full commit hash. Omitting `revision` selects the default branch. Keep
+`import_source(source, revision?, into)` runs inline in `std/llm-step`. It accepts an HTTPS repository and a branch, full ref, or full commit hash. Omitting `revision` selects the default branch. Use
 `/import` for local paths.
 
 For each tool call:
@@ -29,8 +29,5 @@ The [server endpoint](git-import.md) fetches H and its full history into private
 negotiation tips; standalone trees and blobs may still be downloaded again. A completion marker for the same URL and H skips fetch and verification. The endpoint handles object availability; callers
 handle ref resolution and conversation state.
 
-Configure the [GitHub token](agent-github.md#credentials) for private repositories. The agent uses `/secret/github-token` for GitHub ref lookup and passes `--github-token-file=/secret/github-token` to
-`import-git`. The command forwards it in the sensitive `X-Caos-Git-Token` header; the server does not look up the calling job's secrets.
-
-Ref lookup and fetch share a repository-scoped Git credential helper. Tokens stay out of URLs, Git config, saved arguments, provenance, and logs. Automatic GitHub credentials apply only to
-`github.com` on the default HTTPS port. Public imports need no token. Importing needs neither `gh` nor another worker.
+Configure the [GitHub token](agent-github.md#credentials) for private GitHub repositories. The agent uses it for ref lookup and passes `--github-token-file=/secret/github-token` to `import-git`, which
+forwards the token to the server for the fetch. Public imports need no token.
