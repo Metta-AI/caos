@@ -221,11 +221,8 @@ fn install_model_secret(root: &Path, key: &str, images: &[&str]) -> Result<Vec<S
     Ok(done)
 }
 
-/// `.caos-secrets` must never become tracked: the tui's own `/update-tree`
-/// runs `git add -A`, which would fold the store into a turn commit pushed to
-/// the server. When git does not already ignore it, add the rule to the
-/// repo-local `.git/info/exclude` — never the tracked `.gitignore`, since a
-/// setup step must not dirty the working tree.
+/// Keep the local secret store out of Git commits. Use `.git/info/exclude`
+/// so setup does not change the repository's tracked `.gitignore`.
 fn ensure_store_ignored(root: &Path) -> Result<Option<String>, String> {
     let status = Command::new("git")
         .args(["check-ignore", "-q", "--", SECRETS_DIR])

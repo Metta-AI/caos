@@ -157,8 +157,6 @@ so it never leaves the conversation pane.
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `/checkout <gitlink> [directory]` | Check out this commit, reusing its local directory when omitted |
 | `Ctrl+O` | Browse conversation files and source-tree diffs |
-| `/pr <gitlink> <base-branch> [remote-URL]` | Preview one PR; Enter confirms |
-| `/publish-branch <gitlink> [remote-URL]` | Preview and push this snapshot without creating a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -173,10 +171,7 @@ Completed user and agent turns show branchable hashes in the transcript. Enter
 TUI. Enter `/title <new title>` to change the
 shared title without changing the conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
-client default. Enter `/update-tree <gitlink> <message>` to send an ordinary
-user turn whose commit also folds in edits in that gitlink's remembered checkout — the
-intended companion to `/checkout <gitlink> [directory]` (check out the head, edit files, then
-`/update-tree <gitlink> <message>` with the text you want in that turn). Activity entries
+client default. Activity entries
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
@@ -318,20 +313,15 @@ conversation history. Opening and running conversations never overwrite a
 checkout. `/checkout <gitlink> [directory]` uses an explicit destination or
 reuses that gitlink's remembered local directory. The destination must be a clean Git checkout
 or an empty/new directory. The client imports the code objects and detaches HEAD
-at the named commit. `/update-tree <gitlink> <message>` commits local edits in
-that gitlink's remembered checkout and imports their
-closure into the client before submission. These commands never replace the
-internal harness.
+at the named commit. Commit local edits with Git, then use
+`/import imports/local-edit /absolute/path/to/checkout` to attach that commit at
+an unused conversation path. Ask the agent to integrate the imported source.
+These commands never replace the internal harness.
 
-Publication preserves source tree history, uses leased branch updates, and
-checks conflict cleanup before preview and again before pushing. Resolve a
-nonempty `.caos/conflicts` ledger by fixing each path and clearing its entries.
-Saving an edited source tree removes an empty ledger and prunes its empty
-`.caos` directory. Any remaining `.caos` entry blocks publication; publishing
-never rewrites the selected commit. It leaves the local
-checkout and index unchanged. Credentials remain in the local secret store;
-the launcher reuses an existing checkout store or its own persistent store under
-the data directory.
+The agent publishes branches and manages PRs. See
+[GitHub interactions](../../../design/agent-github.md) for the workflow.
+Credentials are supplied through the local secret store; the launcher uses the
+checkout's store or its persistent store under the data directory.
 
 
 Over SSH, clipboard copying uses a terminal escape sequence. “Copy requested”
