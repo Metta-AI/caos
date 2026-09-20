@@ -72,7 +72,7 @@ not earlier commits; a file added and deleted in its history is outside this che
 Local Git staging still respects .gitignore for untracked files. Imports keep their exact commits, and agent tools continue to capture files as they do today. Ignored scratch files can therefore
 remain in a source during work; the agent must remove them or adjust the rules before publication.
 
-Registered stacks keep conflicts in a separate draft gitlink and report, outside source history. Older merge operations can still create a .caos/conflicts ledger; resolve it before publishing. The
-generic endpoint does not scan for that ledger, inline markers, or conversation ancestry.
+Registered stacks keep conflicts in a separate draft gitlink and report, outside source history. The `merge` tool can produce a `.caos/conflicts` ledger; resolve it before publishing. The endpoint
+does not scan for that ledger, inline markers, or conversation ancestry.
 
 Implementation: [server endpoint](../rust/crates/server/src/push.rs), [worker command](../rust/crates/caos/src/push_git.rs), and [agent tool](../std/llm-step/src/publish_source.rs).
