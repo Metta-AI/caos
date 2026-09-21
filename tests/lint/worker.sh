@@ -24,6 +24,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 caos get -r /cas/args/in || fail "materializing this test's dependencies"
 caos get /cas/args/src-lint || fail "reading lint-flake-src.sh"
 caos get /cas/args/bake-lint || fail "reading lint-bake-anchor.sh"
+caos get /cas/args/pin-lint || fail "reading lint-client-repo-pin.sh"
 root=/cas/args/in/DEEP-DEPS
 # BOTH LINTS PASS VACUOUSLY ON AN EMPTY TREE — one walks `crates/**/*.rs`, the
 # other `std/*/Cargo.toml`, and neither has anything to say about a glob that
@@ -33,6 +34,12 @@ root=/cas/args/in/DEEP-DEPS
 [ -e "$root/flake.nix" ]   || fail "no flake.nix under $root — DEPS did not mount"
 tomls=("$root"/std/*/Cargo.toml)
 [ -e "${tomls[0]}" ] || fail "no std/*/Cargo.toml under $root — DEPS did not mount"
+# Same reason as the three above: the pin lint walks `**/flake.lock` and says
+# nothing about a tree with none, so a mount that did not happen would read as
+# a pass. It needs the EXPRESSION file, which only survives because `examples`
+# arrives through `in` unevaluated — evaluating it would strip the directive.
+[ -r "$root/examples/client-repo/.caos-expr" ] \
+  || fail "no examples/client-repo/.caos-expr under $root — DEPS did not mount"
 echo "checking ${#tomls[@]} std Cargo.toml file(s) under $root" >&2
 
 # The only check in this suite that covers `nix build`. Everything else compiles
@@ -48,6 +55,15 @@ bash /cas/args/src-lint "$root" \
 echo "== lint-bake-anchor.sh: every std tool's crates.io deps are anchored ==" >&2
 bash /cas/args/bake-lint "$root" \
   || fail "a std tool's crates.io dep is missing from bake-anchor (see above)"
+
+# The checked-in client-repo template must stay evaluable. `nix flake update`
+# rewrites flake.lock and leaves the expression's two `rev=` values naming the
+# previous commit, which std/flake-input-loader then refuses — for whoever
+# forks the template, not for anything in this suite, which is why the suite
+# has to be what notices.
+echo "== lint-client-repo-pin.sh: every client repo's expression matches its lock ==" >&2
+bash /cas/args/pin-lint "$root" \
+  || fail "a client repo's .caos-expr and flake.lock name different caos commits (see above)"
 
 printf 'lint: ALL PASS (%s std Cargo.toml files checked)\n' "${#tomls[@]}" > /tmp/report
 cat /tmp/report >&2

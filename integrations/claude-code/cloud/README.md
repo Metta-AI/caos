@@ -18,10 +18,36 @@ smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
 every request paid a fresh connection — the reason `/eval-locator` exists — while
 the client now holds ONE connection and opens a stream per request.
 
-## Nothing is committed to a repository
+## The session starts from a CLIENT repo, not from the code
 
-Configuration is user-level in the container, so one environment serves every
-repo. Three routes were possible; only one works:
+The repository a session opens is a **caos client repo**
+([`../../../examples/client-repo`](../../../examples/client-repo)): a handful of
+text files that pin a caos and mount its `std/`. The code to work on is
+**imported into the conversation** by the agent's `import_source` tool — the
+server fetches it from GitHub directly, so nothing is cloned into the container
+and nothing is pushed out of it.
+
+That is what makes starting a session cheap on a large repository. The old
+arrangement checked the target repo out shallow, unshallowed it in the session
+hook (`caos` pushes the workspace commit, and a push packs the whole reachable
+graph), then pushed it to the server. A 100k-commit repo paid all of that
+before the first turn; now it pays a `POST /git/import` on the server, and the
+container's own checkout stays a few kilobytes.
+
+The client repo is also the **version knob**. `setup.sh` reads its `flake.lock`
+before installing anything, so the client binary, the tools and the tree the
+session evaluates all come from the commit the repo pins — and
+`session-start.sh` re-reads it every session, because the environment snapshot
+freezes whatever setup resolved. `caos-pin.sh` is that reader, used by both.
+
+With caos reachable at a path in the checkout (`caos-std/`, from the repo's
+root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
+rather than a locator pinned to the client's own build. The same path makes
+`reader=caos-std/llm-step` resolvable in a **committed** `.caos-secrets` entry,
+which is how a shared repo can declare a GitHub token without holding one.
+
+Claude Code's own configuration is still user-level in the container, so one
+environment serves every repo. Three routes were possible; only one works:
 
 | source | |
 |---|---|
@@ -38,16 +64,33 @@ All three are written anyway; it costs nothing.
 a `caos` git remote and an arbitrary checkout has none, so the hook adds it per
 session, from user-level settings rather than anything committed.
 
+**The checkout is there before the setup script runs**, which is what lets the
+pin be read that early — and reading it early matters, because work done after
+the snapshot is paid by every session. Measured from a session's
+`env_manager_log`: `Cloned from seed bundle` precedes `Running setup script`.
+
+A repo that pins no caos (caos' own, or any ordinary one) falls through to the
+`--base` in the settings form, exactly as before this existed.
+
 ## Configuring the environment
 
+**Repository**: a caos client repo — fork
+[`examples/client-repo`](../../../examples/client-repo) and point the
+environment at your fork.
+
 **Setup script**: paste these two lines into the environment's "Setup script"
-field (swap `main` for a branch or commit to test a change — everything else is
-read back out of it):
+field (swap `main` for a branch or commit to test a change to the *bootstrap
+scripts* — everything else is read back out of it):
 
 ```
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 ```
+
+This `--base` says where `setup.sh`, `caos-pin.sh` and `session-start.sh` come
+from. It does **not** choose the caos that gets installed when the repository
+pins one: `flake.lock` outranks it, and the line above then never needs editing
+again.
 
 **Environment variable**: `CAOS_SERVER_URL`, holding either —
 - `caos://<ticket>` — what `caosd ticket` prints on the machine running the
@@ -57,6 +100,18 @@ curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 `CAOS_SERVER_URL` is a **credential** when it is a ticket: whoever holds it can
 drive that server, which runs containers and holds every secret. The status tool
 redacts it rather than printing it for a model to quote.
+
+**For private repositories**, two more, both named by the client repo's
+committed `.caos-secrets/github-token` rather than by anything here:
+
+- `GITHUB_TOKEN` — a PAT with access to the repos you want to import or publish.
+- `CAOS_GITHUB_TOKEN_ENTROPY` — 16+ random characters, yours alone. This is
+  what keeps your cached results unreadable by anyone else holding the same
+  client repo; it is a bearer capability for the cache, which is why it comes
+  from the environment and never from the committed file.
+
+Leave both unset for public work: the secret is simply absent from the store
+(one line on stderr), and imports of public repositories need no credential.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
 client), `api.anthropic.com`, and iroh's relays (`*.relay.n0.iroh.link`,

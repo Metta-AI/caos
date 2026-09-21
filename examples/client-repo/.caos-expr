@@ -1,0 +1,20 @@
+# The root expression of a caos client repo: mount caos' `std/` into THIS
+# tree's evaluation result, so everything below can name `caos-std/<entry>`.
+#
+# Nothing of caos is committed here. The mount exists only in the evaluated
+# tree — content-addressed, deduped, never on disk — which is why `caos-std/`
+# is gitignored and why this repo stays a handful of text files however large
+# caos gets.
+#
+# The locator appears TWICE on purpose (design/flake-inputs.md, "Consumer
+# root"): `--base` yields the loader's own image, `--input-tree` yields the
+# tree it splices. Passing the tree as an argument is what lets caos' `:@@=`
+# resolution fetch it client-side, so the ArgTree carries an oid and the URL
+# never enters a cache key.
+#
+# Both revs must equal what flake.lock locks for `--input=caos`. The loader
+# checks exactly that and refuses the evaluation if they differ.
+run --base:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std/flake-input-loader \
+    --in:@=. --expr=$CAOS_EXPR \
+    --input=caos --input-tree:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std \
+    --output-path=caos-std

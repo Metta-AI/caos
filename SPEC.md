@@ -326,7 +326,6 @@ There should be exactly one copy of the code that starts a stack and builds the 
   tool gets the tree under test and builds from source, so there is no ref of
   prebuilt host binaries to resolve. Do not reintroduce one.
 
-# 
 
 # From agents
 

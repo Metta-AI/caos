@@ -1,0 +1,29 @@
+# GitHub credentials for private repositories.
+#
+# COMMITTED, and safe to be: neither the token nor its cache-isolation entropy
+# is in this file. Both name environment variables, so every user of this repo
+# supplies their own and no two of them share a `secret-hash`.
+#
+# You do NOT need this for public repositories — `import_source` and
+# `publish_source` reach those unauthenticated. Leave the variables unset and
+# the secret is simply absent from the store (the client says so once, on
+# stderr, and carries on).
+#
+# To use it, set both in the cloud environment's variables:
+#   GITHUB_TOKEN               a PAT with access to the repos you want
+#   CAOS_GITHUB_TOKEN_ENTROPY  any random string of 16+ chars, yours alone
+#
+# The entropy is what keeps your cached results out of anyone else's reach: it
+# is a bearer capability for the cache, so it must not be shared and must not
+# be committed. That is why `entropy:env=` is required here rather than the
+# literal `entropy=` that `caos secrets` writes for a local store.
+name=github-token
+value:env=GITHUB_TOKEN
+entropy:env=CAOS_GITHUB_TOKEN_ENTROPY
+
+# WHO MAY READ IT. A reader is a path in THIS tree, eval-path'd — which is why
+# the caos-std mount has to exist: `caos-std/llm-step` resolves through the
+# root .caos-expr above. A reader naming a path the tree does not carry grants
+# nothing and is dropped with a warning, so if imports of private repos fail
+# with a permission error, check this path first.
+reader=caos-std/llm-step

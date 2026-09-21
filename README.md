@@ -399,9 +399,10 @@ the object machinery through a one-way dependency. Their difference is the
     `--llm-call:@=std/llm-call` here, `--llm-step:@=caos-std/llm-step` in a repo
     that mounted caos, or `:@@=<git ref>` in one that only pinned it. There is
     no default and no path this client goes looking in;
-  - `secrets [--check]` — tend the git-ignored `.caos-secrets` store: fill a
+  - `secrets [--check]` — tend the `.caos-secrets` store: fill a
     missing `entropy=`, warn on a weak one (`--check` reports only and exits
-    non-zero, for CI). Offline — no server (design/secrets.md).
+    non-zero, for CI). Offline — no server (design/secrets.md). A committed
+    entry taking its value from the environment is left alone (below).
 
 Conversations read their model credential from that local store rather than
 putting it in a curried worker. The easiest setup is `caos tui`: when the store
@@ -435,6 +436,36 @@ isolation. The value file must hold the key verbatim — no trailing newline,
 since the value goes into the `x-api-key` header untouched. The file and value
 path stay local; only the entropy-derived identity enters an ArgTree, while the
 value is carried out of band for the run.
+
+### A secrets file that can be committed
+
+`value:env=<VAR>` and `entropy:env=<VAR>` take both halves from the process
+environment, so the file itself carries no secret and belongs in git — which is
+what lets a shared client repo ship the *declaration* (the name and the
+readers) while each user supplies their own bytes:
+
+```text
+# .caos-secrets/github-token — committed; both values come from the environment
+name=github-token
+value:env=GITHUB_TOKEN
+entropy:env=CAOS_GITHUB_TOKEN_ENTROPY
+reader=caos-std/llm-step
+```
+
+The pairing is a rule, not a convention: `value:env=` beside a literal
+`entropy=` is **refused at parse time**. Entropy is a bearer capability for the
+cache — knowing it reconstructs the key of any run that used it — so a
+committed literal would put every clone of the repo on one `secret-hash` and
+let one user's cached results answer another's. `caos secrets` will not invent
+one either; it says to add `entropy:env=` instead.
+
+An `:env=` variable that is unset or blank **drops that secret** from the store,
+with one line on stderr, rather than failing the turn. A template can therefore
+declare a token most of its users never set: public work keeps running, and a
+worker that genuinely needed the credential fails on the missing
+`/secret/<name>`, which is the contract anyway. Unlike the other two forms, an
+`:env=` value is trimmed — a variable set by a shell far more often carries a
+stray newline than a token that ends in one.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are

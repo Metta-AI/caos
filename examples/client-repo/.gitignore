@@ -1,0 +1,8 @@
+# Where std/flake-input-loader mounts caos' std. It exists only in the
+# evaluated tree; the loader REFUSES to overwrite a real directory at its
+# --output-path, so a stray checkout here would break every evaluation.
+/caos-std/
+
+# The entropy and value files a local (non-committed) secret would use.
+# The committed declarations in .caos-secrets/ take both from the environment.
+/.caos-secrets/*-value
