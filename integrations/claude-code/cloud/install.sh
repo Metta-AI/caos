@@ -410,9 +410,20 @@ chmod 0644 "$PREFIX/share/caos/build"
 # a slow or unreachable GitHub serves the installed client rather than hanging
 # startup. Its refresh output is forced to STDERR, because the wrapper's stdout
 # becomes the tool server's JSON-RPC the moment it execs.
-cat > "$PREFIX/bin/caos-serve" <<WRAP
+# WRITTEN TO A TEMPORARY AND MOVED INTO PLACE, never truncated where it stands.
+# This script is what `caos-serve` re-runs, so the file being rewritten is the
+# one bash is CURRENTLY READING -- and bash reads a script lazily, by byte
+# offset, so truncating it mid-run makes it resume at an offset into different
+# text. A rename swaps the inode and leaves the running shell on the old one.
+#
+# `--caos-std-path` rides in the refresh command for the same reason the step
+# does: without it the refresh would rewrite this wrapper in the LOCATOR form,
+# silently repointing the next launch at the step the client was built from
+# rather than the one the repo pins.
+serve_tmp="$PREFIX/bin/.caos-serve.$$"
+cat > "$serve_tmp" <<WRAP
 #!/bin/bash
-timeout 20 bash -c "curl -fsSL '$BASE/integrations/claude-code/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
+timeout 20 bash -c "curl -fsSL '$BASE/integrations/claude-code/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'${caos_std_path:+ --caos-std-path='$caos_std_path'}" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
 WRAP
 if [ -n "$caos_std_path" ]; then
     # A REPO-PINNED step needs nothing from the build record: the path names the
@@ -421,11 +432,11 @@ if [ -n "$caos_std_path" ]; then
     # root `.caos-expr` from the checkout (`resolve_cli_image_with_store`
     # eval-paths the ingested workspace), which is what makes a path that exists
     # only in the EVALUATION result nameable here.
-    cat >> "$PREFIX/bin/caos-serve" <<WRAP
+    cat >> "$serve_tmp" <<WRAP
 exec "$PREFIX/bin/caos" mcp serve "--llm-step:@=$caos_std_path/llm-step"
 WRAP
 else
-    cat >> "$PREFIX/bin/caos-serve" <<WRAP
+    cat >> "$serve_tmp" <<WRAP
 # The step, pinned to the commit the refresh JUST installed -- not the one the
 # snapshot's mcp.json named. Refreshing the binary without this would run the new
 # server against an OLD llm-step (its tools are the pinned rev's), which is the
@@ -439,7 +450,8 @@ fi
 exec "$PREFIX/bin/caos" "\$@"
 WRAP
 fi
-chmod 0755 "$PREFIX/bin/caos-serve"
+chmod 0755 "$serve_tmp"
+mv -f "$serve_tmp" "$PREFIX/bin/caos-serve"
 
 # The repository files. NOT overwritten without --force: a checkout that already
 # has `.claude/settings.json` has someone's configuration in it, and replacing
