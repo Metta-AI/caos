@@ -198,13 +198,38 @@ else
     # Neither a branch nor a tag, so a commit -- and possibly an abbreviated
     # one. The build tags carry 12 hex digits, so a shorter sha is a prefix of
     # exactly the tag wanted, and nothing else has to expand it.
+    #
+    # BOTH DIRECTIONS, because a FULL sha is now the common case: `caos-pin.sh`
+    # reads `flake.lock`, and nix locks a rev at all forty characters. Matching
+    # only `<tag digits> == <ref>*` asks whether twelve characters start with
+    # forty, which they never do -- so every repo-pinned install failed with
+    # "no branch, tag or built commit called <the sha that is right there>".
+    # Comparing the first twelve of each covers the abbreviated ref this was
+    # written for and the full one it is given.
     VERSION=""
+    ref12="${REF:0:12}"
     while IFS= read -r b; do
-        case "${b#build-}" in "$REF"*) VERSION="$b"; break ;; esac
+        digits="${b#build-}"
+        case "$digits" in
+            "$ref12"*) VERSION="$b"; break ;;
+        esac
+        case "$ref12" in
+            "$digits"*) VERSION="$b"; break ;;
+        esac
     done <<< "$builds"
+    # A pinned commit whose build has not landed yet is the same situation a
+    # branch head is in while CI runs, and it gets the same answer: walk back
+    # for the newest build at or before it rather than installing nothing. A
+    # repo that re-pins the moment it pushes would otherwise take out every
+    # session started in that window.
     if [ -z "$VERSION" ]; then
-        echo "$REPO has no branch, tag or built commit called $REF" >&2
-        exit 1
+        echo "$REPO has no build for $REF" >&2
+        echo "  (the workflow publishes build-<commit>; it may still be running)" >&2
+        if ! VERSION="$(newest_build_at_or_before "$REF")"; then
+            echo "  and no build exists in its last $WALK_DEPTH commits either" >&2
+            exit 1
+        fi
+        echo "  falling back to $VERSION, the newest build at or before it" >&2
     fi
 fi
 echo "$REPO $REF -> $VERSION" >&2
