@@ -101,10 +101,20 @@ esac
 # install.
 caos_std_path=""
 repo_dir=""
+# `$CLAUDE_PROJECT_DIR` is almost certainly NOT set here -- it is a Claude Code
+# hook variable and Claude Code has not started yet -- so the glob is what
+# actually finds the checkout. It is tried first anyway, for the day that
+# changes, and costs one test.
+#
+# `-e .git`, not `-d`: a worktree's `.git` is a FILE, and refusing one would
+# send this down the fallback for a checkout that is perfectly good.
+#
+# An unmatched glob stays literal in bash, which these tests then reject, so
+# there is no case where the literal is mistaken for a directory.
 for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
     [ -n "$candidate" ] || continue
     candidate="${candidate%/}"
-    [ -d "$candidate/.git" ] || continue
+    [ -e "$candidate/.git" ] || continue
     [ -r "$candidate/flake.lock" ] || continue
     repo_dir="$candidate"
     break
