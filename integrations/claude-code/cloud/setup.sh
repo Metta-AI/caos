@@ -51,6 +51,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
+bootstrap_base=""
 enable_bash=""
 for arg in "$@"; do
     case "$arg" in
@@ -62,6 +63,11 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+# The base this script was FETCHED from, kept before the repo is allowed to
+# replace it: the sibling scripts (caos-pin.sh, session-start.sh) have to come
+# from the same place as this file, or a checkout could point the bootstrap at a
+# tree that never contained one.
+bootstrap_base="$base"
 
 # The repo and the ref come back out of the base, which is why there is only
 # one thing to state. Shape-checked only: install.sh takes the same --base and
@@ -78,6 +84,47 @@ case "$base" in
         ;;
 esac
 
+# ---------------------------------------------------------------------------
+# The repo's own pin, if it has one
+# ---------------------------------------------------------------------------
+# A caos-client repo DECLARES which caos it uses, in flake.lock, and where it
+# mounts caos' std, in its root `.caos-expr`. When the checkout says both, it
+# outranks `--base`: the client, the tools and the tree the session evaluates
+# then all come from the commit the repo pins, and the two lines in the settings
+# form stop being a version at all -- they are only where the bootstrap scripts
+# come from.
+#
+# THE CHECKOUT IS ALREADY HERE. Measured from a session's env_manager_log:
+# "Cloned from seed bundle" precedes "Running setup script", so this can read
+# the repo rather than defer to the first session hook -- which matters because
+# work done after the snapshot is paid by EVERY session, and this is the whole
+# install.
+caos_std_path=""
+repo_dir=""
+for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
+    [ -n "$candidate" ] || continue
+    candidate="${candidate%/}"
+    [ -d "$candidate/.git" ] || continue
+    [ -r "$candidate/flake.lock" ] || continue
+    repo_dir="$candidate"
+    break
+done
+if [ -n "$repo_dir" ]; then
+    echo "reading the caos pin from $repo_dir" >&2
+    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+              | bash -s -- "$repo_dir")"; then
+        eval "$pin"
+        base="$caos_pin_base"
+        caos_std_path="$caos_pin_std_path"
+        echo "this repo pins caos $caos_pin_repo at $caos_pin_rev" >&2
+        echo "  and mounts its std at $caos_std_path" >&2
+    else
+        echo "  (no usable caos pin; falling back to --base=$base)" >&2
+    fi
+else
+    echo "no checkout with a flake.lock under /home/user; using --base=$base" >&2
+fi
+
 # WHICH CLIENT: whatever --base names, passed straight through. There is no
 # branch or version to choose here, because choosing one could only mean
 # installing a client that does not match the scripts installing it.
@@ -86,6 +133,7 @@ esac
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
 args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
+args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
 installer="$base/integrations/claude-code/cloud/install.sh"
 
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
@@ -130,6 +178,7 @@ cat > /usr/local/bin/caos-cloud-session-start <<EOF
 #!/bin/bash
 base="$base"
 enable_bash="$enable_bash"
+caos_std_path="$caos_std_path"
 EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
@@ -138,7 +187,8 @@ if ! script="$(curl -fsSL "$base/integrations/claude-code/cloud/session-start.sh
     echo "caos: could not fetch $base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
-exec bash -c "$script" caos-cloud-session-start --base="$base" ${enable_bash:+--enable-bash}
+exec bash -c "$script" caos-cloud-session-start --base="$base" \
+    ${enable_bash:+--enable-bash} ${caos_std_path:+--caos-std-path="$caos_std_path"}
 BOOTSTRAP
 chmod 0755 /usr/local/bin/caos-cloud-session-start
 bash -n /usr/local/bin/caos-cloud-session-start || {

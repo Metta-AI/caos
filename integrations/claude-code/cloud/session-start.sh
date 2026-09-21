@@ -30,12 +30,18 @@ step() { log "[+$(($(date +%s) - hook_started))s] $*"; }
 
 base=""
 enable_bash=""
+caos_std_path=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}" ;;
         --enable-bash) enable_bash=yes ;;
+        --caos-std-path=*) caos_std_path="${arg#--caos-std-path=}" ;;
     esac
 done
+# Where the sibling scripts come from, kept separately because the repo is
+# allowed to move `$base` (the pin) and a moved pin must not be able to point
+# this hook at a tree that has no caos-pin.sh in it.
+bootstrap_base="$base"
 
 # ONE NAME, because there is one thing to name: a ticket IS a server URL
 # (design/iroh-transport.md), so `CAOS_IROH_TICKET` would be a second spelling
@@ -165,9 +171,37 @@ fi
 # the commit the client was built from: a refreshed client left with the old
 # configuration would drive a step from a different tree than itself, the one
 # pairing that cannot go quiet. Both are a no-op when nothing moved.
+# RE-READ the repo's pin first, because the snapshot froze the last one.
+#
+# The environment's snapshot carries whatever caos the setup script resolved,
+# and a push to the client repo does not reach it -- so a repo that has since
+# re-pinned would keep getting the OLD client and the OLD tools, agreeing with
+# each other and with nothing the repo says. That is the half-update the rest of
+# this file is arranged to avoid, and it is why the pin is read again here
+# rather than trusted from the bootstrap.
+#
+# Cheap when nothing moved: one jq over flake.lock, and the install below then
+# stops at a single `ls-remote`. Non-fatal and quiet -- a checkout that does not
+# pin caos (caos' own repo, or any ordinary one) keeps the frozen base, which is
+# exactly where this was before the pin existed.
+if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
+    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+              2>/dev/null | bash -s -- "$PWD" 2>/dev/null)"; then
+        eval "$pin"
+        if [ "$base" != "$caos_pin_base" ] || [ "$caos_std_path" != "$caos_pin_std_path" ]; then
+            step "the repo's pin moved: caos $caos_pin_repo at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
+        fi
+        base="$caos_pin_base"
+        caos_std_path="$caos_pin_std_path"
+    fi
+fi
+
 if [ -n "$base" ]; then
     step "refreshing the client"
-    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base" ${enable_bash:+--enable-bash}; then
+    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" \
+         | bash -s -- --no-repo-files --user-config --base="$base" \
+               ${enable_bash:+--enable-bash} \
+               ${caos_std_path:+--caos-std-path="$caos_std_path"}; then
         log "could not refresh the client; carrying on with the installed one"
     fi
 fi
@@ -214,19 +248,30 @@ step "unshallow done"
 # serve will. Bounded and non-fatal -- a warm that cannot finish just leaves the
 # background path in place, which is where we were before this ran.
 if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; then
-    record=/usr/local/share/caos/build
-    step_repo=""
-    step_commit=""
-    if [ -r "$record" ]; then
-        while IFS='=' read -r key value; do
-            case "$key" in
-                repo) step_repo="$value" ;;
-                commit) step_commit="$value" ;;
-            esac
-        done < "$record"
+    locator=""
+    if [ -n "$caos_std_path" ]; then
+        # A repo-pinned step: the SAME path the config names, so the warm fills
+        # the cache the serve then reads. Naming it any other way would resolve
+        # a different tree and leave the first turn with no tools while a
+        # perfectly good registry sat in the cache under another key.
+        locator="--llm-step:@=$caos_std_path/llm-step"
+    else
+        record=/usr/local/share/caos/build
+        step_repo=""
+        step_commit=""
+        if [ -r "$record" ]; then
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    repo) step_repo="$value" ;;
+                    commit) step_commit="$value" ;;
+                esac
+            done < "$record"
+        fi
+        if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
+            locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
+        fi
     fi
-    if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
-        locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
+    if [ -n "$locator" ]; then
         step "warming the caos tool registry for the first turn"
         # Its output goes to a FILE, not the hook's own stdout/stderr, and this
         # is not tidiness: Claude Code holds the session at "starting" until this
@@ -251,7 +296,8 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
         while IFS= read -r line; do log "warm: $line"; done < /tmp/caos-warm.log
         step "warm done"
     else
-        log "no build record; leaving the tools to mcp serve's background resolve"
+        log "nothing names the step (no repo pin and no build record);" \
+            "leaving the tools to mcp serve's background resolve"
     fi
 fi
 

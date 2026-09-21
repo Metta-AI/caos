@@ -40,6 +40,7 @@ force=""
 repo_files=yes
 user_config=""
 enable_bash=""
+caos_std_path=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -59,6 +60,16 @@ for arg in "$@"; do
         # because it is never wanted without an install and needs the very
         # commit the install just resolved.
         --user-config) user_config=yes ;;
+        # A caos-client repo mounts caos' `std/` into its own evaluated tree
+        # (std/flake-input-loader), so the step has a PATH in the checkout and
+        # the configuration can name it as one: `--llm-step:@=<path>/llm-step`.
+        # Without this the step is pinned by locator to the commit this client
+        # was built from, which is what an arbitrary checkout needs.
+        #
+        # The path is the repo's `--output-path`, which `caos-pin.sh` reads out
+        # of its `.caos-expr` -- not a convention this script may assume.
+        --caos-std-path=*) caos_std_path="${arg#--caos-std-path=}"
+                           caos_std_path="${caos_std_path%/}" ;;
         --base=*) BASE="${arg#--base=}"; BASE="${BASE%/}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -377,6 +388,19 @@ chmod 0644 "$PREFIX/share/caos/build"
 cat > "$PREFIX/bin/caos-serve" <<WRAP
 #!/bin/bash
 timeout 20 bash -c "curl -fsSL '$BASE/integrations/claude-code/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
+WRAP
+if [ -n "$caos_std_path" ]; then
+    # A REPO-PINNED step needs nothing from the build record: the path names the
+    # caos the checkout itself mounts, so the refresh above cannot move it out
+    # from under the serve. The client resolves it by descending through the
+    # root `.caos-expr` from the checkout (`resolve_cli_image_with_store`
+    # eval-paths the ingested workspace), which is what makes a path that exists
+    # only in the EVALUATION result nameable here.
+    cat >> "$PREFIX/bin/caos-serve" <<WRAP
+exec "$PREFIX/bin/caos" mcp serve "--llm-step:@=$caos_std_path/llm-step"
+WRAP
+else
+    cat >> "$PREFIX/bin/caos-serve" <<WRAP
 # The step, pinned to the commit the refresh JUST installed -- not the one the
 # snapshot's mcp.json named. Refreshing the binary without this would run the new
 # server against an OLD llm-step (its tools are the pinned rev's), which is the
@@ -389,6 +413,7 @@ if [ -n "\$r" ] && [ -n "\$c" ]; then
 fi
 exec "$PREFIX/bin/caos" "\$@"
 WRAP
+fi
 chmod 0755 "$PREFIX/bin/caos-serve"
 
 # The repository files. NOT overwritten without --force: a checkout that already
@@ -455,9 +480,14 @@ fi
 # each session right after the refresh (a refreshed client with the old config
 # would drive a step from a different tree than the binary driving it).
 write_user_config() {
-    if [ -z "$COMMIT" ] || [ -z "$REPO" ]; then
+    # The commit is needed only by the LOCATOR form. A repo-pinned step names a
+    # path in the checkout instead, so a build that cannot say which tree it
+    # came from is no obstacle -- the repo says, which is the whole point.
+    if [ -z "$caos_std_path" ] && { [ -z "$COMMIT" ] || [ -z "$REPO" ]; }; then
         echo "FATAL: this build cannot say which commit it came from, so there is" >&2
         echo "  no tree to pin the step to and the config would be useless." >&2
+        echo "  (A caos-client repo avoids this: pass --caos-std-path=<path> and" >&2
+        echo "   the step is named by a path in the checkout instead.)" >&2
         exit 1
     fi
     local raw_settings raw_mcp locator settings servers configured home cfg tmp changed settings_prog
@@ -466,11 +496,21 @@ write_user_config() {
         echo "FATAL: could not fetch the config assets from this build's release" >&2
         exit 1
     fi
-    # A `:@@=` locator pins the step to another repo's tree by full sha, fetched
-    # by the client and evaluated like a local directory -- so an arbitrary
-    # checkout needs no std/llm-step of its own, and the step comes from the SAME
-    # tree the client was built from.
-    locator="--llm-step:@@=github:$REPO?rev=$COMMIT&dir=std/llm-step"
+    if [ -n "$caos_std_path" ]; then
+        # A caos-client repo MOUNTS caos' std into its evaluated tree, so the
+        # step is an ordinary path and the client resolves it by descent -- the
+        # same walk that reaches `DEEP-DEPS/<x>` inside caos itself. This is
+        # also what makes `reader=$caos_std_path/llm-step` resolvable in a
+        # committed `.caos-secrets` entry: readers are eval-path'd against the
+        # same tree, and a reader naming a path the tree lacks grants nothing.
+        locator="--llm-step:@=$caos_std_path/llm-step"
+    else
+        # A `:@@=` locator pins the step to another repo's tree by full sha,
+        # fetched by the client and evaluated like a local directory -- so an
+        # arbitrary checkout needs no std/llm-step of its own, and the step comes
+        # from the SAME tree the client was built from.
+        locator="--llm-step:@@=github:$REPO?rev=$COMMIT&dir=std/llm-step"
+    fi
     echo "the tools come from $locator" >&2
     local unbin='def plain: split("\"${CAOS_BIN:-caos}\"") | join("caos")
                     | split("${CAOS_BIN:-caos}") | join("caos")

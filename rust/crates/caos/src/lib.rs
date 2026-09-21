@@ -4555,10 +4555,43 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
     }
 
     let mut issues = 0;
+    let mut env_entropy_missing = false;
     for (name, path) in local_secret_files(dir)? {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
         let spec = parse_local_secret_spec(&name, &text)?;
-        match spec.entropy.as_deref() {
+        // `entropy:env=` is already specified, so there is nothing to fill in
+        // and nothing to write. Its LENGTH is still worth checking when the
+        // variable happens to be set here, but its absence is not an issue:
+        // this command is an offline lint that a CI gate runs, and CI is
+        // exactly where a user's entropy variable is not going to be set.
+        if let Some(LocalEntropy::Env(var)) = &spec.entropy {
+            if let Some(value) = non_empty_env(var) {
+                if value.len() < MIN_ENTROPY_LEN {
+                    eprintln!(
+                        "{name}: weak entropy in ${var} ({} chars < {MIN_ENTROPY_LEN})",
+                        value.len()
+                    );
+                    issues += 1;
+                }
+            }
+            continue;
+        }
+        match spec.entropy.as_ref().map(|e| match e {
+            LocalEntropy::Literal(literal) => literal.as_str(),
+            LocalEntropy::Env(var) => var.as_str(),
+        }) {
+            // A `value:env=` file is the COMMITTED form, so the entropy this
+            // would otherwise generate must not be written into it — and this
+            // command cannot pick the variable to read it from either. Say what
+            // to add instead of writing something the loader will then refuse.
+            None if matches!(spec.value, Some(LocalSecretValue::Env(_))) => {
+                eprintln!(
+                    "{name}: value:env= with no entropy — add `entropy:env=<VAR>` \
+                     (a committed file cannot carry a literal one)"
+                );
+                issues += 1;
+                env_entropy_missing = true;
+            }
             None => {
                 if check {
                     eprintln!("{name}: missing entropy");
@@ -4586,7 +4619,10 @@ pub fn cli_secrets(check: bool) -> Result<(), String> {
             Some(_) => {}
         }
     }
-    if check && issues > 0 {
+    // A `value:env=` file with no entropy is an error whether or not `--check`
+    // was asked for: nothing was written to fix it, so returning success would
+    // report a store this command has just declined to repair as tended.
+    if issues > 0 && (check || env_entropy_missing) {
         return Err(format!("{issues} secret(s) with missing or weak entropy"));
     }
     if !check && issues > 0 {
@@ -4622,8 +4658,11 @@ pub fn local_secret_present(dir: &Path, name: &str) -> Result<bool, String> {
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("reading secret {file_name}: {e}"))?;
         let spec = parse_local_secret_spec(&file_name, &text)?;
-        resolve_local_secret_value(&file_name, &path, spec.value)?;
-        present |= spec.name == name;
+        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
+        // A declared secret whose environment variable is not set is not
+        // present: the caller asks this to decide whether a credential is
+        // available, and a declaration without bytes is not one.
+        present |= spec.name == name && value.is_some();
     }
     Ok(present)
 }
@@ -4643,7 +4682,26 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("reading secret {file_name}: {e}"))?;
         let spec = parse_local_secret_spec(&file_name, &text)?;
-        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
+        let Some(value) = resolve_local_secret_value(&file_name, &path, spec.value)? else {
+            warn_unset_secret_env(&file_name, "value");
+            continue;
+        };
+        // No entropy, no secret. An empty `entropy` would put every user of
+        // this declaration on the same `secret-hash`, so a declaration whose
+        // entropy variable is unset is dropped exactly as a valueless one is —
+        // the isolation is not optional, and silently running without it is
+        // the failure this form was added to avoid.
+        let entropy = match spec.entropy {
+            Some(LocalEntropy::Literal(literal)) => literal,
+            Some(LocalEntropy::Env(var)) => match non_empty_env(&var) {
+                Some(entropy) => entropy,
+                None => {
+                    warn_unset_secret_env(&file_name, "entropy");
+                    continue;
+                }
+            },
+            None => String::new(),
+        };
         let mut readers = Vec::new();
         for reader in &spec.readers {
             match resolve_reader_client(t, &pinned, reader)? {
@@ -4662,7 +4720,7 @@ pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String
         store.push(ClientSecret {
             name: spec.name,
             value,
-            entropy: spec.entropy.unwrap_or_default(),
+            entropy,
             readers,
         });
     }
@@ -4880,12 +4938,29 @@ fn local_secret_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 enum LocalSecretValue {
     Inline(String),
     File(String),
+    /// `value:env=<VAR>` — the bytes come from the process environment, so the
+    /// file declaring them carries no secret and can be COMMITTED. That is the
+    /// point of the form: a shared starter repo ships the declaration (the
+    /// name, the readers) and each user supplies their own value.
+    Env(String),
+}
+
+/// A secret's cache-isolation entropy: a literal, or `entropy:env=<VAR>`.
+///
+/// It gets the same env form as the value because it is a capability and not a
+/// label — SPEC: "the entropy is a bearer capability for the cache: knowing it
+/// reconstructs the key of any run that used it". A committed literal beside a
+/// committed `value:env=` would hand every fork of that repo one `secret-hash`,
+/// which is the isolation `secret-hash` exists to provide.
+enum LocalEntropy {
+    Literal(String),
+    Env(String),
 }
 
 struct LocalSecretSpec {
     name: String,
     value: Option<LocalSecretValue>,
-    entropy: Option<String>,
+    entropy: Option<LocalEntropy>,
     readers: Vec<String>,
 }
 
@@ -4907,12 +4982,33 @@ fn parse_local_secret_spec(file_name: &str, text: &str) -> Result<LocalSecretSpe
             .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
         match key {
             "name" => name = val.trim().to_string(),
-            "entropy" => entropy = Some(val.trim().to_string()),
+            "entropy" => entropy = Some(LocalEntropy::Literal(val.trim().to_string())),
+            "entropy:env" => entropy = Some(LocalEntropy::Env(val.trim().to_string())),
             "value" => value = Some(LocalSecretValue::Inline(val.to_string())),
             "value:@" => value = Some(LocalSecretValue::File(val.to_string())),
+            "value:env" => value = Some(LocalSecretValue::Env(val.trim().to_string())),
             "reader" => readers.push(val.trim().to_string()),
             other => return Err(format!("secret {file_name}: unknown key {other:?}")),
         }
+    }
+    // THE ONE COMBINATION THAT IS REFUSED, and it is refused here so that every
+    // caller refuses it: a value from the environment is the committed-file
+    // form, and a literal `entropy=` in a committed file is the same bearer
+    // capability in every clone of it. Two users with different tokens would
+    // then compute the SAME `secret-hash` and share cache keys — exactly what
+    // SPEC's "avoid accidentally sharing data derived from secrets through the
+    // cache" forbids.
+    //
+    // An ERROR rather than the drop-with-warning an absent reader gets, because
+    // the two fail in opposite directions: dropping a reader only narrows
+    // access, while a shared entropy widens what one user's cache exposes to
+    // another. Fail-closed means stopping here.
+    if let (Some(LocalSecretValue::Env(var)), Some(LocalEntropy::Literal(_))) = (&value, &entropy) {
+        return Err(format!(
+            "secret {file_name}: value:env={var} with a literal entropy= — a file whose VALUE \
+             comes from the environment is meant to be committed, and a committed entropy is a \
+             cache capability every clone would share. Use entropy:env=<VAR> as well."
+        ));
     }
     Ok(LocalSecretSpec {
         name,
@@ -4922,13 +5018,23 @@ fn parse_local_secret_spec(file_name: &str, text: &str) -> Result<LocalSecretSpe
     })
 }
 
+/// The secret's bytes, or `None` when an `:env=` form names a variable this
+/// process does not have.
+///
+/// `None` is not an error, and that is deliberate. The committed-file form
+/// exists so a shared starter repo can DECLARE a secret that most users will
+/// never set — a `github-token` that only private imports need. Erroring on an
+/// unset variable would make that declaration break every turn for everyone
+/// who does not need it. Dropping it instead leaves the worker to fail on a
+/// missing `/secret/<name>` if it really wanted one, which is the contract SPEC
+/// already states ("A worker must fail if the secret is missing or invalid").
 fn resolve_local_secret_value(
     file_name: &str,
     path: &Path,
     value: Option<LocalSecretValue>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     match value.ok_or_else(|| format!("secret {file_name}: no value= line"))? {
-        LocalSecretValue::Inline(value) => Ok(value),
+        LocalSecretValue::Inline(value) => Ok(Some(value)),
         LocalSecretValue::File(value_path) => {
             let file = path
                 .parent()
@@ -4936,8 +5042,27 @@ fn resolve_local_secret_value(
                 .join(&value_path);
             let bytes = std::fs::read(&file)
                 .map_err(|e| format!("secret {file_name} value:@={value_path}: {e}"))?;
-            String::from_utf8(bytes).map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))
         }
+        // TRIMMED, unlike the other two forms, which are verbatim by contract.
+        // An environment variable is set by a shell, and `export T=$(cat tok)`
+        // or a copied-in value carrying a newline is far likelier than a token
+        // that genuinely ends in whitespace. Untrimmed, that newline rides into
+        // the Authorization header and comes back as a 401 that reads as a bad
+        // token rather than a bad variable.
+        LocalSecretValue::Env(var) => Ok(non_empty_env(&var)),
+    }
+}
+
+/// A trimmed environment variable, or `None` when it is unset or blank. Blank
+/// counts as unset: an exported-but-empty variable is a value nothing can use,
+/// and treating it as present would ship an empty credential.
+fn non_empty_env(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -4996,6 +5121,25 @@ fn reader_path_absent(error: &str) -> bool {
 /// on every turn while an interactive client owns the terminal: the first load
 /// happens before the TUI takes the screen, so the notice lands at the shell
 /// prompt instead of being repainted over inside a frame.
+/// Once per process, like [`warn_absent_reader`]: a store is rebuilt on every
+/// turn and every tool call, so an unset variable would otherwise print on each
+/// one. Said at all because the alternative — a declared secret that quietly
+/// is not in the store — is the kind of absence a worker reports much later as
+/// a permission error against GitHub.
+fn warn_unset_secret_env(secret: &str, field: &str) {
+    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert(format!("{secret}\u{0}{field}")) {
+        eprintln!(
+            "caos: secret {secret}: its {field}:env= variable is unset or empty — the secret is \
+             not in this store (set it to use the secret; ignore this if you do not need it)"
+        );
+    }
+}
+
 fn warn_absent_reader(secret: &str, reader: &str) {
     static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
     let mut warned = WARNED
@@ -5670,7 +5814,14 @@ gpgsig -----BEGIN PGP SIGNATURE-----
 
 #[cfg(test)]
 mod local_secret_tests {
-    use super::{parse_local_secret_spec, LocalSecretValue};
+    use super::{parse_local_secret_spec, LocalEntropy, LocalSecretValue};
+
+    fn literal_entropy(spec: &super::LocalSecretSpec) -> Option<&str> {
+        match &spec.entropy {
+            Some(LocalEntropy::Literal(literal)) => Some(literal.as_str()),
+            _ => None,
+        }
+    }
 
     #[test]
     fn one_parser_serves_entropy_maintenance_and_runtime_loading() {
@@ -5680,12 +5831,57 @@ mod local_secret_tests {
         )
         .unwrap();
         assert_eq!(spec.name, "api-key");
-        assert_eq!(spec.entropy.as_deref(), Some("abc123"));
+        assert_eq!(literal_entropy(&spec), Some("abc123"));
         assert_eq!(spec.readers, ["DEEP-DEPS/tool"]);
         match spec.value {
             Some(LocalSecretValue::File(path)) => assert_eq!(path, "../key"),
             _ => panic!("value:@ was not preserved as an unresolved file value"),
         }
+    }
+
+    /// The committed-file form: both halves come from the environment, so the
+    /// file itself carries neither the bytes nor the cache capability.
+    #[test]
+    fn env_forms_name_variables_rather_than_carrying_values() {
+        let spec = parse_local_secret_spec(
+            "github-token",
+            "value:env=GITHUB_TOKEN\nentropy:env=CAOS_GITHUB_TOKEN_ENTROPY\nreader=caos-std/llm-step\n",
+        )
+        .unwrap();
+        assert_eq!(spec.name, "github-token");
+        assert_eq!(spec.readers, ["caos-std/llm-step"]);
+        match spec.value {
+            Some(LocalSecretValue::Env(var)) => assert_eq!(var, "GITHUB_TOKEN"),
+            _ => panic!("value:env was not parsed as an environment value"),
+        }
+        match spec.entropy {
+            Some(LocalEntropy::Env(var)) => assert_eq!(var, "CAOS_GITHUB_TOKEN_ENTROPY"),
+            _ => panic!("entropy:env was not parsed as an environment entropy"),
+        }
+    }
+
+    /// The whole reason `entropy:env=` exists: a committed literal would be one
+    /// bearer capability shared by every clone, so the pairing is refused at
+    /// parse time rather than warned about at use time.
+    #[test]
+    fn a_committed_value_may_not_carry_a_literal_entropy() {
+        let error = parse_local_secret_spec(
+            "github-token",
+            "value:env=GITHUB_TOKEN\nentropy=0123456789abcdef\n",
+        )
+        .err()
+        .expect("a committed literal entropy must be refused");
+        assert!(error.contains("value:env=GITHUB_TOKEN"), "{error}");
+        assert!(error.contains("entropy:env="), "{error}");
+    }
+
+    /// The reverse pairing is fine: a gitignored value file beside an entropy
+    /// the environment supplies narrows nothing and shares nothing.
+    #[test]
+    fn a_file_value_may_take_its_entropy_from_the_environment() {
+        let spec = parse_local_secret_spec("token", "value:@=../key\nentropy:env=E\n").unwrap();
+        assert!(matches!(spec.value, Some(LocalSecretValue::File(_))));
+        assert!(matches!(spec.entropy, Some(LocalEntropy::Env(_))));
     }
 
     #[test]
