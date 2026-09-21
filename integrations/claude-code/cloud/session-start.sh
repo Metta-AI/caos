@@ -185,11 +185,19 @@ fi
 # pin caos (caos' own repo, or any ordinary one) keeps the frozen base, which is
 # exactly where this was before the pin existed.
 if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
+    # Cleared before the eval, and read back with `:-` after it, so a
+    # caos-pin.sh that somehow succeeds while printing less than it promises
+    # cannot take the hook out on an unset variable under `set -u`. The whole
+    # point of this block is to be optional; it must not become the thing that
+    # stops a session starting.
+    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
     if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
               2>/dev/null | bash -s -- "$PWD" 2>/dev/null)"; then
-        eval "$pin"
+        eval "$pin" || true
+    fi
+    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
         if [ "$base" != "$caos_pin_base" ] || [ "$caos_std_path" != "$caos_pin_std_path" ]; then
-            step "the repo's pin moved: caos $caos_pin_repo at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
+            step "the repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
         fi
         base="$caos_pin_base"
         caos_std_path="$caos_pin_std_path"

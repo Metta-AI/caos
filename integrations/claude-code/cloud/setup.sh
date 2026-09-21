@@ -111,12 +111,18 @@ for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
 done
 if [ -n "$repo_dir" ]; then
     echo "reading the caos pin from $repo_dir" >&2
+    # Cleared first and read back with `:-`, so a reader that exits 0 while
+    # printing less than it promises cannot leave `set -u` to abort the whole
+    # setup over a fallback that was meant to be optional.
+    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
     if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
               | bash -s -- "$repo_dir")"; then
-        eval "$pin"
+        eval "$pin" || true
+    fi
+    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
         base="$caos_pin_base"
         caos_std_path="$caos_pin_std_path"
-        echo "this repo pins caos $caos_pin_repo at $caos_pin_rev" >&2
+        echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
         echo "  and mounts its std at $caos_std_path" >&2
     else
         echo "  (no usable caos pin; falling back to --base=$base)" >&2
