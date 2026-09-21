@@ -199,22 +199,21 @@ else
     # one. The build tags carry 12 hex digits, so a shorter sha is a prefix of
     # exactly the tag wanted, and nothing else has to expand it.
     #
-    # BOTH DIRECTIONS, because a FULL sha is now the common case: `caos-pin.sh`
-    # reads `flake.lock`, and nix locks a rev at all forty characters. Matching
-    # only `<tag digits> == <ref>*` asks whether twelve characters start with
-    # forty, which they never do -- so every repo-pinned install failed with
-    # "no branch, tag or built commit called <the sha that is right there>".
-    # Comparing the first twelve of each covers the abbreviated ref this was
-    # written for and the full one it is given.
+    # TRUNCATE THE REF, do not lengthen the tag, because a FULL sha is now the
+    # common case: `caos-pin.sh` reads `flake.lock`, and nix locks a rev at all
+    # forty characters. Asking whether a tag's twelve digits START WITH the ref
+    # asks whether twelve characters start with forty, which they never do --
+    # so every repo-pinned install failed with "no branch, tag or built commit
+    # called <the sha printed right next to it>".
+    #
+    # One comparison covers both: `$ref12` is the ref's first twelve, so a
+    # SHORTER ref still prefix-matches the tag it abbreviates and a longer one
+    # matches on exactly the twelve the tag carries.
     VERSION=""
     ref12="${REF:0:12}"
     while IFS= read -r b; do
-        digits="${b#build-}"
-        case "$digits" in
+        case "${b#build-}" in
             "$ref12"*) VERSION="$b"; break ;;
-        esac
-        case "$ref12" in
-            "$digits"*) VERSION="$b"; break ;;
         esac
     done <<< "$builds"
     # A pinned commit whose build has not landed yet is the same situation a
