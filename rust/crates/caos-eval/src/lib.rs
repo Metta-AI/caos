@@ -407,6 +407,27 @@ fn eval_expr(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        // A DIRECTIVE IS ONE LINE. There are no backslash continuations here,
+        // and saying so is worth a branch because the failure otherwise names
+        // the wrong thing entirely: the `\` survives as a token, reaches the
+        // argument parser, and comes back as
+        // `argument must look like --name=value, got: \` -- which reads as a
+        // malformed argument on a line whose arguments are all well formed, and
+        // sends the reader hunting through the part of the line that is right.
+        //
+        // Cost of not saying it, measured: a client repo whose root expression
+        // was written across four lines (copied from a doc that wraps it for
+        // the page) failed every resolution of its mounted `caos-std/`, which
+        // surfaced as a cloud session that recorded the prompt and then never
+        // took a turn -- the `UserPromptSubmit` hook cannot form a request
+        // without resolving the step, so it retried and gave up in silence.
+        if line.ends_with('\\') {
+            return Err(format!(
+                "eval-path: .caos-expr line {} ends in a backslash, and a directive is \
+                 ONE LINE -- there are no continuations. Join it onto a single line: {line:?}",
+                i
+            ));
+        }
         if value.is_some() {
             return Err("eval-path: .caos-expr has content after its final expression".to_string());
         }

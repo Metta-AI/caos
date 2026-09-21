@@ -402,14 +402,21 @@ The WHOLE-TREE case — a consumer that wants `DEPS`/`DEEP-DEPS` of its own, so
 its directories can declare deps against caos' `std/*` — is **`std/flake-input-loader`**,
 and it needed no new machinery: it is an ordinary rustc-built entry with a
 `.caos-expr` and `DEPS`, reachable by locator because `dir=` descends through
-evaluation (4a). The consumer's root `.caos-expr` is one line:
+evaluation (4a). The consumer's root `.caos-expr` is one line — literally one,
+because `eval` splits on `text.lines()` and a trailing `\` is not a
+continuation but a token, which the argument parser then rejects as
+`argument must look like --name=value, got: \`:
 
 ```
-run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/flake-input-loader \
-    --in:@=. --expr=$CAOS_EXPR \
-    --input=caos --input-tree:@@=git+https://github.com/org/caos?rev=<sha>&dir=std \
-    --output-path=caos-std
+run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/flake-input-loader --in:@=. --expr=$CAOS_EXPR --input=caos --input-tree:@@=git+https://github.com/org/caos?rev=<sha>&dir=std --output-path=caos-std
 ```
+
+(This block used to wrap that line across four, for the page. It reads as
+copy-pasteable and is not: a client repo written from it failed every
+resolution of its own `caos-std/`, and because the `UserPromptSubmit` hook
+cannot form a request without resolving the step, the session recorded the
+prompt and then never took a turn. `eval` now rejects a trailing backslash by
+name rather than letting it reach the argument parser.)
 
 The caller says WHICH input, WHAT of it to load, and WHERE it goes. Three
 things about that line are load-bearing:

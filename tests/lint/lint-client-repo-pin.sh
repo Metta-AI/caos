@@ -29,6 +29,26 @@ input="${2:-caos}"
 status=0
 checked=0
 
+# A DIRECTIVE IS ONE LINE, everywhere, not just in a client repo. `eval` splits
+# on `text.lines()`, so a trailing `\` is a token that reaches the argument
+# parser -- and design/flake-inputs.md wrapped its own example across four
+# lines for the page, which is where the one real instance came from. `eval`
+# now refuses it by name; this catches it before anything evaluates.
+exprs=0
+while IFS= read -r expr; do
+    exprs=$((exprs + 1))
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        case "$(printf '%s' "$line" | tr -d '[:space:]')" in ''|'#'*) continue ;; esac
+        case "$line" in
+            *\\) echo "FAIL: $expr line $n ends in a backslash; a .caos-expr" >&2
+                 echo "      directive is ONE line and has no continuations" >&2
+                 status=1 ;;
+        esac
+    done < "$expr"
+done < <(find "$root" -name .caos-expr -not -path '*/.git/*')
+
 while IFS= read -r lock; do
     dir="$(dirname "$lock")"
     # The same node walk `std/flake-input-loader` and `caos-pin.sh` do:

@@ -6,6 +6,11 @@
 # is gitignored and why this repo stays a handful of text files however large
 # caos gets.
 #
+# ONE LINE, and it has to be: a directive is a line, and there are no backslash
+# continuations. design/flake-inputs.md wraps this same expression across four
+# lines to fit the page; copying that wrapping verbatim makes every resolution
+# of `caos-std/` fail.
+#
 # The locator appears TWICE on purpose (design/flake-inputs.md, "Consumer
 # root"): `--base` yields the loader's own image, `--input-tree` yields the
 # tree it splices. Passing the tree as an argument is what lets caos' `:@@=`
@@ -14,7 +19,4 @@
 #
 # Both revs must equal what flake.lock locks for `--input=caos`. The loader
 # checks exactly that and refuses the evaluation if they differ.
-run --base:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std/flake-input-loader \
-    --in:@=. --expr=$CAOS_EXPR \
-    --input=caos --input-tree:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std \
-    --output-path=caos-std
+run --base:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std/flake-input-loader --in:@=. --expr=$CAOS_EXPR --input=caos --input-tree:@@=github:Metta-AI/caos?rev=bbb31008efc443dce779d1ac5b23401dba266203&dir=std --output-path=caos-std
