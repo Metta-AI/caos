@@ -7,8 +7,12 @@ conversation**, not checked out onto disk.
 
 That is the one thing to internalise before your first tool call. Your file
 tools do not read this container's filesystem — they read the conversation
-tree, which starts out holding almost nothing. `ls` at the root is supposed to
-look empty.
+tree, which starts out holding almost nothing.
+
+List it with `ls path="/"`. A bare `ls` with no path errors
+(`` `path` names no path ``), and the near-empty result — `.caos/` and
+`code/` — is what a fresh conversation is supposed to look like, not a sign
+that anything went wrong.
 
 ## Start by importing what you were asked to work on
 
@@ -29,8 +33,13 @@ Then copy the snapshot to the boundary you will edit, and leave the import
 untouched as the record of where you started:
 
 ```
-cp -a imports/<repo>/base feature/01-change
+mkdir -p feature && cp -a imports/<repo>/base feature/01-change
 ```
+
+The `mkdir -p` is not optional — `cp` will not create the parent, and without
+it the call fails with `cp: cannot create directory 'feature/01-change': No
+such file or directory`. Use `cp -a`, never a plain `cp`: `-a` is what carries
+the source tree's commit identity across, and a plain copy loses it.
 
 Edit `feature/01-change`. Keep `imports/<repo>/base` exactly as imported —
 it is what any later diff, merge or publication is measured against.
