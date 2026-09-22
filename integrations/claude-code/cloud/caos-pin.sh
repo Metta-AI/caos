@@ -40,8 +40,11 @@ if [ -z "$dir" ] || [ ! -d "$dir" ]; then
 fi
 lock="$dir/flake.lock"
 if [ ! -r "$lock" ]; then
-    # Not an error worth shouting about: most repositories are not caos-client
-    # repos, and the caller falls back to its own --base for those.
+    # Reported, not shouted: this script's job is to answer or say why, and the
+    # CALLER decides what a missing pin costs. `setup.sh` treats it as fatal (a
+    # cloud session must start from a client repo); `session-start.sh` keeps the
+    # snapshot's client. Neither substitutes a branch, because install.sh takes
+    # only a commit.
     say "$dir has no flake.lock; not a caos-client repo"
     exit 1
 fi

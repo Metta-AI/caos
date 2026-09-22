@@ -356,11 +356,12 @@ chmod 0644 "$PREFIX/share/caos/build"
 # FRESH setup installed and skips the setup that would refresh it; the
 # SessionStart hook does refresh, but its `install.sh` lands AFTER Claude Code
 # has already spawned `mcp serve` from the old binary, so the session runs stale
-# (its tools too -- `llm-step` is pinned to the client's commit). This wrapper
-# moves the refresh to the LAUNCH: `configure.sh` points the caos MCP server's
-# command at it, so before the server starts it reinstalls the newest build for
-# this base and then execs the client. `$BASE` is baked in -- the wrapper cannot
-# read its own argv for it any more than this script can. Bounded and non-fatal:
+# (its tools too). This wrapper moves the refresh to the LAUNCH: the user-level
+# MCP declaration points the caos server's command at it, so before the server
+# starts it reinstalls `$BASE`'s build and then execs the client. `$BASE` is a
+# COMMIT and is baked in -- the wrapper cannot read its own argv for it any
+# more than this script can -- so "refresh" means "make sure this exact build
+# is installed", which is a no-op whenever it already is. Bounded and non-fatal:
 # a slow or unreachable GitHub serves the installed client rather than hanging
 # startup. Its refresh output is forced to STDERR, because the wrapper's stdout
 # becomes the tool server's JSON-RPC the moment it execs.
