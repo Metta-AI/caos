@@ -13,6 +13,18 @@
 #   GITHUB_TOKEN               a PAT with access to the repos you want
 #   CAOS_GITHUB_TOKEN_ENTROPY  any random string of 16+ chars, yours alone
 #
+# MIND THE FIRST ONE IN A CLOUD SESSION: the container ALREADY has a
+# `GITHUB_TOKEN`, set by the harness for its own clone (measured — a session
+# with neither variable set warned about the ENTROPY, which is only reached
+# once the value has resolved). So setting only the entropy here silently
+# promotes the harness's token into a caos secret. That may be exactly what you
+# want; decide it deliberately, and name a variable of your own
+# (`value:env=MY_GITHUB_PAT`) if it is not.
+#
+# Requiring BOTH is what makes that a choice rather than an accident: an
+# ambient token with no entropy would otherwise have run with no cache
+# isolation at all.
+#
 # The entropy is what keeps your cached results out of anyone else's reach: it
 # is a bearer capability for the cache, so it must not be shared and must not
 # be committed. That is why `entropy:env=` is required here rather than the

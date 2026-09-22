@@ -121,6 +121,15 @@ committed `.caos-secrets/github-token` rather than by anything here:
 Leave both unset for public work: the secret is simply absent from the store
 (one line on stderr), and imports of public repositories need no credential.
 
+One thing to know before setting only one of them: **the container already has
+a `GITHUB_TOKEN`**, put there by the harness for its own clone. Measured — a
+session with neither variable set warned about the ENTROPY, and that warning is
+only reached once the value has resolved. So setting just
+`CAOS_GITHUB_TOKEN_ENTROPY` promotes the harness's token into a caos secret,
+which may be what you want or may not. Requiring both is what keeps that a
+decision: an ambient token with no entropy would otherwise have run with no
+cache isolation at all.
+
 **Network access**: the environment's normal egress is enough. GitHub (the
 client), `api.anthropic.com`, and iroh's relays (`*.relay.n0.iroh.link`,
 `dns.iroh.link`) are all reachable. Measured from a container: all return 200.
