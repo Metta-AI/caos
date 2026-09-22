@@ -6,6 +6,7 @@ Uses ephemeral loopback ports.
 """
 import base64
 import concurrent.futures
+import gzip
 import hashlib
 import http.server
 import json
@@ -59,7 +60,7 @@ def main():
         git_bin.mkdir()
         git_shim = git_bin / "git"
         git_shim.write_text("#!/bin/sh\nfor arg do\n"
-            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index|pack-objects|index-pack)\n'
+            'case "$arg" in ls-remote|fetch|cat-file|rev-list|show-index|pack-objects|index-pack|push)\n'
             "printf '%s\\n' \"$arg\" >> " + shlex.quote(str(git_commands)) + "; break;;\n"
             "esac\ndone\nexec " + shlex.quote(shutil.which("git")) + ' "$@"\n')
         git_shim.chmod(0o755)
@@ -83,7 +84,11 @@ def main():
         cert, key = root / "cert.pem", root / "key.pem"
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", str(key), "-out", str(cert))
         observations = []
-        fault = {"fail": False}
+        fault = {"fail": False, "lost_push": False, "race": None}
+        published = root / "published.git"
+        run("git", "init", "--bare", "-q", str(published))
+        run("git", "--git-dir", str(published), "config", "http.receivepack", "true")
+        run("git", "--git-dir", str(origin), "config", "http.receivepack", "true")
         surplus = {}
         def packet(data):
             return f"{len(data) + 4:04x}".encode() + data
@@ -99,6 +104,8 @@ def main():
             def serve(self):
                 path, _, query = self.path.partition("?")
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if self.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
                 if path.startswith("/surplus.git/"):
                     if self.command == "GET":
                         payload = (packet(b"# service=git-upload-pack\n") + b"0000"
@@ -139,7 +146,16 @@ def main():
                 # Protocol v2 supplies explicit negotiation requests.
                 if self.headers.get("Git-Protocol"):
                     git_env["HTTP_GIT_PROTOCOL"] = self.headers["Git-Protocol"]
+                pushing = path.endswith("/git-receive-pack")
+                if pushing and fault["race"]:
+                    branch, old = fault["race"]
+                    fault["race"] = None
+                    run("git", "--git-dir", str(published), "update-ref", "refs/heads/" + branch, old)
                 response = subprocess.check_output(["git", "http-backend"], input=body, env=git_env)
+                if pushing and fault["lost_push"]:
+                    fault["lost_push"] = False
+                    self.close_connection = True
+                    return
                 headers, payload = response.split(b"\r\n\r\n", 1)
                 observations.append((path, body, len(payload), authorized))
                 self.send_response(200)
@@ -184,11 +200,11 @@ def main():
         private = f"https://localhost:{remote_port}/private.git"
         def payload(commit, source=public):
             return {"source":source, "commit":commit}
-        def call(data, credential=None, expected=200):
+        def call(data, credential=None, expected=200, endpoint="/git/import"):
             headers = {"Content-Type":"application/json"}
             if credential:
                 headers["X-Caos-Git-Token"] = credential
-            request = urllib.request.Request(base + "/git/import", json.dumps(data).encode(), headers)
+            request = urllib.request.Request(base + endpoint, json.dumps(data).encode(), headers)
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     status, body = response.status, response.read()
@@ -244,6 +260,12 @@ def main():
             checks = git_commands.read_text()[len(commands):].splitlines()
             assert "index-pack" in checks and "rev-list" not in checks, checks
             visible(second[0])
+            # Imported commits have no refs. Clients must still be able to
+            # fetch them before any conversation or branch has been created.
+            consumer = root / "consumer"
+            run("git", "init", "-q", str(consumer))
+            run("git", "-C", str(consumer), "fetch", "-q", base, second[0])
+            assert run("git", "-C", str(consumer), "rev-parse", "FETCH_HEAD") == second[0]
             assert list((odb / "objects/pack").glob("*.pack"))
             before = len(observations)
             commands = git_commands.read_text()
@@ -460,6 +482,204 @@ def main():
                     invalid = subprocess.run([cli, "import-git", *args], env=cli_env, capture_output=True)
                     assert invalid.returncode != 0
                     assert token.encode() not in invalid.stdout + invalid.stderr
+            # Pushes use a separate empty remote: object transfer comes from
+            # the server, including code ancestry, without a worker checkout.
+            destination = f"https://localhost:{remote_port}/published.git"
+            def push(commit, branch="topic", old=None, dest=destination, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old},
+                            endpoint="/git/push", **kwargs)
+            def remote_head(branch):
+                return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
+            git_commands.write_text("")
+            assert push(first[0])["status"] == "complete"
+            assert "rev-list" not in git_commands.read_text().splitlines(), "push re-walked stored object closure"
+            assert "ls-remote" not in git_commands.read_text().splitlines(), "endpoint performed a separate remote lookup"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
+            assert remote_head("topic") == second[0]
+            # Equal destination converges even after a lost acknowledgement.
+            assert push(second[0], old=first[0])["kind"] == "ref-converged"
+            assert push(third[0], old=first[0])["status"] == "conflict"
+            assert json.loads(push(first[0], old=second[0], expected=422))["code"] == "not-fast-forward"
+            assert remote_head("topic") == second[0]
+            assert json.loads(push("e" * 40, branch="missing", expected=422))["code"] == "missing-commit"
+            unimported = advance()
+            run("git", "--git-dir", str(origin), "push", "-q", str(published),
+                unimported[0] + ":refs/heads/unimported")
+            assert json.loads(push(first[0], branch="unimported", old=unimported[0],
+                expected=422))["code"] == "missing-expected"
+            hook = published / "hooks/pre-receive"
+            hook.write_text("#!/bin/sh\necho " + shlex.quote(token) + " >&2\nexit 1\n")
+            hook.chmod(0o755)
+            rejected = push(first[0], branch="hooked")
+            assert rejected["status"] == "conflict" and rejected["kind"] == "push-rejected"
+            assert rejected["code"] == "hook-declined"
+            if cli:
+                rejected = json.loads(run(cli, "push-git", destination, first[0], "hooked",
+                    "--expected=absent", env=cli_env))
+                assert rejected["kind"] == "push-rejected"
+                assert "hook declined" in rejected["diagnostic"]
+                assert token not in json.dumps(rejected)
+            hook.unlink()
+            for branch in ["", "-x", "../main", "topic:other", "topic*", "topic.lock"]:
+                push(first[0], branch=branch, expected=400)
+            call({"destination":destination, "commit":first[0], "branch":"missing-lease"},
+                 endpoint="/git/push", expected=400)
+            # The receiver's lease catches movement after the initial lookup.
+            fault["race"] = ("topic", first[0])
+            assert push(third[0], old=second[0])["status"] == "conflict"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
+            fault["lost_push"] = True
+            lost = push(third[0], old=second[0])
+            # libcurl may retry the POST after a lost reply, then Git reports
+            # the successful first attempt's old value as a stale lease.
+            assert lost["status"] == "uncertain" or lost["kind"] == "lease-rejected", lost
+            assert remote_head("topic") == third[0]
+            # Recovery can resend the identical intent; Git sees the converged ref.
+            assert push(third[0], old=second[0])["kind"] == "ref-converged"
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                outcomes = list(pool.map(lambda _: push(fourth[0], old=third[0]), range(4)))
+            assert all(r["status"] == "complete" for r in outcomes)
+            assert remote_head("topic") == fourth[0]
+            assert run("git", "--git-dir", str(published), "rev-list", "--count", fourth[0]) == "4"
+
+            def source_commit(tree, parent=None):
+                args = ["git", "--git-dir", str(origin), "commit-tree", tree, "-m", "publication fixture"]
+                if parent: args += ["-p", parent]
+                head = run(*args, env=env)
+                call(payload(head))
+                return head
+            # Publication checks the exact snapshot against its own ignore rules.
+            # Files here are intentionally tracked; ordinary git-add admission
+            # would not catch them. The server must neither rewrite nor push them.
+            def ignore_snapshot(files, parent=first[0]):
+                index_env = dict(env, GIT_INDEX_FILE=str(root / "ignore-index"))
+                run("git", "--git-dir", str(origin), "read-tree", "--empty", env=index_env)
+                entries = b""
+                for name, content in files.items():
+                    mode = "100644"
+                    if isinstance(content, tuple):
+                        mode, content = content
+                    blob = run("git", "--git-dir", str(origin), "hash-object", "-w", "--stdin",
+                               input=content.encode())
+                    entries += f"{mode} {blob}\t{name}\0".encode()
+                run("git", "--git-dir", str(origin), "update-index", "-z", "--index-info",
+                    input=entries, env=index_env)
+                tree = run("git", "--git-dir", str(origin), "write-tree", env=index_env)
+                return source_commit(tree, parent)
+
+            cases = [
+                ({"results/out": "generated", ".gitignore": "results/\n"}, True),
+                ({".gitignore": "*.log\n!keep.log\n", "keep.log": "kept"}, False),
+                ({".gitignore": "*.log\n", "sub/.gitignore": "!keep.log\n",
+                  "sub/keep.log": "kept"}, False),
+                ({"sub/.gitignore": "*.tmp\n", "sub/a.tmp": "generated"}, True),
+                ({".gitignore": "sub/\n", "sub/.gitignore": "!keep\n",
+                  "sub/keep": "parent exclusion wins"}, True),
+                ({".gitignore": "*.log\n", "a space/line\nbreak.log": "generated"}, True),
+                ({".gitignore": "*.log\n", "link.log": ("120000", "elsewhere")}, True),
+                ({".gitignore": "cache/\n", "cache": ("120000", "elsewhere")}, False),
+                ({".gitignore": ("120000", "rules"), "rules": "*.log\n", "file.log": "kept"}, False),
+                ({".gitignore": "/root-only\n", "sub/root-only": "kept"}, False),
+                ({".gitignore": "*.tmp\n", "ordinary.txt": "kept"}, False),
+            ]
+            # Host policy and the server's index must not influence the check.
+            (odb / "info").mkdir(exist_ok=True)
+            (odb / "info/exclude").write_text("ordinary.txt\n")
+            global_excludes = root / "server-excludes"
+            global_excludes.write_text("ordinary.txt\n")
+            run("git", "--git-dir", str(odb), "config", "core.excludesFile", str(global_excludes))
+            (odb / "index").write_bytes(b"server index must remain untouched")
+            ignored_head = None
+            for number, (files, ignored) in enumerate(cases):
+                head = ignore_snapshot(files)
+                branch = f"ignore-{number}"
+                git_commands.write_text("")
+                if ignored:
+                    ignored_head = head
+                    assert json.loads(push(head, branch=branch, expected=422))["code"] == "ignored-files"
+                    assert "push" not in git_commands.read_text().splitlines()
+                    assert subprocess.run(["git", "--git-dir", str(published), "show-ref",
+                        "--verify", "--quiet", "refs/heads/" + branch]).returncode == 1
+                else:
+                    try:
+                        assert push(head, branch=branch)["status"] == "complete"
+                    except AssertionError as error:
+                        raise AssertionError(f"ignore case {number}: {files!r}") from error
+                    assert remote_head(branch) == head
+                assert (odb / "index").read_bytes() == b"server index must remain untouched"
+                assert not list((odb / "caos-pushes").glob("*.check"))
+            # Rejected updates leave an existing branch and exact lease intact.
+            assert push(first[0], branch="ignore-update")["status"] == "complete"
+            assert json.loads(push(ignored_head, branch="ignore-update", old=first[0],
+                                   expected=422))["code"] == "ignored-files"
+            assert remote_head("ignore-update") == first[0]
+            if cli:
+                rejected = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
+                                          "--expected=absent", env=cli_env))
+                assert rejected["kind"] == "validation-rejected"
+                assert ".gitignore" in rejected["diagnostic"]
+                assert "no push was attempted" in rejected["diagnostic"]
+            # This is a tip-tree policy, not a history scrub.
+            cleaned = ignore_snapshot({"ordinary.txt": "kept"}, parent=ignored_head)
+            assert push(cleaned, branch="ignore-cleaned")["status"] == "complete"
+            (odb / "index").unlink()
+            (odb / "info/exclude").unlink()
+            run("git", "--git-dir", str(odb), "config", "--unset", "core.excludesFile")
+            empty = run("git", "--git-dir", str(origin), "mktree", input=b"")
+            reserved = run("git", "--git-dir", str(origin), "mktree", input=f"040000 tree {empty}\t.caos\n".encode())
+            assert push(source_commit(reserved), branch="reserved")["status"] == "complete"
+            marker = run("git", "--git-dir", str(origin), "hash-object", "-w", "--stdin", input=b"<<<<<<< ours\nconflict\n=======\nother\n>>>>>>> theirs\n")
+            marked_tree = run("git", "--git-dir", str(origin), "mktree", input=f"100644 blob {marker}\tfile\n".encode())
+            marked = source_commit(marked_tree, first[0])
+            assert push(marked, branch="markers")["status"] == "complete"
+            assert remote_head("markers") == marked
+            # Conflict resolution belongs to the agent; the endpoint transfers exact commits.
+            clean = source_commit(first[1], marked)
+            assert push(clean, branch="resolved")["status"] == "complete"
+            genesis_env = dict(env, GIT_AUTHOR_NAME="caos", GIT_AUTHOR_EMAIL="caos@caos",
+                               GIT_COMMITTER_NAME="caos", GIT_COMMITTER_EMAIL="caos@caos",
+                               GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000")
+            genesis = run("git", "--git-dir", str(origin), "commit-tree", empty,
+                          input=b"caos-conversation-genesis-v3\n", env=genesis_env)
+            assert genesis == "a2519b3360c5b1ded9a8cb7e5869d32901eae743"
+            conversation = source_commit(empty, genesis)
+            assert push(conversation, branch="conversation")["status"] == "complete"
+            assert push(first[0], branch="code-after-conversation")["status"] == "complete"
+            assert push(first[0], branch="private-test", dest=private, credential="wrong-token")["status"] == "uncertain"
+            assert push(first[0], branch="private-test", dest=private, credential=token)["status"] == "complete"
+            if cli:
+                receipt = json.loads(run(cli, "push-git", destination, second[0], "cli", "--expected=absent", env=cli_env))
+                assert receipt["commit"] == second[0] and receipt["status"] == "complete"
+                assert remote_head("cli") == second[0]
+                rejected = json.loads(run(cli, "push-git", destination, first[0], "cli",
+                                          "--expected=" + second[0], env=cli_env))
+                assert rejected["status"] == "conflict" and rejected["kind"] == "validation-rejected"
+                assert "not a fast-forward" in rejected["diagnostic"]
+                local_failure = subprocess.run([cli, "push-git", destination, first[0], "local",
+                    "--expected=absent", "--github-token-file=" + str(root / "no-such-token")],
+                    env=cli_env, capture_output=True)
+                assert local_failure.returncode == 1 and not local_failure.stdout
+                assert remote_head("cli") == second[0]
+                for extra in [[], ["--expected=main"], ["--expected=absent", "--expected=absent"]]:
+                    invalid = subprocess.run([cli, "push-git", destination, second[0], "cli", *extra], env=cli_env, capture_output=True)
+                    assert invalid.returncode != 0
+            # Small uploads now stay packed too. The live reader must discover
+            # more packs than gix's default capacity of 32 without a restart.
+            for index in range(40):
+                packed = advance()
+                run("git", "--git-dir", str(origin), "push", "-q", base,
+                    packed[0] + f":refs/heads/pack-growth-{index}")
+                for oid in packed:
+                    object_request(oid)
+            assert len(list((odb / "objects/pack").glob("*.pack"))) > 32
+            # Commit staging must also work once its live-store alternate
+            # contains more than 32 packs.
+            staged_tip = advance(packed[0])
+            for kind, oid in [("blob", staged_tip[2]), ("tree", staged_tip[1]), ("commit", staged_tip[0])]:
+                post_from_origin(kind, oid)
+            print("git-push: creation, fast-forward, stale and racing leases, lost responses, duplicate requests, guards and CLI PASS")
             stop(server); server = None
             server = start()
             visible(posted_child[0])

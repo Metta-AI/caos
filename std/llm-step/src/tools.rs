@@ -30,7 +30,7 @@ const MAX_ENTRIES: usize = 1_000;
 pub fn is_inline(name: &str) -> bool {
     matches!(
         name,
-        "read" | "ls" | "write" | "edit" | "import_source" | "tool_help"
+        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source" | "tool_help"
     )
 }
 

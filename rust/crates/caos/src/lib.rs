@@ -20,6 +20,7 @@
 
 pub mod gitlinks;
 pub mod import_git;
+pub mod push_git;
 pub mod timing;
 
 use std::ffi::OsStr;
@@ -431,9 +432,8 @@ pub trait Transport {
         Ok(None)
     }
 
-    /// Fetch commit `rev` (and its tree) from the FOREIGN repo at `url` into
-    /// local storage, for a `:@@=` arg — or `Ok(None)` if this transport has no
-    /// repo to fetch into.
+    /// Fetch the tree of a pinned commit into local storage and return its OID,
+    /// or None if this transport has no repository to fetch into.
     ///
     /// `None` is the default because the worker's [`HttpTransport`] speaks only
     /// `/object`: there is no working repo and no `caos` remote to negotiate
@@ -449,7 +449,7 @@ pub trait Transport {
     /// different URLs get different keys for identical content. By the time a
     /// worker sees this arg it is an ordinary oid, resolved before the request
     /// existed (design/flake-inputs.md).
-    fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<()>, String> {
+    fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<gix::ObjectId>, String> {
         Ok(None)
     }
 
@@ -894,68 +894,69 @@ impl Transport for GitTransport {
         parse_oid(out.trim()).map(Some)
     }
 
-    fn fetch_git_ref(&self, url: &str, rev: &str) -> Result<Option<()>, String> {
-        // ALREADY HAVE IT? A rev is a full commit sha, so local presence is
-        // authoritative — the bytes cannot have changed under the name. This is
-        // the whole memo: re-evaluating the same locator costs nothing and
-        // touches no network.
-        //
-        // Two honest limits. (1) It tests the COMMIT, and the fetch below pulls
-        // that commit's whole tree, so a hit we ourselves put there is complete
-        // — but a commit already present for some OTHER reason (a partial or
-        // filtered clone) can have a missing tree, and that surfaces as a
-        // missing-object error while descending, not as a re-fetch. (2) The
-        // objects are unreferenced by design (see `--no-tags` below), so a
-        // `git gc` may prune them and the next resolve pays the fetch again;
-        // that is a cache miss, never a wrong answer.
-        if self.have_commit(rev) {
-            return Ok(Some(()));
+    fn fetch_git_ref(&self, url: &str, rev: &str) -> Result<Option<gix::ObjectId>, String> {
+        let tree_ref = format!("refs/caos/locator-trees/{rev}");
+        for name in [rev, tree_ref.as_str()] {
+            if let Ok(tree) = self.git_capture(
+                &["rev-parse", "--verify", &format!("{name}^{{tree}}")],
+                None,
+            ) {
+                return parse_oid(tree.trim()).map(Some);
+            }
         }
-        // `--depth 1`: we want ONE commit's tree, not a repo's history. That is
-        // also the granularity a host will serve — GitHub answers a sha in a
-        // want only when it is reachable (`uploadpack.allowReachableSHA1InWant`),
-        // which is exactly why the locator pins a COMMIT and selects within it
-        // with `dir=` rather than naming a subtree hash (design/flake-inputs.md).
-        //
-        // `--no-tags` and `--no-write-fetch-head` keep a foreign repo from
-        // leaving anything behind in the caller's: nothing is referenced, so the
-        // objects are ordinary unreachable ones the next `git gc` may drop —
-        // re-fetching them is a cache miss, never a correctness problem.
-        //
-        // `core.alternateRefsCommand=true` (a command that prints nothing) is
-        // load-bearing, and cost a debugging session. git's post-fetch
-        // connectivity check runs `rev-list --not --all --alternate-refs`, so it
-        // walks the tips of every ALTERNATE object store as well — and a repo
-        // whose alternate holds a deliberate SUBSET (the test harness points the
-        // client at exactly that, tests/lib/run-test.sh) then dies with
-        // `missing blob object <x>` naming an object that has nothing to do with
-        // the fetch, blamed on the fetch. Dropping those tips makes the check
-        // verify OUR closure and only ours, which is stricter, not looser.
-        //
-        // Narrow to this fetch on purpose: alternate tips are an exclusion set,
-        // so suppressing them is only safe when the fetched closure stands
-        // alone. It does here (`--depth 1` — a commit and its tree), and it does
-        // NOT for `fetch_object_negotiated`, where a chat commit's history may
-        // legitimately live in an alternate.
-        self.run_git(&[
-            "-c",
-            "core.alternateRefsCommand=true",
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--depth",
-            "1",
-            url,
-            rev,
-        ])
-        .map_err(|e| format!("fetching {rev} from {url}: {e}"))?;
-        if !self.have_commit(rev) {
-            return Err(format!("{url} did not deliver commit {rev}"));
-        }
-        Ok(Some(()))
+        // A locator needs a snapshot, not history. Keep the shallow boundary
+        // and incomplete commit in a disposable repo; copy only its tree closure.
+        let scratch = scratch_dir()?;
+        let result = (|| {
+            let git = |args: &[&str]| git_capture_in(args, None, &scratch);
+            git(&["init", "--bare", "--quiet"])?;
+            git(&[
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--",
+                url,
+                rev,
+            ])?;
+            let tree = git(&[
+                "rev-parse",
+                "--verify",
+                &format!("{rev}^{{commit}}^{{tree}}"),
+            ])?;
+            let tree = tree.trim();
+            let pack = scratch.join("tree.pack");
+            let mut writer = std::process::Command::new("git")
+                .current_dir(&scratch)
+                .args(["pack-objects", "--stdout", "--revs"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::fs::File::create(&pack).map_err(|e| e.to_string())?)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let written = writeln!(writer.stdin.take().unwrap(), "{tree}");
+            let status = writer.wait().map_err(|e| e.to_string())?;
+            written.map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err("packing locator tree failed".into());
+            }
+            let status = std::process::Command::new("git")
+                .current_dir(&self.work_dir)
+                .args(["index-pack", "--stdin"])
+                .stdin(std::fs::File::open(&pack).map_err(|e| e.to_string())?)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err("storing locator tree failed".into());
+            }
+            // The ref maps the pin to its tree across processes and retains the
+            // complete tree for GC. No foreign commit enters the caller's store.
+            self.run_git(&["update-ref", &tree_ref, tree])?;
+            parse_oid(tree).map(Some)
+        })();
+        let _ = std::fs::remove_dir_all(scratch);
+        result.map_err(|e| format!("fetching {rev} from {url}: {e}"))
     }
 
     fn server_url(&self) -> Result<String, String> {
@@ -1420,19 +1421,6 @@ impl GitTransport {
             )
         })?;
         Ok(())
-    }
-
-    /// Does the local repo already hold `rev` as a COMMIT?
-    ///
-    /// A SUBPROCESS on purpose, rather than the cached `self.repo`: a `git fetch`
-    /// lands a new pack that the already-open odb handle will not see, and this
-    /// is called on both sides of exactly that fetch. (`get_object` solves the
-    /// same problem by re-opening; here one `cat-file` is simpler and is already
-    /// a process boundary.) `^{commit}` also does the type check for us — a rev
-    /// that names a tree or a tag object is not a pin we can peel.
-    fn have_commit(&self, rev: &str) -> bool {
-        self.git_capture(&["cat-file", "-e", &format!("{rev}^{{commit}}")], None)
-            .is_ok()
     }
 
     /// Run a network Git command in this transport's bound working tree.
@@ -3317,23 +3305,10 @@ fn resolve_remote_arg(
         let url = git_ref.fetch_url();
         t.fetch_git_ref(&url, rev)?.ok_or_else(|| {
             format!(
-                "cannot fetch {value:?}: resolving a remote ref is a CLIENT capability, \
-                 so a `:@@=` arg must already be an oid by the time a worker sees it"
+                "cannot fetch {value:?}: resolving a remote ref is a CLIENT capability; \\
+                 a remote locator must already be an oid by the time a worker sees it"
             )
-        })?;
-        // Peel the pinned commit to its tree. Everything below is ordinary
-        // object reading, against objects the fetch just made local.
-        let (kind, content) = t.get_object(rev)?;
-        if kind != "commit" {
-            return Err(format!(
-                "git ref {value:?}: {rev} is a {kind}, not a commit"
-            ));
-        }
-        // Bound rather than returned inline: the parsed commit BORROWS `content`,
-        // and a block's tail temporaries outlive its locals.
-        let commit = gix::objs::CommitRef::from_bytes(&content, gix::hash::Kind::Sha1)
-            .map_err(|e| format!("git ref {value:?}: malformed commit {rev}: {e}"))?;
-        commit.tree()
+        })?
     };
 
     let dir = git_ref.dir.as_deref().unwrap_or("");
