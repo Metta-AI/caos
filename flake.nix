@@ -669,7 +669,7 @@ sandbox = false''
         cliPackages = "--package caos-cli --package caos-iroh --bins";
 
         # THE CLIENT FOR A NAMED LINUX TARGET, regardless of what this machine
-        # is. `dev/dev-publish` pushes these into caosd so a cloud container can
+        # is. `caosd up` pushes these into caosd so a cloud container can
         # run uncommitted work; a container is x86_64, and the host build is
         # not (`muslTarget` follows the build host: aarch64 on Apple Silicon).
         # Publishing the host's binary from a Mac yields one that installs
@@ -1546,7 +1546,7 @@ sandbox = false''
       {
         packages = {
           # The client a cloud container can actually exec, built for the
-          # container's architecture rather than this machine's. `dev-publish`
+          # container's architecture rather than this machine's. `caosd up`
           # pushes it into caosd; see `clientForTarget`.
           caos-client-x86_64-linux = clientForTarget "x86_64-unknown-linux-musl";
           caos-client-aarch64-linux = clientForTarget "aarch64-unknown-linux-musl";
