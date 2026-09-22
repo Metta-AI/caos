@@ -180,6 +180,23 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
+Two bare tags are flags:
+- `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
+  than returning a value. Absent means READ-ONLY, which is the default because
+  it is the safe reading of a tool that forgot to say
+- `@git` — bind the source tree commit and the turn's ref snapshot
+
+The tag lives in the help rather than as its own arg so that `tool_help` can
+report it WITHOUT EVALUATING: "will this change my tree?" is the second most
+important fact about a tool, so the description has to carry it, and an arg
+would be readable only by building the tool. It also costs no reserved name.
+
+**A tag this parser cannot act on is reported, never absorbed.** A misspelled
+`@writer` would otherwise leave a writer read-only — and a read-only tool's
+proposal is discarded as a value, so the edit simply does not happen, with no
+error anywhere. `@params x` is likewise not `@param` with `s x` after it; it
+once minted an arg named `s` and lost the real one.
+
 Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`
 and `help` are refused: the interpreter, or the tool's own expression, binds
 those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
@@ -248,15 +265,29 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 Everything here was considered and deliberately deferred. Nothing above depends
 on any of it, and each is written down because the reason is easy to lose.
 
-- **A repository tool cannot propose a change.** Which of a tool's results is a
-  proposed source tree and which is a tree-shaped value is decided by a
-  HARDCODED MATCH ON THE TOOL'S NAME (`llm-step`'s `callback_result`): only
-  `bash` (returns a tree, the harness mints the commit) and `merge` (returns a
-  two-parent commit) can propose. Every other tool, including every repository
-  tool, is value-only. It cannot be inferred instead, because `grep` returns a
-  tree that is a value — so generalizing this needs one DECLARED read/write
-  field, which would also decide what `in` binds and which of the two result
-  shapes applies.
+- **A repository tool cannot propose a change, though it can now DECLARE that
+  it wants to.** `@writer` parses and `tool_help` reports it; nothing reads the
+  bit yet. Which of a tool's results is a proposed change and which is a
+  tree-shaped value is still decided by a HARDCODED MATCH ON THE TOOL'S NAME
+  (`llm-step`'s `callback_result`): only `bash` (returns a tree, the harness
+  mints the commit) and `merge` (returns a two-parent commit) can propose;
+  every other tool, including every repository tool, is value-only. It cannot
+  be inferred from the result instead, because `grep` returns a tree that is a
+  value and a reader may legitimately return a commit (a blame-like tool
+  answering with the commit it found). Replacing that match with the declared
+  bit is what the tag exists for.
+
+  The agreed shape for when it does: a writer's result is
+  `{prop, out, message?, failed?}` — `prop` a tree or a commit, `out` the text
+  the model reads, `message` an optional commit message for when the harness
+  mints (today it writes the tool name, so a conversation's source history is a
+  column of identical one-word messages), and `failed` a marker entry rather
+  than a banner in `out`, since a writer's `out` is arbitrary logs and says
+  `FAILED` in passing. Most writers return a tree and let the harness mint;
+  only a tool needing a second parent (merge) builds its own commit. SCOPE
+  comes from the INVOCATION, not the declaration: a writer run on a source tree
+  returns a source commit, one run on the conversation returns a conversation
+  commit, and the path the caller named already decides which.
 - **`help` is read from the expression's text, not from the evaluated tree.**
   So a tool whose help lives only in a built image cannot be described. Reading
   it from the ArgTree would fix that, at the cost of `tool_help` having to

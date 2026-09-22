@@ -83,6 +83,48 @@ set -euo pipefail
 echo "boom: this tool never writes /cas/out" >&2
 exit 1
 EOF
+# A DECLARED WRITER: `@writer` in its help, a `{prop, out, message}` result,
+# and `prop` a TREE so the harness mints the commit — the shape almost every
+# writer wants, where the tool never has to know what a commit is.
+tool writer 'Add WRITER.md to the source tree.
+@writer' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# `/cas/args/in`, not `/cas/in`: a bound arg lands under /cas/args (SPEC,
+# "CaosTools" -- Receiving args).
+caos get -r /cas/args/in
+rm -rf /tmp/w && mkdir -p /tmp/w
+cp -RL /cas/args/in/. /tmp/w/
+chmod -R u+w /tmp/w
+printf 'written by the writer tool\n' > /tmp/w/WRITER.md
+caos put /tmp/w /cas/prop
+rm -rf /tmp/wres && mkdir -p /tmp/wres
+printf 'added WRITER.md\n' > /tmp/wres/out
+printf 'writer: add WRITER.md\n' > /tmp/wres/message
+ln -s /cas/prop /tmp/wres/prop
+caos put /tmp/wres /cas/out
+EOF
+# A writer that returns a COMMIT unrelated to the one it was given. `reconcile`
+# ERRORS rather than conflicts on that, which would take the turn down, so the
+# harness has to catch it first and say which two commits disagree.
+tool orphan 'Return a commit that does not descend from its input.
+@writer' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf /tmp/o && mkdir -p /tmp/o
+printf 'unrelated\n' > /tmp/o/x
+caos put /tmp/o /cas/orphantree
+{ printf 'tree %s\n' "$(caos hash /cas/orphantree)"
+  printf 'author caos <t@t> 0 +0000\n'
+  printf 'committer caos <t@t> 0 +0000\n'
+  printf '\nunrelated\n'
+} > /tmp/ocommit
+caos put-commit /tmp/ocommit /cas/orphancommit
+rm -rf /tmp/ores && mkdir -p /tmp/ores
+printf 'tried to publish an unrelated commit\n' > /tmp/ores/out
+ln -s /cas/orphancommit /tmp/ores/prop
+caos put /tmp/ores /cas/out
+EOF
 # A directory that is NOT a tool: its expression binds no `--help`. `tool_help`
 # has to say so distinctly from "no such path", because the two have different
 # fixes.
@@ -93,13 +135,13 @@ printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
 
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled source_tree")
 
-stage "script the stub LLM (describe; edit; bad call; dead sub-run; good call)"
+stage "script the stub LLM (describe; edit; bad call; dead sub-run; good; write)"
 # All calls share one response and run in order. `tool_help` comes first,
 # because that is the order a model works in with nothing listing the tools:
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -149,7 +191,11 @@ grep -qF 'suffix (optional)' /tmp/stub/request-2.json \
   || fail "tool_help did not mark @param [name] optional"
 grep -qF 'The word to echo.' /tmp/stub/request-2.json \
   || fail "tool_help dropped a @param's documentation"
-echo "  ok: word required, suffix optional, docs carried" >&2
+# Whether a tool changes the tree is STATED, not left to an absent line: these
+# fixtures declare no `@writer`, so they must be described as read-only.
+grep -qF 'Read-only' /tmp/stub/request-2.json \
+  || fail "tool_help did not say whether the tool changes the tree"
+echo "  ok: word required, suffix optional, read-only stated, docs carried" >&2
 
 stage "tool_help: the two not-a-tool answers, each naming the siblings"
 grep -qF 'binds no `--help`' /tmp/stub/request-2.json \
@@ -176,22 +222,45 @@ stage "a tool whose SUB-RUN dies is an is_error result, not a dead turn"
   || fail "the turn died on the failing tool instead of continuing"
 grep -qF 'the `run_tool` tool failed to run' /tmp/stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
-# Four: the two bad `tool_help` paths, the missing required arg, and the dead
-# sub-run. Every one is a value the model can read, not a dead turn.
-[ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 4 ] \
-  || fail "the tool_help, validation and sub-run failures were not all is_error"
+# Five: the two bad `tool_help` paths, the missing required arg, the dead
+# sub-run, and the writer whose commit does not descend from its input. Every
+# one is a value the model can read, not a dead turn.
+#
+# On a mismatch this DUMPS EVERY tool_result, because the count alone says only
+# that something changed -- not which call, and not why.
+errors=$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)
+if [ "$errors" != 5 ]; then
+  echo "--- $errors is_error blocks, expected 5. Every tool_result:" >&2
+  jq -r '..|objects|select(.type=="tool_result")
+         | "  \(.tool_use_id) is_error=\(.is_error // false): \((.content[0].text // "")[0:300])"' \
+    /tmp/stub/request-2.json >&2 || true
+  fail "the tool_help, validation, sub-run and ancestry failures were not all is_error"
+fi
 # The good call is after both failures in the same queue. Its result proves
 # that the queue continued, the bash edit survived the failed sub-run, and the
 # declared args reached the script at /cas/args/<name>.
 grep -qF 'hello-from-tree-v2 word=banana-split' /tmp/stub/request-2.json \
   || fail "the queued tool lost its args or the edited source_tree"
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/caos-tools.records
-bash_source_tree=$(source_tree_commit "$head")
-assert_oid "$bash_source_tree" "bash-adopted source_tree"
-jq -e --arg source_tree "$bash_source_tree" \
-  'select(.id == "toolu_04") | .task != null and .input_commit == $source_tree' \
-  /tmp/caos-tools.records >/dev/null \
-  || fail "later hello call did not start from the bash edit"
+# toolu_04 (the good `hello`) and toolu_06 (the writer) must have run on THE
+# SAME source commit: hello is read-only, so nothing moved the pointer between
+# them. That is the queue continuing on one tree, which is what this ever meant.
+#
+# NOT "the source tree at the end of the turn", which it used to compare
+# against: those matched only while toolu_04 was the last call to move the
+# tree, and a writer after it makes the final tree a commit that did not exist
+# when toolu_04 ran. And NOT bash's own resolution `output` either -- bash is
+# UNSCOPED (it may edit conversation files and several trees at once), so
+# `plan_file_changes` records its gitlink move under `files` and leaves
+# `source_tree_resolution` null. Only a source-tree-SCOPED call carries an
+# `output`.
+hello_input=$(jq -r 'select(.id == "toolu_04") | .input_commit' /tmp/caos-tools.records)
+writer_input=$(jq -r 'select(.id == "toolu_06") | .input_commit' /tmp/caos-tools.records)
+assert_oid "$hello_input" "the source commit the queued hello call ran on"
+[ "$hello_input" = "$writer_input" ] \
+  || fail "queued calls did not share one source commit: $hello_input vs $writer_input"
+jq -e 'select(.id == "toolu_04") | .task != null' /tmp/caos-tools.records >/dev/null \
+  || fail "the queued hello call was never dispatched"
 final_source_tree=$(source_tree_commit "$head")
 fetch_code "$final_source_tree" "fetching final source_tree"
 case "$(git show "$final_source_tree:caos-tools/hello/worker.sh")" in
@@ -199,5 +268,37 @@ case "$(git show "$final_source_tree:caos-tools/hello/worker.sh")" in
   *) fail "the failed sub-run lost the earlier source_tree edit" ;;
 esac
 echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
+
+stage "a DECLARED writer changes the source tree; a reader cannot"
+# `@writer` is the whole difference. `hello` ran twice above and returned a
+# blob; the source tree moved only for the tool that declared itself a writer.
+grep -qF 'Writes: proposes a change' /tmp/stub/request-2.json \
+  || fail "tool_help did not describe the writer as one"
+grep -qF 'added WRITER.md' /tmp/stub/request-2.json \
+  || fail "the writer's out entry did not reach the model"
+case "$(git show "$final_source_tree:WRITER.md" 2>&1)" in
+  *"written by the writer tool"*) ;;
+  *) fail "the writer's proposal was not applied to the source tree" ;;
+esac
+# It built on the bash edit rather than replacing the tree it was handed.
+case "$(git show "$final_source_tree:caos-tools/hello/worker.sh")" in
+  *hello-from-tree-v2*) ;;
+  *) fail "the writer's proposal discarded the earlier edit" ;;
+esac
+# The tool's own `message` became the commit message. Without it the mint falls
+# back to the tool path, which is why source history was a column of identical
+# one-word messages.
+[ "$(git log -1 --format=%s "$final_source_tree")" = "writer: add WRITER.md" ] \
+  || fail "the writer's message did not become the commit message: $(git log -1 --format=%s "$final_source_tree")"
+echo "  ok: WRITER.md applied over the edit, with the tool's commit message" >&2
+
+stage "a writer's commit must descend from the one it was given"
+grep -qF 'does not descend from the commit it was given' /tmp/stub/request-2.json \
+  || fail "an unrelated proposal commit was not reported to the model"
+# And it did not land: reconcile would have ERRORED on it, taking the turn.
+if git show "$final_source_tree:x" >/dev/null 2>&1; then
+  fail "the unrelated commit was applied to the source tree"
+fi
+echo "  ok: the orphan commit was refused as a value, naming both commits" >&2
 
 pass caos-tools

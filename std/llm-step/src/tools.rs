@@ -71,13 +71,7 @@ const GREP_HELP: &str = "Search the conversation tree, including code references
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
 /// tool takes. A std entry that declares `@git` gets the same builder.
 pub(crate) fn builtin_tool(name: &str, help: &str) -> TreeTool {
-    let (doc, args, git) = parse_help(&format!("built-in {name}"), help);
-    TreeTool {
-        name: name.to_string(),
-        doc,
-        args,
-        git,
-    }
+    TreeTool::new(name, parse_help(&format!("built-in {name}"), help))
 }
 
 fn builtin_declaration(name: &str, help: &str) -> Value {
@@ -149,6 +143,33 @@ pub struct TreeTool {
     /// `wc` changes every step, so binding it into a tool that doesn't need it
     /// (build/test) would turn every cache hit into a miss.
     pub git: bool,
+    /// The tool declared `@writer`: its result is a PROPOSED CHANGE to the tree
+    /// it was run on, not a value. Nothing reads this yet — the harness still
+    /// decides writer-ness by tool name (`callback_result`); this carries the
+    /// declaration so that match can be replaced by it.
+    pub writer: bool,
+}
+
+impl TreeTool {
+    /// A named tool from its parsed help.
+    fn new(name: &str, help: Help) -> TreeTool {
+        TreeTool {
+            name: name.to_string(),
+            doc: help.doc,
+            args: help.args,
+            git: help.git,
+            writer: help.writer,
+        }
+    }
+
+    /// The same, with a placeholder description when the help gave none — a
+    /// tool with no prose still has to be describable.
+    fn named(name: &str, mut help: Help, placeholder: &str) -> TreeTool {
+        if help.doc.is_empty() {
+            help.doc = placeholder.to_string();
+        }
+        TreeTool::new(name, help)
+    }
 }
 
 /// One `@param` tag: `@param <name> <description>` is required, `@param
@@ -185,21 +206,61 @@ fn parse_arg(payload: &str) -> Option<TreeArg> {
     })
 }
 
-/// Parse a tool's `help` string as a JAVADOC comment (SPEC, "Tools"): the free
-/// text before the first block tag is the description; `@param <name>` /
-/// `@param [<name>]` tags declare the parameters; a bare `@git` tag asks for the
-/// history context. Returns `(description, params, git)` — an empty description
-/// for the caller to placeholder. A malformed `@param` is skipped with a
-/// message. This is the DURABLE parser: Phase 4 feeds it the isolated `--help`
-/// here-string; today it is fed text lifted from the script header (below).
-fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
+/// One tool's parsed `help`: what it does, what it takes, and the flag tags.
+pub struct Help {
+    /// Free text before the first block tag; empty for the caller to
+    /// placeholder.
+    pub doc: String,
+    pub args: Vec<TreeArg>,
+    /// `@git`: bind the source tree commit and the turn's ref snapshot.
+    pub git: bool,
+    /// `@writer`: this tool PROPOSES A CHANGE to the tree it is run on, rather
+    /// than returning a value. Absent means read-only, which is the default
+    /// precisely because it is the safe answer for a tool that forgot to say.
+    pub writer: bool,
+}
+
+/// If `line` opens a javadoc BLOCK TAG, its name without the `@`.
+///
+/// Tag-shaped means the first token is `@` followed only by lowercase letters
+/// and hyphens, which is what keeps an `@` inside prose from reading as a tag:
+/// `caos@caos` and `github.com@evil.example` both fail it, and both appear in
+/// help text today.
+fn block_tag(line: &str) -> Option<&str> {
+    let tag = line.split_whitespace().next()?.strip_prefix('@')?;
+    let shaped = !tag.is_empty()
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '-');
+    shaped.then_some(tag)
+}
+
+/// Parse a tool's `help` string as a JAVADOC comment (SPEC, "CaosTools"): the
+/// free text before the first block tag is the description, `@param <name>` /
+/// `@param [<name>]` tags declare the parameters, and the bare tags `@git` and
+/// `@writer` set flags.
+///
+/// **An unrecognized tag is reported, never absorbed.** A misspelled `@writer`
+/// would otherwise leave a writer silently read-only — and then its proposal is
+/// discarded as a value, so the edit simply does not happen, with no error
+/// anywhere. Same reasoning as the `@param` message below: a tag this parser
+/// cannot act on is a defect in the tool, and the only place it can be noticed
+/// is here.
+fn parse_help(ctx: &str, text: &str) -> Help {
     let mut doc: Vec<&str> = Vec::new();
     let mut args = Vec::new();
     let mut git = false;
+    let mut writer = false;
     let mut in_tags = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("@param") {
+        // `@param` must END there: `strip_prefix` alone would read `@params x`
+        // as `@param` with `s x` after it and mint an arg named `s`, which is
+        // exactly the silent mis-parse the tags below are guarded against.
+        let param = trimmed
+            .strip_prefix("@param")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+        if let Some(rest) = param {
             in_tags = true;
             match parse_arg(rest.trim()) {
                 Some(a) => args.push(a),
@@ -208,12 +269,25 @@ fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
         } else if trimmed == "@git" {
             in_tags = true;
             git = true;
+        } else if trimmed == "@writer" {
+            in_tags = true;
+            writer = true;
+        } else if let Some(tag) = block_tag(trimmed) {
+            in_tags = true;
+            eprintln!(
+                "{ctx}: unknown block tag @{tag} — ignored (known: @param, @git, @writer)"
+            );
         } else if !in_tags {
             // Description text — everything before the first block tag.
             doc.push(trimmed);
         }
     }
-    (doc.join(" ").trim().to_string(), args, git)
+    Help {
+        doc: doc.join(" ").trim().to_string(),
+        args,
+        git,
+        writer,
+    }
 }
 
 /// The `help` string a tool's `.caos-expr` binds, read from the EXPRESSION'S
@@ -306,18 +380,11 @@ fn read_tool(name: &str, dir: &str) -> Result<Result<TreeTool, NotATool>, String
     let Some(help) = expr_help(&text) else {
         return Ok(Err(NotATool::NoHelp));
     };
-    let (doc, args, git) = parse_help(&format!("{name}/.caos-expr"), &help);
-    let doc = if doc.is_empty() {
-        format!("Repository tool {name} (no description).")
-    } else {
-        doc
-    };
-    Ok(Ok(TreeTool {
-        name: name.to_string(),
-        doc,
-        args,
-        git,
-    }))
+    Ok(Ok(TreeTool::named(
+        name,
+        parse_help(&format!("{name}/.caos-expr"), &help),
+        &format!("Repository tool {name} (no description)."),
+    )))
 }
 
 /// A harness-provided std tool (std/caos-build, std/caos-test), described by the
@@ -348,18 +415,11 @@ pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     }
     caos(["get", &help_path])?;
     let help = fs::read_to_string(&help_path).map_err(|e| format!("reading {help_path}: {e}"))?;
-    let (doc, args, git) = parse_help(&format!("std/{name}"), &help);
-    let doc = if doc.is_empty() {
-        format!("Built-in tool {name} (no description).")
-    } else {
-        doc
-    };
-    Ok(Some(TreeTool {
-        name: name.to_string(),
-        doc,
-        args,
-        git,
-    }))
+    Ok(Some(TreeTool::named(
+        name,
+        parse_help(&format!("std/{name}"), &help),
+        &format!("Built-in tool {name} (no description)."),
+    )))
 }
 
 /// One discovered tool's registry entry. A tool with no `@param` tags takes
@@ -477,6 +537,15 @@ pub fn not_a_tool_message(reason: NotATool, path: &str) -> String {
 /// reads this, and a schema dump is the registry we just stopped keeping.
 fn describe(tool: &TreeTool, path: &str) -> String {
     let mut out = format!("{path}\n\n{}\n", tool.doc);
+    // Stated for readers too, not just writers. "Will this change my tree?" is
+    // the second most important fact about a tool, and an absent line would
+    // leave the model unable to tell a reader from a description that simply
+    // did not mention it.
+    out.push_str(if tool.writer {
+        "\nWrites: proposes a change to the tree it is run on.\n"
+    } else {
+        "\nRead-only: returns a value and changes nothing.\n"
+    });
     if tool.args.is_empty() {
         out.push_str(
             "\nParameters: none. Its input is the source tree containing it, so \
@@ -530,6 +599,75 @@ fn suggestion(parent: &str, nearby: Option<Vec<String>>) -> String {
         parent.to_string()
     };
     format!(". Directories in {where_}: {}", names.join(" "))
+}
+
+/// A WRITER tool's result value: `{prop, out, message?, failed?}` (SPEC,
+/// "CaosTools").
+pub struct WriterResult {
+    /// CAS path of the proposal. A TREE — the harness mints the commit — or a
+    /// COMMIT, used as-is, which only a tool needing a second parent (merge)
+    /// has any reason to build.
+    pub prop: String,
+    /// `"tree"` or `"commit"`, from the entry's own kind rather than its name:
+    /// one entry that says what it is beats two entries named after kinds,
+    /// where `prop/tree` holding a commit would be a lie.
+    pub kind: String,
+    /// The text the model reads.
+    pub out: String,
+    /// An optional commit message, used when the harness mints. Without it the
+    /// mint falls back to the tool's path, which is why a conversation's source
+    /// history is otherwise a column of identical one-word messages.
+    pub message: Option<String>,
+    /// The `failed` entry is PRESENT, so the call is an error. A marker rather
+    /// than a banner in `out`, because `out` is arbitrary logs and a build that
+    /// printed `FAILED` in passing would condemn a perfectly good proposal.
+    pub failed: bool,
+}
+
+/// Read a writer's result.
+///
+/// Every failure here is the TOOL's defect, and it is reported to the model
+/// naming the tool rather than failing the worker: a repository tool is code
+/// the model may have just written, so a malformed result has to be
+/// correctable within the turn instead of taking the turn down.
+pub fn writer_result(result: &str) -> Result<WriterResult, String> {
+    caos(["get", result])?;
+    let dir = Path::new(result);
+    if !dir.is_dir() {
+        return Err("a writer's result must be a tree of {prop, out}, not a blob".to_string());
+    }
+    let blob = |name: &str| -> Result<Option<String>, String> {
+        let file = dir.join(name);
+        if !file.exists() {
+            return Ok(None);
+        }
+        caos(["get", path(&file)])?;
+        let bytes = fs::read(&file).map_err(|e| format!("reading {name}: {e}"))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    let prop = dir.join("prop");
+    if !prop.exists() {
+        return Err(
+            "a writer's result has no `prop` entry — the proposed tree or commit".to_string(),
+        );
+    }
+    let prop = path(&prop).to_string();
+    let kind = worker_common::cas_kind(&prop)?;
+    if kind != "tree" && kind != "commit" {
+        return Err(format!("a writer's `prop` must be a tree or a commit, not a {kind}"));
+    }
+    // `out` is REQUIRED. Substituting a generic line for a tool that forgot it
+    // would hide the tool's silence behind the harness's voice, and the whole
+    // point of the entry is that the model learns what happened.
+    let out = blob("out")?
+        .ok_or("a writer's result has no `out` entry — the text for the model")?;
+    Ok(WriterResult {
+        prop,
+        kind,
+        out,
+        message: blob("message")?,
+        failed: dir.join("failed").exists(),
+    })
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,
@@ -1038,39 +1176,78 @@ mod tests {
                     A second description line.\n\
                     @param hash The record hash.\n\
                     @param [log] Which inner-stack log.";
-        let (doc, args, git) = parse_help("t", help);
-        assert_eq!(doc, "Print one test's record. A second description line.");
-        assert!(!git);
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[0].name, "hash");
-        assert!(args[0].required);
-        assert_eq!(args[0].doc, "The record hash.");
-        assert_eq!(args[1].name, "log");
-        assert!(!args[1].required);
+        let h = parse_help("t", help);
+        assert_eq!(h.doc, "Print one test's record. A second description line.");
+        assert!(!h.git);
+        assert!(!h.writer, "a tool is read-only unless it says otherwise");
+        assert_eq!(h.args.len(), 2);
+        assert_eq!(h.args[0].name, "hash");
+        assert!(h.args[0].required);
+        assert_eq!(h.args[0].doc, "The record hash.");
+        assert_eq!(h.args[1].name, "log");
+        assert!(!h.args[1].required);
     }
 
     #[test]
     fn parse_help_git_tag_and_no_params() {
-        let (doc, args, git) = parse_help("t", "Just a description.\n@git");
-        assert_eq!(doc, "Just a description.");
-        assert!(git);
-        assert!(args.is_empty());
+        let h = parse_help("t", "Just a description.\n@git");
+        assert_eq!(h.doc, "Just a description.");
+        assert!(h.git);
+        assert!(h.args.is_empty());
 
         // Empty help → empty description (the caller placeholders it) and no args.
-        let (doc, args, git) = parse_help("t", "");
-        assert!(doc.is_empty());
-        assert!(args.is_empty());
-        assert!(!git);
+        let h = parse_help("t", "");
+        assert!(h.doc.is_empty());
+        assert!(h.args.is_empty());
+        assert!(!h.git);
+        assert!(!h.writer);
+    }
+
+    #[test]
+    fn writer_is_opt_in_and_independent_of_git() {
+        let h = parse_help("t", "Merges a branch in.\n@writer");
+        assert!(h.writer);
+        assert!(!h.git);
+        assert_eq!(h.doc, "Merges a branch in.");
+
+        // Both tags, in either order, and the description still stops at the
+        // first one.
+        let h = parse_help("t", "Walks history and edits.\n@writer\n@git");
+        assert!(h.writer && h.git);
+        assert_eq!(h.doc, "Walks history and edits.");
+        let h = parse_help("t", "d\n@git\n@writer");
+        assert!(h.writer && h.git);
+    }
+
+    #[test]
+    fn a_tag_this_parser_cannot_act_on_is_never_absorbed() {
+        // A misspelled `@writer` must not leave a writer silently read-only:
+        // the proposal would be discarded as a value and the edit would just
+        // not happen. It is reported (stderr) and kept OUT of the description,
+        // which is where an unknown tag would otherwise land.
+        let h = parse_help("t", "A tool.\n@wrter\n@param x The x.");
+        assert!(!h.writer);
+        assert_eq!(h.doc, "A tool.");
+        assert_eq!(h.args.len(), 1, "parsing continues past the unknown tag");
+
+        // `@params x` is NOT `@param` with `s x` after it — that once minted an
+        // arg named `s` and silently lost the real one.
+        let h = parse_help("t", "d\n@params hash The hash.");
+        assert!(h.args.is_empty(), "got {:?}", h.args.first().map(|a| &a.name));
+
+        // An `@` inside prose is not a tag. Both of these appear in help and
+        // commit text today.
+        let h = parse_help("t", "Mail caos@caos or see github.com@evil.example");
+        assert_eq!(h.doc, "Mail caos@caos or see github.com@evil.example");
     }
 
     #[test]
     fn parse_help_skips_reserved_and_malformed_params() {
         // `in` is reserved; `Bad` is not a lowercase name → both skipped, the
         // good one survives.
-        let (_doc, args, _git) =
-            parse_help("t", "d\n@param in nope\n@param Bad nope\n@param ok yes");
-        assert_eq!(args.len(), 1);
-        assert_eq!(args[0].name, "ok");
+        let h = parse_help("t", "d\n@param in nope\n@param Bad nope\n@param ok yes");
+        assert_eq!(h.args.len(), 1);
+        assert_eq!(h.args[0].name, "ok");
     }
 
     #[test]
@@ -1098,18 +1275,17 @@ mod tests {
 
     #[test]
     fn describe_renders_the_help_a_model_reads() {
-        let (doc, args, _) = parse_help(
-            "t",
-            "Say hello from the tree.\n@param word The word to echo.\n\
-             @param [suffix] An optional suffix.",
+        let tool = TreeTool::new(
+            "hello",
+            parse_help(
+                "t",
+                "Say hello from the tree.\n@param word The word to echo.\n\
+                 @param [suffix] An optional suffix.",
+            ),
         );
-        let tool = TreeTool {
-            name: "hello".into(),
-            doc,
-            args,
-            git: false,
-        };
         let text = describe(&tool, "main/caos-tools/hello");
+        // Read-only is STATED, not left to an absent line.
+        assert!(text.contains("Read-only"));
         assert!(text.starts_with("main/caos-tools/hello\n"));
         assert!(text.contains("Say hello from the tree."));
         // Requiredness is stated in words, not a JSON `required` array: this is
@@ -1119,14 +1295,15 @@ mod tests {
 
         // No `@param` means the source tree IS the input, and saying so is the
         // whole answer — an empty parameter list reads like a missing one.
-        let bare = TreeTool {
-            name: "t".into(),
-            doc: "Test everything.".into(),
-            args: Vec::new(),
-            git: false,
-        };
+        let bare = TreeTool::new("t", parse_help("t", "Test everything."));
         let text = describe(&bare, "main/caos-tools/t");
         assert!(text.contains("Parameters: none."));
+
+        // A writer says so, in the one place a model is guaranteed to look.
+        let w = TreeTool::new("m", parse_help("t", "Merge a branch.\n@writer"));
+        let text = describe(&w, "main/caos-tools/m");
+        assert!(text.contains("Writes:"));
+        assert!(!text.contains("Read-only"));
     }
 
     #[test]
@@ -1200,6 +1377,7 @@ mod tests {
                 },
             ],
             git: false,
+            writer: false,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -1217,6 +1395,7 @@ mod tests {
             doc: "Build.".to_string(),
             args: Vec::new(),
             git: false,
+            writer: false,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -1243,6 +1422,7 @@ mod tests {
                 },
             ],
             git: false,
+            writer: false,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 

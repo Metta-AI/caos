@@ -1135,14 +1135,7 @@ fn drive_call(
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let mut scoped_call = call.clone();
     if call.name == "run_tool" {
-        if let Some(name) = &name {
-            let path = call.input["path"]
-                .as_str()
-                .ok_or("run_tool requires path")?;
-            scoped_call.input["path"] = json!(path
-                .strip_prefix(&format!("{name}/"))
-                .ok_or("tool path is outside its source tree")?);
-        }
+        scoped_call.input["path"] = json!(tool_path_in_scope(call, name.as_deref())?);
     }
     match prepare_compute(&scoped, &scoped_call, &ws, &wc, request, round)? {
         Prepared::Result(block) => {
@@ -1239,6 +1232,32 @@ fn source_tree_target(
         ));
     };
     Ok(Some((name, source_tree.commit.clone())))
+}
+
+/// A `run_tool` call's tool path WITHIN the tree it will run against: the
+/// conversation path the model gave, minus the source-tree prefix that selected
+/// that tree.
+///
+/// Both halves matter, and dropping either breaks a different thing. The prefix
+/// has to go because the remainder is EVALUATED AGAINST THAT TREE'S OWN ROOT —
+/// evaluate a conversation-relative path against the conversation root instead
+/// and a repository's root `.caos-expr` never runs, so `--base:@=DEEP-DEPS/<x>`
+/// inside the tool resolves to nothing. And it is what makes a human's
+/// `run-tool` land on the same ArgTree: one source tree, empty prefix, whole
+/// path (SPEC, "CaosTools" — Resolution).
+///
+/// `None` scope is the conversation tree, where there is no prefix to strip.
+fn tool_path_in_scope(call: &Call, source_tree: Option<&str>) -> Result<String, String> {
+    let path = call.input["path"]
+        .as_str()
+        .ok_or("run_tool requires path")?;
+    match source_tree {
+        Some(name) => path
+            .strip_prefix(&format!("{name}/"))
+            .map(str::to_string)
+            .ok_or_else(|| "tool path is outside its source tree".to_string()),
+        None => Ok(path.to_string()),
+    }
 }
 
 fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
@@ -1639,6 +1658,21 @@ fn dispatch_started(
         ("ws", Arg::Path(ws.as_str())),
     ];
     let clean = call_without_source_tree(call);
+    // A repository tool that declared `@writer` — carried as its PATH, so
+    // presence is the bit and the value is what an error message can name.
+    // Read from the declaration here, at dispatch, because by the time the
+    // result comes back the tool's own path is no longer bound (`self_curry`
+    // unbinds it) and `record.name` is only ever `run_tool`.
+    let writer_storage;
+    if call.name == "run_tool" {
+        let path = tool_path_in_scope(call, record.source_tree_name.as_deref())?;
+        if let Ok(Ok(tool)) = tools::tool_at(&ws, &path) {
+            if tool.writer {
+                writer_storage = path;
+                extras.push(("tool-writer", Arg::Lit(&writer_storage)));
+            }
+        }
+    }
     let scope_storage;
     if call.name == "grep" {
         let (_, prefix) = tools::grep_precheck(&clean, &ws)
@@ -1693,6 +1727,12 @@ fn callback_result(
     state: &mut progress::State,
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
+    // A DECLARED writer, before the name match below. The arms in that match
+    // are the built-ins that still decide writer-ness by name; this is the
+    // path that replaces them (SPEC, "CaosTools" — Not built).
+    if let Some(tool) = read_arg_opt("tool-writer")? {
+        return writer_callback(state, record, &tool);
+    }
     match record.name.as_str() {
         subagents::WAIT_TOOL => wait_callback_block(state, record),
         "grep" => {
@@ -1730,6 +1770,64 @@ fn callback_result(
             None,
         )),
     }
+}
+
+/// A declared writer's result: `{prop, out, message?, failed?}` becomes the
+/// model's tool_result plus a PROPOSAL for `complete_compute` to reconcile at
+/// whichever scope the call selected.
+///
+/// Every mistake a tool can make here is answered as an `is_error` tool_result
+/// NAMING THE TOOL, never a worker failure — a repository tool is code the
+/// model may have written moments ago, so a malformed result has to be
+/// correctable inside the turn.
+fn writer_callback(
+    state: &mut progress::State,
+    record: &CallRecord,
+    tool: &str,
+) -> Result<(Value, Option<Oid>), String> {
+    let fail = |message: String| Ok((error_block(&record.id, &message), None));
+    let result = match tools::writer_result(&arg("result")) {
+        Ok(result) => result,
+        Err(error) => return fail(format!("{tool}: {error}")),
+    };
+    let base = record
+        .input_commit
+        .as_ref()
+        .ok_or("a writer's tool.start has no input commit")?;
+    let proposal = match result.kind.as_str() {
+        // The common case: the tool hands back a tree and never has to know
+        // what a commit is. Parentage is ours, so it descends by construction.
+        "tree" => {
+            let tree = Oid::parse(&cas_hash(&result.prop)?, "writer result tree")?;
+            let message = result.message.as_deref().unwrap_or(tool);
+            mint_source_tree_commit(state, &tree, base, message.trim())?
+        }
+        // A commit the tool built itself, which only a second parent justifies.
+        // `reconcile` ERRORS rather than conflicts when a proposal does not
+        // descend from its base, so check it here, where the model can be told
+        // which two commits disagree instead of losing the turn to it.
+        _ => {
+            let proposal = Oid::parse(&cas_hash(&result.prop)?, "writer result commit")?;
+            state.fetch_object(&proposal)?;
+            let descends = conversation_protocol::v3::CodeOps::is_ancestor(
+                state.store(),
+                base,
+                &proposal,
+            )?;
+            if !descends {
+                return fail(format!(
+                    "{tool}: the returned commit {proposal} does not descend from the commit \
+                     it was given ({base}). A writer must build on its input; return a tree \
+                     instead and the commit will be made for you."
+                ));
+            }
+            proposal
+        }
+    };
+    Ok((
+        result_block(&record.id, result.out.trim_end(), result.failed),
+        Some(proposal),
+    ))
 }
 
 fn mint_source_tree_commit(
@@ -3325,6 +3423,7 @@ fn self_curry(
         "tool-eval",
         "tool-args",
         "tool-git",
+        "tool-writer",
         "in",
         "result",
         "error",
