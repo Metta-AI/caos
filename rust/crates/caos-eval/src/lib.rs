@@ -225,8 +225,15 @@ pub trait EvalHost {
 pub enum MemoKind {
     /// Keyed on `<tree>`: one node transform.
     Node,
-    /// Keyed on `<start tree>\0<path>`: a whole walk.
+    /// Keyed on `<start tree>\0<path>\0<mode>`: a whole walk.
     Path,
+}
+
+/// Whether the final node's expression is evaluated after reaching it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalMode {
+    Evaluate,
+    StopBeforeTarget,
 }
 
 /// Walk `start_tree` from its root down to `path`, evaluating every `.caos-expr`
@@ -247,11 +254,22 @@ pub fn eval_path(
     start_tree: &str,
     path: &str,
 ) -> Result<(String, String), String> {
-    let key = format!("{start_tree}\0{path}");
+    eval_path_with_mode(host, start_tree, path, EvalMode::Evaluate)
+}
+
+/// The ordinary evaluator with an optional unevaluated final node. Ancestor
+/// expressions and their dependencies retain the usual evaluation semantics.
+pub fn eval_path_with_mode(
+    host: &dyn EvalHost,
+    start_tree: &str,
+    path: &str,
+    mode: EvalMode,
+) -> Result<(String, String), String> {
+    let key = format!("{start_tree}\0{path}\0{mode:?}");
     if let Some(hit) = host.memo_get(MemoKind::Path, &key) {
         return Ok(hit);
     }
-    let result = eval_path_uncached(host, start_tree, path)?;
+    let result = eval_path_uncached(host, start_tree, path, mode)?;
     host.memo_put(MemoKind::Path, &key, &result);
     Ok(result)
 }
@@ -261,6 +279,7 @@ fn eval_path_uncached(
     host: &dyn EvalHost,
     start_tree: &str,
     path: &str,
+    mode: EvalMode,
 ) -> Result<(String, String), String> {
     let comps: Vec<&str> = path
         .split('/')
@@ -270,6 +289,9 @@ fn eval_path_uncached(
     let mut node_oid = start_tree.to_string();
     let mut i = 0usize;
     loop {
+        if i == comps.len() && mode == EvalMode::StopBeforeTarget {
+            break;
+        }
         // A gitlink stays a commit value unless the path enters its tree.
         if node_kind == "commit" && i < comps.len() {
             node_oid = commit_tree(host, &node_oid)?;

@@ -96,6 +96,22 @@ This replaces many other mechanisms:
 - A rust program can be compiled by rustc, without any help from build-builtins
 - A flake can be passed to flake-builder, without any special support for flakes in caos
 
+## Resolving an unevaluated target
+
+`caos-cli eval-path --stop-before-target <path>` and the worker continuation
+`caos eval-path-then <in> --eval=<path> --stop-before-target` use the same
+`caos-eval` traversal as ordinary evaluation. Ancestor expressions and their
+dependencies evaluate normally; the final node is returned unchanged. For an
+empty path or `.` this returns the original root. Path memos include the mode,
+so a resolved definition and its evaluated result cannot share an answer.
+
+Repository tool help uses this mode to read the target's own expression.
+Invocation uses ordinary evaluation because it needs the resulting image;
+arguments are validated before invocation.
+Workers still yield through the evaluation continuation, and pinned locators
+are still resolved on the client. Ordinary `caos resolve` remains a lookup of
+stored content and does not evaluate expressions.
+
 ## Deep deps
 
 Most repos will have a top-level `.caos-expr` that invokes `std/deep-deps` on the tree, allowing any directory to declare deps outside its subtree

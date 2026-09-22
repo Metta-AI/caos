@@ -1052,6 +1052,7 @@ fn resolve_promise(
     let mut request: Option<String> = None;
     let (mut map, mut run, mut then) = (None, None, None);
     let mut eval = None;
+    let mut eval_mode = caos_eval::EvalMode::Evaluate;
     let mut catch = false;
     let mut max_parallel: Option<usize> = None;
     for entry in fetch_tree(config, cont)
@@ -1074,6 +1075,7 @@ fn resolve_promise(
             "eval" => eval = Some(blob_string(config, &entry.oid.to_string())?),
             // Presence is the whole signal; the content is unread.
             "catch" => catch = true,
+            "stop-before-target" => eval_mode = caos_eval::EvalMode::StopBeforeTarget,
             // How many map children may be IN FLIGHT at once. Absent means all
             // of them, which is what this always did.
             "max-parallel" => {
@@ -1098,6 +1100,12 @@ fn resolve_promise(
                 ))
             }
         }
+    }
+    if eval_mode == caos_eval::EvalMode::StopBeforeTarget && eval.is_none() {
+        return Err(HttpError::new(
+            400,
+            "stop-before-target requires an eval continuation",
+        ));
     }
     validate_continuation_shape(
         cont,
@@ -1247,14 +1255,15 @@ fn resolve_promise(
             eval_path: path,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         };
-        let evaluated = caos_eval::eval_path(&host, &input.oid.to_string(), path)
-            .map(|(kind, hash)| format!("{kind} {hash}"))
-            .map_err(|e| {
-                HttpError::new(
-                    500,
-                    format!("eval-path {path:?} in continuation {cont}: {e}"),
-                )
-            });
+        let evaluated =
+            caos_eval::eval_path_with_mode(&host, &input.oid.to_string(), path, eval_mode)
+                .map(|(kind, hash)| format!("{kind} {hash}"))
+                .map_err(|e| {
+                    HttpError::new(
+                        500,
+                        format!("eval-path {path:?} in continuation {cont}: {e}"),
+                    )
+                });
         Some(continuation_result(config, cont, evaluated, catch)?)
     } else {
         None

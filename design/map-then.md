@@ -149,6 +149,11 @@ identity on a `run`-valued expression rather than trusting it. The one thing the
 server host cannot do is resolve a `:@@=` locator: that stays client-side, so
 the URL never enters a cache key (design/flake-inputs.md).
 
+`eval-path-then --stop-before-target` records an optional `stop-before-target`
+marker alongside `eval`. The server uses the shared evaluator to evaluate only
+ancestors and delivers the unevaluated target as `result`. This marker requires
+`eval`; the existing `then` and `catch` behavior is unchanged.
+
 ## Catch: a failing single-valued step as a value
 
 `caos run-then <in> --run:<t>=<img> --then:<t>=<img> --catch` (helper:

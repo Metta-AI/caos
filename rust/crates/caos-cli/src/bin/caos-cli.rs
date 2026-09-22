@@ -91,19 +91,26 @@ fn run(args: &[String]) -> Result<(), String> {
         // job over this repo's tree: what an agent's tool invocation does,
         // callable by hand. See `caos::cli_run_tool` for the result conventions.
         Some("run-tool") => caos::cli_run_tool(&transport()?, &args[2..]),
-        // `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files
+        // `eval-path [--tree=<oid>] [--stop-before-target] <path>` — evaluate the `.caos-expr` files
         // from the tree root down to <path> and print the result's
         // "<kind> <hash>". With no --tree, the tracked source tree is the
         // start. See design/caos-expr.md.
         Some("eval-path") => {
-            let (tree, path) = match &args[2..] {
-                [path] => (None, path.as_str()),
-                [flag, path] if flag.starts_with("--tree=") => {
-                    (Some(&flag["--tree=".len()..]), path.as_str())
+            let mut tree = None;
+            let mut path = None;
+            let mut mode = caos::EvalMode::Evaluate;
+            for arg in &args[2..] {
+                if let Some(oid) = arg.strip_prefix("--tree=") {
+                    tree = Some(oid);
+                } else if arg == "--stop-before-target" {
+                    mode = caos::EvalMode::StopBeforeTarget;
+                } else if !arg.starts_with("--") && path.is_none() {
+                    path = Some(arg.as_str());
+                } else {
+                    return Err(usage(args));
                 }
-                _ => return Err(usage(args)),
-            };
-            caos::cli_eval_path(&transport()?, tree, path)
+            }
+            caos::cli_eval_path(&transport()?, tree, path.ok_or_else(|| usage(args))?, mode)
         }
         // `get <hash> <path>` — check a result out on the host, the escape
         // hatch from laziness. `run-tool` prints a hash and materializes
@@ -200,7 +207,7 @@ fn usage(args: &[String]) -> String {
          {prog} mcp <hook | serve | warm> [--llm-step:@=<path>]\n    \
          (Claude Code: the hook that records a session, and the MCP tool server it spawns)\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
-         {prog} eval-path [--tree=<oid>] <path>\n  \
+         {prog} eval-path [--tree=<oid>] [--stop-before-target] <path>\n  \
          {prog} get <hash> <path>\n  \
          {prog} status [--all] <arg tree hash>\n  \
          {prog} secrets [--check]"

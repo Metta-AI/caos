@@ -32,8 +32,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
-    run_worker, scratch, secret, Arg,
+    prepare_request, read_arg, read_arg_opt, resolve_then_catching, run_request_then,
+    run_request_then_catching, run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -1330,6 +1330,8 @@ fn prepare_compute(
                     ],
                 )?;
                 run_request_then(&task, None)?;
+            } else if call.name == "tool_help" {
+                resolve_then_catching(ws, relative, Arg::Hash(&me))?;
             } else {
                 eval_then_catching(ws, relative, Arg::Hash(&me))?;
             }
@@ -1447,7 +1449,7 @@ fn client_tool_matches(ws: &str, path: &str) -> Result<bool, String> {
         && read_arg_opt("client-tool-root")?.as_deref() == Some(cas_hash(ws)?.as_str()))
 }
 
-/// Resume with the evaluated tool image; describe it or validate and invoke it.
+/// Resume with a tool definition for help or an evaluated image for invocation.
 fn launch_resolved_tool(
     cfg: &Config,
     state: &mut progress::State,
@@ -1480,8 +1482,13 @@ fn launch_resolved_tool(
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
     let site = CallSite::at(request, round, &call, &current.declaration_message);
-    let tool = match tools::evaluated_tool(&image, call.input["path"].as_str().unwrap_or(&relative))
-    {
+    let display = call.input["path"].as_str().unwrap_or(&relative);
+    let resolved = if call.name == "tool_help" {
+        tools::tool_definition(&image, display)
+    } else {
+        tools::evaluated_tool(&image, display)
+    };
+    let tool = match resolved {
         Ok(tool) => tool,
         Err(error) => {
             site.failed(

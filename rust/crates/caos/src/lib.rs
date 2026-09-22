@@ -37,7 +37,8 @@ use gix::objs::WriteTo;
 
 mod eval;
 mod watch;
-pub use eval::cli_eval_path;
+pub use caos_eval::EvalMode;
+pub use eval::{cli_eval_path, eval_path_with_mode};
 
 /// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool as a caos job over this repo's tree, exactly what an agent's tool
@@ -126,15 +127,16 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
-/// Evaluate a tool path against its selected source or conversation snapshot.
+/// Evaluate a tool path, optionally leaving the final definition unevaluated.
 /// Locator resolution and secret marking remain client-side.
 pub fn eval_tree_tool(
     t: &dyn Transport,
     root: &str,
     path: &str,
     store: &[ClientSecret],
+    mode: EvalMode,
 ) -> Result<String, String> {
-    let (kind, oid) = eval::eval_path(t, root, path, store)?;
+    let (kind, oid) = eval_path_with_mode(t, root, path, store, mode)?;
     if kind != "tree" {
         return Err(format!("{path} evaluates to a {kind}, not a tool ArgTree"));
     }
@@ -3643,6 +3645,7 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
 /// `in` (recorded verbatim, not an image); `--catch` turns a failed walk into
 /// `--error` (and needs `--then`), like run-then's. This is how a WORKER — which
 /// may not block on a run — gets a `.caos-expr` evaluated: it asks the server to.
+/// `--stop-before-target` evaluates only ancestors and returns the final node unchanged.
 pub fn caos_eval_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
     record_continuation(
         t,
@@ -3651,7 +3654,7 @@ pub fn caos_eval_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<
         kvs,
         &["then"],
         &["eval"],
-        &["catch"],
+        &["catch", "stop-before-target"],
         |given| {
             if !given.contains(&"eval") {
                 return Err("`eval-path-then` needs --eval=<path>".to_string());
@@ -6092,7 +6095,7 @@ mod tool_resolution_tests {
     }
 
     fn evaluated_help(t: &Store, root: &str, path: &str) -> (String, String) {
-        let image = eval_tree_tool(t, root, path, &[]).unwrap();
+        let image = eval_tree_tool(t, root, path, &[], EvalMode::Evaluate).unwrap();
         let mut node = image.clone();
         for name in ["args", "help"] {
             node = fetch_tree_entries(t, &node)
@@ -6129,9 +6132,11 @@ mod tool_resolution_tests {
         let t = Store::default();
         let target = expr(&t, "run --base=forbidden --help=Failing");
         let root = generated(&t, &target);
-        assert!(eval_tree_tool(&t, &root, "args/tool", &[])
-            .unwrap_err()
-            .contains("target expression was evaluated"));
+        assert!(
+            eval_tree_tool(&t, &root, "args/tool", &[], EvalMode::Evaluate)
+                .unwrap_err()
+                .contains("target expression was evaluated")
+        );
         assert_eq!(t.computes.get(), 1);
     }
 
@@ -6140,7 +6145,7 @@ mod tool_resolution_tests {
         let t = Store::default();
         let target = expr(&t, "HELP=<<END\nGenerated runner.\n@param word The word.\nEND\ncurry --base=fixture --help=$HELP");
         let root = generated(&t, &target);
-        let evaluated = eval_tree_tool(&t, &root, "args/tool", &[]).unwrap();
+        let evaluated = eval_tree_tool(&t, &root, "args/tool", &[], EvalMode::Evaluate).unwrap();
         assert_eq!(evaluated_help(&t, &root, "args/tool").0, evaluated);
         assert_ne!(evaluated, target);
         let word = t.put_object("blob", b"supplied").unwrap();
@@ -6177,7 +6182,7 @@ mod tool_resolution_tests {
         let target = expr(&t, "curry --base=fixture --help=Ordinary");
         let root = tree(&t, &[("tool", "tree", &target)]);
         assert_eq!(evaluated_help(&t, &root, "tool").1, "Ordinary");
-        let error = eval_tree_tool(&t, &root, "missing", &[]).unwrap_err();
+        let error = eval_tree_tool(&t, &root, "missing", &[], EvalMode::Evaluate).unwrap_err();
         assert!(error.contains("no such path:"));
         assert!(error.contains("missing"));
         assert!(error.contains("Directories in .: tool"));
@@ -6192,6 +6197,88 @@ mod tool_resolution_tests {
         *t.remote.borrow_mut() = Some(parse_oid(&repo).unwrap());
         let root = expr(&t, "curry --base=fixture --repo:@@=git+https://example.invalid/tool-fixture?rev=1234567890123456789012345678901234567890");
         assert_eq!(evaluated_help(&t, &root, "args/repo/tool").1, "Pinned");
+        assert_eq!(t.fetches.get(), 1);
+    }
+    fn definition(t: &Store, root: &str, path: &str) -> (String, String) {
+        let directory = eval_tree_tool(t, root, path, &[], EvalMode::StopBeforeTarget).unwrap();
+        let oid = fetch_tree_entries(t, &directory)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry_name(entry) == b".caos-expr")
+            .unwrap()
+            .oid
+            .to_string();
+        let (_, bytes) = t.get_object(&oid).unwrap();
+        (directory, String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn help_reaches_generated_definition_without_evaluating_the_tool() {
+        let t = Store::default();
+        let target = expr(&t, "HELP=<<END\nGenerated help.\n@param word The word.\nEND\nrun --base=forbidden --help=$HELP");
+        let root = generated(&t, &target);
+        assert!(fetch_tree_entries(&t, &root)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|e| entry_name(e) != b"args"));
+        let (found, text) = definition(&t, &root, "args/tool");
+        assert_eq!(found, target);
+        assert!(text.contains("Generated help."));
+        assert!(text.contains("@param word The word."));
+        assert_eq!(t.computes.get(), 0, "help must not dispatch the target");
+        let error = eval::eval_path(&t, &target, "", &[]).unwrap_err();
+        assert!(error.contains("target expression was evaluated"));
+        assert_eq!(t.computes.get(), 1);
+    }
+
+    #[test]
+    fn stopping_at_the_root_and_evaluating_it_have_separate_memos() {
+        let t = Store::default();
+        let root = expr(&t, "curry --base=fixture --help=Root");
+        let stopped = eval_path_with_mode(&t, &root, "", &[], EvalMode::StopBeforeTarget).unwrap();
+        assert_eq!(stopped, ("tree".into(), root.clone()));
+        let evaluated = eval::eval_path(&t, &root, "", &[]).unwrap();
+        assert_ne!(evaluated.1, root);
+        assert_eq!(
+            eval_path_with_mode(&t, &root, "", &[], EvalMode::StopBeforeTarget).unwrap(),
+            stopped
+        );
+        assert_eq!(eval::eval_path(&t, &root, "", &[]).unwrap(), evaluated);
+    }
+
+    #[test]
+    fn stopping_at_the_target_still_evaluates_ancestor_dependencies() {
+        let t = Store::default();
+        let target = expr(&t, "run --base=forbidden --help=Dependency");
+        let dependency = generated(&t, &target);
+        let directive = expr(&t, "curry --base=fixture --dep:@=dependency");
+        let expression = fetch_tree_entries(&t, &directive).unwrap().unwrap()[0]
+            .oid
+            .to_string();
+        let root = tree(
+            &t,
+            &[
+                (".caos-expr", "blob", &expression),
+                ("dependency", "tree", &dependency),
+            ],
+        );
+        assert_eq!(definition(&t, &root, "args/dep/args/tool").0, target);
+        assert_eq!(t.computes.get(), 0);
+    }
+
+    #[test]
+    fn target_locators_are_not_resolved_by_reading_the_definition() {
+        let t = Store::default();
+        let image = tree(&t, &[]);
+        *t.remote.borrow_mut() = Some(parse_oid(&image).unwrap());
+        let target = expr(&t, "curry --base:@@=git+https://example.invalid/target-fixture?rev=abcdefabcdefabcdefabcdefabcdefabcdefabcd --help=Pinned");
+        let root = tree(&t, &[("tool", "tree", &target)]);
+        let (found, text) = definition(&t, &root, "tool");
+        assert!(text.contains("--help=Pinned"));
+        assert_eq!(t.fetches.get(), 0);
+        eval::eval_path(&t, &found, "", &[]).unwrap();
         assert_eq!(t.fetches.get(), 1);
     }
 }

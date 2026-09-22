@@ -4,9 +4,9 @@
 #
 # Repository tools (SPEC "CaosTools"): a tool is any DIRECTORY whose
 # `.caos-expr` binds the javadoc `help` (description as free text, `@param` tags
-# as the parameters), addressed by PATH. Both calls evaluate the path to get
-# the image. `tool_help` reads its help; `run_tool` validates arguments, curries
-# them onto the image and runs it over the original source tree.
+# as the parameters), addressed by PATH. Help evaluates only ancestors and
+# reads the target expression. Invocation evaluates the full path, validates
+# arguments and runs the image over the original source tree.
 #
 # NOTHING ENUMERATES THE TOOLS, and the first stage below asserts exactly that:
 # the declared tool list holds `tool_help`/`run_tool` and no `hello`, and the
@@ -104,8 +104,11 @@ printf 'generated word=%s input=%s' "$(cat /cas/args/word)" \
   "$(cat /cas/args/in/input-marker)" > /tmp/o
 caos put /tmp/o /cas/out
 EOF
-mkdir -p /tmp/ws/generator/templates
+mkdir -p /tmp/ws/generator/templates/help-only
 mv /tmp/ws/caos-tools/generated /tmp/ws/generator/templates/hello
+# Evaluating this expression MUST fail. Describing it must succeed.
+printf 'run --base=not-an-image --help=Generated-help-without-evaluation\n' \
+  > /tmp/ws/generator/templates/help-only/.caos-expr
 cat > /tmp/ws/generator/generate.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -126,7 +129,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good call)"
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"generated-help","input":{"path":"main/generator/tools/help-only"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -167,7 +170,7 @@ if grep -qF 'impostor' /tmp/stub/request-1.json; then
 fi
 echo "  ok: tool_help + run_tool declared; no tool of the tree's own" >&2
 
-stage "tool_help: doc and the @param contract after evaluation"
+stage "tool_help: doc and the @param contract without evaluating the target"
 grep -qF 'Say hello from the tree.' /tmp/stub/request-2.json \
   || fail "tool_help did not carry the tool's description"
 grep -qF 'word (required)' /tmp/stub/request-2.json \
@@ -228,8 +231,8 @@ esac
 echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
 
 stage "generated tools use ancestor evaluation and preserve the original input"
-grep -qF 'Generated tool.' /tmp/stub/request-2.json \
-  || fail "help did not describe the evaluated generated tool"
+grep -qF 'Generated-help-without-evaluation' /tmp/stub/request-2.json \
+  || fail "describing the generated tool evaluated its failing expression"
 grep -qF 'generated word=supplied input=original-source' /tmp/stub/request-2.json \
   || fail "generated invocation lost its arguments or original source input"
 grep -qF 'main/generator/tools/missing' /tmp/stub/request-2.json \
