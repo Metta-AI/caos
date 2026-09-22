@@ -26,3 +26,5 @@ sources. Pinning and replay are also covered by llm-step's unit tests.
 The github entry exercises the packaged CLI and stack extension, secret grants,
 invocation replay and the agent callback using version/help commands. It requires
 no GitHub account and makes no external writes.
+
+The llm-stack entry registers a two-layer stack, pauses a conflicting rebase, resolves it in a later turn, and propagates a subsequent review edit. It checks source ancestry, atomic pointer updates, and absence of source-tree conflict ledgers. GitHub submission unit tests cover initial submission, reuse of existing PRs and partial failure; the HTTPS Git fixture checks leased history rewrites.
