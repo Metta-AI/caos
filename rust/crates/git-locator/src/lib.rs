@@ -128,6 +128,24 @@ pub fn parse_git_ref(value: &str) -> Result<GitRef, String> {
     })
 }
 
+/// Validate the explicit owner/repository accepted by GitHub tools.
+pub fn github_repository(repository: &str) -> Result<(), String> {
+    let pieces: Vec<_> = repository.split('/').collect();
+    if pieces.len() != 2
+        || pieces.iter().any(|p| {
+            p.is_empty()
+                || p.starts_with('.')
+                || p.starts_with('-')
+                || !p
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
+    {
+        return Err("repository must be GitHub owner/repository".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod git_ref_tests {
     use super::{parse_git_ref, GitRef};
