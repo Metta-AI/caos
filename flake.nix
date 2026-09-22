@@ -980,7 +980,14 @@ sandbox = false''
           # group that no longer exists — all of those callers are gone. Adding
           # one back is a sign that work has leaked out of the stack again.
           # docker rides in from the host PATH (caosd already requires it).
-          runtimeInputs = [ pkgs.coreutils pkgs.bash ];
+          #
+          # GIT IS THE ONE EXCEPTION, and it is not work that leaked out of the
+          # stack: `up` publishes this checkout to the server it just started
+          # (see the dev publish at the end of that arm), which is a git push
+          # and can be nothing else. The client it publishes is a store path
+          # resolved at EVAL time, so there is no `nix` here and no shelling
+          # out to a script in the tree -- this command stays self-contained.
+          runtimeInputs = [ pkgs.coreutils pkgs.bash pkgs.git ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
@@ -1430,6 +1437,65 @@ sandbox = false''
                 sleep 1
               done
               [ -n "$ok" ] || die "the stack never finished bring-up"
+
+              # ---------------------------------------------------------------
+              # Publish this checkout to the stack it just started
+              # ---------------------------------------------------------------
+              # So a cloud session can run UNCOMMITTED work: one commit at
+              # `refs/caos/dev` carrying the working tree (for `std/`, reached
+              # by `:@@=git+caos://…&dir=std`) and the x86_64 client a container
+              # installs. Nothing new listens -- the server already serves git
+              # -- and the container reads it back with `git ls-remote` +
+              # `git fetch`.
+              #
+              # HERE, BECAUSE THIS IS THE CADENCE. `caosd up` is already the
+              # command that makes the server see this tree: it republishes std
+              # on every bring-up, which is why std files must be git-added
+              # before it runs. A publish tied to `nix build` instead would
+              # miss `std/` entirely, since std is compiled by caos itself and
+              # needs no nix build at all.
+              #
+              # THE CLIENT IS AN EVAL-TIME STORE PATH, not a `nix build` at
+              # runtime: this command has no nix on PATH and should not grow
+              # one. It is built for the CONTAINER's architecture rather than
+              # this machine's -- on x86_64 Linux that is `workspaceBins`,
+              # already built for the stack; on a Mac it is a real cross-build.
+              #
+              # Over PLAIN HTTP to the port just published, so this needs no
+              # `caos` remote, no ticket and no `git-remote-caos`: the server is
+              # right here and this is the same URL a local client uses.
+              #
+              # Never fatal. A stack that is up is the thing asked for; a
+              # publish that cannot happen (no checkout, a server not answering
+              # git yet) says so and leaves it.
+              if [ -d .git ] || git rev-parse --git-dir >/dev/null 2>&1; then
+                dev_client=${clientForTarget "x86_64-unknown-linux-musl"}
+                dev_idx="$CAOS_DATA/stack/dev-publish.index"
+                rm -f "$dev_idx"
+                if GIT_INDEX_FILE="$dev_idx" sh -c '
+                     set -e
+                     git read-tree --empty
+                     git add -A
+                     for n in caos git-remote-caos; do
+                       b=$(git hash-object -w "'"$dev_client"'/bin/$n")
+                       git update-index --add --cacheinfo "100755,$b,dev-bin/$n"
+                     done
+                     git write-tree' > "$CAOS_DATA/stack/dev-tree" 2>/dev/null; then
+                  dev_tree="$(cat "$CAOS_DATA/stack/dev-tree")"
+                  dev_head="$(git rev-parse --verify --quiet HEAD || true)"
+                  dev_commit="$(printf 'caosd up: %s\n' "$(date -u +%FT%TZ)" \
+                    | git commit-tree "$dev_tree" ''${dev_head:+-p "$dev_head"})"
+                  if git push --quiet --force http://localhost:9090 \
+                       "$dev_commit:refs/caos/dev" 2>/dev/null; then
+                    echo "==> published this tree to refs/caos/dev ($dev_commit)" >&2
+                  else
+                    echo "==> could not publish to refs/caos/dev; the stack is up regardless" >&2
+                  fi
+                else
+                  echo "==> could not snapshot this checkout; skipping the dev publish" >&2
+                fi
+                rm -f "$dev_idx" "$CAOS_DATA/stack/dev-tree"
+              fi
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
               ;;
