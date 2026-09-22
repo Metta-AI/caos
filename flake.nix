@@ -667,6 +667,107 @@ sandbox = false''
         # one and not the other reaches the server itself and then fails inside
         # git with `'remote-caos' is not a git command`.
         cliPackages = "--package caos-cli --package caos-iroh --bins";
+
+        # THE CLIENT FOR A NAMED LINUX TARGET, regardless of what this machine
+        # is. `caosd up` pushes these into caosd so a cloud container can
+        # run uncommitted work; a container is x86_64, and the host build is
+        # not (`muslTarget` follows the build host: aarch64 on Apple Silicon).
+        # Publishing the host's binary from a Mac yields one that installs
+        # cleanly and then cannot exec, which presents as a session with no
+        # caos in it at all.
+        #
+# THE HOST'S TARGET COSTS NOTHING, and that is the common case. `workspaceBins`
+        # is already a static musl Linux build of the whole workspace for
+        # `muslTarget` — it is what `stackInputs` hands the dev stack — so on an
+        # x86_64 Linux machine the binaries a container needs are already on
+        # disk. Asking for them again under a different `pname` would compile
+        # the workspace a second time to produce identical bytes.
+        #
+        # So only a DIFFERENT target builds anything, which in practice means a
+        # Mac: its whole caos world is aarch64 (`linuxSystem`, `muslTarget`),
+        # and a cloud container is x86_64.
+        #
+        # SELF-CONTAINED ON PURPOSE in that branch. It builds its own toolchain,
+        # crane lib and args rather than parameterizing the ones above, so
+        # nothing that currently builds can change shape. The cost is a second
+        # `rust-std` (~135 MiB, which the toolchain above deliberately avoids)
+        # and a second dependency compile, paid only by whoever asks for a
+        # target their machine does not already build.
+        clientFromBins =
+          name: bins:
+          pkgs.runCommand name { } ''
+            mkdir -p $out/bin
+            cp ${bins}/bin/caos-cli $out/bin/caos
+            cp ${bins}/bin/git-remote-caos $out/bin/git-remote-caos
+            chmod +w $out/bin/caos $out/bin/git-remote-caos
+          '';
+
+        clientForTarget =
+          target:
+          if target == muslTarget then
+            clientFromBins "caos-client-${target}" workspaceBins
+          else
+          let
+            toolchain =
+              (
+                if rustChannel == "stable" then
+                  pkgs.rust-bin.stable.latest
+                else
+                  pkgs.rust-bin.stable.${rustChannel}
+              ).minimal.override
+                { targets = [ target ]; };
+            crossCrane = (crane.mkLib pkgs).overrideToolchain toolchain;
+            envTarget = pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] target);
+            isAarch64 = pkgs.lib.hasPrefix "aarch64" target;
+            # rustc links musl self-contained, but C-carrying deps (rustls'
+            # crypto backend, reached through iroh) compile via cc-rs and need a
+            # real musl cc for the TARGET, not the host.
+            crossCC =
+              if isAarch64 then
+                pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+              else
+                pkgs.pkgsCross.musl64.stdenv.cc;
+            # Apple ld cannot link Linux ELF; rust-lld ships in the toolchain
+            # and links musl cross-platform. Same reasoning as `muslCrossLinker`
+            # above, but bound to THIS target.
+            crossLd = pkgs.writeShellScript "caos-rust-lld-${target}" ''
+              sysroot="$(${toolchain}/bin/rustc --print sysroot)"
+              exec "$(echo "$sysroot"/lib/rustlib/*/bin/rust-lld)" "$@"
+            '';
+            targetArgs =
+              nativeArgs
+              // {
+                pname = "caos-client-${target}";
+                CARGO_BUILD_TARGET = target;
+                "CC_${builtins.replaceStrings [ "-" ] [ "_" ] target}" =
+                  "${crossCC}/bin/${crossCC.targetPrefix}cc";
+                # UNCONDITIONALLY rust-lld, not just on Darwin as the host build
+                # above does. That guard is right for `muslTarget`, which is the
+                # host's OWN architecture -- "Linux hosts link musl with their
+                # native toolchain" holds when there is no arch to cross. This
+                # branch is only reached when the target arch DIFFERS, so the
+                # native `cc` is the wrong linker every time: measured as
+                # `collect2: error: ld returned 1 exit status` linking
+                # `caos-iroh` for aarch64 on an x86_64 host, with `cc` named as
+                # the linker in the failing command.
+                "CARGO_TARGET_${envTarget}_LINKER" = "${crossLd}";
+                "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
+              };
+            built = crossCrane.buildPackage (
+              targetArgs
+              // {
+                cargoArtifacts = crossCrane.buildDepsOnly (
+                  targetArgs // { cargoExtraArgs = cliPackages; }
+                );
+                cargoExtraArgs = cliPackages;
+                doCheck = false;
+              }
+            );
+          in
+          # Just the two files a container installs, under the names it expects.
+          # `caos` rather than `caos-cli`: the wrapper that renames it is a
+          # /nix/store shell script and does not travel.
+          clientFromBins "caos-client-${target}" built;
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs // { cargoExtraArgs = cliPackages; }
         );
@@ -879,7 +980,14 @@ sandbox = false''
           # group that no longer exists — all of those callers are gone. Adding
           # one back is a sign that work has leaked out of the stack again.
           # docker rides in from the host PATH (caosd already requires it).
-          runtimeInputs = [ pkgs.coreutils pkgs.bash ];
+          #
+          # GIT IS THE ONE EXCEPTION, and it is not work that leaked out of the
+          # stack: `up` publishes this checkout to the server it just started
+          # (see the dev publish at the end of that arm), which is a git push
+          # and can be nothing else. The client it publishes is a store path
+          # resolved at EVAL time, so there is no `nix` here and no shelling
+          # out to a script in the tree -- this command stays self-contained.
+          runtimeInputs = [ pkgs.coreutils pkgs.bash pkgs.git ];
           text = ''
             : "''${CAOS_DATA:=$PWD/.caos-data}"
             CAOS_DATA="$(readlink -m "$CAOS_DATA")"
@@ -1330,6 +1438,65 @@ sandbox = false''
               done
               [ -n "$ok" ] || die "the stack never finished bring-up"
 
+              # ---------------------------------------------------------------
+              # Publish this checkout to the stack it just started
+              # ---------------------------------------------------------------
+              # So a cloud session can run UNCOMMITTED work: one commit at
+              # `refs/caos/dev` carrying the working tree (for `std/`, reached
+              # by `:@@=git+caos://…&dir=std`) and the x86_64 client a container
+              # installs. Nothing new listens -- the server already serves git
+              # -- and the container reads it back with `git ls-remote` +
+              # `git fetch`.
+              #
+              # HERE, BECAUSE THIS IS THE CADENCE. `caosd up` is already the
+              # command that makes the server see this tree: it republishes std
+              # on every bring-up, which is why std files must be git-added
+              # before it runs. A publish tied to `nix build` instead would
+              # miss `std/` entirely, since std is compiled by caos itself and
+              # needs no nix build at all.
+              #
+              # THE CLIENT IS AN EVAL-TIME STORE PATH, not a `nix build` at
+              # runtime: this command has no nix on PATH and should not grow
+              # one. It is built for the CONTAINER's architecture rather than
+              # this machine's -- on x86_64 Linux that is `workspaceBins`,
+              # already built for the stack; on a Mac it is a real cross-build.
+              #
+              # Over PLAIN HTTP to the port just published, so this needs no
+              # `caos` remote, no ticket and no `git-remote-caos`: the server is
+              # right here and this is the same URL a local client uses.
+              #
+              # Never fatal. A stack that is up is the thing asked for; a
+              # publish that cannot happen (no checkout, a server not answering
+              # git yet) says so and leaves it.
+              if [ -d .git ] || git rev-parse --git-dir >/dev/null 2>&1; then
+                dev_client=${clientForTarget "x86_64-unknown-linux-musl"}
+                dev_idx="$CAOS_DATA/stack/dev-publish.index"
+                rm -f "$dev_idx"
+                if GIT_INDEX_FILE="$dev_idx" sh -c '
+                     set -e
+                     git read-tree --empty
+                     git add -A
+                     for n in caos git-remote-caos; do
+                       b=$(git hash-object -w "'"$dev_client"'/bin/$n")
+                       git update-index --add --cacheinfo "100755,$b,dev-bin/$n"
+                     done
+                     git write-tree' > "$CAOS_DATA/stack/dev-tree" 2>/dev/null; then
+                  dev_tree="$(cat "$CAOS_DATA/stack/dev-tree")"
+                  dev_head="$(git rev-parse --verify --quiet HEAD || true)"
+                  dev_commit="$(printf 'caosd up: %s\n' "$(date -u +%FT%TZ)" \
+                    | git commit-tree "$dev_tree" ''${dev_head:+-p "$dev_head"})"
+                  if git push --quiet --force http://localhost:9090 \
+                       "$dev_commit:refs/caos/dev" 2>/dev/null; then
+                    echo "==> published this tree to refs/caos/dev ($dev_commit)" >&2
+                  else
+                    echo "==> could not publish to refs/caos/dev; the stack is up regardless" >&2
+                  fi
+                else
+                  echo "==> could not snapshot this checkout; skipping the dev publish" >&2
+                fi
+                rm -f "$dev_idx" "$CAOS_DATA/stack/dev-tree"
+              fi
+
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
               ;;
             down)
@@ -1378,6 +1545,12 @@ sandbox = false''
       in
       {
         packages = {
+          # The client a cloud container can actually exec, built for the
+          # container's architecture rather than this machine's. `caosd up`
+          # pushes it into caosd; see `clientForTarget`.
+          caos-client-x86_64-linux = clientForTarget "x86_64-unknown-linux-musl";
+          caos-client-aarch64-linux = clientForTarget "aarch64-unknown-linux-musl";
+
           # `nix run github:Metta-AI/caos#deploy-caosd-prod` on a fresh box.
           # Go rather than shell: this program's job is quoting a nix
           # expression and branching on host facts, which is precisely where
