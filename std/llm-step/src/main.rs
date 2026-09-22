@@ -2970,9 +2970,11 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     let mut registry = vec![bash_tool()];
     registry.extend(tools::declarations());
-    registry.push(with_source_tree(tools::tree_tool_declaration(
+    let mut publish = with_source_tree(tools::tree_tool_declaration(
         &tools::builtin_tool("publish_source", publish_source::HELP),
-    )));
+    ));
+    publish["input_schema"]["properties"]["rewrite"]["type"] = json!("boolean");
+    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
