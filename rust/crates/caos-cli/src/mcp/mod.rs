@@ -43,7 +43,7 @@ use conversation_protocol::v3::records::{
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::tree::Signature;
 use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::{CodeOps, ObjectStore};
+use conversation_protocol::v3::ObjectStore;
 
 use crate::{
     conversation_ref, default_title, ensure_code_commit, fetch_validated_head, mint_transition,
@@ -61,12 +61,6 @@ const SESSION_PREFIX: &str = "cc/";
 /// server get a session injected; everything else this hook sees is left
 /// exactly as the model wrote it.
 const TOOL_PREFIX: &str = "mcp__caos__";
-
-/// Where a workspace keeps the tools it defines itself. The step reads this
-/// name out of the tree it is handed (`std/llm-step`'s `tree_tools_dir`); the
-/// client reads it off disk, to decide whether handing over a tree is worth
-/// what it costs.
-const TREE_TOOLS_DIR: &str = "caos-tools";
 
 /// What a request record says ran the turn. Claude Code chooses the model and
 /// does not tell a hook which, so naming the harness is the honest answer --
@@ -379,16 +373,11 @@ fn read_outcome(
     Ok(ToolOutcome { text, is_error })
 }
 
-/// The tools this session offers, as MCP declarations.
-///
-/// Asked of the step that implements them, so there is one description of
-/// `edit` wherever a model meets it, and a tool a repository defines under
-/// `caos-tools/` is offered here exactly as it is in the tui.
 /// The last successful tool discovery's phase timings, for `caos_status` to
 /// report -- the one place a locked-down session can see WHERE the wait went.
 /// Discovery is not just the `:@@=` eval walk `/eval-locator` sped up; it also
-/// pushes the workspace tree and runs `llm-step` in a worker, and only a
-/// measurement says which dominates. Written once per successful resolve.
+/// runs `llm-step` in a worker, and only a measurement says which dominates.
+/// Written once per successful resolve.
 static DISCOVERY_TIMING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The timing string [`declarations`] last recorded, or `None` before the first
@@ -397,39 +386,32 @@ pub(crate) fn discovery_timing() -> Option<String> {
     DISCOVERY_TIMING.lock().ok().and_then(|slot| slot.clone())
 }
 
+/// The tools this session offers, as MCP declarations.
+///
+/// Asked of the step that implements them, so there is one description of
+/// `edit` wherever a model meets it. A tool a repository defines is NOT among
+/// them: it is reached by path through `tool_help` / `run_tool`, exactly as in
+/// the tui.
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
     let total = std::time::Instant::now();
     let store = caos::build_secret_store(t)?;
     let mark = std::time::Instant::now();
     let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
     let resolve_step = mark.elapsed();
-    let mut kvs = vec!["--list-tools=1".to_string()];
-    // The tree whose `caos-tools/` entries are offered -- named ONLY when
-    // there are any, and the ordering is the whole point.
+    // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
+    // A repository's own tools are reached by PATH (`tool_help` to describe one,
+    // `run_tool` to invoke it), so the declarations are the same whatever the
+    // conversation carries -- which is what lets this answer be cached, and
+    // makes a client that ignores `tools/list_changed` correct rather than
+    // stale.
     //
-    // Naming it PUSHES THE WHOLE WORKING TREE to the caos server, which for a
-    // repository of any size is the most expensive thing this client does, and
-    // for a repository with no `caos-tools/` it buys an answer of "none". So
-    // the cheap local question is asked first: a directory that is not there
-    // defines no tools.
-    //
-    // Worse than wasteful without it. A caos server that REFUSES is harmless
-    // -- the error is caught and the listing goes on without the tree -- but
-    // one reached through a tunnel whose far end is gone does not refuse. It
-    // accepts and swallows, so the push never returns, the resolution never
-    // finishes, and the session gets a tool server that is connected and
-    // permanently empty.
-    let mark = std::time::Instant::now();
-    if t.work_dir().join(TREE_TOOLS_DIR).is_dir() {
-        if let Ok(workspace) = resolve_base(t, options) {
-            let mut objects = open_store(t)?;
-            let workspace = oid(&workspace, "conversation base")?;
-            ensure_code_commit(t, &mut objects, &workspace)?;
-            let tree = objects.tree_of(&workspace)?;
-            kvs.push(format!("--workspace:hash={tree}"));
-        }
-    }
-    let workspace_prep = mark.elapsed();
+    // It used to pass `--workspace:hash=<tree>`, which PUSHED THE WHOLE WORKING
+    // TREE to the caos server -- by its own comment the most expensive thing
+    // this client does, and through a dead tunnel a push that never returns, so
+    // the session got a tool server that was connected and permanently empty.
+    // The step never read the argument: `grep -rn workspace std/llm-step/src/`
+    // is empty, and `registry` never enumerated tree tools.
+    let kvs = vec!["--list-tools=1".to_string()];
     let mark = std::time::Instant::now();
     let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
     let run_list = mark.elapsed();
@@ -445,22 +427,17 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     caos::timing::record(
         "declarations",
         &format!(
-            "resolve-llm-step {:.1}s, workspace-prep {:.1}s, run-list-tools {:.1}s (total {:.1}s) \
+            "resolve-llm-step {:.1}s, run-list-tools {:.1}s (total {:.1}s) \
              [objects: {held} already on the server, {sent} pushed]",
             resolve_step.as_secs_f64(),
-            workspace_prep.as_secs_f64(),
             run_list.as_secs_f64(),
             total.elapsed().as_secs_f64(),
         ),
     );
     if let Ok(mut slot) = DISCOVERY_TIMING.lock() {
-        let breakdown = crate::code_commit_timing()
-            .map(|b| format!(" [{b}]"))
-            .unwrap_or_default();
         *slot = Some(format!(
-            "resolve-llm-step {:.1}s, workspace-prep {:.1}s{breakdown}, run-list-tools {:.1}s (total {:.1}s)",
+            "resolve-llm-step {:.1}s, run-list-tools {:.1}s (total {:.1}s)",
             resolve_step.as_secs_f64(),
-            workspace_prep.as_secs_f64(),
             run_list.as_secs_f64(),
             total.elapsed().as_secs_f64(),
         ));

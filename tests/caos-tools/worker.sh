@@ -2,20 +2,28 @@
 # shellcheck disable=SC1091,SC2016,SC2034,SC2154
 # tests/caos-tools — a WORKER test, in dev/worker-test (it needs git).
 #
-# Tree-defined agent tools (caos-tools/<name>/, SPEC "Tools"): llm-step
-# discovers them per round from the CURRENT source tree — each is a DIRECTORY
-# whose `.caos-expr` binds the javadoc `help` (description as free text,
-# `@param` tags as the parameters) — and at INVOCATION time asks the server to
-# EVALUATE that expression, then curries the model's args onto the ArgTree it
-# yields and runs it over the tree. Asserts, against the scripted stub LLM:
-# registration (name + doc in the request; a reserved name is NOT shadowed),
-# invocation and same-turn dynamism — a bash edit to the tool changes a later
-# call in the same queued batch — the `@param` contract: declared args reach
-# the script at /cas/args/<name>, while a missing required arg comes back as an
-# is_error tool_result WITHOUT a sub-run — and, at the other end of that
-# spectrum, a tool whose sub-run DIES (no result at all) also coming back as an
-# is_error tool_result, over an unchanged source tree, with the queued calls and
-# turn carrying on.
+# Repository tools (SPEC "CaosTools"): a tool is any DIRECTORY whose
+# `.caos-expr` binds the javadoc `help` (description as free text, `@param` tags
+# as the parameters), addressed by PATH. `tool_help` describes one by READING
+# that expression — no evaluation, so describing a compiled tool never builds
+# it — and `run_tool` asks the server to EVALUATE it, then curries the model's
+# args onto the ArgTree it yields and runs it over the tree.
+#
+# NOTHING ENUMERATES THE TOOLS, and the first stage below asserts exactly that:
+# the declared tool list holds `tool_help`/`run_tool` and no `hello`, and the
+# system prompt carries no per-source-tree schema block. That is what makes the
+# list tree-independent, so a conversation that gains a source tree mid-run
+# neither re-keys the prompt nor grows it.
+#
+# Asserts, against the scripted stub LLM: description through `tool_help`
+# (doc + required/optional params) and its two not-a-tool answers; invocation
+# and same-turn dynamism — a bash edit to the tool changes a later call in the
+# same queued batch — the `@param` contract: declared args reach the script at
+# /cas/args/<name>, while a missing required arg comes back as an is_error
+# tool_result WITHOUT a sub-run — and, at the other end of that spectrum, a tool
+# whose sub-run DIES (no result at all) also coming back as an is_error
+# tool_result, over an unchanged source tree, with the queued calls and turn
+# carrying on.
 #
 # NOTHING HERE WAS EVER THE CLIENT'S. The tools run in workers, llm-step is a
 # worker, and the client only curried the turn and blocked on it —
@@ -31,7 +39,7 @@ stage "stage the tooled source_tree"
 llm_test_setup
 
 # The image the fixture tools name. A tool is a DIRECTORY carrying a
-# `.caos-expr` (SPEC, "Tools"), and that expression names the image it runs on
+# `.caos-expr` (SPEC, "CaosTools"), and that expression names the image it runs on
 # — here by `:hash=`, because this fixture source tree holds no std to name by
 # path. `--bash` is this TEST's mount, already evaluated to an image.
 bash_img=$(caos hash /cas/args/bash)
@@ -60,7 +68,9 @@ fi
 printf '%s' "$out" > /tmp/o
 caos put /tmp/o /cas/out
 EOF
-# A reserved-name shadow attempt: must be ignored, never registered.
+# A directory NAMED like a built-in. Nothing can shadow `bash` any more — a
+# repository tool is reached by path, never by name — so this must simply not
+# affect the built-in `bash` the model is offered.
 tool bash 'An impostor bash.' <<'EOF'
 #!/usr/bin/env bash
 EOF
@@ -73,9 +83,9 @@ set -euo pipefail
 echo "boom: this tool never writes /cas/out" >&2
 exit 1
 EOF
-# A directory that is NOT a tool: its expression binds no `--help`. Registering
-# it would advertise a tool the model has no contract for, so discovery skips it
-# (loudly, on stderr).
+# A directory that is NOT a tool: its expression binds no `--help`. `tool_help`
+# has to say so distinctly from "no such path", because the two have different
+# fixes.
 mkdir -p /tmp/ws/caos-tools/undocumented
 cp /tmp/ws/caos-tools/hello/worker.sh /tmp/ws/caos-tools/undocumented/worker.sh
 printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
@@ -83,11 +93,13 @@ printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
 
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled source_tree")
 
-stage "script the stub LLM (edit; bad call; dead sub-run; good call; end)"
-# All calls share one response and run in order. The missing arg must be
-# answered in place, and the dead sub-run must preserve the bash-edited
-# source tree, so the final valid hello call can still run the v2 script.
-R1='[{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
+stage "script the stub LLM (describe; edit; bad call; dead sub-run; good call)"
+# All calls share one response and run in order. `tool_help` comes first,
+# because that is the order a model works in with nothing listing the tools:
+# describe the path, then run it. The missing arg must be answered in place, and
+# the dead sub-run must preserve the bash-edited source tree, so the final valid
+# hello call can still run the v2 script.
+R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -107,34 +119,48 @@ assistant_transcript=$(transcript_text "$head")
 grep -qF 'tools done' <<<"$assistant_transcript" \
   || fail "terminal assistant event"
 
-stage "registration: repository schemas describe path-addressed tools"
-jq -r .system /tmp/stub/request-1.json > /tmp/repository-context
-jq -e '[.tools[].name] | index("run_tool") != null and index("hello") == null' /tmp/stub/request-1.json >/dev/null \
-  || fail "repository tools were not routed through run_tool"
-grep -qF '"name":"hello"' /tmp/repository-context || fail "hello not registered"
-grep -qF 'Say hello from the tree.' /tmp/stub/request-1.json \
-  || fail "description not used"
+stage "nothing enumerates the tools: the declared list is tree-independent"
+jq -r .system /tmp/stub/request-1.json > /tmp/system-prompt
+jq -e '[.tools[].name] | index("run_tool") != null and index("tool_help") != null
+        and index("hello") == null and index("boom") == null' \
+  /tmp/stub/request-1.json >/dev/null \
+  || fail "repository tools must be reached through tool_help/run_tool, not declared"
+# The per-source-tree schema block is gone. Its absence is the whole point: with
+# it, a conversation that gained a source tree re-keyed the prompt and grew it.
+if grep -qF 'Repository tools for source tree' /tmp/system-prompt; then
+  fail "the system prompt still enumerates a source tree's tools"
+fi
+if grep -qF 'Say hello from the tree.' /tmp/stub/request-1.json; then
+  fail "a repository tool's doc reached the model without being asked for"
+fi
 [ "$(grep -oF '"name":"bash"' /tmp/stub/request-1.json | wc -l)" = 1 ] \
-  || fail "reserved bash shadowed (or missing)"
+  || fail "built-in bash missing (or duplicated by the same-named directory)"
 if grep -qF 'impostor' /tmp/stub/request-1.json; then
-  fail "shadow tool's doc leaked into the registry"
+  fail "the same-named directory's doc leaked into the declared tools"
 fi
-if grep -qF '"name":"undocumented"' /tmp/stub/request-1.json; then
-  fail "a directory whose expression binds no --help was registered as a tool"
-fi
-echo "  ok: hello registered; impostor bash and the no-help directory ignored" >&2
+echo "  ok: tool_help + run_tool declared; no tool of the tree's own" >&2
 
-# serde_json's Map is a BTreeMap, so a request's object keys come out sorted —
-# that is what these literal fragments are matching, not the order the json!
-# macro writes them in.
-stage "@param: declared as a schema, required marked, doc carried"
-grep -qF '"word":{"description":"The word to echo.","type":"string"}' \
-  /tmp/repository-context || fail "@param word not declared as a string property"
-grep -qF '"suffix":{"description":"An optional suffix.","type":"string"}' \
-  /tmp/repository-context || fail "@param [suffix] not declared"
-grep -qF '"required":["word"]' /tmp/repository-context \
-  || fail "required args wrong: [name] must be optional, a bare name required"
-echo "  ok: word required, suffix optional, boom unchanged" >&2
+stage "tool_help: doc and the @param contract, without evaluating anything"
+grep -qF 'Say hello from the tree.' /tmp/stub/request-2.json \
+  || fail "tool_help did not carry the tool's description"
+grep -qF 'word (required)' /tmp/stub/request-2.json \
+  || fail "tool_help did not mark a bare @param name required"
+grep -qF 'suffix (optional)' /tmp/stub/request-2.json \
+  || fail "tool_help did not mark @param [name] optional"
+grep -qF 'The word to echo.' /tmp/stub/request-2.json \
+  || fail "tool_help dropped a @param's documentation"
+echo "  ok: word required, suffix optional, docs carried" >&2
+
+stage "tool_help: the two not-a-tool answers, each naming the siblings"
+grep -qF 'binds no `--help`' /tmp/stub/request-2.json \
+  || fail "an expression with no --help was not distinguished from a non-tool"
+grep -qF 'no such path' /tmp/stub/request-2.json \
+  || fail "a path that does not exist was not reported as such"
+# Discovery is documentation, so a wrong path is the ordinary mistake: the
+# siblings turn it into a self-correcting one instead of a round trip.
+grep -qF 'Directories in main/caos-tools:' /tmp/stub/request-2.json \
+  || fail "a bad tool path did not name the sibling directories"
+echo "  ok: no-help, no-such-path, and the sibling listing" >&2
 
 stage "@param: a bad call is an is_error result, not a worker error"
 grep -qF 'hello needs a' /tmp/stub/request-2.json \
@@ -150,8 +176,10 @@ stage "a tool whose SUB-RUN dies is an is_error result, not a dead turn"
   || fail "the turn died on the failing tool instead of continuing"
 grep -qF 'the `run_tool` tool failed to run' /tmp/stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
-[ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 2 ] \
-  || fail "the validation and sub-run failures were not both marked is_error"
+# Four: the two bad `tool_help` paths, the missing required arg, and the dead
+# sub-run. Every one is a value the model can read, not a dead turn.
+[ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 4 ] \
+  || fail "the tool_help, validation and sub-run failures were not all is_error"
 # The good call is after both failures in the same queue. Its result proves
 # that the queue continued, the bash edit survived the failed sub-run, and the
 # declared args reached the script at /cas/args/<name>.

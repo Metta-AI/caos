@@ -1299,11 +1299,17 @@ fn prepare_compute(
                 )));
             };
             let tool = match tools::tool_at(ws, relative) {
-                Ok(Some(tool)) => tool,
-                Ok(None) => {
+                Ok(Ok(tool)) => tool,
+                // Say WHY it is not a tool, and point at `tool_help`: nothing
+                // lists the tools, so a wrong path is the ordinary mistake and
+                // this message is the only way back from one.
+                Ok(Err(reason)) => {
                     return Ok(Prepared::Result(error_block(
                         &call.id,
-                        "path is not a tool",
+                        &format!(
+                            "{}. Use tool_help to describe a tool before running it",
+                            tools::not_a_tool_message(reason, relative)
+                        ),
                     )))
                 }
                 Err(error) => return Ok(Prepared::Result(error_block(&call.id, &error))),
@@ -2968,7 +2974,7 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     }
     registry.push(json!({
         "name":"run_tool",
-        "description":"Run a repository tool by conversation-relative path, e.g. feature/dirty/caos-tools/test. The tool runs with the containing source tree as its input; its schema is listed in repository context.",
+        "description":"Run a repository tool by conversation-relative path, e.g. feature/dirty/caos-tools/test. The tool runs with the containing source tree as its input. Nothing lists the available tools: each repository documents its own, and `tool_help` at a path gives that tool's parameters. Pass them under `arguments` as strings.",
         "input_schema":{"type":"object","properties":{
             "path":{"type":"string"}, "arguments":{"type":"object"}
         },"required":["path"]}
@@ -2981,8 +2987,11 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
 /// A harness that drives the model itself (`caos mcp`) has to publish these
 /// declarations to it. Nothing here reads a conversation: a listing describes
 /// what the step CAN run, and is asked for before there is a conversation to
-/// run it in. Repository tools a source tree defines under `caos-tools/` are
-/// reached through the generic `run_tool`, not enumerated here.
+/// run it in. Repository tools are reached by PATH, through `tool_help` and
+/// `run_tool`, and are not enumerated here — which is what makes this listing
+/// TREE-INDEPENDENT, so it is the same answer whatever source trees a
+/// conversation gains, and a client that ignores `tools/list_changed` stays
+/// correct.
 fn list_tools(cfg: &Config) -> Result<(), String> {
     let registry = registry(cfg)?;
     let dir = scratch("llm-step-tools")?;

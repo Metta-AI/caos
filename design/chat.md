@@ -252,9 +252,15 @@ link that CAS object into the conversation tree; the next tool call exposes it
 as a directory.
 
 Repository tools are called with `run_tool` at a conversation-relative path,
-such as `feature/01-change/caos-tools/test`. The harness resolves the tool from
-the captured snapshot. Its input is the outermost source tree containing that
-path; a tool outside source trees receives the conversation tree.
+such as `feature/01-change/caos-tools/test`, and described by `tool_help` at
+that same path. The harness resolves the tool from the captured snapshot. Its
+input is the outermost source tree containing that path; a tool outside source
+trees receives the conversation tree.
+
+Nothing lists the available tools. A tool is any directory whose `.caos-expr`
+binds a `help`, each repository documents its own, and `tool_help` is the
+authoritative description of what one takes (SPEC, "CaosTools"). The tool list
+is therefore the same whatever source trees a conversation gains.
 
 ### Preparing a stack
 

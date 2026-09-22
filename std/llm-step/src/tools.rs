@@ -28,7 +28,10 @@ const MAX_ENTRIES: usize = 1_000;
 
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
-    matches!(name, "read" | "ls" | "write" | "edit" | "import_source")
+    matches!(
+        name,
+        "read" | "ls" | "write" | "edit" | "import_source" | "tool_help"
+    )
 }
 
 /// Help text for the built-in tools, authored exactly like a caos-tools
@@ -55,6 +58,9 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param old-string Exact text to replace.
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
+
+const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It reads the tree only -- it never builds or runs the tool.
+@param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
 const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
 @param pattern The regular expression to search for.
@@ -86,6 +92,7 @@ pub fn declarations() -> Vec<Value> {
         ("write", WRITE_HELP),
         ("edit", EDIT_HELP),
         ("import_source", crate::import_source::HELP),
+        ("tool_help", TOOL_HELP_HELP),
     ]
     .iter()
     .map(|(name, help)| builtin_declaration(name, help))
@@ -100,44 +107,18 @@ pub fn grep_declaration() -> Value {
     builtin_declaration("grep", GREP_HELP)
 }
 
-// ---- Tree tools (caos-tools/<name>/, SPEC "Tools") -------------------------
-
-/// Reserved built-in tool names a tree tool may not shadow: the model's
-/// primitives (including the repair path for a broken tool edit — bash and
-/// the file tools) must stay stable whatever the tree carries, and the
-/// history tools (`log`/`show`/`diff`, std entries the harness DEPends on)
-/// are standard, not project-defined.
-const RESERVED_TOOLS: &[&str] = &[
-    "import_source",
-    "bash",
-    "grep",
-    "read",
-    "ls",
-    "write",
-    "edit",
-    "log",
-    "show",
-    "diff",
-    "caos-build",
-    "caos-test",
-    "caos-test-result",
-    "spawn_agent",
-    "wait_agent",
-    "harvest_agent",
-    "run_async",
-];
-
-/// The tree's tool directory (`caos-tools/` in the source tree), expanded one
-/// level; `None` when the tree defines no tools.
-fn tree_tools_dir(ws: &str) -> Result<Option<String>, String> {
-    caos(["get", ws])?;
-    let dir = format!("{ws}/caos-tools");
-    if !Path::new(&dir).is_dir() {
-        return Ok(None);
-    }
-    caos(["get", &dir])?;
-    Ok(Some(dir))
-}
+// ---- Repository tools (SPEC "CaosTools") -----------------------------------
+//
+// A repository tool is ANY directory in the conversation whose `.caos-expr`
+// binds a `help` -- there is no registry and no reserved directory name. The
+// model names its path: `tool_help` describes it, `run_tool` invokes it.
+//
+// Nothing enumerates them, and that is the design. Enumeration meant injecting
+// every source tree's tools into the system prompt, so a conversation that
+// gains a tree mid-run re-keyed the prompt and grew it per tree. Naming a path
+// instead makes the tool list tree-INDEPENDENT (see `mcp::declarations`), at
+// the price of discovery being documentation: an undocumented tool is
+// invisible, which is the trade.
 
 /// Arg names a tree tool may not declare: the interpreter binds these itself
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
@@ -295,70 +276,48 @@ fn expr_help(expr: &str) -> Option<String> {
     None
 }
 
-/// Read one tool directory into its registry shape: the `help` its
-/// `.caos-expr` binds, parsed into a description and parameters.
-fn read_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
+/// Why a path is not a tool — distinct from "no such path", which `caos
+/// resolve` reports, and from a CAS failure, which is the worker's problem.
+/// The model gets told which, because the three have different fixes.
+pub enum NotATool {
+    /// Not a directory, or a directory carrying no `.caos-expr`: either way,
+    /// ordinary content.
+    NoExpression,
+    /// It has an expression, but the expression binds no `--help`. An
+    /// evaluable entry, not a tool.
+    NoHelp,
+}
+
+/// Read one tool directory into its described shape: the `help` its
+/// `.caos-expr` binds, parsed into a description and parameters. `name` is the
+/// path the caller used, for messages only.
+fn read_tool(name: &str, dir: &str) -> Result<Result<TreeTool, NotATool>, String> {
     // Materialize the directory's own entries first. A `caos get` is SHALLOW:
     // the parent fetch made this directory exist, but nothing inside it —
-    // without this, every tool looks like a directory with no `.caos-expr` and
-    // the whole registry comes back empty (it did).
+    // without this, every tool looks like a directory with no `.caos-expr`
+    // (every one did, and the whole registry came back empty).
     caos(["get", dir])?;
     let path = format!("{dir}/.caos-expr");
     if !Path::new(&path).is_file() {
-        return Ok(None);
+        return Ok(Err(NotATool::NoExpression));
     }
     caos(["get", &path])?;
     let text = fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
     let Some(help) = expr_help(&text) else {
-        eprintln!("caos-tools/{name}/.caos-expr binds no --help — not registered as a tool");
-        return Ok(None);
+        return Ok(Err(NotATool::NoHelp));
     };
-    let (doc, args, git) = parse_help(&format!("caos-tools/{name}/.caos-expr"), &help);
+    let (doc, args, git) = parse_help(&format!("{name}/.caos-expr"), &help);
     let doc = if doc.is_empty() {
-        format!("Project tool caos-tools/{name} (no description).")
+        format!("Repository tool {name} (no description).")
     } else {
         doc
     };
-    Ok(Some(TreeTool {
+    Ok(Ok(TreeTool {
         name: name.to_string(),
         doc,
         args,
         git,
     }))
-}
-
-/// Discover the tree-defined tools: each CHILD DIRECTORY of `caos-tools/` that
-/// carries a `.caos-expr`, described by the `help` that expression binds.
-/// Resolved fresh from the CURRENT source tree every round, so an agent that
-/// adds, edits, or removes a tool sees the change on its next request.
-/// Reserved names are skipped loudly; a directory with no `.caos-expr`, or one
-/// whose expression binds no `--help`, is not a tool.
-pub fn tree_tools(ws: &str) -> Result<Vec<TreeTool>, String> {
-    let Some(dir) = tree_tools_dir(ws)? else {
-        return Ok(Vec::new());
-    };
-    let mut names: Vec<String> = fs::read_dir(&dir)
-        .map_err(|e| format!("reading {dir}: {e}"))?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
-    names.sort();
-
-    let mut out = Vec::new();
-    for name in names {
-        let p = format!("{dir}/{name}");
-        if !Path::new(&p).is_dir() {
-            continue;
-        }
-        if RESERVED_TOOLS.contains(&name.as_str()) {
-            eprintln!("caos-tools/{name} shadows the built-in {name:?} tool — ignored");
-            continue;
-        }
-        if let Some(tool) = read_tool(&name, &p)? {
-            out.push(tool);
-        }
-    }
-    Ok(out)
 }
 
 /// A harness-provided std tool (std/caos-build, std/caos-test), described by the
@@ -431,7 +390,13 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
 }
 
 /// Resolve a tool by path in its captured input snapshot and read its schema.
-pub fn tool_at(ws: &str, relative: &str) -> Result<Option<TreeTool>, String> {
+///
+/// `relative` is resolved with `caos resolve`, which TRAVERSES COMMIT ENTRIES
+/// (`caos::gitlinks::resolve`) — so a conversation-relative path reaches into a
+/// source tree without the caller unwrapping the gitlink. `Err` carries the
+/// resolve failure (`no such path: …`) as well as CAS trouble; the inner `Err`
+/// says the path exists but is not a tool.
+pub fn tool_at(ws: &str, relative: &str) -> Result<Result<TreeTool, NotATool>, String> {
     let resolved = fresh("tool-path");
     caos([
         "resolve",
@@ -440,9 +405,131 @@ pub fn tool_at(ws: &str, relative: &str) -> Result<Option<TreeTool>, String> {
         &resolved,
     ])?;
     if !Path::new(&resolved).is_dir() {
-        return Ok(None);
+        return Ok(Err(NotATool::NoExpression));
     }
     read_tool(relative, &resolved)
+}
+
+/// `tool_help`: describe the tool at a conversation-relative path.
+///
+/// READS THE TREE ONLY — it resolves the path, reads the `.caos-expr` and parses
+/// the `help` here-string it binds. It never evaluates, so describing a compiled
+/// tool does not build it, and the answer is immediate (this is why `tool_help`
+/// is inline and `run_tool` is not).
+fn tool_help(call: &Value, ws: &str) -> Result<String, Fail> {
+    let raw = call["input"]["path"].as_str().unwrap_or("").trim();
+    let path = raw.trim_matches('/');
+    if path.is_empty() {
+        return Err(User(
+            "tool_help needs a `path`: the conversation-relative directory of a tool, \
+             such as feature/01-change/caos-tools/test"
+                .to_string(),
+        ));
+    }
+    let outcome = tool_at(ws, path);
+    if let Ok(Ok(tool)) = &outcome {
+        return Ok(describe(tool, path));
+    }
+    // The directory names beside `path`, used TWICE: to prove absence, and to
+    // suggest the name the model meant.
+    let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+    let nearby = nearby_dirs(ws, parent);
+    // A wrong path is the model's to fix, so every answer here is an is_error
+    // tool_result rather than a worker failure -- the same choice
+    // `grep_precheck` makes for a scope the model named.
+    let what = match outcome {
+        Ok(Ok(_)) => unreachable!("described above"),
+        Ok(Err(reason)) => not_a_tool_message(reason, path),
+        // `worker_common::caos` gives back only an exit status; the REASON went
+        // to this worker's stderr. So do not quote that error at the model --
+        // it would read `caos resolve <hash> … exited with exit status: 1`,
+        // which names an internal command line and not the problem.
+        //
+        // Instead, decide on EVIDENCE: a parent that resolves and does not list
+        // this name proves the path is absent. Without that proof this is
+        // reported as the CAS trouble it may be — distinguishing absent from
+        // broken, rather than assuming the cheerful one.
+        Err(error) => match &nearby {
+            Some(names) if !names.iter().any(|n| n == leaf) => {
+                format!("no such path: {path}")
+            }
+            _ => format!("cannot read {path}: {error}"),
+        },
+    };
+    Err(User(format!("{what}{}", suggestion(parent, nearby))))
+}
+
+/// Why `path` is not a tool, in the model's words. Shared by `tool_help` and
+/// `run_tool` so one wrong path reads the same whichever tool met it.
+pub fn not_a_tool_message(reason: NotATool, path: &str) -> String {
+    match reason {
+        NotATool::NoExpression => {
+            format!("{path} is not a tool: it is not a directory carrying a `.caos-expr`")
+        }
+        NotATool::NoHelp => format!(
+            "{path} has a `.caos-expr` but it binds no `--help`, so it is an evaluable \
+             entry rather than a tool"
+        ),
+    }
+}
+
+/// `tool_help`'s description of one tool, as prose rather than JSON: the model
+/// reads this, and a schema dump is the registry we just stopped keeping.
+fn describe(tool: &TreeTool, path: &str) -> String {
+    let mut out = format!("{path}\n\n{}\n", tool.doc);
+    if tool.args.is_empty() {
+        out.push_str(
+            "\nParameters: none. Its input is the source tree containing it, so \
+             `run_tool` needs only the path.\n",
+        );
+        return out;
+    }
+    out.push_str("\nParameters (pass under `arguments`, every value a string):\n");
+    for a in &tool.args {
+        let need = if a.required { "required" } else { "optional" };
+        out.push_str(&format!("  {} ({need}) — {}\n", a.name, a.doc));
+    }
+    out
+}
+
+/// The directory names inside `parent` (`""` for the conversation root), or
+/// `None` when `parent` itself could not be read as a directory.
+///
+/// One `caos resolve` and one `caos get` — never a per-child fetch. `None` is
+/// load-bearing: it is the difference between "that name is not there" and "I
+/// could not look", and [`tool_help`] reports those differently.
+fn nearby_dirs(ws: &str, parent: &str) -> Option<Vec<String>> {
+    let resolved = fresh("tool-parent");
+    let hash = worker_common::cas_hash(ws).ok()?;
+    caos(["resolve", &hash, parent, &resolved]).ok()?;
+    if !Path::new(&resolved).is_dir() {
+        return None;
+    }
+    caos(["get", &resolved]).ok()?;
+    let mut names: Vec<String> = fs::read_dir(&resolved)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    names.sort();
+    Some(names)
+}
+
+/// Where else to look, appended to a failed `tool_help`. Discovery is
+/// documentation now, so a wrong path is the ordinary mistake, and naming the
+/// candidates turns it into a self-correcting one instead of a round trip.
+fn suggestion(parent: &str, nearby: Option<Vec<String>>) -> String {
+    let Some(mut names) = nearby.filter(|names| !names.is_empty()) else {
+        return String::new();
+    };
+    names.truncate(50);
+    let where_ = if parent.is_empty() {
+        "the conversation root".to_string()
+    } else {
+        parent.to_string()
+    };
+    format!(". Directories in {where_}: {}", names.join(" "))
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,
@@ -655,6 +742,7 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "tool_help" => tool_help(call, ws).map(|text| (text, None)),
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
@@ -1009,11 +1097,55 @@ mod tests {
     }
 
     #[test]
-    fn read_and_ls_are_inline_and_reserved() {
-        // Routed in-process (no sub-run) and shadow-proof against a tree tool.
-        for t in ["read", "ls", "import_source"] {
+    fn describe_renders_the_help_a_model_reads() {
+        let (doc, args, _) = parse_help(
+            "t",
+            "Say hello from the tree.\n@param word The word to echo.\n\
+             @param [suffix] An optional suffix.",
+        );
+        let tool = TreeTool {
+            name: "hello".into(),
+            doc,
+            args,
+            git: false,
+        };
+        let text = describe(&tool, "main/caos-tools/hello");
+        assert!(text.starts_with("main/caos-tools/hello\n"));
+        assert!(text.contains("Say hello from the tree."));
+        // Requiredness is stated in words, not a JSON `required` array: this is
+        // read by a model, and a schema dump is the registry we stopped keeping.
+        assert!(text.contains("word (required) — The word to echo."));
+        assert!(text.contains("suffix (optional) — An optional suffix."));
+
+        // No `@param` means the source tree IS the input, and saying so is the
+        // whole answer — an empty parameter list reads like a missing one.
+        let bare = TreeTool {
+            name: "t".into(),
+            doc: "Test everything.".into(),
+            args: Vec::new(),
+            git: false,
+        };
+        let text = describe(&bare, "main/caos-tools/t");
+        assert!(text.contains("Parameters: none."));
+    }
+
+    #[test]
+    fn not_a_tool_distinguishes_no_expression_from_no_help() {
+        // Different fixes, so different messages: add an expression, versus add
+        // a `--help` to the one that is already there.
+        let a = not_a_tool_message(NotATool::NoExpression, "main/x");
+        let b = not_a_tool_message(NotATool::NoHelp, "main/x");
+        assert!(a.contains("not a directory carrying a `.caos-expr`"));
+        assert!(b.contains("binds no `--help`"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn read_and_ls_are_inline_and_declared() {
+        // Routed in-process (no sub-run). A repository tool cannot shadow them:
+        // it is named by path, never by name.
+        for t in ["read", "ls", "import_source", "tool_help"] {
             assert!(is_inline(t));
-            assert!(RESERVED_TOOLS.contains(&t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
         // read-oid is gone — folded into `read` via `root`.

@@ -39,7 +39,7 @@ Claude Code's built-in file and shell tools are denied, which removes them from
 the model's context entirely rather than merely refusing their calls. In their
 place the tool server offers **`llm-step`'s tools** — read, ls, grep, bash,
 write, edit, the history tools, the caos build/test tools, `merge`, and
-whatever the workspace defines under `caos-tools/`.
+`tool_help`/`run_tool`, which reach whatever tools the workspace itself defines.
 
 The deny list is `Bash, Read, Edit, Write, Glob, Grep, NotebookEdit` — every
 built-in whose job a workspace tool does, so the model works in the RECORDED
@@ -85,11 +85,13 @@ helper, the
 resolution's phases), and it rides alongside the real tools too, since those
 diagnostics are wanted most on a session you are trying to confirm.
 
-The tree the session's own `caos-tools/` come from is named ONLY if that
-directory exists, because naming it pushes the whole working tree to the caos
-server. For a repository that defines no tools that is a push of everything to
-be told "none" — and against a server that no longer answers it does not fail,
-it waits.
+**No tree is named for the listing, and the listing is tree-independent because
+of it.** A repository's own tools are reached by path (`tool_help` describes
+one, `run_tool` runs it), so the declarations are the same whatever the
+conversation carries. This listing used to name the workspace tree, which
+pushed the whole working tree to the caos server: for a repository that defined
+no tools, a push of everything to be told "none" — and against a server that no
+longer answers it did not fail, it waited. The step never read the argument.
 
 **The workspace is the conversation's tree, not your checkout.** A `write`
 never touches a file on disk; it produces a new tree and the step appends a
