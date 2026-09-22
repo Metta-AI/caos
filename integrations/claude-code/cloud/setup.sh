@@ -12,14 +12,21 @@
 #   B=https://raw.githubusercontent.com/Metta-AI/caos/main
 #   curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 #
-# `--base` is the whole configuration: everything else -- which repo, which
-# branch or commit, where the sibling scripts live -- is read back out of it. A
-# script piped into bash cannot see its own URL (no $0, no path, no referrer),
-# so it has to be told once, and once is all it is told.
+# `--base` says where the BOOTSTRAP SCRIPTS come from -- this file,
+# caos-pin.sh, session-start.sh -- and nothing else. A script piped into bash
+# cannot see its own URL (no $0, no path, no referrer), so it has to be told
+# once, and once is all it is told. It may name a branch, and usually should:
+# the settings form is then never edited again.
 #
-# Swap `main` for a branch or a commit sha to test a change: the setup script,
-# the installer, the session hook and the client then ALL come from that one
-# ref, and there is no second place to keep in step.
+# IT DOES NOT SAY WHICH CAOS. That comes from the REPOSITORY the environment is
+# pointed at -- a client repo, whose flake.lock pins a commit and whose root
+# .caos-expr mounts that commit's std. This script reads the pin and hands the
+# COMMIT to install.sh, which refuses anything else. A repository with no pin
+# is a misconfigured environment and fails below, rather than being installed
+# from this branch: the step resolves through the pinned commit, so a client
+# from a moving head would be a client from another tree than its own tools.
+#
+# Swap `main` for a branch or a commit to test a change to the SCRIPTS.
 #
 # NOTHING HERE TOUCHES A REPOSITORY. Everything is user-level configuration in
 # the container, so one environment serves every repo and no project has to
@@ -51,6 +58,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
+bootstrap_base=""
 enable_bash=""
 for arg in "$@"; do
     case "$arg" in
@@ -62,6 +70,11 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+# The base this script was FETCHED from, kept before the repo is allowed to
+# replace it: the sibling scripts (caos-pin.sh, session-start.sh) have to come
+# from the same place as this file, or a checkout could point the bootstrap at a
+# tree that never contained one.
+bootstrap_base="$base"
 
 # The repo and the ref come back out of the base, which is why there is only
 # one thing to state. Shape-checked only: install.sh takes the same --base and
@@ -78,14 +91,100 @@ case "$base" in
         ;;
 esac
 
-# WHICH CLIENT: whatever --base names, passed straight through. There is no
-# branch or version to choose here, because choosing one could only mean
-# installing a client that does not match the scripts installing it.
+# ---------------------------------------------------------------------------
+# The repo's own pin, if it has one
+# ---------------------------------------------------------------------------
+# A caos-client repo DECLARES which caos it uses, in flake.lock, and where it
+# mounts caos' std, in its root `.caos-expr`. When the checkout says both, it
+# outranks `--base`: the client, the tools and the tree the session evaluates
+# then all come from the commit the repo pins, and the two lines in the settings
+# form stop being a version at all -- they are only where the bootstrap scripts
+# come from.
+#
+# THE CHECKOUT IS ALREADY HERE. Measured from a session's env_manager_log:
+# "Cloned from seed bundle" precedes "Running setup script", so this can read
+# the repo rather than defer to the first session hook -- which matters because
+# work done after the snapshot is paid by EVERY session, and this is the whole
+# install.
+caos_std_path=""
+repo_dir=""
+# `$CLAUDE_PROJECT_DIR` is almost certainly NOT set here -- it is a Claude Code
+# hook variable and Claude Code has not started yet -- so the glob is what
+# actually finds the checkout. It is tried first anyway, for the day that
+# changes, and costs one test.
+#
+# `-e .git`, not `-d`: a worktree's `.git` is a FILE, and refusing one would
+# send this down the fallback for a checkout that is perfectly good.
+#
+# An unmatched glob stays literal in bash, which these tests then reject, so
+# there is no case where the literal is mistaken for a directory.
+for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
+    [ -n "$candidate" ] || continue
+    candidate="${candidate%/}"
+    [ -e "$candidate/.git" ] || continue
+    [ -r "$candidate/flake.lock" ] || continue
+    repo_dir="$candidate"
+    break
+done
+if [ -n "$repo_dir" ]; then
+    echo "reading the caos pin from $repo_dir" >&2
+    # Cleared first and read back with `:-`, so a reader that exits 0 while
+    # printing less than it promises cannot leave `set -u` to abort the whole
+    # setup over a fallback that was meant to be optional.
+    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
+    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+              | bash -s -- "$repo_dir")"; then
+        eval "$pin" || true
+    fi
+    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
+        base="$caos_pin_base"
+        caos_std_path="$caos_pin_std_path"
+        echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
+        echo "  and mounts its std at $caos_std_path" >&2
+    fi
+fi
+
+# NO PIN, NO INSTALL -- and this is where the old fallback to `--base` lived.
+#
+# `--base` names a BRANCH (that is its job: it is where these bootstrap scripts
+# come from, and the two lines in the settings form should not need editing per
+# caos commit). Handing that branch to install.sh is what the fallback did, and
+# it is exactly the pairing the whole arrangement is arranged to prevent: the
+# step a session runs resolves through the commit the REPO pins, so a client
+# installed from a branch head is a client from a different tree than its own
+# tools.
+#
+# A session repo that pins no caos is therefore not something to paper over
+# with the nearest available version. It is a misconfigured environment, and
+# saying so here -- before the snapshot, where the message is read by whoever
+# is setting it up -- is worth more than a session that starts and then
+# behaves oddly.
+if [ -z "$caos_std_path" ]; then
+    echo "FATAL: this environment's repository does not pin caos." >&2
+    echo "  A caos session starts from a CLIENT repo, which is four things:" >&2
+    echo "    flake.nix + flake.lock pinning a 'caos' input by revision," >&2
+    echo "    a root .caos-expr mounting that input's std (--output-path)," >&2
+    echo "    the AGENTS.md the agent is given, and" >&2
+    echo "    .caos-secrets declaring what it may use." >&2
+    echo "  Point this environment at one, or fork Metta-AI/caos-session." >&2
+    if [ -n "$repo_dir" ]; then
+        echo "  Read $repo_dir/flake.lock; caos-pin.sh's reason is above." >&2
+    else
+        echo "  No checkout with a flake.lock was found under /home/user." >&2
+    fi
+    exit 1
+fi
+
+# WHICH CLIENT: the commit the repo pins, which `$base` now holds -- never the
+# branch this script was fetched from. `$bootstrap_base` keeps that, for the
+# sibling scripts, and the two must not be confused: one is where the scripts
+# come from, the other is which caos the session IS.
 #
 # CAOS_SERVER_URL is the one environment variable left, and could not be
 # anything else: it is read at SESSION start, long after this has run and been
 # snapshotted, so no argument here could carry it.
 args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
+args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
 installer="$base/integrations/claude-code/cloud/install.sh"
 
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
@@ -124,21 +223,35 @@ caos --version >&2 2>/dev/null || true
 #
 # Two lines in a settings form, one of them naming a ref, is worth keeping
 # stable. The scripts behind it are not. So the only durable state here is the
-# base URL, and every session re-reads what that ref says today -- including
-# the CLIENT, which the session script installs.
+# BOOTSTRAP base, and every session re-reads what that ref says today.
+#
+# THE BOOTSTRAP BASE, NOT THE PIN, and the difference is the whole point of
+# this block. Baking the pin here (which it used to) made the session scripts
+# come from whatever commit the repo pinned at SETUP time, frozen -- so a fix
+# to session-start.sh could not reach an existing environment until someone
+# both re-pinned the repo AND rebuilt the environment, and the split this file
+# documents ("--base says where the scripts come from") was not true of its own
+# bootstrap.
+#
+# Nothing about the CLIENT rides here any more either. `base` and
+# `caos_std_path` are not written: session-start.sh re-reads the pin from the
+# checkout on every session, which it must do anyway to catch a repo that has
+# re-pinned, so a copy frozen at setup time could only ever be the stale one of
+# the two.
 cat > /usr/local/bin/caos-cloud-session-start <<EOF
 #!/bin/bash
-base="$base"
+bootstrap_base="$bootstrap_base"
 enable_bash="$enable_bash"
 EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
 # reason on stderr, rather than be blocked by its own setup.
-if ! script="$(curl -fsSL "$base/integrations/claude-code/cloud/session-start.sh")"; then
-    echo "caos: could not fetch $base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
+if ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
+    echo "caos: could not fetch $bootstrap_base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
-exec bash -c "$script" caos-cloud-session-start --base="$base" ${enable_bash:+--enable-bash}
+exec bash -c "$script" caos-cloud-session-start --bootstrap-base="$bootstrap_base" \
+    ${enable_bash:+--enable-bash}
 BOOTSTRAP
 chmod 0755 /usr/local/bin/caos-cloud-session-start
 bash -n /usr/local/bin/caos-cloud-session-start || {

@@ -177,8 +177,13 @@ jobs:
       # HTML error page) and every push to main for an afternoon left a LIVE
       # tag carrying one or two of the five assets. That is the worst state
       # there is for install.sh: it resolves the build by tag, finds it, and
-      # dies on a 404 for the binary -- where NO tag would have made it fall
-      # back to the newest build before the commit and carry on.
+      # dies on a 404 for the binary -- where NO tag at all is a clean refusal
+      # naming the commit, which is what a client repo's owner can act on.
+      # (install.sh used to fall back to the newest build before the commit;
+      # it no longer does, because the step resolves through the pinned commit
+      # and an older client would drive tools from another tree. So a
+      # half-uploaded release is now strictly worse than none, which is the
+      # whole reason for the draft-then-publish order below.)
       #
       # So: create the release as a DRAFT (no tag yet, invisible to
       # install.sh), upload each asset with retries, PROVE all five are

@@ -5,11 +5,13 @@
 //! vendoring or committing any of it. Its root `.caos-expr` is one line:
 //!
 //! ```text
-//! run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/flake-input-loader \
-//!     --in:@=. --expr=$CAOS_EXPR \
-//!     --input=caos --input-tree:@@=git+https://github.com/org/caos?rev=<sha>&dir=std \
-//!     --output-path=caos-std
+//! run --base:@@=git+https://github.com/org/caos?rev=<sha>&dir=std/flake-input-loader --in:@=. --expr=$CAOS_EXPR --input=caos --input-tree:@@=git+https://github.com/org/caos?rev=<sha>&dir=std --output-path=caos-std
 //! ```
+//!
+//! That is ONE line and has to be: `eval` splits on `text.lines()`, so a
+//! trailing `\` is a token rather than a continuation. Wrapping it for
+//! readability -- as this comment and design/flake-inputs.md both used to --
+//! produces a tree whose `caos-std/` never resolves.
 //!
 //! The caller says WHICH input, WHAT of it to load, and WHERE to put it. This
 //! worker checks the pin and does the splice.

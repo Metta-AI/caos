@@ -28,12 +28,30 @@ log() { printf 'caos: %s\n' "$*" >&2; }
 hook_started="$(date +%s)"
 step() { log "[+$(($(date +%s) - hook_started))s] $*"; }
 
-base=""
+# WHERE THE SIBLING SCRIPTS COME FROM -- a branch, normally -- and the ONLY
+# durable argument this hook takes. Which caos to install is not passed in: it
+# is read out of the checkout below, on every session, because that is the only
+# copy that cannot be stale.
+bootstrap_base=""
 enable_bash=""
+base=""
+caos_std_path=""
+legacy_base=""
 for arg in "$@"; do
     case "$arg" in
-        --base=*) base="${arg#--base=}" ;;
+        --bootstrap-base=*) bootstrap_base="${arg#--bootstrap-base=}" ;;
         --enable-bash) enable_bash=yes ;;
+        # An OLDER snapshot's bootstrap passes `--base=<the pin at setup time>`
+        # and `--caos-std-path=`. Both are refused rather than honoured: that
+        # `--base` is a frozen pin masquerading as the script base, and using
+        # it would fetch caos-pin.sh from whatever the repo pinned weeks ago.
+        #
+        # SAID LOUDLY, not aliased. The fix for an argument that moved is to
+        # name it, the way `CAOS_IROH_TICKET` is named above -- an environment
+        # that keeps answering to both spellings is how one ends up setting the
+        # one nothing reads.
+        --base=*) legacy_base="${arg#--base=}" ;;
+        --caos-std-path=*) : ;;
     esac
 done
 
@@ -59,6 +77,18 @@ if [ -r /usr/local/share/caos/setup-stamp ]; then
         < /usr/local/share/caos/setup-stamp
 else
     log "no setup stamp; this environment predates it"
+fi
+
+# An environment snapshotted before the bootstrap stopped baking the pin. Its
+# `--base` is that frozen pin, not a script base, so nothing here uses it — and
+# with no `--bootstrap-base` this hook cannot read the repo's CURRENT pin,
+# which means no client refresh. The session still runs on the client the
+# snapshot holds; say why, once, where the person reading the log can act on it.
+if [ -z "$bootstrap_base" ] && [ -n "$legacy_base" ]; then
+    log "this environment's bootstrap passes --base=${legacy_base##*/}, which is a"
+    log "  frozen pin rather than a script base. Nothing reads it any more."
+    log "  REBUILD THE ENVIRONMENT (re-run its setup script) to get the pin"
+    log "  re-read per session; until then the snapshot's client is used."
 fi
 
 # A ticket IS a server URL now (design/iroh-transport.md), so there is nothing
@@ -165,11 +195,70 @@ fi
 # the commit the client was built from: a refreshed client left with the old
 # configuration would drive a step from a different tree than itself, the one
 # pairing that cannot go quiet. Both are a no-op when nothing moved.
-if [ -n "$base" ]; then
+# RE-READ the repo's pin first, because the snapshot froze the last one.
+#
+# The environment's snapshot carries whatever caos the setup script resolved,
+# and a push to the client repo does not reach it -- so a repo that has since
+# re-pinned would keep getting the OLD client and the OLD tools, agreeing with
+# each other and with nothing the repo says. That is the half-update the rest of
+# this file is arranged to avoid, and it is why the pin is read again here
+# rather than trusted from the bootstrap.
+#
+# Cheap when nothing moved: one jq over flake.lock, and the install below then
+# stops at a single `ls-remote`.
+#
+# THE PIN IS THE ONLY SOURCE OF A BASE FOR THE INSTALL, and `$base` starts
+# EMPTY to make that structural rather than a convention. `$bootstrap_base`
+# names a branch -- it is where these scripts come from -- and install.sh
+# refuses a branch, because the step resolves through the pinned commit and a
+# client from a moving head would be a client from another tree. So a checkout
+# that pins no caos does not get a refresh at all; it keeps the client the
+# snapshot has, which is a session that works rather than one installed from
+# the wrong tree.
+if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
+    # Cleared before the eval, and read back with `:-` after it, so a
+    # caos-pin.sh that somehow succeeds while printing less than it promises
+    # cannot take the hook out on an unset variable under `set -u`. The whole
+    # point of this block is to be optional; it must not become the thing that
+    # stops a session starting.
+    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
+    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+              2>/dev/null | bash -s -- "$PWD" 2>/dev/null)"; then
+        eval "$pin" || true
+    fi
+    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
+        # Printed EVERY session, not only when it changes. There is nothing to
+        # compare it against -- the bootstrap no longer carries a previous pin,
+        # which is the point -- and this one line is what says which caos the
+        # session is about to be, beside the stamp saying which environment it
+        # is. Together they are how a stale snapshot tells itself apart from a
+        # fix that did not work.
+        step "the repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
+        base="$caos_pin_base"
+        caos_std_path="$caos_pin_std_path"
+    fi
+fi
+
+if [ -n "$base" ] && [ -n "$caos_std_path" ]; then
     step "refreshing the client"
-    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" | bash -s -- --no-repo-files --user-config --base="$base" ${enable_bash:+--enable-bash}; then
+    if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" \
+         | bash -s -- --no-repo-files --user-config --base="$base" \
+               ${enable_bash:+--enable-bash} \
+               --caos-std-path="$caos_std_path"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
+elif [ -z "$bootstrap_base" ]; then
+    # NOT the same reason as the branch below, and saying so matters: the
+    # checkout here may pin caos perfectly well. What is missing is a base to
+    # fetch `caos-pin.sh` FROM, which only an environment snapshotted before
+    # `--bootstrap-base` existed can be short of. Reporting that as "this
+    # checkout pins no caos" sends the reader to the repository, which is the
+    # one thing that is not wrong.
+    log "no script base, so the repo's pin was never read (see the note above);"
+    log "  using the client the environment was built with"
+else
+    log "this checkout pins no caos, so there is no commit to refresh from;"
+    log "  using the client the environment was built with"
 fi
 step "client refresh done"
 
@@ -214,19 +303,37 @@ step "unshallow done"
 # serve will. Bounded and non-fatal -- a warm that cannot finish just leaves the
 # background path in place, which is where we were before this ran.
 if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; then
-    record=/usr/local/share/caos/build
-    step_repo=""
-    step_commit=""
-    if [ -r "$record" ]; then
-        while IFS='=' read -r key value; do
-            case "$key" in
-                repo) step_repo="$value" ;;
-                commit) step_commit="$value" ;;
-            esac
-        done < "$record"
+    locator=""
+    if [ -n "$caos_std_path" ]; then
+        # A repo-pinned step: the SAME path the config names, so the warm fills
+        # the cache the serve then reads. Naming it any other way would resolve
+        # a different tree and leave the first turn with no tools while a
+        # perfectly good registry sat in the cache under another key.
+        locator="--llm-step:@=$caos_std_path/llm-step"
+    else
+        # ONLY REACHABLE ON AN OLDER SNAPSHOT, and kept for exactly that. An
+        # environment built by the current setup.sh always has a pin (it fails
+        # without one), so `$caos_std_path` is always set above and this branch
+        # is not taken. Where it IS taken, the snapshot's configuration names
+        # the same `:@@=` form this builds, so the warm and the serve still
+        # agree on a cache key -- which is the only thing that matters here,
+        # since the registry cache is keyed by the `--llm-step` STRING.
+        record=/usr/local/share/caos/build
+        step_repo=""
+        step_commit=""
+        if [ -r "$record" ]; then
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    repo) step_repo="$value" ;;
+                    commit) step_commit="$value" ;;
+                esac
+            done < "$record"
+        fi
+        if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
+            locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
+        fi
     fi
-    if [ -n "$step_repo" ] && [ -n "$step_commit" ]; then
-        locator="--llm-step:@@=github:$step_repo?rev=$step_commit&dir=std/llm-step"
+    if [ -n "$locator" ]; then
         step "warming the caos tool registry for the first turn"
         # Its output goes to a FILE, not the hook's own stdout/stderr, and this
         # is not tidiness: Claude Code holds the session at "starting" until this
@@ -251,7 +358,8 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
         while IFS= read -r line; do log "warm: $line"; done < /tmp/caos-warm.log
         step "warm done"
     else
-        log "no build record; leaving the tools to mcp serve's background resolve"
+        log "nothing names the step (no repo pin and no build record);" \
+            "leaving the tools to mcp serve's background resolve"
     fi
 fi
 
