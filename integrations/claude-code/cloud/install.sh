@@ -115,26 +115,10 @@ case "$(uname -s)/$(uname -m)" in
         exit 1
         ;;
 esac
-
-# A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
-# resolving one is a lookup rather than a parse.
-#
-# Read with `git ls-remote`, NOT api.github.com. That API is anonymous here, so
-# it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares its
-# egress address with every other cloud VM, so the budget is spent by strangers
-# and the 403 is nothing this side can fix. ls-remote has no such limit, needs
-# no token, and speaks to github.com like the download does.
-if ! command -v git >/dev/null 2>&1; then
-    echo "resolving the build for $REF needs git" >&2
-    exit 1
-fi
-remote="https://github.com/$REPO"
-if ! refs="$(git ls-remote "$remote" 2>&1)"; then
-    echo "could not list the refs of $remote:" >&2
-    printf '%s\n' "$refs" | head -3 >&2
-    exit 1
-fi
-
+# VALIDATED BEFORE ANYTHING IS FETCHED. This is a pure check on an argument,
+# so paying a network round trip to be told the argument was wrong is both
+# slower and untestable -- `--base=…/main` used to `ls-remote` first and
+# only then refuse the ref.
 # A COMMIT, AND ONLY A COMMIT. `--base` names the caos this client IS, and with
 # a repo-pinned step that is never a name: `caos-pin.sh` reads it out of
 # `flake.lock`, which records revisions, and the same revision is what the
@@ -163,6 +147,27 @@ if [ "${#REF}" != 40 ]; then
     echo "  ($REF). That is what flake.lock records and what the expression pins." >&2
     exit 2
 fi
+
+
+# A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
+# resolving one is a lookup rather than a parse.
+#
+# Read with `git ls-remote`, NOT api.github.com. That API is anonymous here, so
+# it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares its
+# egress address with every other cloud VM, so the budget is spent by strangers
+# and the 403 is nothing this side can fix. ls-remote has no such limit, needs
+# no token, and speaks to github.com like the download does.
+if ! command -v git >/dev/null 2>&1; then
+    echo "resolving the build for $REF needs git" >&2
+    exit 1
+fi
+remote="https://github.com/$REPO"
+if ! refs="$(git ls-remote "$remote" 2>&1)"; then
+    echo "could not list the refs of $remote:" >&2
+    printf '%s\n' "$refs" | head -3 >&2
+    exit 1
+fi
+
 
 builds=""
 while IFS=$'\t' read -r s r; do

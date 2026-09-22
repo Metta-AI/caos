@@ -486,6 +486,38 @@ fn diagnostics() -> String {
         "client CAOS_REV: {}\n",
         std::env::var("CAOS_REV").unwrap_or_else(|_| "<unset>".to_string())
     ));
+    // WHETHER THIS SESSION IS IN DEV MODE, said outright rather than left to be
+    // inferred from an absence.
+    //
+    // `CAOS_DEV=1` makes the session hook overlay the client published at
+    // `refs/caos/dev` and repoint the tools at the same commit, so a session can
+    // run uncommitted work. The failure it exists to name is picking the wrong
+    // ENVIRONMENT: two environments differing only in this variable look
+    // identical from inside, and a session that quietly ran the pinned client
+    // presented as "my change did not take" -- which cost a debugging session
+    // that a single line here would have ended.
+    //
+    // Both halves, because they can disagree: the variable says what was ASKED
+    // for, and a `dev-` revision says the overlay actually happened. Asked for
+    // and absent means the hook could not reach `refs/caos/dev`.
+    let dev_asked = std::env::var("CAOS_DEV").as_deref() == Ok("1");
+    let dev_rev = std::env::var("CAOS_REV")
+        .map(|r| r.starts_with("dev-"))
+        .unwrap_or(false);
+    d.push_str(&format!(
+        "dev mode: {}\n",
+        match (dev_asked, dev_rev) {
+            (true, true) => "on (CAOS_DEV=1, and this client is the published dev build)",
+            (true, false) =>
+                "ASKED FOR BUT NOT ACTIVE (CAOS_DEV=1, but this is the pinned \
+                 client) -- the hook could not reach refs/caos/dev; is the stack \
+                 up with `caosd up --iroh`?",
+            (false, true) => "client is a dev build, but CAOS_DEV is not set here",
+            (false, false) =>
+                "off -- this session runs the caos its client repo pins, not a \
+                 locally published one. Set CAOS_DEV=1 on the environment for that.",
+        }
+    ));
     // What install.sh resolved this session -- repo, full commit, build tag.
     d.push_str("build record (/usr/local/share/caos/build):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/build")));
