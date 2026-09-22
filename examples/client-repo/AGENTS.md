@@ -85,7 +85,10 @@ would not.
 To move to a newer caos: `nix flake update caos`, then set the two `rev=`
 values in `.caos-expr` to the new commit. They must agree with `flake.lock` —
 `std/flake-input-loader` refuses the evaluation otherwise and names both
-revisions, so this cannot go wrong quietly.
+revisions, so this cannot go wrong quietly. Pin only a commit that already has
+a published build: the client comes from that commit's release and the tools
+resolve through the same rev, so a commit without one is refused rather than
+paired with an older client.
 
 Fork this repository to add your own tools, instructions or pins. Nothing here
 is specific to one project.

@@ -216,19 +216,33 @@ else
             "$ref12"*) VERSION="$b"; break ;;
         esac
     done <<< "$builds"
-    # A pinned commit whose build has not landed yet is the same situation a
-    # branch head is in while CI runs, and it gets the same answer: walk back
-    # for the newest build at or before it rather than installing nothing. A
-    # repo that re-pins the moment it pushes would otherwise take out every
-    # session started in that window.
+    # A NAMED COMMIT DOES NOT FALL BACK, and that is the difference from the
+    # branch case above. A branch head is a moving target that nobody chose: it
+    # has no build for the minutes its workflow runs, and a slightly older
+    # client there beats no client at all. A commit is the opposite — somebody
+    # wrote it down, and with a repo-pinned step it is written down TWICE: the
+    # `--llm-step:@=<path>/llm-step` path resolves through this same rev
+    # (flake-input-loader fetches `?rev=<pinned>&dir=std`), so the std ALWAYS
+    # comes from the pin while a fallback client would come from an older
+    # commit.
+    #
+    # That is the one pairing this file exists to keep, and a fallback breaks it
+    # silently: the session comes up, the tools resolve, and the client driving
+    # them is from a different tree than the tools are. Observed in this
+    # arrangement's own bring-up, where a repo pinning 677ca65f ran
+    # build-092c75c54bcf and said so in one line nobody had reason to read.
+    #
+    # So it fails, and says which of the two things to do. The caller decides
+    # what that costs: at SETUP time it fails the environment build, which is
+    # loud and retryable; in the session hook the refresh is non-fatal and the
+    # snapshot's client carries the session.
     if [ -z "$VERSION" ]; then
-        echo "$REPO has no build for $REF" >&2
-        echo "  (the workflow publishes build-<commit>; it may still be running)" >&2
-        if ! VERSION="$(newest_build_at_or_before "$REF")"; then
-            echo "  and no build exists in its last $WALK_DEPTH commits either" >&2
-            exit 1
-        fi
-        echo "  falling back to $VERSION, the newest build at or before it" >&2
+        echo "$REPO has no build for $REF, and a named commit does not fall back" >&2
+        echo "  to an earlier one: the step resolves through THIS rev, so an older" >&2
+        echo "  client would drive tools built from a different tree." >&2
+        echo "  The workflow publishes build-<commit> and may still be running --" >&2
+        echo "  wait for it, or pin a commit that already has a build." >&2
+        exit 1
     fi
 fi
 echo "$REPO $REF -> $VERSION" >&2

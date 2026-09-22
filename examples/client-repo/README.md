@@ -50,6 +50,13 @@ up the new client, the new tools and the new tree together — the session hook
 re-reads this pin every time, so a pushed change reaches an existing
 environment without rebuilding it.
 
+**Pin a commit that already has a published build.** The client is downloaded
+from that commit's release, while the tools resolve through the same rev, so
+the two are one choice — and a commit whose build has not landed is refused
+rather than paired with an older client. If you are moving the pin to your own
+caos branch: push it, wait for the workflow to publish `build-<commit>`, and
+re-pin after. `gh run list --branch <branch>` says when.
+
 ## What each file does
 
 ```
