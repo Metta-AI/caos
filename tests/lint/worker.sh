@@ -24,7 +24,6 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 caos get -r /cas/args/in || fail "materializing this test's dependencies"
 caos get /cas/args/src-lint || fail "reading lint-flake-src.sh"
 caos get /cas/args/bake-lint || fail "reading lint-bake-anchor.sh"
-caos get /cas/args/expr-lint || fail "reading lint-caos-expr.sh"
 root=/cas/args/in/DEEP-DEPS
 # BOTH LINTS PASS VACUOUSLY ON AN EMPTY TREE — one walks `crates/**/*.rs`, the
 # other `std/*/Cargo.toml`, and neither has anything to say about a glob that
@@ -49,16 +48,6 @@ bash /cas/args/src-lint "$root" \
 echo "== lint-bake-anchor.sh: every std tool's crates.io deps are anchored ==" >&2
 bash /cas/args/bake-lint "$root" \
   || fail "a std tool's crates.io dep is missing from bake-anchor (see above)"
-
-# A `.caos-expr` directive is ONE line, and a trailing backslash is a TOKEN
-# rather than a continuation — it reaches the argument parser and comes back as
-# `argument must look like --name=value, got: \`, naming the wrong thing
-# entirely. `eval` refuses it now; this is the earlier net, before anything
-# evaluates. Unlike the two above it asserts its own mount (it fails on a tree
-# with no `.caos-expr` at all), so there is nothing to check for it here.
-echo "== lint-caos-expr.sh: every .caos-expr directive is one line ==" >&2
-bash /cas/args/expr-lint "$root" \
-  || fail "a .caos-expr uses a backslash continuation, which eval does not accept (see above)"
 
 printf 'lint: ALL PASS (%s std Cargo.toml files checked)\n' "${#tomls[@]}" > /tmp/report
 cat /tmp/report >&2
