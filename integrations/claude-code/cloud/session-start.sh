@@ -263,6 +263,112 @@ fi
 step "client refresh done"
 
 # ---------------------------------------------------------------------------
+# DEV MODE: run the caos on the SERVER, not the one on GitHub
+# ---------------------------------------------------------------------------
+# `caosd up` publishes its checkout to `refs/caos/dev` on the stack it starts:
+# one commit carrying the working tree and the x86_64 client built from it. With
+# `CAOS_DEV=1` this session runs that instead of the repo's pin, so uncommitted
+# work reaches a container with no GitHub push and no wait for CI.
+#
+# EVERY SESSION, not once at setup: that ref moves on every `caosd up`, so a
+# value frozen into the snapshot would be the stale one of the two. This is the
+# same reason the pin itself is re-read above.
+#
+# AFTER the refresh, deliberately. The install above is what puts
+# `git-remote-caos` on disk, and without it `git` cannot speak `caos://` at all
+# -- so the repo's ordinary pin is the bootstrap that makes this reachable, and
+# it never has to move.
+#
+# Never fatal. A dev overlay that cannot happen leaves a session running the
+# pinned client, which works; saying so beats failing to start.
+if [ "${CAOS_DEV:-}" = 1 ] && [ "$have_repo" = 1 ] && [ -n "$server" ]; then
+    step "dev mode: looking for refs/caos/dev on the server"
+    dev_sha="$(git ls-remote "$server" refs/caos/dev 2>/dev/null | awk '{print $1}')"
+    if [ -z "$dev_sha" ]; then
+        log "CAOS_DEV=1 but the server publishes no refs/caos/dev."
+        log "  Run 'caosd up --iroh' on the machine serving this ticket; a plain"
+        log "  'caosd up' publishes the tree but starts no caos:// listener."
+    elif ! git fetch --quiet --depth=1 --no-tags --no-write-fetch-head \
+              -- "$server" "$dev_sha" 2>/dev/null; then
+        log "could not fetch $dev_sha from the server; staying on the pinned client"
+        dev_sha=""
+    fi
+fi
+if [ -n "${dev_sha:-}" ]; then
+    # THE BINARIES, over the ones install.sh just placed. Written beside and
+    # RENAMED rather than truncated in place: these are executables, and
+    # overwriting a mapped file is ETXTBSY rather than an update.
+    #
+    # Into `lib/caos`, which is where the CLIENT looks -- `bin/caos` is a shell
+    # wrapper that execs it, and `ensure_helper_on_path` puts `lib/caos` on PATH
+    # before shelling out to git. A helper written only into `bin` is invisible
+    # to caos' own git.
+    overlaid=""
+    for name in caos git-remote-caos; do
+        dest="/usr/local/lib/caos/$name"
+        if git cat-file blob "$dev_sha:dev-bin/$name" > "$dest.dev" 2>/dev/null; then
+            chmod 0755 "$dest.dev" && mv -f "$dest.dev" "$dest" && overlaid="$overlaid $name"
+        else
+            rm -f "$dest.dev"
+        fi
+    done
+    if [ -n "$overlaid" ]; then
+        step "dev client installed:$overlaid"
+    else
+        log "refs/caos/dev carries no dev-bin/; leaving the pinned client in place"
+    fi
+
+    # THE TOOLS, from the same commit. `std/` is compiled by caos itself from
+    # the std tree, so it is reached by a locator rather than installed -- and
+    # `git+caos://…` is an ordinary git fetch through `git-remote-caos`, which
+    # is why this needs no new transport and no code change (git-locator takes
+    # any `git+<scheme>`).
+    #
+    # BOTH FILES, or neither works: `std/flake-input-loader` refuses a tree
+    # whose expression and `flake.lock` name different revisions, and it is
+    # `flake.lock`'s URL that decides which locators it even checks.
+    expr_file="$PWD/.caos-expr"
+    lock_file="$PWD/flake.lock"
+    if [ -w "$expr_file" ] && [ -r "$lock_file" ]; then
+        # EXCLUDED FIRST, before the ticket is written into either file. A
+        # `caos://` URL ends in the token that authorizes driving that server,
+        # so these two files are about to become credentials -- and an agent
+        # working in this checkout must not be able to commit them. Doing this
+        # first means there is no window in which they are committable.
+        mkdir -p "$PWD/.git/info"
+        for f in .caos-expr flake.lock; do
+            grep -qxF "$f" "$PWD/.git/info/exclude" 2>/dev/null \
+                || echo "$f" >> "$PWD/.git/info/exclude"
+        done
+
+        # Every `:@@=` locator repointed at this server at this commit, keeping
+        # each one's own `dir=`: the expression names two (the loader's image
+        # and the tree it splices) and they differ only by that.
+        sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$server?rev=$dev_sha\&dir=\1|g" \
+            "$expr_file"
+
+        # The lock's `locked` section for the caos input, found through
+        # `nodes.<root>.inputs.<name>` as caos-pin.sh and the loader both do --
+        # the node key is not the input name once an input has been renamed.
+        # `narHash` is DROPPED rather than recomputed: an absent hash is honest,
+        # where a stale one would be a lie nix would later reject.
+        if tmp_lock="$(jq --arg url "$server" --arg rev "$dev_sha" '
+                (.root // "root") as $r
+                | (.nodes[$r].inputs.caos // empty) as $k
+                | if ($k|type) == "string"
+                  then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
+                  else . end' "$lock_file" 2>/dev/null)"; then
+            printf '%s\n' "$tmp_lock" > "$lock_file"
+            step "dev tools: $caos_std_path/ now resolves from the server at ${dev_sha:0:12}"
+        else
+            log "could not rewrite flake.lock; the loader will refuse the drift it now sees"
+        fi
+    else
+        log "no writable .caos-expr / flake.lock here; the tools stay on the repo's pin"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Unshallow the checkout -- LAST, because it is the slowest and gates only the
 # first PUSH, which happens later than the first tool call
 # ---------------------------------------------------------------------------
