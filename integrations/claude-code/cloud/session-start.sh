@@ -28,20 +28,32 @@ log() { printf 'caos: %s\n' "$*" >&2; }
 hook_started="$(date +%s)"
 step() { log "[+$(($(date +%s) - hook_started))s] $*"; }
 
-base=""
+# WHERE THE SIBLING SCRIPTS COME FROM -- a branch, normally -- and the ONLY
+# durable argument this hook takes. Which caos to install is not passed in: it
+# is read out of the checkout below, on every session, because that is the only
+# copy that cannot be stale.
+bootstrap_base=""
 enable_bash=""
+base=""
 caos_std_path=""
+legacy_base=""
 for arg in "$@"; do
     case "$arg" in
-        --base=*) base="${arg#--base=}" ;;
+        --bootstrap-base=*) bootstrap_base="${arg#--bootstrap-base=}" ;;
         --enable-bash) enable_bash=yes ;;
-        --caos-std-path=*) caos_std_path="${arg#--caos-std-path=}" ;;
+        # An OLDER snapshot's bootstrap passes `--base=<the pin at setup time>`
+        # and `--caos-std-path=`. Both are refused rather than honoured: that
+        # `--base` is a frozen pin masquerading as the script base, and using
+        # it would fetch caos-pin.sh from whatever the repo pinned weeks ago.
+        #
+        # SAID LOUDLY, not aliased. The fix for an argument that moved is to
+        # name it, the way `CAOS_IROH_TICKET` is named above -- an environment
+        # that keeps answering to both spellings is how one ends up setting the
+        # one nothing reads.
+        --base=*) legacy_base="${arg#--base=}" ;;
+        --caos-std-path=*) : ;;
     esac
 done
-# Where the sibling scripts come from, kept separately because the repo is
-# allowed to move `$base` (the pin) and a moved pin must not be able to point
-# this hook at a tree that has no caos-pin.sh in it.
-bootstrap_base="$base"
 
 # ONE NAME, because there is one thing to name: a ticket IS a server URL
 # (design/iroh-transport.md), so `CAOS_IROH_TICKET` would be a second spelling
@@ -65,6 +77,18 @@ if [ -r /usr/local/share/caos/setup-stamp ]; then
         < /usr/local/share/caos/setup-stamp
 else
     log "no setup stamp; this environment predates it"
+fi
+
+# An environment snapshotted before the bootstrap stopped baking the pin. Its
+# `--base` is that frozen pin, not a script base, so nothing here uses it — and
+# with no `--bootstrap-base` this hook cannot read the repo's CURRENT pin,
+# which means no client refresh. The session still runs on the client the
+# snapshot holds; say why, once, where the person reading the log can act on it.
+if [ -z "$bootstrap_base" ] && [ -n "$legacy_base" ]; then
+    log "this environment's bootstrap passes --base=${legacy_base##*/}, which is a"
+    log "  frozen pin rather than a script base. Nothing reads it any more."
+    log "  REBUILD THE ENVIRONMENT (re-run its setup script) to get the pin"
+    log "  re-read per session; until then the snapshot's client is used."
 fi
 
 # A ticket IS a server URL now (design/iroh-transport.md), so there is nothing
@@ -183,12 +207,14 @@ fi
 # Cheap when nothing moved: one jq over flake.lock, and the install below then
 # stops at a single `ls-remote`.
 #
-# THE PIN IS THE ONLY SOURCE OF A BASE FOR THE INSTALL. `$bootstrap_base` names
-# a branch -- it is where these scripts come from -- and install.sh refuses a
-# branch, because the step resolves through the pinned commit and a client from
-# a moving head would be a client from another tree. So a checkout that pins no
-# caos does not get a refresh at all; it keeps the client the snapshot has,
-# which is a session that works rather than one installed from the wrong tree.
+# THE PIN IS THE ONLY SOURCE OF A BASE FOR THE INSTALL, and `$base` starts
+# EMPTY to make that structural rather than a convention. `$bootstrap_base`
+# names a branch -- it is where these scripts come from -- and install.sh
+# refuses a branch, because the step resolves through the pinned commit and a
+# client from a moving head would be a client from another tree. So a checkout
+# that pins no caos does not get a refresh at all; it keeps the client the
+# snapshot has, which is a session that works rather than one installed from
+# the wrong tree.
 if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     # Cleared before the eval, and read back with `:-` after it, so a
     # caos-pin.sh that somehow succeeds while printing less than it promises
@@ -201,16 +227,15 @@ if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
         eval "$pin" || true
     fi
     if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
-        if [ "$base" != "$caos_pin_base" ] || [ "$caos_std_path" != "$caos_pin_std_path" ]; then
-            step "the repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
-        fi
+        # Printed EVERY session, not only when it changes. There is nothing to
+        # compare it against -- the bootstrap no longer carries a previous pin,
+        # which is the point -- and this one line is what says which caos the
+        # session is about to be, beside the stamp saying which environment it
+        # is. Together they are how a stale snapshot tells itself apart from a
+        # fix that did not work.
+        step "the repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:0:12}, std at $caos_pin_std_path"
         base="$caos_pin_base"
         caos_std_path="$caos_pin_std_path"
-    else
-        # The bootstrap's `$base` is a branch, which install.sh refuses, so
-        # there is nothing to refresh FROM. Cleared rather than passed, so the
-        # attempt below is skipped with a reason instead of failing with one.
-        base=""
     fi
 fi
 

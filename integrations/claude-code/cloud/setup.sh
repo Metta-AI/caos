@@ -221,23 +221,35 @@ caos --version >&2 2>/dev/null || true
 #
 # Two lines in a settings form, one of them naming a ref, is worth keeping
 # stable. The scripts behind it are not. So the only durable state here is the
-# base URL, and every session re-reads what that ref says today -- including
-# the CLIENT, which the session script installs.
+# BOOTSTRAP base, and every session re-reads what that ref says today.
+#
+# THE BOOTSTRAP BASE, NOT THE PIN, and the difference is the whole point of
+# this block. Baking the pin here (which it used to) made the session scripts
+# come from whatever commit the repo pinned at SETUP time, frozen -- so a fix
+# to session-start.sh could not reach an existing environment until someone
+# both re-pinned the repo AND rebuilt the environment, and the split this file
+# documents ("--base says where the scripts come from") was not true of its own
+# bootstrap.
+#
+# Nothing about the CLIENT rides here any more either. `base` and
+# `caos_std_path` are not written: session-start.sh re-reads the pin from the
+# checkout on every session, which it must do anyway to catch a repo that has
+# re-pinned, so a copy frozen at setup time could only ever be the stale one of
+# the two.
 cat > /usr/local/bin/caos-cloud-session-start <<EOF
 #!/bin/bash
-base="$base"
+bootstrap_base="$bootstrap_base"
 enable_bash="$enable_bash"
-caos_std_path="$caos_std_path"
 EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
 # reason on stderr, rather than be blocked by its own setup.
-if ! script="$(curl -fsSL "$base/integrations/claude-code/cloud/session-start.sh")"; then
-    echo "caos: could not fetch $base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
+if ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
+    echo "caos: could not fetch $bootstrap_base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
-exec bash -c "$script" caos-cloud-session-start --base="$base" \
-    ${enable_bash:+--enable-bash} ${caos_std_path:+--caos-std-path="$caos_std_path"}
+exec bash -c "$script" caos-cloud-session-start --bootstrap-base="$bootstrap_base" \
+    ${enable_bash:+--enable-bash}
 BOOTSTRAP
 chmod 0755 /usr/local/bin/caos-cloud-session-start
 bash -n /usr/local/bin/caos-cloud-session-start || {
