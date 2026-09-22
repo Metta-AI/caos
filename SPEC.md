@@ -108,17 +108,14 @@ and nothing enumerates them.
 Two built-in tools address one by PATH:
 
 - `tool_help --path=<conversation path>` returns that tool's description and
-  parameters. It is an INLINE tool: it resolves the path, reads the
-  `.caos-expr` and parses the `help` here-string it binds, so it never
-  evaluates and never builds. It says which of three things went wrong — no
-  such path, no `.caos-expr`, or an expression binding no `--help` — since
-  each has a different fix, and it names the sibling directories, because a
-  wrong path is the ordinary mistake once nothing lists the tools. All three
-  are error tool_results, never worker failures.
-- `run_tool --path=<conversation path> --arguments=<object>` evaluates that
-  path and runs the resulting ArgTree with the given arguments. An undeclared
-  argument, a missing required one, or a non-string value is answered as an
-  error tool_result before anything is dispatched.
+  parameters. It evaluates the path, including the target expression, and reads
+  the resulting ArgTree's `help` binding. This can build the tool; it does not
+  invoke it. Missing paths and invalid tools are recoverable tool errors.
+  Missing paths also name sibling directories.
+- `run_tool --path=<conversation path> --arguments=<object>` evaluates the same
+  path, validates arguments against the evaluated help, and invokes the tool.
+  An undeclared argument, a missing required one, or a non-string value is
+  answered as an error tool_result before invocation.
 
 Additionally a human runs a tool with `caos-cli run-tool <path> [--k=v ...]`.
 
@@ -130,8 +127,7 @@ prompt and grew it per tree. Naming a path instead makes the tool list
 TREE-INDEPENDENT, which is also what lets `caos mcp`'s listing be cached and
 makes a client that ignores `tools/list_changed` correct rather than stale. The
 price is real and deliberate: an undocumented tool is invisible. Prose may drift
-from the tool; `tool_help` is the authority, which is why it is cheap enough to
-call every time.
+from the tool; `tool_help` is the authority.
 
 ## Resolution
 
@@ -143,15 +139,20 @@ would resolve to nothing. And it is why a human's `run-tool` lands on the same
 ArgTree: the human has one source tree — the worktree — so the prefix is empty
 and the remainder is the whole path.
 
-`tool_help` resolves with `caos resolve`, which traverses commit entries, so a
-conversation-relative path reaches into a source tree without the caller
-unwrapping the gitlink.
+Both tools use ordinary CAOS evaluation, including its dependency-resolution
+semantics. Thus a root expression may generate a `tools/check` directory absent
+from the stored tree: both tools can reach and evaluate it.
 
-A tool is resolved fresh on every call, so an agent that edits a tool sees the
-change on its next call, within the same turn. A tool that lives in the
-conversation tree rather than inside a source tree gets no root `.caos-expr`,
-and so cannot reach `DEEP-DEPS/<x>`; in practice a tool belongs in a source
-tree.
+Resolution uses the current conversation snapshot on every call. The
+definition's evaluated tree is separate from the input: invocation still binds
+the original selected source tree, or the original conversation tree when no
+source-tree prefix was selected, as `in`.
+
+MCP resolves the requested `path` against that same snapshot on the client,
+where pinned `:@@=` dependencies can be fetched. It hands the evaluated tool
+to both callers. The handoff names its input tree and path, so a changed snapshot
+cannot consume a stale result. Workers continue to use evaluation continuations
+and do not fetch locators themselves.
 
 ## Help text
 
@@ -169,8 +170,7 @@ curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
 Authoring it there rather than in the script is what SPLITS the two identities:
 a `.caos-expr` is stripped from the tree its own expression is evaluated
 against, so editing the docs re-keys the tool's ArgTree — the thing a caller
-runs — and re-keys NOTHING the tool builds from. It is also what lets
-`tool_help` answer without evaluating.
+runs — and re-keys NOTHING the tool builds from.
 
 The free text before the first block tag is the tool's description (a tool
 with none gets a placeholder); `@param` tags declare the parameters:
@@ -257,10 +257,9 @@ on any of it, and each is written down because the reason is easy to lose.
   tree that is a value — so generalizing this needs one DECLARED read/write
   field, which would also decide what `in` binds and which of the two result
   shapes applies.
-- **`help` is read from the expression's text, not from the evaluated tree.**
-  So a tool whose help lives only in a built image cannot be described. Reading
-  it from the ArgTree would fix that, at the cost of `tool_help` having to
-  evaluate — which for a compiled tool means building it just to describe it.
+- **Describing a tool evaluates it.** `tool_help` reads help from the evaluated
+  ArgTree, so describing a compiled tool may build it. Skipping the target
+  expression is a possible performance optimization when help is in its text.
 - **Agent args are string literals only.** A human's `run-tool` passes typed
   args through (`--x:@=path`, `--x:hash=`), an agent's cannot, so a tool that
   wants a tree works by hand and not from an agent. Closing it means declaring
@@ -280,14 +279,10 @@ on any of it, and each is written down because the reason is easy to lose.
 - **`caos-cli run-tool` and `caos-cli run` are still separate verbs**, and
   `run-tool` does not validate against the help, so "both callers build the same
   ArgTree" is a goal rather than an invariant.
-- **A tool reaching a `:@@=` locator cannot be run by an agent.** The server's
-  eval walk refuses a locator (it is client-resolved only), and `caos mcp`'s
-  client-side pre-resolution is keyed by the MCP TOOL NAME
-  (`mcp::dispatch_call` → `caos::eval_tree_tool`), which is always `run_tool` —
-  so it looks for `caos-tools/run_tool`, finds nothing, and lets the server
-  refuse. This PREDATES path addressing: the tool list never offered a
-  repository tool under its own name, so the lookup never matched. The fix is
-  to key it on the path in the call's `arguments` instead.
+- **Locator resolution requires a client.** MCP pre-resolves the requested
+  tool path, including pinned ancestor dependencies. A turn driven entirely
+  by workers still cannot resolve a new `:@@=` locator; its dependencies must
+  already be available as content. There is no worker-side remote fetch.
 
 # Secrets
 
