@@ -62,13 +62,28 @@ mint() { # <cas-name> <tree-oid> <message> [parent...]
   caos put-commit /tmp/commit "/cas/$dst" || fail "minting $dst"
 }
 
-# The merged commit's raw bytes are the result. Everything the old test asked
-# git is a line in them, or in the tree they name.
+# The result is a WRITER result -- `{prop, out}` (SPEC, "CaosTools") -- so the
+# merged commit is `prop` and the text for the model is `out`. It used to be the
+# bare commit, with llm-step composing the conflict report from the merged
+# tree; that made the tool's answer depend on who ran it.
+#
+# Everything the old test asked git is a line in the commit's raw bytes, or in
+# the tree they name.
 merge_run() { # <ours-cas-path> <theirs-cas-path> -> a request hash
   caos prepare-request --base:hash="$(caos hash /cas/args/merge)" \
     --ours:@="$1" --theirs:@="$2"
 }
-result_commit() { caos get /cas/args/result >/dev/null; cat /cas/args/result; }
+result_commit() {
+  caos get /cas/args/result >/dev/null
+  caos get /cas/args/result/prop >/dev/null
+  cat /cas/args/result/prop
+}
+result_out() {
+  caos get /cas/args/result >/dev/null
+  caos get /cas/args/result/out >/dev/null
+  cat /cas/args/result/out
+}
+prop_hash() { caos get /cas/args/result >/dev/null; caos hash /cas/args/result/prop; }
 commit_field() { printf '%s\n' "$1" | grep -m1 "^$2 " | cut -d' ' -f2- ; }
 # The merged tree, materialized: `caos get-hash` fetches by oid, `-r` walks it.
 merged_tree() { # <raw commit> -> a path
@@ -147,16 +162,27 @@ $conflicts"
   fi
   echo "  ok: markers in f.txt; .caos/conflicts lists f.txt and nothing else" >&2
 
+  # `out` is the tool's OWN answer now. It carries the resolution instructions
+  # and the ledger itself, so the model needs nothing composed for it.
+  out=$(result_out)
+  [[ "$out" == *"merge produced conflicts"* ]] || fail "out does not report the conflict:
+$out"
+  [[ "$out" == *".caos/conflicts:"* ]] || fail "out does not carry the ledger:
+$out"
+  [[ "$out" == *f.txt* ]] || fail "out does not name the conflicted path:
+$out"
+  echo "  ok: out reports the conflict and inlines the ledger" >&2
+
   echo "== an identical merge is a cache hit with the same commit ==" >&2
   build_sides
   caos run-request-then "$(merge_run /cas/ours /cas/theirs)" \
-    --then:hash="$(next cached --was="$(caos hash /cas/args/result)" \
+    --then:hash="$(next cached --was="$(prop_hash)" \
       --ours="$ours" --base-c="$(cat /cas/args/base-c)")"
   ;;
 
 cached)
   caos get /cas/args/was; caos get /cas/args/ours; caos get /cas/args/base-c
-  [ "$(caos hash /cas/args/result)" = "$(cat /cas/args/was)" ] \
+  [ "$(prop_hash)" = "$(cat /cas/args/was)" ] \
     || fail "identical merge produced a different commit"
   echo "  ok: same two commits -> same M" >&2
 
@@ -186,6 +212,11 @@ clean)
     || fail "clean merge did not keep ours' f.txt"
   [ "$(cat "$t/ours.txt")" = "o" ]     || fail "clean merge dropped ours.txt"
   [ "$(cat "$t/theirs.txt")" = "tc" ]  || fail "clean merge dropped theirs.txt"
+  out=$(result_out)
+  [[ "$out" == *"completed cleanly"* ]] || fail "clean merge's out does not say so:
+$out"
+  if [[ "$out" == *"conflict"* ]]; then fail "clean merge's out mentions conflicts:
+$out"; fi
   echo "  ok: clean merge is a pure two-parent commit, no .caos/conflicts" >&2
 
   printf 'merge: ALL PASS\n' > /tmp/report

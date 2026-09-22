@@ -40,6 +40,20 @@ const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
 const MAX_SPINE_WALK: usize = 4096;
 static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
+/// Built-ins whose declaration lives in their image's `help`, and the arg that
+/// carries that image. This is a DISPATCH map — which image implements a tool —
+/// and deliberately says nothing about what any of them does.
+///
+/// `bash` is absent, and cannot join until a help can declare a non-string
+/// parameter: its `paths` is an ARRAY, while every `@param` is a string, so
+/// moving its schema here would silently narrow the tool.
+const BUILTIN_IMAGES: [(&str, &str); 4] = [
+    ("merge", "merge-image"),
+    ("caos-build", "caos-build-image"),
+    ("caos-test", "caos-test-image"),
+    ("caos-test-result", "caos-test-result-image"),
+];
+
 const STD_TOOLS: [(&str, &str); 3] = [
     ("caos-build", "caos-build-image"),
     ("caos-test", "caos-test-image"),
@@ -1664,14 +1678,9 @@ fn dispatch_started(
     // result comes back the tool's own path is no longer bound (`self_curry`
     // unbinds it) and `record.name` is only ever `run_tool`.
     let writer_storage;
-    if call.name == "run_tool" {
-        let path = tool_path_in_scope(call, record.source_tree_name.as_deref())?;
-        if let Ok(Ok(tool)) = tools::tool_at(&ws, &path) {
-            if tool.writer {
-                writer_storage = path;
-                extras.push(("tool-writer", Arg::Lit(&writer_storage)));
-            }
-        }
+    if let Some(declared) = declared_writer(call, record, &ws)? {
+        writer_storage = declared;
+        extras.push(("tool-writer", Arg::Lit(&writer_storage)));
     }
     let scope_storage;
     if call.name == "grep" {
@@ -1687,6 +1696,39 @@ fn dispatch_started(
     dispatched
         .map_err(|error| format!("launching recorded task {task} for {}: {error}", call.name))?;
     Ok(())
+}
+
+/// The name to report a writer by, if this call's tool DECLARED `@writer`.
+///
+/// Two sources, one rule. A repository tool is described by the `.caos-expr` at
+/// its path; a built-in by the `help` its curried image carries. Which image
+/// implements `merge` is something the harness must know either way — whether
+/// merge WRITES is not, and that is the whole point of reading it from the
+/// declaration instead of matching the name in `callback_result`.
+fn declared_writer(
+    call: &Call,
+    record: &CallRecord,
+    ws: &str,
+) -> Result<Option<String>, String> {
+    if call.name == "run_tool" {
+        let path = tool_path_in_scope(call, record.source_tree_name.as_deref())?;
+        // A path that no longer resolves is not this function's problem: the
+        // call already ran, and its result is about to be read.
+        return Ok(match tools::tool_at(ws, &path) {
+            Ok(Ok(tool)) if tool.writer => Some(path),
+            _ => None,
+        });
+    }
+    let Some(argument) = BUILTIN_IMAGES
+        .iter()
+        .find_map(|&(name, argument)| (name == call.name).then_some(argument))
+    else {
+        return Ok(None);
+    };
+    Ok(match tools::std_tool(&call.name, &arg(argument))? {
+        Some(tool) if tool.writer => Some(call.name.clone()),
+        _ => None,
+    })
 }
 
 fn dispatch_wait_started(
@@ -1727,9 +1769,10 @@ fn callback_result(
     state: &mut progress::State,
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
-    // A DECLARED writer, before the name match below. The arms in that match
-    // are the built-ins that still decide writer-ness by name; this is the
-    // path that replaces them (SPEC, "CaosTools" — Not built).
+    // A DECLARED writer. `merge` came through here once its `.caos-expr` said
+    // `@writer`, and every repository tool does. `bash` is the one writer still
+    // matched by NAME below, and only because its `paths` parameter is an array
+    // that no `@param` can yet describe (SPEC, "CaosTools" — Not built).
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
     }
@@ -1741,14 +1784,6 @@ fn callback_result(
                 tools::grep_result_block(&record.id, &arg("result"), &scope)?,
                 None,
             ))
-        }
-        "merge" => {
-            let proposal = Oid::parse(&cas_hash(&arg("result"))?, "merge result commit")?;
-            state.fetch_object(&proposal)?;
-            let tree = state.store().tree_of(&proposal)?;
-            let ws = fresh("merge-source-tree");
-            caos(["get-hash", tree.as_str(), &ws])?;
-            Ok((merge_result_block(&record.id, &ws)?, Some(proposal)))
         }
         "bash" => {
             let block = bash_result_block(&record.id)?;
@@ -3071,8 +3106,13 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(tools::grep_declaration());
     }
+    // Described by the help its IMAGE carries, like the std tools -- not by a
+    // literal here. The second copy that used to live in this file is what
+    // `std/merge/.caos-expr` warns against, and the two had already drifted.
     if cfg.merge_image.is_some() {
-        registry.push(with_source_tree(merge_tool()));
+        if let Some(tool) = tools::std_tool("merge", &arg("merge-image"))? {
+            registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
+        }
     }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
     for &(name, arg_name) in &STD_TOOLS {
@@ -3160,18 +3200,6 @@ fn bash_tool() -> Value {
     })
 }
 
-fn merge_tool() -> Value {
-    json!({
-        "name": "merge",
-        "description": "Three-way merge another commit into the current source tree. `theirs` is a full commit hash already imported into CAOS (a custom harness may also supply a named ref snapshot); the current side is the source tree as it is now. A clean merge advances the source tree to the merged result. A conflict advances it too, with git's inline conflict markers in the files and a reserved `.caos/conflicts` file listing every unresolved path — including structural conflicts (delete/modify, mode, binary) that have NO markers. Resolve each: edit the file (use `read` with the stage's oid as `root` to inspect its content), then delete that path's rows from `.caos/conflicts`. Saving the resolution removes the empty ledger and its .caos directory if empty. Bash changes are committed automatically, just like inline edits. Then run relevant checks.",
-        "input_schema": {
-            "type":"object",
-            "properties":{"theirs":{"type":"string","description":"Full imported commit hash. A ref name works only if the harness explicitly supplied a ref snapshot."}},
-            "required":["theirs"]
-        }
-    })
-}
-
 fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
     let id = call["id"].as_str().unwrap_or("");
     let theirs = call["input"]["theirs"]
@@ -3213,29 +3241,6 @@ fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, Str
             names.join(", ")
         }
     ))
-}
-
-fn merge_result_block(id: &str, ws: &str) -> Result<Value, String> {
-    let caos_dir = format!("{ws}/.caos");
-    let mut conflicts = None;
-    if Path::new(&caos_dir).exists() {
-        caos(["get", &caos_dir])?;
-        let file = format!("{caos_dir}/conflicts");
-        if Path::new(&file).exists() {
-            caos(["get", &file])?;
-            conflicts = Some(
-                fs::read_to_string(&file).map_err(|error| format!("reading conflicts: {error}"))?,
-            );
-        }
-    }
-    let text = match conflicts {
-        Some(body) => format!(
-            "merge produced conflicts. The source tree now carries git's inline conflict markers in the affected files, plus .caos/conflicts (git's unmerged notation, richer than markers). Resolve each path — edit the file, reading a stage's content with `read` (pass the stage oid as `root`) — then delete that path's rows from .caos/conflicts. Saving the resolution removes the empty ledger and its .caos directory if empty. Bash edits and deletions are committed automatically. Run relevant checks.\n\n.caos/conflicts:\n{}",
-            body.trim_end()
-        ),
-        None => "merge completed cleanly; the source tree is the merged result.".to_string(),
-    };
-    Ok(result_block(id, &text, false))
 }
 
 fn bash_result_block(id: &str) -> Result<Value, String> {

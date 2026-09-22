@@ -93,4 +93,36 @@ commit=/tmp/merge-commit
   printf 'committer caos <caos@caos> %s +0000\n' "$timestamp"
   printf '\nmerge %s into %s\n' "$theirs" "$ours"
 } > "$commit"
-caos put-commit "$commit" /cas/out
+caos put-commit "$commit" /cas/mergecommit
+
+# The writer result: `{prop, out}` (SPEC, "CaosTools"). `prop` is the COMMIT
+# above rather than a tree, because a merge is the one case that needs a second
+# parent -- every other writer hands back a tree and lets the harness mint.
+#
+# `out` IS WRITTEN HERE, not by the harness. It used to be composed in llm-step
+# from `.caos/conflicts`, which meant the tool's own answer depended on who ran
+# it; the same reasoning already put this tool's `help` in its `.caos-expr`.
+res=/tmp/merge-result
+rm -rf "$res"; mkdir -p "$res"
+if [ "$code" = 1 ]; then
+  # A quoted heredoc: this prose contains apostrophes and backticks, and
+  # printf with single quotes turns it into unreadable '"'"' escapes.
+  cat > "$res/out" <<'CONFLICTS'
+merge produced conflicts. The source tree now carries git's inline conflict
+markers in the affected files, plus .caos/conflicts (git's unmerged notation,
+richer than markers). Resolve each path -- edit the file, reading a stage's
+content with `read` (pass the stage oid as `root`) -- then delete that path's
+rows from .caos/conflicts. Saving the resolution removes the empty ledger and
+its .caos directory if empty. Bash edits and deletions are committed
+automatically. Run relevant checks.
+
+.caos/conflicts:
+CONFLICTS
+  cat "$work/.caos/conflicts" >> "$res/out"
+  # A conflict is NOT a failed call: the proposal is wanted and the model is
+  # being asked to finish it, so no `failed` entry.
+else
+  printf 'merge completed cleanly; the source tree is the merged result.\n' > "$res/out"
+fi
+ln -s /cas/mergecommit "$res/prop"
+caos put "$res" /cas/out

@@ -249,6 +249,35 @@ once did — makes the tool untestable through the surface an agent uses. If a
 result needs more detail than its report carries, expose the detail as ANOTHER
 TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 
+## Writers
+
+A tool that declares `@writer` PROPOSES A CHANGE to the tree it was run on
+instead of returning a value. Its result is `{prop, out, message?, failed?}`:
+
+- `prop` — the proposal. A TREE, and the harness mints the commit, which is
+  what lets almost every writer never handle a commit at all; or a COMMIT, for
+  the one case a second parent justifies (`merge`). A returned commit MUST
+  descend from the commit the tool was given: `reconcile` errors rather than
+  conflicts otherwise, so the harness checks it first and answers with an
+  error tool_result naming the tool and both commits
+- `out` — the text the model reads. REQUIRED: substituting a generic line for
+  a tool that forgot it would hide the tool's silence behind the harness's
+  voice
+- `message` — an optional commit message, used when the harness mints. Without
+  it the mint falls back to the tool's path
+- `failed` — present means the call failed. A marker entry rather than a banner
+  in `out`, because `out` is arbitrary logs and a build that printed `FAILED`
+  in passing would condemn a good proposal
+
+**SCOPE comes from the invocation, not the declaration.** A writer run on a
+source tree returns a source commit; one run on the conversation returns a
+conversation commit. The path the caller named already decides which, so the
+declaration says only WHETHER a tool writes, never where.
+
+A writer's `out` SHALL be its own. Composing it in the harness — as the merge
+conflict report once was — makes the tool's answer depend on who ran it, which
+is the same reason the `help` lives in the expression.
+
 ## Failure
 
 - A caller's mistake — a path that is not a tool, a missing required arg, an
@@ -265,29 +294,12 @@ TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
 Everything here was considered and deliberately deferred. Nothing above depends
 on any of it, and each is written down because the reason is easy to lose.
 
-- **A repository tool cannot propose a change, though it can now DECLARE that
-  it wants to.** `@writer` parses and `tool_help` reports it; nothing reads the
-  bit yet. Which of a tool's results is a proposed change and which is a
-  tree-shaped value is still decided by a HARDCODED MATCH ON THE TOOL'S NAME
-  (`llm-step`'s `callback_result`): only `bash` (returns a tree, the harness
-  mints the commit) and `merge` (returns a two-parent commit) can propose;
-  every other tool, including every repository tool, is value-only. It cannot
-  be inferred from the result instead, because `grep` returns a tree that is a
-  value and a reader may legitimately return a commit (a blame-like tool
-  answering with the commit it found). Replacing that match with the declared
-  bit is what the tag exists for.
-
-  The agreed shape for when it does: a writer's result is
-  `{prop, out, message?, failed?}` — `prop` a tree or a commit, `out` the text
-  the model reads, `message` an optional commit message for when the harness
-  mints (today it writes the tool name, so a conversation's source history is a
-  column of identical one-word messages), and `failed` a marker entry rather
-  than a banner in `out`, since a writer's `out` is arbitrary logs and says
-  `FAILED` in passing. Most writers return a tree and let the harness mint;
-  only a tool needing a second parent (merge) builds its own commit. SCOPE
-  comes from the INVOCATION, not the declaration: a writer run on a source tree
-  returns a source commit, one run on the conversation returns a conversation
-  commit, and the path the caller named already decides which.
+- **`bash` is the one writer still known by its NAME.** Its `paths` parameter
+  is an ARRAY and every `@param` is a string, so moving its schema into a help
+  — which is where `@writer` has to live — would silently narrow a heavily used
+  tool. It migrates when a help can declare a parameter's kind, which is the
+  typed-args item below. `callback_result` therefore still has one writer arm,
+  and `bash_result_block` still composes text the worker could render itself.
 - **`help` is read from the expression's text, not from the evaluated tree.**
   So a tool whose help lives only in a built image cannot be described. Reading
   it from the ArgTree would fix that, at the cost of `tool_help` having to
