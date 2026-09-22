@@ -94,6 +94,201 @@ We have various kinds of salt to control what work gets redone:
 If these become slow:
 - Sample `ps` during a run
 
+# CaosTools
+
+**Status:** built, in the minimal form below. The "Not built" list at the end of
+this section is the rest, and none of it is assumed anywhere.
+
+A CaosTool is an ArgTree designed to be run by an agent, distinguished from any
+other ArgTree by carrying a `help` argument that describes the arguments it
+accepts. A tool is therefore any directory in the conversation whose
+`.caos-expr` binds a `--help`. There is no registry, no reserved directory name,
+and nothing enumerates them.
+
+Two built-in tools address one by PATH:
+
+- `tool_help --path=<conversation path>` returns that tool's description and
+  parameters. It is an INLINE tool: it resolves the path, reads the
+  `.caos-expr` and parses the `help` here-string it binds, so it never
+  evaluates and never builds. It says which of three things went wrong — no
+  such path, no `.caos-expr`, or an expression binding no `--help` — since
+  each has a different fix, and it names the sibling directories, because a
+  wrong path is the ordinary mistake once nothing lists the tools. All three
+  are error tool_results, never worker failures.
+- `run_tool --path=<conversation path> --arguments=<object>` evaluates that
+  path and runs the resulting ArgTree with the given arguments. An undeclared
+  argument, a missing required one, or a non-string value is answered as an
+  error tool_result before anything is dispatched.
+
+Additionally a human runs a tool with `caos-cli run-tool <path> [--k=v ...]`.
+
+**Agents discover tools from documentation** — a repository's own `AGENTS.md`,
+README or design docs — not from a listing. That is the whole point of the
+change: enumerating them meant injecting every source tree's tools into the
+system prompt, so a conversation that gained a source tree mid-run re-keyed the
+prompt and grew it per tree. Naming a path instead makes the tool list
+TREE-INDEPENDENT, which is also what lets `caos mcp`'s listing be cached and
+makes a client that ignores `tools/list_changed` correct rather than stale. The
+price is real and deliberate: an undocumented tool is invisible. Prose may drift
+from the tool; `tool_help` is the authority, which is why it is cheap enough to
+call every time.
+
+## Resolution
+
+A path names a tree and a tool within it: the conversation-path prefix selects
+the source tree, and the remainder is evaluated against THAT TREE'S ROOT. Both
+halves matter. Evaluating against the conversation root instead would skip a
+repository's root `.caos-expr`, so `--base:@=DEEP-DEPS/<x>` inside the tool
+would resolve to nothing. And it is why a human's `run-tool` lands on the same
+ArgTree: the human has one source tree — the worktree — so the prefix is empty
+and the remainder is the whole path.
+
+`tool_help` resolves with `caos resolve`, which traverses commit entries, so a
+conversation-relative path reaches into a source tree without the caller
+unwrapping the gitlink.
+
+A tool is resolved fresh on every call, so an agent that edits a tool sees the
+change on its next call, within the same turn. A tool that lives in the
+conversation tree rather than inside a source tree gets no root `.caos-expr`,
+and so cannot reach `DEEP-DEPS/<x>`; in practice a tool belongs in a source
+tree.
+
+## Help text
+
+The `help` string is a JAVADOC comment, and it is authored as a HERE-STRING in
+the expression itself (design/caos-expr.md):
+
+```
+HELP=<<END
+Print one test's complete record from a `test` run.
+@param hash The hash the `test` report prints beside a test's name.
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
+```
+
+Authoring it there rather than in the script is what SPLITS the two identities:
+a `.caos-expr` is stripped from the tree its own expression is evaluated
+against, so editing the docs re-keys the tool's ArgTree — the thing a caller
+runs — and re-keys NOTHING the tool builds from. It is also what lets
+`tool_help` answer without evaluating.
+
+The free text before the first block tag is the tool's description (a tool
+with none gets a placeholder); `@param` tags declare the parameters:
+- `@param <name> <description>` — a REQUIRED parameter
+- `@param [<name>] <description>` — an OPTIONAL parameter
+
+The bracketed name is the one extension over stock javadoc, which has no
+notion of an optional parameter.
+
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`
+and `help` are refused: the interpreter, or the tool's own expression, binds
+those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
+skipped with a message, never silently turned into an arg the model cannot use.
+
+Every parameter is a STRING, because every arg reaches the script as a blob
+whatever JSON type it left the model as. `tool_help` states each one's name,
+whether it is required, and its documentation as prose rather than as a JSON
+schema — the model reads it, and a schema dump is the registry that was just
+removed. A tool with no `@param` tags takes no parameters: the source tree IS
+its input.
+
+## Invocation
+
+- The job is `curry(<tool arg tree>, <declared args>)` run with the source tree
+  as `--in`, where `<tool arg tree>` is what evaluating the tool's path yields
+- Evaluation happens where blocking is legal. A worker may not block, so the
+  agent's harness tail-calls `eval-path-then` and curries in the callback
+  (design/map-then.md); `caos-cli run-tool` evaluates directly. Both land on
+  the same ArgTree, so a hand-run and an agent call are one cache entry
+- Args are part of the ArgTree, and the ArgTree is the cache key. The same
+  tool called with different args is a different job; a repeat of either is a
+  cache hit. Tools need no keying logic of their own
+
+## Receiving args
+
+- A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
+  arg — `caos get` it before reading
+- An omitted optional arg simply does not exist; test with `[ -e ]`
+- Values are never shell-interpolated. They are argv elements to `caos curry`,
+  then bytes in a file
+
+## Returning a result
+
+The result is a git object whose shape the tool chooses. Three conventions,
+applied identically by `run-tool` and by the agent harness:
+
+- a BLOB — printed verbatim. The shape for a tool whose answer is text
+- a tree with a `report` file — the report is printed, and a `FAILED` banner
+  in it marks the call a failure. Do NOT use this shape for a tool that
+  returns arbitrary logs, which say `FAILED` all the time
+- any other tree — its top-level listing is shown
+
+Long results are truncated by keeping the TAIL, so a tool SHALL put its
+summary and its diagnostics last.
+
+A tool's printed answer SHALL be the same for both callers. A convention that
+shows the human more than the agent — as an extra pass over the result tree
+once did — makes the tool untestable through the surface an agent uses. If a
+result needs more detail than its report carries, expose the detail as ANOTHER
+TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
+
+## Failure
+
+- A caller's mistake — a path that is not a tool, a missing required arg, an
+  undeclared one, a non-scalar value — is answered as an error tool_result the
+  model can read and correct. The tool's own run never launches (the path
+  evaluation may still have happened; it is not the tool)
+- A tool's own EXPECTED failures SHALL be values too, not job errors: a tool
+  is often called precisely because something already went wrong, and a job
+  error there takes the agent's turn down with it
+- Unexpected failures die, per the reliability principles above
+
+## Not built
+
+Everything here was considered and deliberately deferred. Nothing above depends
+on any of it, and each is written down because the reason is easy to lose.
+
+- **A repository tool cannot propose a change.** Which of a tool's results is a
+  proposed source tree and which is a tree-shaped value is decided by a
+  HARDCODED MATCH ON THE TOOL'S NAME (`llm-step`'s `callback_result`): only
+  `bash` (returns a tree, the harness mints the commit) and `merge` (returns a
+  two-parent commit) can propose. Every other tool, including every repository
+  tool, is value-only. It cannot be inferred instead, because `grep` returns a
+  tree that is a value — so generalizing this needs one DECLARED read/write
+  field, which would also decide what `in` binds and which of the two result
+  shapes applies.
+- **`help` is read from the expression's text, not from the evaluated tree.**
+  So a tool whose help lives only in a built image cannot be described. Reading
+  it from the ArgTree would fix that, at the cost of `tool_help` having to
+  evaluate — which for a compiled tool means building it just to describe it.
+- **Agent args are string literals only.** A human's `run-tool` passes typed
+  args through (`--x:@=path`, `--x:hash=`), an agent's cannot, so a tool that
+  wants a tree works by hand and not from an agent. Closing it means declaring
+  the KIND that lands at `/cas/args/<name>` — the tool's contract — and leaving
+  the ROUTE to the caller, since the operators differ per caller and `:@@=` is
+  client-resolved only and so cannot be offered to an agent at all.
+- **`in` is bound unconditionally, and always the whole selected tree.** So
+  `caos-test-result`, whose entire input is a hash, carries the source tree in
+  its key and re-keys on every edit; `merge`, which never reads `in`, carries it
+  too. `grep` already shows the fix — it binds only the scope being searched,
+  which is why a scoped grep is cheap.
+- **The std tools (`caos-build`, `caos-test`, `caos-test-result`) are still
+  addressed by NAME**, because they arrive as curried image args rather than as
+  paths, and an ordinary repository has no `std/`. Path-addressing them needs
+  either a reserved path for harness-supplied tools or a repository opting in by
+  mounting std.
+- **`caos-cli run-tool` and `caos-cli run` are still separate verbs**, and
+  `run-tool` does not validate against the help, so "both callers build the same
+  ArgTree" is a goal rather than an invariant.
+- **A tool reaching a `:@@=` locator cannot be run by an agent.** The server's
+  eval walk refuses a locator (it is client-resolved only), and `caos mcp`'s
+  client-side pre-resolution is keyed by the MCP TOOL NAME
+  (`mcp::dispatch_call` → `caos::eval_tree_tool`), which is always `run_tool` —
+  so it looks for `caos-tools/run_tool`, finds nothing, and lets the server
+  refuse. This PREDATES path addressing: the tool list never offered a
+  repository tool under its own name, so the lookup never matched. The fix is
+  to key it on the path in the call's `arguments` instead.
+
 # Secrets
 
 **Status:** partly built. The store is carried as ephemeral run context and
@@ -330,115 +525,6 @@ There should be exactly one copy of the code that starts a stack and builds the 
 # From agents
 
 Agents, add more notes here
-
-# Tools
-
-Tools are workers that the llm can call directly
-
-## Declaring a tool
-
-A tool is a directory in `caos-tools` with a `.caos-expr` that returns an arg tree that includes a `help` that has a string value. The string describes how the tool should be called. The tool is run an ordinary caos job over the source tree. It has TWO callers and one contract: an agent's tool call (`worker-llm-step`), and `caos-cli run-tool <name> [--k=v ...]` by hand. Both build the same ArgTree, so a tool cannot behave differently depending on who invoked it
-
-The `help` string is a JAVADOC comment, and it is authored as a HERE-STRING in
-the expression itself (design/caos-expr.md):
-
-```
-HELP=<<END
-Print one test's complete record from a `test` run.
-@param hash The hash the `test` report prints beside a test's name.
-END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
-```
-
-Authoring it there rather than in the script is what SPLITS the two
-identities: a `.caos-expr` is stripped from the tree its own expression is
-evaluated against, so editing the docs re-keys the tool's ArgTree — the thing
-a caller runs — and re-keys NOTHING the tool builds from.
-
-**Listing READS the expression; invoking EVALUATES it.** An agent's tool
-registry is assembled mid-turn, inside a worker, which may not block on the
-runs an evaluation dispatches — and evaluating a compiled tool would build it
-just to list it. So discovery takes the `help` bytes straight out of the
-`.caos-expr` text, and invocation evaluates. The two agree because they name
-the same here-string. A directory whose expression binds no `--help` is not a
-tool; it is skipped, loudly.
-
-The free text before the first block tag is the tool's description (a tool
-with none gets a placeholder); `@param` tags declare the parameters:
-- `@param <name> <description>` — a REQUIRED parameter
-- `@param [<name>] <description>` — an OPTIONAL parameter
-
-The bracketed name is the one extension over stock javadoc, which has no
-notion of an optional parameter.
-
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt` and
-`help` are refused: the interpreter, or the tool's own expression, binds those
-itself and currying SHALL fail on a rebind. A malformed `@param` tag is skipped
-with a message, never silently
-turned into an arg the model cannot use.
-
-Every parameter is declared to the model as a string, because every arg
-reaches the script as a blob whatever JSON type it left the model as. A tool
-with no `@param` tags takes no parameters: the source tree IS its input.
-
-## Invocation
-
-- The job is `curry(<tool arg tree>, <declared args>)` run with the source tree
-  tree as `--in`, where `<tool arg tree>` is what evaluating
-  `caos-tools/<name>` yields
-- The two callers reach that evaluation differently, and must land on the same
-  ArgTree: `caos-cli run-tool` evaluates directly (a client may block), while
-  an agent's worker tail-calls `eval-path-then` and curries in the callback
-  (design/map-then.md). A hand-run and an agent call are then one cache entry
-- Tools are discovered fresh from the CURRENT source tree on every LLM round and
-  resolved again at INVOCATION time, so an agent that edits a tool sees the
-  change on its next call, within the same turn
-- `bash`, `grep`, `read`, `ls`, `write`, `edit`, and `import_source` are reserved. A
-  `caos-tools/bash/` is ignored, not registered — the model's primitives,
-  including the repair path for a broken tool edit, stay stable whatever the
-  tree carries
-- A directory under `caos-tools/` with no `.caos-expr` is not a tool
-
-## Receiving args
-
-- A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
-  arg — `caos get` it before reading
-- An omitted optional arg simply does not exist; test with `[ -e ]`
-- Values are never shell-interpolated. They are argv elements to `caos curry`,
-  then bytes in a file
-- Args are part of the ArgTree, and the ArgTree is the cache key. The same
-  tool called with different args is a different job; a repeat of either is a
-  cache hit. Tools need no keying logic of their own
-
-## Returning a result
-
-The result is a git object whose shape the tool chooses. Three conventions,
-applied identically by `run-tool` and by the agent harness:
-
-- a BLOB — printed verbatim. The shape for a tool whose answer is text
-- a tree with a `report` file — the report is printed, and a `FAILED` banner
-  in it marks the call a failure. Do NOT use this shape for a tool that
-  returns arbitrary logs, which say `FAILED` all the time
-- any other tree — its top-level listing is shown
-
-Long results are truncated by keeping the TAIL, so a tool SHALL put its
-summary and its diagnostics last.
-
-A tool's printed answer SHALL be the same for both callers. A convention that
-shows the human more than the agent — as an extra pass over the result tree
-once did — makes the tool untestable through the surface an agent uses. If a
-result needs more detail than its report carries, expose the detail as ANOTHER
-TOOL taking a hash (`caos-test` and `caos-test-result`), not as richer printing.
-
-## Failure
-
-- A caller's mistake — a missing required arg, an undeclared one, a
-  non-scalar value — is answered as an error tool_result the model can read
-  and correct. The sub-run never launches
-- A tool's own EXPECTED failures SHALL be values too, not job errors: a tool
-  is often called precisely because something already went wrong, and a job
-  error there takes the agent's turn down with it
-- Unexpected failures die, per the reliability principles above
 
 # Merging and conflict resolution
 

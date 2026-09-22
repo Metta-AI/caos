@@ -562,17 +562,6 @@ fn reject_reserved_caos(t: &GitTransport, commit: &str, what: &str) -> Result<()
     }
 }
 
-/// Sub-phase timing of the most recent `ensure_code_commit`, so discovery can
-/// tell which of its three network/disk steps ate the wall clock. Written on
-/// every call; read once by `declarations`.
-static CODE_COMMIT_TIMING: Mutex<Option<String>> = Mutex::new(None);
-
-/// The breakdown recorded by the last `ensure_code_commit`, e.g.
-/// `ensure-local 0.1s, is-ancestor 0.0s, ensure-pushed 115.0s`.
-pub fn code_commit_timing() -> Option<String> {
-    CODE_COMMIT_TIMING.lock().ok().and_then(|slot| slot.clone())
-}
-
 fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> Result<(), String> {
     let mark = Instant::now();
     store.ensure_local(commit)?;
@@ -598,18 +587,15 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
         is_ancestor.as_secs_f64(),
         ensure_pushed.as_secs_f64(),
     );
-    // Recorded to the journal as well as the static, because the process that
-    // pays this is usually `mcp hook` -- which has no `declarations` later to
-    // read the static out, so until now the most expensive measurement caos
-    // takes was computed once per prompt and discarded every time.
+    // The journal is the only channel for this, and it has to be: the process
+    // that pays this is usually `mcp hook`, which exits without printing a
+    // summary, so the most expensive measurement caos takes was once computed
+    // per prompt and discarded every time.
     let (held, sent) = caos::push_counts();
     caos::timing::record(
         "code-commit",
         &format!("{breakdown} [objects: {held} already on the server, {sent} pushed]"),
     );
-    if let Ok(mut slot) = CODE_COMMIT_TIMING.lock() {
-        *slot = Some(breakdown);
-    }
     pushed
 }
 

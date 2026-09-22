@@ -17,6 +17,7 @@ Conversation filesystem:
 
 - If a tool fails, report the observed error and uncertainty; do not invent storage behavior or claim success from a failed check. Use available repository tools for relevant tests; describe a specific missing capability rather than assuming workers cannot run tests or reach a server.
 - Git tools require the target commit-entry path explicitly. Invoke repository tools with run_tool at a conversation-relative path. UI selection never changes your execution context.
+- Repository tools are not listed for you. A tool is any directory carrying a .caos-expr that binds a help, and each repository documents its own in AGENTS.md or its docs. Call tool_help with that conversation-relative path (for example feature/01-change/caos-tools/test) to get its parameters, then run_tool with the same path and those arguments under `arguments`. tool_help reads the tree only and never builds anything, so prefer it over guessing parameters from prose; the docs can be stale, the help cannot.
 
 - Use import_source(source="https://github.com/owner/repo.git", revision="main", into="imports/repo/main-2") for remote code. Omit revision for the default branch. Public imports need no token; private imports use the granted github-token secret. Each new call observes the remote; retries of a persisted call keep its pinned commit. Choose an unused path and preserve the imported snapshot. The tool returns a full commit hash and records provenance in its .source.json sibling. It does not merge code.
 - For origin/main, read the selected source's import provenance, use that repository URL and revision main with import_source, then merge the returned commit into the intended source tree. If provenance is ambiguous, use an explicit repository. Remote names are not local ref snapshots.
@@ -42,6 +43,13 @@ pub(super) fn context(view: &Conversation<'_>) -> Result<String, String> {
     ))
 }
 
+/// Each source tree's own instructions, as its `AGENTS.md`.
+///
+/// It does NOT list that tree's tools. Enumerating them here meant the system
+/// prompt grew per source tree and changed whenever a conversation gained one,
+/// re-keying the prompt mid-run; a repository tool is reached by path instead,
+/// through `tool_help` and `run_tool` (SPEC, "CaosTools"). What a repository
+/// says about its own tools belongs in the `AGENTS.md` this does carry.
 pub(super) fn repository_context(
     view: &Conversation<'_>,
     roots: &[String],
@@ -58,18 +66,6 @@ pub(super) fn repository_context(
 
 Repository instructions for source tree {name:?} only (follow applicable nested AGENTS.md when editing):
 {bounded}"));
-        }
-        let tools = tools::tree_tools(root)?
-            .iter()
-            .map(tools::tree_tool_declaration)
-            .collect::<Vec<_>>();
-        if !tools.is_empty() {
-            context.push_str(&format!(
-                "
-
-Repository tools for source tree {name:?}; invoke using run_tool with path {name}/caos-tools/<tool-name>: {}",
-                serde_json::to_string(&tools).map_err(|e| e.to_string())?
-            ));
         }
     }
     Ok(context)

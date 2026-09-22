@@ -83,12 +83,12 @@ Examples:
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching
 
 Caos uses `eval-path` in several places:
-- When an agent requests a tool: `eval-path caos-tools/<tool>` yields the
-  tool's ArgTree — reached by the agent's worker as `eval-path-then`, and by
-  `caos-cli run-tool` directly. REGISTERING the tools does not evaluate: the
-  listing reads each `caos-tools/<name>/.caos-expr` for its `--help`
-  here-string, because a worker assembling the round's registry cannot block,
-  and listing a compiled tool should not build it (SPEC, "Tools")
+- When an agent requests a tool: `eval-path <tool path>` yields the tool's
+  ArgTree — reached by the agent's worker as `eval-path-then`, and by
+  `caos-cli run-tool` directly. DESCRIBING a tool does not evaluate:
+  `tool_help` reads that directory's `.caos-expr` for its `--help`
+  here-string, so describing a compiled tool does not build it (SPEC,
+  "CaosTools")
 - When running an image: `eval-path <image>`
 
 This replaces many other mechanisms:

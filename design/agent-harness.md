@@ -234,9 +234,14 @@ Two arguments cut the model out of the step, for a harness that owns the model
 itself. `caos mcp` is that harness: Claude Code chooses the calls and reads the
 results, and caos keeps the durable record.
 
-- `--list-tools` (optionally `--workspace:hash=<tree>`) describes the registry
-  as JSON and stops. Nothing about a conversation is read: a tool server is
-  asked for its tools before there is a conversation to run them in.
+- `--list-tools` describes the tools as JSON and stops. Nothing about a
+  conversation is read, and NO TREE IS NAMED: a tool server is asked for its
+  tools before there is a conversation to run them in, and a repository's own
+  tools are reached by path through `tool_help`/`run_tool` rather than
+  enumerated (SPEC, "CaosTools"). The answer is therefore the same whatever
+  source trees a conversation gains. It used to accept
+  `--workspace:hash=<tree>`, which pushed the caller's whole working tree to
+  the server for an argument the step never read.
 - `--tools-only=<call id>` drains the request's declared calls and stops,
   leaving the request RUNNING for the next one, with the conversation as it
   now stands as its result. The named call must have completed by the time the
