@@ -342,24 +342,19 @@ if [ -n "${dev_sha:-}" ]; then
     expr_file="$PWD/.caos-expr"
     lock_file="$PWD/flake.lock"
     if [ -w "$expr_file" ] && [ -r "$lock_file" ]; then
-        # PROTECTED FIRST, before the ticket is written into either file. A
-        # `caos://` URL ends in the token that authorizes driving that server,
-        # so these two files are about to become credentials -- and an agent
-        # working in this checkout must not be able to commit them. Doing this
-        # first means there is no window in which they are committable.
+        # THE TICKET HAS TO REACH THE CONVERSATION, so nothing here may hide
+        # these edits from git. `--skip-worktree` was tried, to stop an agent
+        # committing a `caos://` URL that is also a credential, and it made dev
+        # mode a no-op: caos ingests the checkout through `hash_dir`, which
+        # copies the REAL index for its stat cache and so inherits that bit,
+        # and `git add -u <dir>` on a skip-worktree path exits 0 and silently
+        # keeps HEAD's blob. Both files reverted together, so the loader's
+        # rev-drift check saw two consistent files and passed, and every
+        # conversation evaluated the committed pin while the hook logged
+        # success. The ticket goes to the user's own caosd either way; what is
+        # left is an agent committing it upstream, and that is a push-time
+        # concern, not a reason to lie to git about what is on disk.
         #
-        # `--skip-worktree`, NOT `.git/info/exclude`, and the difference is the
-        # whole of it: exclude (like .gitignore) governs UNTRACKED files only,
-        # and both of these are tracked in a client repo. Measured -- with them
-        # merely excluded, `git status` still reported ` M .caos-expr` and
-        # ` M flake.lock`, so `git commit -a` would have published the ticket.
-        # skip-worktree tells git to ignore local changes to a tracked file,
-        # which is exactly this case.
-        for f in .caos-expr flake.lock; do
-            git update-index --skip-worktree "$f" 2>/dev/null \
-                || log "could not protect $f from being committed; it will hold the server ticket"
-        done
-
         # Every `:@@=` locator repointed at this server at this commit, keeping
         # each one's own `dir=`: the expression names two (the loader's image
         # and the tree it splices) and they differ only by that.
