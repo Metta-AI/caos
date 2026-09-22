@@ -4,10 +4,9 @@
 #
 # Repository tools (SPEC "CaosTools"): a tool is any DIRECTORY whose
 # `.caos-expr` binds the javadoc `help` (description as free text, `@param` tags
-# as the parameters), addressed by PATH. `tool_help` describes one by READING
-# that expression — no evaluation, so describing a compiled tool never builds
-# it — and `run_tool` asks the server to EVALUATE it, then curries the model's
-# args onto the ArgTree it yields and runs it over the tree.
+# as the parameters), addressed by PATH. Both calls evaluate the path to get
+# the image. `tool_help` reads its help; `run_tool` validates arguments, curries
+# them onto the image and runs it over the original source tree.
 #
 # NOTHING ENUMERATES THE TOOLS, and the first stage below asserts exactly that:
 # the declared tool list holds `tool_help`/`run_tool` and no `hello`, and the
@@ -91,6 +90,34 @@ cp /tmp/ws/caos-tools/hello/worker.sh /tmp/ws/caos-tools/undocumented/worker.sh
 printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
   > /tmp/ws/caos-tools/undocumented/.caos-expr
 
+# An ancestor computes a tools/ directory absent from the stored source tree.
+# The target's input must still be the ORIGINAL source tree, with this marker.
+printf 'original-source' > /tmp/ws/input-marker
+tool generated 'Generated tool.
+@param word The supplied word.' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/in
+caos get /cas/args/in/input-marker
+caos get /cas/args/word
+printf 'generated word=%s input=%s' "$(cat /cas/args/word)" \
+  "$(cat /cas/args/in/input-marker)" > /tmp/o
+caos put /tmp/o /cas/out
+EOF
+mkdir -p /tmp/ws/generator/templates
+mv /tmp/ws/caos-tools/generated /tmp/ws/generator/templates/hello
+cat > /tmp/ws/generator/generate.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/in
+caos get /cas/args/in/templates
+mkdir -p /tmp/generated
+ln -s /cas/args/in/templates /tmp/generated/tools
+caos put /tmp/generated /cas/out
+EOF
+printf 'run --base:hash=%s --worker1:@=generate.sh --in:@=.\n' "$bash_img" \
+  > /tmp/ws/generator/.caos-expr
+
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the tooled source_tree")
 
 stage "script the stub LLM (describe; edit; bad call; dead sub-run; good call)"
@@ -99,7 +126,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good call)"
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -140,7 +167,7 @@ if grep -qF 'impostor' /tmp/stub/request-1.json; then
 fi
 echo "  ok: tool_help + run_tool declared; no tool of the tree's own" >&2
 
-stage "tool_help: doc and the @param contract, without evaluating anything"
+stage "tool_help: doc and the @param contract after evaluation"
 grep -qF 'Say hello from the tree.' /tmp/stub/request-2.json \
   || fail "tool_help did not carry the tool's description"
 grep -qF 'word (required)' /tmp/stub/request-2.json \
@@ -151,14 +178,14 @@ grep -qF 'The word to echo.' /tmp/stub/request-2.json \
   || fail "tool_help dropped a @param's documentation"
 echo "  ok: word required, suffix optional, docs carried" >&2
 
-stage "tool_help: the two not-a-tool answers, each naming the siblings"
+stage "tool_help: invalid definitions and missing paths with sibling hints"
 grep -qF 'binds no `--help`' /tmp/stub/request-2.json \
   || fail "an expression with no --help was not distinguished from a non-tool"
 grep -qF 'no such path' /tmp/stub/request-2.json \
   || fail "a path that does not exist was not reported as such"
 # Discovery is documentation, so a wrong path is the ordinary mistake: the
 # siblings turn it into a self-correcting one instead of a round trip.
-grep -qF 'Directories in main/caos-tools:' /tmp/stub/request-2.json \
+grep -qF 'Directories in caos-tools:' /tmp/stub/request-2.json \
   || fail "a bad tool path did not name the sibling directories"
 echo "  ok: no-help, no-such-path, and the sibling listing" >&2
 
@@ -176,9 +203,9 @@ stage "a tool whose SUB-RUN dies is an is_error result, not a dead turn"
   || fail "the turn died on the failing tool instead of continuing"
 grep -qF 'the `run_tool` tool failed to run' /tmp/stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
-# Four: the two bad `tool_help` paths, the missing required arg, and the dead
+# Five: the three bad `tool_help` paths, the missing required arg, and the dead
 # sub-run. Every one is a value the model can read, not a dead turn.
-[ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 4 ] \
+[ "$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)" = 5 ] \
   || fail "the tool_help, validation and sub-run failures were not all is_error"
 # The good call is after both failures in the same queue. Its result proves
 # that the queue continued, the bash edit survived the failed sub-run, and the
@@ -200,4 +227,11 @@ case "$(git show "$final_source_tree:caos-tools/hello/worker.sh")" in
 esac
 echo "  ok: the dead sub-run came back as a value and the queued tool still ran" >&2
 
+stage "generated tools use ancestor evaluation and preserve the original input"
+grep -qF 'Generated tool.' /tmp/stub/request-2.json \
+  || fail "help did not describe the evaluated generated tool"
+grep -qF 'generated word=supplied input=original-source' /tmp/stub/request-2.json \
+  || fail "generated invocation lost its arguments or original source input"
+grep -qF 'main/generator/tools/missing' /tmp/stub/request-2.json \
+  || fail "missing generated path did not produce a useful error"
 pass caos-tools
