@@ -330,15 +330,22 @@ if [ -n "${dev_sha:-}" ]; then
     expr_file="$PWD/.caos-expr"
     lock_file="$PWD/flake.lock"
     if [ -w "$expr_file" ] && [ -r "$lock_file" ]; then
-        # EXCLUDED FIRST, before the ticket is written into either file. A
+        # PROTECTED FIRST, before the ticket is written into either file. A
         # `caos://` URL ends in the token that authorizes driving that server,
         # so these two files are about to become credentials -- and an agent
         # working in this checkout must not be able to commit them. Doing this
         # first means there is no window in which they are committable.
-        mkdir -p "$PWD/.git/info"
+        #
+        # `--skip-worktree`, NOT `.git/info/exclude`, and the difference is the
+        # whole of it: exclude (like .gitignore) governs UNTRACKED files only,
+        # and both of these are tracked in a client repo. Measured -- with them
+        # merely excluded, `git status` still reported ` M .caos-expr` and
+        # ` M flake.lock`, so `git commit -a` would have published the ticket.
+        # skip-worktree tells git to ignore local changes to a tracked file,
+        # which is exactly this case.
         for f in .caos-expr flake.lock; do
-            grep -qxF "$f" "$PWD/.git/info/exclude" 2>/dev/null \
-                || echo "$f" >> "$PWD/.git/info/exclude"
+            git update-index --skip-worktree "$f" 2>/dev/null \
+                || log "could not protect $f from being committed; it will hold the server ticket"
         done
 
         # Every `:@@=` locator repointed at this server at this commit, keeping
