@@ -313,7 +313,19 @@ if [ -n "${dev_sha:-}" ]; then
         fi
     done
     if [ -n "$overlaid" ]; then
-        step "dev client installed:$overlaid"
+        # AND SAY SO IN THE VERSION, because otherwise nothing does. `bin/caos`
+        # is a wrapper that exports a `CAOS_REV` baked in at install time, and
+        # the overlay above replaces only the binary it execs -- so `caos
+        # --version` and `caos_status` both go on reporting the PINNED build
+        # while a different one runs. Measured in a live session: diagnostics
+        # read `client CAOS_REV: build-3bf5b67cd5a7` with the dev client in
+        # place, which is the exact reading that would send someone to debug
+        # why dev mode had not taken.
+        if [ -w /usr/local/bin/caos ]; then
+            sed -i "s|CAOS_REV:-[^}]*}|CAOS_REV:-dev-${dev_sha:0:12}}|" /usr/local/bin/caos \
+                || log "could not stamp the wrapper; caos --version will name the pinned build"
+        fi
+        step "dev client installed:$overlaid (caos --version now says dev-${dev_sha:0:12})"
     else
         log "refs/caos/dev carries no dev-bin/; leaving the pinned client in place"
     fi
