@@ -46,9 +46,9 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, ensure_code_commit, fetch_validated_head, mint_transition,
-    oid, open_store, push_cas, reject_reserved_caos, resolve_base, resolve_username, signature,
-    update_local_cache, TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
+    conversation_ref, default_title, fetch_validated_head, mint_transition, oid, open_store,
+    push_cas, resolve_base, resolve_username, seed_content, signature, update_local_cache,
+    TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
 /// Conversation ids for recorded sessions live under one component so they are
@@ -704,15 +704,11 @@ fn root_commit(
     let base = oid(&resolve_base(t, options)?, "conversation base")?;
     cc_timing("resolve_base", phase.elapsed());
     let phase = std::time::Instant::now();
-    ensure_code_commit(t, store, &base)?;
+    // The client repo's own tree becomes the conversation's content, at the
+    // root -- the same `seed_content` the tui uses, so a recorded session and a
+    // hand-driven one start identically.
+    let content = seed_content(t, store, &base)?;
     cc_timing("ensure_code_commit", phase.elapsed());
-    reject_reserved_caos(t, base.as_str(), "base code")?;
-    // Seed the base as the conversation's `code/dirty` source tree -- the shape
-    // `mint_conversation_root` builds for the tui, so a recorded session and a
-    // hand-driven one carry code the same way.
-    let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
-    content.put_oid("code/dirty", conversation_protocol::v3::Mode::Commit, base);
-    let content = content.build(store)?;
     let genesis = oid(G3, "v3 genesis")?;
     let root = Transition::ConversationRoot {
         identity: Identity {

@@ -228,13 +228,20 @@ done < talk.parents
 [ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
   || fail "conversation spine did not end at G3"
 
-source_tree_output=$($TOOL source-tree --repo "$PWD" --head "$tip" --name code/dirty)
-source_tree=${source_tree_output%%$'\n'*}
-source_tree=${source_tree#commit }
-git -c fetch.negotiationAlgorithm=noop fetch -q caos "$source_tree" \
-  || fail "fetching main source_tree"
-[ "$(git show "$source_tree:notes/todo.txt")" = "hello notes" ] \
-  || fail "completed conversation lost its base source_tree"
+# THE BASE IS THE CONVERSATION'S OWN CONTENT, at the root -- not a source tree
+# at `code/dirty`, which is what this asserted before. A session starts from a
+# caos CLIENT repo (SPEC, "Agent/harness integration"): a pin, an `AGENTS.md`,
+# `.caos-secrets` declarations. That is conversation content, so it lands where
+# the agent's file tools land, and `--base` seeds it directly.
+#
+# Read the same way `.caos/title` is read above, which is the point: there is
+# no source tree to resolve and fetch, because there is no source tree until
+# something is imported.
+[ "$($TOOL read --repo "$PWD" --head "$tip" --path notes/todo.txt)" = "hello notes" ] \
+  || fail "completed conversation lost its base content"
+if $TOOL source-tree --repo "$PWD" --head "$tip" --name code/dirty >/dev/null 2>&1; then
+  fail "conversation still carries a code/dirty source tree; --base seeds the root now"
+fi
 
 admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
 admission=$($TOOL request --repo "$PWD" --head "$admitted")
