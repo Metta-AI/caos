@@ -96,8 +96,11 @@ curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 ```
 
 This `--base` says where `setup.sh`, `caos-pin.sh` and `session-start.sh` come
-from. It does **not** choose the caos that gets installed when the repository
-pins one: `flake.lock` outranks it, and the line above then never needs editing
+from, and **only** that. It does not choose the caos that gets installed — the
+repository's `flake.lock` does, and `install.sh` accepts nothing but a full
+commit sha, so the branch here can never become the client. A repository that
+pins no caos does not fall back to this branch; setup fails, naming what is
+missing. The line above then never needs editing
 again.
 
 **Environment variable**: `CAOS_SERVER_URL`, holding either —

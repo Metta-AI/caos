@@ -1,24 +1,37 @@
 #!/bin/bash
 # Install the caos Claude Code client into a repository.
 #
-#   B=https://raw.githubusercontent.com/Metta-AI/caos/main
+#   C=<the 40-hex commit your client repo pins>
+#   B=https://raw.githubusercontent.com/Metta-AI/caos/$C
 #   curl -fsSL "$B/integrations/claude-code/cloud/install.sh" | bash -s -- --base="$B"
 #
-# `--base` says which caos, and is the only thing that does. It names a repo and
-# a ref -- a branch, a tag or a sha -- and the client installed is the newest
-# build at or before that point. Swap `main` for anything else to install from
-# there.
+# `--base` says which caos, and is the only thing that does. It ends in a FULL
+# COMMIT SHA -- not a branch, not a tag -- and installs that commit's published
+# build, or fails.
+#
+# WHY A COMMIT AND NOTHING ELSE. A client repo pins caos in `flake.lock`, which
+# records revisions, and the SAME revision rides in the root expression's
+# `:@@=` locators, where `std/flake-input-loader` refuses the tree unless the
+# two agree. So the step a session runs is always resolved through one specific
+# commit. A branch here could only install a client from a different tree than
+# its own tools -- the one pairing this file exists to keep. There is no
+# fallback to an earlier build for the same reason: a written-down commit is
+# honoured or refused, never quietly replaced.
+#
+# `setup.sh`'s `--base` is a DIFFERENT thing and may name a branch: it says
+# where the bootstrap scripts come from, not which caos gets installed. It
+# reads the commit out of the checkout and passes that here.
 #
 # There is deliberately no --branch, --commit or --version. The URL already
-# names a ref, and a flag that could name a DIFFERENT one would only ever be
-# used to install a client that does not match the script installing it.
+# names the commit, and a flag that could name a DIFFERENT one would only ever
+# be used to install a client that does not match the script installing it.
 #
 # Saying it twice is not redundant: a script piped into bash cannot see its own
 # URL -- no $0, no path, no referrer -- so it has to be told the thing it was
 # just fetched from.
 #
-# Resolving a ref needs `git` and one `ls-remote`, and downloading needs `curl`.
-# Nothing here touches api.github.com: see the note above the resolution.
+# Resolving the build needs `git` and one `ls-remote`, and downloading needs
+# `curl`. Nothing here touches api.github.com: see the note above the resolution.
 #
 # It installs three things into the CURRENT REPOSITORY plus one binary:
 #
@@ -76,12 +89,11 @@ for arg in "$@"; do
     esac
 done
 
-# --base is the repo and the ref -- `<raw>/<owner>/<repo>/<ref>` -- and NOTHING
-# more: the integration path is added by the URLs that fetch from it, not baked
-# into --base, so the value reads as the base it is. Peeled by stripping owner
-# and repo from the front; whatever remains is the ref, so a slashed branch
-# (`feature/x`) survives where counting fields would take `feature` and resolve
-# against the wrong tree.
+# --base is the repo and the commit -- `<raw>/<owner>/<repo>/<sha>` -- and
+# NOTHING more: the integration path is added by the URLs that fetch from it,
+# not baked into --base, so the value reads as the base it is. Peeled by
+# stripping owner and repo from the front; whatever remains is checked below to
+# be a full sha.
 rest="${BASE#"$RAW"/}"
 owner="${rest%%/*}"; rest="${rest#*/}"
 name="${rest%%/*}";  REF="${rest#*/}"
@@ -105,20 +117,15 @@ case "$(uname -s)/$(uname -m)" in
 esac
 
 # A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
-# resolving one is a lookup rather than a parse. A name carrying the branch
-# cannot be taken apart again: `-` is legal in a branch name, so `cc` and
-# `cc-conversations` produce tags no rule can separate.
+# resolving one is a lookup rather than a parse.
 #
-# Resolved with `git ls-remote`, NOT api.github.com. That API is anonymous
-# here, so it is rate limited to 60 requests an hour PER IP -- and a cloud VM
-# shares its egress address with every other cloud VM, so the budget is spent
-# by strangers and the 403 is nothing this side can fix.
-#
-# ls-remote has no such limit, needs no token, speaks to github.com like the
-# download does, and answers both halves of the question at once: the refs it
-# lists include the branch heads AND every `build-<commit>` tag.
+# Read with `git ls-remote`, NOT api.github.com. That API is anonymous here, so
+# it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares its
+# egress address with every other cloud VM, so the budget is spent by strangers
+# and the 403 is nothing this side can fix. ls-remote has no such limit, needs
+# no token, and speaks to github.com like the download does.
 if ! command -v git >/dev/null 2>&1; then
-    echo "resolving $REF needs git" >&2
+    echo "resolving the build for $REF needs git" >&2
     exit 1
 fi
 remote="https://github.com/$REPO"
@@ -128,122 +135,56 @@ if ! refs="$(git ls-remote "$remote" 2>&1)"; then
     exit 1
 fi
 
-# Looked up before being guessed at: a name that IS a branch or a tag is one,
-# and only a name that is neither gets treated as a commit. Deciding by shape
-# instead would mean asking whether a string looks like a sha, and a branch may
-# be named anything at all.
-sha=""
-while IFS=$'\t' read -r s r; do
-    case "$r" in
-        # A peeled annotated tag is the commit; the unpeeled ref is the tag
-        # object, which nothing was ever built from.
-        "refs/tags/$REF^{}") sha="$s"; break ;;
-        "refs/heads/$REF"|"refs/tags/$REF") sha="$s" ;;
-    esac
-done <<< "$refs"
+# A COMMIT, AND ONLY A COMMIT. `--base` names the caos this client IS, and with
+# a repo-pinned step that is never a name: `caos-pin.sh` reads it out of
+# `flake.lock`, which records revisions, and the same revision is what the
+# expression's `:@@=` locators carry -- the two must agree or
+# `std/flake-input-loader` refuses the tree. So a branch cannot reach here
+# through the supported path, and accepting one could only produce the pairing
+# this file exists to prevent: a client from a moving head driving tools
+# resolved through some other commit.
+#
+# What used to be here was a branch/tag lookup plus a walk back to the newest
+# build at or before the ref, for the window in which a branch head has no
+# build yet. Both are gone with the branch: a written-down commit is honoured
+# or refused, never quietly replaced. The cost is stated in the READMEs --
+# push, wait for `build-<commit>`, then re-pin.
+case "$REF" in
+    *[!0-9a-f]* | "")
+        echo "--base must end in a full commit sha, not $REF" >&2
+        echo "  A client repo pins caos by revision (flake.lock), and the step" >&2
+        echo "  resolves through that same revision, so a branch or tag here" >&2
+        echo "  would install a client from a different tree than its tools." >&2
+        exit 2
+        ;;
+esac
+if [ "${#REF}" != 40 ]; then
+    echo "--base must end in a FULL 40-character commit sha; got ${#REF} characters" >&2
+    echo "  ($REF). That is what flake.lock records and what the expression pins." >&2
+    exit 2
+fi
 
 builds=""
 while IFS=$'\t' read -r s r; do
     case "$r" in refs/tags/build-*) builds="$builds${r#refs/tags/}"$'\n' ;; esac
 done <<< "$refs"
 
-# THE NEWEST BUILD AT OR BEFORE A COMMIT, which is what the header at the top
-# of this file has always promised and what the code never did.
-#
-# A branch head has no build until its workflow finishes, and in that window
-# every environment built from that branch failed to install a client AT ALL --
-# one push, and the next cloud session comes up with no caos in it. A slightly
-# older client is a different thing from no client.
-#
-# Needs history, which `ls-remote` does not carry, so it shallow-fetches the ref
-# and walks back. Fifty is a bound, not a guess: past that, something other than
-# "CI is still running" is wrong, and saying so is more use than reaching
-# further back.
-WALK_DEPTH=50
-newest_build_at_or_before() { # <ref-or-sha> ; prints build-<12 hex>
-    local ref=$1 dir walk commit short
-    dir="$(mktemp -d)"
-    if ! git -C "$dir" init -q . 2>/dev/null \
-        || ! git -C "$dir" fetch -q --depth "$WALK_DEPTH" "$remote" "$ref" 2>/dev/null; then
-        rm -rf "$dir"
-        return 1
-    fi
-    walk="$(git -C "$dir" log --format=%H FETCH_HEAD 2>/dev/null)"
-    rm -rf "$dir"
-    [ -n "$walk" ] || return 1
-    while IFS= read -r commit; do
-        short="${commit:0:12}"
-        case "$builds" in
-            *"build-$short"$'\n'*) printf 'build-%s\n' "$short"; return 0 ;;
-        esac
-    done <<< "$walk"
-    return 1
-}
-
-if [ -n "$sha" ]; then
-    VERSION="build-${sha:0:12}"
-    case "$builds" in
-        *"$VERSION"$'\n'*) ;;
-        *)
-            echo "$REPO $REF is $sha, which has no build yet" >&2
-            echo "  (the workflow publishes build-<commit>; it may still be running)" >&2
-            if ! VERSION="$(newest_build_at_or_before "$REF")"; then
-                echo "  and no build exists in its last $WALK_DEPTH commits either" >&2
-                exit 1
-            fi
-            echo "  falling back to $VERSION, the newest build at or before it" >&2
-            ;;
+# A build is named `build-<first twelve of the commit>`, so this is a lookup,
+# not a search: truncate the ref and ask whether that tag exists.
+VERSION=""
+ref12="${REF:0:12}"
+while IFS= read -r b; do
+    case "${b#build-}" in
+        "$ref12") VERSION="$b"; break ;;
     esac
-else
-    # Neither a branch nor a tag, so a commit -- and possibly an abbreviated
-    # one. The build tags carry 12 hex digits, so a shorter sha is a prefix of
-    # exactly the tag wanted, and nothing else has to expand it.
-    #
-    # TRUNCATE THE REF, do not lengthen the tag, because a FULL sha is now the
-    # common case: `caos-pin.sh` reads `flake.lock`, and nix locks a rev at all
-    # forty characters. Asking whether a tag's twelve digits START WITH the ref
-    # asks whether twelve characters start with forty, which they never do --
-    # so every repo-pinned install failed with "no branch, tag or built commit
-    # called <the sha printed right next to it>".
-    #
-    # One comparison covers both: `$ref12` is the ref's first twelve, so a
-    # SHORTER ref still prefix-matches the tag it abbreviates and a longer one
-    # matches on exactly the twelve the tag carries.
-    VERSION=""
-    ref12="${REF:0:12}"
-    while IFS= read -r b; do
-        case "${b#build-}" in
-            "$ref12"*) VERSION="$b"; break ;;
-        esac
-    done <<< "$builds"
-    # A NAMED COMMIT DOES NOT FALL BACK, and that is the difference from the
-    # branch case above. A branch head is a moving target that nobody chose: it
-    # has no build for the minutes its workflow runs, and a slightly older
-    # client there beats no client at all. A commit is the opposite — somebody
-    # wrote it down, and with a repo-pinned step it is written down TWICE: the
-    # `--llm-step:@=<path>/llm-step` path resolves through this same rev
-    # (flake-input-loader fetches `?rev=<pinned>&dir=std`), so the std ALWAYS
-    # comes from the pin while a fallback client would come from an older
-    # commit.
-    #
-    # That is the one pairing this file exists to keep, and a fallback breaks it
-    # silently: the session comes up, the tools resolve, and the client driving
-    # them is from a different tree than the tools are. Observed in this
-    # arrangement's own bring-up, where a repo pinning 677ca65f ran
-    # build-092c75c54bcf and said so in one line nobody had reason to read.
-    #
-    # So it fails, and says which of the two things to do. The caller decides
-    # what that costs: at SETUP time it fails the environment build, which is
-    # loud and retryable; in the session hook the refresh is non-fatal and the
-    # snapshot's client carries the session.
-    if [ -z "$VERSION" ]; then
-        echo "$REPO has no build for $REF, and a named commit does not fall back" >&2
-        echo "  to an earlier one: the step resolves through THIS rev, so an older" >&2
-        echo "  client would drive tools built from a different tree." >&2
-        echo "  The workflow publishes build-<commit> and may still be running --" >&2
-        echo "  wait for it, or pin a commit that already has a build." >&2
-        exit 1
-    fi
+done <<< "$builds"
+if [ -z "$VERSION" ]; then
+    echo "$REPO has no build for $REF, and a pinned commit does not fall back" >&2
+    echo "  to an earlier one: the step resolves through THIS rev, so an older" >&2
+    echo "  client would drive tools built from a different tree." >&2
+    echo "  The workflow publishes build-<commit> and may still be running --" >&2
+    echo "  wait for it, then re-pin. \`gh run list\` says when." >&2
+    exit 1
 fi
 echo "$REPO $REF -> $VERSION" >&2
 

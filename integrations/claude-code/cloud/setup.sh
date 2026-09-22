@@ -12,14 +12,21 @@
 #   B=https://raw.githubusercontent.com/Metta-AI/caos/main
 #   curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
 #
-# `--base` is the whole configuration: everything else -- which repo, which
-# branch or commit, where the sibling scripts live -- is read back out of it. A
-# script piped into bash cannot see its own URL (no $0, no path, no referrer),
-# so it has to be told once, and once is all it is told.
+# `--base` says where the BOOTSTRAP SCRIPTS come from -- this file,
+# caos-pin.sh, session-start.sh -- and nothing else. A script piped into bash
+# cannot see its own URL (no $0, no path, no referrer), so it has to be told
+# once, and once is all it is told. It may name a branch, and usually should:
+# the settings form is then never edited again.
 #
-# Swap `main` for a branch or a commit sha to test a change: the setup script,
-# the installer, the session hook and the client then ALL come from that one
-# ref, and there is no second place to keep in step.
+# IT DOES NOT SAY WHICH CAOS. That comes from the REPOSITORY the environment is
+# pointed at -- a client repo, whose flake.lock pins a commit and whose root
+# .caos-expr mounts that commit's std. This script reads the pin and hands the
+# COMMIT to install.sh, which refuses anything else. A repository with no pin
+# is a misconfigured environment and fails below, rather than being installed
+# from this branch: the step resolves through the pinned commit, so a client
+# from a moving head would be a client from another tree than its own tools.
+#
+# Swap `main` for a branch or a commit to test a change to the SCRIPTS.
 #
 # NOTHING HERE TOUCHES A REPOSITORY. Everything is user-level configuration in
 # the container, so one environment serves every repo and no project has to
@@ -134,16 +141,42 @@ if [ -n "$repo_dir" ]; then
         caos_std_path="$caos_pin_std_path"
         echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
         echo "  and mounts its std at $caos_std_path" >&2
-    else
-        echo "  (no usable caos pin; falling back to --base=$base)" >&2
     fi
-else
-    echo "no checkout with a flake.lock under /home/user; using --base=$base" >&2
 fi
 
-# WHICH CLIENT: whatever --base names, passed straight through. There is no
-# branch or version to choose here, because choosing one could only mean
-# installing a client that does not match the scripts installing it.
+# NO PIN, NO INSTALL -- and this is where the old fallback to `--base` lived.
+#
+# `--base` names a BRANCH (that is its job: it is where these bootstrap scripts
+# come from, and the two lines in the settings form should not need editing per
+# caos commit). Handing that branch to install.sh is what the fallback did, and
+# it is exactly the pairing the whole arrangement is arranged to prevent: the
+# step a session runs resolves through the commit the REPO pins, so a client
+# installed from a branch head is a client from a different tree than its own
+# tools.
+#
+# A session repo that pins no caos is therefore not something to paper over
+# with the nearest available version. It is a misconfigured environment, and
+# saying so here -- before the snapshot, where the message is read by whoever
+# is setting it up -- is worth more than a session that starts and then
+# behaves oddly.
+if [ -z "$caos_std_path" ]; then
+    echo "FATAL: this environment's repository does not pin caos." >&2
+    echo "  A caos session starts from a CLIENT repo: flake.nix + flake.lock with" >&2
+    echo "  a 'caos' input, and a root .caos-expr mounting its std (see" >&2
+    echo "  https://github.com/Metta-AI/caos/tree/main/examples/client-repo)." >&2
+    echo "  Point this environment at one, or fork that template." >&2
+    if [ -n "$repo_dir" ]; then
+        echo "  Read $repo_dir/flake.lock; caos-pin.sh's reason is above." >&2
+    else
+        echo "  No checkout with a flake.lock was found under /home/user." >&2
+    fi
+    exit 1
+fi
+
+# WHICH CLIENT: the commit the repo pins, which `$base` now holds -- never the
+# branch this script was fetched from. `$bootstrap_base` keeps that, for the
+# sibling scripts, and the two must not be confused: one is where the scripts
+# come from, the other is which caos the session IS.
 #
 # CAOS_SERVER_URL is the one environment variable left, and could not be
 # anything else: it is read at SESSION start, long after this has run and been

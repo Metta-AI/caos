@@ -181,9 +181,14 @@ fi
 # rather than trusted from the bootstrap.
 #
 # Cheap when nothing moved: one jq over flake.lock, and the install below then
-# stops at a single `ls-remote`. Non-fatal and quiet -- a checkout that does not
-# pin caos (caos' own repo, or any ordinary one) keeps the frozen base, which is
-# exactly where this was before the pin existed.
+# stops at a single `ls-remote`.
+#
+# THE PIN IS THE ONLY SOURCE OF A BASE FOR THE INSTALL. `$bootstrap_base` names
+# a branch -- it is where these scripts come from -- and install.sh refuses a
+# branch, because the step resolves through the pinned commit and a client from
+# a moving head would be a client from another tree. So a checkout that pins no
+# caos does not get a refresh at all; it keeps the client the snapshot has,
+# which is a session that works rather than one installed from the wrong tree.
 if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     # Cleared before the eval, and read back with `:-` after it, so a
     # caos-pin.sh that somehow succeeds while printing less than it promises
@@ -201,17 +206,25 @@ if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
         fi
         base="$caos_pin_base"
         caos_std_path="$caos_pin_std_path"
+    else
+        # The bootstrap's `$base` is a branch, which install.sh refuses, so
+        # there is nothing to refresh FROM. Cleared rather than passed, so the
+        # attempt below is skipped with a reason instead of failing with one.
+        base=""
     fi
 fi
 
-if [ -n "$base" ]; then
+if [ -n "$base" ] && [ -n "$caos_std_path" ]; then
     step "refreshing the client"
     if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" \
          | bash -s -- --no-repo-files --user-config --base="$base" \
                ${enable_bash:+--enable-bash} \
-               ${caos_std_path:+--caos-std-path="$caos_std_path"}; then
+               --caos-std-path="$caos_std_path"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
+else
+    log "this checkout pins no caos, so there is no commit to refresh from;"
+    log "  using the client the environment was built with"
 fi
 step "client refresh done"
 
