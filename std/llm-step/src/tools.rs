@@ -30,7 +30,7 @@ const MAX_ENTRIES: usize = 1_000;
 pub fn is_inline(name: &str) -> bool {
     matches!(
         name,
-        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source" | "tool_help"
+        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source"
     )
 }
 
@@ -59,7 +59,7 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
-const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It reads the tree only -- it never builds or runs the tool.
+const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates ancestor expressions to find the directory, then reads its own expression without building or running the tool.
 @param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
 const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
@@ -120,161 +120,9 @@ pub fn grep_declaration() -> Value {
 // the price of discovery being documentation: an undocumented tool is
 // invisible, which is the trade.
 
-/// Arg names a tree tool may not declare: the interpreter binds these itself
-/// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
-/// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
-/// so a tool can't declare a model arg the interpreter would then clobber.
-///
-/// EVERY NAME HERE IS ONE SOMETHING BINDS. `std` used to be on this list and is
-/// not any more: there is no `std` arg, a dependency rides inside the tree as a
-/// `DEEP-DEPS/<name>` mount, so nothing would ever have collided with a tool
-/// declaring one. Reserving a name for its history costs a tool author a
-/// perfectly good parameter and tells the next reader that something binds it.
-const RESERVED_ARGS: &[&str] = &[
-    "in", "worker1", "base", "salt", "wc", "refs",
-    // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
-    // refuses to rebind — so a tool declaring `@param help` would fail at
-    // invocation rather than here, where the model can be told why.
-    "help",
-];
-
-/// One tree tool as the registry sees it: its name, its description, and the
-/// parameters it accepts — parsed from its javadoc `help` (SPEC, "Tools").
-pub struct TreeTool {
-    pub name: String,
-    pub doc: String,
-    pub args: Vec<TreeArg>,
-    /// The tool declared `@git`: bind the source tree commit (`wc`) and the
-    /// turn's ref snapshot (`refs`) so it can walk history. Off by default —
-    /// `wc` changes every step, so binding it into a tool that doesn't need it
-    /// (build/test) would turn every cache hit into a miss.
-    pub git: bool,
-}
-
-/// One `@param` tag: `@param <name> <description>` is required, `@param
-/// [<name>] <description>` optional. The name becomes the script's `--<name>`
-/// arg, readable at `/cas/args/<name>`.
-pub struct TreeArg {
-    pub name: String,
-    pub doc: String,
-    pub required: bool,
-}
-
-/// Parse one `@param` tag's payload (everything after the tag) into a
-/// parameter. `None` — reported by the caller — for a malformed name, so a
-/// typo costs a visible skip rather than an arg the model can't use.
-fn parse_arg(payload: &str) -> Option<TreeArg> {
-    let (token, doc) = match payload.split_once(char::is_whitespace) {
-        Some((t, d)) => (t, d.trim()),
-        None => (payload, ""),
-    };
-    let (name, required) = match token.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
-        Some(inner) => (inner, false),
-        None => (token, true),
-    };
-    let ok = !name.is_empty()
-        && !RESERVED_ARGS.contains(&name)
-        && name.starts_with(|c: char| c.is_ascii_lowercase())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    ok.then(|| TreeArg {
-        name: name.to_string(),
-        doc: doc.to_string(),
-        required,
-    })
-}
-
-/// Parse a tool's `help` string as a JAVADOC comment (SPEC, "Tools"): the free
-/// text before the first block tag is the description; `@param <name>` /
-/// `@param [<name>]` tags declare the parameters; a bare `@git` tag asks for the
-/// history context. Returns `(description, params, git)` — an empty description
-/// for the caller to placeholder. A malformed `@param` is skipped with a
-/// message. This is the DURABLE parser: Phase 4 feeds it the isolated `--help`
-/// here-string; today it is fed text lifted from the script header (below).
-fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
-    let mut doc: Vec<&str> = Vec::new();
-    let mut args = Vec::new();
-    let mut git = false;
-    let mut in_tags = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("@param") {
-            in_tags = true;
-            match parse_arg(rest.trim()) {
-                Some(a) => args.push(a),
-                None => eprintln!("{ctx}: unusable @param tag: {line}"),
-            }
-        } else if trimmed == "@git" {
-            in_tags = true;
-            git = true;
-        } else if !in_tags {
-            // Description text — everything before the first block tag.
-            doc.push(trimmed);
-        }
-    }
-    (doc.join(" ").trim().to_string(), args, git)
-}
-
-/// The `help` string a tool's `.caos-expr` binds, read from the EXPRESSION'S
-/// OWN TEXT: a `HELP=<<END … END` here-string whose variable the value line
-/// passes as `--help=$HELP`, or a one-line `--help=<literal>`.
-///
-/// **Read, not evaluated, and that is the point.** Evaluating a tool would
-/// dispatch the runs its expression names (a compiled tool builds), and a
-/// worker may not block on a run — discovery happens mid-turn, in the middle of
-/// this worker's function, where there is no continuation to tail-call into. So
-/// listing reads the bytes the expression authors, and INVOCATION evaluates
-/// (`eval-path-then`). The two agree because they read the same here-string:
-/// the arg tree's `--help` is this text.
-///
-/// `None` when the expression binds no `help` — a directory that is not a tool,
-/// or a tool whose docs went missing; the caller says which and skips it.
-fn expr_help(expr: &str) -> Option<String> {
-    let mut here: Vec<(String, String)> = Vec::new();
-    let mut value_lines: Vec<&str> = Vec::new();
-    let lines: Vec<&str> = expr.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim();
-        i += 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // `NAME=<<TERM` opens a here-string: the body runs to a line equal to
-        // TERM, exactly as the evaluator reads it (design/caos-expr.md).
-        if let Some((name, term)) = line.split_once("=<<") {
-            if !term.is_empty() && !term.contains(char::is_whitespace) {
-                let mut body: Vec<&str> = Vec::new();
-                while i < lines.len() && lines[i].trim() != term {
-                    body.push(lines[i]);
-                    i += 1;
-                }
-                i += 1; // the terminator
-                here.push((name.to_string(), body.join("\n")));
-                continue;
-            }
-        }
-        value_lines.push(lines[i - 1]);
-    }
-    // `--help=…` on any command line: a `$VAR` names a here-string above, and
-    // anything else is the literal itself.
-    for line in value_lines {
-        for tok in line.split_whitespace() {
-            let Some(value) = tok.strip_prefix("--help=") else {
-                continue;
-            };
-            return match value.strip_prefix('$') {
-                Some(var) => here
-                    .iter()
-                    .find(|(name, _)| name == var)
-                    .map(|(_, body)| body.clone()),
-                None => Some(value.to_string()),
-            };
-        }
-    }
-    None
-}
+#[cfg(test)]
+use conversation_protocol::tools::{expr_help, parse_arg, TreeArg};
+pub use conversation_protocol::tools::{parse_help, TreeTool};
 
 /// Why a path is not a tool — distinct from "no such path", which `caos
 /// resolve` reports, and from a CAS failure, which is the worker's problem.
@@ -303,21 +151,10 @@ fn read_tool(name: &str, dir: &str) -> Result<Result<TreeTool, NotATool>, String
     }
     caos(["get", &path])?;
     let text = fs::read_to_string(&path).map_err(|e| format!("reading {path}: {e}"))?;
-    let Some(help) = expr_help(&text) else {
-        return Ok(Err(NotATool::NoHelp));
-    };
-    let (doc, args, git) = parse_help(&format!("{name}/.caos-expr"), &help);
-    let doc = if doc.is_empty() {
-        format!("Repository tool {name} (no description).")
-    } else {
-        doc
-    };
-    Ok(Ok(TreeTool {
-        name: name.to_string(),
-        doc,
-        args,
-        git,
-    }))
+    match conversation_protocol::tools::read_tool(name, &text) {
+        Ok(tool) => Ok(Ok(tool)),
+        Err(_) => Ok(Err(NotATool::NoHelp)),
+    }
 }
 
 /// A harness-provided std tool (std/caos-build, std/caos-test), described by the
@@ -389,14 +226,9 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
     })
 }
 
-/// Resolve a tool by path in its captured input snapshot and read its schema.
-///
-/// `relative` is resolved with `caos resolve`, which TRAVERSES COMMIT ENTRIES
-/// (`caos::gitlinks::resolve`) — so a conversation-relative path reaches into a
-/// source tree without the caller unwrapping the gitlink. `Err` carries the
-/// resolve failure (`no such path: …`) as well as CAS trouble; the inner `Err`
-/// says the path exists but is not a tool.
-pub fn tool_at(ws: &str, relative: &str) -> Result<Result<TreeTool, NotATool>, String> {
+/// Read the final directory beneath an already evaluated parent. Both tool
+/// calls arrive here after the shared ancestor-evaluation continuation.
+fn read_tool_at(ws: &str, relative: &str) -> Result<Result<(TreeTool, String), NotATool>, String> {
     let resolved = fresh("tool-path");
     caos([
         "resolve",
@@ -407,56 +239,30 @@ pub fn tool_at(ws: &str, relative: &str) -> Result<Result<TreeTool, NotATool>, S
     if !Path::new(&resolved).is_dir() {
         return Ok(Err(NotATool::NoExpression));
     }
-    read_tool(relative, &resolved)
+    read_tool(relative, &resolved).map(|tool| tool.map(|tool| (tool, resolved)))
 }
 
-/// `tool_help`: describe the tool at a conversation-relative path.
-///
-/// READS THE TREE ONLY — it resolves the path, reads the `.caos-expr` and parses
-/// the `help` here-string it binds. It never evaluates, so describing a compiled
-/// tool does not build it, and the answer is immediate (this is why `tool_help`
-/// is inline and `run_tool` is not).
-fn tool_help(call: &Value, ws: &str) -> Result<String, Fail> {
-    let raw = call["input"]["path"].as_str().unwrap_or("").trim();
-    let path = raw.trim_matches('/');
-    if path.is_empty() {
-        return Err(User(
-            "tool_help needs a `path`: the conversation-relative directory of a tool, \
-             such as feature/01-change/caos-tools/test"
-                .to_string(),
-        ));
+/// Resolve and describe one final directory, with recoverable diagnostics
+/// against the evaluated parent. The display path stays conversation-relative.
+pub fn tool_at(parent: &str, leaf: &str, display: &str) -> Result<(TreeTool, String), String> {
+    let outcome = read_tool_at(parent, leaf);
+    if let Ok(Ok((mut tool, definition))) = outcome {
+        tool.name = display.to_string();
+        return Ok((tool, definition));
     }
-    let outcome = tool_at(ws, path);
-    if let Ok(Ok(tool)) = &outcome {
-        return Ok(describe(tool, path));
-    }
-    // The directory names beside `path`, used TWICE: to prove absence, and to
-    // suggest the name the model meant.
-    let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
-    let nearby = nearby_dirs(ws, parent);
-    // A wrong path is the model's to fix, so every answer here is an is_error
-    // tool_result rather than a worker failure -- the same choice
-    // `grep_precheck` makes for a scope the model named.
+    let nearby = nearby_dirs(parent, "");
     let what = match outcome {
-        Ok(Ok(_)) => unreachable!("described above"),
-        Ok(Err(reason)) => not_a_tool_message(reason, path),
-        // `worker_common::caos` gives back only an exit status; the REASON went
-        // to this worker's stderr. So do not quote that error at the model --
-        // it would read `caos resolve <hash> … exited with exit status: 1`,
-        // which names an internal command line and not the problem.
-        //
-        // Instead, decide on EVIDENCE: a parent that resolves and does not list
-        // this name proves the path is absent. Without that proof this is
-        // reported as the CAS trouble it may be — distinguishing absent from
-        // broken, rather than assuming the cheerful one.
+        Ok(Ok(_)) => unreachable!(),
+        Ok(Err(reason)) => not_a_tool_message(reason, display),
         Err(error) => match &nearby {
-            Some(names) if !names.iter().any(|n| n == leaf) => {
-                format!("no such path: {path}")
+            Some(names) if !names.iter().any(|name| name == leaf) => {
+                format!("no such path: {display}")
             }
-            _ => format!("cannot read {path}: {error}"),
+            _ => format!("cannot read {display}: {error}"),
         },
     };
-    Err(User(format!("{what}{}", suggestion(parent, nearby))))
+    let (directory, _) = display.rsplit_once('/').unwrap_or(("", display));
+    Err(format!("{what}{}", suggestion(directory, nearby)))
 }
 
 /// Why `path` is not a tool, in the model's words. Shared by `tool_help` and
@@ -475,7 +281,7 @@ pub fn not_a_tool_message(reason: NotATool, path: &str) -> String {
 
 /// `tool_help`'s description of one tool, as prose rather than JSON: the model
 /// reads this, and a schema dump is the registry we just stopped keeping.
-fn describe(tool: &TreeTool, path: &str) -> String {
+pub fn describe(tool: &TreeTool, path: &str) -> String {
     let mut out = format!("{path}\n\n{}\n", tool.doc);
     if tool.args.is_empty() {
         out.push_str(
@@ -497,7 +303,7 @@ fn describe(tool: &TreeTool, path: &str) -> String {
 ///
 /// One `caos resolve` and one `caos get` — never a per-child fetch. `None` is
 /// load-bearing: it is the difference between "that name is not there" and "I
-/// could not look", and [`tool_help`] reports those differently.
+/// could not look", and `tool_help` reports those differently.
 fn nearby_dirs(ws: &str, parent: &str) -> Option<Vec<String>> {
     let resolved = fresh("tool-parent");
     let hash = worker_common::cas_hash(ws).ok()?;
@@ -538,42 +344,8 @@ fn suggestion(parent: &str, nearby: Option<Vec<String>>) -> String {
 /// comes back as a ready-made `is_error` tool_result rather than a worker
 /// error — the same contract `grep_precheck` uses.
 pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>, Value> {
-    let id = call["id"].as_str().unwrap_or("");
-    let fail = |msg: String| Err(result_block(id, &msg, true));
-    let empty = serde_json::Map::new();
-    let input = call["input"].as_object().unwrap_or(&empty);
-    for key in input.keys() {
-        if !tool.args.iter().any(|a| &a.name == key) {
-            let known: Vec<&str> = tool.args.iter().map(|a| a.name.as_str()).collect();
-            return fail(format!(
-                "{} takes no {key:?} argument (declared: {})",
-                tool.name,
-                if known.is_empty() {
-                    "none".to_string()
-                } else {
-                    known.join(", ")
-                }
-            ));
-        }
-    }
-    let mut out = Vec::new();
-    for a in &tool.args {
-        let value = match input.get(&a.name) {
-            None | Some(Value::Null) => {
-                if a.required {
-                    return fail(format!("{} needs a {:?} argument", tool.name, a.name));
-                }
-                continue;
-            }
-            Some(Value::String(s)) => s.clone(),
-            Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string(),
-            Some(_) => {
-                return fail(format!("{}'s {:?} must be a string", tool.name, a.name));
-            }
-        };
-        out.push((a.name.clone(), value));
-    }
-    Ok(out)
+    conversation_protocol::tools::bind_args(&call["input"], tool)
+        .map_err(|error| result_block(call["id"].as_str().unwrap_or(""), &error, true))
 }
 
 /// The tool_result block for a tree tool's result — a VALUE whose shape the
@@ -742,7 +514,6 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
-        "tool_help" => tool_help(call, ws).map(|text| (text, None)),
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
@@ -1144,10 +915,12 @@ mod tests {
     fn read_and_ls_are_inline_and_declared() {
         // Routed in-process (no sub-run). A repository tool cannot shadow them:
         // it is named by path, never by name.
-        for t in ["read", "ls", "import_source", "tool_help"] {
+        for t in ["read", "ls", "import_source"] {
             assert!(is_inline(t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
+        assert!(!is_inline("tool_help"));
+        assert!(declarations().iter().any(|d| d["name"] == "tool_help"));
         // read-oid is gone — folded into `read` via `root`.
         assert!(!is_inline("read-oid"));
         assert!(!declarations().iter().any(|d| d["name"] == "read-oid"));

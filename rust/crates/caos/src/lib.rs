@@ -126,49 +126,66 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
-/// Resolve a project tool `caos-tools/<name>` to its ArgTree oid, CLIENT-SIDE --
-/// the same `eval_path` walk [`cli_run_tool`] does, and the reason it exists as
-/// its own entry point.
-///
-/// The agent harness runs a tool by asking the SERVER to `eval-path-then`
-/// `caos-tools/<name>` (a worker cannot evaluate). That server walk refuses a
-/// `:@@=` locator (`EvalHost::resolve_remote` is client-only), so a repository
-/// whose tool reaches one through its root `.caos-expr` -- coworld-ctf mounts
-/// caos' std that way -- cannot have its tools run by an agent at all. Resolving
-/// here, on the client, does the `:@@=` fetch and hands the harness the finished
-/// tree; the walk is byte-identical to the one the server would do for a
-/// `:@=`-only tool, and the curry is marked with this caller's secret store, so
-/// a secret-needing resolution works exactly where the secret model lives.
-///
-/// `Ok(None)` when `caos-tools/<name>` is not a tool in the tracked worktree --
-/// a built-in (`bash`, `read`, …) or an unknown name -- so a caller can pass the
-/// result straight through and let the harness handle those as it always has.
-/// Evaluated against the dirty worktree (`ingest_path(".")`), like `run-tool`
-/// and `eval-path`, so an edited tool resolves edited.
-pub fn eval_tree_tool(
+/// Evaluate a tool's parent path on the client that can fetch pinned locators.
+/// The worker receives this parent and reads the target definition.
+pub fn resolve_tool_parent(
     t: &dyn Transport,
-    name: &str,
+    root: &str,
+    path: &str,
     store: &[ClientSecret],
-) -> Result<Option<String>, String> {
-    let dir = format!("caos-tools/{name}");
-    if !Path::new(&format!("{dir}/.caos-expr")).is_file() {
-        return Ok(None);
-    }
-    let (_, ws) = t
-        .ingest_path(".")?
-        .ok_or_else(|| "this client cannot ingest the workspace tree".to_string())?;
-    let (kind, oid) = eval::eval_path(t, &ws.to_string(), &dir, store)?;
+) -> Result<String, String> {
+    let (kind, oid) = eval::eval_path(t, root, path, store)?;
     if kind != "tree" {
         return Err(format!(
-            "{dir}/.caos-expr evaluates to a {kind}, not an ArgTree"
+            "cannot resolve {path}: its parent evaluates to a {kind}"
         ));
     }
-    // The walk builds the ArgTree in the LOCAL store; the server has only what a
-    // `run` it dispatched left there. A caller passes this oid as a `:hash=`
-    // arg, which the server must hold, so push its closure now -- sound for a
-    // tree (`ensure_pushed`), and a no-op when a prior resolution already sent it.
     t.ensure_pushed(&oid)?;
-    Ok(Some(oid))
+    Ok(oid)
+}
+
+/// Evaluate a tool directory after the caller has validated its definition and
+/// arguments. Locator resolution and secret marking remain client-side.
+pub fn eval_tree_tool(
+    t: &dyn Transport,
+    directory: &str,
+    path: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let (kind, oid) = eval::eval_path(t, directory, "", store)?;
+    if kind != "tree" {
+        return Err(format!(
+            "{path}/.caos-expr evaluates to a {kind}, not an ArgTree"
+        ));
+    }
+    t.ensure_pushed(&oid)?;
+    Ok(oid)
+}
+
+/// Read the final directory's expression beneath an evaluated parent, without
+/// evaluating the target. The caller owns help parsing and argument validation.
+pub fn read_tool_definition(
+    t: &dyn Transport,
+    parent: &str,
+    leaf: &str,
+) -> Result<(String, String), String> {
+    let entry = fetch_tree_entries(t, parent)?
+        .unwrap_or_default()
+        .into_iter()
+        .find(|entry| entry_name(entry) == leaf.as_bytes())
+        .ok_or_else(|| format!("no such tool path: {leaf}"))?;
+    let directory = entry.oid.to_string();
+    let expression = fetch_tree_entries(t, &directory)?
+        .unwrap_or_default()
+        .into_iter()
+        .find(|entry| entry_name(entry) == b".caos-expr")
+        .ok_or_else(|| format!("{leaf} is not a directory carrying a .caos-expr"))?;
+    let (kind, bytes) = t.get_object(&expression.oid.to_string())?;
+    if kind != "blob" {
+        return Err(format!("{leaf}/.caos-expr is not a file"));
+    }
+    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
+    Ok((directory, text))
 }
 
 /// Print a tool result's report conventions, reading ONLY the objects they
@@ -6049,5 +6066,175 @@ mod memo_tests {
         M.put("a".to_string(), "one".to_string());
         assert_eq!(M.get("a"), Some("one".to_string()));
         assert_eq!(M.get("b"), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_resolution_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Store {
+        objects: RefCell<HashMap<String, (String, Vec<u8>)>>,
+        remote: RefCell<Option<gix::ObjectId>>,
+        fetches: Cell<usize>,
+        computes: Cell<usize>,
+    }
+    impl Transport for Store {
+        fn put_object(&self, kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
+            let oid = hash_bytes(kind, bytes)?;
+            self.objects
+                .borrow_mut()
+                .insert(oid.to_string(), (kind.into(), bytes.to_vec()));
+            Ok(oid)
+        }
+        fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
+            self.objects
+                .borrow()
+                .get(oid)
+                .cloned()
+                .ok_or_else(|| format!("missing {oid}"))
+        }
+        fn has_object(&self, oid: &str) -> Result<bool, String> {
+            Ok(self.objects.borrow().contains_key(oid))
+        }
+        fn server_url(&self) -> Result<String, String> {
+            self.computes.set(self.computes.get() + 1);
+            Err("fixture forbids dispatch: target expression was evaluated".into())
+        }
+        fn fetch_git_ref(&self, _: &str, _: &str) -> Result<Option<gix::ObjectId>, String> {
+            self.fetches.set(self.fetches.get() + 1);
+            Ok(*self.remote.borrow())
+        }
+    }
+    fn tree(t: &Store, entries: &[(&str, &str, &str)]) -> String {
+        post_tree(
+            t,
+            entries
+                .iter()
+                .map(|(name, kind, oid)| gix::objs::tree::Entry {
+                    mode: eval::mode_of_kind(kind),
+                    filename: name.as_bytes().into(),
+                    oid: parse_oid(oid).unwrap(),
+                })
+                .collect(),
+        )
+        .unwrap()
+        .to_string()
+    }
+    fn expr(t: &Store, text: &str) -> String {
+        let base = tree(t, &[]);
+        let text = text
+            .replace("--base=fixture", &format!("--base:hash={base}"))
+            .replace("--base=forbidden", &format!("--base:hash={base}"));
+        let blob = t.put_object("blob", text.as_bytes()).unwrap().to_string();
+        tree(t, &[(".caos-expr", "blob", &blob)])
+    }
+    fn generated(t: &Store, tool: &str) -> String {
+        // The original root has no args/ directory at all. Evaluation creates it.
+        expr(t, &format!("curry --base=fixture --tool:hash={tool}"))
+    }
+
+    fn definition(t: &Store, root: &str, path: &str) -> (String, String) {
+        let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
+        let parent = resolve_tool_parent(t, root, parent, &[]).unwrap();
+        read_tool_definition(t, &parent, leaf).unwrap()
+    }
+
+    #[test]
+    fn help_reaches_generated_definition_without_evaluating_the_tool() {
+        let t = Store::default();
+        let target = expr(&t, "HELP=<<END\nGenerated help.\n@param word The word.\nEND\nrun --base=forbidden --help=$HELP");
+        let root = generated(&t, &target);
+        assert!(fetch_tree_entries(&t, &root)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|e| entry_name(e) != b"args"));
+        let (found, text) = definition(&t, &root, "args/tool");
+        assert_eq!(found, target);
+        assert!(text.contains("Generated help."));
+        assert!(text.contains("@param word The word."));
+        assert_eq!(t.computes.get(), 0, "help must not dispatch the target");
+        let error = eval::eval_path(&t, &target, "", &[]).unwrap_err();
+        assert!(error.contains("target expression was evaluated"));
+        assert_eq!(t.computes.get(), 1);
+    }
+
+    #[test]
+    fn run_reaches_the_same_definition_and_prepares_the_supplied_arguments() {
+        let t = Store::default();
+        let target = expr(&t, "HELP=<<END\nGenerated runner.\n@param word The word.\nEND\ncurry --base=fixture --help=$HELP");
+        let root = generated(&t, &target);
+        let (found, _) = definition(&t, &root, "args/tool");
+        let evaluated = eval_tree_tool(&t, &found, "args/tool", &[]).unwrap();
+        assert_ne!(evaluated, target);
+        let word = t.put_object("blob", b"supplied").unwrap();
+        let request = assemble_arg_tree(
+            &t,
+            &evaluated,
+            vec![
+                gix::objs::tree::Entry {
+                    mode: eval::mode_of_kind("blob"),
+                    filename: b"word".to_vec().into(),
+                    oid: word,
+                },
+                gix::objs::tree::Entry {
+                    mode: eval::mode_of_kind("tree"),
+                    filename: b"in".to_vec().into(),
+                    oid: parse_oid(&root).unwrap(),
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        let entries = fetch_tree_entries(&t, &request).unwrap().unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| entry_name(e) == b"word" && e.oid == word));
+        assert!(entries
+            .iter()
+            .any(|e| entry_name(e) == b"in" && e.oid.to_string() == root));
+    }
+
+    #[test]
+    fn ordinary_and_missing_paths() {
+        let t = Store::default();
+        let target = expr(&t, "curry --base=fixture --help=Ordinary");
+        let root = tree(&t, &[("tool", "tree", &target)]);
+        assert!(definition(&t, &root, "tool").1.contains("--help=Ordinary"));
+        let parent = resolve_tool_parent(&t, &root, "", &[]).unwrap();
+        assert!(read_tool_definition(&t, &parent, "missing")
+            .unwrap_err()
+            .contains("no such tool path: missing"));
+    }
+
+    #[test]
+    fn target_locators_are_not_resolved_by_reading_the_definition() {
+        let t = Store::default();
+        let image = tree(&t, &[]);
+        *t.remote.borrow_mut() = Some(parse_oid(&image).unwrap());
+        let target = expr(&t, "curry --base:@@=git+https://example.invalid/target-fixture?rev=abcdefabcdefabcdefabcdefabcdefabcdefabcd --help=Pinned");
+        let root = tree(&t, &[("tool", "tree", &target)]);
+        let (found, text) = definition(&t, &root, "tool");
+        assert!(text.contains("--help=Pinned"));
+        assert_eq!(t.fetches.get(), 0);
+        eval_tree_tool(&t, &found, "tool", &[]).unwrap();
+        assert_eq!(t.fetches.get(), 1);
+    }
+
+    #[test]
+    fn pinned_ancestor_dependencies_are_resolved_by_the_client() {
+        let t = Store::default();
+        let target = expr(&t, "curry --base=fixture --help=Pinned");
+        let repo = tree(&t, &[("tool", "tree", &target)]);
+        *t.remote.borrow_mut() = Some(parse_oid(&repo).unwrap());
+        let root = expr(&t, "curry --base=fixture --repo:@@=git+https://example.invalid/tool-fixture?rev=1234567890123456789012345678901234567890");
+        assert!(definition(&t, &root, "args/repo/tool")
+            .1
+            .contains("--help=Pinned"));
+        assert_eq!(t.fetches.get(), 1);
     }
 }

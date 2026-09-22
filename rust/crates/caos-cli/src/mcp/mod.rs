@@ -205,7 +205,16 @@ fn run_tool(
     let (request, request_head, round) =
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    dispatch_call(t, options, &id, name, &request, &request_head, &call)?;
+    dispatch_call(
+        t,
+        options,
+        &id,
+        name,
+        &declared,
+        &request,
+        &request_head,
+        &call,
+    )?;
     read_outcome(t, &id, &request, round, &call)
 }
 
@@ -216,20 +225,17 @@ fn run_tool(
 /// would be answered from the first's memo. `--tools-only` carries the call id
 /// for exactly that reason, and the step checks it ran before returning.
 ///
-/// A PROJECT TOOL (`caos-tools/<name>`) is resolved HERE, on the client, and its
-/// tree handed to the step -- see [`caos::eval_tree_tool`] for why: the step's
-/// own `eval-path-then` runs SERVER-SIDE and refuses a `:@@=` locator, so a tool
-/// that reaches one (coworld-ctf's do, through its root `.caos-expr`) can only be
-/// evaluated where the fetch lives. `--client-tool-tree` carries the resolved
-/// oid and `--client-tool-name` the tool it belongs to, so the step uses it only
-/// for the matching tool and evaluates everything else exactly as before. A
-/// resolution that fails is left to the step: it evaluates server-side and
-/// surfaces the same error the run would, so nothing is hidden.
+/// Repository tools resolve against their conversation path, client-side so
+/// pinned locators use the existing fetch/evaluation machinery. Help resolves
+/// only ancestors; invocation validates the definition and arguments before
+/// evaluating the target. The handoff is pinned to the input tree and path.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_call(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
     name: &str,
+    arguments: &Value,
     request: &Oid,
     request_head: &Oid,
     call: &str,
@@ -241,20 +247,63 @@ fn dispatch_call(
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    match caos::eval_tree_tool(t, name, &store) {
-        Ok(Some(tree)) => {
-            kvs.push(format!("--client-tool-name={name}"));
-            kvs.push(format!("--client-tool-tree:hash={tree}"));
+    if matches!(name, "tool_help" | "run_tool") {
+        let object_store = open_store(t)?;
+        let (_, head) =
+            fetch_validated_head(t, &object_store, id)?.ok_or("tool conversation disappeared")?;
+        let view = Conversation::open(&object_store, &head)?;
+        if let Ok((root, path)) = tool_resolution_scope(&object_store, &view, arguments) {
+            kvs.push(format!("--client-tool-root={root}"));
+            kvs.push(format!("--client-tool-path={path}"));
+            let (parent_path, leaf) = conversation_protocol::tools::parent_path(&path)?;
+            let resolved = caos::resolve_tool_parent(t, root.as_str(), &parent_path, &store)
+                .and_then(|parent| {
+                    kvs.push(format!("--client-tool-parent:hash={parent}"));
+                    if name == "run_tool" {
+                        let args = arguments
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let (directory, expression) =
+                            caos::read_tool_definition(t, &parent, &leaf)?;
+                        let tool = conversation_protocol::tools::read_tool(&path, &expression)?;
+                        conversation_protocol::tools::bind_args(&args, &tool)?;
+                        let tree = caos::eval_tree_tool(t, &directory, &path, &store)?;
+                        kvs.push(format!("--client-tool-tree:hash={tree}"));
+                    }
+                    Ok(())
+                });
+            if let Err(error) = resolved {
+                // Deliver a recoverable tool error. Falling back to the server
+                // would discard the actual locator/argument error.
+                kvs.push(format!("--client-tool-error={error}"));
+            }
         }
-        Ok(None) => {}
-        Err(error) => eprintln!(
-            "caos mcp serve: could not resolve {name:?} on the client ({error}); \
-             letting the step evaluate it"
-        ),
     }
     let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
     let server = t.server_url()?;
     caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
+}
+
+/// Match the worker's input selection against the conversation snapshot, not
+/// the client's checkout. Generated definitions never become the tool's input.
+fn tool_resolution_scope(
+    store: &dyn ObjectStore,
+    view: &Conversation<'_>,
+    arguments: &Value,
+) -> Result<(Oid, String), String> {
+    let path = arguments["path"].as_str().ok_or("tool requires path")?;
+    paths::validate_tree_path(path)?;
+    for name in view.source_tree_names()?.into_iter().rev() {
+        if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
+            let source = view.source_tree(&name)?.ok_or("source tree disappeared")?;
+            return Ok((
+                store.read_commit(&source.commit)?.tree,
+                relative.to_string(),
+            ));
+        }
+    }
+    Ok((view.tree().clone(), path.to_string()))
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the

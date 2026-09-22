@@ -296,7 +296,7 @@ fn callback(
     let tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
     timing::phase(&format!("tool wait {tool}"));
 
-    if read_arg_opt("tool-eval")?.is_some() {
+    if read_arg_opt("tool-eval")?.is_some() || read_arg_opt("tool-lookup")?.is_some() {
         if Path::new(&arg("error")).exists() {
             let error = read_arg("error")?;
             let block = failed_run_block(&id, &tool, &error);
@@ -309,6 +309,9 @@ fn callback(
             };
             CallSite::at(request, round, &call, &declaration).failed(state, &block, target)?;
             return resume(cfg, state, request, request_head);
+        }
+        if read_arg_opt("tool-lookup")?.is_some() {
+            return launch_resolved_tool(cfg, state, request, request_head, round, &id);
         }
         return launch_evaluated_tool(cfg, state, request, request_head, round, &id);
     }
@@ -1134,7 +1137,7 @@ fn drive_call(
     };
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let mut scoped_call = call.clone();
-    if call.name == "run_tool" {
+    if matches!(call.name.as_str(), "run_tool" | "tool_help") {
         if let Some(name) = &name {
             let path = call.input["path"]
                 .as_str()
@@ -1198,7 +1201,7 @@ fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String
         if tools::is_inline(&call.name) {
             return Ok(Target::Files);
         }
-        if call.name == "run_tool" {
+        if matches!(call.name.as_str(), "run_tool" | "tool_help") {
             let path = call.input["path"]
                 .as_str()
                 .ok_or("run_tool requires path")?;
@@ -1300,47 +1303,38 @@ fn prepare_compute(
     let clean = call_without_source_tree(call);
     match call.name.as_str() {
         "bash" => prepare_bash(cfg, &clean, ws),
-        "run_tool" => {
-            let Some(relative) = clean["input"]["path"].as_str() else {
-                return Ok(Prepared::Result(error_block(
-                    &call.id,
-                    "run_tool requires path",
-                )));
-            };
-            let tool = match tools::tool_at(ws, relative) {
-                Ok(Ok(tool)) => tool,
-                // Say WHY it is not a tool, and point at `tool_help`: nothing
-                // lists the tools, so a wrong path is the ordinary mistake and
-                // this message is the only way back from one.
-                Ok(Err(reason)) => {
-                    return Ok(Prepared::Result(error_block(
-                        &call.id,
-                        &format!(
-                            "{}. Use tool_help to describe a tool before running it",
-                            tools::not_a_tool_message(reason, relative)
-                        ),
-                    )))
-                }
+        "run_tool" | "tool_help" => {
+            let relative = clean["input"]["path"].as_str().unwrap_or("");
+            let (parent, _) = match conversation_protocol::tools::parent_path(relative) {
+                Ok(path) => path,
                 Err(error) => return Ok(Prepared::Result(error_block(&call.id, &error))),
             };
-            let nested = json!({"id":call.id, "input":clean["input"].get("arguments")
-                .cloned().unwrap_or_else(|| json!({}))});
-            match tools::tree_tool_args(&nested, &tool) {
-                Err(block) => Ok(Prepared::Result(block)),
-                Ok(bound) => {
-                    launch_tree_evaluation(
-                        &nested,
-                        relative,
-                        &bound,
-                        tool.git,
-                        ws,
-                        wc,
-                        request,
-                        round.declaring_round,
-                    )?;
-                    Ok(Prepared::Evaluation)
+            let me = self_curry(
+                Some(wc),
+                request,
+                round.declaring_round,
+                &call.id,
+                &[
+                    ("current-tool", Arg::Lit(&call.name)),
+                    ("tool-lookup", Arg::Lit(relative)),
+                ],
+            )?;
+            if client_tool_matches(ws, relative)? {
+                if let Some(error) = read_arg_opt("client-tool-error")? {
+                    return Ok(Prepared::Result(error_block(&call.id, &error)));
                 }
+                let task = prepare_request(
+                    Arg::Hash(&me),
+                    &[
+                        ("in", Arg::Path(ws)),
+                        ("result", Arg::Path(&arg("client-tool-parent"))),
+                    ],
+                )?;
+                run_request_then(&task, None)?;
+            } else {
+                eval_then_catching(ws, &parent, Arg::Hash(&me))?;
             }
+            Ok(Prepared::Evaluation)
         }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
@@ -1452,6 +1446,7 @@ fn prepared_request(
 fn launch_tree_evaluation(
     call: &Value,
     name: &str,
+    definition: &str,
     bound: &[(String, String)],
     git: bool,
     ws: &str,
@@ -1490,7 +1485,7 @@ fn launch_tree_evaluation(
     // that reaches such a locator) we skip the walk and run `me` with the tree
     // it handed us bound as `--result` -- byte-identical to what the eval would
     // have bound, so the re-entry cannot tell the difference.
-    let dispatched = match client_tool_tree(name)? {
+    let dispatched = match client_tool_tree(ws, name)? {
         Some(tree) => {
             let task = prepare_request(
                 Arg::Hash(&me),
@@ -1498,31 +1493,99 @@ fn launch_tree_evaluation(
             )?;
             run_request_then(&task, None)
         }
-        None => eval_then_catching(ws, name, Arg::Hash(&me)),
+        None => eval_then_catching(definition, "", Arg::Hash(&me)),
     };
     timing::phase(&format!("tool dispatch {name}"));
     dispatched
 }
 
-/// The client-resolved ArgTree for tool `name`, if `caos mcp serve` handed one
-/// in for THIS tool (`--client-tool-name` / `--client-tool-tree`). The name
-/// guards it: a tools-only run drives one call, but a bare tree with no owner
-/// would be used for whatever tool happened to evaluate, so the two args travel
-/// together and only the matching tool consumes them. `None` (evaluate
-/// server-side) for every tool the client did not resolve -- the built-ins and
-/// any `:@=`-only project tool, which the server walk handles unchanged.
-fn client_tool_tree(name: &str) -> Result<Option<String>, String> {
-    match read_arg_opt("client-tool-name")? {
-        Some(owner) if owner == name => {
-            let tree = arg("client-tool-tree");
-            if Path::new(&tree).exists() {
-                Ok(Some(cas_hash(&tree)?))
+/// A client handoff is usable only for this exact snapshot and relative path.
+fn client_tool_matches(ws: &str, path: &str) -> Result<bool, String> {
+    Ok(read_arg_opt("client-tool-path")?.as_deref() == Some(path)
+        && read_arg_opt("client-tool-root")?.as_deref() == Some(cas_hash(ws)?.as_str()))
+}
+
+fn client_tool_tree(ws: &str, path: &str) -> Result<Option<String>, String> {
+    if client_tool_matches(ws, path)? && Path::new(&arg("client-tool-tree")).exists() {
+        Ok(Some(cas_hash(&arg("client-tool-tree"))?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Resume the shared ancestor walk. The result is the evaluated PARENT, so
+/// reading the final directory cannot evaluate or build the tool itself.
+fn launch_resolved_tool(
+    cfg: &Config,
+    state: &mut progress::State,
+    request: &Oid,
+    request_head: &Oid,
+    round: u64,
+    id: &str,
+) -> Result<(), String> {
+    let record = require_request(&state.conversation()?, request)?;
+    let current = round_state(&state.conversation()?, &record)?;
+    if current.declaring_round != round {
+        return resume(cfg, state, request, request_head);
+    }
+    let call = current
+        .pending
+        .iter()
+        .find(|call| call.id == id)
+        .cloned()
+        .ok_or("resolved tool is no longer pending")?;
+    let target = resolve_target(&state.conversation()?, &call)?;
+    let (name, current_input) = match target {
+        Target::SourceTree { name, commit } => (Some(name), commit),
+        Target::Files => (None, state.head().clone()),
+    };
+    let commit = Oid::parse(&cas_hash(&arg("wc"))?, "tool lookup input commit")?;
+    if current_input != commit {
+        return resume(cfg, state, request, request_head);
+    }
+    let (ws, wc) = materialize_source_tree(state, &commit)?;
+    let relative = read_arg("tool-lookup")?;
+    let (_, leaf) = conversation_protocol::tools::parent_path(&relative)?;
+    let parent = arg("result");
+    let site = CallSite::at(request, round, &call, &current.declaration_message);
+    let outcome = tools::tool_at(
+        &parent,
+        &leaf,
+        call.input["path"].as_str().unwrap_or(&relative),
+    );
+    let block = match outcome {
+        Ok((tool, definition)) => {
+            if call.name == "tool_help" {
+                result_block(
+                    id,
+                    &tools::describe(&tool, call.input["path"].as_str().unwrap_or(&relative)),
+                    false,
+                )
             } else {
-                Ok(None)
+                let nested = json!({"id": id, "name": call.name,
+                    "input": call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
+                match tools::tree_tool_args(&nested, &tool) {
+                    Err(block) => block,
+                    Ok(bound) => {
+                        return launch_tree_evaluation(
+                            &nested,
+                            &relative,
+                            &definition,
+                            &bound,
+                            tool.git,
+                            &ws,
+                            &wc,
+                            request,
+                            round,
+                        );
+                    }
+                }
             }
         }
-        _ => Ok(None),
-    }
+        Err(error) => error_block(id, &error),
+    };
+    site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
+    resume(cfg, state, request, request_head)
 }
 
 fn launch_evaluated_tool(
@@ -1589,9 +1652,26 @@ fn launch_evaluated_tool(
             args.push(("refs", Arg::Lit(refs)));
         }
     }
-    let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
-    let task_text = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(&ws))])?;
-    let task = Oid::parse(&task_text, "tree tool task")?;
+    let task = (|| {
+        if worker_common::cas_kind(&arg("result"))? != "tree" {
+            return Err("tool expression did not produce an ArgTree".to_string());
+        }
+        let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
+        let task_text = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(&ws))])?;
+        Oid::parse(&task_text, "tree tool task")
+    })();
+    let task = match task {
+        Ok(task) => task,
+        Err(error) => {
+            let site = CallSite::at(request, round, &call, &current.declaration_message);
+            site.failed(
+                state,
+                &error_block(id, &error),
+                source_tree_name.map(|name| (name, commit)),
+            )?;
+            return resume(cfg, state, request, request_head);
+        }
+    };
     let started = CallRecord {
         request: request.clone(),
         round,
@@ -3323,6 +3403,7 @@ fn self_curry(
         "ws",
         "scope",
         "tool-eval",
+        "tool-lookup",
         "tool-args",
         "tool-git",
         "in",
@@ -4184,6 +4265,34 @@ mod tests {
                 matches!(resolve_target(&view, &call).unwrap(), Target::Files),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn tool_paths_select_the_original_input_independently_of_definitions() {
+        let mut store = MemoryStore::new();
+        let source = test_oid('a');
+        let head = root_with(
+            &mut store,
+            BTreeMap::from([("project/revision".into(), source.clone())]),
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &head).unwrap();
+        for name in ["run_tool", "tool_help"] {
+            // The definition need not exist until evaluation. Input selection
+            // uses only stored source boundaries and has no code/dirty rule.
+            let mut call = Call {
+                id: "tool-path".into(),
+                name: name.into(),
+                input: json!({"path": "project/revision/generated/tool"}),
+            };
+            assert!(matches!(resolve_target(&view, &call).unwrap(),
+                Target::SourceTree { name, commit } if name == "project/revision" && commit == source));
+            call.input["path"] = json!("generated/tool");
+            assert!(matches!(
+                resolve_target(&view, &call).unwrap(),
+                Target::Files
+            ));
         }
     }
 

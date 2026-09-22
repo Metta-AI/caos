@@ -3,3 +3,5 @@
 //! same conversation history (design/chat.md).
 
 pub mod v3;
+
+pub mod tools;
