@@ -144,6 +144,7 @@ value:@=<file containing key>
 # an arg tree
 reader=std/github-push
 reader=tools/deploy
+# Use `value:env=...` and `entropy:env=...` to pull from the environment. If value comes from the env, entropy must too
 ```
 - When a call stack is started, such as `caos-cli run`, we read the current source tree and the list of secrets. Readers in secrets are matched against the tree. Any worker named as a reader is granted access to the secret. These workers have a hash of the names and entropy of all exposed secrets injected into them as /cas/args/secret-hash
 - A reader naming a path the tree does not carry is ignored, with a warning
@@ -195,6 +196,20 @@ Note that this means that the server sees all secrets. We can revisit if this be
   sees values it never injects (sub-runs aren't known ahead of time, so the
   client can't pre-filter to the granted subset). Moot for a per-user/local
   server; a tighter hand-off is future work.
+
+# Agent/harness integration
+
+When a user uses caos with an agent harness, caos creates a conversation commit based on the repo that it's started from. This repo should be some version of a caos-client repo, not a normal repo that contains the files that the user wants to work on. The repo:
+- Must contain flake.nix and flake.lock with a caos input, and a matching .caos-expr that loads the caos flake
+- Possibly contains a some readmes and agents.md
+- Possibly contains some caos expressions that load in other repos, that
+contain helpful tools, and the readmes describe those tools 
+
+When starting a session:
+- The claude cloud env's setup script reads the flake/expression's caos url and runs `<url>/integrations/claude-code/cloud/install.sh --base=... --caos-std-path=<path to caos std>`. This installs everything
+- We start the conversation commit from this repo's default branch, or whatever branch the user chooses
+
+The user will then say something like "import <repo name>" and the agent will find the repo in github, import it as a source tree in the conversation commit and then start working on it 
 
 # Codebase
 
@@ -310,6 +325,7 @@ There should be exactly one copy of the code that starts a stack and builds the 
 - `refs/caos/bins` does NOT exist. Nothing creates it and nothing reads it: a
   tool gets the tree under test and builds from source, so there is no ref of
   prebuilt host binaries to resolve. Do not reintroduce one.
+
 
 # From agents
 
