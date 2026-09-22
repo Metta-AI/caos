@@ -302,6 +302,13 @@ if [ "$have_repo" = 1 ] && [ -n "$server" ] && command -v caos >/dev/null 2>&1; 
         # perfectly good registry sat in the cache under another key.
         locator="--llm-step:@=$caos_std_path/llm-step"
     else
+        # ONLY REACHABLE ON AN OLDER SNAPSHOT, and kept for exactly that. An
+        # environment built by the current setup.sh always has a pin (it fails
+        # without one), so `$caos_std_path` is always set above and this branch
+        # is not taken. Where it IS taken, the snapshot's configuration names
+        # the same `:@@=` form this builds, so the warm and the serve still
+        # agree on a cache key -- which is the only thing that matters here,
+        # since the registry cache is keyed by the `--llm-step` STRING.
         record=/usr/local/share/caos/build
         step_repo=""
         step_commit=""
