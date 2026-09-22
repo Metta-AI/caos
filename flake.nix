@@ -667,6 +667,107 @@ sandbox = false''
         # one and not the other reaches the server itself and then fails inside
         # git with `'remote-caos' is not a git command`.
         cliPackages = "--package caos-cli --package caos-iroh --bins";
+
+        # THE CLIENT FOR A NAMED LINUX TARGET, regardless of what this machine
+        # is. `dev/dev-publish` pushes these into caosd so a cloud container can
+        # run uncommitted work; a container is x86_64, and the host build is
+        # not (`muslTarget` follows the build host: aarch64 on Apple Silicon).
+        # Publishing the host's binary from a Mac yields one that installs
+        # cleanly and then cannot exec, which presents as a session with no
+        # caos in it at all.
+        #
+# THE HOST'S TARGET COSTS NOTHING, and that is the common case. `workspaceBins`
+        # is already a static musl Linux build of the whole workspace for
+        # `muslTarget` — it is what `stackInputs` hands the dev stack — so on an
+        # x86_64 Linux machine the binaries a container needs are already on
+        # disk. Asking for them again under a different `pname` would compile
+        # the workspace a second time to produce identical bytes.
+        #
+        # So only a DIFFERENT target builds anything, which in practice means a
+        # Mac: its whole caos world is aarch64 (`linuxSystem`, `muslTarget`),
+        # and a cloud container is x86_64.
+        #
+        # SELF-CONTAINED ON PURPOSE in that branch. It builds its own toolchain,
+        # crane lib and args rather than parameterizing the ones above, so
+        # nothing that currently builds can change shape. The cost is a second
+        # `rust-std` (~135 MiB, which the toolchain above deliberately avoids)
+        # and a second dependency compile, paid only by whoever asks for a
+        # target their machine does not already build.
+        clientFromBins =
+          name: bins:
+          pkgs.runCommand name { } ''
+            mkdir -p $out/bin
+            cp ${bins}/bin/caos-cli $out/bin/caos
+            cp ${bins}/bin/git-remote-caos $out/bin/git-remote-caos
+            chmod +w $out/bin/caos $out/bin/git-remote-caos
+          '';
+
+        clientForTarget =
+          target:
+          if target == muslTarget then
+            clientFromBins "caos-client-${target}" workspaceBins
+          else
+          let
+            toolchain =
+              (
+                if rustChannel == "stable" then
+                  pkgs.rust-bin.stable.latest
+                else
+                  pkgs.rust-bin.stable.${rustChannel}
+              ).minimal.override
+                { targets = [ target ]; };
+            crossCrane = (crane.mkLib pkgs).overrideToolchain toolchain;
+            envTarget = pkgs.lib.toUpper (builtins.replaceStrings [ "-" ] [ "_" ] target);
+            isAarch64 = pkgs.lib.hasPrefix "aarch64" target;
+            # rustc links musl self-contained, but C-carrying deps (rustls'
+            # crypto backend, reached through iroh) compile via cc-rs and need a
+            # real musl cc for the TARGET, not the host.
+            crossCC =
+              if isAarch64 then
+                pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+              else
+                pkgs.pkgsCross.musl64.stdenv.cc;
+            # Apple ld cannot link Linux ELF; rust-lld ships in the toolchain
+            # and links musl cross-platform. Same reasoning as `muslCrossLinker`
+            # above, but bound to THIS target.
+            crossLd = pkgs.writeShellScript "caos-rust-lld-${target}" ''
+              sysroot="$(${toolchain}/bin/rustc --print sysroot)"
+              exec "$(echo "$sysroot"/lib/rustlib/*/bin/rust-lld)" "$@"
+            '';
+            targetArgs =
+              nativeArgs
+              // {
+                pname = "caos-client-${target}";
+                CARGO_BUILD_TARGET = target;
+                "CC_${builtins.replaceStrings [ "-" ] [ "_" ] target}" =
+                  "${crossCC}/bin/${crossCC.targetPrefix}cc";
+                # UNCONDITIONALLY rust-lld, not just on Darwin as the host build
+                # above does. That guard is right for `muslTarget`, which is the
+                # host's OWN architecture -- "Linux hosts link musl with their
+                # native toolchain" holds when there is no arch to cross. This
+                # branch is only reached when the target arch DIFFERS, so the
+                # native `cc` is the wrong linker every time: measured as
+                # `collect2: error: ld returned 1 exit status` linking
+                # `caos-iroh` for aarch64 on an x86_64 host, with `cc` named as
+                # the linker in the failing command.
+                "CARGO_TARGET_${envTarget}_LINKER" = "${crossLd}";
+                "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
+              };
+            built = crossCrane.buildPackage (
+              targetArgs
+              // {
+                cargoArtifacts = crossCrane.buildDepsOnly (
+                  targetArgs // { cargoExtraArgs = cliPackages; }
+                );
+                cargoExtraArgs = cliPackages;
+                doCheck = false;
+              }
+            );
+          in
+          # Just the two files a container installs, under the names it expects.
+          # `caos` rather than `caos-cli`: the wrapper that renames it is a
+          # /nix/store shell script and does not travel.
+          clientFromBins "caos-client-${target}" built;
         nativeCliArtifacts = craneLib.buildDepsOnly (
           nativeArgs // { cargoExtraArgs = cliPackages; }
         );
@@ -1378,6 +1479,12 @@ sandbox = false''
       in
       {
         packages = {
+          # The client a cloud container can actually exec, built for the
+          # container's architecture rather than this machine's. `dev-publish`
+          # pushes it into caosd; see `clientForTarget`.
+          caos-client-x86_64-linux = clientForTarget "x86_64-unknown-linux-musl";
+          caos-client-aarch64-linux = clientForTarget "aarch64-unknown-linux-musl";
+
           # `nix run github:Metta-AI/caos#deploy-caosd-prod` on a fresh box.
           # Go rather than shell: this program's job is quoting a nix
           # expression and branching on host facts, which is precisely where

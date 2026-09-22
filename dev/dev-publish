@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Publish the working tree AND the binaries built from it to caosd, as one
+# commit at `refs/caos/dev`, so a cloud session can run your uncommitted work
+# without GitHub and without waiting for CI.
+#
+#   dev/dev-publish              # nix build, snapshot, push; prints the sha
+#   dev/dev-publish --no-build   # skip the "building" notice; nix still
+#                                # resolves the package (a cache hit when warm)
+#
+# WHY THIS IS NOT PART OF `nix build`, which is the obvious place for it and
+# cannot work:
+#
+#   * a nix build is sandboxed and offline. Pushing to caosd is a network side
+#     effect with a non-deterministic result, which is the one thing a
+#     derivation may not do. (`post-build-hook` could, but it is a daemon-wide
+#     setting that would fire for every build on the machine.)
+#   * and it would MISS the common case. `std/` is compiled by caos itself, in
+#     a rustc worker, from the std tree -- so editing `std/llm-step` changes
+#     what a session runs with no `nix build` involved at all. Tying the
+#     publish to the build would quietly skip exactly the edits that need it
+#     most.
+#
+# So the unit is the WORKING TREE, not the build: one commit carrying the
+# source (for `std/`, reached by `:@@=git+caos://…&dir=std`) and the two
+# binaries (for the client). There is no "dirty" to declare and nothing to
+# remember to commit -- the snapshot IS the commit, and the sha it prints is
+# what the container pins.
+#
+# Nothing new listens. caosd already serves git over its ticket, so this is an
+# ordinary push and the container reads it back with an ordinary
+# `git ls-remote` + `git fetch`.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo"
+
+remote="${CAOS_REMOTE:-caos}"
+ref="${CAOS_DEV_REF:-refs/caos/dev}"
+build=yes
+for arg in "$@"; do
+    case "$arg" in
+        --no-build) build="" ;;
+        --remote=*) remote="${arg#--remote=}" ;;
+        --ref=*)    ref="${arg#--ref=}" ;;
+        *) echo "usage: dev/dev-publish [--no-build] [--remote=<name>] [--ref=<ref>]" >&2; exit 2 ;;
+    esac
+done
+
+git remote get-url "$remote" >/dev/null 2>&1 \
+    || { echo "no '$remote' git remote; point one at your caosd (caosd ticket)" >&2; exit 1; }
+
+# THE HOST'S git-remote-caos, on PATH, because the push below goes over a
+# `caos://` remote and git reaches one by EXEC'ing `git-remote-caos` by name.
+# Without it the push dies as `git: 'remote-caos' is not a git command`, which
+# names neither caos nor the missing helper.
+#
+# NOT the one this script publishes. There are two binaries of that name in
+# play and they are for different machines: the published one is built for the
+# CONTAINER (x86_64), while this one has to run HERE -- on a Mac those are
+# different architectures, and using the wrong one fails to exec.
+host_tools="$(nix build --no-link --print-out-paths .#caos-cli)"
+[ -x "$host_tools/bin/git-remote-caos" ] \
+    || { echo "no git-remote-caos in $host_tools/bin" >&2; exit 1; }
+export PATH="$host_tools/bin:$PATH"
+
+# THE CLIENT A CONTAINER CAN EXEC, built for the CONTAINER's architecture
+# rather than this machine's (`clientForTarget`, flake.nix). That distinction
+# is the whole reason this is a package and not `result/bin`: `muslTarget` and
+# `linuxSystem` both follow the build host, so a Mac's entire caos world is
+# aarch64 while a cloud container is x86_64. Publishing the host's binary from
+# a Mac yields one that installs cleanly and then cannot exec, which presents
+# as a session with no caos in it at all.
+#
+# On x86_64 Linux this costs seconds: the package is `workspaceBins`, which the
+# dev stack has already built. Only a machine that does not natively build
+# x86_64 Linux compiles anything here.
+#
+# It also hands over two ready files rather than a wrapper. `result/bin/caos-cli`
+# is a shell script that sets CAOS_REV and execs the real executable elsewhere
+# in the store, so it names /nix/store paths a container does not have; the
+# package copies the inner binaries out under the names a container installs.
+target_pkg=".#caos-client-x86_64-linux"
+if [ -n "$build" ]; then
+    echo "building $target_pkg" >&2
+fi
+client="$(nix build --no-link --print-out-paths "$target_pkg")"
+inner="$client/bin/caos"
+helper="$client/bin/git-remote-caos"
+
+# Asserted, not assumed. These are the two properties a container needs and
+# neither is visible until it fails there: a dynamically linked binary finds no
+# loader, and a foreign-arch one does not exec at all. Both are one `file` call
+# here and an unexplainable session there.
+for b in "$inner" "$helper"; do
+    [ -x "$b" ] || { echo "$target_pkg did not produce $b" >&2; exit 1; }
+    file "$b" | grep -qE 'static-pie linked|statically linked' \
+        || { echo "$b is not static:" >&2; file "$b" >&2; exit 1; }
+    file "$b" | grep -q 'x86-64' \
+        || { echo "$b is not x86-64, which a cloud container requires:" >&2
+             file "$b" >&2; exit 1; }
+done
+
+# The snapshot: the working tree as git sees it, in a TEMPORARY index so the
+# real one is untouched. `git add -A` honours .gitignore, which is what keeps
+# `.caos-data` (a server's object store), `result` and `target` out.
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+export GIT_INDEX_FILE="$tmp/index"
+git read-tree --empty
+git add -A
+
+# The binaries ride in the same commit, under a directory the container knows.
+# Hashing them into the object store directly (rather than copying them into
+# the worktree) keeps the worktree clean and makes a rebuild of an unchanged
+# tree free: nix is reproducible, so the blob is identical and git stores it
+# once.
+for pair in "caos:$inner" "git-remote-caos:$helper"; do
+    name="${pair%%:*}"; path="${pair#*:}"
+    blob="$(git hash-object -w "$path")"
+    git update-index --add --cacheinfo "100755,$blob,dev-bin/$name"
+done
+
+tree="$(git write-tree)"
+head_sha="$(git rev-parse --verify --quiet HEAD || true)"
+dirty=""
+if [ -n "$head_sha" ] && [ "$tree" != "$(git rev-parse "$head_sha^{tree}")" ]; then
+    dirty=" (working tree differs from $(git rev-parse --short "$head_sha"))"
+fi
+commit="$(git commit-tree "$tree" \
+    ${head_sha:+-p "$head_sha"} \
+    -m "dev-publish: $(git rev-parse --short "${head_sha:-HEAD}" 2>/dev/null || echo tree)$dirty")"
+
+echo "pushing $commit -> $remote $ref" >&2
+git push --quiet --force "$remote" "$commit:$ref"
+
+echo "$commit"
+echo "published$dirty" >&2
+echo "  tools:  :@@=git+\$CAOS_SERVER_URL?rev=$commit&dir=std" >&2
+echo "  client: dev-bin/caos and dev-bin/git-remote-caos in that tree" >&2
