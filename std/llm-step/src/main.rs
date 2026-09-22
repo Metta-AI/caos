@@ -2,6 +2,7 @@
 
 mod async_work;
 mod githist;
+mod github;
 mod import_source;
 mod progress;
 mod publish_source;
@@ -60,6 +61,7 @@ struct Config {
     bash_image: String,
     grep_image: Option<String>,
     merge_image: Option<String>,
+    github_source: Option<String>,
     std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
@@ -124,6 +126,7 @@ impl Config {
             bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             merge_image: image_arg("merge-image")?,
+            github_source: image_arg("github-source")?,
             std_tool_images: STD_TOOLS
                 .iter()
                 .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
@@ -297,6 +300,9 @@ fn callback(
     timing::phase(&format!("tool wait {tool}"));
 
     if read_arg_opt("tool-eval")?.is_some() {
+        if tool == "github" {
+            return github::evaluated(cfg, state, request, request_head, round, &id);
+        }
         if Path::new(&arg("error")).exists() {
             let error = read_arg("error")?;
             let block = failed_run_block(&id, &tool, &error);
@@ -1073,6 +1079,9 @@ fn drive_call(
         return Ok(true);
     }
 
+    if call.name == "github" {
+        return github::start(cfg, state, &site);
+    }
     if call.name == subagents::SPAWN_TOOL {
         return spawn_agent_call(cfg, state, &site);
     }
@@ -1623,6 +1632,9 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
+    if call.name == "github" {
+        return github::dispatch(request, round, call, record);
+    }
     let commit = record
         .input_commit
         .as_ref()
@@ -1688,6 +1700,7 @@ fn callback_result(
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
     match record.name.as_str() {
+        "github" => github::result(record),
         subagents::WAIT_TOOL => wait_callback_block(state, record),
         "grep" => {
             let scope = read_arg_opt("scope")?.unwrap_or_default();
@@ -2971,6 +2984,9 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
         registry.push(with_source_tree(merge_tool()));
     }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
+    if cfg.github_source.is_some() {
+        registry.push(github::declaration());
+    }
     for &(name, arg_name) in &STD_TOOLS {
         if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
             if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
