@@ -226,43 +226,12 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
     })
 }
 
-/// Read the final directory beneath an already evaluated parent. Both tool
-/// calls arrive here after the shared ancestor-evaluation continuation.
-fn read_tool_at(ws: &str, relative: &str) -> Result<Result<(TreeTool, String), NotATool>, String> {
-    let resolved = fresh("tool-path");
-    caos([
-        "resolve",
-        &worker_common::cas_hash(ws)?,
-        relative,
-        &resolved,
-    ])?;
-    if !Path::new(&resolved).is_dir() {
-        return Ok(Err(NotATool::NoExpression));
+/// Describe an already-resolved directory without evaluating its expression.
+pub fn tool_at(definition: &str, display: &str) -> Result<TreeTool, String> {
+    if worker_common::cas_kind(definition)? != "tree" {
+        return Err(not_a_tool_message(NotATool::NoExpression, display));
     }
-    read_tool(relative, &resolved).map(|tool| tool.map(|tool| (tool, resolved)))
-}
-
-/// Resolve and describe one final directory, with recoverable diagnostics
-/// against the evaluated parent. The display path stays conversation-relative.
-pub fn tool_at(parent: &str, leaf: &str, display: &str) -> Result<(TreeTool, String), String> {
-    let outcome = read_tool_at(parent, leaf);
-    if let Ok(Ok((mut tool, definition))) = outcome {
-        tool.name = display.to_string();
-        return Ok((tool, definition));
-    }
-    let nearby = nearby_dirs(parent, "");
-    let what = match outcome {
-        Ok(Ok(_)) => unreachable!(),
-        Ok(Err(reason)) => not_a_tool_message(reason, display),
-        Err(error) => match &nearby {
-            Some(names) if !names.iter().any(|name| name == leaf) => {
-                format!("no such path: {display}")
-            }
-            _ => format!("cannot read {display}: {error}"),
-        },
-    };
-    let (directory, _) = display.rsplit_once('/').unwrap_or(("", display));
-    Err(format!("{what}{}", suggestion(directory, nearby)))
+    read_tool(display, definition)?.map_err(|reason| not_a_tool_message(reason, display))
 }
 
 /// Why `path` is not a tool, in the model's words. Shared by `tool_help` and
@@ -296,46 +265,6 @@ pub fn describe(tool: &TreeTool, path: &str) -> String {
         out.push_str(&format!("  {} ({need}) — {}\n", a.name, a.doc));
     }
     out
-}
-
-/// The directory names inside `parent` (`""` for the conversation root), or
-/// `None` when `parent` itself could not be read as a directory.
-///
-/// One `caos resolve` and one `caos get` — never a per-child fetch. `None` is
-/// load-bearing: it is the difference between "that name is not there" and "I
-/// could not look", and `tool_help` reports those differently.
-fn nearby_dirs(ws: &str, parent: &str) -> Option<Vec<String>> {
-    let resolved = fresh("tool-parent");
-    let hash = worker_common::cas_hash(ws).ok()?;
-    caos(["resolve", &hash, parent, &resolved]).ok()?;
-    if !Path::new(&resolved).is_dir() {
-        return None;
-    }
-    caos(["get", &resolved]).ok()?;
-    let mut names: Vec<String> = fs::read_dir(&resolved)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect();
-    names.sort();
-    Some(names)
-}
-
-/// Where else to look, appended to a failed `tool_help`. Discovery is
-/// documentation now, so a wrong path is the ordinary mistake, and naming the
-/// candidates turns it into a self-correcting one instead of a round trip.
-fn suggestion(parent: &str, nearby: Option<Vec<String>>) -> String {
-    let Some(mut names) = nearby.filter(|names| !names.is_empty()) else {
-        return String::new();
-    };
-    names.truncate(50);
-    let where_ = if parent.is_empty() {
-        "the conversation root".to_string()
-    } else {
-        parent.to_string()
-    };
-    format!(". Directories in {where_}: {}", names.join(" "))
 }
 
 /// Bind a tree-tool call's inputs to the parameters the script declared,

@@ -183,14 +183,14 @@ grep -qF 'The word to echo.' /tmp/stub/request-2.json \
   || fail "tool_help dropped a @param's documentation"
 echo "  ok: word required, suffix optional, docs carried" >&2
 
-stage "tool_help: the two not-a-tool answers, each naming the siblings"
+stage "tool_help: invalid definitions and missing paths with sibling hints"
 grep -qF 'binds no `--help`' /tmp/stub/request-2.json \
   || fail "an expression with no --help was not distinguished from a non-tool"
 grep -qF 'no such path' /tmp/stub/request-2.json \
   || fail "a path that does not exist was not reported as such"
 # Discovery is documentation, so a wrong path is the ordinary mistake: the
 # siblings turn it into a self-correcting one instead of a round trip.
-grep -qF 'Directories in main/caos-tools:' /tmp/stub/request-2.json \
+grep -qF 'Directories in caos-tools:' /tmp/stub/request-2.json \
   || fail "a bad tool path did not name the sibling directories"
 echo "  ok: no-help, no-such-path, and the sibling listing" >&2
 

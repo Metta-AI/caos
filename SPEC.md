@@ -112,9 +112,8 @@ Two built-in tools address one by PATH:
   reads the tool's own `.caos-expr` and parses its `help` here-string.
   It never evaluates, builds, or runs the target tool merely to describe it.
   It says which of three things went wrong — no such path, no `.caos-expr`, or
-  an expression binding no `--help` — since
-  each has a different fix, and it names the sibling directories, because a
-  wrong path is the ordinary mistake once nothing lists the tools. All three
+  an expression binding no `--help` — since each has a different fix. A missing
+  path names the sibling directories to help the caller find the tool. All three
   are error tool_results, never worker failures.
 - `run_tool --path=<conversation path> --arguments=<object>` evaluates that
   path and runs the resulting ArgTree with the given arguments. An undeclared
@@ -145,12 +144,12 @@ would resolve to nothing. And it is why a human's `run-tool` lands on the same
 ArgTree: the human has one source tree — the worktree — so the prefix is empty
 and the remainder is the whole path.
 
-Both tools evaluate the path's ancestors with the ordinary CAOS evaluator,
-including its dependency-resolution semantics, then read the final directory
-without evaluating its expression. Thus a root expression may generate a
-`tools/check` directory absent from the stored tree: `tool_help` reads that
-definition and `run_tool` validates its arguments before evaluating and
-invoking it. Missing paths and invalid definitions are recoverable tool errors.
+Both tools use the ordinary CAOS evaluator's `--stop-before-target` mode,
+including its dependency-resolution semantics. The mode evaluates ancestors
+and returns the final directory without evaluating its expression. Thus a root
+expression may generate a `tools/check` directory absent from the stored tree:
+`tool_help` reads that definition and `run_tool` validates its arguments before
+evaluating and invoking it. Missing paths and invalid definitions are recoverable tool errors.
 
 Resolution uses the current conversation snapshot on every call. The
 definition's evaluated tree is separate from the input: invocation still binds
@@ -158,7 +157,7 @@ the original selected source tree, or the original conversation tree when no
 source-tree prefix was selected, as `in`.
 
 MCP resolves the requested `path` against that same snapshot on the client,
-where pinned `:@@=` dependencies can be fetched. It hands the evaluated parent
+where pinned `:@@=` dependencies can be fetched. It hands the resolved definition
 to both tools and, after shared argument validation, the evaluated target to
 `run_tool`. The handoff names its input tree and path, so a changed snapshot
 cannot consume a stale result. Workers continue to use evaluation continuations

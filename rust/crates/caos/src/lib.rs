@@ -37,7 +37,8 @@ use gix::objs::WriteTo;
 
 mod eval;
 mod watch;
-pub use eval::cli_eval_path;
+pub use caos_eval::EvalMode;
+pub use eval::{cli_eval_path, eval_path_with_mode};
 
 /// `run-tool <name | script> [--name=value ...]` — run a caos-tool by hand: fire
 /// the tool as a caos job over this repo's tree, exactly what an agent's tool
@@ -126,24 +127,6 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
-/// Evaluate a tool's parent path on the client that can fetch pinned locators.
-/// The worker receives this parent and reads the target definition.
-pub fn resolve_tool_parent(
-    t: &dyn Transport,
-    root: &str,
-    path: &str,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    let (kind, oid) = eval::eval_path(t, root, path, store)?;
-    if kind != "tree" {
-        return Err(format!(
-            "cannot resolve {path}: its parent evaluates to a {kind}"
-        ));
-    }
-    t.ensure_pushed(&oid)?;
-    Ok(oid)
-}
-
 /// Evaluate a tool directory after the caller has validated its definition and
 /// arguments. Locator resolution and secret marking remain client-side.
 pub fn eval_tree_tool(
@@ -162,30 +145,19 @@ pub fn eval_tree_tool(
     Ok(oid)
 }
 
-/// Read the final directory's expression beneath an evaluated parent, without
-/// evaluating the target. The caller owns help parsing and argument validation.
-pub fn read_tool_definition(
-    t: &dyn Transport,
-    parent: &str,
-    leaf: &str,
-) -> Result<(String, String), String> {
-    let entry = fetch_tree_entries(t, parent)?
-        .unwrap_or_default()
-        .into_iter()
-        .find(|entry| entry_name(entry) == leaf.as_bytes())
-        .ok_or_else(|| format!("no such tool path: {leaf}"))?;
-    let directory = entry.oid.to_string();
-    let expression = fetch_tree_entries(t, &directory)?
+/// Read an already-resolved tool's own expression without evaluating it.
+pub fn read_tool_definition(t: &dyn Transport, directory: &str) -> Result<String, String> {
+    let expression = fetch_tree_entries(t, directory)?
         .unwrap_or_default()
         .into_iter()
         .find(|entry| entry_name(entry) == b".caos-expr")
-        .ok_or_else(|| format!("{leaf} is not a directory carrying a .caos-expr"))?;
+        .ok_or_else(|| "tool is not a directory carrying a .caos-expr".to_string())?;
     let (kind, bytes) = t.get_object(&expression.oid.to_string())?;
     if kind != "blob" {
-        return Err(format!("{leaf}/.caos-expr is not a file"));
+        return Err("tool .caos-expr is not a file".to_string());
     }
     let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    Ok((directory, text))
+    Ok(text)
 }
 
 /// Print a tool result's report conventions, reading ONLY the objects they
@@ -3689,6 +3661,7 @@ pub fn caos_run_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(
 /// `in` (recorded verbatim, not an image); `--catch` turns a failed walk into
 /// `--error` (and needs `--then`), like run-then's. This is how a WORKER — which
 /// may not block on a run — gets a `.caos-expr` evaluated: it asks the server to.
+/// `--stop-before-target` evaluates only ancestors and returns the final node unchanged.
 pub fn caos_eval_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<(), String> {
     record_continuation(
         t,
@@ -3697,7 +3670,7 @@ pub fn caos_eval_then(t: &dyn Transport, input: &str, kvs: &[String]) -> Result<
         kvs,
         &["then"],
         &["eval"],
-        &["catch"],
+        &["catch", "stop-before-target"],
         |given| {
             if !given.contains(&"eval") {
                 return Err("`eval-path-then` needs --eval=<path>".to_string());
@@ -6138,9 +6111,11 @@ mod tool_resolution_tests {
     }
 
     fn definition(t: &Store, root: &str, path: &str) -> (String, String) {
-        let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", path));
-        let parent = resolve_tool_parent(t, root, parent, &[]).unwrap();
-        read_tool_definition(t, &parent, leaf).unwrap()
+        let (kind, directory) =
+            eval_path_with_mode(t, root, path, &[], EvalMode::StopBeforeTarget).unwrap();
+        assert_eq!(kind, "tree");
+        let expression = read_tool_definition(t, &directory).unwrap();
+        (directory, expression)
     }
 
     #[test]
@@ -6205,10 +6180,50 @@ mod tool_resolution_tests {
         let target = expr(&t, "curry --base=fixture --help=Ordinary");
         let root = tree(&t, &[("tool", "tree", &target)]);
         assert!(definition(&t, &root, "tool").1.contains("--help=Ordinary"));
-        let parent = resolve_tool_parent(&t, &root, "", &[]).unwrap();
-        assert!(read_tool_definition(&t, &parent, "missing")
-            .unwrap_err()
-            .contains("no such tool path: missing"));
+        let error =
+            eval_path_with_mode(&t, &root, "missing", &[], EvalMode::StopBeforeTarget).unwrap_err();
+        assert!(error.contains("no such path:"));
+        assert!(error.contains("missing"));
+        assert!(error.contains("Directories in .: tool"));
+        assert!(
+            reader_path_absent(&error),
+            "missing optional readers must still be recognized"
+        );
+    }
+
+    #[test]
+    fn stopping_at_the_root_and_evaluating_it_have_separate_memos() {
+        let t = Store::default();
+        let root = expr(&t, "curry --base=fixture --help=Root");
+        let stopped = eval_path_with_mode(&t, &root, "", &[], EvalMode::StopBeforeTarget).unwrap();
+        assert_eq!(stopped, ("tree".into(), root.clone()));
+        let evaluated = eval::eval_path(&t, &root, "", &[]).unwrap();
+        assert_ne!(evaluated.1, root);
+        assert_eq!(
+            eval_path_with_mode(&t, &root, "", &[], EvalMode::StopBeforeTarget).unwrap(),
+            stopped
+        );
+        assert_eq!(eval::eval_path(&t, &root, "", &[]).unwrap(), evaluated);
+    }
+
+    #[test]
+    fn stopping_at_the_target_still_evaluates_ancestor_dependencies() {
+        let t = Store::default();
+        let target = expr(&t, "run --base=forbidden --help=Dependency");
+        let dependency = generated(&t, &target);
+        let directive = expr(&t, "curry --base=fixture --dep:@=dependency");
+        let expression = fetch_tree_entries(&t, &directive).unwrap().unwrap()[0]
+            .oid
+            .to_string();
+        let root = tree(
+            &t,
+            &[
+                (".caos-expr", "blob", &expression),
+                ("dependency", "tree", &dependency),
+            ],
+        );
+        assert_eq!(definition(&t, &root, "args/dep/args/tool").0, target);
+        assert_eq!(t.computes.get(), 0);
     }
 
     #[test]

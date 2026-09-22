@@ -255,24 +255,32 @@ fn dispatch_call(
         if let Ok((root, path)) = tool_resolution_scope(&object_store, &view, arguments) {
             kvs.push(format!("--client-tool-root={root}"));
             kvs.push(format!("--client-tool-path={path}"));
-            let (parent_path, leaf) = conversation_protocol::tools::parent_path(&path)?;
-            let resolved = caos::resolve_tool_parent(t, root.as_str(), &parent_path, &store)
-                .and_then(|parent| {
-                    kvs.push(format!("--client-tool-parent:hash={parent}"));
-                    if name == "run_tool" {
-                        let args = arguments
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or_else(|| json!({}));
-                        let (directory, expression) =
-                            caos::read_tool_definition(t, &parent, &leaf)?;
-                        let tool = conversation_protocol::tools::read_tool(&path, &expression)?;
-                        conversation_protocol::tools::bind_args(&args, &tool)?;
-                        let tree = caos::eval_tree_tool(t, &directory, &path, &store)?;
-                        kvs.push(format!("--client-tool-tree:hash={tree}"));
-                    }
-                    Ok(())
-                });
+            let resolved = caos::eval_path_with_mode(
+                t,
+                root.as_str(),
+                &path,
+                &store,
+                caos::EvalMode::StopBeforeTarget,
+            )
+            .and_then(|(kind, directory)| {
+                if kind != "tree" {
+                    return Err(format!("{path} is not a tool directory (got {kind})"));
+                }
+                t.ensure_pushed(&directory)?;
+                kvs.push(format!("--client-tool-definition:hash={directory}"));
+                if name == "run_tool" {
+                    let args = arguments
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let expression = caos::read_tool_definition(t, &directory)?;
+                    let tool = conversation_protocol::tools::read_tool(&path, &expression)?;
+                    conversation_protocol::tools::bind_args(&args, &tool)?;
+                    let tree = caos::eval_tree_tool(t, &directory, &path, &store)?;
+                    kvs.push(format!("--client-tool-tree:hash={tree}"));
+                }
+                Ok(())
+            });
             if let Err(error) = resolved {
                 // Deliver a recoverable tool error. Falling back to the server
                 // would discard the actual locator/argument error.

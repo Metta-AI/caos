@@ -206,20 +206,3 @@ pub fn bind_args(input: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>
     }
     Ok(out)
 }
-
-/// Split a conversation/source-relative tool path. Only its parent is evaluated;
-/// the final directory must retain its own expression for help and validation.
-pub fn parent_path(path: &str) -> Result<(String, String), String> {
-    let parts: Vec<_> = path
-        .trim()
-        .split('/')
-        .filter(|p| !p.is_empty() && *p != ".")
-        .collect();
-    if parts.is_empty() || parts.contains(&"..") {
-        return Err(format!("invalid tool path: {path:?}"));
-    }
-    Ok((
-        parts[..parts.len() - 1].join("/"),
-        parts[parts.len() - 1].to_string(),
-    ))
-}

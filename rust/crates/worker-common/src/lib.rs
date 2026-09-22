@@ -293,16 +293,32 @@ fn run_then_inner(input: &str, run: Arg, then: Option<Arg>, catch: bool) -> Resu
 /// a worker gets a `.caos-expr` evaluated: it may not block on a run, so it asks
 /// the server to (design/caos-expr.md). Like [`run_then`], a worker's final act.
 pub fn eval_then(input: &str, path: &str, then: Option<Arg>) -> Result<(), String> {
-    eval_then_inner(input, path, then, false)
+    eval_then_inner(input, path, then, &[])
 }
 
 /// [`eval_then`] with `--catch`: a FAILED walk reaches `then` as `--error=<blob>`
 /// instead of failing the request. `then` is required.
 pub fn eval_then_catching(input: &str, path: &str, then: Arg) -> Result<(), String> {
-    eval_then_inner(input, path, Some(then), true)
+    eval_then_inner(input, path, Some(then), &["--catch"])
 }
 
-fn eval_then_inner(input: &str, path: &str, then: Option<Arg>, catch: bool) -> Result<(), String> {
+/// Resolve an expression-aware path without evaluating its final node.
+/// Like eval_then_catching, errors are delivered to the continuation.
+pub fn resolve_then_catching(input: &str, path: &str, then: Arg) -> Result<(), String> {
+    eval_then_inner(
+        input,
+        path,
+        Some(then),
+        &["--catch", "--stop-before-target"],
+    )
+}
+
+fn eval_then_inner(
+    input: &str,
+    path: &str,
+    then: Option<Arg>,
+    flags: &[&str],
+) -> Result<(), String> {
     // `--eval` is the one non-image entry in a continuation: the PATH is
     // recorded verbatim, so it stays a plain literal while `then` is typed like
     // every other image ref.
@@ -314,9 +330,7 @@ fn eval_then_inner(input: &str, path: &str, then: Option<Arg>, catch: bool) -> R
     if let Some(then) = then {
         argv.push(then.token("then"));
     }
-    if catch {
-        argv.push("--catch".into());
-    }
+    argv.extend(flags.iter().map(|flag| (*flag).to_string()));
     caos_argv(&str_refs(&argv))
 }
 

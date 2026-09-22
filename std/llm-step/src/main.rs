@@ -32,8 +32,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
-    run_worker, scratch, secret, Arg,
+    prepare_request, read_arg, read_arg_opt, resolve_then_catching, run_request_then,
+    run_request_then_catching, run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -298,9 +298,15 @@ fn callback(
 
     if read_arg_opt("tool-eval")?.is_some() || read_arg_opt("tool-lookup")?.is_some() {
         if Path::new(&arg("error")).exists() {
-            let error = read_arg("error")?;
-            let block = failed_run_block(&id, &tool, &error);
+            let mut error = read_arg("error")?;
             let target = pending_call_target(state, request, round, &id)?;
+            if let Some(path) = read_arg_opt("tool-lookup")? {
+                let path = target
+                    .as_ref()
+                    .map_or(path.clone(), |(name, _)| format!("{name}/{path}"));
+                error = format!("{path}: {error}");
+            }
+            let block = failed_run_block(&id, &tool, &error);
             let declaration = declaration_message(&state.conversation()?, request, round)?;
             let call = Call {
                 id,
@@ -1305,10 +1311,6 @@ fn prepare_compute(
         "bash" => prepare_bash(cfg, &clean, ws),
         "run_tool" | "tool_help" => {
             let relative = clean["input"]["path"].as_str().unwrap_or("");
-            let (parent, _) = match conversation_protocol::tools::parent_path(relative) {
-                Ok(path) => path,
-                Err(error) => return Ok(Prepared::Result(error_block(&call.id, &error))),
-            };
             let me = self_curry(
                 Some(wc),
                 request,
@@ -1327,12 +1329,12 @@ fn prepare_compute(
                     Arg::Hash(&me),
                     &[
                         ("in", Arg::Path(ws)),
-                        ("result", Arg::Path(&arg("client-tool-parent"))),
+                        ("result", Arg::Path(&arg("client-tool-definition"))),
                     ],
                 )?;
                 run_request_then(&task, None)?;
             } else {
-                eval_then_catching(ws, &parent, Arg::Hash(&me))?;
+                resolve_then_catching(ws, relative, Arg::Hash(&me))?;
             }
             Ok(Prepared::Evaluation)
         }
@@ -1513,8 +1515,7 @@ fn client_tool_tree(ws: &str, path: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Resume the shared ancestor walk. The result is the evaluated PARENT, so
-/// reading the final directory cannot evaluate or build the tool itself.
+/// Resume with the resolved, unevaluated tool directory.
 fn launch_resolved_tool(
     cfg: &Config,
     state: &mut progress::State,
@@ -1545,16 +1546,14 @@ fn launch_resolved_tool(
     }
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
-    let (_, leaf) = conversation_protocol::tools::parent_path(&relative)?;
-    let parent = arg("result");
+    let definition = arg("result");
     let site = CallSite::at(request, round, &call, &current.declaration_message);
     let outcome = tools::tool_at(
-        &parent,
-        &leaf,
+        &definition,
         call.input["path"].as_str().unwrap_or(&relative),
     );
     let block = match outcome {
-        Ok((tool, definition)) => {
+        Ok(tool) => {
             if call.name == "tool_help" {
                 result_block(
                     id,

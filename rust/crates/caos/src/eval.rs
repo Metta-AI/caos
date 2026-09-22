@@ -175,15 +175,31 @@ pub(crate) fn eval_path(
     path: &str,
     store: &[ClientSecret],
 ) -> Result<(String, String), String> {
+    eval_path_with_mode(t, start_tree, path, store, caos_eval::EvalMode::Evaluate)
+}
+
+/// Evaluate ancestors and optionally leave the final node unevaluated.
+pub fn eval_path_with_mode(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+    store: &[ClientSecret],
+    mode: caos_eval::EvalMode,
+) -> Result<(String, String), String> {
     let host = ClientEvalHost { t, store };
-    caos_eval::eval_path(&host, start_tree, path)
+    caos_eval::eval_path_with_mode(&host, start_tree, path, mode)
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
 /// root of the tree down to `<path>` and print the resulting object's
 /// `"<kind> <hash>"`. With no `--tree`, the tracked source tree is the start
 /// (dirty edits included, like `run-tool`'s `--in:@=.`).
-pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Result<(), String> {
+pub fn cli_eval_path(
+    t: &dyn Transport,
+    tree: Option<&str>,
+    path: &str,
+    mode: caos_eval::EvalMode,
+) -> Result<(), String> {
     let start = match tree {
         Some(oid) => {
             let (kind, _) = t.get_object(oid)?;
@@ -204,7 +220,7 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
     // the store to any `run` it dispatches (design/secrets.md). A `:@=` target is
     // NOT marked; see `caos_eval`'s `resolve_expr_path`.
     let store = build_secret_store(t)?;
-    let (kind, hash) = eval_path(t, &start, path, &store)?;
+    let (kind, hash) = eval_path_with_mode(t, &start, path, &store, mode)?;
     println!("{kind} {hash}");
     Ok(())
 }

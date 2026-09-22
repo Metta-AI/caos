@@ -103,6 +103,20 @@ caught)
   echo "  caught: $(cat /cas/args/error)" >&2
   echo "  ok: a failed walk was delivered as --error and the request succeeded" >&2
 
+  echo "== stop-before-target resolves a directory without running it ==" >&2
+  fixture
+  caos get /cas/fixture
+  expected=$(caos hash /cas/fixture/pkg)
+  caos eval-path-then /cas/fixture --eval=pkg --stop-before-target \
+    --then:hash="$(next resolved --expected="$expected")"
+  ;;
+
+resolved)
+  caos get /cas/args/expected
+  [ "$(caos hash /cas/args/result)" = "$(cat /cas/args/expected)" ] \
+    || fail "stop-before-target evaluated the target expression"
+  caos get /cas/args/result
+  [ -f /cas/args/result/.caos-expr ] || fail "the definition lost its expression"
   printf 'eval-then: ALL PASS\n' > /tmp/report
   cat /tmp/report >&2
   caos put /tmp/report /cas/out
