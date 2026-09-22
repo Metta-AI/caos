@@ -7,6 +7,7 @@ mod import_source;
 mod object_upload;
 mod progress;
 mod publish_source;
+mod push_stack;
 mod source_trees;
 mod stack;
 mod subagents;
@@ -1067,6 +1068,10 @@ fn drive_call(
                 stack::execute(state, &site)?;
                 return Ok(true);
             }
+            if existing.name == "push_stack" {
+                push_stack::execute(state, &site)?;
+                return Ok(true);
+            }
             if existing.name == "publish_source" {
                 publish_source::execute(state, &site)?;
                 return Ok(true);
@@ -1089,7 +1094,7 @@ fn drive_call(
         stack::execute(state, &site)?;
         return Ok(true);
     }
-    if matches!(call.name.as_str(), "github") {
+    if call.name == "github" {
         return github::start(cfg, state, &site);
     }
     if call.name == subagents::SPAWN_TOOL {
@@ -1100,6 +1105,10 @@ fn drive_call(
     }
     if call.name == subagents::HARVEST_TOOL {
         harvest_agent_call(state, &site)?;
+        return Ok(true);
+    }
+    if call.name == "push_stack" {
+        push_stack::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == "publish_source" {
@@ -1642,7 +1651,7 @@ fn dispatch_started(
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
-    if matches!(call.name.as_str(), "github") {
+    if call.name == "github" {
         return github::dispatch(request, round, call, record);
     }
     let commit = record
@@ -2978,11 +2987,12 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 }
 
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
-    let mut registry = vec![bash_tool(), stack::declaration()];
+    let mut registry = vec![bash_tool(), stack::declaration(), push_stack::declaration()];
     registry.extend(tools::declarations());
-    let mut publish = with_source_tree(tools::tree_tool_declaration(
-        &tools::builtin_tool("publish_source", publish_source::HELP),
-    ));
+    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
+        "publish_source",
+        publish_source::HELP,
+    )));
     publish["input_schema"]["properties"]["rewrite"]["type"] = json!("boolean");
     registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
@@ -3673,7 +3683,10 @@ mod tests {
         golden_with_first("read", json!({"file-path":"files/a"}))
     }
 
-    pub(super) fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
+    pub(super) fn golden_with_first(
+        first_name: &str,
+        first_input: Value,
+    ) -> Result<Golden, String> {
         let mut store = MemoryStore::new();
         let root = root_with(&mut store, BTreeMap::new())?;
         let user = append_memory(
@@ -4428,15 +4441,29 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(recovered, pending);
+            for malformed in [
+                b"{\"status\":".as_slice(),
+                br#"{"status":"unknown","kind":"push-success","observed":null}"#,
+                br#"{"status":"complete","observed":null}"#,
+                br#"{"status":"complete","kind":"push-success","observed":"invalid-oid"}"#,
+            ] {
+                for (observed, expected_status) in [
+                    (Ok(Some(commit.clone())), PublicationStatus::Complete),
+                    (Ok(Some(old.clone())), PublicationStatus::Uncertain),
+                    (Ok(Some(newer.clone())), PublicationStatus::Conflict),
+                    (
+                        Err("remote unavailable".into()),
+                        PublicationStatus::Uncertain,
+                    ),
+                ] {
+                    let outcome = publish_source::reconcile(&pending, malformed, || observed);
+                    assert_eq!(outcome.status, expected_status);
+                }
+            }
             let outcome = if rejected {
                 publish_source::reconcile(
                     &recovered,
-                    conversation_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "validation-rejected",
-                        Some("Source contains ignored files".into()),
-                        None,
-                    ),
+                    br#"{"status":"conflict","kind":"validation-rejected","diagnostic":"Source contains ignored files","observed":null}"#,
                     || panic!("validation rejection must not observe the remote"),
                 )
             } else {
@@ -4444,16 +4471,20 @@ mod tests {
                 // rejected old value even though its first push succeeded.
                 publish_source::reconcile(
                     &recovered,
-                    conversation_protocol::v3::publication::Outcome::new(
-                        PublicationStatus::Conflict,
-                        "lease-rejected",
-                        None,
-                        None,
-                    ),
+                    br#"{"status":"conflict","kind":"lease-rejected","observed":null}"#,
                     || Ok(Some(commit.clone())),
                 )
             };
-            publish_source::finish(&mut state, &site, &pending, Some(outcome)).unwrap();
+            // Both tools retain the remote result before completing the call.
+            // A restart in between must use that result without pushing again.
+            let outcome = if rejected {
+                publish_source::retain(&mut state, &pending, outcome).unwrap();
+                state.reload().unwrap();
+                None
+            } else {
+                Some(outcome)
+            };
+            publish_source::finish(&mut state, &site, &pending, outcome).unwrap();
             let view = state.conversation().unwrap();
             assert_eq!(
                 view.source_tree("feature/lower").unwrap().unwrap().commit,
