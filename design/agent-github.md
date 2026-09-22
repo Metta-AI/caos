@@ -1,38 +1,31 @@
-# Importing and publishing
+# GitHub interactions
 
-Imports are implemented through the server endpoint, `caos import-git`, and the agent's `import_source` tool. Publication pushes individual branches or registered stacks of branches. Stack operations
-keep merge drafts outside source history.
+The agent imports code, edits source gitlinks, and publishes their commits as remote branches. It uses GitHub CLI for PRs, reviews, issues and comments. The TUI handles local imports and checkouts.
 
-## Importing
+| Workflow | Design | Main tools |
+| --- | --- | --- |
+| Bring remote code into a conversation | [Importing remote source](agent-import.md), [server fetch and negotiation](git-import.md) | `import_source`, `caos import-git`, `POST /git/import` |
+| Publish one source gitlink as a branch | [Publishing branches](agent-publish.md) | `publish_source`, `caos push-git`, `POST /git/push` |
+| Update and publish related branches | [Stacks](agent-stacks.md) | `stack`, `push_stack` |
+| Create PRs and interact with GitHub | [PRs and GitHub commands](agent-prs.md) | `github`, running `gh` and the pinned `gh stack` extension |
 
-`import_source(source, revision?, into)` runs inline in `std/llm-step`. It accepts an HTTPS repository and a branch, full ref, or full commit hash. Omitting `revision` selects the default branch. Keep
-`/import` for local paths.
+## How the pieces fit
 
-For each tool call:
+A [conversation](chat.md) contains source gitlinks pointing to code commits. Importing attaches an existing commit at a new path. Editing that source advances its gitlink. Publishing sends its exact
+commit and history from the server's Git store to a remote branch; it does not move the source gitlink.
 
-1. Resolve the revision with `git ls-remote`, using the agent's existing Git
-   binary. A full commit hash needs no lookup.
-2. Save the chosen hash H and provenance in the conversation's `tool.start`
-   payload. Resumed attempts reuse H; concurrent attempts use the first saved
-   observation. A new call resolves the remote again.
-3. Run `caos import-git <source> H`. This sends
-   `POST /git/import {"source": "<https-url>", "commit": "H"}`.
-4. After the server returns `{"commit": "H"}`, atomically attach the snapshot,
-   its provenance, and the tool result:
+A registered stack orders these source gitlinks and remembers the predecessor each layer was based on. The `stack` tool rebases or merges using Git objects, pausing conflicts in a separate draft that
+the agent can edit and continue. `push_stack` publishes the layers' branches through the same server path as a single-branch push.
 
-   ```text
-   imports/repo/main              gitlink -> H
-   imports/repo/main.source.json  provenance
-   ```
+The `github` tool runs a worker containing GitHub CLI. It manages remote metadata after branches exist. It needs no source checkout for PR creation, review, or linking existing PR URLs. Source
+restacking and branch pushes remain CAOS operations.
 
-The destination and provenance path must both be unused. An import creates an unchanged snapshot; it does not merge into or advance another source. Provenance records the repository, requested
-revision, commit, observation time, and default branch when known. For `origin/main`, choose the repository from the selected source's provenance and import `main` at a fresh path.
+Stack publication is independent of PRs. It pushes branches and records their results; it does not create PRs or GitHub stack membership. The generic `github` tool can manage those separately.
+Automatically submitting all PRs for a stack is a follow-up described in the [PR design](agent-prs.md#prs-for-a-stack).
 
-The [server endpoint](git-import.md) fetches H and its full history into private staging, verifies them, and publishes the complete pack into the server store. It uses verified complete imports as
-negotiation tips; standalone trees and blobs may still be downloaded again. A completion marker for the same URL and H skips fetch and verification. The endpoint handles object availability; callers
-handle ref resolution and conversation state.
+## Credentials
 
-Supply the token through the existing secret store:
+Supply a GitHub token through the existing secret store when launching the TUI:
 
 ```text
 # .caos-secrets/github-token
@@ -42,21 +35,13 @@ reader=std/llm-step
 reader=std/github
 ```
 
-Keep the value file ignored and run `caos secrets` to initialize its entropy. The agent uses `/secret/github-token` for GitHub ref lookup and passes `--github-token-file=/secret/github-token` to
-`import-git`. The command forwards it in the sensitive `X-Caos-Git-Token` header; the server does not look up the calling job's secrets.
+Put the token value in an ignored file and run `caos secrets` to initialize its entropy. `std/llm-step` uses the token for GitHub ref lookup and forwards it to the server for imports and pushes.
+`std/github` passes it to `gh` as `GH_TOKEN`.
 
-Ref lookup and fetch share a repository-scoped Git credential helper. Tokens stay out of URLs, Git config, saved arguments, provenance, and logs. Automatic GitHub credentials apply only to
-`github.com` on the default HTTPS port. Public imports need no token. Importing needs neither `gh` nor another worker.
+## Local work and recovery
 
-## Publishing
+Use `/checkout` to edit a source locally. Commit the edits with Git, then use `/import` to attach the result at a new conversation path. Ask the agent to integrate that imported commit into the
+intended source. See [local editing](chat.md#viewing-files-and-working-locally) for the commands.
 
-[Branch publication](agent-publish.md) uses POST /git/push, caos push-git and publish_source to push exact commits directly from the server with an expected-head lease. The github tool runs gh with an
-explicit repository for PRs, issues, review and stack metadata.
-
-[Stack operations](agent-stacks.md) register ordered source gitlinks, remember each layer's predecessor, and merge or rebase them using Git objects. Conflicts pause with a separate draft gitlink and
-report. The agent edits the draft and explicitly continues; finished source history contains no .caos/conflicts or draft editing commits.
-
-push_stack pushes registered layers through the same server path as publish_source, recording each branch's result. Stack pushing needs no GitHub worker and creates no PRs or GitHub stack membership.
-PR automation is a separate follow-up.
-
-The TUI's /pr and /publish-branch commands are removed. /import remains for local paths. Older non-stack merge operations still use the legacy source-tree conflict ledger.
+Imports pin the resolved commit for each call. Pushes pin the source commit and expected remote head before sending. GitHub commands record each invocation so a worker retry does not silently repeat a
+write. The linked designs describe each recovery path and what the agent does when the remote outcome is uncertain.

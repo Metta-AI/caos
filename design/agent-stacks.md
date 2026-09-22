@@ -1,5 +1,7 @@
 # Agent stacks
 
+Part of [GitHub interactions](agent-github.md). This page covers source history and branch publication; [PRs and GitHub stack membership](agent-prs.md#prs-for-a-stack) are separate.
+
 A stack is an ordered list of source gitlinks. Git computes merges directly from objects; CAOS records the order and any paused operation. Publication pushes the stack's branches directly from the
 server.
 

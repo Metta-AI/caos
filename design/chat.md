@@ -2,8 +2,9 @@
 
 A conversation has one filesystem. It holds messages and protocol metadata under
 `.caos/`, ordinary files such as notes and memories, and references to code.
-The agent imports HTTPS repositories into this filesystem. The TUI imports
-local checkouts, exports code for local editing, and publishes to remotes.
+The agent imports HTTPS repositories into this filesystem and publishes code to remotes. The TUI imports local checkouts and exports code for local editing.
+
+See [GitHub interactions](agent-github.md) for the import, branch publication, stack and PR workflows.
 
 | Name | Meaning |
 | --- | --- |
@@ -153,7 +154,7 @@ completion markers certify full history and allow object reuse.
 The handler atomically records its result and attaches the gitlink/provenance
 only if both paths remain free. Replays do not add another result. Imports do
 not merge into existing code. Local paths still use `/import` below.
-See [agent-github.md](agent-github.md#importing) for credential and retry details.
+See [importing remote source](agent-import.md) for credentials and retry details.
 
 ## Importing code with `/import`
 
@@ -348,22 +349,18 @@ a clean Git checkout or an empty/new directory.
 
 The client remembers that destination locally, keyed by server, conversation,
 and gitlink path. A later `/checkout feature/01-change` can reuse it.
-`/update-tree feature/01-change <message>` commits edits in that path's remembered
-checkout, submits them back to that source, and continues the conversation with
-the user's message. The source path is explicit in both commands.
+Commit local edits with Git, then import the checkout at an unused conversation
+path, for example `/import imports/local-edit /absolute/path/to/checkout`.
+Ask the agent to integrate that imported commit into the intended source gitlink.
+The imported snapshot remains separate until that integration.
 
 Browser selection does not choose checkout or publication targets, and does not
 change the agent's execution context.
 
 ## Publishing
 
-The agent uses publish_source(source_tree, repository, branch) to publish an
-exact code commit and github(repository, args, stdin?) for PRs and stacks.
-Publication receipts remain in the conversation; source gitlinks do not move.
-The TUI's /pr and /publish-branch commands are removed.
+The agent uses `publish_source` for one branch, `stack` to update related source histories, `push_stack` to publish their branches, and `github` for PRs and other GitHub operations. Publication
+receipts remain in the conversation; publishing does not move source gitlinks.
 
-See [agent publication and stacks](agent-publish.md) for the server endpoint,
-leases, invocation records and stack updates. The agent checks the complete
-PR scope and tests before publication. Integrating upstream retains inherited
-changes; transplanting only a small edit onto a different base is a separate
-operation.
+[GitHub interactions](agent-github.md) is the entry point for these designs. The agent checks the complete PR scope and tests before publication. Integrating upstream retains inherited changes;
+transplanting only a small edit onto a different base is a separate operation.
