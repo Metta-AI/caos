@@ -27,12 +27,20 @@ text files that pin a caos and mount its `std/`. The code to work on is
 server fetches it from GitHub directly, so nothing is cloned into the container
 and nothing is pushed out of it.
 
-That is what makes starting a session cheap on a large repository. The old
-arrangement checked the target repo out shallow, unshallowed it in the session
-hook (`caos` pushes the workspace commit, and a push packs the whole reachable
-graph), then pushed it to the server. A 100k-commit repo paid all of that
-before the first turn; now it pays a `POST /git/import` on the server, and the
-container's own checkout stays a few kilobytes.
+That is what makes starting a session cheap on a large repository, and the
+mechanism is the whole of the reason. The old arrangement checked the TARGET
+repo out shallow, then had to unshallow it in the session hook — `caos` pushes
+the workspace commit and a push packs its whole reachable graph, so the history
+had to be present — and then pushed that graph to the server. All of it scaled
+with the repository, and all of it landed before the first turn. Now the
+server fetches the repository itself, once, and the container's checkout is the
+client repo.
+
+Measured on a client repo: the session hook reaches `unshallow done` at
+**+3s**, refresh included. The unshallow is kept rather than deleted — a fork
+that accumulates history still needs it, and at this size it costs nothing.
+What a large TARGET repository costs was not measured before the change and is
+not claimed here; what changed is that it is no longer on this path at all.
 
 The client repo is also the **version knob**. `setup.sh` reads its `flake.lock`
 before installing anything, so the client binary, the tools and the tree the
@@ -156,6 +164,21 @@ Measured end to end, a fresh session on a correctly-ticketed environment:
 The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
 is fixed on their side; the first session against a step-tree the server has
 never built also waits out one rustc compile, and only that first one.
+
+Measured again on a client repo, against a server that already held the std
+entries: resolving `--llm-step:@=caos-std/llm-step` through the
+`flake-input-loader` mount took **15.0s** and cached **20 tools** on the first
+attempt. Moving the pin does NOT by itself force a rebuild — `std/llm-step`'s
+tree is content-addressed, so a caos commit that does not touch it resolves to
+the same oid and stays a memo hit.
+
+**A session that records the prompt and then never takes a turn is a step that
+will not resolve.** `UserPromptSubmit` cannot form a request without resolving
+`--llm-step`, so a broken expression presents as a silent session rather than
+an error: the transcript holds one user event, no assistant event, and the hook
+log stops after `warming the caos tool registry`. Run
+`caos mcp warm "--llm-step:@=<path>/llm-step"` in a checkout with the `caos`
+remote set — it prints the real reason, which the session never does.
 
 ## The setup-time budget
 
