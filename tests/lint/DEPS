@@ -6,7 +6,3 @@
 ../../rust rust
 ../../std std
 ../../flake.nix flake.nix
-# The checked-in client-repo template, for lint-client-repo-pin.sh. Mounted
-# rather than evaluated: it carries a `.caos-expr` whose whole job is to fetch
-# caos over the network, and the lint reads that file as TEXT.
-../../examples examples

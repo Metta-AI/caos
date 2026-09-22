@@ -161,10 +161,12 @@ fi
 # behaves oddly.
 if [ -z "$caos_std_path" ]; then
     echo "FATAL: this environment's repository does not pin caos." >&2
-    echo "  A caos session starts from a CLIENT repo: flake.nix + flake.lock with" >&2
-    echo "  a 'caos' input, and a root .caos-expr mounting its std (see" >&2
-    echo "  https://github.com/Metta-AI/caos/tree/main/examples/client-repo)." >&2
-    echo "  Point this environment at one, or fork that template." >&2
+    echo "  A caos session starts from a CLIENT repo, which is four things:" >&2
+    echo "    flake.nix + flake.lock pinning a 'caos' input by revision," >&2
+    echo "    a root .caos-expr mounting that input's std (--output-path)," >&2
+    echo "    the AGENTS.md the agent is given, and" >&2
+    echo "    .caos-secrets declaring what it may use." >&2
+    echo "  Point this environment at one, or fork Metta-AI/caos-session." >&2
     if [ -n "$repo_dir" ]; then
         echo "  Read $repo_dir/flake.lock; caos-pin.sh's reason is above." >&2
     else

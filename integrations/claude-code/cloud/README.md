@@ -20,9 +20,10 @@ the client now holds ONE connection and opens a stream per request.
 
 ## The session starts from a CLIENT repo, not from the code
 
-The repository a session opens is a **caos client repo**
-([`../../../examples/client-repo`](../../../examples/client-repo)): a handful of
-text files that pin a caos and mount its `std/`. The code to work on is
+The repository a session opens is a **caos client repo** — a handful of text
+files that pin a caos and mount its `std/`. `Metta-AI/caos-session` is the one
+to fork; its shape is spelled out under *Configuring the environment* below,
+so this does not depend on being able to open it. The code to work on is
 **imported into the conversation** by the agent's `import_source` tool — the
 server fetches it from GitHub directly, so nothing is cloned into the container
 and nothing is pushed out of it.
@@ -82,9 +83,21 @@ A repo that pins no caos (caos' own, or any ordinary one) falls through to the
 
 ## Configuring the environment
 
-**Repository**: a caos client repo — fork
-[`examples/client-repo`](../../../examples/client-repo) and point the
-environment at your fork.
+**Repository**: a caos client repo — fork `Metta-AI/caos-session` and point the
+environment at your fork. It is four things, and nothing else:
+
+```
+flake.nix / flake.lock   a `caos` input pinned by revision — the version knob
+.caos-expr               one line, mounting that input's std/ at --output-path
+AGENTS.md (+ CLAUDE.md)  what the agent is told at the start of every session
+.caos-secrets/           secret DECLARATIONS — names and readers, no values
+.gitignore               the mount point, which must not exist as a real directory
+```
+
+The root expression is the `std/flake-input-loader` line from
+[`design/flake-inputs.md`](../../../design/flake-inputs.md) ("Consumer root"),
+on **one** line — `eval` splits on lines, so a trailing `\` is a token rather
+than a continuation.
 
 **Setup script**: paste these two lines into the environment's "Setup script"
 field (swap `main` for a branch or commit to test a change to the *bootstrap
