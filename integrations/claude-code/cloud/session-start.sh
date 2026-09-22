@@ -247,6 +247,15 @@ if [ -n "$base" ] && [ -n "$caos_std_path" ]; then
                --caos-std-path="$caos_std_path"; then
         log "could not refresh the client; carrying on with the installed one"
     fi
+elif [ -z "$bootstrap_base" ]; then
+    # NOT the same reason as the branch below, and saying so matters: the
+    # checkout here may pin caos perfectly well. What is missing is a base to
+    # fetch `caos-pin.sh` FROM, which only an environment snapshotted before
+    # `--bootstrap-base` existed can be short of. Reporting that as "this
+    # checkout pins no caos" sends the reader to the repository, which is the
+    # one thing that is not wrong.
+    log "no script base, so the repo's pin was never read (see the note above);"
+    log "  using the client the environment was built with"
 else
     log "this checkout pins no caos, so there is no commit to refresh from;"
     log "  using the client the environment was built with"
