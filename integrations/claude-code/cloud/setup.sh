@@ -127,12 +127,26 @@ esac
 # one's own answers 200.
 dev_tree=""
 if [ -n "$dev_server" ]; then
-    dev_sha="$(git ls-remote "$dev_server" refs/caos/dev 2>/dev/null | awk '{print $1}')"
+    # SAY WHICH FAILURE, because an empty result has two very different causes
+    # and this message used to assert the wrong one. "No such ref" means the dev
+    # stack is up but published nothing; a transport error means it was never
+    # reached -- and the usual reason for that is the RELAY being down, which
+    # looks identical from here and has already been mistaken for it three
+    # times.
+    dev_err="$(mktemp)"
+    dev_sha="$(git ls-remote "$dev_server" refs/caos/dev 2>"$dev_err" | awk '{print $1}')"
     if [ -z "$dev_sha" ]; then
-        echo "FATAL: --dev-server was given but it publishes no refs/caos/dev." >&2
-        echo "  Bring the dev stack up with 'caosd up --iroh'." >&2
+        echo "FATAL: --dev-server named a server this phase could not use." >&2
+        echo "  git-remote-caos: $(command -v git-remote-caos || echo 'NOT ON PATH')" >&2
+        echo "  ls-remote said: $(tr '\n' ' ' < "$dev_err" | cut -c1-240)" >&2
+        echo "  Empty with no error means the stack is up but published no" >&2
+        echo "  refs/caos/dev: run 'caosd up --iroh'. An error instead usually" >&2
+        echo "  means the RELAY is down -- this phase cannot reach n0's, so it" >&2
+        echo "  depends on the one CAOS_IROH_RELAY names." >&2
+        rm -f "$dev_err"
         exit 1
     fi
+    rm -f "$dev_err"
     dev_tree=/usr/local/share/caos/dev-tree
     rm -rf "$dev_tree" /usr/local/share/caos/dev.git
     install -d "$dev_tree" /usr/local/share/caos/dev.git
