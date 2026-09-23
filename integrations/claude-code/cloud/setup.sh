@@ -60,6 +60,7 @@ RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
 bootstrap_base=""
 enable_bash=""
+dev_server=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
@@ -67,6 +68,17 @@ for arg in "$@"; do
         # (baked into the session-start bootstrap below): allow Bash/Read/Grep in
         # the deny list this env writes, so a session can inspect the container.
         --enable-bash) enable_bash=yes ;;
+        # DEV MODE ARRIVES AS AN ARGUMENT, not as `CAOS_DEV`/`CAOS_SERVER_URL`,
+        # because this script cannot see either. The environment's variables are
+        # injected into the SESSION process tree, which begins at "Starting
+        # Claude Code" -- after this has run. Measured: with the check reading
+        # `${CAOS_DEV:-}` here, a session stamped `off` while the environment
+        # plainly set `CAOS_DEV=1`. The script re-runs for every new session;
+        # the variables are simply not in it.
+        #
+        # It carries the TICKET, not a flag, because the overlay has to
+        # `git ls-remote` the server and nothing else here identifies it.
+        --dev-server=*) dev_server="${arg#--dev-server=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -180,9 +192,12 @@ fi
 # sibling scripts, and the two must not be confused: one is where the scripts
 # come from, the other is which caos the session IS.
 #
-# CAOS_SERVER_URL is the one environment variable left, and could not be
-# anything else: it is read at SESSION start, long after this has run and been
-# snapshotted, so no argument here could carry it.
+# CAOS_SERVER_URL IS NOT READABLE HERE. It is injected into the SESSION process
+# tree, which begins at "Starting Claude Code" -- after this script has run --
+# so the one thing that needs it at setup time takes it as `--dev-server=`
+# instead. This comment used to say that no argument here could carry it; that
+# was an assumption, and a session disproved it by stamping `off` while the
+# environment plainly set `CAOS_DEV=1`.
 args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
 args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
 installer="$base/integrations/claude-code/cloud/install.sh"
@@ -211,6 +226,149 @@ caos --version >&2 2>/dev/null || true
 # the same directory, so there is nothing to install here — a `caos://` server
 # needs both (`git` execs the helper by name; the client finds it beside
 # itself).
+
+# ---------------------------------------------------------------------------
+# DEV MODE: run the caos on the SERVER, not the one the repo pins
+# ---------------------------------------------------------------------------
+# `caosd up` publishes its checkout to `refs/caos/dev` on the stack it starts:
+# one commit carrying the working tree and the x86_64 client built from it. With
+# `--dev-server=<ticket>` a session runs that instead of the repo's pin, so
+# uncommitted work reaches a container with no GitHub push and no wait for CI.
+#
+# HERE, NOT IN THE SESSION HOOK, and the reason is PROCESS LIFETIME. Claude Code
+# spawns `caos mcp serve` as it starts and keeps that ONE process for the whole
+# session. The overlay below replaces `/usr/local/lib/caos/caos` with `mv`,
+# which swaps the directory entry for a NEW INODE -- a process already exec'd
+# from the old one goes on running it. Run from the SessionStart hook, that swap
+# landed ~23s AFTER Claude Code had already spawned the server, so every MCP
+# tool call was served by the PINNED client for the session's entire life while
+# the workers it dispatched were the dev ones. Measured: `tool_help` reached
+# llm-step with no client handoff at all -- the pinned build's dispatch has no
+# such branch -- and the error that produced blamed the repository's own
+# expression, which was the one thing that was right.
+#
+# The platform supplies the ordering this needs, so it is structural rather than
+# lucky: env_manager_log shows "Cloned from seed bundle" before "Running setup
+# script", and "Setup script completed" strictly before "Starting Claude Code".
+# It must stay BELOW the install above, which is what puts `git-remote-caos` on
+# PATH and so what lets git speak `caos://` here at all.
+#
+# PINNED FOR THE SESSION'S LIFE: this runs for a new session and is cached on
+# resume, so a resumed session keeps the client and tools it was created with
+# instead of re-reading the ref. Deliberate -- swapping the caos build underneath
+# a conversation already seeded and memoized against the previous one is a
+# half-update, and the failure that produces reads as a code bug.
+#
+# EVERY PATH WRITES THE STAMP, the ones that decide not to act included. The
+# session hook prints it verbatim and computes nothing, so what a session
+# reports cannot drift from what happened here.
+install -d /usr/local/share/caos
+dev_stamp="off -- no --dev-server, so this session runs the caos its repo pins."
+if [ -n "$dev_server" ]; then
+    dev_sha=""
+    if [ -z "$repo_dir" ]; then
+        dev_stamp="ASKED FOR BUT NOT ACTIVE -- no checkout here to repoint."
+    else
+        dev_sha="$(git -C "$repo_dir" ls-remote "$dev_server" refs/caos/dev \
+                   2>/dev/null | awk '{print $1}')"
+        if [ -z "$dev_sha" ]; then
+            dev_stamp="ASKED FOR BUT NOT ACTIVE -- the server publishes no refs/caos/dev."
+            dev_stamp="$dev_stamp Bring the stack up with 'caosd up --iroh'."
+        elif ! git -C "$repo_dir" fetch --quiet --depth=1 --no-tags \
+                  --no-write-fetch-head -- "$dev_server" "$dev_sha" 2>/dev/null; then
+            dev_stamp="ASKED FOR BUT NOT ACTIVE -- could not fetch ${dev_sha:0:12}."
+            dev_sha=""
+        fi
+    fi
+fi
+if [ -n "${dev_sha:-}" ]; then
+    # THE BINARIES. Written beside and RENAMED rather than truncated in place:
+    # these are executables, and overwriting a mapped file is ETXTBSY, not an
+    # update. Into `lib/caos`, which is where the client looks -- `bin/caos` is
+    # a wrapper that execs it, and `ensure_helper_on_path` puts `lib/caos` on
+    # PATH before shelling out to git, so a helper written only into `bin` is
+    # invisible to caos' own git.
+    overlaid=""
+    for name in caos git-remote-caos; do
+        dest="/usr/local/lib/caos/$name"
+        if git -C "$repo_dir" cat-file blob "$dev_sha:dev-bin/$name" > "$dest.dev" 2>/dev/null
+        then
+            chmod 0755 "$dest.dev" && mv -f "$dest.dev" "$dest" && overlaid="$overlaid $name"
+        else
+            rm -f "$dest.dev"
+        fi
+    done
+    # AND SAY SO IN THE VERSION, because otherwise nothing does: `bin/caos` is a
+    # wrapper exporting a `CAOS_REV` baked in at install time, and the overlay
+    # replaces only the binary it execs -- so `caos --version` and `caos_status`
+    # would go on naming the PINNED build while a different one runs.
+    if [ -n "$overlaid" ] && [ -w /usr/local/bin/caos ]; then
+        sed -i "s|CAOS_REV:-[^}]*}|CAOS_REV:-dev-${dev_sha:0:12}}|" /usr/local/bin/caos || true
+    fi
+
+    # THE TOOLS, from the same commit. `std/` is compiled by caos itself from the
+    # std tree, so it is reached by a locator rather than installed -- and
+    # `git+caos://…` is an ordinary git fetch through `git-remote-caos`, which is
+    # why this needs no new transport (git-locator takes any `git+<scheme>`).
+    #
+    # BOTH FILES, or neither works: `std/flake-input-loader` refuses a tree whose
+    # expression and `flake.lock` name different revisions, and it is
+    # `flake.lock`'s URL that decides which locators it even checks.
+    #
+    # NOTHING HIDES THESE EDITS FROM GIT. `--skip-worktree` was tried, to stop an
+    # agent committing a `caos://` URL that is also a credential, and it made dev
+    # mode a no-op: caos ingests the checkout through `hash_dir`, which copies the
+    # REAL index for its stat cache and so inherits that bit, and `git add -u
+    # <dir>` on a skip-worktree path exits 0 and silently keeps HEAD's blob. Both
+    # files reverted together, so the loader's rev-drift check saw two consistent
+    # files and passed. The ticket reaches the user's own caosd either way; an
+    # agent committing it upstream is a push-time concern, not a reason to lie to
+    # git about what is on disk.
+    tools=""
+    if [ -w "$repo_dir/.caos-expr" ] && [ -r "$repo_dir/flake.lock" ]; then
+        # Every `:@@=` locator repointed at this server at this commit, keeping
+        # each one's own `dir=`: the expression names two (the loader's image and
+        # the tree it splices) and they differ only by that.
+        sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$dev_server?rev=$dev_sha\&dir=\1|g" \
+            "$repo_dir/.caos-expr"
+        # The lock's `locked` section for the caos input, found through
+        # `nodes.<root>.inputs.<name>` as caos-pin.sh and the loader both do --
+        # the node key is not the input name once an input has been renamed.
+        # `narHash` is DROPPED rather than recomputed: an absent hash is honest,
+        # where a stale one would be a lie nix would later reject.
+        if tmp_lock="$(jq --arg url "$dev_server" --arg rev "$dev_sha" '
+                (.root // "root") as $r
+                | (.nodes[$r].inputs.caos // empty) as $k
+                | if ($k|type) == "string"
+                  then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
+                  else . end' "$repo_dir/flake.lock" 2>/dev/null)"; then
+            printf '%s\n' "$tmp_lock" > "$repo_dir/flake.lock"
+            tools=1
+        fi
+    fi
+    if [ -n "$overlaid" ] && [ -n "$tools" ]; then
+        dev_stamp="ON -- client and tools from refs/caos/dev at ${dev_sha:0:12}."
+    else
+        dev_stamp="ASKED FOR BUT NOT ACTIVE -- refs/caos/dev ${dev_sha:0:12};"
+        dev_stamp="$dev_stamp client overlay:${overlaid:- none}; tools rewrite: ${tools:+done}${tools:-NOT DONE}."
+    fi
+fi
+printf '%s\n' "$dev_stamp" > /usr/local/share/caos/dev-stamp
+# THE SERVER THIS OVERLAY CAME FROM, recorded so the session hook can check it
+# against the `CAOS_SERVER_URL` the session actually talks to. The ticket now
+# lives in two places -- this script's arguments and the environment's variables
+# -- and the hazard of two copies of one value is exactly what the
+# `CAOS_IROH_TICKET` note above warns about. They cannot be collapsed (this
+# script cannot read the variable), so instead they are COMPARED: a drifted pair
+# means the client and tools were overlaid from a different server than the
+# session drives, which would otherwise be silent and unfalsifiable.
+#
+# Root-owned, and no new exposure: the container already holds this value in its
+# environment, and the environment definition already shows it to anyone who can
+# open it.
+printf '%s\n' "$dev_server" > /usr/local/share/caos/dev-server
+chmod 0600 /usr/local/share/caos/dev-server
+echo "dev mode: $dev_stamp" >&2
 
 # The per-session work: the git remote. What goes in the
 # snapshot is a BOOTSTRAP that fetches the real script every session, not the
