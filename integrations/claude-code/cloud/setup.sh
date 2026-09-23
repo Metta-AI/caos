@@ -108,6 +108,118 @@ esac
 # the repo rather than defer to the first session hook -- which matters because
 # work done after the snapshot is paid by EVERY session, and this is the whole
 # install.
+caos_std_path=""
+repo_dir=""
+# `$CLAUDE_PROJECT_DIR` is almost certainly NOT set here -- it is a Claude Code
+# hook variable and Claude Code has not started yet -- so the glob is what
+# actually finds the checkout. It is tried first anyway, for the day that
+# changes, and costs one test.
+#
+# `-e .git`, not `-d`: a worktree's `.git` is a FILE, and refusing one would
+# send this down the fallback for a checkout that is perfectly good.
+#
+# An unmatched glob stays literal in bash, which these tests then reject, so
+# there is no case where the literal is mistaken for a directory.
+for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
+    [ -n "$candidate" ] || continue
+    candidate="${candidate%/}"
+    [ -e "$candidate/.git" ] || continue
+    [ -r "$candidate/flake.lock" ] || continue
+    repo_dir="$candidate"
+    break
+done
+if [ -n "$repo_dir" ]; then
+    echo "reading the caos pin from $repo_dir" >&2
+    # Cleared first and read back with `:-`, so a reader that exits 0 while
+    # printing less than it promises cannot leave `set -u` to abort the whole
+    # setup over a fallback that was meant to be optional.
+    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
+    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+              | bash -s -- "$repo_dir")"; then
+        eval "$pin" || true
+    fi
+    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
+        base="$caos_pin_base"
+        caos_std_path="$caos_pin_std_path"
+        echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
+        echo "  and mounts its std at $caos_std_path" >&2
+    fi
+fi
+
+# NO PIN, NO INSTALL -- and this is where the old fallback to `--base` lived.
+#
+# `--base` names a BRANCH (that is its job: it is where these bootstrap scripts
+# come from, and the two lines in the settings form should not need editing per
+# caos commit). Handing that branch to install.sh is what the fallback did, and
+# it is exactly the pairing the whole arrangement is arranged to prevent: the
+# step a session runs resolves through the commit the REPO pins, so a client
+# installed from a branch head is a client from a different tree than its own
+# tools.
+#
+# A session repo that pins no caos is therefore not something to paper over
+# with the nearest available version. It is a misconfigured environment, and
+# saying so here -- before the snapshot, where the message is read by whoever
+# is setting it up -- is worth more than a session that starts and then
+# behaves oddly.
+if [ -z "$caos_std_path" ]; then
+    echo "FATAL: this environment's repository does not pin caos." >&2
+    echo "  A caos session starts from a CLIENT repo, which is four things:" >&2
+    echo "    flake.nix + flake.lock pinning a 'caos' input by revision," >&2
+    echo "    a root .caos-expr mounting that input's std (--output-path)," >&2
+    echo "    the AGENTS.md the agent is given, and" >&2
+    echo "    .caos-secrets declaring what it may use." >&2
+    echo "  Point this environment at one, or fork Metta-AI/caos-session." >&2
+    if [ -n "$repo_dir" ]; then
+        echo "  Read $repo_dir/flake.lock; caos-pin.sh's reason is above." >&2
+    else
+        echo "  No checkout with a flake.lock was found under /home/user." >&2
+    fi
+    exit 1
+fi
+
+# WHICH CLIENT: the commit the repo pins, which `$base` now holds -- never the
+# branch this script was fetched from. `$bootstrap_base` keeps that, for the
+# sibling scripts, and the two must not be confused: one is where the scripts
+# come from, the other is which caos the session IS.
+#
+# CAOS_SERVER_URL is the one environment variable left, and could not be
+# anything else: it is read at SESSION start, long after this has run and been
+# snapshotted, so no argument here could carry it.
+args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
+args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
+installer="$base/integrations/claude-code/cloud/install.sh"
+# `--no-repo-files --user-config`: the client goes on PATH and its deny list,
+# hooks and server declaration go USER-level (pinned to the commit just
+# installed), leaving the checkout exactly as it was found. install.sh does both
+# in one pass -- there is no separate configure step -- because the config is
+# never wanted without an install and needs the very commit the install resolved.
+#
+# Checked afterwards rather than trusted: `curl -fsSL <404> | bash` exits ZERO.
+# curl writes nothing, bash reads an empty script and succeeds, and the setup
+# looks clean while installing nothing at all. The failure then surfaces one
+# layer down as every hook dying on `caos: command not found`, which reads like
+# a hook problem. Fail here, where the cause is still visible.
+echo "installing the caos client from $installer $args" >&2
+curl -fsSL "$installer" | bash -s -- $args
+if ! command -v caos >/dev/null 2>&1; then
+    echo "FATAL: the caos client did not install from $installer" >&2
+    echo "  The installer's own error is above this line; read that, not this." >&2
+    exit 1
+fi
+caos --version >&2 2>/dev/null || true
+
+# AFTER THE BOOTSTRAP INSTALL, and that is a hard dependency rather than a
+# preference: fetching the dev package speaks `caos://`, and git speaks it only
+# through `git-remote-caos`, which the install above is what puts on PATH. Run
+# before it, this died with
+#   git: 'remote-caos' is not a git command
+# which reads as the dev server being unreachable rather than as the helper
+# being absent. The two are indistinguishable from the caller, which is why the
+# message now prints `command -v git-remote-caos` beside the error.
+#
+# So the pinned install is a BOOTSTRAP rather than waste: it supplies the
+# transport the real package arrives over, and the second install below
+# replaces everything it put down.
 # ---------------------------------------------------------------------------
 # THE INSTALL PACKAGE, FROM THE DEV SERVER
 # ---------------------------------------------------------------------------
@@ -187,42 +299,24 @@ if [ -n "$dev_server" ]; then
     printf '%s\n' "$dev_sha" > "$dev_assets/REV"
 fi
 
-caos_std_path=""
-repo_dir=""
-# `$CLAUDE_PROJECT_DIR` is almost certainly NOT set here -- it is a Claude Code
-# hook variable and Claude Code has not started yet -- so the glob is what
-# actually finds the checkout. It is tried first anyway, for the day that
-# changes, and costs one test.
+# THE REAL INSTALL, replacing everything the bootstrap put down: the client, the
+# git helper, the deny list, the hooks and the MCP server declaration, all from
+# the dev tree. The installer itself comes from there too, so an edit to
+# install.sh is in the package like everything else.
 #
-# `-e .git`, not `-d`: a worktree's `.git` is a FILE, and refusing one would
-# send this down the fallback for a checkout that is perfectly good.
-#
-# An unmatched glob stays literal in bash, which these tests then reject, so
-# there is no case where the literal is mistaken for a directory.
-for candidate in "${CLAUDE_PROJECT_DIR:-}" /home/user/*/ /home/user; do
-    [ -n "$candidate" ] || continue
-    candidate="${candidate%/}"
-    [ -e "$candidate/.git" ] || continue
-    [ -r "$candidate/flake.lock" ] || continue
-    repo_dir="$candidate"
-    break
-done
-if [ -n "$repo_dir" ]; then
-    echo "reading the caos pin from $repo_dir" >&2
-    # Cleared first and read back with `:-`, so a reader that exits 0 while
-    # printing less than it promises cannot leave `set -u` to abort the whole
-    # setup over a fallback that was meant to be optional.
-    caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
-    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
-              | bash -s -- "$repo_dir")"; then
-        eval "$pin" || true
+# `--base` is still passed and still unused on this path -- --dev-assets
+# replaces the release it would otherwise resolve -- but install.sh validates it
+# either way, so a nonsense value would fail here rather than be ignored.
+if [ -n "$dev_tree" ]; then
+    dev_installer="$dev_tree/integrations/claude-code/cloud/install.sh"
+    echo "re-installing from the dev package: $dev_installer" >&2
+    if ! bash "$dev_installer" $args --dev-assets="$dev_assets"; then
+        echo "FATAL: the dev package would not install." >&2
+        echo "  The bootstrap client is still in place, but it is the PINNED" >&2
+        echo "  one -- this session would run the repo's caos, not yours." >&2
+        exit 1
     fi
-    if [ -n "${caos_pin_base:-}" ] && [ -n "${caos_pin_std_path:-}" ]; then
-        base="$caos_pin_base"
-        caos_std_path="$caos_pin_std_path"
-        echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
-        echo "  and mounts its std at $caos_std_path" >&2
-    fi
+    caos --version >&2 2>/dev/null || true
 fi
 
 # THE TOOLS, from the dev commit too. `std/` is compiled by caos itself from the
@@ -256,79 +350,6 @@ if [ -n "$dev_tree" ] && [ -n "$repo_dir" ] \
     fi
 fi
 
-# NO PIN, NO INSTALL -- and this is where the old fallback to `--base` lived.
-#
-# `--base` names a BRANCH (that is its job: it is where these bootstrap scripts
-# come from, and the two lines in the settings form should not need editing per
-# caos commit). Handing that branch to install.sh is what the fallback did, and
-# it is exactly the pairing the whole arrangement is arranged to prevent: the
-# step a session runs resolves through the commit the REPO pins, so a client
-# installed from a branch head is a client from a different tree than its own
-# tools.
-#
-# A session repo that pins no caos is therefore not something to paper over
-# with the nearest available version. It is a misconfigured environment, and
-# saying so here -- before the snapshot, where the message is read by whoever
-# is setting it up -- is worth more than a session that starts and then
-# behaves oddly.
-if [ -z "$caos_std_path" ]; then
-    echo "FATAL: this environment's repository does not pin caos." >&2
-    echo "  A caos session starts from a CLIENT repo, which is four things:" >&2
-    echo "    flake.nix + flake.lock pinning a 'caos' input by revision," >&2
-    echo "    a root .caos-expr mounting that input's std (--output-path)," >&2
-    echo "    the AGENTS.md the agent is given, and" >&2
-    echo "    .caos-secrets declaring what it may use." >&2
-    echo "  Point this environment at one, or fork Metta-AI/caos-session." >&2
-    if [ -n "$repo_dir" ]; then
-        echo "  Read $repo_dir/flake.lock; caos-pin.sh's reason is above." >&2
-    else
-        echo "  No checkout with a flake.lock was found under /home/user." >&2
-    fi
-    exit 1
-fi
-
-# WHICH CLIENT: the commit the repo pins, which `$base` now holds -- never the
-# branch this script was fetched from. `$bootstrap_base` keeps that, for the
-# sibling scripts, and the two must not be confused: one is where the scripts
-# come from, the other is which caos the session IS.
-#
-# CAOS_SERVER_URL is the one environment variable left, and could not be
-# anything else: it is read at SESSION start, long after this has run and been
-# snapshotted, so no argument here could carry it.
-args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
-args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
-installer="$base/integrations/claude-code/cloud/install.sh"
-# THE INSTALLER ITSELF FROM THE DEV TREE, and the assets with it, so an edit to
-# install.sh is in the package like everything else. `--base` is left alone but
-# unused on this path: --dev-assets replaces the release it would resolve.
-if [ -n "$dev_tree" ]; then
-    installer="$dev_tree/integrations/claude-code/cloud/install.sh"
-    args="$args --dev-assets=$dev_assets"
-fi
-
-# `--no-repo-files --user-config`: the client goes on PATH and its deny list,
-# hooks and server declaration go USER-level (pinned to the commit just
-# installed), leaving the checkout exactly as it was found. install.sh does both
-# in one pass -- there is no separate configure step -- because the config is
-# never wanted without an install and needs the very commit the install resolved.
-#
-# Checked afterwards rather than trusted: `curl -fsSL <404> | bash` exits ZERO.
-# curl writes nothing, bash reads an empty script and succeeds, and the setup
-# looks clean while installing nothing at all. The failure then surfaces one
-# layer down as every hook dying on `caos: command not found`, which reads like
-# a hook problem. Fail here, where the cause is still visible.
-echo "installing the caos client from $installer $args" >&2
-if [ -n "$dev_tree" ]; then
-    bash "$installer" $args
-else
-    curl -fsSL "$installer" | bash -s -- $args
-fi
-if ! command -v caos >/dev/null 2>&1; then
-    echo "FATAL: the caos client did not install from $installer" >&2
-    echo "  The installer's own error is above this line; read that, not this." >&2
-    exit 1
-fi
-caos --version >&2 2>/dev/null || true
 
 # The git remote helper arrives with the client, from the same release and into
 # the same directory, so there is nothing to install here — a `caos://` server
