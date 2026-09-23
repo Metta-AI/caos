@@ -312,6 +312,17 @@ fi
 # index for its stat cache and inherits that bit, so `git add -u <dir>` keeps
 # HEAD's blob and exits 0. Both files reverted together, so the loader's drift
 # check saw two consistent files and passed.
+if [ -n "$dev_tree" ] && { [ -z "$repo_dir" ] || [ ! -w "$repo_dir/.caos-expr" ] \
+                          || [ ! -r "$repo_dir/flake.lock" ]; }; then
+    # SAID OUT LOUD. This guard has three ways to be false and used to leave no
+    # trace for any of them, so a session that quietly kept the committed pin
+    # looked identical to one that was rewritten.
+    printf 'DID NOT rewrite: repo_dir=%s expr_writable=%s lock_readable=%s\n' \
+        "${repo_dir:-<none>}" \
+        "$([ -w "${repo_dir:-/nonexistent}/.caos-expr" ] && echo yes || echo no)" \
+        "$([ -r "${repo_dir:-/nonexistent}/flake.lock" ] && echo yes || echo no)" \
+        >> /usr/local/share/caos/dev-probe
+fi
 if [ -n "$dev_tree" ] && [ -n "$repo_dir" ] \
    && [ -w "$repo_dir/.caos-expr" ] && [ -r "$repo_dir/flake.lock" ]; then
     sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$dev_server?rev=$dev_sha\&dir=\1|g" \
@@ -354,6 +365,9 @@ if [ -n "$dev_tree" ] && [ -n "$repo_dir" ] \
             exit 1
         fi
         echo "conversation seeds from ${seed_commit:0:12} (unreferenced)" >&2
+        printf 'rewrote %s/.caos-expr to rev=%s; conversation seeds from %s\n' \
+            "$repo_dir" "${dev_sha:0:12}" "${seed_commit:0:12}" \
+            >> /usr/local/share/caos/dev-probe
     else
         echo "FATAL: could not rewrite flake.lock; the loader will refuse the drift" >&2
         exit 1
