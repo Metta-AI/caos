@@ -280,7 +280,11 @@ bash -n /usr/local/bin/caos-cloud-session-start || {
 install -d /usr/local/share/caos
 caos_probe() {
     for url in "$@"; do
-        code="$(curl -sS -o /dev/null -m 8 -w '%{http_code}' "$url" 2>&1)" \
+        # -k: the bare-IP probes below would otherwise fail on certificate
+        # mismatch, which is indistinguishable from the connection being
+        # refused -- and telling those apart is the whole point. Certificate
+        # identity is observed in the relay trace instead, which does verify.
+        code="$(curl -sS -k -o /dev/null -m 8 -w '%{http_code}' "$url" 2>&1)" \
             || code="FAILED(${code##*: })"
         printf '%s=%s ' "${url#https://}" "$code"
     done
@@ -294,6 +298,8 @@ caos_probe \
            https://use1-1.relay.iroh.network./ \
            https://euw1-1.relay.iroh.network./ \
            https://aps1-1.relay.iroh.network./ \
+           https://5.78.69.43/ \
+           https://116.203.71.221/ \
            https://iroh.computer/ \
            https://www.hetzner.com/ \
            https://example.com/ \
