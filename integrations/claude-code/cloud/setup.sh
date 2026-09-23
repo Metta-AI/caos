@@ -28,6 +28,13 @@
 #
 # Swap `main` for a branch or a commit to test a change to the SCRIPTS.
 #
+# DEV MODE is a third line, `--dev-server=<ticket>`, naming a caosd of your own
+# (`caosd ticket` prints it). With it, everything below the bootstrap install --
+# the client, the git helper, the settings and MCP JSON, these scripts, and the
+# tree the session evaluates -- comes from `refs/caos/dev` on that server rather
+# than from a GitHub release, so an edit reaches the next session with no push
+# and no CI.
+#
 # NOTHING HERE TOUCHES A REPOSITORY. Everything is user-level configuration in
 # the container, so one environment serves every repo and no project has to
 # carry caos or Claude Code settings of its own. Three routes were possible and
@@ -60,6 +67,7 @@ RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
 bootstrap_base=""
 enable_bash=""
+dev_server=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
@@ -67,6 +75,13 @@ for arg in "$@"; do
         # (baked into the session-start bootstrap below): allow Bash/Read/Grep in
         # the deny list this env writes, so a session can inspect the container.
         --enable-bash) enable_bash=yes ;;
+        # DEV MODE: a ticket for a caosd of one's own, from which this script
+        # takes the WHOLE install package (see the block below). An ARGUMENT
+        # rather than an environment variable because this phase does not get
+        # the environment's variables -- measured: a session stamped `off`
+        # while the environment plainly set CAOS_DEV=1, and `--enable-bash`
+        # was already having to come in this way for the same reason.
+        --dev-server=*) dev_server="${arg#--dev-server=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -132,7 +147,17 @@ if [ -n "$repo_dir" ]; then
     # printing less than it promises cannot leave `set -u` to abort the whole
     # setup over a fallback that was meant to be optional.
     caos_pin_base=""; caos_pin_std_path=""; caos_pin_repo=""; caos_pin_rev=""
-    if pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
+    caos_pin_url=""
+    # THE DEV TREE'S COPY WHEN THERE IS ONE, which there is on the second pass:
+    # the dev block below re-execs this file from the fetched package, and
+    # caos-pin.sh would otherwise be the one file in a dev session still coming
+    # from GitHub. On the first pass the tree does not exist yet -- the pin has
+    # to be read before the bootstrap install that supplies the transport the
+    # tree arrives over -- so the fetch is what happens then.
+    dev_pin="/usr/local/share/caos/dev-tree/integrations/claude-code/cloud/caos-pin.sh"
+    if [ -n "${CAOS_SETUP_FROM_DEV:-}" ] && [ -r "$dev_pin" ]; then
+        pin="$(bash "$dev_pin" "$repo_dir")" && eval "$pin" || true
+    elif pin="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/caos-pin.sh" \
               | bash -s -- "$repo_dir")"; then
         eval "$pin" || true
     fi
@@ -159,6 +184,19 @@ fi
 # saying so here -- before the snapshot, where the message is read by whoever
 # is setting it up -- is worth more than a session that starts and then
 # behaves oddly.
+# A pin that yields no GitHub base is a DIFFERENT failure, and naming it
+# separately is the difference between "point this at a client repo" and "this
+# client repo is already pointed at your machine". The second happens when a
+# checkout carries a lock a previous dev session rewrote.
+if [ -n "${caos_pin_rev:-}" ] && [ -z "${caos_pin_base:-}" ]; then
+    echo "FATAL: this repository pins caos at ${caos_pin_url:-?}," >&2
+    echo "  which is not a GitHub release this phase can install from." >&2
+    echo "  Dev mode still starts from the committed GitHub pin: it is the" >&2
+    echo "  bootstrap that supplies git-remote-caos, which is how anything" >&2
+    echo "  reaches a caos:// server at all. Commit a github: pin, or clone" >&2
+    echo "  a checkout whose flake.lock has not been rewritten." >&2
+    exit 1
+fi
 if [ -z "$caos_std_path" ]; then
     echo "FATAL: this environment's repository does not pin caos." >&2
     echo "  A caos session starts from a CLIENT repo, which is four things:" >&2
@@ -186,7 +224,6 @@ fi
 args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
 args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
 installer="$base/integrations/claude-code/cloud/install.sh"
-
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
 # hooks and server declaration go USER-level (pinned to the commit just
 # installed), leaving the checkout exactly as it was found. install.sh does both
@@ -206,6 +243,223 @@ if ! command -v caos >/dev/null 2>&1; then
     exit 1
 fi
 caos --version >&2 2>/dev/null || true
+
+# AFTER THE BOOTSTRAP INSTALL, and that is a hard dependency rather than a
+# preference: fetching the dev package speaks `caos://`, and git speaks it only
+# through `git-remote-caos`, which the install above is what puts on PATH. Run
+# before it, this died with
+#   git: 'remote-caos' is not a git command
+# which reads as the dev server being unreachable rather than as the helper
+# being absent. The two are indistinguishable from the caller, which is why the
+# message now prints `command -v git-remote-caos` beside the error.
+#
+# So the pinned install is a BOOTSTRAP rather than waste: it supplies the
+# transport the real package arrives over, and the second install below
+# replaces everything it put down.
+# ---------------------------------------------------------------------------
+# THE INSTALL PACKAGE, FROM THE DEV SERVER
+# ---------------------------------------------------------------------------
+# The point of dev mode: edit here, see it in the next session, with no push and
+# no CI. That needs the WHOLE package from the dev stack -- the client, the git
+# helper, the settings and mcp JSON, and these scripts -- because the binaries
+# otherwise come from a GitHub RELEASE that only CI builds.
+#
+# All of it is in the commit `caosd up` publishes at `refs/caos/dev`:
+# `dev-bin/{caos,git-remote-caos}` and
+# `integrations/claude-code/shared/{settings,mcp}.json`, which is exactly what
+# the release workflow copies into its assets.
+#
+# HERE, NOT IN THE SESSION HOOK, because Claude Code reads the JSON at launch
+# and the hook runs after that. The relay this reaches is a custom one
+# (CAOS_IROH_RELAY): n0's answer 503 from this phase, measured, while a relay of
+# one's own answers 200.
+dev_tree=""
+# ONE STAMP, WRITTEN ONCE, at the END of this block -- never appended to as the
+# steps run. Three writers at three points in this file is what it was, and the
+# last of them used `>`: the rewrite's report was written and then destroyed by
+# a later probe, so a session reported reaching the dev server and said nothing
+# at all about whether the checkout had been repointed, which is the question.
+# Every step below is fatal on failure, so REACHING the write is itself the
+# claim and there is no half-state left for a stamp to describe.
+install -d /usr/local/share/caos
+rm -f /usr/local/share/caos/dev-stamp
+if [ -n "$dev_server" ]; then
+    # SAY WHICH FAILURE, because an empty result has two very different causes
+    # and this message used to assert the wrong one. "No such ref" means the dev
+    # stack is up but published nothing; a transport error means it was never
+    # reached -- and the usual reason for that is the RELAY being down, which
+    # looks identical from here and has already been mistaken for it three
+    # times.
+    dev_err="$(mktemp)"
+    dev_sha="$(git ls-remote "$dev_server" refs/caos/dev 2>"$dev_err" | awk '{print $1}')"
+    if [ -z "$dev_sha" ]; then
+        echo "FATAL: --dev-server named a server this phase could not use." >&2
+        echo "  git-remote-caos: $(command -v git-remote-caos || echo 'NOT ON PATH')" >&2
+        echo "  ls-remote said: $(tr '\n' ' ' < "$dev_err" | cut -c1-240)" >&2
+        echo "  Empty with no error means the stack is up but published no" >&2
+        echo "  refs/caos/dev: run 'caosd up --iroh'. An error instead usually" >&2
+        echo "  means the RELAY is down -- this phase cannot reach n0's, so it" >&2
+        echo "  depends on the one CAOS_IROH_RELAY names." >&2
+        rm -f "$dev_err"
+        exit 1
+    fi
+    rm -f "$dev_err"
+    dev_tree=/usr/local/share/caos/dev-tree
+    rm -rf "$dev_tree" /usr/local/share/caos/dev.git
+    install -d "$dev_tree" /usr/local/share/caos/dev.git
+    git init -q --bare /usr/local/share/caos/dev.git
+    if ! git --git-dir=/usr/local/share/caos/dev.git fetch -q --depth=1 \
+             "$dev_server" "$dev_sha"; then
+        echo "FATAL: could not fetch $dev_sha from the dev server" >&2
+        exit 1
+    fi
+    git --git-dir=/usr/local/share/caos/dev.git archive "$dev_sha" \
+        | tar -x -C "$dev_tree"
+    echo "dev package: $dev_sha from the dev server" >&2
+
+    # THIS SCRIPT, from the dev tree, once. An edit to setup.sh is part of the
+    # package and would otherwise be the one file that still needed a push. The
+    # guard is what stops it looping: the re-exec'd copy sees it set and runs
+    # through. Compared by content rather than trusted, so an unchanged tree
+    # costs nothing.
+    dev_setup="$dev_tree/integrations/claude-code/cloud/setup.sh"
+    if [ -z "${CAOS_SETUP_FROM_DEV:-}" ] && [ -r "$dev_setup" ] \
+       && ! cmp -s "$dev_setup" "$0" 2>/dev/null; then
+        echo "re-running the dev tree's own setup.sh" >&2
+        export CAOS_SETUP_FROM_DEV=1
+        exec bash "$dev_setup" "$@"
+    fi
+
+    # The asset directory install.sh reads, laid out the way the release is so
+    # nothing downstream has to know which of the two it got.
+    dev_assets="$dev_tree/dist"
+    install -d "$dev_assets"
+    install -m 0755 "$dev_tree/dev-bin/caos" "$dev_assets/caos"
+    install -m 0755 "$dev_tree/dev-bin/git-remote-caos" \
+        "$dev_assets/git-remote-caos-x86_64-linux"
+    install -m 0644 "$dev_tree/integrations/claude-code/shared/settings.json" \
+        "$dev_assets/claude-settings.json"
+    install -m 0644 "$dev_tree/integrations/claude-code/shared/mcp.json" \
+        "$dev_assets/mcp.json"
+    printf '%s\n' "$dev_sha" > "$dev_assets/REV"
+fi
+
+# THE TOOLS, from the dev commit too. `std/` is compiled by caos itself from the
+# std tree, so it is reached by a locator rather than installed, and
+# `git+caos://…` is an ordinary git fetch through `git-remote-caos`.
+#
+# BOTH FILES, or neither works: `std/flake-input-loader` refuses a tree whose
+# expression and `flake.lock` name different revisions.
+#
+# NOTHING HIDES THESE EDITS FROM GIT. `--skip-worktree` was tried, to keep an
+# agent from committing a ticket that is also a credential, and it made dev mode
+# a no-op: caos ingests the checkout through `hash_dir`, which copies the REAL
+# index for its stat cache and inherits that bit, so `git add -u <dir>` keeps
+# HEAD's blob and exits 0. Both files reverted together, so the loader's drift
+# check saw two consistent files and passed.
+#
+# FATAL, not a note. This guard has three ways to be false, and under every one
+# of them the session installs the dev CLIENT and then evaluates the COMMITTED
+# tools -- the half-update dev mode exists to prevent, and the hardest state to
+# read from inside a session. It used to write a line to a stamp and carry on,
+# which is how it was discovered: from the outside, "rewritten" and "quietly
+# not rewritten" looked the same.
+if [ -n "$dev_tree" ] && { [ -z "$repo_dir" ] || [ ! -w "$repo_dir/.caos-expr" ] \
+                          || [ ! -r "$repo_dir/flake.lock" ]; }; then
+    echo "FATAL: the checkout cannot be repointed at the dev server." >&2
+    printf '  repo_dir=%s expr_writable=%s lock_readable=%s\n' \
+        "${repo_dir:-<none>}" \
+        "$([ -w "${repo_dir:-/nonexistent}/.caos-expr" ] && echo yes || echo no)" \
+        "$([ -r "${repo_dir:-/nonexistent}/flake.lock" ] && echo yes || echo no)" >&2
+    echo "  Without it this session runs your client against the pinned tools." >&2
+    exit 1
+fi
+if [ -n "$dev_tree" ]; then
+    sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$dev_server?rev=$dev_sha\&dir=\1|g" \
+        "$repo_dir/.caos-expr"
+    if tmp_lock="$(jq --arg url "$dev_server" --arg rev "$dev_sha" '
+            (.root // "root") as $r
+            | (.nodes[$r].inputs.caos // empty) as $k
+            | if ($k|type) == "string"
+              then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
+              else . end' "$repo_dir/flake.lock" 2>/dev/null)"; then
+        printf '%s\n' "$tmp_lock" > "$repo_dir/flake.lock"
+        echo "dev tools: $caos_std_path/ now resolves from the dev server at ${dev_sha:0:12}" >&2
+
+        # THE CONVERSATION SEEDS FROM ITS OWN COMMIT, not from HEAD. `mcp serve`
+        # builds a conversation's CONTENT with `resolve_base`, which is HEAD
+        # unless told otherwise -- so the rewrite above reached the checkout and
+        # NOT the tree the session evaluates. Measured: a session ran the dev
+        # client and the dev step while every `caos-std/<entry>` still resolved
+        # through the committed pin, which is the one thing dev mode exists to
+        # prevent.
+        #
+        # UNREFERENCED, via `commit-tree` into a throwaway index: nothing points
+        # at it, so `git push` cannot carry it and the ticket it contains -- a
+        # credential -- stays out of every pushable ref. The branch and the
+        # working tree are left exactly as they were.
+        seed_idx="$(mktemp -u)"
+        seed_commit=""
+        if seed_tree="$(cd "$repo_dir" && GIT_INDEX_FILE="$seed_idx" sh -c \
+                'git read-tree HEAD && git add -A && git write-tree' 2>/dev/null)" \
+           && [ -n "$seed_tree" ]; then
+            seed_commit="$(git -C "$repo_dir" commit-tree "$seed_tree" \
+                -p "$(git -C "$repo_dir" rev-parse HEAD)" \
+                -m "caos dev mode: the checkout as setup.sh left it" 2>/dev/null)"
+        fi
+        rm -f "$seed_idx"
+        if [ -z "$seed_commit" ]; then
+            echo "FATAL: could not mint a conversation seed commit." >&2
+            echo "  Without it the session evaluates the COMMITTED pin while" >&2
+            echo "  running a dev client -- the half-update dev mode prevents." >&2
+            exit 1
+        fi
+        echo "conversation seeds from ${seed_commit:0:12} (unreferenced)" >&2
+    else
+        echo "FATAL: could not rewrite flake.lock; the loader will refuse the drift" >&2
+        exit 1
+    fi
+fi
+
+# THE REAL INSTALL, replacing everything the bootstrap put down: the client, the
+# git helper, the deny list, the hooks and the MCP server declaration, all from
+# the dev tree. The installer itself comes from there too, so an edit to
+# install.sh is in the package like everything else.
+#
+# `--base` is still passed and still unused on this path -- --dev-assets
+# replaces the release it would otherwise resolve -- but install.sh validates it
+# either way, so a nonsense value would fail here rather than be ignored.
+if [ -n "$dev_tree" ]; then
+    dev_installer="$dev_tree/integrations/claude-code/cloud/install.sh"
+    echo "re-installing from the dev package: $dev_installer" >&2
+    if ! bash "$dev_installer" $args --dev-assets="$dev_assets" \
+             ${seed_commit:+--seed-commit="$seed_commit"}; then
+        echo "FATAL: the dev package would not install." >&2
+        echo "  The bootstrap client is still in place, but it is the PINNED" >&2
+        echo "  one -- this session would run the repo's caos, not yours." >&2
+        exit 1
+    fi
+    caos --version >&2 2>/dev/null || true
+
+    # THE STAMP, and it is the LAST thing the dev block does. Every step above
+    # exits on failure, so a stamp that exists says all of them happened --
+    # which is what makes it readable as a fact by session-start.sh and by
+    # `caos_status`, neither of which can see this output.
+    #
+    # NOT THE TICKET. A `caos://` URL is the capability to drive that server,
+    # and this file is quoted verbatim into a model's context by `caos_status`.
+    # The revision identifies the build; the ticket would only identify the
+    # reader's own machine to whoever the transcript reaches.
+    cat > /usr/local/share/caos/dev-stamp <<STAMP
+rev=$dev_sha
+seed=$seed_commit
+std_path=$caos_std_path
+repo=$repo_dir
+STAMP
+    chmod 0644 /usr/local/share/caos/dev-stamp
+fi
+
+
 
 # The git remote helper arrives with the client, from the same release and into
 # the same directory, so there is nothing to install here — a `caos://` server
@@ -246,7 +500,9 @@ EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
 # reason on stderr, rather than be blocked by its own setup.
-if ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
+if [ -r /usr/local/share/caos/dev-tree/integrations/claude-code/cloud/session-start.sh ]; then
+    script="$(cat /usr/local/share/caos/dev-tree/integrations/claude-code/cloud/session-start.sh)"
+elif ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
     echo "caos: could not fetch $bootstrap_base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi

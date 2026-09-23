@@ -3,8 +3,12 @@
 # evaluated tree caos' `std/` is mounted.
 #
 #   eval "$(bash caos-pin.sh /home/user/my-repo)"
-#   # sets: caos_pin_base, caos_pin_std_path, caos_pin_rev, caos_pin_repo
-#   # prints nothing and exits 1 when the checkout does not pin caos
+#   # sets: caos_pin_std_path, caos_pin_rev, caos_pin_url
+#   #  plus: caos_pin_base, caos_pin_repo -- ONLY when the pin is a GitHub one
+#   # prints nothing and exits 1 when the checkout does not pin caos at all
+#
+# A pin that is not on GitHub yields no `caos_pin_base` and is still a pin: test
+# for the variable the caller actually needs, not for the exit status.
 #
 # WHY THIS EXISTS AS ITS OWN FILE: two callers need the same answer, at
 # different times. `setup.sh` reads it once, before the environment is
@@ -87,6 +91,16 @@ fi
 # Only the shapes that yield a GitHub raw base, because that is what install.sh
 # takes. A `git+https://github.com/...` input locks as type `git` with the URL
 # in `url`; a `github:` input locks as type `github` with owner/repo split out.
+#
+# A SHAPE THAT YIELDS NO BASE IS NOT "NO PIN". It is the answer for a repo
+# pinned somewhere install.sh cannot download a release from -- which is what
+# every dev-mode checkout looks like, since the setup script rewrites the lock
+# to the `caos://` server it took the package from. Exiting 1 on those made the
+# caller report "this checkout pins no caos" about a checkout pinned precisely,
+# deliberately, at the user's own machine. So the rev, the URL and the std path
+# are printed either way and only `caos_pin_base` is withheld; the CALLER, which
+# knows whether it needs a base, decides what that costs.
+no_base=""
 case "$ty" in
     github)
         [ -n "$owner" ] && [ -n "$repo" ] || { say "github input lacks owner/repo"; exit 1; }
@@ -102,18 +116,16 @@ case "$ty" in
                 owner="${u%%/*}"; repo="${u#*/}"
                 ;;
             *)
-                say "the '$input' input is at $url, which is not github.com --"
-                say "  install.sh downloads its client from a GitHub release, so"
-                say "  a non-GitHub pin cannot be turned into a --base."
-                exit 1
+                no_base="the '$input' input is at $url, which is not github.com"
                 ;;
         esac
-        [ -n "$owner" ] && [ -n "$repo" ] && [ "$owner" != "$repo" ] \
-            || { say "could not read owner/repo out of $url"; exit 1; }
+        if [ -z "$no_base" ] && { [ -z "$owner" ] || [ -z "$repo" ] \
+                                  || [ "$owner" = "$repo" ]; }; then
+            no_base="could not read owner/repo out of $url"
+        fi
         ;;
     *)
-        say "the '$input' input has type '$ty', which carries no URL to build a --base from"
-        exit 1
+        no_base="the '$input' input has type '$ty', which carries no URL to build a --base from"
         ;;
 esac
 
@@ -161,7 +173,14 @@ fi
 
 # `declare`-free on purpose: the caller `eval`s this, and these are plain
 # assignments so it works in any shell and under `set -u`.
-printf 'caos_pin_base=%s\n' "$RAW/$owner/$repo/$rev"
+if [ -n "$no_base" ]; then
+    say "$no_base;"
+    say "  install.sh downloads its client from a GitHub release, so this pin"
+    say "  yields no --base. Everything else about it is printed."
+else
+    printf 'caos_pin_base=%s\n' "$RAW/$owner/$repo/$rev"
+    printf 'caos_pin_repo=%s\n' "$owner/$repo"
+fi
 printf 'caos_pin_std_path=%s\n' "$std_path"
-printf 'caos_pin_repo=%s\n' "$owner/$repo"
 printf 'caos_pin_rev=%s\n' "$rev"
+printf 'caos_pin_url=%s\n' "${url:-$ty:$owner/$repo}"

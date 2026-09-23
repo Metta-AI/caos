@@ -79,6 +79,33 @@ else
     log "no setup stamp; this environment predates it"
 fi
 
+# ---------------------------------------------------------------------------
+# Is this a dev environment? Read once, here, used three times below
+# ---------------------------------------------------------------------------
+# Dev mode is done ENTIRELY by the setup script -- the client, the git helper,
+# the JSON, the checkout's own `.caos-expr`, and the unreferenced commit the
+# conversation seeds from. This hook does none of it, and the version that did
+# is gone: it fired on `CAOS_DEV`, which nothing sets any more, and everything
+# it did would now be undone or duplicated by what setup leaves on disk.
+#
+# What is left for a session is to KNOW, because three things here would
+# otherwise be wrong: the client must not be refreshed from GitHub (that is the
+# pinned build, and installing it would undo dev mode), the registry warm must
+# name the same step the tool server was configured with, and the session has to
+# be told which caos it is.
+dev_rev=""
+dev_seed=""
+dev_std_path=""
+if [ -r /usr/local/share/caos/dev-stamp ]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            rev) dev_rev="$value" ;;
+            seed) dev_seed="$value" ;;
+            std_path) dev_std_path="$value" ;;
+        esac
+    done < /usr/local/share/caos/dev-stamp
+fi
+
 # An environment snapshotted before the bootstrap stopped baking the pin. Its
 # `--base` is that frozen pin, not a script base, so nothing here uses it — and
 # with no `--bootstrap-base` this hook cannot read the repo's CURRENT pin,
@@ -215,7 +242,23 @@ fi
 # that pins no caos does not get a refresh at all; it keeps the client the
 # snapshot has, which is a session that works rather than one installed from
 # the wrong tree.
-if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
+#
+# IN DEV MODE NEITHER RUNS. The refresh exists to un-freeze a snapshot's client
+# by re-installing the repo's pin from GitHub; here that would replace the
+# binary setup took from the dev server with the one the repo pins, undoing dev
+# mode at the start of every session. Nor is there a pin left to read: setup
+# rewrote `flake.lock` to name the dev server, and caos-pin.sh -- which exists
+# to turn a pin into a GitHub base -- correctly declines to make one out of a
+# `caos://` URL. That decline used to reach the log as "this checkout pins no
+# caos", about a checkout pinned precisely, deliberately, at your own machine.
+if [ -n "$dev_rev" ]; then
+    # From the stamp, not from the checkout: `--caos-std-path` is what setup
+    # handed install.sh, so it is what the tool server's `--llm-step:@=` names,
+    # and the warm below has to agree with that or it fills a cache key nothing
+    # reads and the first turn has no tools.
+    caos_std_path="$dev_std_path"
+    step "dev mode: client and tools from the dev server; no refresh from GitHub"
+elif [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     # Cleared before the eval, and read back with `:-` after it, so a
     # caos-pin.sh that somehow succeeds while printing less than it promises
     # cannot take the hook out on an unset variable under `set -u`. The whole
@@ -239,7 +282,12 @@ if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     fi
 fi
 
-if [ -n "$base" ] && [ -n "$caos_std_path" ]; then
+if [ -n "$dev_rev" ]; then
+    # Said above, and deliberately not said twice: the branch is here so that
+    # the "pins no caos" line below cannot be reached in dev mode, where it is
+    # both false and the exact wrong place to send a reader.
+    :
+elif [ -n "$base" ] && [ -n "$caos_std_path" ]; then
     step "refreshing the client"
     if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" \
          | bash -s -- --no-repo-files --user-config --base="$base" \
@@ -263,128 +311,32 @@ fi
 step "client refresh done"
 
 # ---------------------------------------------------------------------------
-# DEV MODE: run the caos on the SERVER, not the one on GitHub
+# WHICH CAOS THIS SESSION IS -- on STDOUT, the only stream that reaches anyone
 # ---------------------------------------------------------------------------
-# `caosd up` publishes its checkout to `refs/caos/dev` on the stack it starts:
-# one commit carrying the working tree and the x86_64 client built from it. With
-# `CAOS_DEV=1` this session runs that instead of the repo's pin, so uncommitted
-# work reaches a container with no GitHub push and no wait for CI.
+# A SessionStart hook contributes its STDOUT to the session. Its stderr is
+# captured as a `system/hook_response` event, which is classed as NON-TRANSCRIPT
+# and dropped -- the run-log API says so in as many words, and reading these
+# lines at all meant paging the raw events endpoint three cursors back.
 #
-# EVERY SESSION, not once at setup: that ref moves on every `caosd up`, so a
-# value frozen into the snapshot would be the stale one of the two. This is the
-# same reason the pin itself is re-read above.
+# Every line this file logs is stderr (`log()` redirects, `step()` calls `log`).
+# So the dev-mode trace added to make "did dev mode take?" a FACT rather than an
+# inference was written, every session, into the one stream the session discards
+# -- and then cost exactly the debugging session it exists to prevent: a run
+# whose hook had said `dev client installed ... dev-0ac792e540a0` read, from
+# everywhere a human or a model can see, as a change that had not taken.
 #
-# AFTER the refresh, deliberately. The install above is what puts
-# `git-remote-caos` on disk, and without it `git` cannot speak `caos://` at all
-# -- so the repo's ordinary pin is the bootstrap that makes this reachable, and
-# it never has to move.
-#
-# Never fatal. A dev overlay that cannot happen leaves a session running the
-# pinned client, which works; saying so beats failing to start.
-if [ "${CAOS_DEV:-}" = 1 ] && [ "$have_repo" = 1 ] && [ -n "$server" ]; then
-    step "dev mode: looking for refs/caos/dev on the server"
-    dev_sha="$(git ls-remote "$server" refs/caos/dev 2>/dev/null | awk '{print $1}')"
-    if [ -z "$dev_sha" ]; then
-        log "CAOS_DEV=1 but the server publishes no refs/caos/dev."
-        log "  Run 'caosd up --iroh' on the machine serving this ticket; a plain"
-        log "  'caosd up' publishes the tree but starts no caos:// listener."
-    elif ! git fetch --quiet --depth=1 --no-tags --no-write-fetch-head \
-              -- "$server" "$dev_sha" 2>/dev/null; then
-        log "could not fetch $dev_sha from the server; staying on the pinned client"
-        dev_sha=""
-    fi
-fi
-if [ -n "${dev_sha:-}" ]; then
-    # THE BINARIES, over the ones install.sh just placed. Written beside and
-    # RENAMED rather than truncated in place: these are executables, and
-    # overwriting a mapped file is ETXTBSY rather than an update.
-    #
-    # Into `lib/caos`, which is where the CLIENT looks -- `bin/caos` is a shell
-    # wrapper that execs it, and `ensure_helper_on_path` puts `lib/caos` on PATH
-    # before shelling out to git. A helper written only into `bin` is invisible
-    # to caos' own git.
-    overlaid=""
-    for name in caos git-remote-caos; do
-        dest="/usr/local/lib/caos/$name"
-        if git cat-file blob "$dev_sha:dev-bin/$name" > "$dest.dev" 2>/dev/null; then
-            chmod 0755 "$dest.dev" && mv -f "$dest.dev" "$dest" && overlaid="$overlaid $name"
-        else
-            rm -f "$dest.dev"
-        fi
-    done
-    if [ -n "$overlaid" ]; then
-        # AND SAY SO IN THE VERSION, because otherwise nothing does. `bin/caos`
-        # is a wrapper that exports a `CAOS_REV` baked in at install time, and
-        # the overlay above replaces only the binary it execs -- so `caos
-        # --version` and `caos_status` both go on reporting the PINNED build
-        # while a different one runs. Measured in a live session: diagnostics
-        # read `client CAOS_REV: build-3bf5b67cd5a7` with the dev client in
-        # place, which is the exact reading that would send someone to debug
-        # why dev mode had not taken.
-        if [ -w /usr/local/bin/caos ]; then
-            sed -i "s|CAOS_REV:-[^}]*}|CAOS_REV:-dev-${dev_sha:0:12}}|" /usr/local/bin/caos \
-                || log "could not stamp the wrapper; caos --version will name the pinned build"
-        fi
-        step "dev client installed:$overlaid (caos --version now says dev-${dev_sha:0:12})"
-    else
-        log "refs/caos/dev carries no dev-bin/; leaving the pinned client in place"
-    fi
-
-    # THE TOOLS, from the same commit. `std/` is compiled by caos itself from
-    # the std tree, so it is reached by a locator rather than installed -- and
-    # `git+caos://…` is an ordinary git fetch through `git-remote-caos`, which
-    # is why this needs no new transport and no code change (git-locator takes
-    # any `git+<scheme>`).
-    #
-    # BOTH FILES, or neither works: `std/flake-input-loader` refuses a tree
-    # whose expression and `flake.lock` name different revisions, and it is
-    # `flake.lock`'s URL that decides which locators it even checks.
-    expr_file="$PWD/.caos-expr"
-    lock_file="$PWD/flake.lock"
-    if [ -w "$expr_file" ] && [ -r "$lock_file" ]; then
-        # PROTECTED FIRST, before the ticket is written into either file. A
-        # `caos://` URL ends in the token that authorizes driving that server,
-        # so these two files are about to become credentials -- and an agent
-        # working in this checkout must not be able to commit them. Doing this
-        # first means there is no window in which they are committable.
-        #
-        # `--skip-worktree`, NOT `.git/info/exclude`, and the difference is the
-        # whole of it: exclude (like .gitignore) governs UNTRACKED files only,
-        # and both of these are tracked in a client repo. Measured -- with them
-        # merely excluded, `git status` still reported ` M .caos-expr` and
-        # ` M flake.lock`, so `git commit -a` would have published the ticket.
-        # skip-worktree tells git to ignore local changes to a tracked file,
-        # which is exactly this case.
-        for f in .caos-expr flake.lock; do
-            git update-index --skip-worktree "$f" 2>/dev/null \
-                || log "could not protect $f from being committed; it will hold the server ticket"
-        done
-
-        # Every `:@@=` locator repointed at this server at this commit, keeping
-        # each one's own `dir=`: the expression names two (the loader's image
-        # and the tree it splices) and they differ only by that.
-        sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$server?rev=$dev_sha\&dir=\1|g" \
-            "$expr_file"
-
-        # The lock's `locked` section for the caos input, found through
-        # `nodes.<root>.inputs.<name>` as caos-pin.sh and the loader both do --
-        # the node key is not the input name once an input has been renamed.
-        # `narHash` is DROPPED rather than recomputed: an absent hash is honest,
-        # where a stale one would be a lie nix would later reject.
-        if tmp_lock="$(jq --arg url "$server" --arg rev "$dev_sha" '
-                (.root // "root") as $r
-                | (.nodes[$r].inputs.caos // empty) as $k
-                | if ($k|type) == "string"
-                  then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
-                  else . end' "$lock_file" 2>/dev/null)"; then
-            printf '%s\n' "$tmp_lock" > "$lock_file"
-            step "dev tools: $caos_std_path/ now resolves from the server at ${dev_sha:0:12}"
-        else
-            log "could not rewrite flake.lock; the loader will refuse the drift it now sees"
-        fi
-    else
-        log "no writable .caos-expr / flake.lock here; the tools stay on the repo's pin"
-    fi
+# THE STAMP IS THE AUTHORITY, not anything this hook can test. Dev mode happens
+# in the setup script, entirely, and every step of it there is fatal -- so the
+# file existing is the whole claim, and a session cannot be in the state this
+# used to have a third message for ("asked for but not active"). It reported on
+# `CAOS_DEV`, which nothing has set since the dev server became a setup
+# argument, so it said `off` in every dev session it was asked about.
+if [ -n "$dev_rev" ]; then
+    echo "caos dev mode: ON -- the whole install package came from refs/caos/dev" \
+         "at ${dev_rev:0:12}, and this session's conversation seeds from" \
+         "${dev_seed:0:12} (the checkout as setup left it)."
+else
+    echo "caos dev mode: off -- this session runs the caos its repo pins."
 fi
 
 # ---------------------------------------------------------------------------
