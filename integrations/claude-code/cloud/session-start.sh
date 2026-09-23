@@ -373,6 +373,7 @@ if [ -n "${dev_sha:-}" ]; then
                   then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
                   else . end' "$lock_file" 2>/dev/null)"; then
             printf '%s\n' "$tmp_lock" > "$lock_file"
+            dev_tools_ok=1
             step "dev tools: $caos_std_path/ now resolves from the server at ${dev_sha:0:12}"
         else
             log "could not rewrite flake.lock; the loader will refuse the drift it now sees"
@@ -380,6 +381,35 @@ if [ -n "${dev_sha:-}" ]; then
     else
         log "no writable .caos-expr / flake.lock here; the tools stay on the repo's pin"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# WHICH CAOS THIS SESSION IS -- on STDOUT, the only stream that reaches anyone
+# ---------------------------------------------------------------------------
+# A SessionStart hook contributes its STDOUT to the session. Its stderr is
+# captured as a `system/hook_response` event, which is classed as NON-TRANSCRIPT
+# and dropped -- the run-log API says so in as many words, and reading these
+# lines at all meant paging the raw events endpoint three cursors back.
+#
+# Every line this file logs is stderr (`log()` redirects, `step()` calls `log`).
+# So the dev-mode trace added to make "did dev mode take?" a FACT rather than an
+# inference was written, every session, into the one stream the session discards
+# -- and then cost exactly the debugging session it exists to prevent: a run
+# whose hook had said `dev client installed ... dev-0ac792e540a0` read, from
+# everywhere a human or a model can see, as a change that had not taken.
+#
+# ONE LINE on success, because this lands in every session's context and the
+# detail belongs on stderr. The failure case gets two, and names which half
+# failed: "asked for and did not happen" is the reading that sends someone to
+# debug their own code instead of their environment.
+if [ "${CAOS_DEV:-}" != 1 ]; then
+    echo "caos dev mode: off -- this session runs the caos its repo pins."
+elif [ -n "${overlaid:-}" ] && [ -n "${dev_tools_ok:-}" ]; then
+    echo "caos dev mode: ON -- client and tools from refs/caos/dev at ${dev_sha:0:12}."
+else
+    echo "caos dev mode: ASKED FOR BUT NOT ACTIVE -- this session runs the PINNED caos."
+    echo "  refs/caos/dev: ${dev_sha:-not published}; client overlay:${overlaid:- none};" \
+         "tools rewrite: ${dev_tools_ok:+done}${dev_tools_ok:-NOT DONE}."
 fi
 
 # ---------------------------------------------------------------------------
