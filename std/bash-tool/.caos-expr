@@ -6,4 +6,27 @@
 # DEPENDS on the pool and curries the built binary onto it itself, so the result
 # is curry(runner, worker1=<the compiled binary>) — a ready-to-run bounded bash
 # tool in the shared runner pool.
-run --base:@=DEEP-DEPS/rustc --src:@=.
+#
+# THE HELP IS BOUND HERE, so this tool describes itself. It was a hand-written
+# `json!` declaration inside llm-step, which is also where `@writer` had to be
+# known by matching the name "bash" -- and a copied description drifts (the
+# same note std/merge/.caos-expr carries, for the same reason).
+#
+# `{array}` on `paths` is why this could not move sooner: every `@param` was a
+# string, and declaring `paths` as one would have silently narrowed the tool
+# from a list to a single value.
+HELP=<<END
+Run sh -c from the conversation root. Ordinary files (including memories and
+skills) and source trees are writable together. Declare paths to read or edit
+existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to
+organize source trees. cp -a preserves their commit identity; editing their
+files creates child commits when the result is stored. Conversation-root .caos
+protocol metadata cannot be changed; a source tree's .caos/conflicts ledger is
+editable.
+@param cmd The command to run with sh -c.
+@param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root.
+@param {array} [paths] Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees.
+@writer
+END
+IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=.
+curry --base=$IMAGE --help=$HELP

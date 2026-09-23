@@ -53,7 +53,9 @@ read)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "read: exit $(cat "$R/exit")"
   [ "$(cat "$R/stdout")" = "one" ] || fail "read: stdout $(cat "$R/stdout")"
-  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "read-only run changed the tree"
+  [ ! -e "$R/failed" ] || fail "a clean run left a failed marker"
+  [ -s "$R/out" ] || fail "the result carries no rendered out"
+  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "read-only run changed the tree"
   echo "  ok: read its file; tree unchanged (identical hash)" >&2
 
   echo "== undeclared touch: EACCES + structured retry hint ==" >&2
@@ -77,12 +79,12 @@ denied)
 write)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "write: exit $(cat "$R/exit")"
-  [ "$(cat "$R/tree/new.txt")" = "hi" ] || fail "created file missing/wrong"
-  [ "$(cat "$R/tree/a/one.txt")" = "$(printf 'one\nedited')" ] || fail "edit not staged"
+  [ "$(cat "$R/prop/new.txt")" = "hi" ] || fail "created file missing/wrong"
+  [ "$(cat "$R/prop/a/one.txt")" = "$(printf 'one\nedited')" ] || fail "edit not staged"
   caos get -r /cas/args/ws || fail "reading the fixture"
-  [ "$(caos hash "$R/tree/a/b")" = "$(caos hash /cas/args/ws/a/b)" ] \
+  [ "$(caos hash "$R/prop/a/b")" = "$(caos hash /cas/args/ws/a/b)" ] \
     || fail "untouched subtree a/b did not round-trip by hash"
-  [ "$(cat "$R/tree/top.txt")" = "top" ] || fail "untouched top.txt lost"
+  [ "$(cat "$R/prop/top.txt")" = "top" ] || fail "untouched top.txt lost"
   echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
 
   echo "== a failing command is a value, not a run error ==" >&2
@@ -94,7 +96,10 @@ failed)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "7" ] || fail "exit code not surfaced: $(cat "$R/exit")"
   grep -q "oops" "$R/stderr" || fail "stderr not captured"
-  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "failed run mangled the tree"
+  # `failed` PRESENT is what makes the call an error tool_result. A marker, not
+  # a banner in `out`: command output says FAILED in passing all the time.
+  [ -e "$R/failed" ] || fail "a non-zero exit left no failed marker"
+  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "failed run mangled the tree"
   echo "  ok: exit 7 + stderr returned as a value" >&2
 
   echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
@@ -106,7 +111,7 @@ execbit)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "exec run: exit $(cat "$R/exit")"
   [ "$(cat "$R/stdout")" = "hi" ] || fail "declared file was not executable"
-  [ "$(caos hash "$R/tree")" = "$(ws_oid)" ] || fail "exec bit lost round-tripping"
+  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "exec bit lost round-tripping"
   echo "  ok: ./run.sh ran and the 100755 mode round-tripped" >&2
 
   printf 'bash-tool: ALL PASS\n' > /tmp/report

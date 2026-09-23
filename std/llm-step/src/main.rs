@@ -44,10 +44,8 @@ static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
 /// carries that image. This is a DISPATCH map — which image implements a tool —
 /// and deliberately says nothing about what any of them does.
 ///
-/// `bash` is absent, and cannot join until a help can declare a non-string
-/// parameter: its `paths` is an ARRAY, while every `@param` is a string, so
-/// moving its schema here would silently narrow the tool.
-const BUILTIN_IMAGES: [(&str, &str); 4] = [
+const BUILTIN_IMAGES: [(&str, &str); 5] = [
+    ("bash", "bash-image"),
     ("merge", "merge-image"),
     ("caos-build", "caos-build-image"),
     ("caos-test", "caos-test-image"),
@@ -1769,10 +1767,10 @@ fn callback_result(
     state: &mut progress::State,
     record: &CallRecord,
 ) -> Result<(Value, Option<Oid>), String> {
-    // A DECLARED writer. `merge` came through here once its `.caos-expr` said
-    // `@writer`, and every repository tool does. `bash` is the one writer still
-    // matched by NAME below, and only because its `paths` parameter is an array
-    // that no `@param` can yet describe (SPEC, "CaosTools" — Not built).
+    // A DECLARED writer -- every writer, now. What is left in the match below
+    // are RENDERERS (`grep`'s sparse match tree) and the subagent join, not
+    // class decisions: no tool's ability to change the tree depends on its
+    // name any more.
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
     }
@@ -1784,21 +1782,6 @@ fn callback_result(
                 tools::grep_result_block(&record.id, &arg("result"), &scope)?,
                 None,
             ))
-        }
-        "bash" => {
-            let block = bash_result_block(&record.id)?;
-            let ws = format!("{}/tree", arg("result"));
-            if !Path::new(&ws).exists() {
-                return Err("bash result carries no `tree` entry".to_string());
-            }
-            caos(["get", &ws])?;
-            let tree = Oid::parse(&cas_hash(&ws)?, "bash result tree")?;
-            let base = record
-                .input_commit
-                .as_ref()
-                .ok_or("bash record has no input source tree")?;
-            let proposal = mint_source_tree_commit(state, &tree, base, "bash")?;
-            Ok((block, Some(proposal)))
         }
         _ => Ok((
             tools::tree_tool_result_block(&record.id, &arg("result"))?,
@@ -3094,7 +3077,13 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 }
 
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
-    let mut registry = vec![bash_tool()];
+    // bash is described by the help ITS OWN IMAGE carries, like merge and the
+    // std tools. Not wrapped in `with_source_tree`: bash works in the
+    // conversation tree unless the caller names one.
+    let mut registry = match tools::std_tool("bash", &arg("bash-image"))? {
+        Some(tool) => vec![tools::tree_tool_declaration(&tool)],
+        None => return Err("the bash image carries no help".to_string()),
+    };
     registry.extend(tools::declarations());
     registry.push(with_source_tree(tools::tree_tool_declaration(
         &tools::builtin_tool("publish_source", publish_source::HELP),
@@ -3188,18 +3177,6 @@ fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static 
         .map(|image| (image, arg_name))
 }
 
-fn bash_tool() -> Value {
-    json!({
-        "name":"bash",
-        "description":"Run sh -c from the conversation root. Ordinary files (including memories and skills) and source trees are writable together. Declare paths to read or edit existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to organize source trees. cp -a preserves their commit identity; editing their files creates child commits when the result is stored. Conversation-root .caos protocol metadata cannot be changed; a source tree's .caos/conflicts ledger is editable.",
-        "input_schema":{"type":"object","properties":{
-            "cmd":{"type":"string"},
-            "cwd":{"type":"string","description":"Optional conversation-relative working directory; defaults to the conversation root."},
-            "paths":{"type":"array","items":{"type":"string"},"description":"Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees."}
-        },"required":["cmd"]}
-    })
-}
-
 fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
     let id = call["id"].as_str().unwrap_or("");
     let theirs = call["input"]["theirs"]
@@ -3241,32 +3218,6 @@ fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, Str
             names.join(", ")
         }
     ))
-}
-
-fn bash_result_block(id: &str) -> Result<Value, String> {
-    caos(["get", &arg("result")])?;
-    let leaf = |name: &str| -> Result<String, String> {
-        let file = format!("{}/{name}", arg("result"));
-        caos(["get", &file])?;
-        let bytes = fs::read(&file).map_err(|error| format!("reading {file}: {error}"))?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    };
-    let exit = leaf("exit")?.trim().to_string();
-    let stdout = leaf("stdout")?;
-    let stderr = leaf("stderr")?;
-    let denied = if Path::new(&format!("{}/denied", arg("result"))).exists() {
-        Some(leaf("denied")?)
-    } else {
-        None
-    };
-    let mut text = format!("exit: {exit}\nstdout:\n{stdout}\nstderr:\n{stderr}");
-    if let Some(denied) = denied {
-        text += &format!(
-            "\nunmaterialized paths touched: {}; retry with them in `paths`.",
-            denied.split_whitespace().collect::<Vec<_>>().join(", ")
-        );
-    }
-    Ok(result_block(id, &text, exit != "0"))
 }
 
 fn failed_run_block(id: &str, tool: &str, error: &str) -> Value {

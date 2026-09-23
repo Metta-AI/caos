@@ -82,15 +82,25 @@ fn run() -> Result<(), String> {
         fs::write(res.join("denied"), listing.join("\n") + "\n")
             .map_err(|e| format!("writing denied: {e}"))?;
     }
-    // The rendered form, in the `report` blob every caos tool answers with, so
-    // each caller reads one instead of composing its own from the parts. The
-    // parts stay: `tree` and `exit` are DATA a harness consumes — advance the
-    // workspace, decide whether the call failed — while this is presentation,
-    // and presentation duplicated across callers is how one tool ends up
-    // reading two ways depending on who ran it.
-    fs::write(res.join("report"), report(exit, &out.stdout, &out.stderr, &denied))
-        .map_err(|e| format!("writing report: {e}"))?;
-    link("/cas/newtree", res.join("tree"))?;
+    // `out`: the rendered form, read by every caller instead of each composing
+    // its own from the parts. The parts stay because they are DATA (`exit` says
+    // whether the command failed, `denied` which paths were not materialized)
+    // while this is presentation — and presentation duplicated across callers
+    // is how one tool ends up reading two ways depending on who ran it.
+    // llm-step used to re-render exactly this from `exit`/`stdout`/`stderr`.
+    fs::write(res.join("out"), report(exit, &out.stdout, &out.stderr, &denied))
+        .map_err(|e| format!("writing out: {e}"))?;
+    // `failed` PRESENT means the call failed, which for a shell is a non-zero
+    // exit. A marker entry rather than a banner inside `out`, because `out`
+    // here is arbitrary command output and says FAILED in passing all the time
+    // (SPEC, "CaosTools" — Writers).
+    if exit != 0 {
+        fs::write(res.join("failed"), format!("exit {exit}\n"))
+            .map_err(|e| format!("writing failed: {e}"))?;
+    }
+    // `prop`: the proposed tree. The harness mints the commit — this tool has
+    // no reason to know what a commit is.
+    link("/cas/newtree", res.join("prop"))?;
     caos(["put", path(&res), "/cas/out"])
 }
 

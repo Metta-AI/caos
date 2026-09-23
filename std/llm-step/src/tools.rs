@@ -179,12 +179,58 @@ pub struct TreeArg {
     pub name: String,
     pub doc: String,
     pub required: bool,
+    pub ty: ArgType,
+}
+
+/// The JSON type a parameter accepts, declared as `@param {<type>} <name>`.
+///
+/// A bare `@param <name>` is a STRING, which is what nearly everything wants:
+/// a curried arg reaches the script as a blob whatever it left the model as.
+/// The type exists for the cases where narrowing the model to a string would
+/// narrow the TOOL — `bash`'s `paths` is a list, and saying "string" would
+/// have quietly taken that away.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArgType {
+    Text,
+    /// An array of strings. Curried as a blob of NEWLINE-SEPARATED elements,
+    /// which is the encoding `bash` already gave its `paths` by hand.
+    Lines,
+}
+
+impl ArgType {
+    fn parse(name: &str) -> Option<ArgType> {
+        match name {
+            "string" => Some(ArgType::Text),
+            "array" => Some(ArgType::Lines),
+            _ => None,
+        }
+    }
+
+    /// This type's JSON Schema fragment, with `doc` as the description.
+    fn schema(self, doc: &str) -> Value {
+        match self {
+            ArgType::Text => json!({"type": "string", "description": doc}),
+            ArgType::Lines => {
+                json!({"type": "array", "items": {"type": "string"}, "description": doc})
+            }
+        }
+    }
 }
 
 /// Parse one `@param` tag's payload (everything after the tag) into a
 /// parameter. `None` — reported by the caller — for a malformed name, so a
 /// typo costs a visible skip rather than an arg the model can't use.
 fn parse_arg(payload: &str) -> Option<TreeArg> {
+    // An optional leading `{type}`. An UNKNOWN type fails the whole tag rather
+    // than falling back to a string: a typo that silently narrowed an array
+    // parameter would take a capability away with no error anywhere.
+    let (ty, payload) = match payload.strip_prefix('{') {
+        Some(rest) => {
+            let (name, rest) = rest.split_once('}')?;
+            (ArgType::parse(name.trim())?, rest.trim_start())
+        }
+        None => (ArgType::Text, payload),
+    };
     let (token, doc) = match payload.split_once(char::is_whitespace) {
         Some((t, d)) => (t, d.trim()),
         None => (payload, ""),
@@ -203,6 +249,7 @@ fn parse_arg(payload: &str) -> Option<TreeArg> {
         name: name.to_string(),
         doc: doc.to_string(),
         required,
+        ty,
     })
 }
 
@@ -430,10 +477,7 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
     let mut props = serde_json::Map::new();
     let mut required = Vec::new();
     for a in &tool.args {
-        props.insert(
-            a.name.clone(),
-            json!({"type": "string", "description": a.doc}),
-        );
+        props.insert(a.name.clone(), a.ty.schema(&a.doc));
         if a.required {
             required.push(Value::String(a.name.clone()));
         }
@@ -705,8 +749,31 @@ pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, Stri
             }
             Some(Value::String(s)) => s.clone(),
             Some(v @ (Value::Number(_) | Value::Bool(_))) => v.to_string(),
+            // An `{array}` parameter arrives as a list and is curried as one
+            // NEWLINE-SEPARATED blob, because that is all an arg can be by the
+            // time the script reads it. A lone string is accepted as a
+            // one-element list rather than refused on a technicality.
+            Some(Value::Array(items)) if a.ty == ArgType::Lines => {
+                let mut lines = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(line) => lines.push(line.to_string()),
+                        None => {
+                            return fail(format!(
+                                "every entry of {}'s {:?} must be a string",
+                                tool.name, a.name
+                            ))
+                        }
+                    }
+                }
+                lines.join("\n")
+            }
             Some(_) => {
-                return fail(format!("{}'s {:?} must be a string", tool.name, a.name));
+                let wanted = match a.ty {
+                    ArgType::Text => "a string",
+                    ArgType::Lines => "an array of strings",
+                };
+                return fail(format!("{}'s {:?} must be {wanted}", tool.name, a.name));
             }
         };
         out.push((a.name.clone(), value));
@@ -1204,6 +1271,53 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_type_reaches_the_schema_and_the_binding() {
+        let h = parse_help(
+            "t",
+            "Run a command.\n@param cmd The command.\n\
+             @param {array} [paths] Paths to materialize.\n\
+             @param {string} [cwd] Working directory.",
+        );
+        assert_eq!(h.args.len(), 3);
+        // Bare is a string; `{string}` is the same thing said out loud.
+        assert_eq!(h.args[0].ty, ArgType::Text);
+        assert_eq!(h.args[2].ty, ArgType::Text);
+        assert_eq!(h.args[1].ty, ArgType::Lines);
+        assert_eq!(h.args[1].name, "paths");
+        assert!(!h.args[1].required, "the bracket still marks it optional");
+        assert_eq!(h.args[1].doc, "Paths to materialize.");
+
+        let tool = TreeTool::new("bash", h);
+        let d = tree_tool_declaration(&tool);
+        assert_eq!(d["input_schema"]["properties"]["cmd"]["type"], "string");
+        assert_eq!(d["input_schema"]["properties"]["paths"]["type"], "array");
+        assert_eq!(
+            d["input_schema"]["properties"]["paths"]["items"]["type"],
+            "string"
+        );
+        assert_eq!(d["input_schema"]["required"], json!(["cmd"]));
+
+        // An array binds as ONE newline-separated blob -- all an arg can be by
+        // the time a script reads it -- and a lone string is one element.
+        let call = json!({"id":"c","input":{"cmd":"ls","paths":["a","b/c"]}});
+        let bound = tree_tool_args(&call, &tool).expect("array accepted");
+        assert!(bound.contains(&("paths".to_string(), "a\nb/c".to_string())));
+        let call = json!({"id":"c","input":{"cmd":"ls","paths":"solo"}});
+        let bound = tree_tool_args(&call, &tool).expect("lone string accepted");
+        assert!(bound.contains(&("paths".to_string(), "solo".to_string())));
+
+        // A non-string entry is the model's mistake, named as such.
+        let call = json!({"id":"c","input":{"cmd":"ls","paths":[1]}});
+        let block = tree_tool_args(&call, &tool).expect_err("number refused");
+        assert_eq!(block["is_error"], true);
+
+        // An UNKNOWN type fails the whole tag rather than defaulting to a
+        // string: silently narrowing an array parameter removes a capability.
+        let h = parse_help("t", "d\n@param {nope} x The x.");
+        assert!(h.args.is_empty());
+    }
+
+    #[test]
     fn writer_is_opt_in_and_independent_of_git() {
         let h = parse_help("t", "Merges a branch in.\n@writer");
         assert!(h.writer);
@@ -1369,11 +1483,13 @@ mod tests {
                     name: "hash".to_string(),
                     doc: "The record hash.".to_string(),
                     required: true,
+                    ty: ArgType::Text,
                 },
                 TreeArg {
                     name: "log".to_string(),
                     doc: "Which log.".to_string(),
                     required: false,
+                    ty: ArgType::Text,
                 },
             ],
             git: false,
@@ -1414,11 +1530,13 @@ mod tests {
                     name: "word".to_string(),
                     doc: String::new(),
                     required: true,
+                    ty: ArgType::Text,
                 },
                 TreeArg {
                     name: "suffix".to_string(),
                     doc: String::new(),
                     required: false,
+                    ty: ArgType::Text,
                 },
             ],
             git: false,

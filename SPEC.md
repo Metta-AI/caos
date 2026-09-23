@@ -202,8 +202,14 @@ and `help` are refused: the interpreter, or the tool's own expression, binds
 those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
 skipped with a message, never silently turned into an arg the model cannot use.
 
-Every parameter is a STRING, because every arg reaches the script as a blob
-whatever JSON type it left the model as. `tool_help` states each one's name,
+A parameter is a STRING unless it says otherwise, because every arg reaches the
+script as a blob whatever JSON type it left the model as. `@param {<type>}
+<name>` declares another: `{string}` is the default said out loud, and
+`{array}` is a list of strings, which the model sends as a JSON array and which
+is CURRIED AS ONE NEWLINE-SEPARATED BLOB — all an arg can be by the time a
+script reads it. An UNKNOWN type fails the whole tag rather than falling back
+to a string, because silently narrowing an array parameter takes a capability
+away with nothing to notice. `tool_help` states each one's name,
 whether it is required, and its documentation as prose rather than as a JSON
 schema — the model reads it, and a schema dump is the registry that was just
 removed. A tool with no `@param` tags takes no parameters: the source tree IS
@@ -269,6 +275,12 @@ instead of returning a value. Its result is `{prop, out, message?, failed?}`:
   in `out`, because `out` is arbitrary logs and a build that printed `FAILED`
   in passing would condemn a good proposal
 
+**NO TOOL'S WRITER-NESS DEPENDS ON ITS NAME.** Every writer declares itself,
+built-ins included: `bash` and `merge` carry `@writer` in their own
+`.caos-expr`, and the harness reads it there. What remains keyed by name in
+`callback_result` is `grep`'s renderer for its sparse match tree and the
+subagent join — presentation and plumbing, not the right to change a tree.
+
 **SCOPE comes from the invocation, not the declaration.** A writer run on a
 source tree returns a source commit; one run on the conversation returns a
 conversation commit. The path the caller named already decides which, so the
@@ -294,12 +306,6 @@ is the same reason the `help` lives in the expression.
 Everything here was considered and deliberately deferred. Nothing above depends
 on any of it, and each is written down because the reason is easy to lose.
 
-- **`bash` is the one writer still known by its NAME.** Its `paths` parameter
-  is an ARRAY and every `@param` is a string, so moving its schema into a help
-  — which is where `@writer` has to live — would silently narrow a heavily used
-  tool. It migrates when a help can declare a parameter's kind, which is the
-  typed-args item below. `callback_result` therefore still has one writer arm,
-  and `bash_result_block` still composes text the worker could render itself.
 - **`help` is read from the expression's text, not from the evaluated tree.**
   So a tool whose help lives only in a built image cannot be described. Reading
   it from the ArgTree would fix that, at the cost of `tool_help` having to
