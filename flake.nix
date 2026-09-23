@@ -1486,8 +1486,14 @@ sandbox = false''
                   dev_head="$(git rev-parse --verify --quiet HEAD || true)"
                   dev_commit="$(printf 'caosd up: %s\n' "$(date -u +%FT%TZ)" \
                     | git commit-tree "$dev_tree" ''${dev_head:+-p "$dev_head"})"
+                  # STDERR IS NOT DISCARDED. It was, and this publish then failed
+                  # silently for an hour behind "the stack is up regardless":
+                  # every session kept resolving a snapshot from before the
+                  # change under test, which reads as the change not working.
+                  # git's own message is thin (the server now says why), but a
+                  # line of it beats the one line that says nothing is wrong.
                   if git push --quiet --force http://localhost:9090 \
-                       "$dev_commit:refs/caos/dev" 2>/dev/null; then
+                       "$dev_commit:refs/caos/dev"; then
                     echo "==> published this tree to refs/caos/dev ($dev_commit)" >&2
                   else
                     echo "==> could not publish to refs/caos/dev; the stack is up regardless" >&2
