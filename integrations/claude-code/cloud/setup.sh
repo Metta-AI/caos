@@ -286,11 +286,18 @@ caos_probe() {
     done
     printf '\n'
 }
-caos_probe https://raw.githubusercontent.com/ \
+caos_probe \
            https://usw1-1.relay.n0.iroh.link./ \
+           https://use1-1.relay.n0.iroh.link./ \
+           https://euc1-1.relay.n0.iroh.link./ \
+           https://aps1-1.relay.n0.iroh.link./ \
+           https://use1-1.relay.iroh.network./ \
+           https://euw1-1.relay.iroh.network./ \
+           https://aps1-1.relay.iroh.network./ \
+           https://iroh.computer/ \
+           https://www.hetzner.com/ \
            https://example.com/ \
     > /usr/local/share/caos/net-probe-setup 2>&1
-echo "net probe (setup): $(cat /usr/local/share/caos/net-probe-setup)" >&2
 
 # WHY ONLY THE RELAY. Measured: from this phase the relay answers 503 while
 # example.com answers 200, so this is not a blocked network and not a domain

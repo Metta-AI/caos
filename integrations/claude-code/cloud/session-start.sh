@@ -300,8 +300,16 @@ else
     echo "caos net probe (setup phase): not recorded by this environment's setup."
 fi
 printf 'caos net probe (hook phase):  %s' \
-    "$(caos_probe https://raw.githubusercontent.com/ \
+    "$(caos_probe \
                   https://usw1-1.relay.n0.iroh.link./ \
+                  https://use1-1.relay.n0.iroh.link./ \
+                  https://euc1-1.relay.n0.iroh.link./ \
+                  https://aps1-1.relay.n0.iroh.link./ \
+                  https://use1-1.relay.iroh.network./ \
+                  https://euw1-1.relay.iroh.network./ \
+                  https://aps1-1.relay.iroh.network./ \
+                  https://iroh.computer/ \
+                  https://www.hetzner.com/ \
                   https://example.com/)"
 
 # The same verbose trace setup.sh took, so the two can be diffed. Only the relay
