@@ -300,6 +300,7 @@ caos_probe \
            https://aps1-1.relay.iroh.network./ \
            https://5.78.69.43/ \
            https://116.203.71.221/ \
+           http://34.200.32.255/ \
            http://34.200.32.255:3340/ \
            http://example.com/ \
            https://iroh.computer/ \
