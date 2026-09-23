@@ -54,6 +54,7 @@ repo_files=yes
 user_config=""
 enable_bash=""
 caos_std_path=""
+dev_assets=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -83,6 +84,15 @@ for arg in "$@"; do
         # of its `.caos-expr` -- not a convention this script may assume.
         --caos-std-path=*) caos_std_path="${arg#--caos-std-path=}"
                            caos_std_path="${caos_std_path%/}" ;;
+        # EVERYTHING FROM A LOCAL DIRECTORY, so a dev stack can serve its own
+        # install package: the client, the git helper and the two JSON assets.
+        # Without it those come from a GitHub RELEASE, which means a push and a
+        # CI round trip before an edit here can be seen at all.
+        #
+        # `curl` speaks `file://`, so pointing `url` at this directory leaves
+        # every fetch below unchanged -- including the `${url%/*}/<name>` form
+        # the helper and the assets use.
+        --dev-assets=*) dev_assets="${arg#--dev-assets=}"; dev_assets="${dev_assets%/}" ;;
         --base=*) BASE="${arg#--base=}"; BASE="${BASE%/}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -94,151 +104,173 @@ done
 # not baked into --base, so the value reads as the base it is. Peeled by
 # stripping owner and repo from the front; whatever remains is checked below to
 # be a full sha.
-rest="${BASE#"$RAW"/}"
-owner="${rest%%/*}"; rest="${rest#*/}"
-name="${rest%%/*}";  REF="${rest#*/}"
-if [ "${BASE#"$RAW"/}" = "$BASE" ] || [ -z "$owner" ] || [ -z "$name" ] \
-   || [ -z "$REF" ] || [ "$REF" = "$name" ]; then
-    echo "--base must look like" >&2
-    echo "  $RAW/<owner>/<repo>/<ref>" >&2
-    echo "  got: $BASE" >&2
-    exit 2
-fi
-REPO="$owner/$name"
-
-case "$(uname -s)/$(uname -m)" in
-    Linux/x86_64) asset=caos-x86_64-linux ;;
-    Linux/aarch64|Linux/arm64) asset=caos-aarch64-linux ;;
-    *)
-        echo "no published binary for $(uname -s)/$(uname -m);" >&2
-        echo "build from source with \`nix build .#caos-cli\`." >&2
+# EVERYTHING BELOW UNTIL `url=` RESOLVES A GITHUB RELEASE, and --dev-assets
+# replaces the lot: there is no release to look up, no build tag to match and
+# no commit to take from one. `url` is pointed at the local directory instead,
+# and because curl speaks `file://` every fetch after this is unchanged.
+#
+# VERSION still names the build, since it is stamped into the wrapper as
+# CAOS_REV and is the only thing a session can read back to tell which client
+# it is running. A dev install says so plainly rather than borrowing a build
+# number it does not have.
+if [ -n "$dev_assets" ]; then
+    if [ ! -r "$dev_assets/caos" ]; then
+        echo "FATAL: --dev-assets=$dev_assets has no caos binary in it" >&2
         exit 1
-        ;;
-esac
-# VALIDATED BEFORE ANYTHING IS FETCHED. This is a pure check on an argument,
-# so paying a network round trip to be told the argument was wrong is both
-# slower and untestable -- `--base=…/main` used to `ls-remote` first and
-# only then refuse the ref.
-# A COMMIT, AND ONLY A COMMIT. `--base` names the caos this client IS, and with
-# a repo-pinned step that is never a name: `caos-pin.sh` reads it out of
-# `flake.lock`, which records revisions, and the same revision is what the
-# expression's `:@@=` locators carry -- the two must agree or
-# `std/flake-input-loader` refuses the tree. So a branch cannot reach here
-# through the supported path, and accepting one could only produce the pairing
-# this file exists to prevent: a client from a moving head driving tools
-# resolved through some other commit.
-#
-# What used to be here was a branch/tag lookup plus a walk back to the newest
-# build at or before the ref, for the window in which a branch head has no
-# build yet. Both are gone with the branch: a written-down commit is honoured
-# or refused, never quietly replaced. The cost is stated in the READMEs --
-# push, wait for `build-<commit>`, then re-pin.
-case "$REF" in
-    *[!0-9a-f]* | "")
-        echo "--base must end in a full commit sha, not $REF" >&2
-        echo "  A client repo pins caos by revision (flake.lock), and the step" >&2
-        echo "  resolves through that same revision, so a branch or tag here" >&2
-        echo "  would install a client from a different tree than its tools." >&2
+    fi
+    REPO="dev"
+    REF="$(cat "$dev_assets/REV" 2>/dev/null || echo unknown)"
+    COMMIT=""
+    VERSION="dev-${REF:0:12}"
+    url="file://$dev_assets/caos"
+    echo "installing from $dev_assets as $VERSION" >&2
+else
+    rest="${BASE#"$RAW"/}"
+    owner="${rest%%/*}"; rest="${rest#*/}"
+    name="${rest%%/*}";  REF="${rest#*/}"
+    if [ "${BASE#"$RAW"/}" = "$BASE" ] || [ -z "$owner" ] || [ -z "$name" ] \
+       || [ -z "$REF" ] || [ "$REF" = "$name" ]; then
+        echo "--base must look like" >&2
+        echo "  $RAW/<owner>/<repo>/<ref>" >&2
+        echo "  got: $BASE" >&2
         exit 2
-        ;;
-esac
-if [ "${#REF}" != 40 ]; then
-    echo "--base must end in a FULL 40-character commit sha; got ${#REF} characters" >&2
-    echo "  ($REF). That is what flake.lock records and what the expression pins." >&2
-    exit 2
-fi
+    fi
+    REPO="$owner/$name"
 
-
-# A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
-# resolving one is a lookup rather than a parse.
-#
-# Read with `git ls-remote`, NOT api.github.com. That API is anonymous here, so
-# it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares its
-# egress address with every other cloud VM, so the budget is spent by strangers
-# and the 403 is nothing this side can fix. ls-remote has no such limit, needs
-# no token, and speaks to github.com like the download does.
-if ! command -v git >/dev/null 2>&1; then
-    echo "resolving the build for $REF needs git" >&2
-    exit 1
-fi
-remote="https://github.com/$REPO"
-if ! refs="$(git ls-remote "$remote" 2>&1)"; then
-    echo "could not list the refs of $remote:" >&2
-    printf '%s\n' "$refs" | head -3 >&2
-    exit 1
-fi
-
-
-builds=""
-while IFS=$'\t' read -r s r; do
-    case "$r" in refs/tags/build-*) builds="$builds${r#refs/tags/}"$'\n' ;; esac
-done <<< "$refs"
-
-# A build is named `build-<first twelve of the commit>`, so this is a lookup,
-# not a search: truncate the ref and ask whether that tag exists.
-VERSION=""
-ref12="${REF:0:12}"
-while IFS= read -r b; do
-    case "${b#build-}" in
-        "$ref12") VERSION="$b"; break ;;
+    case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64) asset=caos-x86_64-linux ;;
+        Linux/aarch64|Linux/arm64) asset=caos-aarch64-linux ;;
+        *)
+            echo "no published binary for $(uname -s)/$(uname -m);" >&2
+            echo "build from source with \`nix build .#caos-cli\`." >&2
+            exit 1
+            ;;
     esac
-done <<< "$builds"
-if [ -z "$VERSION" ]; then
-    echo "$REPO has no build for $REF, and a pinned commit does not fall back" >&2
-    echo "  to an earlier one: the step resolves through THIS rev, so an older" >&2
-    echo "  client would drive tools built from a different tree." >&2
-    echo "  The workflow publishes build-<commit> and may still be running --" >&2
-    echo "  wait for it, then re-pin. \`gh run list\` says when." >&2
-    exit 1
-fi
-echo "$REPO $REF -> $VERSION" >&2
-
-# The FULL commit this build came from, which a build tag's twelve hex digits
-# are not. Whoever configures a session has to name the step that runs its
-# tools, and outside the caos checkout that name is a pinned locator
-# (`--llm-step:@@=github:<repo>?rev=<40 hex>&dir=std/llm-step`) whose rev is
-# mandatory and unabbreviated. Taken from the ref listing already in hand.
-#
-# AND CHECKED AGAINST THE TAG'S OWN NAME, because the tag has been wrong. The
-# Releases API creates a missing tag at the default branch's head unless the
-# workflow passes `target_commitish`, and it did not until 2026-09-09 -- so
-# every build tag published before that names one commit and points at another
-# (whatever main's head was). Nothing read the target then; this does, and a
-# silently wrong pin would hand a session a step built from an unrelated tree.
-COMMIT=""
-while IFS=$'\t' read -r s r; do
-    case "$r" in
-        # Peeled first: an annotated tag's own object is not what was built.
-        "refs/tags/$VERSION^{}") COMMIT="$s"; break ;;
-        "refs/tags/$VERSION") COMMIT="$s" ;;
+    # VALIDATED BEFORE ANYTHING IS FETCHED. This is a pure check on an argument,
+    # so paying a network round trip to be told the argument was wrong is both
+    # slower and untestable -- `--base=…/main` used to `ls-remote` first and
+    # only then refuse the ref.
+    # A COMMIT, AND ONLY A COMMIT. `--base` names the caos this client IS, and with
+    # a repo-pinned step that is never a name: `caos-pin.sh` reads it out of
+    # `flake.lock`, which records revisions, and the same revision is what the
+    # expression's `:@@=` locators carry -- the two must agree or
+    # `std/flake-input-loader` refuses the tree. So a branch cannot reach here
+    # through the supported path, and accepting one could only produce the pairing
+    # this file exists to prevent: a client from a moving head driving tools
+    # resolved through some other commit.
+    #
+    # What used to be here was a branch/tag lookup plus a walk back to the newest
+    # build at or before the ref, for the window in which a branch head has no
+    # build yet. Both are gone with the branch: a written-down commit is honoured
+    # or refused, never quietly replaced. The cost is stated in the READMEs --
+    # push, wait for `build-<commit>`, then re-pin.
+    case "$REF" in
+        *[!0-9a-f]* | "")
+            echo "--base must end in a full commit sha, not $REF" >&2
+            echo "  A client repo pins caos by revision (flake.lock), and the step" >&2
+            echo "  resolves through that same revision, so a branch or tag here" >&2
+            echo "  would install a client from a different tree than its tools." >&2
+            exit 2
+            ;;
     esac
-done <<< "$refs"
-if [ -z "$COMMIT" ]; then
-    echo "$REPO has no tag $VERSION to take a commit from" >&2
-    exit 1
-fi
-# A mismatch drops the commit rather than failing: installing the CLIENT does
-# not need it, and refusing over it would take out the whole install for a
-# build that is otherwise perfectly good. What cannot proceed is naming the
-# step by locator, and that is where the refusal belongs -- in the caller that
-# reads this record and finds no commit in it.
-case "$VERSION" in
-    build-*)
-        if [ "${VERSION#build-}" != "${COMMIT:0:12}" ]; then
-            echo "$REPO tag $VERSION points at $COMMIT, a different commit," >&2
-            echo "  so this build cannot say which tree it came from. It predates" >&2
-            echo "  the workflow fix that puts a build tag on the commit it names;" >&2
-            echo "  a session that has to name the step needs a newer build." >&2
-            COMMIT=""
-        fi
-        ;;
-esac
+    if [ "${#REF}" != 40 ]; then
+        echo "--base must end in a FULL 40-character commit sha; got ${#REF} characters" >&2
+        echo "  ($REF). That is what flake.lock records and what the expression pins." >&2
+        exit 2
+    fi
 
-# Always a named release by this point -- there is no `/releases/latest/`
-# route here on purpose. GitHub's "latest" is the newest release of ANY kind,
-# and with a release per push that is whichever branch pushed last, which is
-# nobody's intent.
-url="https://github.com/$REPO/releases/download/$VERSION/$asset"
+
+    # A build is named by its COMMIT -- `build-<12 hex>` -- and by nothing else, so
+    # resolving one is a lookup rather than a parse.
+    #
+    # Read with `git ls-remote`, NOT api.github.com. That API is anonymous here, so
+    # it is rate limited to 60 requests an hour PER IP -- and a cloud VM shares its
+    # egress address with every other cloud VM, so the budget is spent by strangers
+    # and the 403 is nothing this side can fix. ls-remote has no such limit, needs
+    # no token, and speaks to github.com like the download does.
+    if ! command -v git >/dev/null 2>&1; then
+        echo "resolving the build for $REF needs git" >&2
+        exit 1
+    fi
+    remote="https://github.com/$REPO"
+    if ! refs="$(git ls-remote "$remote" 2>&1)"; then
+        echo "could not list the refs of $remote:" >&2
+        printf '%s\n' "$refs" | head -3 >&2
+        exit 1
+    fi
+
+
+    builds=""
+    while IFS=$'\t' read -r s r; do
+        case "$r" in refs/tags/build-*) builds="$builds${r#refs/tags/}"$'\n' ;; esac
+    done <<< "$refs"
+
+    # A build is named `build-<first twelve of the commit>`, so this is a lookup,
+    # not a search: truncate the ref and ask whether that tag exists.
+    VERSION=""
+    ref12="${REF:0:12}"
+    while IFS= read -r b; do
+        case "${b#build-}" in
+            "$ref12") VERSION="$b"; break ;;
+        esac
+    done <<< "$builds"
+    if [ -z "$VERSION" ]; then
+        echo "$REPO has no build for $REF, and a pinned commit does not fall back" >&2
+        echo "  to an earlier one: the step resolves through THIS rev, so an older" >&2
+        echo "  client would drive tools built from a different tree." >&2
+        echo "  The workflow publishes build-<commit> and may still be running --" >&2
+        echo "  wait for it, then re-pin. \`gh run list\` says when." >&2
+        exit 1
+    fi
+    echo "$REPO $REF -> $VERSION" >&2
+
+    # The FULL commit this build came from, which a build tag's twelve hex digits
+    # are not. Whoever configures a session has to name the step that runs its
+    # tools, and outside the caos checkout that name is a pinned locator
+    # (`--llm-step:@@=github:<repo>?rev=<40 hex>&dir=std/llm-step`) whose rev is
+    # mandatory and unabbreviated. Taken from the ref listing already in hand.
+    #
+    # AND CHECKED AGAINST THE TAG'S OWN NAME, because the tag has been wrong. The
+    # Releases API creates a missing tag at the default branch's head unless the
+    # workflow passes `target_commitish`, and it did not until 2026-09-09 -- so
+    # every build tag published before that names one commit and points at another
+    # (whatever main's head was). Nothing read the target then; this does, and a
+    # silently wrong pin would hand a session a step built from an unrelated tree.
+    COMMIT=""
+    while IFS=$'\t' read -r s r; do
+        case "$r" in
+            # Peeled first: an annotated tag's own object is not what was built.
+            "refs/tags/$VERSION^{}") COMMIT="$s"; break ;;
+            "refs/tags/$VERSION") COMMIT="$s" ;;
+        esac
+    done <<< "$refs"
+    if [ -z "$COMMIT" ]; then
+        echo "$REPO has no tag $VERSION to take a commit from" >&2
+        exit 1
+    fi
+    # A mismatch drops the commit rather than failing: installing the CLIENT does
+    # not need it, and refusing over it would take out the whole install for a
+    # build that is otherwise perfectly good. What cannot proceed is naming the
+    # step by locator, and that is where the refusal belongs -- in the caller that
+    # reads this record and finds no commit in it.
+    case "$VERSION" in
+        build-*)
+            if [ "${VERSION#build-}" != "${COMMIT:0:12}" ]; then
+                echo "$REPO tag $VERSION points at $COMMIT, a different commit," >&2
+                echo "  so this build cannot say which tree it came from. It predates" >&2
+                echo "  the workflow fix that puts a build tag on the commit it names;" >&2
+                echo "  a session that has to name the step needs a newer build." >&2
+                COMMIT=""
+            fi
+            ;;
+    esac
+
+    # Always a named release by this point -- there is no `/releases/latest/`
+    # route here on purpose. GitHub's "latest" is the newest release of ANY kind,
+    # and with a release per push that is whichever branch pushed last, which is
+    # nobody's intent.
+    url="https://github.com/$REPO/releases/download/$VERSION/$asset"
+fi
 
 # A function, purely so the "already current" test below can skip it without
 # indenting a heredoc -- a `WRAPPER` terminator moved off column 0 swallows the
@@ -381,10 +413,22 @@ chmod 0644 "$PREFIX/share/caos/build"
 # silently repointing the next launch at the step the client was built from
 # rather than the one the repo pins.
 serve_tmp="$PREFIX/bin/.caos-serve.$$"
+# NO REFRESH IN DEV MODE, and this is not an optimisation. The refresh exists to
+# un-freeze a snapshot's client by re-installing from GitHub; run after a dev
+# install it would replace the binary that was just taken from the dev server
+# with the one the repo pins -- undoing dev mode a few seconds after setup
+# established it, at the moment the tool server starts. The dev client is
+# current by construction: setup.sh installed it from this session's fetch.
+if [ -n "$dev_assets" ]; then
+    cat > "$serve_tmp" <<WRAP
+#!/bin/bash
+WRAP
+else
 cat > "$serve_tmp" <<WRAP
 #!/bin/bash
 timeout 20 bash -c "curl -fsSL '$BASE/integrations/claude-code/cloud/install.sh' | bash -s -- --no-repo-files --base='$BASE'${caos_std_path:+ --caos-std-path='$caos_std_path'}" >&2 || echo "caos-serve: client refresh skipped (failed or timed out); using the installed one" >&2
 WRAP
+fi
 if [ -n "$caos_std_path" ]; then
     # A REPO-PINNED step needs nothing from the build record: the path names the
     # caos the checkout itself mounts, so the refresh above cannot move it out

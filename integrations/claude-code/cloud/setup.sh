@@ -108,6 +108,71 @@ esac
 # the repo rather than defer to the first session hook -- which matters because
 # work done after the snapshot is paid by EVERY session, and this is the whole
 # install.
+# ---------------------------------------------------------------------------
+# THE INSTALL PACKAGE, FROM THE DEV SERVER
+# ---------------------------------------------------------------------------
+# The point of dev mode: edit here, see it in the next session, with no push and
+# no CI. That needs the WHOLE package from the dev stack -- the client, the git
+# helper, the settings and mcp JSON, and these scripts -- because the binaries
+# otherwise come from a GitHub RELEASE that only CI builds.
+#
+# All of it is in the commit `caosd up` publishes at `refs/caos/dev`:
+# `dev-bin/{caos,git-remote-caos}` and
+# `integrations/claude-code/shared/{settings,mcp}.json`, which is exactly what
+# the release workflow copies into its assets.
+#
+# HERE, NOT IN THE SESSION HOOK, because Claude Code reads the JSON at launch
+# and the hook runs after that. The relay this reaches is a custom one
+# (CAOS_IROH_RELAY): n0's answer 503 from this phase, measured, while a relay of
+# one's own answers 200.
+dev_tree=""
+if [ -n "$dev_server" ]; then
+    dev_sha="$(git ls-remote "$dev_server" refs/caos/dev 2>/dev/null | awk '{print $1}')"
+    if [ -z "$dev_sha" ]; then
+        echo "FATAL: --dev-server was given but it publishes no refs/caos/dev." >&2
+        echo "  Bring the dev stack up with 'caosd up --iroh'." >&2
+        exit 1
+    fi
+    dev_tree=/usr/local/share/caos/dev-tree
+    rm -rf "$dev_tree" /usr/local/share/caos/dev.git
+    install -d "$dev_tree" /usr/local/share/caos/dev.git
+    git init -q --bare /usr/local/share/caos/dev.git
+    if ! git --git-dir=/usr/local/share/caos/dev.git fetch -q --depth=1 \
+             "$dev_server" "$dev_sha"; then
+        echo "FATAL: could not fetch $dev_sha from the dev server" >&2
+        exit 1
+    fi
+    git --git-dir=/usr/local/share/caos/dev.git archive "$dev_sha" \
+        | tar -x -C "$dev_tree"
+    echo "dev package: $dev_sha from the dev server" >&2
+
+    # THIS SCRIPT, from the dev tree, once. An edit to setup.sh is part of the
+    # package and would otherwise be the one file that still needed a push. The
+    # guard is what stops it looping: the re-exec'd copy sees it set and runs
+    # through. Compared by content rather than trusted, so an unchanged tree
+    # costs nothing.
+    dev_setup="$dev_tree/integrations/claude-code/cloud/setup.sh"
+    if [ -z "${CAOS_SETUP_FROM_DEV:-}" ] && [ -r "$dev_setup" ] \
+       && ! cmp -s "$dev_setup" "$0" 2>/dev/null; then
+        echo "re-running the dev tree's own setup.sh" >&2
+        export CAOS_SETUP_FROM_DEV=1
+        exec bash "$dev_setup" "$@"
+    fi
+
+    # The asset directory install.sh reads, laid out the way the release is so
+    # nothing downstream has to know which of the two it got.
+    dev_assets="$dev_tree/dist"
+    install -d "$dev_assets"
+    install -m 0755 "$dev_tree/dev-bin/caos" "$dev_assets/caos"
+    install -m 0755 "$dev_tree/dev-bin/git-remote-caos" \
+        "$dev_assets/git-remote-caos-x86_64-linux"
+    install -m 0644 "$dev_tree/integrations/claude-code/shared/settings.json" \
+        "$dev_assets/claude-settings.json"
+    install -m 0644 "$dev_tree/integrations/claude-code/shared/mcp.json" \
+        "$dev_assets/mcp.json"
+    printf '%s\n' "$dev_sha" > "$dev_assets/REV"
+fi
+
 caos_std_path=""
 repo_dir=""
 # `$CLAUDE_PROJECT_DIR` is almost certainly NOT set here -- it is a Claude Code
@@ -143,6 +208,37 @@ if [ -n "$repo_dir" ]; then
         caos_std_path="$caos_pin_std_path"
         echo "this repo pins caos ${caos_pin_repo:-?} at ${caos_pin_rev:-?}" >&2
         echo "  and mounts its std at $caos_std_path" >&2
+    fi
+fi
+
+# THE TOOLS, from the dev commit too. `std/` is compiled by caos itself from the
+# std tree, so it is reached by a locator rather than installed, and
+# `git+caos://…` is an ordinary git fetch through `git-remote-caos`.
+#
+# BOTH FILES, or neither works: `std/flake-input-loader` refuses a tree whose
+# expression and `flake.lock` name different revisions.
+#
+# NOTHING HIDES THESE EDITS FROM GIT. `--skip-worktree` was tried, to keep an
+# agent from committing a ticket that is also a credential, and it made dev mode
+# a no-op: caos ingests the checkout through `hash_dir`, which copies the REAL
+# index for its stat cache and inherits that bit, so `git add -u <dir>` keeps
+# HEAD's blob and exits 0. Both files reverted together, so the loader's drift
+# check saw two consistent files and passed.
+if [ -n "$dev_tree" ] && [ -n "$repo_dir" ] \
+   && [ -w "$repo_dir/.caos-expr" ] && [ -r "$repo_dir/flake.lock" ]; then
+    sed -i "s|:@@=[^ ?]*?rev=[0-9a-f]*\&dir=\([^ ]*\)|:@@=git+$dev_server?rev=$dev_sha\&dir=\1|g" \
+        "$repo_dir/.caos-expr"
+    if tmp_lock="$(jq --arg url "$dev_server" --arg rev "$dev_sha" '
+            (.root // "root") as $r
+            | (.nodes[$r].inputs.caos // empty) as $k
+            | if ($k|type) == "string"
+              then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
+              else . end' "$repo_dir/flake.lock" 2>/dev/null)"; then
+        printf '%s\n' "$tmp_lock" > "$repo_dir/flake.lock"
+        echo "dev tools: $caos_std_path/ now resolves from the dev server at ${dev_sha:0:12}" >&2
+    else
+        echo "FATAL: could not rewrite flake.lock; the loader will refuse the drift" >&2
+        exit 1
     fi
 fi
 
@@ -188,6 +284,13 @@ fi
 args="--no-repo-files --user-config --base=$base${enable_bash:+ --enable-bash}"
 args="$args${caos_std_path:+ --caos-std-path=$caos_std_path}"
 installer="$base/integrations/claude-code/cloud/install.sh"
+# THE INSTALLER ITSELF FROM THE DEV TREE, and the assets with it, so an edit to
+# install.sh is in the package like everything else. `--base` is left alone but
+# unused on this path: --dev-assets replaces the release it would resolve.
+if [ -n "$dev_tree" ]; then
+    installer="$dev_tree/integrations/claude-code/cloud/install.sh"
+    args="$args --dev-assets=$dev_assets"
+fi
 
 # `--no-repo-files --user-config`: the client goes on PATH and its deny list,
 # hooks and server declaration go USER-level (pinned to the commit just
@@ -201,7 +304,11 @@ installer="$base/integrations/claude-code/cloud/install.sh"
 # layer down as every hook dying on `caos: command not found`, which reads like
 # a hook problem. Fail here, where the cause is still visible.
 echo "installing the caos client from $installer $args" >&2
-curl -fsSL "$installer" | bash -s -- $args
+if [ -n "$dev_tree" ]; then
+    bash "$installer" $args
+else
+    curl -fsSL "$installer" | bash -s -- $args
+fi
 if ! command -v caos >/dev/null 2>&1; then
     echo "FATAL: the caos client did not install from $installer" >&2
     echo "  The installer's own error is above this line; read that, not this." >&2
@@ -248,7 +355,9 @@ EOF
 cat >> /usr/local/bin/caos-cloud-session-start <<'BOOTSTRAP'
 # Never fatal: a session that cannot reach GitHub should still start, with the
 # reason on stderr, rather than be blocked by its own setup.
-if ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
+if [ -r /usr/local/share/caos/dev-tree/integrations/claude-code/cloud/session-start.sh ]; then
+    script="$(cat /usr/local/share/caos/dev-tree/integrations/claude-code/cloud/session-start.sh)"
+elif ! script="$(curl -fsSL "$bootstrap_base/integrations/claude-code/cloud/session-start.sh")"; then
     echo "caos: could not fetch $bootstrap_base/integrations/claude-code/cloud/session-start.sh; skipping" >&2
     exit 0
 fi
