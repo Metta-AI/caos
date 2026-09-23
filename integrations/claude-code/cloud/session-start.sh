@@ -342,24 +342,19 @@ if [ -n "${dev_sha:-}" ]; then
     expr_file="$PWD/.caos-expr"
     lock_file="$PWD/flake.lock"
     if [ -w "$expr_file" ] && [ -r "$lock_file" ]; then
-        # PROTECTED FIRST, before the ticket is written into either file. A
-        # `caos://` URL ends in the token that authorizes driving that server,
-        # so these two files are about to become credentials -- and an agent
-        # working in this checkout must not be able to commit them. Doing this
-        # first means there is no window in which they are committable.
+        # THE TICKET HAS TO REACH THE CONVERSATION, so nothing here may hide
+        # these edits from git. `--skip-worktree` was tried, to stop an agent
+        # committing a `caos://` URL that is also a credential, and it made dev
+        # mode a no-op: caos ingests the checkout through `hash_dir`, which
+        # copies the REAL index for its stat cache and so inherits that bit,
+        # and `git add -u <dir>` on a skip-worktree path exits 0 and silently
+        # keeps HEAD's blob. Both files reverted together, so the loader's
+        # rev-drift check saw two consistent files and passed, and every
+        # conversation evaluated the committed pin while the hook logged
+        # success. The ticket goes to the user's own caosd either way; what is
+        # left is an agent committing it upstream, and that is a push-time
+        # concern, not a reason to lie to git about what is on disk.
         #
-        # `--skip-worktree`, NOT `.git/info/exclude`, and the difference is the
-        # whole of it: exclude (like .gitignore) governs UNTRACKED files only,
-        # and both of these are tracked in a client repo. Measured -- with them
-        # merely excluded, `git status` still reported ` M .caos-expr` and
-        # ` M flake.lock`, so `git commit -a` would have published the ticket.
-        # skip-worktree tells git to ignore local changes to a tracked file,
-        # which is exactly this case.
-        for f in .caos-expr flake.lock; do
-            git update-index --skip-worktree "$f" 2>/dev/null \
-                || log "could not protect $f from being committed; it will hold the server ticket"
-        done
-
         # Every `:@@=` locator repointed at this server at this commit, keeping
         # each one's own `dir=`: the expression names two (the loader's image
         # and the tree it splices) and they differ only by that.
@@ -378,6 +373,7 @@ if [ -n "${dev_sha:-}" ]; then
                   then .nodes[$k].locked = {type:"git", url:$url, rev:$rev}
                   else . end' "$lock_file" 2>/dev/null)"; then
             printf '%s\n' "$tmp_lock" > "$lock_file"
+            dev_tools_ok=1
             step "dev tools: $caos_std_path/ now resolves from the server at ${dev_sha:0:12}"
         else
             log "could not rewrite flake.lock; the loader will refuse the drift it now sees"
@@ -385,6 +381,35 @@ if [ -n "${dev_sha:-}" ]; then
     else
         log "no writable .caos-expr / flake.lock here; the tools stay on the repo's pin"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# WHICH CAOS THIS SESSION IS -- on STDOUT, the only stream that reaches anyone
+# ---------------------------------------------------------------------------
+# A SessionStart hook contributes its STDOUT to the session. Its stderr is
+# captured as a `system/hook_response` event, which is classed as NON-TRANSCRIPT
+# and dropped -- the run-log API says so in as many words, and reading these
+# lines at all meant paging the raw events endpoint three cursors back.
+#
+# Every line this file logs is stderr (`log()` redirects, `step()` calls `log`).
+# So the dev-mode trace added to make "did dev mode take?" a FACT rather than an
+# inference was written, every session, into the one stream the session discards
+# -- and then cost exactly the debugging session it exists to prevent: a run
+# whose hook had said `dev client installed ... dev-0ac792e540a0` read, from
+# everywhere a human or a model can see, as a change that had not taken.
+#
+# ONE LINE on success, because this lands in every session's context and the
+# detail belongs on stderr. The failure case gets two, and names which half
+# failed: "asked for and did not happen" is the reading that sends someone to
+# debug their own code instead of their environment.
+if [ "${CAOS_DEV:-}" != 1 ]; then
+    echo "caos dev mode: off -- this session runs the caos its repo pins."
+elif [ -n "${overlaid:-}" ] && [ -n "${dev_tools_ok:-}" ]; then
+    echo "caos dev mode: ON -- client and tools from refs/caos/dev at ${dev_sha:0:12}."
+else
+    echo "caos dev mode: ASKED FOR BUT NOT ACTIVE -- this session runs the PINNED caos."
+    echo "  refs/caos/dev: ${dev_sha:-not published}; client overlay:${overlaid:- none};" \
+         "tools rewrite: ${dev_tools_ok:+done}${dev_tools_ok:-NOT DONE}."
 fi
 
 # ---------------------------------------------------------------------------

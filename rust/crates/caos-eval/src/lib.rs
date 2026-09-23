@@ -292,8 +292,30 @@ fn eval_path_uncached(
                 comps[i]
             ));
         }
-        let (mode, oid) = lookup_in_tree(host, &node_oid, comps[i])?
-            .ok_or_else(|| format!("eval-path: {:?} not found in {node_oid}", comps[i]))?;
+        let entries = host
+            .fetch_tree_entries(&node_oid)?
+            .ok_or_else(|| format!("{node_oid} is not a tree while resolving {path}"))?;
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry_name(entry) == comps[i].as_bytes())
+        else {
+            let directories: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.mode.is_tree())
+                .take(50)
+                .map(|entry| String::from_utf8_lossy(entry_name(entry)))
+                .collect();
+            let parent = if i == 0 {
+                ".".into()
+            } else {
+                comps[..i].join("/")
+            };
+            return Err(format!(
+                "eval-path: no such path: {path:?}. Directories in {parent}: {}. {:?} not found in {node_oid}",
+                directories.join(" "), comps[i]
+            ));
+        };
+        let (mode, oid) = (entry.mode, entry.oid);
         node_kind = kind_of_mode(mode).to_string();
         node_oid = oid.to_string();
         i += 1;
