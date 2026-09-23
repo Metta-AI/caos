@@ -269,16 +269,28 @@ if [ -n "$dev_server" ]; then
     if [ -z "$repo_dir" ]; then
         dev_stamp="ASKED FOR BUT NOT ACTIVE -- no checkout here to repoint."
     else
+        # STDERR IS KEPT, not sent to /dev/null, and the reason is that the two
+        # ways this fails want opposite fixes and look identical from outside.
+        # `git` cannot speak `caos://` without `git-remote-caos` on PATH, and it
+        # cannot reach the endpoint if this phase's network policy does not pass
+        # QUIC to an arbitrary host -- one is an install-order bug here, the
+        # other means dev mode cannot live in this script at all. A silent empty
+        # result was read as the second, on nothing better than a slow runtime.
+        dev_err="$(mktemp)"
         dev_sha="$(git -C "$repo_dir" ls-remote "$dev_server" refs/caos/dev \
-                   2>/dev/null | awk '{print $1}')"
+                   2>"$dev_err" | awk '{print $1}')"
         if [ -z "$dev_sha" ]; then
-            dev_stamp="ASKED FOR BUT NOT ACTIVE -- the server publishes no refs/caos/dev."
-            dev_stamp="$dev_stamp Bring the stack up with 'caosd up --iroh'."
+            dev_stamp="ASKED FOR BUT NOT ACTIVE -- no refs/caos/dev from the server."
+            dev_stamp="$dev_stamp git-remote-caos: $(command -v git-remote-caos \
+                       || echo 'NOT ON PATH')."
+            dev_stamp="$dev_stamp ls-remote said: $(tr '\n' ' ' < "$dev_err" | cut -c1-200)"
         elif ! git -C "$repo_dir" fetch --quiet --depth=1 --no-tags \
-                  --no-write-fetch-head -- "$dev_server" "$dev_sha" 2>/dev/null; then
-            dev_stamp="ASKED FOR BUT NOT ACTIVE -- could not fetch ${dev_sha:0:12}."
+                  --no-write-fetch-head -- "$dev_server" "$dev_sha" 2>"$dev_err"; then
+            dev_stamp="ASKED FOR BUT NOT ACTIVE -- could not fetch ${dev_sha:0:12}:"
+            dev_stamp="$dev_stamp $(tr '\n' ' ' < "$dev_err" | cut -c1-200)"
             dev_sha=""
         fi
+        rm -f "$dev_err"
     fi
 fi
 if [ -n "${dev_sha:-}" ]; then
