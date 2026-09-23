@@ -149,8 +149,9 @@ pub const DEFAULT_PORT: u16 = 11204;
 ///   trust decision. This changes the RELAY HOP ONLY: payloads stay end-to-end
 ///   encrypted between endpoint keys, so the relay could not read them before
 ///   and cannot now.
-/// * **The proxy the environment names**, rather than attempting a direct
-///   connection such a network will not permit.
+/// * **The proxy the environment names** -- but ONLY for n0's default relays.
+///   A relay named by `CAOS_IROH_RELAY` is dialled directly instead; see
+///   [`endpoint_builder`] for why, and for how curl hid the difference.
 ///
 /// Both come from `integrations/claude-code/cloud`, where they were first
 /// carried as a patch against dumbpipe; they are the part of that patch worth
@@ -197,18 +198,36 @@ pub fn configured_relay() -> Option<iroh::RelayUrl> {
 }
 
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
-    let builder = Endpoint::builder(presets::N0)
-        .ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
-        .proxy_from_env();
-    let Some(url) = std::env::var_os(RELAY_ENV).map(|v| v.to_string_lossy().into_owned()) else {
-        return builder;
+    let builder =
+        Endpoint::builder(presets::N0).ca_tls_config(iroh_relay::tls::CaTlsConfig::system());
+    let Some(url) = std::env::var_os(RELAY_ENV)
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|u| !u.is_empty())
+    else {
+        return builder.proxy_from_env();
     };
-    if url.is_empty() {
-        return builder;
-    }
     match iroh_relay::RelayMap::try_from_iter([url.as_str()]) {
         Ok(map) => {
-            eprintln!("caos-iroh: {RELAY_ENV}={url}: using it instead of n0's relays");
+            // DIALLED DIRECTLY, and that is the whole reason this branch skips
+            // `proxy_from_env`. iroh proxies EVERY relay dial once a proxy is
+            // configured -- `dial_url` has no scheme test and no `no_proxy`
+            // (neither crate mentions it) -- and it takes that proxy from
+            // HTTP_PROXY, http_proxy, HTTPS_PROXY, https_proxy in turn. A cloud
+            // session sets only `https_proxy`, so a plain `http://` relay was
+            // reached as `CONNECT <host>:80` through it, and timed out.
+            //
+            // curl hid this: for an `http://` URL curl consults only
+            // `http_proxy`, which is unset there, so it went DIRECT and
+            // answered 200 while iroh could not connect at all. Verified:
+            // `https_proxy=<black hole> curl http://<relay>/` still returns 200.
+            //
+            // A relay named here is one the operator chose FOR THIS NETWORK, so
+            // direct is the right assumption; the proxy below exists for n0's
+            // defaults, which such a network may not permit directly.
+            eprintln!("caos-iroh: {RELAY_ENV}={url}: using it instead of n0's relays,");
+            eprintln!(
+                "caos-iroh:   dialled directly (no proxy, even if one is in the environment)"
+            );
             builder.relay_mode(iroh::RelayMode::Custom(map))
         }
         Err(error) => {
@@ -216,7 +235,7 @@ pub fn endpoint_builder() -> iroh::endpoint::Builder {
             eprintln!(
                 "caos-iroh:   falling back to n0's relays, which a cloud SETUP phase cannot reach"
             );
-            builder
+            builder.proxy_from_env()
         }
     }
 }
