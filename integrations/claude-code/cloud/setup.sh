@@ -299,26 +299,6 @@ if [ -n "$dev_server" ]; then
     printf '%s\n' "$dev_sha" > "$dev_assets/REV"
 fi
 
-# THE REAL INSTALL, replacing everything the bootstrap put down: the client, the
-# git helper, the deny list, the hooks and the MCP server declaration, all from
-# the dev tree. The installer itself comes from there too, so an edit to
-# install.sh is in the package like everything else.
-#
-# `--base` is still passed and still unused on this path -- --dev-assets
-# replaces the release it would otherwise resolve -- but install.sh validates it
-# either way, so a nonsense value would fail here rather than be ignored.
-if [ -n "$dev_tree" ]; then
-    dev_installer="$dev_tree/integrations/claude-code/cloud/install.sh"
-    echo "re-installing from the dev package: $dev_installer" >&2
-    if ! bash "$dev_installer" $args --dev-assets="$dev_assets"; then
-        echo "FATAL: the dev package would not install." >&2
-        echo "  The bootstrap client is still in place, but it is the PINNED" >&2
-        echo "  one -- this session would run the repo's caos, not yours." >&2
-        exit 1
-    fi
-    caos --version >&2 2>/dev/null || true
-fi
-
 # THE TOOLS, from the dev commit too. `std/` is compiled by caos itself from the
 # std tree, so it is reached by a locator rather than installed, and
 # `git+caos://…` is an ordinary git fetch through `git-remote-caos`.
@@ -344,11 +324,63 @@ if [ -n "$dev_tree" ] && [ -n "$repo_dir" ] \
               else . end' "$repo_dir/flake.lock" 2>/dev/null)"; then
         printf '%s\n' "$tmp_lock" > "$repo_dir/flake.lock"
         echo "dev tools: $caos_std_path/ now resolves from the dev server at ${dev_sha:0:12}" >&2
+
+        # THE CONVERSATION SEEDS FROM ITS OWN COMMIT, not from HEAD. `mcp serve`
+        # builds a conversation's CONTENT with `resolve_base`, which is HEAD
+        # unless told otherwise -- so the rewrite above reached the checkout and
+        # NOT the tree the session evaluates. Measured: a session ran the dev
+        # client and the dev step while every `caos-std/<entry>` still resolved
+        # through the committed pin, which is the one thing dev mode exists to
+        # prevent.
+        #
+        # UNREFERENCED, via `commit-tree` into a throwaway index: nothing points
+        # at it, so `git push` cannot carry it and the ticket it contains -- a
+        # credential -- stays out of every pushable ref. The branch and the
+        # working tree are left exactly as they were.
+        seed_idx="$(mktemp -u)"
+        seed_commit=""
+        if seed_tree="$(cd "$repo_dir" && GIT_INDEX_FILE="$seed_idx" sh -c \
+                'git read-tree HEAD && git add -A && git write-tree' 2>/dev/null)" \
+           && [ -n "$seed_tree" ]; then
+            seed_commit="$(git -C "$repo_dir" commit-tree "$seed_tree" \
+                -p "$(git -C "$repo_dir" rev-parse HEAD)" \
+                -m "caos dev mode: the checkout as setup.sh left it" 2>/dev/null)"
+        fi
+        rm -f "$seed_idx"
+        if [ -z "$seed_commit" ]; then
+            echo "FATAL: could not mint a conversation seed commit." >&2
+            echo "  Without it the session evaluates the COMMITTED pin while" >&2
+            echo "  running a dev client -- the half-update dev mode prevents." >&2
+            exit 1
+        fi
+        echo "conversation seeds from ${seed_commit:0:12} (unreferenced)" >&2
     else
         echo "FATAL: could not rewrite flake.lock; the loader will refuse the drift" >&2
         exit 1
     fi
 fi
+
+# THE REAL INSTALL, replacing everything the bootstrap put down: the client, the
+# git helper, the deny list, the hooks and the MCP server declaration, all from
+# the dev tree. The installer itself comes from there too, so an edit to
+# install.sh is in the package like everything else.
+#
+# `--base` is still passed and still unused on this path -- --dev-assets
+# replaces the release it would otherwise resolve -- but install.sh validates it
+# either way, so a nonsense value would fail here rather than be ignored.
+if [ -n "$dev_tree" ]; then
+    dev_installer="$dev_tree/integrations/claude-code/cloud/install.sh"
+    echo "re-installing from the dev package: $dev_installer" >&2
+    if ! bash "$dev_installer" $args --dev-assets="$dev_assets" \
+             ${seed_commit:+--seed-commit="$seed_commit"}; then
+        echo "FATAL: the dev package would not install." >&2
+        echo "  The bootstrap client is still in place, but it is the PINNED" >&2
+        echo "  one -- this session would run the repo's caos, not yours." >&2
+        exit 1
+    fi
+    caos --version >&2 2>/dev/null || true
+fi
+
 
 
 # The git remote helper arrives with the client, from the same release and into

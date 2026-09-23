@@ -79,6 +79,29 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
     let mut options = TurnOptions::default();
     let mut rest = Vec::new();
     for argument in args {
+        // `--base=<full sha>` SEEDS THE CONVERSATION from a commit other than
+        // HEAD, which is what dev mode needs: `setup.sh` rewrites the
+        // checkout's `.caos-expr` to point at the dev stack, but the
+        // conversation's CONTENT comes from `resolve_base`, which without this
+        // is unconditionally `HEAD` -- so the rewrite reached the checkout and
+        // not the tree the session evaluates. Measured: a session ran the dev
+        // client and dev step while every `caos-std/<entry>` still resolved
+        // through the committed pin.
+        //
+        // A FULL SHA AND NOTHING ELSE. A revspec here would reintroduce
+        // "resolved through a moving head" in a place nobody would think to
+        // look -- the same pairing `install.sh` refuses `--base` a branch for.
+        // The caller mints an unreferenced commit (`git commit-tree`), so there
+        // is no name for this to accept anyway.
+        if let Some(sha) = argument.strip_prefix("--base=") {
+            if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "--base must be a full 40-character commit sha, not {sha:?}"
+                ));
+            }
+            options.base = Some(sha.to_string());
+            continue;
+        }
         if !options.take_image_arg(argument) {
             rest.push(argument.as_str());
         }

@@ -55,6 +55,7 @@ user_config=""
 enable_bash=""
 caos_std_path=""
 dev_assets=""
+seed_commit=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -93,6 +94,11 @@ for arg in "$@"; do
         # every fetch below unchanged -- including the `${url%/*}/<name>` form
         # the helper and the assets use.
         --dev-assets=*) dev_assets="${arg#--dev-assets=}"; dev_assets="${dev_assets%/}" ;;
+        # The commit the CONVERSATION seeds from, passed through to `mcp serve`
+        # as `--base`. Without it a session's content comes from HEAD, so a dev
+        # checkout whose `.caos-expr` was rewritten still evaluates the
+        # COMMITTED pin -- dev client, dev step, pinned tools.
+        --seed-commit=*) seed_commit="${arg#--seed-commit=}" ;;
         --base=*) BASE="${arg#--base=}"; BASE="${BASE%/}" ;;
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -437,7 +443,7 @@ if [ -n "$caos_std_path" ]; then
     # eval-paths the ingested workspace), which is what makes a path that exists
     # only in the EVALUATION result nameable here.
     cat >> "$serve_tmp" <<WRAP
-exec "$PREFIX/bin/caos" mcp serve "--llm-step:@=$caos_std_path/llm-step"
+exec "$PREFIX/bin/caos" mcp serve "--llm-step:@=$caos_std_path/llm-step"${seed_commit:+ "--base=$seed_commit"}
 WRAP
 else
     cat >> "$serve_tmp" <<WRAP
