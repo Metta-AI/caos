@@ -252,16 +252,28 @@ fn dispatch_call(
         let (_, head) =
             fetch_validated_head(t, &object_store, id)?.ok_or("tool conversation disappeared")?;
         let view = Conversation::open(&object_store, &head)?;
-        if let Ok((root, path)) = tool_resolution_scope(&object_store, &view, arguments) {
-            kvs.push(format!("--client-tool-root={root}"));
-            kvs.push(format!("--client-tool-path={path}"));
-            let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
-                .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
-            if let Err(error) = resolved {
-                // Deliver a recoverable tool error. Falling back to the server
-                // would discard the actual client-side evaluation error.
-                kvs.push(format!("--client-tool-error={error}"));
+        match tool_resolution_scope(&object_store, &view, arguments) {
+            Ok((root, path)) => {
+                kvs.push(format!("--client-tool-root={root}"));
+                kvs.push(format!("--client-tool-path={path}"));
+                let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
+                    .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
+                if let Err(error) = resolved {
+                    // Deliver a recoverable tool error. Falling back to the server
+                    // would discard the actual client-side evaluation error.
+                    kvs.push(format!("--client-tool-error={error}"));
+                }
             }
+            // SAY SO. Skipping quietly pushes no handoff at all, which is
+            // indistinguishable at the worker from a client too old to send
+            // one -- llm-step reports `no client tool handoff` for both. The
+            // step then evaluates server-side, the server refuses the `:@@=`
+            // it finds there, and the error names the repository's expression
+            // rather than the scope that could not be worked out here.
+            Err(error) => eprintln!(
+                "caos mcp serve: no resolution scope for {name} ({error}); \
+                 letting the step evaluate server-side"
+            ),
         }
     }
     let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
