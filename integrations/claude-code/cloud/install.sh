@@ -559,13 +559,29 @@ write_user_config() {
         locator="--llm-step:@@=github:$REPO?rev=$COMMIT&dir=std/llm-step"
     fi
     echo "the tools come from $locator" >&2
+    # THE HOOK NEEDS `--base` TOO, and that is not a detail: the HOOK creates the
+    # conversation (`on_user_prompt`, "creating the conversation on the session's
+    # first one"), not the tool server. Putting the seed only on `mcp serve`
+    # -- which is where it looks like it belongs -- left every conversation
+    # seeded from HEAD, so a dev session rewrote its checkout, minted a seed
+    # commit, installed a dev client, and still evaluated the COMMITTED pin.
+    # Verified against the conversation tree: its `.caos-expr` blob was
+    # byte-identical to the one in the client repo's HEAD.
+    local seed_arg=""
+    if [ -n "$seed_commit" ]; then
+        seed_arg=" --base=$seed_commit"
+    fi
     local unbin='def plain: split("\"${CAOS_BIN:-caos}\"") | join("caos")
                     | split("${CAOS_BIN:-caos}") | join("caos")
-                    | split("--llm-step:@=std/llm-step") | join($step);
+                    | split("--llm-step:@=std/llm-step") | join($step + $seed);
            def unbin: if type == "string" then plain else . end;
            walk(unbin)'
     # In the hook command the locator is a shell word (quote its `&`/`?`); in an
-    # mcp `args` entry it is bare argv. A SessionStart hook is added: the client
+    # mcp `args` entry it is bare argv -- which is why `$seed` is EMPTY for the
+    # mcp one. Appending it there concatenated two flags into a single argv
+    # element (`--llm-step:@=... --base=...`), and the seed is not wanted there
+    # in any case: `caos-serve` replaces the command and carries `--base` on its
+    # own exec line. A SessionStart hook is added: the client
     # finds caos through a `caos` git remote an arbitrary checkout lacks, so the
     # remote is added per session from user-level settings.
     settings_prog="$unbin"'
@@ -580,14 +596,16 @@ write_user_config() {
             | .permissions.allow = ((.permissions.allow // []) + ["Bash","Read","Grep","Glob"] | unique)'
         echo "--enable-bash: Bash/Read/Grep/Glob will be allowed this session" >&2
     fi
-    if ! settings="$(printf '%s' "$raw_settings" | jq --arg step "'$locator'" "$settings_prog")"; then
+    if ! settings="$(printf '%s' "$raw_settings" \
+        | jq --arg step "'$locator'" --arg seed "$seed_arg" "$settings_prog")"; then
         echo "FATAL: the settings asset is not the JSON this expects" >&2
         exit 1
     fi
     # command becomes `caos-serve`, the refresh-then-exec wrapper installed above,
     # so a snapshot's frozen binary is still current when it serves.
     if ! servers="$(printf '%s' "$raw_mcp" \
-        | jq --arg step "$locator" "$unbin"' | .mcpServers | .caos.command = "caos-serve"')"; then
+        | jq --arg step "$locator" --arg seed "" \
+              "$unbin"' | .mcpServers | .caos.command = "caos-serve"')"; then
         echo "FATAL: the mcp asset is not the JSON this expects" >&2
         exit 1
     fi
