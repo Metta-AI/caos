@@ -226,9 +226,9 @@ fn run_tool(
 /// for exactly that reason, and the step checks it ran before returning.
 ///
 /// Repository tools resolve against their conversation path, client-side so
-/// pinned locators use the existing fetch/evaluation machinery. Both calls
-/// receive the evaluated tool; the worker describes it or validates arguments
-/// before invocation. The handoff is pinned to the input tree and path.
+/// pinned locators use the existing fetch/evaluation machinery. Help skips the
+/// target expression; invocation evaluates normally. The handoff is pinned to
+/// the input tree and path.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_call(
     t: &GitTransport,
@@ -255,7 +255,12 @@ fn dispatch_call(
         if let Ok((root, path)) = tool_resolution_scope(&object_store, &view, arguments) {
             kvs.push(format!("--client-tool-root={root}"));
             kvs.push(format!("--client-tool-path={path}"));
-            let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
+            let mode = if name == "tool_help" {
+                caos::EvalMode::StopBeforeTarget
+            } else {
+                caos::EvalMode::Evaluate
+            };
+            let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store, mode)
                 .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
             if let Err(error) = resolved {
                 // Deliver a recoverable tool error. Falling back to the server

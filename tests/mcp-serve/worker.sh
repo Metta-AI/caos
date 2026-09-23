@@ -132,7 +132,7 @@ echo "== MCP resolves pinned generated paths on the client ==" >&2
 # This foreign repo exists only in THIS client container. Server evaluation
 # cannot fetch it; both help and invocation must consume the client handoff.
 foreign=$(mktemp -d)
-mkdir -p "$foreign/hello" generated
+mkdir -p "$foreign/hello" "$foreign/help-only" generated
 bash_image=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash)
 cat > "$foreign/hello/.caos-expr" <<EXPR
 HELP=<<END
@@ -150,6 +150,13 @@ caos get /cas/args/word
 printf 'pinned %s %s' "$(cat /cas/args/word)" "$(cat /cas/args/in/mcp-marker)" > /tmp/out
 caos put /tmp/out /cas/out
 WORKER
+cat > "$foreign/help-only/.caos-expr" <<'EXPR'
+HELP=<<END
+Pinned help without target evaluation.
+@param word The word.
+END
+run --base=invalid-image --help=$HELP
+EXPR
 git -C "$foreign" init -q
 git -C "$foreign" add -A
 git -C "$foreign" -c user.name=test -c user.email=test@caos commit -qm pinned-tools
@@ -178,10 +185,10 @@ call_tool() { # <rpc id> <name> <leaf> [arguments JSON]
       path:$path,arguments:$arguments}}}')"
   await "\"id\":$id" 300 || fail "pinned tool call $id did not answer"
 }
-help=$(call_tool 20 tool_help hello)
+help=$(call_tool 20 tool_help help-only)
 case "$help" in
-  *'"isError":false'*'Pinned generated tool.'*|*'Pinned generated tool.'*'"isError":false'*) ;;
-  *) fail "pinned help missed the generated path: $help" ;;
+  *'"isError":false'*'Pinned help without target evaluation.'*|*'Pinned help without target evaluation.'*'"isError":false'*) ;;
+  *) fail "pinned help evaluated the target or missed the generated path: $help" ;;
 esac
 invalid=$(call_tool 21 run_tool hello)
 case "$invalid" in

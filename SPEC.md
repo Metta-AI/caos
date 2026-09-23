@@ -108,10 +108,10 @@ and nothing enumerates them.
 Two built-in tools address one by PATH:
 
 - `tool_help --path=<conversation path>` returns that tool's description and
-  parameters. It evaluates the path, including the target expression, and reads
-  the resulting ArgTree's `help` binding. This can build the tool; it does not
-  invoke it. Missing paths and invalid tools are recoverable tool errors.
-  Missing paths also name sibling directories.
+  parameters. It evaluates ancestor expressions to reach the directory, then
+  reads the tool's own `.caos-expr` help. It does not evaluate or build the target.
+  Missing paths and invalid tools are recoverable tool errors; missing paths
+  also name sibling directories.
 - `run_tool --path=<conversation path> --arguments=<object>` evaluates the same
   path, validates arguments against the evaluated help, and invokes the tool.
   An undeclared argument, a missing required one, or a non-string value is
@@ -139,9 +139,11 @@ would resolve to nothing. And it is why a human's `run-tool` lands on the same
 ArgTree: the human has one source tree — the worktree — so the prefix is empty
 and the remainder is the whole path.
 
-Both tools use ordinary CAOS evaluation, including its dependency-resolution
-semantics. Thus a root expression may generate a `tools/check` directory absent
-from the stored tree: both tools can reach and evaluate it.
+Both tools use the same CAOS evaluator and its dependency-resolution semantics.
+A root expression may generate a `tools/check` directory absent from the stored
+tree. Help uses `--stop-before-target` to reach its definition without evaluating
+the target, avoiding builds merely to describe a tool. Invocation evaluates the
+full path normally; it needs the resulting image.
 
 Resolution uses the current conversation snapshot on every call. The
 definition's evaluated tree is separate from the input: invocation still binds
@@ -149,8 +151,9 @@ the original selected source tree, or the original conversation tree when no
 source-tree prefix was selected, as `in`.
 
 MCP resolves the requested `path` against that same snapshot on the client,
-where pinned `:@@=` dependencies can be fetched. It hands the evaluated tool
-to both callers. The handoff names its input tree and path, so a changed snapshot
+where pinned `:@@=` dependencies can be fetched. It hands the resolved definition
+to help and the evaluated image to invocation. The handoff names its input tree
+and path, so a changed snapshot
 cannot consume a stale result. Workers continue to use evaluation continuations
 and do not fetch locators themselves.
 
@@ -257,9 +260,9 @@ on any of it, and each is written down because the reason is easy to lose.
   tree that is a value — so generalizing this needs one DECLARED read/write
   field, which would also decide what `in` binds and which of the two result
   shapes applies.
-- **Describing a tool evaluates it.** `tool_help` reads help from the evaluated
-  ArgTree, so describing a compiled tool may build it. Skipping the target
-  expression is a possible performance optimization when help is in its text.
+- **Help must be present in the expression's text.** `tool_help` skips target
+  evaluation for performance, so help generated only by a build cannot be
+  described. Invocation still reads the evaluated image's help.
 - **Agent args are string literals only.** A human's `run-tool` passes typed
   args through (`--x:@=path`, `--x:hash=`), an agent's cannot, so a tool that
   wants a tree works by hand and not from an agent. Closing it means declaring

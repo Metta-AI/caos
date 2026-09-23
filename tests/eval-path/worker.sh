@@ -172,6 +172,14 @@ EOF
 
 commit "eval-path fixtures"
 
+echo "== --stop-before-target leaves the requested expression untouched ==" >&2
+stopped=$("$CAOS_CLI" eval-path --stop-before-target pkg-direct)
+[ "$stopped" = "tree $(git rev-parse HEAD:pkg-direct)" ] \
+  || fail "stop-before-target evaluated the requested directory: $stopped"
+root=$(git rev-parse HEAD^{tree})
+[ "$("$CAOS_CLI" eval-path --tree="$root" --stop-before-target .)" = "tree $root" ] \
+  || fail "stop-before-target evaluated the root"
+
 echo "== eval-path evaluates a directory's .caos-expr ==" >&2
 out=$("$CAOS_CLI" eval-path pkg-direct) || fail "eval-path pkg-direct failed"
 kind=${out%% *}; hash=${out##* }

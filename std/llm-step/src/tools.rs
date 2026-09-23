@@ -59,7 +59,7 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
-const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
+const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates ancestor expressions to find the directory, then reads its own expression without building or running the tool.
 @param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
 const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
@@ -230,7 +230,6 @@ fn parse_help(ctx: &str, text: &str) -> (String, Vec<TreeArg>, bool) {
 ///
 /// `None` when the expression binds no `help` — a directory that is not a tool,
 /// or a tool whose docs went missing; the caller says which and skips it.
-#[cfg(test)]
 fn expr_help(expr: &str) -> Option<String> {
     let mut here: Vec<(String, String)> = Vec::new();
     let mut value_lines: Vec<&str> = Vec::new();
@@ -344,6 +343,26 @@ pub fn tree_tool_declaration(tool: &TreeTool) -> Value {
         "description": tool.doc,
         "input_schema": schema
     })
+}
+
+/// Read help from the resolved definition without building the target.
+pub fn tool_definition(dir: &str, display: &str) -> Result<TreeTool, String> {
+    if worker_common::cas_kind(dir)? != "tree" {
+        return Err(format!("{display} is not a tool directory"));
+    }
+    caos(["get", dir])?;
+    let expression = format!("{dir}/.caos-expr");
+    if !Path::new(&expression).is_file() {
+        return Err(format!(
+            "{display} is not a directory carrying a `.caos-expr`"
+        ));
+    }
+    caos(["get", &expression])?;
+    let text = fs::read_to_string(&expression)
+        .map_err(|error| format!("reading {expression}: {error}"))?;
+    let help = expr_help(&text)
+        .ok_or_else(|| format!("{display} has a `.caos-expr` but it binds no `--help`"))?;
+    Ok(builtin_tool(display, &help))
 }
 
 /// Describe an evaluated tool using the same help binding as a std tool.
