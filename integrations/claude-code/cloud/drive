@@ -18,6 +18,7 @@
 #   drive -c session_XXXX --probe           # dump the env of a running session
 #   drive --env session_XXXX                # read a session's env from OUTSIDE
 #   drive --env https://claude.ai/code/...  # same, from a session URL
+#   drive --conv session_XXXX               # the session's CONVERSATION on caosd
 #   drive --env-config                      # LIST cloud environments (id + name)
 #   drive --env-config Caos                 # print an env's setup script + vars
 #   drive --env-update Caos --init-script F # replace an env's setup script
@@ -67,6 +68,7 @@ session=""
 file=""
 probe=0
 env_read=0
+conv_read=0
 env_config=0
 env_update=0
 env_create=0
@@ -81,6 +83,7 @@ for ((i = 1; i <= $#; i++)); do
     case "${!i}" in
         --probe) probe=1 ;;
         --env) env_read=1 ;;
+        --conv) conv_read=1 ;;
         --env-config) env_config=1 ;;
         --env-update) env_update=1 ;;
         --env-create) env_create=1 ;;
@@ -237,6 +240,74 @@ if [ "$env_create" = 1 ]; then
         || { echo "drive --env-create: failed:" >&2; printf '%s' "$resp" | head -c 300 >&2; echo >&2; exit 1; }
     echo "created $(printf '%s' "$resp" | jqf -r '.environment_id') ($session_arg)"
     printf '%s' "$resp" | env_print
+    exit 0
+fi
+
+# `--conv` finds the CONVERSATION a session is recording into, on the caos
+# server, and prints enough to read its tree by hand.
+#
+# THE ID IS NOT THE ONE IN THE URL. A conversation is `cc/<the Claude Code
+# INTERNAL session uuid>`, which appears only in hook payloads, and the ref
+# spells that HEX-ENCODED -- so neither the session id you can see nor a plain
+# grep of the refs will find it.
+#
+# Why bother: the conversation tree is the one place that says what a session
+# actually evaluates. A checkout can be rewritten (dev mode rewrites
+# `.caos-expr`) while the conversation still carries the committed file, and
+# from inside the session the two are indistinguishable -- `mcp__caos__read`
+# shows the conversation's copy, which is the one that matters and the one
+# nobody thinks to doubt.
+if [ "$conv_read" = 1 ]; then
+    sid="$(printf '%s' "${session:-$session_arg}" | grep -oE 'session_[A-Za-z0-9]+' | head -1 || true)"
+    if [ -z "$sid" ]; then
+        echo "drive --conv: need a session id or a claude.ai/code URL with one" >&2
+        exit 2
+    fi
+    token="$(jqf -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null || true)"
+    api="https://api.anthropic.com/v1/code/sessions/$sid"
+    hdr=(-H "Authorization: Bearer $token"
+         -H "anthropic-beta: oauth-2025-04-20"
+         -H "anthropic-version: 2023-06-01")
+    internal="$(curl -sS -m 20 "${hdr[@]}" "$api/events" 2>/dev/null \
+        | jqf -r '(.data // []) | map(select(.payload.session_id)) | .[0].payload.session_id // empty')"
+    if [ -z "$internal" ]; then
+        echo "drive --conv: no hook payload in $sid yet, so no internal session id." >&2
+        echo "  A session that has not run a turn has no conversation." >&2
+        exit 1
+    fi
+    hex="$(printf 'cc/%s' "$internal" | od -An -tx1 | tr -d ' \n')"
+    ref="refs/caos/v3/conversations/$hex/head"
+    server="${CAOS_SERVER_URL:-http://localhost:9090}"
+    echo "session:      $sid"
+    echo "internal id:  $internal"
+    echo "conversation: cc/$internal"
+    echo "ref:          $ref"
+    head="$(git ls-remote "$server" "$ref" 2>/dev/null | awk '{print $1}')"
+    if [ -z "$head" ]; then
+        echo "head:         (not on $server -- wrong server, or no turn yet)"
+        exit 1
+    fi
+    echo "head:         $head"
+    cat <<NOTE
+
+Read its tree in a SCRATCH BARE REPO -- never your working checkout. A
+\`--depth=1\` fetch into a repo you push from records a shallow boundary, and
+this server refuses shallow pushes ("shallow pushes are not accepted"), so
+every later push from that checkout dies for an unrelated-looking reason.
+
+  git init -q --bare /tmp/conv.git
+  git -C /tmp/conv.git fetch -q --depth=1 $server $head
+  git -C /tmp/conv.git ls-tree $head
+  git -C /tmp/conv.git cat-file blob <blob-sha>       # e.g. .caos-expr
+
+Every conversation, with the names decoded:
+
+  git ls-remote $server 'refs/caos/v3/conversations/*' |
+    while read -r sha ref; do
+      hex=\$(echo "\$ref" | cut -d/ -f5)
+      echo "\$sha \$(echo "\$hex" | fold -w2 | while read -r b; do printf "\\x\$b"; done)"
+    done
+NOTE
     exit 0
 fi
 
