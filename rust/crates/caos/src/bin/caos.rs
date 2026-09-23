@@ -49,6 +49,8 @@ fn main() -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     match args.get(1).map(String::as_str) {
+        Some("git-merge-tree") => caos::git_objects::run_merge(&args[2..]),
+        Some("git-commit-tree") => caos::git_objects::run_commit(&args[2..]),
         Some("import-git") => caos::import_git::run(&args[2..]),
         Some("push-git") => caos::push_git::run(&args[2..]),
         Some("get-hash") => match (args.get(2), args.get(3), args.get(4)) {
@@ -521,7 +523,7 @@ fn wipe_dir_contents(dir: &str) {
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
-        "usage:\n  {prog} import-git <https-url> <commit> [--github-token-file=<path>]\n  {prog} push-git <https-url> <commit> <branch> --expected=<hash|absent> [--github-token-file=<path>]\n  {prog} resolve <hash> <relative-path> <cas-path>\n  {prog} kind <cas-path>\n  {prog} get-hash <hash> <path>\n  \
+        "usage:\n  {prog} git-merge-tree <merge-base-tree> <ours-tree> <theirs-tree>\n  {prog} git-commit-tree <tree> --parent=<commit>... --author=<signature> --committer=<signature> --message-file=<path>\n  {prog} import-git <https-url> <commit> [--github-token-file=<path>]\n  {prog} push-git <https-url> <commit> <branch> --expected=<hash|absent> [--github-token-file=<path>]\n  {prog} resolve <hash> <relative-path> <cas-path>\n  {prog} kind <cas-path>\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} put-commit <src-file> <cas-path>\n  \
