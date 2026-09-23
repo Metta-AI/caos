@@ -322,18 +322,21 @@ printf 'caos net probe (hook phase):  %s' \
 # is traced: it is the one host whose answer differs by phase (503 vs 200), and
 # the question is what in the path treats it differently.
 caos_relay_trace() {
+    label="$1"; shift
+    echo "--- $label ---"
+    curl -sS -m 10 -v "$@" -o /tmp/caos-relay-body -D /tmp/caos-relay-hdr https://usw1-1.relay.n0.iroh.link./ 2>&1 | grep -E "Trying |Connected to |CONNECT tunnel|Establish HTTP proxy|ALPN: |subject:|issuer:|using HTTP|^< HTTP|error|refused|timed out"
+    echo "  response headers:"
+    sed 's/^/    /' /tmp/caos-relay-hdr 2>/dev/null
+    echo "  body: $(head -c 160 /tmp/caos-relay-body 2>/dev/null | tr '
+' ' ')"
+}
+caos_relay_all() {
     echo "--- proxy env ---"
     proxies="$(env | grep -iE '^(https?_proxy|no_proxy)=' | cut -c1-120)"
-    if [ -n "$proxies" ]; then printf '%s\n' "$proxies"; else echo "(no proxy variables set)"; fi
-    echo "--- path, tls, alpn, status ---"
-    # GREPPED, NOT TRUNCATED. An earlier version piped this through `head` and
-    # cut both phases off before the response, so the 503 everything was being
-    # argued about was never actually observed.
-    curl -sS -m 10 -v -o /tmp/caos-relay-body -D /tmp/caos-relay-hdr         https://usw1-1.relay.n0.iroh.link./ 2>&1         | grep -E "Trying |Connected to |CONNECT tunnel|Establish HTTP proxy|ALPN: |subject:|issuer:|using HTTP|^< HTTP|error|refused|timed out"
-    echo "--- response headers ---"
-    cat /tmp/caos-relay-hdr 2>/dev/null
-    echo "--- body (first 200 bytes) ---"
-    head -c 200 /tmp/caos-relay-body 2>/dev/null; echo
+    if [ -n "$proxies" ]; then printf '%s
+' "$proxies"; else echo "(no proxy variables set)"; fi
+    caos_relay_trace "A: default, offers h2 and http/1.1"
+    caos_relay_trace "B: forced http/1.1" --http1.1
 }
 echo "===== CAOS RELAY TRACE: SETUP PHASE ====="
 if [ -r /usr/local/share/caos/relay-trace-setup ]; then
@@ -342,7 +345,7 @@ else
     echo "(not recorded by this environment's setup)"
 fi
 echo "===== CAOS RELAY TRACE: HOOK PHASE ====="
-caos_relay_trace 2>&1
+caos_relay_all 2>&1
 echo "===== CAOS RELAY TRACE END ====="
 
 if [ "${CAOS_DEV:-}" = 1 ] && [ "$have_repo" = 1 ] && [ -n "$server" ]; then

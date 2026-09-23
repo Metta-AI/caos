@@ -312,20 +312,23 @@ caos_probe \
 # Via:), whose certificate is presented (a TLS-intercepting proxy shows its
 # own), and whether the 503 carries the relay's body or a proxy's.
 caos_relay_trace() {
+    label="$1"; shift
+    echo "--- $label ---"
+    curl -sS -m 10 -v "$@" -o /tmp/caos-relay-body -D /tmp/caos-relay-hdr https://usw1-1.relay.n0.iroh.link./ 2>&1 | grep -E "Trying |Connected to |CONNECT tunnel|Establish HTTP proxy|ALPN: |subject:|issuer:|using HTTP|^< HTTP|error|refused|timed out"
+    echo "  response headers:"
+    sed 's/^/    /' /tmp/caos-relay-hdr 2>/dev/null
+    echo "  body: $(head -c 160 /tmp/caos-relay-body 2>/dev/null | tr '
+' ' ')"
+}
+caos_relay_all() {
     echo "--- proxy env ---"
     proxies="$(env | grep -iE '^(https?_proxy|no_proxy)=' | cut -c1-120)"
-    if [ -n "$proxies" ]; then printf '%s\n' "$proxies"; else echo "(no proxy variables set)"; fi
-    echo "--- path, tls, alpn, status ---"
-    # GREPPED, NOT TRUNCATED. An earlier version piped this through `head` and
-    # cut both phases off before the response, so the 503 everything was being
-    # argued about was never actually observed.
-    curl -sS -m 10 -v -o /tmp/caos-relay-body -D /tmp/caos-relay-hdr         https://usw1-1.relay.n0.iroh.link./ 2>&1         | grep -E "Trying |Connected to |CONNECT tunnel|Establish HTTP proxy|ALPN: |subject:|issuer:|using HTTP|^< HTTP|error|refused|timed out"
-    echo "--- response headers ---"
-    cat /tmp/caos-relay-hdr 2>/dev/null
-    echo "--- body (first 200 bytes) ---"
-    head -c 200 /tmp/caos-relay-body 2>/dev/null; echo
+    if [ -n "$proxies" ]; then printf '%s
+' "$proxies"; else echo "(no proxy variables set)"; fi
+    caos_relay_trace "A: default, offers h2 and http/1.1"
+    caos_relay_trace "B: forced http/1.1" --http1.1
 }
-caos_relay_trace > /usr/local/share/caos/relay-trace-setup 2>&1
+caos_relay_all > /usr/local/share/caos/relay-trace-setup 2>&1
 
 # ---------------------------------------------------------------------------
 # When did this environment last get built?
