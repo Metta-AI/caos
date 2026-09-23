@@ -162,8 +162,15 @@ enum PushPrefix {
 fn read_push_commands(mut input: impl Read) -> std::io::Result<PushPrefix> {
     let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     let mut prefix = Vec::new();
-    // Capabilities ride on the FIRST command packet, after a NUL.
+    // SHALLOW LINES COME FIRST, capabilities second: the protocol is
+    // `*shallow ( command-list | push-cert )`, and the capabilities ride on the
+    // first COMMAND packet. So a refusal cannot be returned the moment a
+    // `shallow` line is seen — at that point we do not yet know whether the
+    // client can be told (side-band-64k), and guessing wrong means it is told
+    // nothing. Read on to the command flush, which ends the command list and
+    // never touches the pack, then refuse with the capabilities known.
     let mut sideband = false;
+    let mut shallow = false;
     loop {
         let mut header = [0; 4];
         input.read_exact(&mut header)?;
@@ -173,6 +180,12 @@ fn read_push_commands(mut input: impl Read) -> std::io::Result<PushPrefix> {
             .ok_or_else(|| invalid("invalid Git command packet"))?;
         prefix.extend_from_slice(&header);
         if length == 0 {
+            if shallow {
+                return Ok(PushPrefix::Rejected {
+                    message: "shallow pushes are not accepted; send complete history".into(),
+                    sideband,
+                });
+            }
             return Ok(PushPrefix::Ready(prefix));
         }
         if length < 4 || prefix.len() + length - 4 > 16 * 1024 * 1024 {
@@ -185,10 +198,7 @@ fn read_push_commands(mut input: impl Read) -> std::io::Result<PushPrefix> {
             sideband = true;
         }
         if prefix[start..].starts_with(b"shallow ") {
-            return Ok(PushPrefix::Rejected {
-                message: "shallow pushes are not accepted; send complete history".into(),
-                sideband,
-            });
+            shallow = true;
         }
     }
 }
