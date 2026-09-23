@@ -238,6 +238,13 @@ caos --version >&2 2>/dev/null || true
 # (CAOS_IROH_RELAY): n0's answer 503 from this phase, measured, while a relay of
 # one's own answers 200.
 dev_tree=""
+# ONE TRUNCATION, HERE, and everything after this appends. The stamp is written
+# from three places at different points in this file, and the last of them used
+# `>`: the rewrite's report was written and then destroyed by a later probe, so
+# a session reported reaching the dev server and said nothing at all about
+# whether the checkout had been repointed -- which is the question.
+install -d /usr/local/share/caos
+: > /usr/local/share/caos/dev-probe
 if [ -n "$dev_server" ]; then
     # SAY WHICH FAILURE, because an empty result has two very different causes
     # and this message used to assert the wrong one. "No such ref" means the dev
@@ -536,14 +543,14 @@ if [ -n "$dev_server" ]; then
     if ls_out="$(git ls-remote "$dev_server" refs/caos/dev 2>"$ls_err")" \
        && [ -n "$ls_out" ]; then
         echo "REACHED the dev server: $(printf '%s' "$ls_out" | head -1 | cut -c1-60)" \
-            > /usr/local/share/caos/dev-probe
+            >> /usr/local/share/caos/dev-probe
     else
         {
             printf 'COULD NOT reach the dev server. git-remote-caos: %s. ' \
                 "$(command -v git-remote-caos || echo 'NOT ON PATH')"
             printf 'ls-remote said: %s' "$(tr '\n' ' ' < "$ls_err" | cut -c1-240)"
             printf '\n'
-        } > /usr/local/share/caos/dev-probe
+        } >> /usr/local/share/caos/dev-probe
     fi
     rm -f "$ls_err"
     echo "dev probe (setup): $(cat /usr/local/share/caos/dev-probe)" >&2
