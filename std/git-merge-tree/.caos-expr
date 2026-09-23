@@ -1,0 +1,9 @@
+HELP=<<END
+Merge three Git trees stored in CAOS without checking out source files.
+Returns JSON containing tree (the merged tree ID) and conflicts (Git's native
+report, empty when clean). Does not update conversation files or gitlinks.
+@param merge-base Base tree ID
+@param ours Current tree ID
+@param theirs Incoming tree ID
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
