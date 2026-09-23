@@ -304,6 +304,29 @@ printf 'caos net probe (hook phase):  %s' \
                   https://usw1-1.relay.n0.iroh.link./ \
                   https://example.com/)"
 
+# The same verbose trace setup.sh took, so the two can be diffed. Only the relay
+# is traced: it is the one host whose answer differs by phase (503 vs 200), and
+# the question is what in the path treats it differently.
+caos_relay_trace() {
+    echo "--- proxy env ---"
+    env | grep -iE '^(https?_proxy|no_proxy)=' || echo "(no proxy variables set)"
+    echo "--- curl -v ---"
+    curl -sS -m 10 -v -o /tmp/caos-relay-body \
+        https://usw1-1.relay.n0.iroh.link./ 2>&1 \
+        | grep -vE '^\{ \[|^\} \[|^\* Connection state' | head -45
+    echo "--- body (first 300 bytes) ---"
+    head -c 300 /tmp/caos-relay-body 2>/dev/null; echo
+}
+echo "===== CAOS RELAY TRACE: SETUP PHASE ====="
+if [ -r /usr/local/share/caos/relay-trace-setup ]; then
+    head -c 1800 /usr/local/share/caos/relay-trace-setup
+else
+    echo "(not recorded by this environment's setup)"
+fi
+echo "===== CAOS RELAY TRACE: HOOK PHASE ====="
+caos_relay_trace 2>&1 | head -c 1800
+echo "===== CAOS RELAY TRACE END ====="
+
 if [ "${CAOS_DEV:-}" = 1 ] && [ "$have_repo" = 1 ] && [ -n "$server" ]; then
     step "dev mode: looking for refs/caos/dev on the server"
     # STDERR IS KEPT. An empty result was reported as "the server publishes no

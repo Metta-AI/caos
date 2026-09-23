@@ -292,6 +292,24 @@ caos_probe https://raw.githubusercontent.com/ \
     > /usr/local/share/caos/net-probe-setup 2>&1
 echo "net probe (setup): $(cat /usr/local/share/caos/net-probe-setup)" >&2
 
+# WHY ONLY THE RELAY. Measured: from this phase the relay answers 503 while
+# example.com answers 200, so this is not a blocked network and not a domain
+# allowlist -- something in the path treats that host differently, or is not
+# ready yet. The verbose trace says which: whether a proxy is in front (CONNECT,
+# Via:), whose certificate is presented (a TLS-intercepting proxy shows its
+# own), and whether the 503 carries the relay's body or a proxy's.
+caos_relay_trace() {
+    echo "--- proxy env ---"
+    env | grep -iE '^(https?_proxy|no_proxy)=' || echo "(no proxy variables set)"
+    echo "--- curl -v ---"
+    curl -sS -m 10 -v -o /tmp/caos-relay-body \
+        https://usw1-1.relay.n0.iroh.link./ 2>&1 \
+        | grep -vE '^\{ \[|^\} \[|^\* Connection state' | head -45
+    echo "--- body (first 300 bytes) ---"
+    head -c 300 /tmp/caos-relay-body 2>/dev/null; echo
+}
+caos_relay_trace > /usr/local/share/caos/relay-trace-setup 2>&1
+
 # ---------------------------------------------------------------------------
 # When did this environment last get built?
 # ---------------------------------------------------------------------------
