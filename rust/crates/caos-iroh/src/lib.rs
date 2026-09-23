@@ -197,9 +197,43 @@ pub fn configured_relay() -> Option<iroh::RelayUrl> {
     url.parse().ok()
 }
 
+/// The builder a CLIENT uses, which differs from the listener's in one way: the
+/// proxy decision is made from the relay the TICKET names, not from
+/// `CAOS_IROH_RELAY`.
+///
+/// A client has no `CAOS_IROH_RELAY` -- it learns the relay from the ticket --
+/// so it cannot use [`endpoint_builder`]'s rule, and taking the proxy
+/// unconditionally is what broke a cloud session: iroh routes EVERY relay dial
+/// through a configured proxy (`dial_url`, no scheme test, no `no_proxy`), so a
+/// plaintext relay was dialled as `CONNECT <host>:80` and timed out, while the
+/// SETUP phase -- which sets no proxy variables -- reached the same relay
+/// directly seconds earlier.
+///
+/// The scheme is the signal, and it is iroh's own: `use_tls()` treats `http`
+/// and `ws` as explicitly-plaintext. A proxy exists here to reach TLS relays
+/// through an egress that forbids direct connections; a plaintext relay is
+/// either directly reachable or not usable at all, so proxying it can only
+/// fail.
+pub fn client_endpoint_builder(ticket: &Ticket) -> iroh::endpoint::Builder {
+    let plaintext_relay = ticket
+        .addr
+        .relay_urls()
+        .any(|u| matches!(u.scheme(), "http" | "ws"));
+    if plaintext_relay {
+        eprintln!("caos-iroh: the ticket's relay is plaintext; dialling it directly");
+        base_endpoint_builder()
+    } else {
+        base_endpoint_builder().proxy_from_env()
+    }
+}
+
+/// The settings both ends need, before either decides about a proxy.
+fn base_endpoint_builder() -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0).ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
+}
+
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
-    let builder =
-        Endpoint::builder(presets::N0).ca_tls_config(iroh_relay::tls::CaTlsConfig::system());
+    let builder = base_endpoint_builder();
     let Some(url) = std::env::var_os(RELAY_ENV)
         .map(|v| v.to_string_lossy().into_owned())
         .filter(|u| !u.is_empty())
@@ -388,7 +422,7 @@ impl Client {
     /// listener authenticates the token, not the caller's identity, so there is
     /// no client key to store, lose, or have to enroll with a server.
     pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
-        let endpoint = endpoint_builder()
+        let endpoint = client_endpoint_builder(ticket)
             .bind()
             .await
             .map_err(|e| format!("binding an iroh endpoint: {e}"))?;
