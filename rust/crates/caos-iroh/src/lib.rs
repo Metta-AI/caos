@@ -177,7 +177,24 @@ pub const DEFAULT_PORT: u16 = 11204;
 /// worst outcome here -- the symptom is "my change did not take", a full phase
 /// away from the cause -- so a bad URL names itself rather than falling back to
 /// n0 in silence. `caos-iroh serve` also prints the relays the ticket carries.
-const RELAY_ENV: &str = "CAOS_IROH_RELAY";
+pub const RELAY_ENV: &str = "CAOS_IROH_RELAY";
+
+/// The relay `CAOS_IROH_RELAY` names, parsed, or `None`.
+///
+/// Public because the TICKET has to carry it even when the endpoint has not
+/// reached it. A ticket otherwise lists only relays actually CONNECTED to, so a
+/// caosd started with no route out mints one with no relay at all -- usable
+/// from its own LAN and nowhere else, with nothing saying so. Bringing a stack
+/// up offline is an ordinary thing to do, and the configured relay is a
+/// statement of intent rather than an observation: trust it, and let the
+/// connection happen whenever the network does.
+pub fn configured_relay() -> Option<iroh::RelayUrl> {
+    let url = std::env::var_os(RELAY_ENV).map(|v| v.to_string_lossy().into_owned())?;
+    if url.is_empty() {
+        return None;
+    }
+    url.parse().ok()
+}
 
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
     let builder = Endpoint::builder(presets::N0)
