@@ -303,6 +303,9 @@ if [ -r /usr/local/share/caos/net-probe-setup ]; then
 else
     echo "caos net probe (setup phase): not recorded by this environment's setup."
 fi
+if [ -r /usr/local/share/caos/dev-probe ]; then
+    printf "caos dev probe (setup phase): %s" "$(cat /usr/local/share/caos/dev-probe)"
+fi
 printf 'caos net probe (hook phase):  %s' \
     "$(caos_probe \
                   https://usw1-1.relay.n0.iroh.link./ \

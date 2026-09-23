@@ -60,6 +60,7 @@ RAW="https://raw.githubusercontent.com"
 base="$RAW/Metta-AI/caos/main"
 bootstrap_base=""
 enable_bash=""
+dev_server=""
 for arg in "$@"; do
     case "$arg" in
         --base=*) base="${arg#--base=}"; base="${base%/}" ;;
@@ -67,6 +68,7 @@ for arg in "$@"; do
         # (baked into the session-start bootstrap below): allow Bash/Read/Grep in
         # the deny list this env writes, so a session can inspect the container.
         --enable-bash) enable_bash=yes ;;
+        --dev-server=*) dev_server="${arg#--dev-server=}" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -331,6 +333,32 @@ caos_relay_all() {
     caos_relay_trace "A: default, offers h2 and http/1.1"
     caos_relay_trace "B: forced http/1.1" --http1.1
 }
+# CAN THE SETUP PHASE REACH THE DEV SERVER? The whole of dev mode rests on this
+# and nothing else has ever tested it: every earlier probe was an HTTP GET, and
+# the relay's index page answering says nothing about the relay PROTOCOL, which
+# is a websocket upgrade carrying a long-lived connection.
+#
+# `--dev-server=<ticket>` rather than CAOS_SERVER_URL because this script cannot
+# read the environment's variables -- measured, a session stamped `off` while
+# the environment plainly set CAOS_DEV=1.
+if [ -n "$dev_server" ]; then
+    ls_err="$(mktemp)"
+    if ls_out="$(git ls-remote "$dev_server" refs/caos/dev 2>"$ls_err")" \
+       && [ -n "$ls_out" ]; then
+        echo "REACHED the dev server: $(printf '%s' "$ls_out" | head -1 | cut -c1-60)" \
+            > /usr/local/share/caos/dev-probe
+    else
+        {
+            printf 'COULD NOT reach the dev server. git-remote-caos: %s. ' \
+                "$(command -v git-remote-caos || echo 'NOT ON PATH')"
+            printf 'ls-remote said: %s' "$(tr '\n' ' ' < "$ls_err" | cut -c1-240)"
+            printf '\n'
+        } > /usr/local/share/caos/dev-probe
+    fi
+    rm -f "$ls_err"
+    echo "dev probe (setup): $(cat /usr/local/share/caos/dev-probe)" >&2
+fi
+
 caos_relay_all > /usr/local/share/caos/relay-trace-setup 2>&1
 
 # ---------------------------------------------------------------------------

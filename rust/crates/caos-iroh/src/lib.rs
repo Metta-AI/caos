@@ -155,10 +155,53 @@ pub const DEFAULT_PORT: u16 = 11204;
 /// Both come from `integrations/claude-code/cloud`, where they were first
 /// carried as a patch against dumbpipe; they are the part of that patch worth
 /// keeping.
+/// `CAOS_IROH_RELAY` replaces n0's relays with one you run, and exists because
+/// a Claude Code cloud container's SETUP phase cannot reach n0's at all.
+///
+/// Measured: from that phase all seven relays iroh ships answer `503` with an
+/// Envoy `upstream connect error`, while `www.hetzner.com` answers 200 and four
+/// of those relays ARE Hetzner-hosted. Bare IPs fail the same way, and so does
+/// forcing http/1.1, so it is neither the name, nor the protocol, nor a route:
+/// the gateway refuses those destinations. An `iroh-relay` on a host of one's
+/// own, on port 80, answered 200 from the same phase in the same run.
+///
+/// An `http://` URL is legitimate here and needs no certificate: the relay
+/// client reads TLS off the scheme (`use_tls()` is false for `http`) and
+/// defaults such a URL to port 80. That matters because a non-standard port is
+/// NOT carried by that egress at all -- the same relay on 3340 timed out from
+/// both phases -- so 80 or 443 is the whole of the choice. The relay hop being
+/// plaintext costs nothing that was not already given away: payloads stay
+/// end-to-end encrypted between endpoint keys, as the note above says.
+///
+/// SAID OUT LOUD, both ways. A relay setting that silently does nothing is the
+/// worst outcome here -- the symptom is "my change did not take", a full phase
+/// away from the cause -- so a bad URL names itself rather than falling back to
+/// n0 in silence. `caos-iroh serve` also prints the relays the ticket carries.
+const RELAY_ENV: &str = "CAOS_IROH_RELAY";
+
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
-    Endpoint::builder(presets::N0)
+    let builder = Endpoint::builder(presets::N0)
         .ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
-        .proxy_from_env()
+        .proxy_from_env();
+    let Some(url) = std::env::var_os(RELAY_ENV).map(|v| v.to_string_lossy().into_owned()) else {
+        return builder;
+    };
+    if url.is_empty() {
+        return builder;
+    }
+    match iroh_relay::RelayMap::try_from_iter([url.as_str()]) {
+        Ok(map) => {
+            eprintln!("caos-iroh: {RELAY_ENV}={url}: using it instead of n0's relays");
+            builder.relay_mode(iroh::RelayMode::Custom(map))
+        }
+        Err(error) => {
+            eprintln!("caos-iroh: {RELAY_ENV}={url} is not a relay URL ({error});");
+            eprintln!(
+                "caos-iroh:   falling back to n0's relays, which a cloud SETUP phase cannot reach"
+            );
+            builder
+        }
+    }
 }
 
 /// Could `addr` be reached from another machine?

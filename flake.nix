@@ -1409,6 +1409,7 @@ sandbox = false''
                 -e CAOS_STACK_SEEDER=yes \
                 -e CAOS_STACK_IROH="$IROH" \
                 -e CAOS_STACK_IROH_ADVERTISE="$IROH_ADVERTISE" \
+                -e CAOS_IROH_RELAY="''${CAOS_IROH_RELAY:-}" \
                 -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                 -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
                 -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
