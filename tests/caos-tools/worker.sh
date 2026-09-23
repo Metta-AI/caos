@@ -87,7 +87,8 @@ EOF
 # and `prop` a TREE so the harness mints the commit — the shape almost every
 # writer wants, where the tool never has to know what a commit is.
 tool writer 'Add WRITER.md to the source tree.
-@writer' <<'EOF'
+@writer
+@in' <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 # `/cas/args/in`, not `/cas/in`: a bound arg lands under /cas/args (SPEC,
@@ -141,7 +142,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good; write)
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -291,6 +292,25 @@ esac
 [ "$(git log -1 --format=%s "$final_source_tree")" = "writer: add WRITER.md" ] \
   || fail "the writer's message did not become the commit message: $(git log -1 --format=%s "$final_source_tree")"
 echo "  ok: WRITER.md applied over the edit, with the tool's commit message" >&2
+
+stage "a tool that declares no @in does not key on the tree"
+# toolu_04 and toolu_08 are the SAME hello call with the SAME arguments, and
+# the writer moved the source tree between them. hello declares no `@in`, so
+# the tree is not in its ArgTree and both calls form one identical task --
+# which is the whole point: `caos-test-result`, whose input is a hash, used to
+# carry the entire source tree and so could never hit the memo twice.
+first=$(jq -r 'select(.id == "toolu_04") | .task' /tmp/caos-tools.records)
+again=$(jq -r 'select(.id == "toolu_08") | .task' /tmp/caos-tools.records)
+assert_oid "$first" "the first hello task"
+[ "$first" = "$again" ] \
+  || fail "hello re-keyed across a tree change it never reads: $first vs $again"
+# And their input commits DID differ, so the tree really did move underneath.
+[ "$(jq -r 'select(.id == "toolu_04") | .input_commit' /tmp/caos-tools.records)" \
+  != "$(jq -r 'select(.id == "toolu_08") | .input_commit' /tmp/caos-tools.records)" ] \
+  || fail "the writer did not move the tree, so this proves nothing"
+# The writer, which DOES declare `@in`, keys on the tree by construction: its
+# task carries one and hello's does not.
+echo "  ok: one task for both calls, across a real tree change" >&2
 
 stage "a writer's commit must descend from the one it was given"
 grep -qF 'does not descend from the commit it was given' /tmp/stub/request-2.json \

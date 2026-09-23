@@ -20,5 +20,6 @@ specific to the caos codebase; run in any other tree it reports cleanly that
 there is nothing for it to test.
 @param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys each test and the requests a client test makes, but nothing above them.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
+@in
 END
 curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh --help=$HELP

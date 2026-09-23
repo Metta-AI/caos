@@ -148,6 +148,9 @@ pub struct TreeTool {
     /// decides writer-ness by tool name (`callback_result`); this carries the
     /// declaration so that match can be replaced by it.
     pub writer: bool,
+    /// The tool declared `@in`: bind the tree it was run on. See
+    /// [`Help::wants_in`] for why absence is the default.
+    pub wants_in: bool,
 }
 
 impl TreeTool {
@@ -159,6 +162,7 @@ impl TreeTool {
             args: help.args,
             git: help.git,
             writer: help.writer,
+            wants_in: help.wants_in,
         }
     }
 
@@ -265,6 +269,15 @@ pub struct Help {
     /// than returning a value. Absent means read-only, which is the default
     /// precisely because it is the safe answer for a tool that forgot to say.
     pub writer: bool,
+    /// `@in`: bind the tree this tool was run on as `in`.
+    ///
+    /// Absent means DO NOT BIND IT, and that is the point: the tree is the
+    /// biggest thing that can land in an ArgTree, and the ArgTree is the cache
+    /// key. `caos-test-result`, whose entire input is a hash, carried the whole
+    /// source tree and so re-keyed on every edit to it — asking twice for the
+    /// same test record could not hit. `grep` has always done this right by
+    /// binding only the scope it searches, which is why a scoped grep is cheap.
+    pub wants_in: bool,
 }
 
 /// If `line` opens a javadoc BLOCK TAG, its name without the `@`.
@@ -298,6 +311,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut args = Vec::new();
     let mut git = false;
     let mut writer = false;
+    let mut wants_in = false;
     let mut in_tags = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -319,10 +333,14 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         } else if trimmed == "@writer" {
             in_tags = true;
             writer = true;
+        } else if trimmed == "@in" {
+            in_tags = true;
+            wants_in = true;
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
             eprintln!(
-                "{ctx}: unknown block tag @{tag} — ignored (known: @param, @git, @writer)"
+                "{ctx}: unknown block tag @{tag} — ignored \
+                 (known: @param, @git, @writer, @in)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
@@ -334,6 +352,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         args,
         git,
         writer,
+        wants_in,
     }
 }
 
@@ -590,11 +609,13 @@ fn describe(tool: &TreeTool, path: &str) -> String {
     } else {
         "\nRead-only: returns a value and changes nothing.\n"
     });
+    out.push_str(if tool.wants_in {
+        "Reads the source tree it is run on.\n"
+    } else {
+        "Does not read the tree: its arguments are its whole input.\n"
+    });
     if tool.args.is_empty() {
-        out.push_str(
-            "\nParameters: none. Its input is the source tree containing it, so \
-             `run_tool` needs only the path.\n",
-        );
+        out.push_str("\nParameters: none.\n");
         return out;
     }
     out.push_str("\nParameters (pass under `arguments`, every value a string):\n");
@@ -1271,6 +1292,26 @@ mod tests {
     }
 
     #[test]
+    fn in_is_opt_in_and_described() {
+        // Absent means the tree is NOT bound, which is what keeps it out of the
+        // cache key for a tool whose whole input is its arguments.
+        let reader = TreeTool::new(
+            "caos-test-result",
+            parse_help("t", "Print a record.\n@param hash The hash."),
+        );
+        assert!(!reader.wants_in);
+        let text = describe(&reader, "std/caos-test-result");
+        assert!(text.contains("Does not read the tree"));
+
+        let tester = TreeTool::new("caos-test", parse_help("t", "Run the suite.\n@in"));
+        assert!(tester.wants_in);
+        assert!(describe(&tester, "std/caos-test").contains("Reads the source tree"));
+        // `@in` is a flag, not a parameter: it must not become an argument the
+        // model is asked to supply.
+        assert!(tester.args.is_empty());
+    }
+
+    #[test]
     fn a_declared_type_reaches_the_schema_and_the_binding() {
         let h = parse_help(
             "t",
@@ -1494,6 +1535,7 @@ mod tests {
             ],
             git: false,
             writer: false,
+            wants_in: false,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -1512,6 +1554,7 @@ mod tests {
             args: Vec::new(),
             git: false,
             writer: false,
+            wants_in: false,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -1541,6 +1584,7 @@ mod tests {
             ],
             git: false,
             writer: false,
+            wants_in: false,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 

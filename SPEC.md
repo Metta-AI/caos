@@ -180,13 +180,15 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Two bare tags are flags:
+Three bare tags are flags:
 - `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
   than returning a value. Absent means READ-ONLY, which is the default because
   it is the safe reading of a tool that forgot to say
+- `@in` — bind the tree it is run on as `in`. Absent means DO NOT, and that is
+  the point: see "Receiving args"
 - `@git` — bind the source tree commit and the turn's ref snapshot
 
-The tag lives in the help rather than as its own arg so that `tool_help` can
+The tags live in the help rather than as their own args so that `tool_help` can
 report it WITHOUT EVALUATING: "will this change my tree?" is the second most
 important fact about a tool, so the description has to carry it, and an arg
 would be readable only by building the tool. It also costs no reserved name.
@@ -212,13 +214,14 @@ to a string, because silently narrowing an array parameter takes a capability
 away with nothing to notice. `tool_help` states each one's name,
 whether it is required, and its documentation as prose rather than as a JSON
 schema — the model reads it, and a schema dump is the registry that was just
-removed. A tool with no `@param` tags takes no parameters: the source tree IS
-its input.
+removed. A tool with no `@param` tags takes no parameters, and one that
+declares no `@in` either has no input beyond its own expression.
 
 ## Invocation
 
-- The job is `curry(<tool arg tree>, <declared args>)` run with the source tree
-  as `--in`, where `<tool arg tree>` is what evaluating the tool's path yields
+- The job is `curry(<tool arg tree>, <declared args>)`, where
+  `<tool arg tree>` is what evaluating the tool's path yields — run over the
+  tree as `--in` only if the tool declared `@in`
 - Evaluation happens where blocking is legal. A worker may not block, so the
   agent's harness tail-calls `eval-path-then` and curries in the callback
   (design/map-then.md); `caos-cli run-tool` evaluates directly. Both land on
@@ -230,10 +233,22 @@ its input.
 ## Receiving args
 
 - A bound arg lands at `/cas/args/<name>`, a lazy placeholder like any other
-  arg — `caos get` it before reading
+  arg — `caos get` it before reading. **`/cas/args/in`, not `/cas/in`**
 - An omitted optional arg simply does not exist; test with `[ -e ]`
 - Values are never shell-interpolated. They are argv elements to `caos curry`,
   then bytes in a file
+- An `{array}` parameter arrives as one blob of NEWLINE-SEPARATED elements
+
+**`in` is bound only for a tool that declared `@in`**, and the reason is the
+cache key. A tree is the biggest thing that can enter an ArgTree, so binding
+one a tool never reads makes it re-key on every edit to a tree it ignores:
+`caos-test-result`, whose entire input is a hash, could not hit the memo twice
+in a row. `grep` has always done this right — it binds only the scope it
+searches, which is why a scoped grep is cheap — and every reader now follows it.
+
+A tool whose `in` is something it BUILDS rather than the tree it was run on
+declares no `@in`: `bash`'s is a `{tree, cmd, cwd, paths}` envelope and `grep`'s
+is the scope, and each is bound by its own dispatch.
 
 ## Returning a result
 

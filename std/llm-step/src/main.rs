@@ -1363,7 +1363,7 @@ fn prepare_compute(
                         &nested,
                         relative,
                         &bound,
-                        tool.git,
+                        &tool,
                         ws,
                         wc,
                         request,
@@ -1418,7 +1418,9 @@ fn prepare_bash(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
         .map_err(|error| format!("writing paths: {error}"))?;
     let input = fresh("toolin");
     caos(["put", path(&dir), &input])?;
-    prepared_request(&cfg.bash_image, &[], &input)
+    // bash's `in` is the ENVELOPE built just above -- {tree, cmd, cwd, paths} --
+    // not the tree it was run on, which is why its help declares no `@in`.
+    prepared_request(&cfg.bash_image, &[], Some(&input))
 }
 
 fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepared, String> {
@@ -1433,7 +1435,10 @@ fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepa
         Arg::Hash(image),
         &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
     )?;
-    prepared_request(&curried, &[], ws)
+    // NO `in`. merge never read one, and `ours` already determines the tree,
+    // so binding it only made the key bigger. Its help declares no `@in`.
+    let _ = ws;
+    prepared_request(&curried, &[], None)
 }
 
 fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
@@ -1445,8 +1450,10 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
         .as_str()
         .ok_or("grep precheck admitted no string pattern")?;
     let image = cfg.grep_image.as_deref().ok_or("grep image is absent")?;
+    // The SCOPE, not the whole tree -- which is why a scoped grep is cheap, and
+    // the example every other reader now follows.
     let curried = caos_curry(Arg::Hash(image), &[("pattern", Arg::Lit(pattern))])?;
-    prepared_request(&curried, &[], &scope)
+    prepared_request(&curried, &[], Some(&scope))
 }
 
 fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<Prepared, String> {
@@ -1462,20 +1469,27 @@ fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<
         .map(|(name, value)| (name.as_str(), Arg::Lit(value)))
         .collect();
     let curried = caos_curry(Arg::Hash(image), &args)?;
-    prepared_request(&curried, &[], ws)
+    prepared_request(&curried, &[], tool.wants_in.then_some(ws))
 }
 
+/// Form the runnable request. `input` is bound as `in` when there is one, and
+/// there is one only when the tool asked for it — the tree is the biggest thing
+/// that can enter an ArgTree, and the ArgTree is the cache key
+/// (SPEC, "CaosTools" — Receiving args).
 fn prepared_request(
     image: &str,
     args: &[(&str, Arg<'_>)],
-    input: &str,
+    input: Option<&str>,
 ) -> Result<Prepared, String> {
     let curried = if args.is_empty() {
         image.to_string()
     } else {
         caos_curry(Arg::Hash(image), args)?
     };
-    let task = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(input))])?;
+    let bound: Vec<(&str, Arg<'_>)> = input
+        .map(|input| vec![("in", Arg::Path(input))])
+        .unwrap_or_default();
+    let task = prepare_request(Arg::Hash(&curried), &bound)?;
     Ok(Prepared::Task(Oid::parse(&task, "tool task")?))
 }
 
@@ -1484,7 +1498,7 @@ fn launch_tree_evaluation(
     call: &Value,
     name: &str,
     bound: &[(String, String)],
-    git: bool,
+    tool: &tools::TreeTool,
     ws: &str,
     wc: &str,
     request: &Oid,
@@ -1511,7 +1525,8 @@ fn launch_tree_evaluation(
             ("ws", Arg::Path(ws)),
             ("tool-eval", Arg::Lit(name)),
             ("tool-args", Arg::Lit(&serialized)),
-            ("tool-git", Arg::Lit(if git { "1" } else { "" })),
+            ("tool-git", Arg::Lit(if tool.git { "1" } else { "" })),
+            ("tool-in", Arg::Lit(if tool.wants_in { "1" } else { "" })),
         ],
     )?;
     // The tool's ArgTree. Normally the SERVER evaluates the tool path for us (a
@@ -1610,6 +1625,7 @@ fn launch_evaluated_tool(
         .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
         .collect();
     let git = read_arg_opt("tool-git")?.is_some_and(|value| value == "1");
+    let wants_in = read_arg_opt("tool-in")?.is_some_and(|value| value == "1");
     let mut args: Vec<(&str, Arg<'_>)> = bound
         .iter()
         .map(|(key, value)| (key.as_str(), Arg::Lit(value)))
@@ -1621,7 +1637,15 @@ fn launch_evaluated_tool(
         }
     }
     let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
-    let task_text = prepare_request(Arg::Hash(&curried), &[("in", Arg::Path(&ws))])?;
+    // `in` only if the tool's help asked for it. A tool whose whole input is
+    // its arguments then keys on those alone, so it hits the memo across edits
+    // to a tree it never reads.
+    let input: Vec<(&str, Arg<'_>)> = if wants_in {
+        vec![("in", Arg::Path(ws.as_str()))]
+    } else {
+        Vec::new()
+    };
+    let task_text = prepare_request(Arg::Hash(&curried), &input)?;
     let task = Oid::parse(&task_text, "tree tool task")?;
     let started = CallRecord {
         request: request.clone(),
@@ -3379,6 +3403,7 @@ fn self_curry(
         "tool-eval",
         "tool-args",
         "tool-git",
+        "tool-in",
         "tool-writer",
         "in",
         "result",
