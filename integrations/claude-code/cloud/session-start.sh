@@ -281,6 +281,29 @@ step "client refresh done"
 #
 # Never fatal. A dev overlay that cannot happen leaves a session running the
 # pinned client, which works; saying so beats failing to start.
+# THE SAME PROBE setup.sh ran, so one session gives a controlled before/after
+# across "Starting Claude Code" in a single container. Both go to STDOUT, which
+# is the only stream a session can read back (this file's `log` is stderr, and
+# setup.sh's output reaches only the env-manager log).
+caos_probe() {
+    for url in "$@"; do
+        code="$(curl -sS -o /dev/null -m 8 -w '%{http_code}' "$url" 2>&1)" \
+            || code="FAILED(${code##*: })"
+        printf '%s=%s ' "${url#https://}" "$code"
+    done
+    printf '\n'
+}
+if [ -r /usr/local/share/caos/net-probe-setup ]; then
+    printf 'caos net probe (setup phase): %s' "$(cat /usr/local/share/caos/net-probe-setup)"
+    printf '\n'
+else
+    echo "caos net probe (setup phase): not recorded by this environment's setup."
+fi
+printf 'caos net probe (hook phase):  %s' \
+    "$(caos_probe https://raw.githubusercontent.com/ \
+                  https://usw1-1.relay.n0.iroh.link./ \
+                  https://example.com/)"
+
 if [ "${CAOS_DEV:-}" = 1 ] && [ "$have_repo" = 1 ] && [ -n "$server" ]; then
     step "dev mode: looking for refs/caos/dev on the server"
     # STDERR IS KEPT. An empty result was reported as "the server publishes no

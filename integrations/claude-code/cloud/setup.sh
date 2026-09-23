@@ -264,6 +264,35 @@ bash -n /usr/local/bin/caos-cloud-session-start || {
 # refreshed client. There is no separate configure step to run here.
 
 # ---------------------------------------------------------------------------
+# What can this phase actually reach?
+# ---------------------------------------------------------------------------
+# A claim that this phase cannot reach the caos server was made from a 30s
+# `ls-remote` timeout and then argued rather than measured. This measures it,
+# and the SAME probe runs in session-start.sh, so one session yields a
+# controlled before/after across "Starting Claude Code" in one container.
+#
+# THE RELAY IS THE INTERESTING URL. A `caos://` ticket from a dev stack carries
+# only private direct addresses (`10.200.0.3:11204 127.0.0.1:11204`), so no
+# container can dial the endpoint directly and every connection goes through
+# the relay the ticket names. GitHub is the control -- known to work here,
+# since this script has already downloaded from it -- and example.com says
+# whether any non-allowlisted host answers.
+install -d /usr/local/share/caos
+caos_probe() {
+    for url in "$@"; do
+        code="$(curl -sS -o /dev/null -m 8 -w '%{http_code}' "$url" 2>&1)" \
+            || code="FAILED(${code##*: })"
+        printf '%s=%s ' "${url#https://}" "$code"
+    done
+    printf '\n'
+}
+caos_probe https://raw.githubusercontent.com/ \
+           https://usw1-1.relay.n0.iroh.link./ \
+           https://example.com/ \
+    > /usr/local/share/caos/net-probe-setup 2>&1
+echo "net probe (setup): $(cat /usr/local/share/caos/net-probe-setup)" >&2
+
+# ---------------------------------------------------------------------------
 # When did this environment last get built?
 # ---------------------------------------------------------------------------
 # "Did the rebuild happen?" has to be a FACT, not an inference. A setup script
