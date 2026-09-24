@@ -535,15 +535,13 @@ fn diagnostics() -> String {
                  pinned build -- something re-installed over it after setup",
                 &rev[..rev.len().min(12)]
             ),
-            (None, true) =>
-                "the client is a dev build, but this environment carries no dev \
+            (None, true) => "the client is a dev build, but this environment carries no dev \
                  stamp -- a snapshot older than the stamp, or a hand-placed binary"
-                    .to_string(),
-            (None, false) =>
-                "off -- this session runs the caos its client repo pins. Pass \
+                .to_string(),
+            (None, false) => "off -- this session runs the caos its client repo pins. Pass \
                  --dev-server=<ticket> on the environment's setup line to run \
                  your own."
-                    .to_string(),
+                .to_string(),
         }
     ));
     // What install.sh resolved this session -- repo, full commit, build tag.
