@@ -18,6 +18,11 @@ smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
 every request paid a fresh connection — the reason `/eval-locator` exists — while
 the client now holds ONE connection and opens a stream per request.
 
+These four scripts are due to be replaced by one Go program run from the setup
+field; [`design/cloud-setup.md`](../../../design/cloud-setup.md) has the plan and
+the measurements that motivate it, including the three assumptions in this
+document that turned out to be false.
+
 ## The session starts from a CLIENT repo, not from the code
 
 The repository a session opens is a **caos client repo** — a handful of text
