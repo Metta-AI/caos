@@ -1,0 +1,3 @@
+../rustc rustc
+../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator

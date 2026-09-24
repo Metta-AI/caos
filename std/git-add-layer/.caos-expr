@@ -1,0 +1,13 @@
+HELP=<<END
+Name and squash the final work layer, then start the next work layer
+Uses the work snapshot's tree and its recorded base as the new commit's parent
+The recorded base must match the preceding layer; replay stale work first
+Signatures use Name <email> <unix-seconds> <+/-HHMM>
+@writer stack
+@param stack Conversation-relative stack directory
+@param name Layer name without its number prefix; cannot be work
+@param author Author signature including timestamp and timezone
+@param committer Committer signature including timestamp and timezone
+@param message Literal commit message
+END
+curry --base:@=DEEP-DEPS/git-stack --operation=add-layer --help=$HELP

@@ -1,0 +1,1 @@
+run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/conversation-protocol --dep1:@=DEEP-DEPS/git-locator

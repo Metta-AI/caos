@@ -1,0 +1,25 @@
+[package]
+name = "git-stack"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+worker-common = { path = "worker-common" }
+conversation-protocol = { path = "conversation-protocol" }
+git-locator = { path = "git-locator" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+minreq = { version = "2", default-features = false, features = ["https-rustls"] }
+
+[dev-dependencies]
+conversation-protocol = { path = "conversation-protocol", features = ["memory-store"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

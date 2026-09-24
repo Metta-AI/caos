@@ -739,3 +739,7 @@ sealed state.
 Per-mutation commits remain in the published source tree history. Only the
 previewed PR tip is checked for unresolved conflicts and reserved state;
 intermediate commits may contain conflict markers or fail to build.
+
+## Source stack layers
+
+The `std/git-add-layer` writer promotes a final numbered work gitlink into a named, squashed commit and starts the next work at that commit. Each numbered layer has a matching `.base` file recording its parent boundary. See [stack creation and replay](design/agent-rebase.md).
