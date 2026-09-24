@@ -231,8 +231,12 @@ fi
 if grep -qF 'Say hello from the tree.' /tmp/stub/request-1.json; then
   fail "a repository tool's doc reached the model without being asked for"
 fi
-[ "$(grep -oF '"name":"bash"' /tmp/stub/request-1.json | wc -l)" = 1 ] \
-  || fail "built-in bash missing (or duplicated by the same-named directory)"
+# NOT ONCE, NONE. `bash` is `std/bash-tool`, reached as `caos-std/bash-tool`
+# through run_tool like every other std tool, so nothing declares it -- and the
+# fixture's own `bash` DIRECTORY must not be declared either, which is the
+# property this counts. It read `= 1` while the step registered a built-in.
+[ "$(grep -oF '"name":"bash"' /tmp/stub/request-1.json | wc -l)" = 0 ] \
+  || fail "a tool named bash was declared; std tools and tree directories are reached by path"
 if grep -qF 'impostor' /tmp/stub/request-1.json; then
   fail "the same-named directory's doc leaked into the declared tools"
 fi

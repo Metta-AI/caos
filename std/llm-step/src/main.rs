@@ -3112,14 +3112,15 @@ fn source_tree_paths(state: &mut progress::State) -> Result<Vec<String>, String>
 }
 
 fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
-    // bash is described by the help ITS OWN IMAGE carries, like merge and the
-    // std tools. Not wrapped in `with_source_tree`: bash works in the
-    // conversation tree unless the caller names one.
-    let mut registry = match tools::std_tool("bash", &arg("bash-image"))? {
-        Some(tool) => vec![tools::tree_tool_declaration(&tool)],
-        None => return Err("the bash image carries no help".to_string()),
-    };
-    registry.extend(tools::declarations());
+    // WHAT IS REGISTERED IS WHAT HAS NO PATH. A tool that lives in `std/` is
+    // reachable as `caos-std/<name>` from any conversation whose tree mounts
+    // caos, so `tool_help` describes it and `run_tool` runs it; registering it
+    // as well is a second way to call one thing, and the two can disagree about
+    // which version runs. `std/README.md` is the index a model reads instead.
+    //
+    // Everything below implements no entry and has no path, so declaring it here
+    // is the only way to reach it at all.
+    let mut registry = tools::declarations();
     registry.push(with_source_tree(tools::tree_tool_declaration(
         &tools::builtin_tool("publish_source", publish_source::HELP),
     )));
@@ -3130,22 +3131,7 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(tools::grep_declaration());
     }
-    // Described by the help its IMAGE carries, like the std tools -- not by a
-    // literal here. The second copy that used to live in this file is what
-    // `std/merge/.caos-expr` warns against, and the two had already drifted.
-    if cfg.merge_image.is_some() {
-        if let Some(tool) = tools::std_tool("merge", &arg("merge-image"))? {
-            registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
-        }
-    }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
-    for &(name, arg_name) in &STD_TOOLS {
-        if cfg.std_tool_images.get(name).is_some_and(Option::is_some) {
-            if let Some(tool) = tools::std_tool(name, &arg(arg_name))? {
-                registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
-            }
-        }
-    }
     registry.push(json!({
         "name":"run_tool",
         "description":"Run a repository tool by conversation-relative path, e.g. feature/dirty/caos-tools/test. The tool runs with the containing source tree as its input. Nothing lists the available tools: each repository documents its own, and `tool_help` at a path gives that tool's parameters. Pass them under `arguments` as strings.",

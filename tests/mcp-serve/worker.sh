@@ -81,7 +81,7 @@ case "$listing" in
   *) fail "a server with no tools offered nothing to ask: $listing" ;;
 esac
 case "$listing" in
-  *'"name":"bash"'*) fail "an unresolvable step somehow offered the real tools" ;;
+  *'"name":"read"'*) fail "an unresolvable step somehow offered the real tools" ;;
 esac
 
 # The REASON is settled by the time tools/list answered (it did the resolving),
@@ -115,10 +115,21 @@ elapsed=$(( $(date +%s) - started ))
 send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
 listing=$(await '"id":9' 600) \
   || fail "the tools never resolved (see the server's stderr below)"
-for tool in bash read ls write edit grep merge log show diff caos-build caos-test; do
+for tool in read ls write edit grep log show diff run_tool tool_help; do
   case "$listing" in
     *"\"name\":\"$tool\""*) ;;
     *) fail "the resolved listing is missing $tool" ;;
+  esac
+done
+# AND THE std TOOLS ARE NOT THERE. Each of these is an entry with its own HELP,
+# so a conversation whose tree mounts caos reaches it as `caos-std/<name>` --
+# `tool_help` describes it and `run_tool` runs it (std/README.md is the index).
+# Registering it as well would be a second way to call one thing, and the two
+# can disagree about which version runs.
+for tool in bash merge caos-build caos-test caos-test-result; do
+  case "$listing" in
+    *"\"name\":\"$tool\""*)
+      fail "$tool is registered; std tools are reached by path through run_tool" ;;
   esac
 done
 # caos_status rides ALONGSIDE the real tools, always: its provisioning
