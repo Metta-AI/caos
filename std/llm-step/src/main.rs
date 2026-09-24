@@ -9,6 +9,7 @@ mod source_trees;
 mod subagents;
 mod timing;
 mod tools;
+mod writers;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -339,8 +340,14 @@ fn callback(
         return resume(cfg, state, request, request_head);
     }
 
-    let (block, proposal) = callback_result(state, &record)?;
-    complete_compute(state, &record, block, proposal)?;
+    if let Some(context) = writers::input(state, &record)? {
+        if let Err(error) = writers::complete(state, &record, &context, &arg("result")) {
+            complete_started_failed(state, &record, &error_block(&record.id, &error))?;
+        }
+    } else {
+        let (block, proposal) = callback_result(state, &record)?;
+        complete_compute(state, &record, block, proposal)?;
+    }
     resume(cfg, state, request, request_head)
 }
 
@@ -1150,7 +1157,15 @@ fn drive_call(
                 .ok_or("tool path is outside its source tree")?);
         }
     }
-    match prepare_compute(&scoped, &scoped_call, &ws, &wc, request, round)? {
+    match prepare_compute(
+        &scoped,
+        &scoped_call,
+        &ws,
+        &wc,
+        state.head(),
+        request,
+        round,
+    )? {
         Prepared::Result(block) => {
             site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
             Ok(true)
@@ -1300,6 +1315,7 @@ fn prepare_compute(
     call: &Call,
     ws: &str,
     wc: &str,
+    conversation_head: &Oid,
     request: &Oid,
     round: &RoundState,
 ) -> Result<Prepared, String> {
@@ -1316,6 +1332,7 @@ fn prepare_compute(
                 &[
                     ("current-tool", Arg::Lit(&call.name)),
                     ("tool-lookup", Arg::Lit(relative)),
+                    ("tool-conversation", Arg::Lit(conversation_head.as_str())),
                 ],
             )?;
             if client_tool_matches(ws, relative)? {
@@ -1501,10 +1518,6 @@ fn launch_resolved_tool(
         Target::Files => (None, state.head().clone()),
     };
     let commit = Oid::parse(&cas_hash(&arg("wc"))?, "tool lookup input commit")?;
-    if current_input != commit {
-        return resume(cfg, state, request, request_head);
-    }
-    let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
     let site = CallSite::at(request, round, &call, &current.declaration_message);
@@ -1520,6 +1533,19 @@ fn launch_resolved_tool(
             return resume(cfg, state, request, request_head);
         }
     };
+    if current_input != commit {
+        if call.name == "run_tool" && tool.writer.is_some() {
+            site.failed(
+                state,
+                &error_block(
+                    id,
+                    "writer tool input changed during evaluation; run the tool again",
+                ),
+                name.map(|name| (name, commit)),
+            )?;
+        }
+        return resume(cfg, state, request, request_head);
+    }
     if call.name == "tool_help" {
         let block = result_block(
             id,
@@ -1538,8 +1564,28 @@ fn launch_resolved_tool(
             return resume(cfg, state, request, request_head);
         }
     };
+    let conversation_head =
+        Oid::parse(&read_arg("tool-conversation")?, "tool lookup conversation")?;
+    let writer = match writers::prepare(state, &conversation_head, &tool, &bound) {
+        Ok(writer) => writer,
+        Err(error) => {
+            site.failed(
+                state,
+                &error_block(id, &error),
+                name.map(|name| (name, commit)),
+            )?;
+            return resume(cfg, state, request, request_head);
+        }
+    };
+    // Lookup uses the containing source snapshot, including for a client
+    // handoff. Only after resolving its declaration can a writer select the
+    // conversation as its input; the evaluated tool image is never that input.
+    let (source_tree_name, commit) = match &writer {
+        Some(context) => (None, context.head.clone()),
+        None => (name, commit),
+    };
+    let (ws, wc) = materialize_source_tree(state, &commit)?;
     let tool_tree = cas_hash(&image)?;
-    let source_tree_name = name;
     let mut args: Vec<(&str, Arg<'_>)> = bound
         .iter()
         .map(|(key, value)| (key.as_str(), Arg::Lit(value)))
@@ -1549,6 +1595,14 @@ fn launch_resolved_tool(
         if let Some(refs) = cfg.merge_refs.as_deref() {
             args.push(("refs", Arg::Lit(refs)));
         }
+    }
+    let context_json = writer
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("serializing writer context: {error}"))?;
+    if let Some(context) = &context_json {
+        args.push(("writer-context", Arg::Lit(context)));
     }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
@@ -1586,7 +1640,14 @@ fn launch_resolved_tool(
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
-            payloads: Vec::new(),
+            payloads: writer
+                .as_ref()
+                .map(|context| {
+                    canonical_payload_bytes(&json!(context))
+                        .map(|bytes| vec![("writer-input.json".into(), bytes)])
+                })
+                .transpose()?
+                .unwrap_or_default(),
             record: started.clone(),
         },
     )? {
@@ -3299,6 +3360,7 @@ fn self_curry(
         "scope",
         "tool-eval",
         "tool-lookup",
+        "tool-conversation",
         "tool-args",
         "tool-git",
         "in",
@@ -3350,12 +3412,12 @@ mod tests {
 
     const CONVERSATION: &str = "conversation";
     const USER_ID: &str = "11111111111111111111111111111111";
-    const ASSISTANT_ID: &str = "22222222222222222222222222222222";
+    pub(super) const ASSISTANT_ID: &str = "22222222222222222222222222222222";
 
-    struct Golden {
-        store: MemoryStore,
-        head: Oid,
-        request: Oid,
+    pub(super) struct Golden {
+        pub(super) store: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) request: Oid,
     }
 
     struct TestDirectory(PathBuf);
@@ -3398,7 +3460,7 @@ mod tests {
             .success());
     }
 
-    fn append_memory(
+    pub(super) fn append_memory(
         store: &mut MemoryStore,
         parent: &Oid,
         transition: Transition,
@@ -3630,7 +3692,10 @@ mod tests {
         golden_with_first("read", json!({"file-path":"files/a"}))
     }
 
-    fn golden_with_first(first_name: &str, first_input: Value) -> Result<Golden, String> {
+    pub(super) fn golden_with_first(
+        first_name: &str,
+        first_input: Value,
+    ) -> Result<Golden, String> {
         let mut store = MemoryStore::new();
         let root = root_with(&mut store, BTreeMap::new())?;
         let user = append_memory(
@@ -4235,11 +4300,11 @@ mod tests {
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
     }
-    struct ImportStore {
-        objects: MemoryStore,
-        head: Oid,
-        race: Option<Transition>,
-        lost_ack: bool,
+    pub(super) struct ImportStore {
+        pub(super) objects: MemoryStore,
+        pub(super) head: Oid,
+        pub(super) race: Option<Transition>,
+        pub(super) lost_ack: bool,
     }
     conversation_protocol::delegate_object_store!(ImportStore, objects);
     impl progress::RefStore for ImportStore {
