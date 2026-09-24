@@ -273,6 +273,19 @@ A tool whose `in` is something it BUILDS rather than the tree it was run on
 declares no `@in`: `bash`'s is a `{tree, cmd, cwd, paths}` envelope and `grep`'s
 is the scope, and each is bound by its own dispatch.
 
+**`@in` makes the input a PARAMETER, so a caller can redirect it.** The tag
+gives the tool an optional `{tree}` argument named `in`, listed by `tool_help`;
+supplying it runs the tool over THAT tree, and omitting it falls back to the
+tree the tool's own path selected. Without this the input is derived from where
+a tool happens to SIT, which is wrong for any tool the conversation itself
+generated — a `caos-build` mounted at `caos-std/` could only ever build
+`caos-std/`, never the source tree you meant. A tool may not declare `@param
+in` by hand: `in` is what the interpreter binds, and `@in` is how to ask for it.
+
+However it arrives, `in` is bound in exactly ONE place — the request — because
+`caos curry` refuses a rebind, and binding the caller's tree onto the tool's
+curry while the request bound the default would be exactly that.
+
 ## Returning a result
 
 The result is a git object whose shape the tool chooses. Three conventions,

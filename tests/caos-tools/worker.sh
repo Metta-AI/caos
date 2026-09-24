@@ -141,6 +141,17 @@ n=$(find /cas/args/src -type f | wc -l)
 printf 'files=%s\n' "$n" > /tmp/o
 caos put /tmp/o /cas/out
 EOF
+# `@in` makes the input a PARAMETER, so a caller can run a tool over a tree
+# other than the one the tool sits in. Reports its input's top-level names.
+tool whichtree 'List the top level of the tree this runs over.
+@in' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/in
+names=$(cd /cas/args/in && ls -A | sort | tr '\n' ' ')
+printf 'saw: %s\n' "$names" > /tmp/o
+caos put /tmp/o /cas/out
+EOF
 # A directory that is NOT a tool: its expression binds no `--help`. `tool_help`
 # has to say so distinctly from "no such path", because the two have different
 # fixes.
@@ -186,7 +197,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good; write)
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_09","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_10","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/nope"}},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_09","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_10","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/nope"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_11","input":{"path":"main/caos-tools/whichtree"},"name":"run_tool","type":"tool_use"},{"id":"toolu_12","input":{"path":"main/caos-tools/whichtree","arguments":{"in":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_13","input":{"path":"main/caos-tools/whichtree"},"name":"tool_help","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -366,6 +377,35 @@ grep -qF 'files=2' /tmp/stub/request-2.json \
 grep -qF 'no such path: main/nope' /tmp/stub/request-2.json \
   || fail "a bad {tree} path was not reported to the model"
 echo "  ok: a path became a tree; a bad path became a value" >&2
+
+stage "the caller can run a tool over a tree other than the tool's own"
+# Asserted by CONTENT, not by the exact listing: `input-marker` sits only at
+# the source tree's root and `worker.sh` only inside a tool directory, so each
+# names its tree unambiguously however the rest of the tree drifts.
+#
+# toolu_11 takes the default: the source tree the tool's path selected.
+default=$(jq -r '..|objects|select(.tool_use_id=="toolu_11")|.content[0].text' \
+  /tmp/stub/request-2.json)
+case "$default" in
+  *input-marker*) ;;
+  *) fail "the default input was not the tool's own source tree: $default" ;;
+esac
+# toolu_12 names another tree, and that is the one the script reads. This is
+# what a conversation-generated caos-build needs: a tool sitting in one place,
+# run over a source tree somewhere else entirely.
+redirected=$(jq -r '..|objects|select(.tool_use_id=="toolu_12")|.content[0].text' \
+  /tmp/stub/request-2.json)
+case "$redirected" in
+  *worker.sh*) ;;
+  *) fail "a supplied in argument did not redirect the tool's input: $redirected" ;;
+esac
+case "$redirected" in
+  *input-marker*) fail "the redirected input still saw the whole source tree" ;;
+esac
+# And it is DISCOVERABLE: tool_help lists it, so nothing has to be told.
+grep -qF 'in (optional)' /tmp/stub/request-2.json \
+  || fail "tool_help did not offer in as a parameter"
+echo "  ok: default input, redirected input, and in listed" >&2
 
 stage "a writer's commit must descend from the one it was given"
 grep -qF 'does not descend from the commit it was given' /tmp/stub/request-2.json \

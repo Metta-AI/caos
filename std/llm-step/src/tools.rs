@@ -153,13 +153,36 @@ pub struct TreeTool {
     pub wants_in: bool,
 }
 
+/// What `@in` offers the model: the tree to run over, defaulting to the one
+/// that the tool's own path selected.
+///
+/// A SYNTHETIC parameter rather than something a tool writes itself — `@param
+/// in` stays refused, because `in` is bound by the interpreter and a tool
+/// declaring it by hand would be declaring the thing that binds it. Making it
+/// a parameter is what lets a caller redirect the input: a tool that lives in
+/// one tree (`caos-std/caos-build`, put there by the conversation's own
+/// expression) can be run over another (`feature/01-change`), which it cannot
+/// do while the input is derived from where the tool happens to sit.
+const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
+                      tool sits in, which for a tool the conversation itself \
+                      generated is usually not the tree you mean.";
+
 impl TreeTool {
     /// A named tool from its parsed help.
     fn new(name: &str, help: Help) -> TreeTool {
+        let mut args = help.args;
+        if help.wants_in {
+            args.push(TreeArg {
+                name: "in".to_string(),
+                doc: IN_DOC.to_string(),
+                required: false,
+                ty: ArgType::Tree,
+            });
+        }
         TreeTool {
             name: name.to_string(),
             doc: help.doc,
-            args: help.args,
+            args,
             git: help.git,
             writer: help.writer,
             wants_in: help.wants_in,
@@ -611,7 +634,7 @@ pub fn describe(tool: &TreeTool, path: &str) -> String {
         "\nRead-only: returns a value and changes nothing.\n"
     });
     out.push_str(if tool.wants_in {
-        "Reads the source tree it is run on.\n"
+        "Reads a tree, named by its `in` parameter below.\n"
     } else {
         "Does not read the tree: its arguments are its whole input.\n"
     });
@@ -1393,10 +1416,22 @@ mod tests {
 
         let tester = TreeTool::new("caos-test", parse_help("t", "Run the suite.\n@in"));
         assert!(tester.wants_in);
-        assert!(describe(&tester, "std/caos-test").contains("Reads the source tree"));
-        // `@in` is a flag, not a parameter: it must not become an argument the
-        // model is asked to supply.
-        assert!(tester.args.is_empty());
+        let text = describe(&tester, "std/caos-test");
+        assert!(text.contains("Reads a tree, named by its `in` parameter"));
+
+        // `@in` becomes an OPTIONAL `{tree}` parameter, which is what lets a
+        // caller run the tool over a tree other than the one it sits in.
+        assert_eq!(tester.args.len(), 1);
+        assert_eq!(tester.args[0].name, "in");
+        assert_eq!(tester.args[0].ty, ArgType::Tree);
+        assert!(!tester.args[0].required, "it defaults, so it is optional");
+        assert!(text.contains("in (optional)"), "listed for the model: {text}");
+
+        // A tool may not declare it by hand: `in` is what the interpreter
+        // binds, and `@in` is the way to ask for it.
+        let by_hand = parse_help("t", "d\n@param {tree} in The tree.");
+        assert!(by_hand.args.is_empty());
+        assert!(!by_hand.wants_in);
     }
 
     #[test]

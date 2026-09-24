@@ -1469,18 +1469,46 @@ fn prepare_std_tool(
         .iter()
         .map(|(name, value)| Ok((name.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let args: Vec<(&str, Arg<'_>)> = ready
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.arg()))
-        .collect();
+    let (args, input) = split_input(&ready, tool.wants_in, ws);
     let curried = caos_curry(Arg::Hash(image), &args)?;
-    prepared_request(&curried, &[], tool.wants_in.then_some(ws))
+    let task = prepare_request(Arg::Hash(&curried), &input)?;
+    Ok(Prepared::Task(Oid::parse(&task, "std tool task")?))
 }
 
 /// Form the runnable request. `input` is bound as `in` when there is one, and
 /// there is one only when the tool asked for it — the tree is the biggest thing
 /// that can enter an ArgTree, and the ArgTree is the cache key
 /// (SPEC, "CaosTools" — Receiving args).
+/// Split the bound arguments into the ones that ride on the TOOL'S CURRY and
+/// the tree bound as the REQUEST's `in`.
+///
+/// `in` is bound in exactly ONE place whichever side supplied it — the
+/// request — because `caos curry` refuses a rebind, and binding the caller's
+/// tree in the curry while the request bound the default would be exactly
+/// that. So the caller's `in` is lifted out of the curry args here.
+///
+/// With no `in` supplied, the default is the tree the tool's own path selected,
+/// and only for a tool that declared `@in`.
+type Bindings<'a> = Vec<(&'a str, Arg<'a>)>;
+
+fn split_input<'a>(
+    ready: &'a [(String, tools::ReadyArg)],
+    wants_in: bool,
+    ws: &'a str,
+) -> (Bindings<'a>, Bindings<'a>) {
+    let args = ready
+        .iter()
+        .filter(|(name, _)| name != "in")
+        .map(|(name, value)| (name.as_str(), value.arg()))
+        .collect();
+    let input = match ready.iter().find(|(name, _)| name == "in") {
+        Some((_, supplied)) => vec![("in", supplied.arg())],
+        None if wants_in => vec![("in", Arg::Path(ws))],
+        None => Vec::new(),
+    };
+    (args, input)
+}
+
 fn prepared_request(
     image: &str,
     args: &[(&str, Arg<'_>)],
@@ -1604,25 +1632,14 @@ fn launch_resolved_tool(
         .iter()
         .map(|(key, value)| Ok((key.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let mut args: Vec<(&str, Arg<'_>)> = ready
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.arg()))
-        .collect();
+    let (args, input) = split_input(&ready, tool.wants_in, ws.as_str());
+    let mut args = args;
     if tool.git {
         args.push(("wc", Arg::Path(&wc)));
         if let Some(refs) = cfg.merge_refs.as_deref() {
             args.push(("refs", Arg::Lit(refs)));
         }
     }
-    // `in` only if the tool's help asked for it: a tree is the biggest thing
-    // that can enter an ArgTree, and the ArgTree is the cache key, so a tool
-    // whose whole input is its arguments keys on those alone and hits the memo
-    // across edits to a tree it never reads.
-    let input: Vec<(&str, Arg<'_>)> = if tool.wants_in {
-        vec![("in", Arg::Path(ws.as_str()))]
-    } else {
-        Vec::new()
-    };
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
         let task_text = prepare_request(Arg::Hash(&curried), &input)?;
