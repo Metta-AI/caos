@@ -39,7 +39,9 @@ pub fn execute(
     let Some(tool) = tool(name) else {
         return crate::error_block(id, "unknown history tool");
     };
-    let bound = match crate::tools::tree_tool_args(call, &tool) {
+    // `None`: these run in-process against the conversation's own object store,
+    // with no materialized tree, and their parameters are all `{string}`.
+    let bound = match crate::tools::tree_tool_args(call, &tool, None) {
         Ok(bound) => bound,
         Err(block) => return block,
     };
@@ -48,7 +50,7 @@ pub fn execute(
             bound
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
+                .and_then(|(_, v)| v.text())
         };
         let resolve = |spec: &str| -> Result<Oid, String> {
             let split = spec.find(['~', '^']).unwrap_or(spec.len());

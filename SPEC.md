@@ -209,9 +209,31 @@ script as a blob whatever JSON type it left the model as. `@param {<type>}
 <name>` declares another: `{string}` is the default said out loud, and
 `{array}` is a list of strings, which the model sends as a JSON array and which
 is CURRIED AS ONE NEWLINE-SEPARATED BLOB — all an arg can be by the time a
-script reads it. An UNKNOWN type fails the whole tag rather than falling back
+script reads it. `{tree}` and `{commit}` bind the OBJECT rather than
+bytes naming it, so the script finds a real tree or commit at
+`/cas/args/<name>`. An UNKNOWN type fails the whole tag rather than falling back
 to a string, because silently narrowing an array parameter takes a capability
-away with nothing to notice. `tool_help` states each one's name,
+away with nothing to notice.
+
+An object parameter is still a STRING to the model — it NAMES one:
+
+- `{tree}` takes a CONVERSATION-RELATIVE PATH or a tree hash. The path resolves
+  against the conversation tree, not the source tree the tool runs in; that is
+  the vocabulary the model has, and the only one that can name a tree OTHER
+  than the one the tool is running over
+- `{commit}` takes a hash, and only a hash. A path cannot name a commit because
+  `caos resolve` traverses a gitlink to the tree inside it, so a path is
+  refused with that explanation rather than quietly yielding a tree
+- `:@@=` is never offered to an agent: a locator is resolved by the CLIENT
+  only, and an agent's evaluation runs server-side
+
+The naming rule rides in the parameter's DESCRIPTION, since that is all the
+model sees. Resolution happens when the call is validated, and what is carried
+onward is an OID: the curry happens in a later worker invocation than the
+validation, and a `/cas` path from the earlier one means nothing in the later.
+A commit then binds as `:@=` on a freshly materialized path, which preserves
+its kind — the way `merge` binds `ours`, and the reason no new arg type is
+needed for one. `tool_help` states each one's name,
 whether it is required, and its documentation as prose rather than as a JSON
 schema — the model reads it, and a schema dump is the registry that was just
 removed. A tool with no `@param` tags takes no parameters, and one that
@@ -325,22 +347,18 @@ on any of it, and each is written down because the reason is easy to lose.
   So a tool whose help lives only in a built image cannot be described. Reading
   it from the ArgTree would fix that, at the cost of `tool_help` having to
   evaluate — which for a compiled tool means building it just to describe it.
-- **Agent args are string literals only.** A human's `run-tool` passes typed
-  args through (`--x:@=path`, `--x:hash=`), an agent's cannot, so a tool that
-  wants a tree works by hand and not from an agent. Closing it means declaring
-  the KIND that lands at `/cas/args/<name>` — the tool's contract — and leaving
-  the ROUTE to the caller, since the operators differ per caller and `:@@=` is
-  client-resolved only and so cannot be offered to an agent at all.
-- **`in` is bound unconditionally, and always the whole selected tree.** So
-  `caos-test-result`, whose entire input is a hash, carries the source tree in
-  its key and re-keys on every edit; `merge`, which never reads `in`, carries it
-  too. `grep` already shows the fix — it binds only the scope being searched,
-  which is why a scoped grep is cheap.
-- **The std tools (`caos-build`, `caos-test`, `caos-test-result`) are still
-  addressed by NAME**, because they arrive as curried image args rather than as
-  paths, and an ordinary repository has no `std/`. Path-addressing them needs
-  either a reserved path for harness-supplied tools or a repository opting in by
-  mounting std.
+- **The std tools (`caos-build`, `caos-test`, `caos-test-result`) are addressed
+  by NAME, and that is now a CHOICE rather than a gap.** Path-addressing them
+  was planned and dropped: `--base:@=std/caos-test` evaluates against the
+  selected source tree's root, and an ordinary repository has no `std/`, so it
+  would work for caos' own tree and for one that mounts caos' std through a
+  `:@@=` locator and break `caos-test` everywhere else — while also losing the
+  guarantee that a harness-provided tool is always offered. The reason
+  path-addressing was right for REPOSITORY tools does not apply here either:
+  enumeration scaled badly because the set grew and changed per source tree,
+  and these are a fixed three whose declarations never move. They already read
+  their help from their images like `bash` and `merge` do, so nothing is
+  inconsistent. Revisit only if a repository needs to REPLACE one.
 - **`caos-cli run-tool` and `caos-cli run` are still separate verbs**, and
   `run-tool` does not validate against the help, so "both callers build the same
   ArgTree" is a goal rather than an invariant.

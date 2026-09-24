@@ -126,6 +126,22 @@ printf 'tried to publish an unrelated commit\n' > /tmp/ores/out
 ln -s /cas/orphancommit /tmp/ores/prop
 caos put /tmp/ores /cas/out
 EOF
+# A `{tree}` PARAMETER: the model names a tree and the script gets the tree
+# itself at /cas/args/<name>, not bytes naming it. Before declared arg types
+# every agent-supplied arg was a literal, so a tool like this worked when run
+# by hand and silently got an empty blob when an agent called it.
+#
+# It declares no `@in`: the tree it reads is the ARGUMENT, so binding the tree
+# it was run on as well would only bloat its key.
+tool countdir 'Count the files in a tree.
+@param {tree} src The tree to count.' <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get -r /cas/args/src || { echo "src did not arrive as a tree" >&2; exit 1; }
+n=$(find /cas/args/src -type f | wc -l)
+printf 'files=%s\n' "$n" > /tmp/o
+caos put /tmp/o /cas/out
+EOF
 # A directory that is NOT a tool: its expression binds no `--help`. `tool_help`
 # has to say so distinctly from "no such path", because the two have different
 # fixes.
@@ -142,7 +158,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good; write)
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"}]'
+R1='[{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_09","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_10","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/nope"}},"name":"run_tool","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -223,15 +239,16 @@ stage "a tool whose SUB-RUN dies is an is_error result, not a dead turn"
   || fail "the turn died on the failing tool instead of continuing"
 grep -qF 'the `run_tool` tool failed to run' /tmp/stub/request-2.json \
   || fail "the sub-run failure was not reported back to the model"
-# Five: the two bad `tool_help` paths, the missing required arg, the dead
-# sub-run, and the writer whose commit does not descend from its input. Every
+# Six: the two bad `tool_help` paths, the missing required arg, the dead
+# sub-run, the writer whose commit does not descend from its input, and the
+# `{tree}` argument naming a path that is not there. Every
 # one is a value the model can read, not a dead turn.
 #
 # On a mismatch this DUMPS EVERY tool_result, because the count alone says only
 # that something changed -- not which call, and not why.
 errors=$(grep -oF '"is_error":true' /tmp/stub/request-2.json | wc -l)
-if [ "$errors" != 5 ]; then
-  echo "--- $errors is_error blocks, expected 5. Every tool_result:" >&2
+if [ "$errors" != 6 ]; then
+  echo "--- $errors is_error blocks, expected 6. Every tool_result:" >&2
   jq -r '..|objects|select(.type=="tool_result")
          | "  \(.tool_use_id) is_error=\(.is_error // false): \((.content[0].text // "")[0:300])"' \
     /tmp/stub/request-2.json >&2 || true
@@ -311,6 +328,16 @@ assert_oid "$first" "the first hello task"
 # The writer, which DOES declare `@in`, keys on the tree by construction: its
 # task carries one and hello's does not.
 echo "  ok: one task for both calls, across a real tree change" >&2
+
+stage "a {tree} argument arrives as a tree, named by a conversation path"
+# hello's directory holds exactly worker.sh and .caos-expr, and a `.caos-expr`
+# is NOT stripped here: nothing is being evaluated, the tree is just read.
+grep -qF 'files=2' /tmp/stub/request-2.json \
+  || fail "the {tree} argument did not arrive as a readable tree"
+# A path that resolves to nothing is the model's mistake, named as such.
+grep -qF 'no such path: main/nope' /tmp/stub/request-2.json \
+  || fail "a bad {tree} path was not reported to the model"
+echo "  ok: a path became a tree; a bad path became a value" >&2
 
 stage "a writer's commit must descend from the one it was given"
 grep -qF 'does not descend from the commit it was given' /tmp/stub/request-2.json \

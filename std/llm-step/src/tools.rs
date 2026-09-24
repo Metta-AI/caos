@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use worker_common::{caos, entries, file_name, path, scratch};
+use worker_common::{caos, entries, file_name, path, scratch, Arg};
 
 use crate::{fresh, fresh_name, result_block};
 
@@ -199,6 +199,14 @@ pub enum ArgType {
     /// An array of strings. Curried as a blob of NEWLINE-SEPARATED elements,
     /// which is the encoding `bash` already gave its `paths` by hand.
     Lines,
+    /// A TREE, bound as the object itself rather than as bytes naming it. The
+    /// model sends a conversation-relative path or a tree oid; either way the
+    /// script finds a real directory at `/cas/args/<name>`.
+    Tree,
+    /// A COMMIT. An oid only — a conversation path cannot denote one, because
+    /// `caos resolve` traverses a gitlink to the tree inside it. The oids a
+    /// model has are the ones `log`/`show`/`diff` printed.
+    Commit,
 }
 
 impl ArgType {
@@ -206,17 +214,132 @@ impl ArgType {
         match name {
             "string" => Some(ArgType::Text),
             "array" => Some(ArgType::Lines),
+            "tree" => Some(ArgType::Tree),
+            "commit" => Some(ArgType::Commit),
             _ => None,
         }
     }
 
     /// This type's JSON Schema fragment, with `doc` as the description.
+    ///
+    /// A tree or a commit is a STRING to the model: it names one, and the
+    /// harness turns that name into the object. The naming rule is appended to
+    /// the description, because the model cannot see this enum — and the
+    /// difference between "a path" and "a hash" is the only part it has to get
+    /// right.
     fn schema(self, doc: &str) -> Value {
+        let text = |hint: &str| json!({"type": "string", "description": format!("{doc} {hint}")});
         match self {
             ArgType::Text => json!({"type": "string", "description": doc}),
             ArgType::Lines => {
                 json!({"type": "array", "items": {"type": "string"}, "description": doc})
             }
+            ArgType::Tree => text(
+                "Give a conversation-relative path (such as feature/01-change/src) \
+                 or a tree hash.",
+            ),
+            ArgType::Commit => text("Give a commit hash, such as one printed by log or diff."),
+        }
+    }
+
+    /// The object kind this type binds, or `None` when it binds bytes.
+    fn object(self) -> Option<&'static str> {
+        match self {
+            ArgType::Text | ArgType::Lines => None,
+            ArgType::Tree => Some("tree"),
+            ArgType::Commit => Some("commit"),
+        }
+    }
+}
+
+/// One bound argument, carrying HOW it binds as well as what to.
+///
+/// It survives a tail call, which is why an object is held as an OID and never
+/// as a `/cas` path: a repository tool's args are bound in a LATER worker
+/// invocation than the one that validated them (the evaluation of the tool's
+/// own path happens in between), and a `/cas` path from the earlier one means
+/// nothing in the later.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Bound {
+    /// Bytes: the literal the model sent.
+    Lit(String),
+    Tree(String),
+    Commit(String),
+}
+
+/// A [`Bound`] made ready to curry, holding whatever string the argument needs.
+///
+/// It exists because a COMMIT binds by PATH: `:@=` on a materialized CAS path
+/// preserves the object's kind, which is how `merge` already binds `ours`, and
+/// it means no new `Arg` variant — and so no change to `worker-common`, which
+/// is spliced into the seeded rustc image and therefore part of the stack's
+/// scaffolding rather than of this tool.
+pub enum ReadyArg {
+    Lit(String),
+    Hash(String),
+    Path(String),
+}
+
+impl ReadyArg {
+    pub fn arg(&self) -> Arg<'_> {
+        match self {
+            ReadyArg::Lit(value) => Arg::Lit(value),
+            ReadyArg::Hash(oid) => Arg::Hash(oid),
+            ReadyArg::Path(path) => Arg::Path(path),
+        }
+    }
+}
+
+impl Bound {
+    /// Make this binding curryable, materializing a commit on the way.
+    ///
+    /// The materialization happens HERE rather than at validation time because
+    /// a `/cas` path does not survive a tail call, while the oid inside
+    /// [`Bound::Commit`] does.
+    pub fn ready(&self) -> Result<ReadyArg, String> {
+        Ok(match self {
+            Bound::Lit(value) => ReadyArg::Lit(value.clone()),
+            Bound::Tree(oid) => ReadyArg::Hash(oid.clone()),
+            Bound::Commit(oid) => {
+                let at = fresh("arg-commit");
+                caos(["get-hash", oid, &at])?;
+                ReadyArg::Path(at)
+            }
+        })
+    }
+
+    /// The literal text, for a caller whose parameters are all `{string}`.
+    /// `None` for an object binding, which has no text form.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Bound::Lit(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The tag and value this rides under in `tool-args`, which crosses a
+    /// worker boundary as JSON.
+    pub fn encode(&self) -> Value {
+        let (kind, value) = match self {
+            Bound::Lit(value) => ("lit", value),
+            Bound::Tree(oid) => ("tree", oid),
+            Bound::Commit(oid) => ("commit", oid),
+        };
+        json!({"kind": kind, "value": value})
+    }
+
+    /// The inverse of [`Bound::encode`]. An unknown tag is a defect in this
+    /// file rather than anything a caller did, so it says so.
+    pub fn decode(value: &Value) -> Result<Bound, String> {
+        let text = value["value"]
+            .as_str()
+            .ok_or("a bound argument has no string value")?
+            .to_string();
+        match value["kind"].as_str() {
+            Some("lit") => Ok(Bound::Lit(text)),
+            Some("tree") => Ok(Bound::Tree(text)),
+            Some("commit") => Ok(Bound::Commit(text)),
+            other => Err(format!("unknown bound-argument kind {other:?}")),
         }
     }
 }
@@ -740,7 +863,24 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
 /// arg, an undeclared one, or a non-scalar value is the model's mistake, so it
 /// comes back as a ready-made `is_error` tool_result rather than a worker
 /// error — the same contract `grep_precheck` uses.
-pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, String)>, Value> {
+/// `conversation` is the tree oid a PATH-valued argument resolves against, and
+/// `None` for a caller that runs without one (the in-process history tools).
+///
+/// THE CONVERSATION TREE, not the source tree the tool runs in. A `{tree}`
+/// argument is how the model names a tree, and what it has to name one with is
+/// a conversation-relative path — the same vocabulary as the tool's own path,
+/// and the only one that can reach a tree OTHER than the one the tool runs in.
+/// Resolving against the source tree instead silently rejects
+/// `main/caos-tools/x` while accepting `caos-tools/x`, which is the opposite of
+/// what the parameter's description promises.
+///
+/// An object parameter given an oid needs no tree either way; one given a path
+/// and no tree is told exactly that, rather than resolving against a stand-in.
+pub fn tree_tool_args(
+    call: &Value,
+    tool: &TreeTool,
+    conversation: Option<&str>,
+) -> Result<Vec<(String, Bound)>, Value> {
     let id = call["id"].as_str().unwrap_or("");
     let fail = |msg: String| Err(result_block(id, &msg, true));
     let empty = serde_json::Map::new();
@@ -793,13 +933,76 @@ pub fn tree_tool_args(call: &Value, tool: &TreeTool) -> Result<Vec<(String, Stri
                 let wanted = match a.ty {
                     ArgType::Text => "a string",
                     ArgType::Lines => "an array of strings",
+                    ArgType::Tree => "a string naming a tree: a conversation path or a hash",
+                    ArgType::Commit => "a string naming a commit: a hash",
                 };
                 return fail(format!("{}'s {:?} must be {wanted}", tool.name, a.name));
             }
         };
-        out.push((a.name.clone(), value));
+        // An OBJECT parameter names a tree or a commit; everything else is
+        // bytes. Resolving here — not at bind time — is deliberate: the
+        // binding happens in a later worker invocation, so the answer has to
+        // be an oid rather than a `/cas` path.
+        let bound = match a.ty.object() {
+            None => Bound::Lit(value),
+            Some(kind) => match resolve_object(&value, kind, conversation) {
+                Ok(bound) => bound,
+                Err(why) => {
+                    return fail(format!("{}'s {:?}: {why}", tool.name, a.name));
+                }
+            },
+        };
+        out.push((a.name.clone(), bound));
     }
     Ok(out)
+}
+
+/// An oid, as git writes them: the only shape that cannot also be a path.
+fn is_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Turn what the model wrote into the object a `{tree}` or `{commit}`
+/// parameter promises, and CHECK ITS KIND.
+///
+/// A hex string of oid length is an oid; anything else is a
+/// conversation-relative path, resolved the way a tool's own path is. The
+/// heuristic is safe in the direction that matters: a path component of
+/// exactly 40 or 64 hex characters would have to be deliberate.
+///
+/// A path cannot name a commit, because `caos resolve` traverses a gitlink to
+/// the tree inside it — so `{commit}` takes an oid, and says so when it does
+/// not get one.
+fn resolve_object(value: &str, want: &str, conversation: Option<&str>) -> Result<Bound, String> {
+    let materialized = fresh("arg-object");
+    if is_oid(value) {
+        caos(["get-hash", value, &materialized])
+            .map_err(|_| format!("no object {value} — is the hash right, and pushed?"))?;
+    } else {
+        if want == "commit" {
+            return Err(format!(
+                "{value:?} is not a commit hash. A path names a tree, not a commit; \
+                 use a hash such as one printed by log, show or diff"
+            ));
+        }
+        let Some(tree) = conversation else {
+            return Err(format!(
+                "{value:?} is a path, and this tool runs without a tree to resolve \
+                 one against. Pass a tree hash instead"
+            ));
+        };
+        caos(["resolve", tree, value, &materialized])
+            .map_err(|_| format!("no such path: {value}"))?;
+    }
+    let got = worker_common::cas_kind(&materialized)?;
+    if got != want {
+        return Err(format!("{value} is a {got}, not a {want}"));
+    }
+    let oid = worker_common::cas_hash(&materialized)?;
+    Ok(match want {
+        "commit" => Bound::Commit(oid),
+        _ => Bound::Tree(oid),
+    })
 }
 
 /// The tool_result block for a tree tool's result — a VALUE whose shape the
@@ -1292,6 +1495,63 @@ mod tests {
     }
 
     #[test]
+    fn object_types_are_strings_to_the_model_and_survive_a_tail_call() {
+        let h = parse_help(
+            "t",
+            "Test a tree.\n@param {tree} src The tree to test.\n\
+             @param {commit} [against] What to compare with.",
+        );
+        assert_eq!(h.args[0].ty, ArgType::Tree);
+        assert_eq!(h.args[1].ty, ArgType::Commit);
+
+        // A tree or a commit is a STRING to the model: it names one. The naming
+        // rule rides in the description, which is all the model can see.
+        let d = tree_tool_declaration(&TreeTool::new("t", h));
+        assert_eq!(d["input_schema"]["properties"]["src"]["type"], "string");
+        let doc = d["input_schema"]["properties"]["src"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(doc.contains("The tree to test."), "keeps the author's text");
+        assert!(doc.contains("conversation-relative path"), "says how to name one");
+        let doc = d["input_schema"]["properties"]["against"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(doc.contains("commit hash"), "a commit takes a hash: {doc}");
+
+        // An oid is recognised by SHAPE, which is the only thing a path cannot
+        // also be. Both git hash widths count.
+        assert!(is_oid(&"a".repeat(40)));
+        assert!(is_oid(&"0".repeat(64)));
+        assert!(!is_oid(&"a".repeat(39)));
+        assert!(!is_oid("feature/01-change/src"));
+        assert!(!is_oid(&"g".repeat(40)), "not hex");
+
+        // A binding round-trips through `tool-args`, because the curry happens
+        // in a LATER worker invocation than the validation.
+        for bound in [
+            Bound::Lit("banana".to_string()),
+            Bound::Tree("a".repeat(40)),
+            Bound::Commit("b".repeat(40)),
+        ] {
+            assert_eq!(Bound::decode(&bound.encode()).unwrap(), bound);
+        }
+        // A literal and a tree bind straight from the oid; a commit binds by
+        // PATH, which is what preserves its kind without a new `Arg` variant.
+        assert!(matches!(
+            Bound::Lit("x".into()).ready().unwrap().arg(),
+            Arg::Lit("x")
+        ));
+        assert!(matches!(
+            Bound::Tree("abc".into()).ready().unwrap().arg(),
+            Arg::Hash("abc")
+        ));
+        assert!(matches!(
+            ReadyArg::Path("/cas/x".into()).arg(),
+            Arg::Path("/cas/x")
+        ));
+    }
+
+    #[test]
     fn in_is_opt_in_and_described() {
         // Absent means the tree is NOT bound, which is what keeps it out of the
         // cache key for a tool whose whole input is its arguments.
@@ -1341,15 +1601,16 @@ mod tests {
         // An array binds as ONE newline-separated blob -- all an arg can be by
         // the time a script reads it -- and a lone string is one element.
         let call = json!({"id":"c","input":{"cmd":"ls","paths":["a","b/c"]}});
-        let bound = tree_tool_args(&call, &tool).expect("array accepted");
-        assert!(bound.contains(&("paths".to_string(), "a\nb/c".to_string())));
+        let bound = tree_tool_args(&call, &tool, None).expect("array accepted");
+        let lines = Bound::Lit("a\nb/c".to_string());
+        assert!(bound.contains(&("paths".to_string(), lines)));
         let call = json!({"id":"c","input":{"cmd":"ls","paths":"solo"}});
-        let bound = tree_tool_args(&call, &tool).expect("lone string accepted");
-        assert!(bound.contains(&("paths".to_string(), "solo".to_string())));
+        let bound = tree_tool_args(&call, &tool, None).expect("lone string accepted");
+        assert!(bound.contains(&("paths".to_string(), Bound::Lit("solo".to_string()))));
 
         // A non-string entry is the model's mistake, named as such.
         let call = json!({"id":"c","input":{"cmd":"ls","paths":[1]}});
-        let block = tree_tool_args(&call, &tool).expect_err("number refused");
+        let block = tree_tool_args(&call, &tool, None).expect_err("number refused");
         assert_eq!(block["is_error"], true);
 
         // An UNKNOWN type fails the whole tag rather than defaulting to a
@@ -1588,16 +1849,19 @@ mod tests {
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 
-        let bound = tree_tool_args(&call(json!({"word": "banana"})), &tool).unwrap();
-        assert_eq!(bound, vec![("word".to_string(), "banana".to_string())]);
+        let lit = |value: &str| Bound::Lit(value.to_string());
+        let bound = tree_tool_args(&call(json!({"word": "banana"})), &tool, None).unwrap();
+        assert_eq!(bound, vec![("word".to_string(), lit("banana"))]);
 
-        // Scalars are stringified, since every arg reaches the script as a blob.
-        let bound = tree_tool_args(&call(json!({"word": 7, "suffix": true})), &tool).unwrap();
+        // Scalars are stringified, since a `{string}` arg reaches the script as
+        // a blob.
+        let bound =
+            tree_tool_args(&call(json!({"word": 7, "suffix": true})), &tool, None).unwrap();
         assert_eq!(
             bound,
             vec![
-                ("word".to_string(), "7".to_string()),
-                ("suffix".to_string(), "true".to_string())
+                ("word".to_string(), lit("7")),
+                ("suffix".to_string(), lit("true"))
             ]
         );
 
@@ -1606,7 +1870,7 @@ mod tests {
             json!({"word": "x", "colour": "red"}), // undeclared arg
             json!({"word": ["banana"]}),           // non-scalar value
         ] {
-            let block = tree_tool_args(&call(bad), &tool).unwrap_err();
+            let block = tree_tool_args(&call(bad), &tool, None).unwrap_err();
             assert_eq!(block["is_error"], true);
             assert_eq!(block["tool_use_id"], "toolu_01");
         }

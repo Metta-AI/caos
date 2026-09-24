@@ -328,6 +328,42 @@ concurrency.
   Nothing expensive is namespaced: the registry's `flake-<H>`, `deps-<D>` and
   `clean-<name>-` tags, the nix store, and the `caos:image:`/`caos:layer:`
   conversion memos are all keyed by content and stay shared across builds.
+- **A `rust/crates/worker-common` change does NOT reach the tools rustc
+  compiles, and `nix build && caosd up` does not fix it.** `worker-common` is
+  spliced into every source-built std tool by the rustc worker
+  (`link(arg("worker-common"), proj.join("worker-common"))`), so adding to it and
+  using that addition from, say, `std/llm-step` fails the compile INSIDE the
+  stack — `no variant ... named X found for enum Arg` — while a plain
+  `cargo build` over `rust/crates/` passes. Every command then fails, including
+  `--only=hello`, because llm-step is built while resolving the suite.
+  MEASURED, and these are the things it is NOT, each checked:
+  - not the cache namespace. `caos-stack-inputs` does move with worker-common
+    (`nix eval --raw .#caos-stack-inputs.outPath` differs across the edit) and
+    the running server had the new one (`CAOS_CACHE_NAMESPACE` in
+    `/proc/<serve>/environ`).
+  - not the redis memo. `redis-cli --scan --pattern "caos:result:*"` was EMPTY,
+    and `run_work_request` consults only that namespaced key.
+  - not `refs/caos/res/`, which is written for clients to fetch and never read
+    back as a cache.
+  - not the rustc seed. `build-builtins.sh` does `rm -rf` + `cp -RL` +
+    `git add`, and the staged blob, the worktree blob and
+    `rust/crates/worker-common/src/lib.rs` all hashed the same.
+  - not `git_ingest` reading `HEAD`: the client repo has NO commits, so
+    `is_clean` is false and the content path is taken.
+  What it points at instead is the CARGO IMAGE. `std/cargo`'s bake builds the
+  root workspace `--offline` and keeps its precompiled `target/`, so the rustc
+  worker puts each project at the bake's own baked build directory to keep those
+  fingerprints valid — visible as a build path that is IDENTICAL across runs
+  with different request hashes
+  (`/nix/var/nix/builds/nix-48-107486502/source/worker-common`). That baked tree
+  already contains a `worker-common/` from when the image was built, and the
+  image is reused by content tag (`cargo: registry hit for clean-cargo-<h>` in
+  `logs/publish.log`) — and registry tags are deliberately NOT namespaced. So the
+  spliced crate can be the bake's copy rather than the one rustc linked.
+  UNTIL THAT IS FIXED: do not put anything a std tool needs into
+  `worker-common`. A commit argument, for instance, does not need an
+  `Arg::Commit` — `:@=` on a materialized CAS path preserves the object's kind,
+  which is how `prepare_merge` has always bound `ours`.
 - If this doesn't catch everything, we need to add it to the above step
 
 

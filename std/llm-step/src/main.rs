@@ -1149,7 +1149,16 @@ fn drive_call(
     if call.name == "run_tool" {
         scoped_call.input["path"] = json!(tool_path_in_scope(call, name.as_deref())?);
     }
-    match prepare_compute(&scoped, &scoped_call, &ws, &wc, request, round)? {
+    let conversation = state.conversation()?.tree().clone();
+    match prepare_compute(
+        &scoped,
+        &scoped_call,
+        &ws,
+        &wc,
+        conversation.as_str(),
+        request,
+        round,
+    )? {
         Prepared::Result(block) => {
             site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
             Ok(true)
@@ -1325,6 +1334,9 @@ fn prepare_compute(
     call: &Call,
     ws: &str,
     wc: &str,
+    // The conversation tree oid: what a `{tree}`/`{commit}` ARGUMENT's path
+    // resolves against, which is not the source tree the tool runs in.
+    conversation: &str,
     request: &Oid,
     round: &RoundState,
 ) -> Result<Prepared, String> {
@@ -1356,7 +1368,7 @@ fn prepare_compute(
             };
             let nested = json!({"id":call.id, "input":clean["input"].get("arguments")
                 .cloned().unwrap_or_else(|| json!({}))});
-            match tools::tree_tool_args(&nested, &tool) {
+            match tools::tree_tool_args(&nested, &tool, Some(conversation)) {
                 Err(block) => Ok(Prepared::Result(block)),
                 Ok(bound) => {
                     launch_tree_evaluation(
@@ -1375,7 +1387,9 @@ fn prepare_compute(
         }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
-        name if std_tool_image(cfg, name).is_some() => prepare_std_tool(cfg, &clean, name, ws),
+        name if std_tool_image(cfg, name).is_some() => {
+            prepare_std_tool(cfg, &clean, name, ws, conversation)
+        }
         name => Ok(Prepared::Result(error_block(
             &call.id,
             &format!("unavailable tool {name:?}; use run_tool with its conversation-relative path"),
@@ -1456,17 +1470,27 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     prepared_request(&curried, &[], Some(&scope))
 }
 
-fn prepare_std_tool(cfg: &Config, call: &Value, name: &str, ws: &str) -> Result<Prepared, String> {
+fn prepare_std_tool(
+    cfg: &Config,
+    call: &Value,
+    name: &str,
+    ws: &str,
+    conversation: &str,
+) -> Result<Prepared, String> {
     let (image, arg_name) = std_tool_image(cfg, name).ok_or("std tool image is absent")?;
     let tool = tools::std_tool(name, &arg(arg_name))?
         .ok_or_else(|| format!("{name} image carries no help"))?;
-    let bound = match tools::tree_tool_args(call, &tool) {
+    let bound = match tools::tree_tool_args(call, &tool, Some(conversation)) {
         Ok(bound) => bound,
         Err(block) => return Ok(Prepared::Result(block)),
     };
-    let args: Vec<(&str, Arg<'_>)> = bound
+    let ready: Vec<(String, tools::ReadyArg)> = bound
         .iter()
-        .map(|(name, value)| (name.as_str(), Arg::Lit(value)))
+        .map(|(name, value)| Ok((name.clone(), value.ready()?)))
+        .collect::<Result<_, String>>()?;
+    let args: Vec<(&str, Arg<'_>)> = ready
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.arg()))
         .collect();
     let curried = caos_curry(Arg::Hash(image), &args)?;
     prepared_request(&curried, &[], tool.wants_in.then_some(ws))
@@ -1497,7 +1521,7 @@ fn prepared_request(
 fn launch_tree_evaluation(
     call: &Value,
     name: &str,
-    bound: &[(String, String)],
+    bound: &[(String, tools::Bound)],
     tool: &tools::TreeTool,
     ws: &str,
     wc: &str,
@@ -1507,9 +1531,12 @@ fn launch_tree_evaluation(
     let id = call["id"]
         .as_str()
         .ok_or("tool_use block has no string id")?;
+    // Each binding carries its KIND across the boundary, because the curry
+    // happens in a later invocation: an object rides as an oid, never as a
+    // `/cas` path from this one.
     let args: serde_json::Map<String, Value> = bound
         .iter()
-        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .map(|(key, value)| (key.clone(), value.encode()))
         .collect();
     let serialized = Value::Object(args).to_string();
     let me = self_curry(
@@ -1618,17 +1645,21 @@ fn launch_evaluated_tool(
     let raw = read_arg("tool-args")?;
     let parsed: Value = serde_json::from_str(&raw)
         .map_err(|error| format!("re-reading the tool's args: {error}"))?;
-    let bound: Vec<(String, String)> = parsed
+    let bound: Vec<(String, tools::Bound)> = parsed
         .as_object()
         .ok_or("tool-args is not a JSON object")?
         .iter()
-        .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
-        .collect();
+        .map(|(key, value)| Ok((key.clone(), tools::Bound::decode(value)?)))
+        .collect::<Result<_, String>>()?;
     let git = read_arg_opt("tool-git")?.is_some_and(|value| value == "1");
     let wants_in = read_arg_opt("tool-in")?.is_some_and(|value| value == "1");
-    let mut args: Vec<(&str, Arg<'_>)> = bound
+    let ready: Vec<(String, tools::ReadyArg)> = bound
         .iter()
-        .map(|(key, value)| (key.as_str(), Arg::Lit(value)))
+        .map(|(key, value)| Ok((key.clone(), value.ready()?)))
+        .collect::<Result<_, String>>()?;
+    let mut args: Vec<(&str, Arg<'_>)> = ready
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.arg()))
         .collect();
     if git {
         args.push(("wc", Arg::Path(&wc)));
