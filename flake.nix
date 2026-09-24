@@ -173,6 +173,36 @@
             "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
         };
 
+        # STRIP FIRST, THEN BLANK THE VENDOR REFERENCES. crane registers
+        # removeReferencesToVendoredSources in postInstallHooks, which runs
+        # BEFORE fixupPhase strips -- so it scans the binaries while they still
+        # carry their line-table DWARF, and that is nearly all of their bytes
+        # and nearly all of the store paths in them.
+        #
+        # Measured on this workspace: 411 MB and 11415 `/nix/store/` hits in
+        # caos-cli before stripping, 107 MB and 2042 after. The hook builds one
+        # regex alternation branch per vendored crate (498 of them), and a real
+        # vendor hash is found only by searching those branches where an
+        # already-blanked one matches the first -- so the cost is superlinear.
+        # 3.8x the bytes cost 51x the time: 66s against 1.3s on a laptop, and
+        # ~6 minutes on the dev box, paid TWICE per deploy (once building, once
+        # bringing caosd up).
+        #
+        # The order is safe: strip deletes the debug sections whether or not
+        # their paths were blanked first, and the references that survive
+        # stripping get blanked either way, so the output is byte-identical.
+        #
+        # This goes on each buildPackage rather than in commonArgs because
+        # buildDepsOnly does NOT get the hook -- crane adds it only where a
+        # package is installed -- so naming the function there fails the deps
+        # build with `removeReferencesToVendoredSources: command not found`.
+        stripThenBlankVendorRefs = {
+          doNotRemoveReferencesToVendorDir = true;
+          postFixup = ''
+            removeReferencesToVendoredSources "$out" "$cargoVendorDir"
+          '';
+        };
+
         commonArgs = {
           inherit src;
           strictDeps = true;
@@ -239,6 +269,7 @@
         # nothing extra ever lands in an image.
         workspaceBins = craneLib.buildPackage (
           commonArgs
+          // stripThenBlankVendorRefs
           // {
             inherit cargoArtifacts;
             cargoExtraArgs = "--workspace";
@@ -269,6 +300,7 @@
         # exact opposite of the intent.
         testWorkspaceBins = craneLib.buildPackage (
           commonArgs
+          // stripThenBlankVendorRefs
           // {
             inherit cargoArtifacts;
             cargoExtraArgs = "--workspace";
@@ -755,6 +787,7 @@ sandbox = false''
               };
             built = crossCrane.buildPackage (
               targetArgs
+              // stripThenBlankVendorRefs
               // {
                 cargoArtifacts = crossCrane.buildDepsOnly (
                   targetArgs // { cargoExtraArgs = cliPackages; }
@@ -792,6 +825,7 @@ sandbox = false''
           else
             craneLib.buildPackage (
               nativeArgs
+              // stripThenBlankVendorRefs
               // {
                 cargoArtifacts = nativeCliArtifacts;
                 cargoExtraArgs = cliPackages;
