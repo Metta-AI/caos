@@ -1,13 +1,18 @@
 # Cloud session setup
 
-A claude.ai/code session provisions caos from four bash scripts totalling 1833
+A claude.ai/code session provisioned caos from four bash scripts totalling 1833
 lines (735 of code): `setup.sh`, `install.sh`, `caos-pin.sh`, `session-start.sh`.
 Three assumptions shaped that arrangement and **all three are false**, measured
-2026-09-23. Correcting them makes most of the machinery redundant and the rest a
-single stdlib-only Go program, run by `go run` (SPEC:425).
+2026-09-23. Correcting them made most of the machinery redundant and the rest two
+stdlib-only Go programs run by `go run` (SPEC:425), plus a small third for the
+session hook.
 
-Nothing in this document is built yet. The current arrangement is described in
-`integrations/claude-code/cloud/README.md`.
+**This is built.** `bootstrap.go`, `install.go` and `session.go` replace the four
+scripts, `tests/cloud-setup` covers them, and
+`integrations/claude-code/cloud/README.md` documents the result. Two of this
+plan's own proposals were refused on the way and then reached by a different
+route; both detours are recorded below rather than tidied away, because the
+reasoning that produced them is easy to repeat.
 
 ## What actually happens when a session starts
 
@@ -25,7 +30,7 @@ One container per session, from the platform's `env_manager_log` plus in-session
 
 **The setup script is the per-session entrypoint, and it is the only one that
 precedes Claude Code.** Everything else caos owns — the `SessionStart` hook,
-`caos-serve` — runs after Claude Code has launched and read its configuration.
+`caos-serve` — ran after Claude Code had launched and read its configuration.
 
 ## The three false assumptions
 
@@ -54,13 +59,13 @@ is the reason `session-start.sh` re-reads the pin and re-runs `install.sh`, and
 the reason `caos-serve` curls `install.sh` before exec'ing the tool server.
 Both redo work setup already did, in the same container, seconds earlier.
 
-## The target
+## The arrangement
 
 ```sh
 # the environment's setup field, in full
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server="caos://<ticket>" \
-    --dev-server="caos://<ticket>" --enable-bash
+    --dev-mode --enable-bash
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, with
@@ -69,10 +74,11 @@ works and leaves no artifacts, **provided the program imports only the
 stdlib** — a module fetch would have to reach `proxy.golang.org`, and the setup
 phase is the phase that answers 503 for every n0 relay.
 
-**Everything arrives as an argument, including the server ticket.** Whether the
-setup phase can read the environment's variables is then not a question anyone
-has to answer, and setup can do the work that today waits for the hook because
-only the hook sees `CAOS_SERVER_URL`.
+**Everything arrives as an argument, including the server ticket, and the ticket
+is named ONCE.** The setup phase cannot read the environment's variables, so a
+server named only there is a remote that appears after the tool server has
+started without one. `--dev-mode` is a mode rather than a second server: it takes
+the install package from the server `--server` already names.
 
 ### Two stages, because the installer is part of the payload
 
@@ -110,13 +116,16 @@ anyway. Stage 2 then costs almost nothing, because stage 1 has just compiled the
 same stdlib packages, so long as it imports the same set.
 
 The container is fresh every session, so this is paid every session unless
-`/root/.cache/go-build` ships warm in the image — unmeasured, and worth knowing
-before accepting ~3s on top of ~15s.
+`/root/.cache/go-build` ships warm in the image (see *Closed questions*).
 
 ### Size
 
-Stage 1 and stage 2 together replace `setup.sh`, `install.sh` and
-`caos-pin.sh` — 1388 lines of bash — with an estimated 450-550 lines of Go.
+Stage 1 and stage 2 replace `setup.sh`, `install.sh` and `caos-pin.sh` — 1388
+lines of bash — with 1258 lines of Go, 945 of them code. The estimate was
+450-550, and it was wrong in the direction worth knowing: the error messages
+survived. They are most of what those scripts were, and they are why an
+environment that is misconfigured says so instead of starting and behaving oddly.
+`session.go` is 219 against `session-start.sh`'s 445.
 
 **The win is not line count.** Go is wordier per operation. It is
 `encoding/json` instead of a `jq` program and `@sh` quoting, errors instead of
@@ -125,20 +134,43 @@ these scripts but a four-minute cloud round trip.
 
 ## Two design changes to make at the same time
 
-**The dev rewrite belongs in the seed commit, not on the worktree.** Setup
-currently rewrites `.caos-expr` and `flake.lock` on disk so that `caos-std/`
+### Done, but only after a detour worth recording
+
+The first attempt refused this, on a reading that was correct about the code and
+wrong about what to do. `resolve_cli_image_with_store` resolves a
+`--llm-step:@=<path>` by `t.ingest_path(".")` — the tracked working tree, dirty
+edits included — and nothing about `mcp serve`'s `--base` reaches that walk. So
+the seed commit decided what the CONVERSATION recorded while the worktree decided
+which tools the server resolved, and rewriting only the seed would have produced
+exactly the half-update the rewrite exists to prevent: a dev client evaluating the
+committed tools.
+
+The conclusion drawn from that — "the worktree rewrite stays" — treated the
+client's resolution rule as fixed. It is not, and it was the thing that was
+wrong: a recorded conversation has a base commit, and resolving its step anywhere
+else is a gap between what a session runs and what it records, dev mode or not.
+`resolve_cli_image_arg_in_tree` closes it, `mcp`'s two resolution sites pass the
+base commit's tree, and stage 1 now builds the rewrite in a throwaway index only.
+
+The checkout stays clean, and the Stop-hook friction below is gone with it.
+
+The original reasoning follows, because it is what the change is for.
+
+Setup used to
+rewrite `.caos-expr` and `flake.lock` on disk so that `caos-std/`
 resolves from the dev stack. That leaves the checkout dirty with a `caos://`
 ticket, which is a credential. Observed in both test sessions: the client repo's
 Stop hook demanded the changes be committed, and the agent had to reason its way
 to declining — "it bakes an ephemeral dev-mode endpoint URL … into the repo, on
 `main`". Correct judgement, but judgement, not a mechanism.
 
-The seed commit is already minted through a throwaway index (`git commit-tree`,
+The seed commit was already minted through a throwaway index (`git commit-tree`,
 unreferenced, so no push can carry it). Building the rewritten content only in
-that index leaves the worktree untouched: the conversation still seeds from the
-dev pin through `caos mcp hook --base=<sha>`, and the ticket never enters a file
-anyone can commit. Verify first that nothing reads the worktree's expression
-directly.
+that index leaves the worktree untouched: the conversation seeds from the dev pin
+through `caos mcp hook --base=<sha>`, the step resolves in that same commit, and
+the ticket never enters a file anyone can commit. "Verify first that nothing
+reads the worktree's expression directly" was the right instruction; something
+did, and the answer was to change it.
 
 **The bootstrap shrinks to `git-remote-caos`.** In dev mode the pinned GitHub
 release is downloaded for one reason: the dev fetch speaks `caos://`, and git
@@ -150,32 +182,52 @@ speaks it only through that helper. Fetch the helper, not the whole client.
   needed the same answer. One Go program has no such problem.
 - `session-start.sh`'s pin re-read and client refresh, and `caos-serve`'s
   curl-refresh: redundant per the third false assumption.
-- `mcp.json`'s step-locator rewrite. `install.sh` rewrites the locator into
-  `args`, then sets `command: "caos-serve"` — a generated shim that execs
-  `caos mcp serve` with its own arguments. Only a fallback branch for a build
-  that cannot name its commit reads those `args`.
-- `install.sh`'s release resolution whenever `--dev-assets` is set (87 code
-  lines skipped on that path today).
+- `caos-serve`, and this went the other way round from the plan. The shim was
+  what made `mcp.json`'s `args` dead, so what is deleted is the SHIM: the
+  configuration now names `caos` with `mcp serve --llm-step:… --base=…` as
+  ordinary argv, and there is no generated shell script in the arrangement at
+  all. The shim existed only to re-install the client before exec'ing it, which
+  the third false assumption paid for.
+- The release resolution on the dev path (87 code lines skipped there today):
+  stage 2 installs from a local directory in both modes, so there is one path.
 - The comments. They narrate the journey rather than the decisions a reader
   might undo, against SPEC:426; 54-60% of these files is prose. The journey
   belongs in commit messages, which already carry it.
 
 ## Where the registry warm goes
 
-Into setup. Today the `SessionStart` hook resolves `--llm-step` and fills the
-cache `mcp serve` reads, racing the tool server Claude Code spawns in parallel
-with the hook — and blocking the session until the hook's output stream reaches
-EOF. In setup it simply precedes the tool server, so the first turn has its
-tools rather than racing a resolve it cannot see.
+It stays in the hook, and the reason was the NETWORK rather than the ordering.
+The setup phase egresses through a TLS-terminating gateway that answers 503 for
+all seven n0 relays, so a ticket carrying one of those was reachable only from a
+session, and a warm moved into setup would have silently failed for every such
+environment.
 
-## Open questions
+That premise has since been removed rather than answered: n0's relays are no
+longer used at all, so every ticket now names a relay the operator runs and the
+setup phase can reach it. The warm COULD move. It has not, because nothing has
+measured it there, and an unmeasured move of the one step that decides whether a
+first turn has tools is not an improvement.
 
-1. **Is `/root/.cache/go-build` warm in the container image?** Decides whether
-   the ~3s cold compile is paid once per session or not at all. One session,
-   with `--enable-bash`: `du -sh` it and time a trivial `go run`.
-2. **A third data point on per-session setup**, hours later, environment
-   untouched. Two consecutive sessions in one evening is thin evidence for
-   deleting a refresh path.
+The ordering argument was right and is not enough. What the hook keeps from it:
+the warm marker is claimed BEFORE the warm starts, because Claude Code spawns the
+tool server in parallel with the hook.
+
+The remote and the unshallow did move into setup: neither needs a relay, and the
+remote is what a session's first tool call cannot survive the absence of.
+
+## Closed questions
+
+Both of the measurements this plan wanted first were dropped as not worth a
+session, and neither changes anything structural.
+
+1. **Is `/root/.cache/go-build` warm in the container image?** Unmeasured. It
+   matters less than it looked: the setup phase runs two Go programs, so by the
+   time the hook runs a third, the packages it needs are compiled in that
+   container whatever the image shipped. The worst case is one cold compile
+   (~2.8s) against the ~15s the phase already costs.
+2. **A third data point on per-session setup.** Not taken. Two consecutive
+   sessions plus the platform's own `Running setup script` line in every
+   `env_manager_log` is the evidence this rests on.
 
 Two earlier questions are closed rather than answered. Whether setup can read
 environment variables no longer matters, because everything is passed as an
@@ -185,27 +237,74 @@ dependency, that is the question they have to answer first.
 
 ## What remains for a `SessionStart` hook
 
-Very little. With the ticket passed as an argument, setup adds the `caos` git
-remote, unshallows, and warms the registry — all three before Claude Code
-starts, rather than racing it.
-
-What is genuinely left is one line of stdout naming the build, stdout being the
-only stream a session keeps: hook stderr is captured as a non-transcript event
-and dropped. That is a hook of a few lines, not a 445-line script.
+`session.go`, and not much of it. Setup adds the `caos` remote and unshallows
+before Claude Code starts; the hook warms the registry, reports a missing remote
+without repairing it, and prints one line of stdout naming the build. Stdout,
+because that is the only stream a session keeps: hook stderr is captured as a
+non-transcript event and dropped.
 
 ## Testing
 
-`tests/cloud-setup`, which does not exist in any form today: run the program
-against a fixture checkout and a fixture asset directory, and assert the
-installed tree, the written JSON, the seed commit's content and the stamp. Cloud
-sessions then confirm integration instead of carrying all of it.
+`tests/cloud-setup` is a `std/go` worker test over both stages: a fixture
+checkout that pins caos, a release-shaped package, a dev-shaped tree, and
+assertions on the installed tree, the written JSON, the rewritten expression and
+lockfile, the seed commit's content and parent, and both stamps — including that
+neither carries the ticket. No network, no server, no client.
+
+It found two real defects on its first run, both of which a cloud session would
+have reported as something else: stage 2 wrote its wrapper into a `bin/` it had
+not created, and a home that does not exist was skipped silently, which would
+have produced a session with a working client and no tools.
+
+`std/go` gained `gitMinimal` for it. A Go worker that shells out to git is an
+ordinary shape here, and the alternative was a second Go image.
 
 Per step: `nix build` (the flake's `src` filter does not see what cargo sees),
 `run-tool caos-test`, then one session. No environment bump is needed to pick up
 a new `refs/caos/dev` — setup re-fetches it every session.
 
-## Order
+## What the settings form now holds
 
-Phase 0 (the open questions) → the seed-commit change and `setup.go` together →
-the hook → the deletions. One commit each, on a branch off `main` taken after
-`dev-mode-whole-package` lands.
+```
+B=https://raw.githubusercontent.com/Metta-AI/caos/main
+curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
+```
+
+`--dev-mode` is the third argument, and `--enable-bash` the
+fourth. `CAOS_SERVER_URL` is not set at all. Deleting the four scripts means an
+environment still pointing at
+`setup.sh` gets a 404 — and `curl -f … | bash` exits ZERO on one, installing
+nothing and reporting success — so the line has to change in the same breath as
+the merge.
+
+## The relay is required, and n0's are never used
+
+Not a cleanup item — it came out of the cleanup breaking a live environment.
+Bringing the stack up without `CAOS_IROH_RELAY` re-minted its ticket with an n0
+relay: same endpoint id, same token, so the ticket sitting in the environment
+still looked current, while the next session died in its setup phase with
+`connecting to <id>: timed out`. The cause was a whole phase away from the
+symptom, and nothing on either side said the relay had moved.
+
+A default that can only ever be wrong is worth deleting rather than documenting.
+So:
+
+- `caos-iroh serve --relay <url>` is required, with no fallback.
+- `caosd up --iroh` refuses to start without `CAOS_IROH_RELAY`, and says how to
+  run one.
+- the stack's bring-up refuses too, since it is where the message gets read.
+- the endpoint builder uses `presets::Minimal` rather than `presets::N0`, so
+  nothing reaches n0 for a relay, a pkarr publisher or a DNS lookup. A `caos://`
+  ticket carries the endpoint id, the relay and the direct addresses, which is
+  everything a dial needs.
+- the client takes its relay map from the TICKET, so it no longer connects to an
+  n0 relay as its own home relay before dialling anything.
+- `proxy_from_env()` is gone from both ends. It existed to reach n0's TLS relays
+  through a restrictive egress, and it actively broke a plaintext relay: iroh
+  routes every relay dial through a configured proxy, so `http://<relay>/` was
+  dialled as `CONNECT <host>:80` and timed out, while curl — which consults only
+  `http_proxy` for an `http://` URL — went direct and answered 200.
+
+What stays is the OS trust store (`CaTlsConfig::system()`), for an `https://`
+relay behind a TLS-intercepting proxy.

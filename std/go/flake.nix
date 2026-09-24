@@ -152,6 +152,11 @@
             pkgs.go
             pkgs.bash
             pkgs.coreutils
+            # git, for the one thing caos has no verb for: refs, and the
+            # plumbing a script reaches for around them (commit-tree into a
+            # throwaway index, in tests/cloud-setup). ~50MB against the build
+            # cache's ~500MB, and the alternative was a second Go image.
+            pkgs.gitMinimal
           ];
           config = {
             Env = [

@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 
 use caos::{
     build_secret_store, compute_client_request_with_store, curry_client_object,
-    prepare_client_request_with_store, resolve_cli_image_arg, run_client_request_with_store,
-    ClientSecret, GitTransport, Transport, CAOS_REMOTE,
+    prepare_client_request_with_store, resolve_cli_image_arg, resolve_cli_image_arg_in_tree,
+    run_client_request_with_store, ClientSecret, GitTransport, Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
     apply, client_signature, inherited_signature, mint, Transition,
@@ -124,6 +124,20 @@ fn resolve_image_arg(
 ) -> Result<String, String> {
     let argument = argument.ok_or_else(|| missing_image_arg(name))?;
     resolve_cli_image_arg(t, argument, store).map_err(|error| format!("--{name}: {error}"))
+}
+
+/// [`resolve_image_arg`] against a named tree rather than the working directory —
+/// what a recorded conversation uses, so its tools come from the tree it records.
+fn resolve_image_arg_in_tree(
+    t: &GitTransport,
+    tree: &str,
+    argument: Option<&str>,
+    name: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let argument = argument.ok_or_else(|| missing_image_arg(name))?;
+    resolve_cli_image_arg_in_tree(t, tree, argument, store)
+        .map_err(|error| format!("--{name}: {error}"))
 }
 
 /// What to tell someone who did not pass `--<name>`. Both spellings, because

@@ -5,10 +5,10 @@ hook` records the conversation, `caos mcp serve` is the tool server — one
 downloaded binary), and a **caos server** to point it at. Neither requires the
 repository to carry anything.
 
-The caos server is named by a **ticket**: `CAOS_SERVER_URL=caos://<ticket>`, and
-the client speaks that transport itself (`design/iroh-transport.md`). The
-container only ever connects OUT — nothing listens for an inbound shell, which
-is what the sandbox refuses.
+The caos server is named by a **ticket**, once, on the setup line —
+`--server=caos://<ticket>` — and the client speaks that transport itself
+(`design/iroh-transport.md`). The container only ever connects OUT; nothing
+listens for an inbound shell, which is what the sandbox refuses.
 
 There is no tunnel process and no local port. This used to be a `dumbpipe`
 connector the session hook started on `127.0.0.1:19090`, with a liveness poll, a
@@ -18,10 +18,37 @@ smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
 every request paid a fresh connection — the reason `/eval-locator` exists — while
 the client now holds ONE connection and opens a stream per request.
 
-These four scripts are due to be replaced by one Go program run from the setup
-field; [`design/cloud-setup.md`](../../../design/cloud-setup.md) has the plan and
-the measurements that motivate it, including the three assumptions in this
-document that turned out to be false.
+## Three programs, run by `go run`
+
+What was four bash scripts (1833 lines) is now three Go programs (about 1100,
+comments included), because the assumption they were arranged around was false:
+**the setup script runs on every session**, not once before a snapshot. So the
+pin re-read and the client re-install that a session hook was doing were redoing
+work done seconds earlier in the same container.
+[`design/cloud-setup.md`](../../../design/cloud-setup.md) has the measurements.
+
+| | |
+|---|---|
+| `bootstrap.go` | stage 1: read the repo's pin, fetch the payload, run stage 2, leave the session ready |
+| `install.go` | stage 2: put the package in place and write Claude Code's configuration |
+| `session.go` | the `SessionStart` hook: warm the tool registry, say which caos this is |
+
+**Two stages, because the installer is part of the payload.** Stage 1 is the only
+thing fetched from `--base`; it then runs the `install.go` it finds in the
+release (or, in dev mode, in `refs/caos/dev`), so an edit to the installer
+reaches the next session with no push. Stage 1 re-execs the dev tree's own copy
+of itself for the same reason.
+
+**Stdlib only, and `curl`/`git` rather than `net/http`.** A module fetch would
+have to reach `proxy.golang.org`, and the setup phase is the phase that answers
+503 for every n0 relay; importing `net/http` also doubles the cold compile (5.7s
+against 2.8s) for something `curl` already does. A warm `go run` is 63ms, and by
+the time the hook runs, two Go programs have already primed the container's build
+cache.
+
+`tests/cloud-setup` covers both stages against fixture trees — a checkout that
+pins caos, a release-shaped package, a dev-shaped tree — with no network and no
+server. Before it, nothing tested any of this but a four-minute cloud round trip.
 
 ## The session starts from a CLIENT repo, not from the code
 
@@ -42,17 +69,19 @@ with the repository, and all of it landed before the first turn. Now the
 server fetches the repository itself, once, and the container's checkout is the
 client repo.
 
-Measured on a client repo: the session hook reaches `unshallow done` at
-**+3s**, refresh included. The unshallow is kept rather than deleted — a fork
-that accumulates history still needs it, and at this size it costs nothing.
+The unshallow is kept rather than deleted — a fork that accumulates history
+still needs it — but it runs in the setup phase now rather than in the hook,
+where it was measured at +3s on a client repo. Nothing a session does has to wait
+for it there.
 What a large TARGET repository costs was not measured before the change and is
 not claimed here; what changed is that it is no longer on this path at all.
 
-The client repo is also the **version knob**. `setup.sh` reads its `flake.lock`
+The client repo is also the **version knob**. Stage 1 reads its `flake.lock`
 before installing anything, so the client binary, the tools and the tree the
-session evaluates all come from the commit the repo pins — and
-`session-start.sh` re-reads it every session, because the environment snapshot
-freezes whatever setup resolved. `caos-pin.sh` is that reader, used by both.
+session evaluates all come from the commit the repo pins. It is read once per
+session rather than twice: the setup phase runs every session, so a repo that has
+re-pinned is picked up there, and a second reader in the hook could only ever be
+the stale one of the two.
 
 With caos reachable at a path in the checkout (`caos-std/`, from the repo's
 root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
@@ -74,9 +103,11 @@ found the hooks firing from `/root`. The CLI runs as root, even though the repo
 sits at `/home/user/repo` and Claude's own state under `/home/claude/.claude`.
 All three are written anyway; it costs nothing.
 
-`SessionStart` is what makes it repo-independent. The client finds caos through
-a `caos` git remote and an arbitrary checkout has none, so the hook adds it per
-session, from user-level settings rather than anything committed.
+Nothing has to be committed to a session repo for it to reach a server, either.
+The client finds caos through a `caos` git remote and an arbitrary checkout has
+none, so stage 1 adds it from its `--server` argument, before Claude Code starts.
+That is the only place a server is named: the hook reports a missing remote and
+does not repair one.
 
 **The checkout is there before the setup script runs**, which is what lets the
 pin be read that early — and reading it early matters, because work done after
@@ -112,25 +143,37 @@ scripts* — everything else is read back out of it):
 
 ```
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
-curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B"
+curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
 ```
 
-This `--base` says where `setup.sh`, `caos-pin.sh` and `session-start.sh` come
-from, and **only** that. It does not choose the caos that gets installed — the
-repository's `flake.lock` does, and `install.sh` accepts nothing but a full
+`go1.24.7` is on the box at `/usr/local/go/bin/go`, and a single stdlib-only file
+with no `go.mod` runs and leaves no artifacts.
+
+This `--base` says where `bootstrap.go` comes from, and **only** that. It does
+not choose the caos that gets installed — the repository's `flake.lock` does, and
+stage 1 accepts nothing but a full
 commit sha, so the branch here can never become the client. A repository that
 pins no caos does not fall back to this branch; setup fails, naming what is
 missing. The line above then never needs editing
 again.
 
-**Environment variable**: `CAOS_SERVER_URL`, holding either —
+**The server**: `--server=` on the line above, **required**, holding either —
 - `caos://<ticket>` — what `caosd ticket` prints on the machine running the
   server (brought up with `caosd up --iroh`). Reachable from anywhere.
 - a plain `http://…` URL, when the server is reachable without one.
 
-`CAOS_SERVER_URL` is a **credential** when it is a ticket: whoever holds it can
-drive that server, which runs containers and holds every secret. The status tool
-redacts it rather than printing it for a model to quote.
+**No environment variable.** `CAOS_SERVER_URL` is not read. The setup phase
+cannot see the environment's variables, so a server named there would produce a
+`caos` remote that appears only after Claude Code has started without one — and
+one ticket in one place cannot fall out of step with itself. A setup line with no
+`--server` fails immediately; an environment still setting the variable is
+reported by `caos_status` as unread rather than ignored.
+
+It is a **credential** when it is a ticket: whoever holds it can drive
+that server, which runs containers and holds every secret. The status tool
+redacts it rather than printing it for a model to quote, and the stamps stage 1
+writes carry the revision but never the ticket.
 
 **For private repositories**, two more, both named by the client repo's
 committed `.caos-secrets/github-token` rather than by anything here:
@@ -154,9 +197,9 @@ decision: an ambient token with no entropy would otherwise have run with no
 cache isolation at all.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
-client), `api.anthropic.com`, and iroh's relays are reachable from a SESSION;
-the setup phase is a different path and refuses the n0 relays (see *Dev mode*
-below, which is the only thing that needs them that early).
+client), `api.anthropic.com`, and your own relay are reachable from both phases.
+n0's relays are not used at all — the setup phase answers 503 for every one of
+them, which is why the relay is a required setting (see *Dev mode* below).
 
 One thing the container needs that a laptop does not: the **OS trust store**.
 Egress here is a TLS-intercepting proxy, so the relay presents the proxy's
@@ -173,21 +216,29 @@ machine, with no push and no CI:
 
 ```
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
-curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B" \
-  --dev-server=caos://<ticket>
+curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
+  --dev-mode
 ```
 
 `caosd up --iroh` publishes the working checkout to `refs/caos/dev` on that
 server: one commit carrying the tree and the x86_64 binaries built from it.
-`setup.sh` fetches that commit and takes **everything** from it — the client,
-`git-remote-caos`, `settings.json`, `mcp.json`, the installer, and this script
-itself (re-exec'd once from the dev tree, so an edit here is in the package like
-anything else). It then repoints the checkout's `.caos-expr` and `flake.lock` at
+Stage 1 fetches that commit and takes **everything** from it — the client,
+`git-remote-caos`, `settings.json`, `mcp.json`, the installer, the session hook,
+and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already
+fetched, so an edit to stage 1 is in the package like anything else). It then
+repoints the checkout's `.caos-expr` and `flake.lock` at
 `git+caos://…?rev=<dev>`, so the tools resolve from there too.
 
+**The CHECKOUT IS LEFT CLEAN.** The rewrite exists only in that unreferenced
+commit, built through a throwaway index, so nothing puts a `caos://` ticket — a
+credential — in a file an agent can be asked to commit. This works because the
+session resolves `--llm-step:@=<std>/llm-step` in the commit it seeds from
+(`resolve_cli_image_arg_in_tree`) rather than by ingesting `"."`: one place holds
+the dev pin, and a session's `git status` is empty.
+
 It is an **argument, not an environment variable**: the setup phase does not get
-the environment's variables. Measured — a session stamped `off` while the
-environment plainly set `CAOS_DEV=1`, which is why that variable is gone.
+the environment's variables at all.
 
 Two things are less obvious and both cost a session to find:
 
@@ -206,14 +257,24 @@ Two things are less obvious and both cost a session to find:
 succeeded; `caos_status` and the session hook both report from it, and each
 step is fatal, so the file existing is the claim.
 
-**The relay has to be one of yours.** The setup phase reaches the network
-through a TLS-terminating gateway that answers **503** for all seven n0 relays
-(measured; controls on the same network pass), while the session hook, which
-egresses through a local `CONNECT` proxy, reaches them fine. A dev stack's
-ticket carries only private addresses, so the relay is the only path — run
-`iroh-relay --dev` on a host of your own and point `CAOS_IROH_RELAY` at it
-(`prod/caosd/configuration.nix` has a unit for it). **Port 80 or 443 only**:
-both phases carry standard ports and time out on anything else.
+**The relay has to be one of yours, and is REQUIRED.** The setup phase reaches
+the network through a TLS-terminating gateway that answers **503** for all seven
+n0 relays (measured; controls on the same network pass). caos therefore never
+uses them — not as a relay, not for discovery — and there is no default to fall
+back to: `caos-iroh serve --relay` takes the URL, `caosd up --iroh` refuses to
+start without `CAOS_IROH_RELAY`, and the stack's bring-up refuses too.
+
+Refusing beats defaulting because of the shape of the failure: a ticket carrying
+an unreachable relay keeps its endpoint id and token, so it is indistinguishable
+from the one already in an environment, while every session against it dies in its
+setup phase with `connecting to <id>: timed out` — a whole phase from the cause.
+
+Run `iroh-relay --dev` on a host of your own (`prod/caosd/configuration.nix` has
+a unit for it) and bring the stack up with
+`CAOS_IROH_RELAY=http://<host>/ caosd up --iroh`. **Port 80 or 443 only**: both
+phases carry standard ports and time out on anything else. An `http://` relay is
+fine — the relay hop carries no plaintext payload, since traffic stays
+end-to-end encrypted between endpoint keys.
 
 ## The ticket keeps working; a re-keyed server does not
 
@@ -233,7 +294,7 @@ environment's.
 
 Measured end to end, a fresh session on a correctly-ticketed environment:
 
-- **hooks fire** — `SessionStart` adds the `caos` remote;
+- **hooks fire** — `SessionStart` warms the tool registry;
   `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
   is honoured, `caos mcp serve` is spawned, and the model can call it.
@@ -264,15 +325,18 @@ remote set — it prints the real reason, which the session never does.
 
 ## The setup-time budget
 
-The setup script is asked to finish in roughly five minutes so the filesystem
-snapshot can be taken, and a cold `nix build` of this tree will not fit. That
-matters more than a slow first run: work done AFTER the snapshot is never cached,
-so a build deferred into a hook is paid again by **every** session.
+The setup script is asked to finish in roughly five minutes, and a cold
+`nix build` of this tree will not fit. Measured, the whole of stage 1 and stage 2
+is **~15s**: a release download, and on the dev path a `refs/caos/dev` fetch.
+Nothing compiles in the container but the two Go programs themselves.
 
-`setup.sh` therefore only DOWNLOADS the client (a static binary from the
-release), and the per-session hook re-runs the installer — which stops at one
-`ls-remote` when the build is already current. Nothing compiles in the
-container.
+Deferring work to a hook buys nothing, and that is the correction this
+arrangement is built on: the setup script runs on **every** session, so there is
+no cheap phase and no expensive one. What is left in the hook is there for a
+different reason: the registry warm talks to the caos server, and the setup phase
+reaches a relay only when it is one of yours — which it now always is, so the
+warm could move. It has not been measured there, and the hook is where it is
+proven.
 
 ## A separate, untested direction: the stack in the container
 

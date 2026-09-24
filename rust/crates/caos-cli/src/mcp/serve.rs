@@ -550,31 +550,22 @@ fn diagnostics() -> String {
     // Where the env came from, stamped once at setup.
     d.push_str("env stamp (/usr/local/share/caos/setup-stamp):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
-    // WHAT THE ENVIRONMENT NAMED, before what the repo got. A missing `caos`
-    // remote is nearly always one of these two lines: nothing named a server, or
-    // the variable that names one has moved and the environment still sets the
-    // old one. That failure is otherwise explained only in a hook log, which a
-    // cloud session cannot read -- this tool is the surface it has.
-    d.push_str(&format!(
-        "CAOS_SERVER_URL: {}\n",
-        match std::env::var("CAOS_SERVER_URL") {
-            Ok(url) => redact_secrets(&url),
-            Err(_) => "<unset>".to_string(),
+    // A VARIABLE NOTHING READS IS NAMED, not silently ignored. The server is
+    // named by the setup line's `--server=<url>`, which adds the `caos` remote
+    // below; an environment still setting one of these is configuration left
+    // behind. Reported here because a cloud session cannot read the hook's log,
+    // and a missing remote reported on its own sends whoever is debugging it to
+    // the repository, which is the one thing that is not wrong.
+    for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
+        if std::env::var_os(name).is_some() {
+            d.push_str(&format!(
+                "{name}: set, and nothing reads it -- the setup line's \
+                 --server=<url> is what names the server now\n"
+            ));
         }
-    ));
-    if std::env::var_os("CAOS_IROH_TICKET").is_some() {
-        d.push_str(
-            "CAOS_IROH_TICKET: set, and nothing reads it \
-             -- set CAOS_SERVER_URL to the ticket instead\n",
-        );
     }
-    // The remote the client dials -- present means session-start added it.
-    // REDACTED, because a `caos://` remote is the capability itself and this
-    // output is quoted verbatim by a model.
-    d.push_str(&format!(
-        "caos remote: {}\n",
-        redact_secrets(&caos_remote())
-    ));
+    // The remote the client dials -- present means the setup phase added it.
+    d.push_str(&format!("caos remote: {}\n", caos_remote()));
     // Whether git can reach a `caos://` remote, which is a DIFFERENT question
     // from whether this client can: the client speaks the transport itself,
     // while git execs `git-remote-caos` by name for every push and fetch. A
@@ -610,7 +601,16 @@ fn diagnostics() -> String {
     d.push_str(&indent(&tail(&read_file("/tmp/caos-warm.log"), 10)));
     // Whether a warm cache was on disk for THIS serve to load at startup.
     d.push_str(&format!("registry cache: {}\n", registry_cache_state()));
-    d
+    // REDACTED ONCE, OVER THE WHOLE DOCUMENT, rather than field by field. A
+    // `caos://` URL is the capability to drive that server and this text is
+    // quoted verbatim by a model into a transcript; most of what is above comes
+    // from OTHER processes -- the phase journal's git command lines, the warm
+    // log, git's own errors -- which quote the remote URL in full and cannot be
+    // asked not to. Redacting the assembled text is what makes that safe by
+    // construction, so a field added later is covered without anyone
+    // remembering. It is also why nothing below here re-redacts: applied twice,
+    // the second pass mangles the first pass's marker.
+    redact_secrets(&d)
 }
 
 /// A one-line note on the on-disk tool-registry cache: present with how many
@@ -1060,6 +1060,31 @@ mod redaction_tests {
         assert!(shown.contains("redacted"), "{shown}");
     }
 
+    /// A ticket reaches this text from processes that do not know it is a
+    /// secret: git quotes the remote URL in its own errors, and the phase
+    /// journal carries the whole `git push` command line. Observed in a cloud
+    /// session, whose agent redacted the leak by hand before reporting it.
+    #[test]
+    fn a_ticket_quoted_by_another_process_is_redacted_too() {
+        let ticket = "caos://endpointabcq3jd3du66g5amur4rvkvqnwbvnais4wfpynkvcjo.\
+                      8507a32d93dabb5d70a2a0d9631596413cbfb15988ed3e76a6417e4127f11b68";
+        let journal = format!(
+            "phase journal (most recent last):\n  \
+             push-failed: 7662 after 0.6s: git push --progress {ticket} 7662:refs/caos/req/7662\n  \
+             warm log: fatal: could not read from remote repository {ticket}\n"
+        );
+        let shown = redact_secrets(&journal);
+        assert!(
+            !shown.contains("8507a32d93dabb5d70a2a0d9631596413cbfb15988ed3e76a6417e4127f11b68"),
+            "a token survived in a line this process did not write: {shown}"
+        );
+        assert_eq!(
+            shown.matches("redacted").count(),
+            2,
+            "every occurrence must be redacted, not just the first: {shown}"
+        );
+    }
+
     #[test]
     fn an_http_remote_is_left_alone() {
         let line = "caos remote: http://localhost:9090";
@@ -1069,20 +1094,22 @@ mod redaction_tests {
 
 #[cfg(test)]
 mod env_diagnostic_tests {
-    /// The status text must NAME the variable that moved, because a cloud
-    /// session cannot read the hook's log and this tool is all it has. A
-    /// misconfigured environment reported only as "no caos remote" sends whoever
-    /// is debugging it looking at the repository instead of the env.
+    /// The status text must NAME a variable nothing reads, because a cloud session
+    /// cannot read the hook's log and this tool is all it has. A misconfigured
+    /// environment reported only as "no caos remote" sends whoever is debugging
+    /// it looking at the repository instead of the env.
     #[test]
-    fn the_diagnostics_mention_both_server_variables() {
+    fn the_diagnostics_name_the_variables_that_moved() {
         let source = include_str!("serve.rs");
+        for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
+            assert!(
+                source.contains(name),
+                "the status text no longer names {name}"
+            );
+        }
         assert!(
-            source.contains("CAOS_SERVER_URL: {}"),
-            "the status text no longer reports CAOS_SERVER_URL"
-        );
-        assert!(
-            source.contains("CAOS_IROH_TICKET: set, and nothing reads it"),
-            "the status text no longer names the variable that moved"
+            source.contains("set, and nothing reads it"),
+            "the status text no longer says the variable is unread"
         );
     }
 }

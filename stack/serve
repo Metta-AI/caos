@@ -343,6 +343,18 @@ fi
 if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
   IROH_STATE=${CAOS_STACK_IROH_STATE:-$CAOS_STACK_STATE/iroh}
   mkdir -p "$IROH_STATE"
+  # FATAL HERE, where the message is read, rather than minting a ticket that
+  # cannot be reached. n0's relays are never used (caos_iroh::endpoint_builder),
+  # so there is nothing to fall back to -- and a ticket carrying an unreachable
+  # relay keeps its endpoint id and token, so it is indistinguishable from the
+  # one already in someone's environment while every session against it times
+  # out a whole phase away from here.
+  if [ -z "${CAOS_IROH_RELAY:-}" ]; then
+    fail "CAOS_STACK_IROH=yes but no CAOS_IROH_RELAY: a caos:// endpoint needs a
+  relay of its own to be reached through. Run 'iroh-relay --dev' on a host you
+  control, on port 80 or 443, and bring the stack up with
+  CAOS_IROH_RELAY=http://<host>/ caosd up --iroh"
+  fi
   # An ARRAY built by word-splitting on purpose: the variable carries zero or
   # more addresses, and each needs its own flag.
   iroh_advertise=()
@@ -355,6 +367,7 @@ if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
     --state "$IROH_STATE" \
     --to "127.0.0.1:80" \
     --git-dir "$CAOS_STACK_STATE/git" \
+    --relay "$CAOS_IROH_RELAY" \
     "${iroh_advertise[@]}"
 fi
 

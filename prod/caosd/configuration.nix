@@ -20,6 +20,10 @@
 }:
 
 let
+  # The stack's state: the docker images, the registry, redis and the server
+  # repo. Named once, because the unit, the caos user's home and every
+  # interactive `caosd` have to agree on it.
+  dataDir = "/data/caos";
   cfg = config.caos;
 in
 {
@@ -61,7 +65,9 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Run an iroh relay here, for clients whose network cannot reach n0's.
+        Run an iroh relay here. caos uses no other: n0's are never dialled,
+        for a relay or for discovery, so SOMEONE has to run one and every
+        `caos://` endpoint is required to name it.
 
         A Claude Code cloud container's SETUP phase is one such network: all
         seven relays iroh ships answer 503 there with an Envoy upstream connect
@@ -71,8 +77,11 @@ in
         relay run HERE answered 200 from that phase, on the host and port where
         an ordinary HTTP server had.
 
-        A dev stack points at it with CAOS_IROH_RELAY, and its ticket then
-        carries this relay instead of n0's.
+        A dev stack points at it with CAOS_IROH_RELAY, which `caosd up --iroh`
+        requires and passes to `caos-iroh serve --relay`. There is no fallback:
+        one that existed minted a ticket carrying the same endpoint id and
+        token as the one already in someone's environment, so it looked current
+        while reaching nothing.
       '';
     };
 
@@ -85,10 +94,49 @@ in
         setup and the session phase, while port 80 answered from both.
       '';
     };
+
+    relay.url = lib.mkOption {
+      type = lib.types.str;
+      default =
+        if cfg.relay.enable then
+          "http://${cfg.advertiseAddress}${
+            lib.optionalString (cfg.relay.port != 80) ":${toString cfg.relay.port}"
+          }/"
+        else
+          "";
+      description = ''
+        The relay this stack's endpoint is reached through, baked into its
+        ticket. Required: caos dials no relay it was not given, so `caosd up
+        --iroh` refuses to start without one.
+
+        THE PUBLIC ADDRESS, not localhost, because this one string does two
+        jobs: it is what this endpoint connects to AND what every client dials
+        out of the ticket. A loopback URL would leave the ticket naming a relay
+        only this machine can reach.
+
+        It defaults to the relay this host runs (relay.enable). A machine that
+        runs none must name someone else's, and the assertion below says so
+        rather than letting the service fail at start.
+      '';
+      example = "http://34.200.32.255/";
+    };
   };
 
   config = {
     system.stateVersion = "25.11";
+
+    # Refused at BUILD time, where the option is named, rather than at start
+    # where the failure is a dead service on a machine that was serving.
+    assertions = [
+      {
+        assertion = cfg.relay.url != "";
+        message = ''
+          caos.relay.url is empty: this host runs no relay of its own
+          (caos.relay.enable = false), so it must name one to be reached
+          through. n0's relays are not used by caos at all.
+        '';
+      }
+    ];
 
     # A flake-managed machine must NOT also be user-data-managed. The NixOS EC2
     # image runs amazon-init on EVERY boot, which copies user-data over
@@ -171,7 +219,7 @@ in
     users.users.caos = {
       isSystemUser = true;
       group = "caos";
-      home = "/data/caos";
+      home = dataDir;
       extraGroups = [ "docker" ];
     };
     # You arrive over SSM as ssm-user; let it drive the stack too.
@@ -240,21 +288,30 @@ in
         pkgs.coreutils
       ];
       environment = {
-        CAOS_DATA = "/data/caos";
+        CAOS_DATA = dataDir;
         CAOS_IROH_ADVERTISE = "${cfg.advertiseAddress}:${toString cfg.irohPort}";
+        CAOS_IROH_RELAY = cfg.relay.url;
       };
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
         User = "caos";
         Group = "caos";
-        WorkingDirectory = "/data/caos";
+        WorkingDirectory = dataDir;
         ExecStart = "${cfg.package}/bin/caosd up --iroh";
         ExecStop = "${cfg.package}/bin/caosd down";
         # A cold first run builds every std worker image before it returns.
         TimeoutStartSec = "90min";
       };
     };
+
+    # SO AN INTERACTIVE `caosd` FINDS THIS MACHINE'S STACK. Without it the
+    # command defaults CAOS_DATA to `$PWD/.caos-data` (flake.nix), so `caosd
+    # logs` from a login shell reads `/.caos-data/stack/logs/*.log` and reports
+    # a missing directory -- and `caosd ticket` and `caosd down` are wrong the
+    # same way, more quietly. The unit sets it for itself; this is for the
+    # person holding the shell.
+    environment.variables.CAOS_DATA = dataDir;
 
     environment.systemPackages = [
       cfg.package

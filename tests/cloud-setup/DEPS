@@ -1,0 +1,7 @@
+# What this test reaches for (format `<path> <name>`).
+../../std/go go
+../../std/flake-builder flake-builder
+# The subject: the two install stages, the session hook, and the two JSON
+# assets they rewrite.
+../../integrations/claude-code/cloud cloud
+../../integrations/claude-code/shared shared

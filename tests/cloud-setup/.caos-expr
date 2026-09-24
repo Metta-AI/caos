@@ -1,0 +1,14 @@
+# tests/cloud-setup, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Its subject is two programs that a cloud container runs before
+# Claude Code starts, so there is no client, no server and no repo of its own —
+# it builds a fixture checkout and a fixture install package in /tmp and runs
+# the real stages over them. std/go rather than std/bash because the subject is
+# Go and because this needs git.
+#
+# THE SUBJECT IS BOUND, so the test re-keys when it changes: `cloud` is the
+# directory holding the two stages and the hook, `shared` the settings and mcp
+# JSON they rewrite. Binding the real assets is what makes a drift in their
+# shape fail here rather than in a cloud session.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --cloud:@=DEEP-DEPS/cloud --shared:@=DEEP-DEPS/shared

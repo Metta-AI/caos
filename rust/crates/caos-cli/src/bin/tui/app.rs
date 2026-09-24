@@ -886,8 +886,9 @@ struct Command {
 // Completion hints for current public models compatible with llm-step's
 // adaptive-thinking request. Explicit strings remain accepted for gateways
 // and newly released models.
-const MODEL_OPTIONS: [&str; 8] = [
+const MODEL_OPTIONS: [&str; 9] = [
     "default",
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-sonnet-5",
     "claude-fable-5",
