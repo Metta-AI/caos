@@ -197,9 +197,9 @@ decision: an ambient token with no entropy would otherwise have run with no
 cache isolation at all.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
-client), `api.anthropic.com`, and your own relay are reachable from both phases.
-n0's relays are not used at all — the setup phase answers 503 for every one of
-them, which is why the relay is a required setting (see *Dev mode* below).
+client), `api.anthropic.com`, and iroh's relays are reachable from a SESSION;
+the setup phase is a different path and refuses the n0 relays (see *Dev mode*
+below, which is the only thing that needs them that early).
 
 One thing the container needs that a laptop does not: the **OS trust store**.
 Egress here is a TLS-intercepting proxy, so the relay presents the proxy's
@@ -230,12 +230,14 @@ fetched, so an edit to stage 1 is in the package like anything else). It then
 repoints the checkout's `.caos-expr` and `flake.lock` at
 `git+caos://…?rev=<dev>`, so the tools resolve from there too.
 
-**The CHECKOUT IS LEFT CLEAN.** The rewrite exists only in that unreferenced
-commit, built through a throwaway index, so nothing puts a `caos://` ticket — a
-credential — in a file an agent can be asked to commit. This works because the
-session resolves `--llm-step:@=<std>/llm-step` in the commit it seeds from
-(`resolve_cli_image_arg_in_tree`) rather than by ingesting `"."`: one place holds
-the dev pin, and a session's `git status` is empty.
+**The WORKING TREE is rewritten, not only the conversation's seed**, and that is
+measured rather than preferred: `resolve_cli_image_with_store` ingests `"."`, so
+the tool server's `--llm-step:@=<std>/llm-step` resolves against the checkout on
+disk and not against the `--base` the conversation seeds from. Rewriting only the
+seed commit would install a dev client that then evaluated the *committed* tools.
+The cost is a dirty checkout holding a ticket, which is why the seed commit is
+unreferenced and the stamps carry no ticket — but an agent in that session will
+see the diff and should be told not to commit it.
 
 It is an **argument, not an environment variable**: the setup phase does not get
 the environment's variables at all.
@@ -257,24 +259,14 @@ Two things are less obvious and both cost a session to find:
 succeeded; `caos_status` and the session hook both report from it, and each
 step is fatal, so the file existing is the claim.
 
-**The relay has to be one of yours, and is REQUIRED.** The setup phase reaches
-the network through a TLS-terminating gateway that answers **503** for all seven
-n0 relays (measured; controls on the same network pass). caos therefore never
-uses them — not as a relay, not for discovery — and there is no default to fall
-back to: `caos-iroh serve --relay` takes the URL, `caosd up --iroh` refuses to
-start without `CAOS_IROH_RELAY`, and the stack's bring-up refuses too.
-
-Refusing beats defaulting because of the shape of the failure: a ticket carrying
-an unreachable relay keeps its endpoint id and token, so it is indistinguishable
-from the one already in an environment, while every session against it dies in its
-setup phase with `connecting to <id>: timed out` — a whole phase from the cause.
-
-Run `iroh-relay --dev` on a host of your own (`prod/caosd/configuration.nix` has
-a unit for it) and bring the stack up with
-`CAOS_IROH_RELAY=http://<host>/ caosd up --iroh`. **Port 80 or 443 only**: both
-phases carry standard ports and time out on anything else. An `http://` relay is
-fine — the relay hop carries no plaintext payload, since traffic stays
-end-to-end encrypted between endpoint keys.
+**The relay has to be one of yours.** The setup phase reaches the network
+through a TLS-terminating gateway that answers **503** for all seven n0 relays
+(measured; controls on the same network pass), while the session hook, which
+egresses through a local `CONNECT` proxy, reaches them fine. A dev stack's
+ticket carries only private addresses, so the relay is the only path — run
+`iroh-relay --dev` on a host of your own and point `CAOS_IROH_RELAY` at it
+(`prod/caosd/configuration.nix` has a unit for it). **Port 80 or 443 only**:
+both phases carry standard ports and time out on anything else.
 
 ## The ticket keeps working; a re-keyed server does not
 
@@ -333,10 +325,8 @@ Nothing compiles in the container but the two Go programs themselves.
 Deferring work to a hook buys nothing, and that is the correction this
 arrangement is built on: the setup script runs on **every** session, so there is
 no cheap phase and no expensive one. What is left in the hook is there for a
-different reason: the registry warm talks to the caos server, and the setup phase
-reaches a relay only when it is one of yours — which it now always is, so the
-warm could move. It has not been measured there, and the hook is where it is
-proven.
+different reason — the registry warm needs the n0 relays, which the setup phase
+cannot reach (503 for all seven, measured) and a session can.
 
 ## A separate, untested direction: the stack in the container
 

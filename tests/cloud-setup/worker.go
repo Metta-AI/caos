@@ -102,19 +102,16 @@ func fixtureAssets(dir string) string {
 	return dir
 }
 
-// The root expression the fixture commits. Both its locators carry the pinned
-// rev, which is what stage 1 has to repoint; it is a value rather than a literal
-// because the test asserts the WORKTREE still holds exactly this afterwards.
-var fixtureExpr = "# the consumer root (design/flake-inputs.md)\n" +
-	"run --base:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/flake-input-loader" +
-	" --in:@=. --expr=$CAOS_EXPR --input=caos" +
-	" --input-tree:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std" +
-	" --output-path=caos-std\n"
-
 // A caos CLIENT repo: a lockfile pinning caos by revision and a root expression
-// mounting that revision's std at a path of the repo's choosing.
+// mounting that revision's std at a path of the repo's choosing. Both locators
+// carry the pinned rev, which is what stage 1 has to rewrite -- the loader
+// refuses a tree whose expression and lockfile disagree.
 func fixtureRepo(dir string) string {
-	expr := fixtureExpr
+	expr := "# the consumer root (design/flake-inputs.md)\n" +
+		"run --base:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/flake-input-loader" +
+		" --in:@=. --expr=$CAOS_EXPR --input=caos" +
+		" --input-tree:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std" +
+		" --output-path=caos-std\n"
 	lock := `{
   "nodes": {
     "root": { "inputs": { "caos": "caos", "nixpkgs": "nixpkgs" } },
@@ -253,7 +250,7 @@ func main() {
 			"the tool server does not seed the conversation as its own argument: %v", args)
 
 		// -------------------------------------------------------------------
-		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
+		w.Step("stage 1 in dev mode repoints the checkout and seeds a conversation")
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
 		devTree := fixtureDevTree("/tmp/dev-tree", assets)
@@ -272,14 +269,17 @@ func main() {
 		out, err := bootstrap.CombinedOutput()
 		w.True(err == nil, "stage 1 failed: %v\n%s", err, out)
 
-		// THE CHECKOUT IS UNTOUCHED. The dev pin lives only in the seed commit
-		// below, so nothing leaves a `caos://` ticket -- a credential -- in a file
-		// an agent can be asked to commit. A dirty worktree here is the whole
-		// regression this arrangement exists to prevent.
-		w.True(git(repo, "status", "--short") == "",
-			"stage 1 dirtied the checkout:\n%s", git(repo, "status", "--short"))
-		w.True(read(filepath.Join(repo, ".caos-expr")) == fixtureExpr,
-			"the worktree's expression was rewritten")
+		expr := read(filepath.Join(repo, ".caos-expr"))
+		w.True(!strings.Contains(expr, pinRev),
+			"the checkout still resolves caos through the committed pin:\n%s", expr)
+		for _, dir := range []string{"std/flake-input-loader", "std"} {
+			want := ":@@=git+" + ticket + "?rev=" + devRev + "&dir=" + dir
+			w.True(strings.Contains(expr, want),
+				"the expression does not reach the dev server for %s:\n%s", dir, expr)
+		}
+		locked := readJSON(filepath.Join(repo, "flake.lock"))["nodes"].(map[string]any)["caos"].(map[string]any)["locked"].(map[string]any)
+		w.True(locked["rev"] == devRev && locked["url"] == ticket,
+			"flake.lock disagrees with the expression, which the loader refuses: %v", locked)
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
@@ -299,23 +299,8 @@ func main() {
 		w.True(len(seedCommit) == 40, "the dev stamp carries no seed commit: %q", seedCommit)
 		w.True(git(repo, "rev-parse", seedCommit+"^") == head,
 			"the seed commit is not a child of HEAD")
-		// THE REWRITE IS HERE AND ONLY HERE. `resolve_cli_image_arg_in_tree`
-		// resolves the session's `--llm-step:@=caos-std/llm-step` in this tree, so
-		// this is what decides which tools the session gets.
-		seedExpr := git(repo, "show", seedCommit+":.caos-expr")
-		w.True(!strings.Contains(seedExpr, pinRev),
-			"the seed still resolves caos through the committed pin:\n%s", seedExpr)
-		for _, dir := range []string{"std/flake-input-loader", "std"} {
-			want := ":@@=git+" + ticket + "?rev=" + devRev + "&dir=" + dir
-			w.True(strings.Contains(seedExpr, want),
-				"the seed does not reach the dev server for %s:\n%s", dir, seedExpr)
-		}
-		// BOTH FILES, or the loader refuses the tree for naming two revisions.
-		var seedLock map[string]any
-		w.Must(json.Unmarshal([]byte(git(repo, "show", seedCommit+":flake.lock")), &seedLock))
-		locked := seedLock["nodes"].(map[string]any)["caos"].(map[string]any)["locked"].(map[string]any)
-		w.True(locked["rev"] == devRev && locked["url"] == ticket,
-			"the seed's lockfile disagrees with its expression: %v", locked)
+		w.True(git(repo, "show", seedCommit+":.caos-expr") == strings.TrimRight(expr, "\n"),
+			"the conversation would evaluate an expression other than the rewritten one")
 		// Nothing points at it, so `git push` cannot carry the ticket it holds.
 		w.True(!strings.Contains(git(repo, "for-each-ref", "--format=%(objectname)"), seedCommit),
 			"a ref points at the seed commit, so a push could carry the ticket")

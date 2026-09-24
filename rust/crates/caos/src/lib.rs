@@ -4188,32 +4188,6 @@ pub fn resolve_cli_image_arg(
     resolve_base_with_store(t, None, ty, value, store)
 }
 
-/// [`resolve_cli_image_arg`] with a `:@=` path looked up in `tree` instead of in
-/// the working directory.
-///
-/// WHICH TREE A CLIENT'S TOOLS COME FROM. Anything that RECORDS a conversation
-/// must name the tree: the conversation's content is its base commit, so a step
-/// resolved from the worktree can come from a tree the session does not record,
-/// and a dev-mode session would then have to rewrite files on disk to keep the
-/// two together. Naming the tree makes them agree by construction.
-///
-/// The other three types are unaffected and delegate: they name an object
-/// outright or fetch it, so the working directory never entered them.
-pub fn resolve_cli_image_arg_in_tree(
-    t: &dyn Transport,
-    tree: &str,
-    argument: &str,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    let (_, ty, value) = parse_arg(argument)?;
-    match ty {
-        ArgType::Path => eval::eval_path(t, tree, value, store)
-            .map(|(_kind, hash)| hash)
-            .map_err(|error| format!("resolving {value:?} in tree {tree}: {error}")),
-        _ => resolve_base_with_store(t, None, ty, value, store),
-    }
-}
-
 /// [`resolve_cli_image`] carrying the caller's secret store into the walk, so a
 /// `run` the expression dispatches and any `curry` it returns are marked with
 /// the caller's identity (design/secrets.md). Conversation setup uses this
