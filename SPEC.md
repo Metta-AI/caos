@@ -146,7 +146,8 @@ from the stored tree: both tools can reach and evaluate it.
 Resolution uses the current conversation snapshot on every call. The
 definition's evaluated tree is separate from the input: invocation still binds
 the original selected source tree, or the original conversation tree when no
-source-tree prefix was selected, as `in`.
+source-tree prefix was selected, as `in`. A writer receives the conversation tree even
+when its definition is inside a source gitlink.
 
 MCP resolves the requested `path` against that same snapshot on the client,
 where pinned `:@@=` dependencies can be fetched. It hands the evaluated tool
@@ -180,8 +181,8 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`
-and `help` are refused: the interpreter, or the tool's own expression, binds
+Arg names are `[a-z][a-z0-9-]*`. `in`, `worker1`, `base`, `salt`, `wc`, `refs`,
+`writer-context`, and `help` are refused: the interpreter, or the tool's own expression, binds
 those itself and currying SHALL fail on a rebind. A malformed `@param` tag is
 skipped with a message, never silently turned into an arg the model cannot use.
 
@@ -192,10 +193,14 @@ schema — the model reads it, and a schema dump is the registry that was just
 removed. A tool with no `@param` tags takes no parameters: the source tree IS
 its input.
 
+Repository tools declare a conversation writer with `@writer <required-path-parameter>` in their help. The harness supplies the conversation tree as `in` and a pinned `writer-context`; the result
+contains a `proposal` tree and a `report` blob. The harness applies changes only inside the declared path, rejects concurrent changes there (including delete-and-recreate), and records the result with
+the edits atomically. Other conversation files are preserved.
+
 ## Invocation
 
 - The job is `curry(<tool arg tree>, <declared args>)` run with the source tree
-  as `--in`, where `<tool arg tree>` is what evaluating the tool's path yields
+  as `--in` (the conversation tree for a writer), where `<tool arg tree>` is what evaluating the tool's path yields
 - Evaluation happens where blocking is legal. A worker may not block, so the
   agent's harness tail-calls `eval-path-then` and curries in the callback
   (design/map-then.md); `caos-cli run-tool` evaluates directly. Both land on
