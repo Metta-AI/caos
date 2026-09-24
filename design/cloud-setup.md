@@ -58,8 +58,9 @@ Both redo work setup already did, in the same container, seconds earlier.
 
 ```sh
 # the environment's setup field, in full
-curl -fsSL "$B/integrations/claude-code/cloud/setup.go" -o /tmp/caos-setup.go
-go run /tmp/caos-setup.go --base="$B" --dev-server="caos://<ticket>"
+curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+go run /tmp/caos-bootstrap.go --base="$B" --server="caos://<ticket>" \
+    --dev-server="caos://<ticket>" --enable-bash
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, with
@@ -68,10 +69,54 @@ works and leaves no artifacts, **provided the program imports only the
 stdlib** — a module fetch would have to reach `proxy.golang.org`, and the setup
 phase is the phase that answers 503 for every n0 relay.
 
-One program: read the pin, fetch the package, install it, mint the conversation
-seed, write the configuration, stamp what it did. It replaces `setup.sh`,
-`install.sh` and `caos-pin.sh` — 1388 lines of bash — with an estimated 450-550
-lines of Go.
+**Everything arrives as an argument, including the server ticket.** Whether the
+setup phase can read the environment's variables is then not a question anyone
+has to answer, and setup can do the work that today waits for the hook because
+only the hook sees `CAOS_SERVER_URL`.
+
+### Two stages, because the installer is part of the payload
+
+Stage 1 is the only thing that comes from GitHub, and it stays small and stable:
+
+1. parse args; find the checkout; read the `caos` pin from `flake.lock`
+2. download `git-remote-caos` from that pin's release — the ONLY reason a dev
+   session touches a GitHub release, since git speaks `caos://` through it
+3. fetch the payload: `refs/caos/dev` over the dev server, or the pinned
+   release otherwise
+4. `go run <payload>/install.go` with the same arguments
+
+Stage 2 is the installer, and it comes FROM the payload — which is the whole
+requirement dev mode exists for: an edit to the installer reaches the next
+session with no push. The release carries the same file, so both modes run one
+installer from two sources.
+
+The pin read stays in stage 1 rather than becoming an argument. It is what lets
+the two lines in the settings form name a branch and never be edited again: the
+repository decides which caos, not the environment.
+
+### The compile is the new cost
+
+Cold `go run` of a stdlib-only program, measured locally, cache emptied between
+runs:
+
+| stage-1 shape | cold | cache |
+|---|---|---|
+| shells out to `curl`/`git` | **2.8s** | 40M |
+| imports `net/http` | 5.7s | 95M |
+
+Warm is 63ms. So **neither stage may import `net/http`** — it drags in the TLS
+stack and doubles the compile, for something `curl` already does and `git` needs
+anyway. Stage 2 then costs almost nothing, because stage 1 has just compiled the
+same stdlib packages, so long as it imports the same set.
+
+The container is fresh every session, so this is paid every session unless
+`/root/.cache/go-build` ships warm in the image — unmeasured, and worth knowing
+before accepting ~3s on top of ~15s.
+
+### Size
+
+Stage 1 and stage 2 together replace `setup.sh`, `install.sh` and
+`caos-pin.sh` — 1388 lines of bash — with an estimated 450-550 lines of Go.
 
 **The win is not line count.** Go is wordier per operation. It is
 `encoding/json` instead of a `jq` program and `@sh` quoting, errors instead of
@@ -125,29 +170,28 @@ tools rather than racing a resolve it cannot see.
 
 ## Open questions
 
-1. **Can setup read the environment's variables?** Load-bearing, and the one
-   measurement behind the current answer is suspect: a session stamped `off`
-   while the environment set `CAOS_DEV=1`, read as "setup gets no env vars",
-   from the same era as the snapshot assumption. If setup *can* read them,
-   `--dev-server` stops being an argument and setup can add the `caos` remote
-   from `CAOS_SERVER_URL` — which is most of what remains of the hook.
-2. **Does the setup phase reach `proxy.golang.org`?** Only matters if a
-   dependency is ever added. Record it as a constraint either way.
-3. **A third data point on per-session setup**, hours later, environment
+1. **Is `/root/.cache/go-build` warm in the container image?** Decides whether
+   the ~3s cold compile is paid once per session or not at all. One session,
+   with `--enable-bash`: `du -sh` it and time a trivial `go run`.
+2. **A third data point on per-session setup**, hours later, environment
    untouched. Two consecutive sessions in one evening is thin evidence for
    deleting a refresh path.
 
-(1) and (2) are one session together, and (1) decides how much of the hook
-survives.
+Two earlier questions are closed rather than answered. Whether setup can read
+environment variables no longer matters, because everything is passed as an
+argument. Whether the setup phase reaches `proxy.golang.org` no longer matters,
+because the programs import only the stdlib — but if anyone ever adds a
+dependency, that is the question they have to answer first.
 
 ## What remains for a `SessionStart` hook
 
-If setup can read the environment: the unshallow, and one stdout line naming the
-build — stdout being the only stream a session keeps, since hook stderr is
-classed non-transcript and dropped. Roughly 30 lines, or a second `go run`.
+Very little. With the ticket passed as an argument, setup adds the `caos` git
+remote, unshallows, and warms the registry — all three before Claude Code
+starts, rather than racing it.
 
-If it cannot: the `caos` git remote and the warm stay in the hook, because both
-need `CAOS_SERVER_URL`.
+What is genuinely left is one line of stdout naming the build, stdout being the
+only stream a session keeps: hook stderr is captured as a non-transcript event
+and dropped. That is a hook of a few lines, not a 445-line script.
 
 ## Testing
 
