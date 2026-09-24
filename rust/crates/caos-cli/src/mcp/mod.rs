@@ -331,6 +331,25 @@ fn tool_resolution_scope(
 /// It is the request's recorded `configuration` too, so a conversation says
 /// which worker ran its tools -- and the tui can pick the turn up, because what
 /// it names is an ordinary step.
+/// The tree a `--llm-step:@=<path>` is looked up in: the conversation's OWN BASE
+/// COMMIT, not the working directory.
+///
+/// The step and the conversation then come from one tree by construction. They
+/// did not before: content came from `resolve_base` while the step was resolved
+/// by ingesting `.`, so the two could disagree — and dev mode had to rewrite the
+/// checkout ON DISK to hold them together, which left a `caos://` ticket in a
+/// file an agent could be asked to commit. With the tree named, the dev rewrite
+/// lives only in the unreferenced commit this reads.
+///
+/// `seed_content` rather than a bare tree lookup, deliberately: it is what
+/// `root_commit` uses for the conversation's content, so the same commit is
+/// pushed and checked once and both readers get the same answer.
+fn step_tree(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
+    let base = oid(&resolve_base(t, options)?, "conversation base")?;
+    let mut store = open_store(t)?;
+    Ok(seed_content(t, &mut store, &base)?.to_string())
+}
+
 fn tools_configuration(
     t: &GitTransport,
     options: &TurnOptions,
@@ -357,7 +376,13 @@ fn tools_configuration(
     // merge tools resolve against the conversation's own Git store, so a ref
     // snapshot passed from here would be a second, staler source of truth.
     let config = vec![format!("--conversation={id}")];
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
+    let base = crate::resolve_image_arg_in_tree(
+        t,
+        &step_tree(t, options)?,
+        options.llm_step.as_deref(),
+        LLM_STEP_ARG,
+        store,
+    )?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
 
@@ -464,7 +489,13 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     let total = std::time::Instant::now();
     let store = caos::build_secret_store(t)?;
     let mark = std::time::Instant::now();
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
+    let base = crate::resolve_image_arg_in_tree(
+        t,
+        &step_tree(t, options)?,
+        options.llm_step.as_deref(),
+        LLM_STEP_ARG,
+        &store,
+    )?;
     let resolve_step = mark.elapsed();
     // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
     // A repository's own tools are reached by PATH (`tool_help` to describe one,

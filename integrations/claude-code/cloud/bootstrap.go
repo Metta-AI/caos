@@ -441,43 +441,118 @@ func installHelper(prefix, slug, tag string) {
 	}
 }
 
-// Point the checkout's own expression and lockfile at the dev server, so the
-// tools resolve from there too.
+// The conversation's seed: the checkout as it stands, with `.caos-expr` and
+// `flake.lock` repointed at the dev server, as ONE unreferenced commit.
 //
-// THE WORKTREE, not just the conversation's seed commit, and that is measured
-// rather than preferred: `resolve_cli_image_with_store` ingests ".", so the tool
-// server's `--llm-step:@=<std>/llm-step` resolves against the working tree and
-// not against the `--base` the conversation seeds from. Rewriting only the seed
-// would install a dev client that then evaluated the COMMITTED tools -- the
-// half-update dev mode exists to prevent.
+// NOTHING IS WRITTEN TO THE WORKTREE. The rewrite is built in a throwaway index
+// instead, so the checkout stays clean and the `caos://` ticket -- a credential
+// -- never enters a file an agent can be asked to commit. It used to be written
+// to disk because the tool server resolved `--llm-step:@=<std>/llm-step` by
+// ingesting ".", which meant the worktree decided which tools a session got;
+// `resolve_cli_image_arg_in_tree` now resolves it in the commit the conversation
+// seeds from, so this commit is the only place the dev pin has to exist.
+//
+// UNREFERENCED: nothing points at it, so `git push` cannot carry it. The branch
+// and the working tree are left exactly as they were found.
 //
 // BOTH FILES, or neither works: std/flake-input-loader refuses a tree whose
 // expression and flake.lock name different revisions.
-func repointAtDev(repoDir, server, sha string) {
-	exprPath := filepath.Join(repoDir, ".caos-expr")
-	expr, err := os.ReadFile(exprPath)
+func seedWithDevPin(repoDir, server, sha string) string {
+	index, err := os.CreateTemp("", "caos-seed-index")
 	if err != nil {
-		fatal("the checkout cannot be repointed at the dev server: %v\n"+
-			"  Without it this session runs your client against the pinned tools.", err)
+		fatal("could not make a seed index: %v", err)
+	}
+	index.Close()
+	os.Remove(index.Name())
+	defer os.Remove(index.Name())
+
+	git := func(stdin string, args ...string) (string, error) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		// An identity of its own, because `commit-tree` refuses without one and
+		// the container's git may have none. Whose commit this is carries no
+		// meaning: nothing ever pushes it, and its only reader is the hook that
+		// seeds a conversation from it.
+		cmd.Env = append(os.Environ(),
+			"GIT_INDEX_FILE="+index.Name(),
+			"GIT_AUTHOR_NAME=caos setup", "GIT_AUTHOR_EMAIL=caos@localhost",
+			"GIT_COMMITTER_NAME=caos setup", "GIT_COMMITTER_EMAIL=caos@localhost")
+		if stdin != "" {
+			cmd.Stdin = strings.NewReader(stdin)
+		}
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
+	}
+	// The worktree's content, not HEAD's: a session that opens a checkout with
+	// local edits should record those too.
+	if _, err := git("", "read-tree", "HEAD"); err != nil {
+		fatal("could not read HEAD into a seed index: %v", err)
+	}
+	if _, err := git("", "add", "-A"); err != nil {
+		fatal("could not stage the checkout into a seed index: %v", err)
+	}
+	for path, content := range map[string]string{
+		".caos-expr": repointExpr(repoDir, server, sha),
+		"flake.lock": repointLock(repoDir, server, sha),
+	} {
+		blob, err := git(content, "hash-object", "-w", "--stdin")
+		if err != nil || blob == "" {
+			fatal("could not store the repointed %s: %v", path, err)
+		}
+		if _, err := git("", "update-index", "--add", "--cacheinfo", "100644,"+blob+","+path); err != nil {
+			fatal("could not stage the repointed %s: %v", path, err)
+		}
+	}
+	tree, err := git("", "write-tree")
+	if err != nil || tree == "" {
+		fatal("could not write the seed tree: %v", err)
+	}
+	head, err := git("", "rev-parse", "HEAD")
+	if err != nil {
+		fatal("could not read HEAD: %v", err)
+	}
+	commit, err := git("", "commit-tree", tree, "-p", head,
+		"-m", "caos dev mode: the checkout, repointed at the dev server")
+	if err != nil || commit == "" {
+		fatal("could not mint a conversation seed commit: %v\n"+
+			"  Without it the session evaluates the COMMITTED pin while running a\n"+
+			"  dev client -- the half-update dev mode prevents.", err)
+	}
+	say("dev tools: %s seeds from %s, which resolves caos from the dev server at %s",
+		repoDir, commit[:12], sha[:12])
+	return commit
+}
+
+// The root expression with every `:@@=<locator>?rev=…&dir=…` pointed at the dev
+// server. Read from the WORKTREE rather than from HEAD, so a local edit to the
+// expression survives into the session.
+func repointExpr(repoDir, server, sha string) string {
+	path := filepath.Join(repoDir, ".caos-expr")
+	expr, err := os.ReadFile(path)
+	if err != nil {
+		fatal("cannot read %s: %v\n"+
+			"  Without it this session runs your client against the pinned tools.", path, err)
 	}
 	locator := regexp.MustCompile(`:@@=[^ ?]*\?rev=[0-9a-f]*&dir=([^ ]*)`)
 	rewritten := locator.ReplaceAllString(string(expr), ":@@=git+"+server+"?rev="+sha+"&dir=$1")
 	if rewritten == string(expr) {
 		fatal("%s carries no `:@@=…?rev=…&dir=…` locator to repoint, so the\n"+
-			"  session would evaluate the committed tools with a dev client.", exprPath)
+			"  session would evaluate the committed tools with a dev client.", path)
 	}
-	if err := os.WriteFile(exprPath, []byte(rewritten), 0o644); err != nil {
-		fatal("could not rewrite %s: %v", exprPath, err)
-	}
+	return rewritten
+}
 
-	lockPath := filepath.Join(repoDir, "flake.lock")
-	data, err := os.ReadFile(lockPath)
+// The lockfile with the `caos` input's locked node naming the dev server.
+func repointLock(repoDir, server, sha string) string {
+	path := filepath.Join(repoDir, "flake.lock")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		fatal("could not read %s: %v", lockPath, err)
+		fatal("could not read %s: %v", path, err)
 	}
 	var lock map[string]any
 	if err := json.Unmarshal(data, &lock); err != nil {
-		fatal("could not read %s as JSON: %v", lockPath, err)
+		fatal("could not read %s as JSON: %v", path, err)
 	}
 	root, _ := lock["root"].(string)
 	if root == "" {
@@ -489,74 +564,14 @@ func repointAtDev(repoDir, server, sha string) {
 	key, _ := inputs["caos"].(string)
 	node, _ := nodes[key].(map[string]any)
 	if node == nil {
-		fatal("%s has no 'caos' input node to repoint; the loader would refuse the drift", lockPath)
+		fatal("%s has no 'caos' input node to repoint; the loader would refuse the drift", path)
 	}
 	node["locked"] = map[string]string{"type": "git", "url": server, "rev": sha}
 	out, err := json.MarshalIndent(lock, "", "  ")
 	if err != nil {
-		fatal("could not rewrite %s: %v", lockPath, err)
+		fatal("could not rewrite %s: %v", path, err)
 	}
-	if err := os.WriteFile(lockPath, append(out, '\n'), 0o644); err != nil {
-		fatal("could not write %s: %v", lockPath, err)
-	}
-	say("dev tools: this checkout now resolves caos from the dev server at %s", sha[:12])
-}
-
-// THE CONVERSATION SEEDS FROM ITS OWN COMMIT, not from HEAD. The HOOK creates a
-// conversation (`on_user_prompt`), and its content comes from `resolve_base`,
-// which is HEAD unless told otherwise -- so the rewrite above reaches the
-// checkout and not the tree the conversation records.
-//
-// UNREFERENCED, via commit-tree into a throwaway index: nothing points at it, so
-// `git push` cannot carry it and the ticket it contains -- a credential -- stays
-// out of every pushable ref. The branch and the working tree are left as they
-// were.
-func seedCommit(repoDir string) string {
-	index, err := os.CreateTemp("", "caos-seed-index")
-	if err != nil {
-		fatal("could not make a seed index: %v", err)
-	}
-	index.Close()
-	os.Remove(index.Name())
-	defer os.Remove(index.Name())
-
-	git := func(args ...string) (string, error) {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = repoDir
-		// An identity of its own, because `commit-tree` refuses without one and
-		// the container's git may have none. Whose commit this is carries no
-		// meaning: nothing ever pushes it, and its only reader is the hook that
-		// seeds a conversation from it.
-		cmd.Env = append(os.Environ(),
-			"GIT_INDEX_FILE="+index.Name(),
-			"GIT_AUTHOR_NAME=caos setup", "GIT_AUTHOR_EMAIL=caos@localhost",
-			"GIT_COMMITTER_NAME=caos setup", "GIT_COMMITTER_EMAIL=caos@localhost")
-		cmd.Stderr = os.Stderr
-		out, err := cmd.Output()
-		return strings.TrimSpace(string(out)), err
-	}
-	if _, err := git("read-tree", "HEAD"); err != nil {
-		fatal("could not read HEAD into a seed index: %v", err)
-	}
-	if _, err := git("add", "-A"); err != nil {
-		fatal("could not stage the checkout into a seed index: %v", err)
-	}
-	tree, err := git("write-tree")
-	if err != nil || tree == "" {
-		fatal("could not write the seed tree: %v", err)
-	}
-	head, err := git("rev-parse", "HEAD")
-	if err != nil {
-		fatal("could not read HEAD: %v", err)
-	}
-	commit, err := git("commit-tree", tree, "-p", head, "-m", "caos dev mode: the checkout as setup left it")
-	if err != nil || commit == "" {
-		fatal("could not mint a conversation seed commit: %v\n"+
-			"  Without it the session evaluates the COMMITTED pin while running a\n"+
-			"  dev client -- the half-update dev mode prevents.", err)
-	}
-	say("conversation seeds from %s (unreferenced)", commit[:12])
-	return commit
+	return string(out) + "\n"
 }
 
 func writeStamp(path string, lines map[string]string) {
@@ -682,8 +697,7 @@ func main() {
 
 	seed := ""
 	if devRev != "" {
-		repointAtDev(repoDir, a.devServer, devRev)
-		seed = seedCommit(repoDir)
+		seed = seedWithDevPin(repoDir, a.devServer, devRev)
 	}
 
 	// STAGE 2, from the payload. `go run` rather than an exec of a built binary:

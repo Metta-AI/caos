@@ -4160,6 +4160,36 @@ pub fn resolve_cli_image_arg(
     resolve_base_with_store(t, None, ty, value, store)
 }
 
+/// [`resolve_cli_image_arg`] with a `:@=` path looked up in `tree` instead of in
+/// the working directory.
+///
+/// WHICH TREE A CLIENT'S TOOLS COME FROM, and for anything that RECORDS a
+/// conversation the working directory is the wrong answer: the conversation's
+/// content is its base commit, so a step resolved from the worktree can come
+/// from a different tree than the session records. That gap is not theoretical —
+/// it is what obliged a dev-mode cloud session to rewrite `.caos-expr` and
+/// `flake.lock` ON DISK, leaving a checkout dirty with a `caos://` ticket
+/// (a credential) for an agent to be asked to commit. Naming the tree keeps the
+/// two together by construction, and the rewrite then lives only in the
+/// unreferenced commit the conversation seeds from.
+///
+/// The other three types are unaffected and delegate: they name an object
+/// outright or fetch it, so the working directory never entered them.
+pub fn resolve_cli_image_arg_in_tree(
+    t: &dyn Transport,
+    tree: &str,
+    argument: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
+    let (_, ty, value) = parse_arg(argument)?;
+    match ty {
+        ArgType::Path => eval::eval_path(t, tree, value, store)
+            .map(|(_kind, hash)| hash)
+            .map_err(|error| format!("resolving {value:?} in tree {tree}: {error}")),
+        _ => resolve_base_with_store(t, None, ty, value, store),
+    }
+}
+
 /// [`resolve_cli_image`] carrying the caller's secret store into the walk, so a
 /// `run` the expression dispatches and any `curry` it returns are marked with
 /// the caller's identity (design/secrets.md). Conversation setup uses this
