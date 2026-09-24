@@ -564,13 +564,8 @@ fn diagnostics() -> String {
             ));
         }
     }
-    // The remote the client dials -- present means session-start added it.
-    // REDACTED, because a `caos://` remote is the capability itself and this
-    // output is quoted verbatim by a model.
-    d.push_str(&format!(
-        "caos remote: {}\n",
-        redact_secrets(&caos_remote())
-    ));
+    // The remote the client dials -- present means the setup phase added it.
+    d.push_str(&format!("caos remote: {}\n", caos_remote()));
     // Whether git can reach a `caos://` remote, which is a DIFFERENT question
     // from whether this client can: the client speaks the transport itself,
     // while git execs `git-remote-caos` by name for every push and fetch. A
@@ -606,7 +601,16 @@ fn diagnostics() -> String {
     d.push_str(&indent(&tail(&read_file("/tmp/caos-warm.log"), 10)));
     // Whether a warm cache was on disk for THIS serve to load at startup.
     d.push_str(&format!("registry cache: {}\n", registry_cache_state()));
-    d
+    // REDACTED ONCE, OVER THE WHOLE DOCUMENT, rather than field by field. A
+    // `caos://` URL is the capability to drive that server and this text is
+    // quoted verbatim by a model into a transcript; most of what is above comes
+    // from OTHER processes -- the phase journal's git command lines, the warm
+    // log, git's own errors -- which quote the remote URL in full and cannot be
+    // asked not to. Redacting the assembled text is what makes that safe by
+    // construction, so a field added later is covered without anyone
+    // remembering. It is also why nothing below here re-redacts: applied twice,
+    // the second pass mangles the first pass's marker.
+    redact_secrets(&d)
 }
 
 /// A one-line note on the on-disk tool-registry cache: present with how many
@@ -1054,6 +1058,31 @@ mod redaction_tests {
             "the token survived redaction: {shown}"
         );
         assert!(shown.contains("redacted"), "{shown}");
+    }
+
+    /// A ticket reaches this text from processes that do not know it is a
+    /// secret: git quotes the remote URL in its own errors, and the phase
+    /// journal carries the whole `git push` command line. Observed in a cloud
+    /// session, whose agent redacted the leak by hand before reporting it.
+    #[test]
+    fn a_ticket_quoted_by_another_process_is_redacted_too() {
+        let ticket = "caos://endpointabcq3jd3du66g5amur4rvkvqnwbvnais4wfpynkvcjo.\
+                      8507a32d93dabb5d70a2a0d9631596413cbfb15988ed3e76a6417e4127f11b68";
+        let journal = format!(
+            "phase journal (most recent last):\n  \
+             push-failed: 7662 after 0.6s: git push --progress {ticket} 7662:refs/caos/req/7662\n  \
+             warm log: fatal: could not read from remote repository {ticket}\n"
+        );
+        let shown = redact_secrets(&journal);
+        assert!(
+            !shown.contains("8507a32d93dabb5d70a2a0d9631596413cbfb15988ed3e76a6417e4127f11b68"),
+            "a token survived in a line this process did not write: {shown}"
+        );
+        assert_eq!(
+            shown.matches("redacted").count(),
+            2,
+            "every occurrence must be redacted, not just the first: {shown}"
+        );
     }
 
     #[test]
