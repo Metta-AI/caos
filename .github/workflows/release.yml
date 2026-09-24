@@ -1,13 +1,14 @@
 # Publish the caos Claude Code client.
 #
-# The release carries five assets, which together are everything a machine that
+# The release carries six assets, which together are everything a machine that
 # has never seen caos needs:
 #
 #   caos-x86_64-linux             the client, statically linked
 #   git-remote-caos-x86_64-linux  the git remote helper for a caos:// server
 #   claude-settings.json          the hooks and the deny list
 #   mcp.json                      the tool server declaration
-#   install.sh                    fetches the client and puts it in place
+#   install.go                    stage 2: puts the package in place (go run)
+#   session.go                    the SessionStart hook (go run)
 #
 # WHY A RELEASE AND NOT A BUILD IN THE CONSUMER. A Claude Code cloud VM has a
 # five-minute setup budget and a filesystem snapshot; compiling there spends the
@@ -108,9 +109,17 @@ jobs:
           done
           cp integrations/claude-code/shared/settings.json dist/claude-settings.json
           cp integrations/claude-code/shared/mcp.json      dist/mcp.json
-          # Copied, not stamped. install.sh resolves the build from its --base
-          # and reports that; a tag baked in here could only ever disagree.
-          install -m 0755 integrations/claude-code/cloud/install.sh dist/install.sh
+          # SOURCE, not a binary, because both are `go run` (SPEC:425) and the
+          # container they run in has Go. Copied rather than stamped: stage 1
+          # resolves the build from the repository's pin and reports that, so a
+          # tag baked in here could only ever disagree.
+          cp integrations/claude-code/cloud/install.go dist/install.go
+          cp integrations/claude-code/cloud/session.go dist/session.go
+          # Both must at least compile, or the release is a session that dies in
+          # its setup phase with a Go syntax error and no client.
+          for f in dist/install.go dist/session.go; do
+            nix run nixpkgs#go -- vet "$f" || { echo "$f does not build"; exit 1; } >&2
+          done
 
           # Prove the thing we are about to publish actually runs, rather than
           # discovering it from a cloud VM that cannot say why.
@@ -155,7 +164,7 @@ jobs:
       #
       # Branch builds are prereleases, so `latest` keeps meaning the newest
       # real version rather than whichever branch pushed most recently. Nothing
-      # resolves through `latest` any more -- install.sh asks for a build by
+      # resolves through `latest` any more -- bootstrap.go asks for a build by
       # commit -- so this costs nothing and stops one branch's push from
       # silently becoming everyone's default.
       #
@@ -166,27 +175,27 @@ jobs:
       # main's head happened to be (build-897eebb571ff points at a main merge
       # from four days earlier, and three other tags share one commit).
       # Nothing read the target, so nothing broke; the moment anything
-      # resolves a build tag to a commit, it gets the wrong tree. install.sh
+      # resolves a build tag to a commit, it gets the wrong tree. bootstrap.go
       # checks the name against the target for exactly that reason.
       #
       # THIS IS `gh`, NOT softprops/action-gh-release, AND THE ORDER OF THE
       # FOUR STEPS BELOW IS THE POINT. The action created a prerelease
-      # PUBLISHED, then uploaded the five assets concurrently with one attempt
+      # PUBLISHED, then uploaded the six assets concurrently with one attempt
       # each. On 2026-09-17 the upload endpoint answered a run of pushes with
       # 5xx bodies ("Error creating asset temp dir", "Error saving asset", an
       # HTML error page) and every push to main for an afternoon left a LIVE
-      # tag carrying one or two of the five assets. That is the worst state
-      # there is for install.sh: it resolves the build by tag, finds it, and
+      # tag carrying one or two of the six assets. That is the worst state
+      # there is for bootstrap.go: it resolves the build by tag, finds it, and
       # dies on a 404 for the binary -- where NO tag at all is a clean refusal
       # naming the commit, which is what a client repo's owner can act on.
-      # (install.sh used to fall back to the newest build before the commit;
+      # (bootstrap.go used to fall back to the newest build before the commit;
       # it no longer does, because the step resolves through the pinned commit
       # and an older client would drive tools from another tree. So a
       # half-uploaded release is now strictly worse than none, which is the
       # whole reason for the draft-then-publish order below.)
       #
       # So: create the release as a DRAFT (no tag yet, invisible to
-      # install.sh), upload each asset with retries, PROVE all five are
+      # bootstrap.go), upload each asset with retries, PROVE all six are
       # attached, and only then publish. A failure anywhere leaves a draft,
       # which is nothing, and a re-run of the job finds that draft and
       # finishes it. Uploads go one at a time: the concurrent burst was what
@@ -201,7 +210,7 @@ jobs:
           PRERELEASE: ${{ github.ref_type != 'tag' }}
         run: |
           set -euo pipefail
-          assets="caos-x86_64-linux git-remote-caos-x86_64-linux claude-settings.json mcp.json install.sh"
+          assets="caos-x86_64-linux git-remote-caos-x86_64-linux claude-settings.json mcp.json install.go session.go"
 
           # Up to five attempts, 5s/10s/20s/40s apart: the failures this
           # exists for lasted minutes, not milliseconds.
@@ -248,7 +257,7 @@ jobs:
 
           # A tag push names an existing tag, and the API ignores --target
           # for one; a branch push's tag does not exist yet and is created at
-          # --target when the draft is published, which is what install.sh's
+          # --target when the draft is published, which is what bootstrap.go's
           # name-against-target check relies on.
           ensure_release() {
             local state

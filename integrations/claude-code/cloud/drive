@@ -30,7 +30,7 @@
 # API as --env-config (same $CLAUDE_SESSION_KEY cookie). --init-script FILE reads
 # the setup script from FILE; --set-env/--unset-env edit env vars; --rename
 # renames. To toggle Bash in an env, point its setup line at a script that passes
-# `--enable-bash` (install.sh honours it) and re-snapshot the env.
+# `--enable-bash` (stage 2 honours it) and re-snapshot the env.
 #
 # `--env-config` reads an environment DEFINITION (setup script + env vars) that
 # `--env` cannot: those live behind the claude.ai WEB api, which is cookie-authed
