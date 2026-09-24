@@ -400,7 +400,15 @@ impl Client {
         // session, which is the worst place to debug one.
         let mut addr = ticket.addr.clone();
         if std::env::var_os("CAOS_IROH_RELAY_ONLY").is_some() {
-            addr = EndpointAddr::from(addr.id);
+            // THE RELAY IS KEPT. Dropping it too leaves an address with nothing
+            // in it but an endpoint id, and this client has no discovery to fill
+            // that in -- n0's DNS is not used -- so the dial fails with "No
+            // addressing information available" rather than going relayed.
+            let mut relayed = EndpointAddr::from(addr.id);
+            for relay in addr.relay_urls() {
+                relayed = relayed.with_relay_url(relay.clone());
+            }
+            addr = relayed;
             eprintln!("caos-iroh: CAOS_IROH_RELAY_ONLY: ignoring the ticket's addresses");
         }
         let connection = endpoint

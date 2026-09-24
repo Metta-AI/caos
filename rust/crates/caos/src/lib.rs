@@ -1192,10 +1192,7 @@ impl GitTransport {
         // it otherwise would silently get `warning: push negotiation failed;
         // proceeding anyway` and the full closure back.
         let negotiate = self.is_commit_object(hash);
-        let mut args: Vec<&str> = Vec::new();
-        if negotiate {
-            args.extend(["-c", "protocol.version=2", "-c", "push.negotiate=true"]);
-        }
+        let mut args: Vec<&str> = push_negotiation_args(negotiate);
         args.extend(["push", "--porcelain", "--progress", CAOS_REMOTE, &refspec]);
 
         let started = std::time::Instant::now();
@@ -1461,6 +1458,37 @@ impl GitTransport {
 /// summary lines. [`git_capture_in`] collects stderr too but keeps it only for
 /// the failure message, so a caller that wants to measure a SUCCESSFUL command
 /// has nowhere to read from.
+/// The `-c` settings a push carries, given whether this object is worth
+/// negotiating.
+///
+/// SET EXPLICITLY EITHER WAY, because ambient config decides otherwise and the
+/// decision above is the one that knows: a Claude Code cloud container ships
+/// `push.negotiate=true` in `/root/.gitconfig`, so LEAVING THE FLAG OFF does not
+/// mean "do not negotiate" — it means "negotiate whatever this is".
+///
+/// Negotiating a tree is not merely useless, it fails. The negotiation walks the
+/// pushed object's ancestry for `have` lines and a tree has none, and protocol
+/// v2 answers a request that carries no haves by going straight to the packfile
+/// section — which is exactly what `--negotiate-only` refuses:
+///
+/// ```text
+/// fatal: expected 'acknowledgments', received 'packfile'
+/// warning: push negotiation failed; proceeding anyway with push
+/// ```
+///
+/// The push then proceeds, so this costs a wasted round trip rather than a
+/// failure — but it is a round trip the negotiation exists to save, and it
+/// reaches the journal looking like a broken transport.
+fn push_negotiation_args(negotiate: bool) -> Vec<&'static str> {
+    if negotiate {
+        // `--negotiate-only` requires v2, and while it is git's default since
+        // 2.26 a client configured otherwise would silently get the full closure.
+        vec!["-c", "protocol.version=2", "-c", "push.negotiate=true"]
+    } else {
+        vec!["-c", "push.negotiate=false"]
+    }
+}
+
 fn git_capture_stderr_in(args: &[&str], cwd: &Path) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -6219,5 +6247,36 @@ mod tool_resolution_tests {
         let root = expr(&t, "curry --base=fixture --repo:@@=git+https://example.invalid/tool-fixture?rev=1234567890123456789012345678901234567890");
         assert_eq!(evaluated_help(&t, &root, "args/repo/tool").1, "Pinned");
         assert_eq!(t.fetches.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod push_negotiation_tests {
+    use super::*;
+
+    /// The flag must be NAMED on both paths. Omitting it on the "no" path reads
+    /// as a decision but is not one: the value then comes from whatever config
+    /// the host carries, and a cloud container carries `push.negotiate=true`.
+    #[test]
+    fn a_push_always_says_whether_to_negotiate() {
+        for negotiate in [true, false] {
+            let args = push_negotiation_args(negotiate);
+            let named = args.iter().any(|a| a.starts_with("push.negotiate="));
+            assert!(
+                named,
+                "push.negotiate is unset for negotiate={negotiate}: {args:?}"
+            );
+        }
+    }
+
+    /// A tree has no ancestry to offer, so negotiating one sends no `have`
+    /// lines, and a v2 fetch with no haves answers `packfile` where
+    /// `--negotiate-only` requires `acknowledgments`.
+    #[test]
+    fn only_a_commit_is_negotiated_and_v2_rides_with_it() {
+        assert!(push_negotiation_args(true).contains(&"push.negotiate=true"));
+        assert!(push_negotiation_args(true).contains(&"protocol.version=2"));
+        assert!(push_negotiation_args(false).contains(&"push.negotiate=false"));
+        assert!(!push_negotiation_args(false).contains(&"push.negotiate=true"));
     }
 }
