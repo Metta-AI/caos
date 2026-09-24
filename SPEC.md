@@ -740,6 +740,9 @@ Per-mutation commits remain in the published source tree history. Only the
 previewed PR tip is checked for unresolved conflicts and reserved state;
 intermediate commits may contain conflict markers or fail to build.
 
-## Source stack layers
+## Object-based stack replay
 
-The `std/git-add-layer` writer promotes a final numbered work gitlink into a named, squashed commit and starts the next work at that commit. Each numbered layer has a matching `.base` file recording its parent boundary. See [stack creation and replay](design/agent-rebase.md).
+The `std/git-add-layer` writer promotes a final numbered work gitlink into a named, squashed commit and starts the next work at that commit. The `std/git-rebase-i` writer executes a plan under
+`<feature>/rebase/`, with one replay per stack. Plans use `onto=`, `pick=`, `squash=`, inline `amend=` messages, `drop=`, and numbered `branch=` boundaries. A range applies one net tree change. Drafts
+and native conflict reports remain outside source trees; the original stack changes only after guarded completion. The stack writers and `std/git-merge-tree` / `std/git-commit-tree` use server objects
+without source checkouts. See [stack replay](design/agent-rebase.md).

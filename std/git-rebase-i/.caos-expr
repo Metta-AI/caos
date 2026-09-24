@@ -1,0 +1,14 @@
+HELP=<<END
+Replay commits into a numbered stack without checking out its sources
+Plan commands use command=value: onto=COMMIT, pick=COMMIT or A..B, squash=COMMIT or A..B, amend=message line, drop=COMMIT, branch=00-name
+Picks keep the last input commit's author and message; amend lines replace the latest output message
+Squash combines changes and messages into the latest unsealed commit
+Conflicts pause at STACK/rebase/work with Git's report at STACK/rebase/conflicts
+Resolve the work gitlink, then continue; deleting STACK/rebase aborts the replay
+Completion replaces numbered layers and preserves other stack files
+@writer stack
+@param stack Conversation-relative stack directory
+@param [plan] STACK/rebase/plan when starting; copy a plan from elsewhere to that path first
+@param [action] Use continue to resume an existing replay, without plan
+END
+curry --base:@=DEEP-DEPS/git-stack --operation=rebase --help=$HELP

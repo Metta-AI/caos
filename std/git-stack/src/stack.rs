@@ -14,8 +14,17 @@ pub struct Layer {
 
 #[derive(Clone, Debug)]
 pub struct Stack {
+    pub directory: Oid,
     pub entries: Vec<TreeEntry>,
     pub layers: Vec<Layer>,
+}
+
+impl Stack {
+    pub fn numbered_tree(&self, store: &mut dyn ObjectStore) -> Result<Oid, String> {
+        store
+            .write_tree(&numbered_entries(&self.entries))
+            .map_err(String::from)
+    }
 }
 
 pub fn directory(store: &dyn ObjectStore, root: &Oid, path: &str) -> Result<Oid, String> {
@@ -30,7 +39,11 @@ pub fn read_stack(store: &dyn ObjectStore, root: &Oid, path: &str) -> Result<Sta
     let directory = directory(store, root, path)?;
     let entries = store.read_tree(&directory).map_err(String::from)?;
     let layers = validate_stack(store, &numbered_entries(&entries))?;
-    Ok(Stack { entries, layers })
+    Ok(Stack {
+        directory,
+        entries,
+        layers,
+    })
 }
 
 pub fn numbered(name: &str) -> bool {
@@ -139,6 +152,13 @@ mod tests {
         assert_eq!(stack.layers[0].commit, oid('a'));
         assert_eq!(stack.layers[0].base, oid('b'));
         assert_eq!(stack.layers.len(), 1);
+        let numbered = stack.numbered_tree(&mut store).unwrap();
+        let mut changed = TreeBuilder::from(Some(root));
+        changed.put("feature/notes", Mode::Blob, b"new notes".to_vec());
+        let root = changed.build(&mut store).unwrap();
+        let edited = read_stack(&store, &root, "feature").unwrap();
+        assert_ne!(stack.directory, edited.directory);
+        assert_eq!(numbered, edited.numbered_tree(&mut store).unwrap());
     }
 
     #[test]
