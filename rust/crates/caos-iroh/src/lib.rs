@@ -149,16 +149,129 @@ pub const DEFAULT_PORT: u16 = 11204;
 ///   trust decision. This changes the RELAY HOP ONLY: payloads stay end-to-end
 ///   encrypted between endpoint keys, so the relay could not read them before
 ///   and cannot now.
-/// * **The proxy the environment names**, rather than attempting a direct
-///   connection such a network will not permit.
+/// * **The proxy the environment names** -- but ONLY for n0's default relays.
+///   A relay named by `CAOS_IROH_RELAY` is dialled directly instead; see
+///   [`endpoint_builder`] for why, and for how curl hid the difference.
 ///
 /// Both come from `integrations/claude-code/cloud`, where they were first
 /// carried as a patch against dumbpipe; they are the part of that patch worth
 /// keeping.
+/// `CAOS_IROH_RELAY` replaces n0's relays with one you run, and exists because
+/// a Claude Code cloud container's SETUP phase cannot reach n0's at all.
+///
+/// Measured: from that phase all seven relays iroh ships answer `503` with an
+/// Envoy `upstream connect error`, while `www.hetzner.com` answers 200 and four
+/// of those relays ARE Hetzner-hosted. Bare IPs fail the same way, and so does
+/// forcing http/1.1, so it is neither the name, nor the protocol, nor a route:
+/// the gateway refuses those destinations. An `iroh-relay` on a host of one's
+/// own, on port 80, answered 200 from the same phase in the same run.
+///
+/// An `http://` URL is legitimate here and needs no certificate: the relay
+/// client reads TLS off the scheme (`use_tls()` is false for `http`) and
+/// defaults such a URL to port 80. That matters because a non-standard port is
+/// NOT carried by that egress at all -- the same relay on 3340 timed out from
+/// both phases -- so 80 or 443 is the whole of the choice. The relay hop being
+/// plaintext costs nothing that was not already given away: payloads stay
+/// end-to-end encrypted between endpoint keys, as the note above says.
+///
+/// SAID OUT LOUD, both ways. A relay setting that silently does nothing is the
+/// worst outcome here -- the symptom is "my change did not take", a full phase
+/// away from the cause -- so a bad URL names itself rather than falling back to
+/// n0 in silence. `caos-iroh serve` also prints the relays the ticket carries.
+pub const RELAY_ENV: &str = "CAOS_IROH_RELAY";
+
+/// The relay `CAOS_IROH_RELAY` names, parsed, or `None`.
+///
+/// Public because the TICKET has to carry it even when the endpoint has not
+/// reached it. A ticket otherwise lists only relays actually CONNECTED to, so a
+/// caosd started with no route out mints one with no relay at all -- usable
+/// from its own LAN and nowhere else, with nothing saying so. Bringing a stack
+/// up offline is an ordinary thing to do, and the configured relay is a
+/// statement of intent rather than an observation: trust it, and let the
+/// connection happen whenever the network does.
+pub fn configured_relay() -> Option<iroh::RelayUrl> {
+    let url = std::env::var_os(RELAY_ENV).map(|v| v.to_string_lossy().into_owned())?;
+    if url.is_empty() {
+        return None;
+    }
+    url.parse().ok()
+}
+
+/// The builder a CLIENT uses, which differs from the listener's in one way: the
+/// proxy decision is made from the relay the TICKET names, not from
+/// `CAOS_IROH_RELAY`.
+///
+/// A client has no `CAOS_IROH_RELAY` -- it learns the relay from the ticket --
+/// so it cannot use [`endpoint_builder`]'s rule, and taking the proxy
+/// unconditionally is what broke a cloud session: iroh routes EVERY relay dial
+/// through a configured proxy (`dial_url`, no scheme test, no `no_proxy`), so a
+/// plaintext relay was dialled as `CONNECT <host>:80` and timed out, while the
+/// SETUP phase -- which sets no proxy variables -- reached the same relay
+/// directly seconds earlier.
+///
+/// The scheme is the signal, and it is iroh's own: `use_tls()` treats `http`
+/// and `ws` as explicitly-plaintext. A proxy exists here to reach TLS relays
+/// through an egress that forbids direct connections; a plaintext relay is
+/// either directly reachable or not usable at all, so proxying it can only
+/// fail.
+pub fn client_endpoint_builder(ticket: &Ticket) -> iroh::endpoint::Builder {
+    let plaintext_relay = ticket
+        .addr
+        .relay_urls()
+        .any(|u| matches!(u.scheme(), "http" | "ws"));
+    if plaintext_relay {
+        eprintln!("caos-iroh: the ticket's relay is plaintext; dialling it directly");
+        base_endpoint_builder()
+    } else {
+        base_endpoint_builder().proxy_from_env()
+    }
+}
+
+/// The settings both ends need, before either decides about a proxy.
+fn base_endpoint_builder() -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0).ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
+}
+
 pub fn endpoint_builder() -> iroh::endpoint::Builder {
-    Endpoint::builder(presets::N0)
-        .ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
-        .proxy_from_env()
+    let builder = base_endpoint_builder();
+    let Some(url) = std::env::var_os(RELAY_ENV)
+        .map(|v| v.to_string_lossy().into_owned())
+        .filter(|u| !u.is_empty())
+    else {
+        return builder.proxy_from_env();
+    };
+    match iroh_relay::RelayMap::try_from_iter([url.as_str()]) {
+        Ok(map) => {
+            // DIALLED DIRECTLY, and that is the whole reason this branch skips
+            // `proxy_from_env`. iroh proxies EVERY relay dial once a proxy is
+            // configured -- `dial_url` has no scheme test and no `no_proxy`
+            // (neither crate mentions it) -- and it takes that proxy from
+            // HTTP_PROXY, http_proxy, HTTPS_PROXY, https_proxy in turn. A cloud
+            // session sets only `https_proxy`, so a plain `http://` relay was
+            // reached as `CONNECT <host>:80` through it, and timed out.
+            //
+            // curl hid this: for an `http://` URL curl consults only
+            // `http_proxy`, which is unset there, so it went DIRECT and
+            // answered 200 while iroh could not connect at all. Verified:
+            // `https_proxy=<black hole> curl http://<relay>/` still returns 200.
+            //
+            // A relay named here is one the operator chose FOR THIS NETWORK, so
+            // direct is the right assumption; the proxy below exists for n0's
+            // defaults, which such a network may not permit directly.
+            eprintln!("caos-iroh: {RELAY_ENV}={url}: using it instead of n0's relays,");
+            eprintln!(
+                "caos-iroh:   dialled directly (no proxy, even if one is in the environment)"
+            );
+            builder.relay_mode(iroh::RelayMode::Custom(map))
+        }
+        Err(error) => {
+            eprintln!("caos-iroh: {RELAY_ENV}={url} is not a relay URL ({error});");
+            eprintln!(
+                "caos-iroh:   falling back to n0's relays, which a cloud SETUP phase cannot reach"
+            );
+            builder.proxy_from_env()
+        }
+    }
 }
 
 /// Could `addr` be reached from another machine?
@@ -309,7 +422,7 @@ impl Client {
     /// listener authenticates the token, not the caller's identity, so there is
     /// no client key to store, lose, or have to enroll with a server.
     pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
-        let endpoint = endpoint_builder()
+        let endpoint = client_endpoint_builder(ticket)
             .bind()
             .await
             .map_err(|e| format!("binding an iroh endpoint: {e}"))?;

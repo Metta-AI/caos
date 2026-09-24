@@ -486,6 +486,64 @@ fn diagnostics() -> String {
         "client CAOS_REV: {}\n",
         std::env::var("CAOS_REV").unwrap_or_else(|_| "<unset>".to_string())
     ));
+    // WHETHER THIS SESSION IS IN DEV MODE, said outright rather than left to be
+    // inferred from an absence. The failure it exists to name is picking the
+    // wrong ENVIRONMENT: two of them look identical from inside, and a session
+    // that quietly ran the pinned client presented as "my change did not take",
+    // which cost a debugging session a single line here would have ended.
+    //
+    // FROM THE SETUP SCRIPT'S STAMP, because that is where dev mode happens:
+    // `setup.sh --dev-server=<ticket>` takes the whole install package from a
+    // caosd of one's own, and writes this file only once every step of it has
+    // succeeded. The stamp carries no ticket -- a `caos://` URL is the
+    // capability to drive that server, and this text is quoted verbatim into a
+    // model's context.
+    //
+    // It used to read `CAOS_DEV`, from when a session HOOK did the overlay.
+    // Nothing sets that variable any more, so the line said `off` in every dev
+    // session it was asked about -- the exact wrong answer, in the one place a
+    // locked-down session can look.
+    //
+    // BOTH SOURCES, because they can disagree and the disagreement is the
+    // interesting state: the stamp says the environment was BUILT in dev mode,
+    // a `dev-` revision says the client this server is running came from there.
+    let dev_stamp = std::fs::read_to_string("/usr/local/share/caos/dev-stamp").unwrap_or_default();
+    let stamped = |key: &str| -> Option<String> {
+        dev_stamp
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+            .filter(|v| !v.is_empty())
+    };
+    let dev_client = std::env::var("CAOS_REV")
+        .map(|r| r.starts_with("dev-"))
+        .unwrap_or(false);
+    d.push_str(&format!(
+        "dev mode: {}\n",
+        match (stamped("rev"), dev_client) {
+            (Some(rev), true) => format!(
+                "on -- the whole install package came from refs/caos/dev at {}, \
+                 and this conversation seeds from {} rather than from HEAD",
+                &rev[..rev.len().min(12)],
+                stamped("seed").map_or_else(
+                    || "<none>".to_string(),
+                    |c| c[..c.len().min(12)].to_string()
+                )
+            ),
+            (Some(rev), false) => format!(
+                "STAMPED BUT NOT RUNNING: this environment was built from \
+                 refs/caos/dev at {}, yet the client serving this session is the \
+                 pinned build -- something re-installed over it after setup",
+                &rev[..rev.len().min(12)]
+            ),
+            (None, true) => "the client is a dev build, but this environment carries no dev \
+                 stamp -- a snapshot older than the stamp, or a hand-placed binary"
+                .to_string(),
+            (None, false) => "off -- this session runs the caos its client repo pins. Pass \
+                 --dev-server=<ticket> on the environment's setup line to run \
+                 your own."
+                .to_string(),
+        }
+    ));
     // What install.sh resolved this session -- repo, full commit, build tag.
     d.push_str("build record (/usr/local/share/caos/build):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/build")));

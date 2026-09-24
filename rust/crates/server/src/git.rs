@@ -86,7 +86,10 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
             );
         }
         match read_push_commands(request.as_reader()) {
-            Ok(prefix) => prefix,
+            Ok(PushPrefix::Ready(prefix)) => prefix,
+            Ok(PushPrefix::Rejected { message, sideband }) => {
+                return respond_push_error(request, &message, sideband)
+            }
             Err(error) => {
                 return request.respond(
                     Response::from_string(error.to_string()).with_status_code(StatusCode(400)),
@@ -142,12 +145,32 @@ pub(crate) fn serve(config: &Config, mut request: Request) -> std::io::Result<()
     result
 }
 
+/// What [`read_push_commands`] found: either the command packets to replay into
+/// http-backend, or a refusal to hand back to the client.
+///
+/// A refusal is kept SEPARATE from an `Err` because the two reach the pusher by
+/// different routes — see [`respond_push_error`]. `sideband` records whether the
+/// client negotiated `side-band-64k`, which decides whether it can be told.
+enum PushPrefix {
+    Ready(Vec<u8>),
+    Rejected { message: String, sideband: bool },
+}
+
 /// Read only receive-pack's command packets, leaving the pack itself streaming.
 /// A shallow declaration can appear anywhere before the command flush, even
 /// when the incomplete commit is not one of the refs being updated.
-fn read_push_commands(mut input: impl Read) -> std::io::Result<Vec<u8>> {
+fn read_push_commands(mut input: impl Read) -> std::io::Result<PushPrefix> {
     let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidData, message);
     let mut prefix = Vec::new();
+    // SHALLOW LINES COME FIRST, capabilities second: the protocol is
+    // `*shallow ( command-list | push-cert )`, and the capabilities ride on the
+    // first COMMAND packet. So a refusal cannot be returned the moment a
+    // `shallow` line is seen — at that point we do not yet know whether the
+    // client can be told (side-band-64k), and guessing wrong means it is told
+    // nothing. Read on to the command flush, which ends the command list and
+    // never touches the pack, then refuse with the capabilities known.
+    let mut sideband = false;
+    let mut shallow = false;
     loop {
         let mut header = [0; 4];
         input.read_exact(&mut header)?;
@@ -157,7 +180,13 @@ fn read_push_commands(mut input: impl Read) -> std::io::Result<Vec<u8>> {
             .ok_or_else(|| invalid("invalid Git command packet"))?;
         prefix.extend_from_slice(&header);
         if length == 0 {
-            return Ok(prefix);
+            if shallow {
+                return Ok(PushPrefix::Rejected {
+                    message: "shallow pushes are not accepted; send complete history".into(),
+                    sideband,
+                });
+            }
+            return Ok(PushPrefix::Ready(prefix));
         }
         if length < 4 || prefix.len() + length - 4 > 16 * 1024 * 1024 {
             return Err(invalid("invalid or oversized Git command list"));
@@ -165,12 +194,48 @@ fn read_push_commands(mut input: impl Read) -> std::io::Result<Vec<u8>> {
         let start = prefix.len();
         prefix.resize(start + length - 4, 0);
         input.read_exact(&mut prefix[start..])?;
+        if find(&prefix[start..], b"side-band-64k").is_some() {
+            sideband = true;
+        }
         if prefix[start..].starts_with(b"shallow ") {
-            return Err(invalid(
-                "shallow pushes are not accepted; send complete history",
-            ));
+            shallow = true;
         }
     }
+}
+
+/// Tell `git push` WHY it was refused, through the git protocol rather than an
+/// HTTP status.
+///
+/// A non-2xx on `/git-receive-pack` is a transport failure to git's HTTP client:
+/// it reports `error: RPC failed; HTTP 400` and DISCARDS the body. So the
+/// sentence naming the only thing wrong, and the fix for it, reached nobody —
+/// measured over an hour in which every `caosd up` publish failed, `git push`
+/// said only `HTTP 400`, and the text became readable only by putting a proxy
+/// on the wire. `GIT_CURL_VERBOSE=1` does not help; it prints headers, not
+/// bodies.
+///
+/// Band 3 of the `side-band-64k` multiplexer is the error channel, and git
+/// prints its payload verbatim behind `remote:`, exactly as it does a
+/// pre-receive hook's rejection. A client that did not negotiate side-band gets
+/// the old 400 — it cannot be told, but it can still report a status.
+fn respond_push_error(request: Request, message: &str, sideband: bool) -> std::io::Result<()> {
+    if !sideband {
+        return request.respond(Response::from_string(message).with_status_code(StatusCode(400)));
+    }
+    let payload = format!("\x03{message}\n");
+    let mut body = format!("{:04x}", payload.len() + 4).into_bytes();
+    body.extend_from_slice(payload.as_bytes());
+    body.extend_from_slice(b"0000");
+    let content_type = Header::from_bytes(
+        &b"Content-Type"[..],
+        &b"application/x-git-receive-pack-result"[..],
+    )
+    .expect("static header is well formed");
+    request.respond(
+        Response::from_data(body)
+            .with_status_code(StatusCode(200))
+            .with_header(content_type),
+    )
 }
 
 /// Read just the CGI header block from the front of `stdout` — up to the first

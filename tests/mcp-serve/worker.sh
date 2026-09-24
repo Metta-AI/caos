@@ -127,6 +127,79 @@ case "$listing" in
   *caos_status*) ;;
   *) fail "caos_status vanished once the real tools resolved" ;;
 esac
+
+echo "== MCP resolves pinned generated paths on the client ==" >&2
+# This foreign repo exists only in THIS client container. Server evaluation
+# cannot fetch it; both help and invocation must consume the client handoff.
+foreign=$(mktemp -d)
+mkdir -p "$foreign/hello" generated
+bash_image=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash)
+cat > "$foreign/hello/.caos-expr" <<EXPR
+HELP=<<END
+Pinned generated tool.
+@param word The word.
+@in
+END
+curry --base:hash=$bash_image --worker1:@=worker.sh --help=\$HELP
+EXPR
+cat > "$foreign/hello/worker.sh" <<'WORKER'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/in
+caos get /cas/args/in/mcp-marker
+caos get /cas/args/word
+printf 'pinned %s %s' "$(cat /cas/args/word)" "$(cat /cas/args/in/mcp-marker)" > /tmp/out
+caos put /tmp/out /cas/out
+WORKER
+git -C "$foreign" init -q
+git -C "$foreign" add -A
+git -C "$foreign" -c user.name=test -c user.email=test@caos commit -qm pinned-tools
+revision=$(git -C "$foreign" rev-parse HEAD)
+printf 'curry --base:docker=unused --tools:@@=git+file://%s?rev=%s\n' \
+  "$foreign" "$revision" > generated/.caos-expr
+printf 'original-input' > mcp-marker
+git add generated mcp-marker
+git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
+session="mcp-path-$(date +%s)-$$"
+printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
+  | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
+head=$(git rev-parse "refs/caos/v3/conversations/$key/head")
+# Discover the repository mount, so this test does not prescribe startup's
+# source-tree prefix (or require a prefix if startup mounts content directly).
+prefix=$(git ls-tree -r "$head" | awk '$1 == "160000" && !found {print $4; found=1}')
+if [ -n "$prefix" ]; then prefix="$prefix/"; fi
+tool_path="${prefix}generated/args/tools"
+call_tool() { # <rpc id> <name> <leaf> [arguments JSON]
+  local id=$1 name=$2 leaf=$3 arguments=${4:-'{}'}
+  send "$(jq -nc --argjson id "$id" --arg name "$name" --arg session "$session" \
+    --arg path "$tool_path/$leaf" --argjson arguments "$arguments" \
+    '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:$name,arguments:{
+      caos_session:$session,caos_tool_use_id:("pinned-"+($id|tostring)),
+      path:$path,arguments:$arguments}}}')"
+  await "\"id\":$id" 300 || fail "pinned tool call $id did not answer"
+}
+help=$(call_tool 20 tool_help hello)
+case "$help" in
+  *'"isError":false'*'Pinned generated tool.'*|*'Pinned generated tool.'*'"isError":false'*) ;;
+  *) fail "pinned help missed the generated path: $help" ;;
+esac
+invalid=$(call_tool 21 run_tool hello)
+case "$invalid" in
+  *needs*word*) ;;
+  *) fail "run_tool did not reject missing arguments: $invalid" ;;
+esac
+ran=$(call_tool 22 run_tool hello '{"word":"supplied"}')
+case "$ran" in
+  *'pinned supplied original-input'*) ;;
+  *) fail "pinned invocation lost its path, arguments, or original input: $ran" ;;
+esac
+missing=$(call_tool 23 tool_help missing)
+case "$missing" in
+  *'"isError":true'*missing*|*missing*'"isError":true'*) ;;
+  *) fail "a missing generated path was not a recoverable tool error: $missing" ;;
+esac
+
 close_server
 
 echo "== an unreachable caos server is named, not waited on ==" >&2

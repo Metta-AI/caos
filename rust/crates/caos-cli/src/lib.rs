@@ -599,6 +599,39 @@ fn ensure_code_commit(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> R
     pushed
 }
 
+/// The conversation's starting content: the base commit's TREE, spliced in at
+/// the root.
+///
+/// A session starts from a caos CLIENT repo (SPEC, "Agent/harness
+/// integration") -- a pin, a root `.caos-expr`, the `AGENTS.md` the agent is
+/// given, and `.caos-secrets` declarations. That is the conversation's own
+/// content, not code under review, so it belongs where the agent's file tools
+/// land: at the root.
+///
+/// It used to be a GITLINK at `code/dirty`, which is the shape a launching
+/// checkout deserves when it IS the code you are working on. For a client repo
+/// it reads as the opposite of what it is: `ls /` shows an opaque `code/`
+/// beside imported repositories, `dirty` suggests unsaved work, the
+/// `AGENTS.md` meant to govern the session sits two levels down inside a
+/// source tree, and `.caos-secrets` becomes editable code.
+///
+/// `reject_reserved_caos` on the base is what makes this safe, and it is now
+/// load-bearing in a way it was not: these entries land BESIDE the protocol's
+/// own `.caos/`, so a base carrying `.caos` would collide with conversation
+/// state rather than merely sitting inside a source tree. A client repo's
+/// `.caos-expr` and `.caos-secrets/` are different path components and do not
+/// trip it -- `ls-tree -- .caos` is a pathspec, matching whole components.
+///
+/// The upstream revision is NOT recorded: `ConversationRoot` carries only
+/// `{identity, title, content}`, and the gitlink was the one place it was
+/// written down. Recovering it means a protocol field, not a file at the root
+/// of every conversation.
+fn seed_content(t: &GitTransport, store: &mut GitStore, commit: &Oid) -> Result<Oid, String> {
+    ensure_code_commit(t, store, commit)?;
+    reject_reserved_caos(t, commit.as_str(), "base code")?;
+    Ok(store.read_commit(commit).map_err(String::from)?.tree)
+}
+
 fn mint_conversation_root(
     t: &GitTransport,
     store: &mut GitStore,
@@ -613,14 +646,7 @@ fn mint_conversation_root(
         Some(content)
     } else if let Some(base) = &options.base {
         let commit = oid(base, "initial code")?;
-        ensure_code_commit(t, store, &commit)?;
-        let mut tree = conversation_protocol::v3::tree::TreeBuilder::from(None);
-        tree.put_oid(
-            "code/dirty",
-            conversation_protocol::v3::Mode::Commit,
-            commit,
-        );
-        Some(tree.build(store)?)
+        Some(seed_content(t, store, &commit)?)
     } else {
         None
     };

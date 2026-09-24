@@ -18,6 +18,11 @@ smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
 every request paid a fresh connection — the reason `/eval-locator` exists — while
 the client now holds ONE connection and opens a stream per request.
 
+These four scripts are due to be replaced by one Go program run from the setup
+field; [`design/cloud-setup.md`](../../../design/cloud-setup.md) has the plan and
+the measurements that motivate it, including the three assumptions in this
+document that turned out to be false.
+
 ## The session starts from a CLIENT repo, not from the code
 
 The repository a session opens is a **caos client repo** — a handful of text
@@ -78,8 +83,10 @@ pin be read that early — and reading it early matters, because work done after
 the snapshot is paid by every session. Measured from a session's
 `env_manager_log`: `Cloned from seed bundle` precedes `Running setup script`.
 
-A repo that pins no caos (caos' own, or any ordinary one) falls through to the
-`--base` in the settings form, exactly as before this existed.
+A repo that pins no caos is a misconfigured environment and setup **fails**,
+naming what is missing. It does not fall back to the `--base` in the settings
+form: that names a branch, and a client installed from a moving head would be a
+client from a different tree than the tools it drives.
 
 ## Configuring the environment
 
@@ -147,8 +154,9 @@ decision: an ambient token with no entropy would otherwise have run with no
 cache isolation at all.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
-client), `api.anthropic.com`, and iroh's relays (`*.relay.n0.iroh.link`,
-`dns.iroh.link`) are all reachable. Measured from a container: all return 200.
+client), `api.anthropic.com`, and iroh's relays are reachable from a SESSION;
+the setup phase is a different path and refuses the n0 relays (see *Dev mode*
+below, which is the only thing that needs them that early).
 
 One thing the container needs that a laptop does not: the **OS trust store**.
 Egress here is a TLS-intercepting proxy, so the relay presents the proxy's
@@ -157,6 +165,55 @@ iroh's compiled-in Mozilla roots reaches NO relay while curl and git on the same
 host are fine. `caos_iroh::endpoint_builder` asks for the system store and
 honours `HTTPS_PROXY`, and the release checks the built helper for the markers
 that prove it.
+
+## Dev mode: the whole install package from your own caosd
+
+A third line on the setup command runs the session against the caos on your
+machine, with no push and no CI:
+
+```
+B=https://raw.githubusercontent.com/Metta-AI/caos/main
+curl -fsSL "$B/integrations/claude-code/cloud/setup.sh" | bash -s -- --base="$B" \
+  --dev-server=caos://<ticket>
+```
+
+`caosd up --iroh` publishes the working checkout to `refs/caos/dev` on that
+server: one commit carrying the tree and the x86_64 binaries built from it.
+`setup.sh` fetches that commit and takes **everything** from it — the client,
+`git-remote-caos`, `settings.json`, `mcp.json`, the installer, and this script
+itself (re-exec'd once from the dev tree, so an edit here is in the package like
+anything else). It then repoints the checkout's `.caos-expr` and `flake.lock` at
+`git+caos://…?rev=<dev>`, so the tools resolve from there too.
+
+It is an **argument, not an environment variable**: the setup phase does not get
+the environment's variables. Measured — a session stamped `off` while the
+environment plainly set `CAOS_DEV=1`, which is why that variable is gone.
+
+Two things are less obvious and both cost a session to find:
+
+- **The committed GitHub pin is still required**, as a bootstrap. Fetching over
+  `caos://` needs `git-remote-caos`, and the release install is what puts it on
+  PATH; the dev package then replaces everything it laid down.
+- **The conversation seeds from an unreferenced commit**, minted by
+  `commit-tree` from the rewritten checkout and passed to the hook as
+  `--base=<full sha>`. The hook — not `mcp serve` — is what creates a
+  conversation, and without this it would seed from `HEAD`: the session would
+  run your client while evaluating the *committed* tools, the half-update the
+  whole arrangement exists to prevent. Nothing points at that commit, so a
+  `git push` cannot carry the ticket it contains.
+
+`/usr/local/share/caos/dev-stamp` is written last, once every step has
+succeeded; `caos_status` and the session hook both report from it, and each
+step is fatal, so the file existing is the claim.
+
+**The relay has to be one of yours.** The setup phase reaches the network
+through a TLS-terminating gateway that answers **503** for all seven n0 relays
+(measured; controls on the same network pass), while the session hook, which
+egresses through a local `CONNECT` proxy, reaches them fine. A dev stack's
+ticket carries only private addresses, so the relay is the only path — run
+`iroh-relay --dev` on a host of your own and point `CAOS_IROH_RELAY` at it
+(`prod/caosd/configuration.nix` has a unit for it). **Port 80 or 443 only**:
+both phases carry standard ports and time out on anything else.
 
 ## The ticket keeps working; a re-keyed server does not
 

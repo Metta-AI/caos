@@ -46,9 +46,9 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, ensure_code_commit, fetch_validated_head, mint_transition,
-    oid, open_store, push_cas, reject_reserved_caos, resolve_base, resolve_username, signature,
-    update_local_cache, TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
+    conversation_ref, default_title, fetch_validated_head, mint_transition, oid, open_store,
+    push_cas, resolve_base, resolve_username, seed_content, signature, update_local_cache,
+    TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
 /// Conversation ids for recorded sessions live under one component so they are
@@ -79,6 +79,29 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
     let mut options = TurnOptions::default();
     let mut rest = Vec::new();
     for argument in args {
+        // `--base=<full sha>` SEEDS THE CONVERSATION from a commit other than
+        // HEAD, which is what dev mode needs: `setup.sh` rewrites the
+        // checkout's `.caos-expr` to point at the dev stack, but the
+        // conversation's CONTENT comes from `resolve_base`, which without this
+        // is unconditionally `HEAD` -- so the rewrite reached the checkout and
+        // not the tree the session evaluates. Measured: a session ran the dev
+        // client and dev step while every `caos-std/<entry>` still resolved
+        // through the committed pin.
+        //
+        // A FULL SHA AND NOTHING ELSE. A revspec here would reintroduce
+        // "resolved through a moving head" in a place nobody would think to
+        // look -- the same pairing `install.sh` refuses `--base` a branch for.
+        // The caller mints an unreferenced commit (`git commit-tree`), so there
+        // is no name for this to accept anyway.
+        if let Some(sha) = argument.strip_prefix("--base=") {
+            if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "--base must be a full 40-character commit sha, not {sha:?}"
+                ));
+            }
+            options.base = Some(sha.to_string());
+            continue;
+        }
         if !options.take_image_arg(argument) {
             rest.push(argument.as_str());
         }
@@ -205,7 +228,16 @@ fn run_tool(
     let (request, request_head, round) =
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    dispatch_call(t, options, &id, name, &request, &request_head, &call)?;
+    dispatch_call(
+        t,
+        options,
+        &id,
+        name,
+        &declared,
+        &request,
+        &request_head,
+        &call,
+    )?;
     read_outcome(t, &id, &request, round, &call)
 }
 
@@ -216,20 +248,17 @@ fn run_tool(
 /// would be answered from the first's memo. `--tools-only` carries the call id
 /// for exactly that reason, and the step checks it ran before returning.
 ///
-/// A PROJECT TOOL (`caos-tools/<name>`) is resolved HERE, on the client, and its
-/// tree handed to the step -- see [`caos::eval_tree_tool`] for why: the step's
-/// own `eval-path-then` runs SERVER-SIDE and refuses a `:@@=` locator, so a tool
-/// that reaches one (coworld-ctf's do, through its root `.caos-expr`) can only be
-/// evaluated where the fetch lives. `--client-tool-tree` carries the resolved
-/// oid and `--client-tool-name` the tool it belongs to, so the step uses it only
-/// for the matching tool and evaluates everything else exactly as before. A
-/// resolution that fails is left to the step: it evaluates server-side and
-/// surfaces the same error the run would, so nothing is hidden.
+/// Repository tools resolve against their conversation path, client-side so
+/// pinned locators use the existing fetch/evaluation machinery. Both calls
+/// receive the evaluated tool; the worker describes it or validates arguments
+/// before invocation. The handoff is pinned to the input tree and path.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_call(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
     name: &str,
+    arguments: &Value,
     request: &Oid,
     request_head: &Oid,
     call: &str,
@@ -241,20 +270,59 @@ fn dispatch_call(
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    match caos::eval_tree_tool(t, name, &store) {
-        Ok(Some(tree)) => {
-            kvs.push(format!("--client-tool-name={name}"));
-            kvs.push(format!("--client-tool-tree:hash={tree}"));
+    if matches!(name, "tool_help" | "run_tool") {
+        let object_store = open_store(t)?;
+        let (_, head) =
+            fetch_validated_head(t, &object_store, id)?.ok_or("tool conversation disappeared")?;
+        let view = Conversation::open(&object_store, &head)?;
+        match tool_resolution_scope(&object_store, &view, arguments) {
+            Ok((root, path)) => {
+                kvs.push(format!("--client-tool-root={root}"));
+                kvs.push(format!("--client-tool-path={path}"));
+                let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
+                    .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
+                if let Err(error) = resolved {
+                    // Deliver a recoverable tool error. Falling back to the server
+                    // would discard the actual client-side evaluation error.
+                    kvs.push(format!("--client-tool-error={error}"));
+                }
+            }
+            // SAY SO. Skipping quietly pushes no handoff at all, which is
+            // indistinguishable at the worker from a client too old to send
+            // one -- llm-step reports `no client tool handoff` for both. The
+            // step then evaluates server-side, the server refuses the `:@@=`
+            // it finds there, and the error names the repository's expression
+            // rather than the scope that could not be worked out here.
+            Err(error) => eprintln!(
+                "caos mcp serve: no resolution scope for {name} ({error}); \
+                 letting the step evaluate server-side"
+            ),
         }
-        Ok(None) => {}
-        Err(error) => eprintln!(
-            "caos mcp serve: could not resolve {name:?} on the client ({error}); \
-             letting the step evaluate it"
-        ),
     }
     let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
     let server = t.server_url()?;
     caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
+}
+
+/// Match the worker's input selection against the conversation snapshot, not
+/// the client's checkout. Generated definitions never become the tool's input.
+fn tool_resolution_scope(
+    store: &dyn ObjectStore,
+    view: &Conversation<'_>,
+    arguments: &Value,
+) -> Result<(Oid, String), String> {
+    let path = arguments["path"].as_str().ok_or("tool requires path")?;
+    paths::validate_tree_path(path)?;
+    for name in view.source_tree_names()?.into_iter().rev() {
+        if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
+            let source = view.source_tree(&name)?.ok_or("source tree disappeared")?;
+            return Ok((
+                store.read_commit(&source.commit)?.tree,
+                relative.to_string(),
+            ));
+        }
+    }
+    Ok((view.tree().clone(), path.to_string()))
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -704,15 +772,11 @@ fn root_commit(
     let base = oid(&resolve_base(t, options)?, "conversation base")?;
     cc_timing("resolve_base", phase.elapsed());
     let phase = std::time::Instant::now();
-    ensure_code_commit(t, store, &base)?;
+    // The client repo's own tree becomes the conversation's content, at the
+    // root -- the same `seed_content` the tui uses, so a recorded session and a
+    // hand-driven one start identically.
+    let content = seed_content(t, store, &base)?;
     cc_timing("ensure_code_commit", phase.elapsed());
-    reject_reserved_caos(t, base.as_str(), "base code")?;
-    // Seed the base as the conversation's `code/dirty` source tree -- the shape
-    // `mint_conversation_root` builds for the tui, so a recorded session and a
-    // hand-driven one carry code the same way.
-    let mut content = conversation_protocol::v3::tree::TreeBuilder::from(None);
-    content.put_oid("code/dirty", conversation_protocol::v3::Mode::Commit, base);
-    let content = content.build(store)?;
     let genesis = oid(G3, "v3 genesis")?;
     let root = Transition::ConversationRoot {
         identity: Identity {

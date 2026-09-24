@@ -236,7 +236,18 @@ async fn serve(options: Options) -> Result<(), String> {
     //
     // The relays stay either way, so a client that can use none of these
     // addresses still connects.
-    let discovered = endpoint.addr();
+    // THE CONFIGURED RELAY GOES IN WHETHER OR NOT IT HAS BEEN REACHED. `addr()`
+    // reports relays this endpoint has CONNECTED to, so a caosd brought up with
+    // no route out -- an ordinary thing to do -- mints a ticket with no relay in
+    // it: usable from its own LAN and nowhere else, and nothing in the ticket
+    // says so. `CAOS_IROH_RELAY` is a statement of intent, so it is trusted
+    // here and the connection can happen whenever the network does.
+    let discovered = match caos_iroh::configured_relay() {
+        Some(relay) if !endpoint.addr().relay_urls().any(|u| *u == relay) => {
+            endpoint.addr().with_relay_url(relay)
+        }
+        _ => endpoint.addr(),
+    };
     let addr = if options.advertise.is_empty() {
         discovered
     } else {

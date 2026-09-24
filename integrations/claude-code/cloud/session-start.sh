@@ -79,6 +79,33 @@ else
     log "no setup stamp; this environment predates it"
 fi
 
+# ---------------------------------------------------------------------------
+# Is this a dev environment? Read once, here, used three times below
+# ---------------------------------------------------------------------------
+# Dev mode is done ENTIRELY by the setup script -- the client, the git helper,
+# the JSON, the checkout's own `.caos-expr`, and the unreferenced commit the
+# conversation seeds from. This hook does none of it, and the version that did
+# is gone: it fired on `CAOS_DEV`, which nothing sets any more, and everything
+# it did would now be undone or duplicated by what setup leaves on disk.
+#
+# What is left for a session is to KNOW, because three things here would
+# otherwise be wrong: the client must not be refreshed from GitHub (that is the
+# pinned build, and installing it would undo dev mode), the registry warm must
+# name the same step the tool server was configured with, and the session has to
+# be told which caos it is.
+dev_rev=""
+dev_seed=""
+dev_std_path=""
+if [ -r /usr/local/share/caos/dev-stamp ]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            rev) dev_rev="$value" ;;
+            seed) dev_seed="$value" ;;
+            std_path) dev_std_path="$value" ;;
+        esac
+    done < /usr/local/share/caos/dev-stamp
+fi
+
 # An environment snapshotted before the bootstrap stopped baking the pin. Its
 # `--base` is that frozen pin, not a script base, so nothing here uses it — and
 # with no `--bootstrap-base` this hook cannot read the repo's CURRENT pin,
@@ -215,7 +242,23 @@ fi
 # that pins no caos does not get a refresh at all; it keeps the client the
 # snapshot has, which is a session that works rather than one installed from
 # the wrong tree.
-if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
+#
+# IN DEV MODE NEITHER RUNS. The refresh exists to un-freeze a snapshot's client
+# by re-installing the repo's pin from GitHub; here that would replace the
+# binary setup took from the dev server with the one the repo pins, undoing dev
+# mode at the start of every session. Nor is there a pin left to read: setup
+# rewrote `flake.lock` to name the dev server, and caos-pin.sh -- which exists
+# to turn a pin into a GitHub base -- correctly declines to make one out of a
+# `caos://` URL. That decline used to reach the log as "this checkout pins no
+# caos", about a checkout pinned precisely, deliberately, at your own machine.
+if [ -n "$dev_rev" ]; then
+    # From the stamp, not from the checkout: `--caos-std-path` is what setup
+    # handed install.sh, so it is what the tool server's `--llm-step:@=` names,
+    # and the warm below has to agree with that or it fills a cache key nothing
+    # reads and the first turn has no tools.
+    caos_std_path="$dev_std_path"
+    step "dev mode: client and tools from the dev server; no refresh from GitHub"
+elif [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     # Cleared before the eval, and read back with `:-` after it, so a
     # caos-pin.sh that somehow succeeds while printing less than it promises
     # cannot take the hook out on an unset variable under `set -u`. The whole
@@ -239,7 +282,12 @@ if [ "$have_repo" = 1 ] && [ -n "$bootstrap_base" ]; then
     fi
 fi
 
-if [ -n "$base" ] && [ -n "$caos_std_path" ]; then
+if [ -n "$dev_rev" ]; then
+    # Said above, and deliberately not said twice: the branch is here so that
+    # the "pins no caos" line below cannot be reached in dev mode, where it is
+    # both false and the exact wrong place to send a reader.
+    :
+elif [ -n "$base" ] && [ -n "$caos_std_path" ]; then
     step "refreshing the client"
     if ! curl -fsSL "$base/integrations/claude-code/cloud/install.sh" \
          | bash -s -- --no-repo-files --user-config --base="$base" \
@@ -261,6 +309,35 @@ else
     log "  using the client the environment was built with"
 fi
 step "client refresh done"
+
+# ---------------------------------------------------------------------------
+# WHICH CAOS THIS SESSION IS -- on STDOUT, the only stream that reaches anyone
+# ---------------------------------------------------------------------------
+# A SessionStart hook contributes its STDOUT to the session. Its stderr is
+# captured as a `system/hook_response` event, which is classed as NON-TRANSCRIPT
+# and dropped -- the run-log API says so in as many words, and reading these
+# lines at all meant paging the raw events endpoint three cursors back.
+#
+# Every line this file logs is stderr (`log()` redirects, `step()` calls `log`).
+# So the dev-mode trace added to make "did dev mode take?" a FACT rather than an
+# inference was written, every session, into the one stream the session discards
+# -- and then cost exactly the debugging session it exists to prevent: a run
+# whose hook had said `dev client installed ... dev-0ac792e540a0` read, from
+# everywhere a human or a model can see, as a change that had not taken.
+#
+# THE STAMP IS THE AUTHORITY, not anything this hook can test. Dev mode happens
+# in the setup script, entirely, and every step of it there is fatal -- so the
+# file existing is the whole claim, and a session cannot be in the state this
+# used to have a third message for ("asked for but not active"). It reported on
+# `CAOS_DEV`, which nothing has set since the dev server became a setup
+# argument, so it said `off` in every dev session it was asked about.
+if [ -n "$dev_rev" ]; then
+    echo "caos dev mode: ON -- the whole install package came from refs/caos/dev" \
+         "at ${dev_rev:0:12}, and this session's conversation seeds from" \
+         "${dev_seed:0:12} (the checkout as setup left it)."
+else
+    echo "caos dev mode: off -- this session runs the caos its repo pins."
+fi
 
 # ---------------------------------------------------------------------------
 # Unshallow the checkout -- LAST, because it is the slowest and gates only the

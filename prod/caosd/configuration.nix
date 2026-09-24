@@ -56,6 +56,35 @@ in
       default = 11204;
       description = "Fixed UDP port for the iroh transport; it must be stable to be in a ticket.";
     };
+
+    relay.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Run an iroh relay here, for clients whose network cannot reach n0's.
+
+        A Claude Code cloud container's SETUP phase is one such network: all
+        seven relays iroh ships answer 503 there with an Envoy upstream connect
+        error -- under h2 and http/1.1 alike, and by bare IP -- while
+        www.hetzner.com answers 200 from the same phase and four of those relays
+        are Hetzner-hosted. It refuses those destinations, not relay traffic: a
+        relay run HERE answered 200 from that phase, on the host and port where
+        an ordinary HTTP server had.
+
+        A dev stack points at it with CAOS_IROH_RELAY, and its ticket then
+        carries this relay instead of n0's.
+      '';
+    };
+
+    relay.port = lib.mkOption {
+      type = lib.types.port;
+      default = 80;
+      description = ''
+        Port for the relay. 80 or 443 and nothing else: that egress carries no
+        other port, measured -- the same relay on 3340 timed out from both the
+        setup and the session phase, while port 80 answered from both.
+      '';
+    };
   };
 
   config = {
@@ -149,6 +178,45 @@ in
     users.users.ssm-user.extraGroups = [ "docker" "caos" ];
 
     networking.firewall.allowedUDPPorts = [ cfg.irohPort ];
+    networking.firewall.allowedTCPPorts = lib.optional cfg.relay.enable cfg.relay.port;
+
+    # The relay, as a UNIT rather than a shell command, because `nix run` dies
+    # with the terminal that started it -- and a dead relay is indistinguishable
+    # from the gateway blocking us, a confusion that has already cost two
+    # debugging rounds.
+    #
+    # `--dev` is plain HTTP, and that is deliberate rather than provisional: the
+    # relay client reads TLS off the URL scheme, so an `http://` relay URL needs
+    # no certificate and no DNS name, and the hop carries nothing readable --
+    # payloads stay end-to-end encrypted between endpoint keys, so the relay
+    # sees ciphertext and metadata either way. TLS here would buy privacy for
+    # the metadata and a way to stop strangers relaying through this box; it is
+    # not what makes the transport work.
+    systemd.services.iroh-relay = lib.mkIf cfg.relay.enable {
+      description = "iroh relay, for clients whose network cannot reach n0's";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.iroh-relay}/bin/iroh-relay --dev --config-path ${
+          pkgs.writeText "iroh-relay.toml" ''
+            http_bind_addr = "[::]:${toString cfg.relay.port}"
+            enable_metrics = false
+          ''
+        }";
+        Restart = "always";
+        RestartSec = 2;
+        DynamicUser = true;
+        # Port 80 is privileged and this does not run as root. Ambient rather
+        # than a root ExecStart: the relay needs to bind low and nothing else.
+        AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+      };
+    };
 
     # Answering "does it start on boot": yes, this is that.
     systemd.services.caosd = {
