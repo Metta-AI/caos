@@ -20,6 +20,10 @@
 }:
 
 let
+  # The stack's state: the docker images, the registry, redis and the server
+  # repo. Named once, because the unit, the caos user's home and every
+  # interactive `caosd` have to agree on it.
+  dataDir = "/data/caos";
   cfg = config.caos;
 in
 {
@@ -215,7 +219,7 @@ in
     users.users.caos = {
       isSystemUser = true;
       group = "caos";
-      home = "/data/caos";
+      home = dataDir;
       extraGroups = [ "docker" ];
     };
     # You arrive over SSM as ssm-user; let it drive the stack too.
@@ -284,7 +288,7 @@ in
         pkgs.coreutils
       ];
       environment = {
-        CAOS_DATA = "/data/caos";
+        CAOS_DATA = dataDir;
         CAOS_IROH_ADVERTISE = "${cfg.advertiseAddress}:${toString cfg.irohPort}";
         CAOS_IROH_RELAY = cfg.relay.url;
       };
@@ -293,13 +297,21 @@ in
         RemainAfterExit = true;
         User = "caos";
         Group = "caos";
-        WorkingDirectory = "/data/caos";
+        WorkingDirectory = dataDir;
         ExecStart = "${cfg.package}/bin/caosd up --iroh";
         ExecStop = "${cfg.package}/bin/caosd down";
         # A cold first run builds every std worker image before it returns.
         TimeoutStartSec = "90min";
       };
     };
+
+    # SO AN INTERACTIVE `caosd` FINDS THIS MACHINE'S STACK. Without it the
+    # command defaults CAOS_DATA to `$PWD/.caos-data` (flake.nix), so `caosd
+    # logs` from a login shell reads `/.caos-data/stack/logs/*.log` and reports
+    # a missing directory -- and `caosd ticket` and `caosd down` are wrong the
+    # same way, more quietly. The unit sets it for itself; this is for the
+    # person holding the shell.
+    environment.variables.CAOS_DATA = dataDir;
 
     environment.systemPackages = [
       cfg.package
