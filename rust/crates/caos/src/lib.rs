@@ -4163,15 +4163,11 @@ pub fn resolve_cli_image_arg(
 /// [`resolve_cli_image_arg`] with a `:@=` path looked up in `tree` instead of in
 /// the working directory.
 ///
-/// WHICH TREE A CLIENT'S TOOLS COME FROM, and for anything that RECORDS a
-/// conversation the working directory is the wrong answer: the conversation's
-/// content is its base commit, so a step resolved from the worktree can come
-/// from a different tree than the session records. That gap is not theoretical —
-/// it is what obliged a dev-mode cloud session to rewrite `.caos-expr` and
-/// `flake.lock` ON DISK, leaving a checkout dirty with a `caos://` ticket
-/// (a credential) for an agent to be asked to commit. Naming the tree keeps the
-/// two together by construction, and the rewrite then lives only in the
-/// unreferenced commit the conversation seeds from.
+/// WHICH TREE A CLIENT'S TOOLS COME FROM. Anything that RECORDS a conversation
+/// must name the tree: the conversation's content is its base commit, so a step
+/// resolved from the worktree can come from a tree the session does not record,
+/// and a dev-mode session would then have to rewrite files on disk to keep the
+/// two together. Naming the tree makes them agree by construction.
 ///
 /// The other three types are unaffected and delegate: they name an object
 /// outright or fetch it, so the working directory never entered them.

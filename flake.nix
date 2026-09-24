@@ -1255,11 +1255,11 @@ sandbox = false''
               if [ "''${2:-}" = --iroh ]; then IROH=yes; fi
               # A RELAY IS REQUIRED, and is refused here rather than defaulted.
               # n0's relays are never used (caos_iroh::endpoint_builder), so a
-              # bring-up without one has nothing to fall back to — and when it
-              # DID fall back, the result was the worst shape available: the
-              # ticket kept its endpoint id and token, so the one already in an
-              # environment still looked current, while every cloud session
-              # against it died in its setup phase with `timed out`.
+              # bring-up without one has nothing to fall back to — and a ticket
+              # carrying an unreachable relay keeps its endpoint id and token,
+              # so it is indistinguishable from the one already in an
+              # environment while every session against it times out in its
+              # setup phase.
               if [ "$IROH" = yes ] && [ -z "''${CAOS_IROH_RELAY:-}" ]; then
                 die "caosd up --iroh needs a relay to be reached through, and there is
   no default: n0's relays answer 503 from a cloud container's setup phase.

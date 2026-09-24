@@ -130,9 +130,9 @@ web() {
 # you are working in, which is the one repo that cannot be it.
 #
 # caos is not a client repo: its flake.lock has no `caos` input, so stage 1
-# refuses the environment and the session dies in its setup phase. That is the
-# correct answer to the wrong question, four minutes and one container after the
-# mistake, and it has been made twice. Ask here instead, where it costs nothing.
+# refuses the environment and the session dies in its setup phase -- the correct
+# answer to the wrong question, four minutes and one container later. Asking here
+# costs nothing.
 #
 # The pin test is `bootstrap.go`'s own (`readLock`): `nodes.<root>.inputs.caos`
 # names a node KEY, and only that node's `locked.rev` is authoritative. A

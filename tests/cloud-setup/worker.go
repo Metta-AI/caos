@@ -2,16 +2,15 @@
 // runs before Claude Code starts (integrations/claude-code/cloud, and
 // design/cloud-setup.md).
 //
-// Until this existed, nothing tested them but a four-minute cloud round trip,
-// which is most of why they were bash. Everything here is a fixture: a checkout
-// that pins caos, an install package laid out the way a release is, and a dev
-// tree laid out the way `refs/caos/dev` is. No network, no server, no client.
+// The only other check on them is a four-minute cloud round trip. Everything
+// here is a fixture: a checkout that pins caos, an install package laid out the
+// way a release is, and a dev tree laid out the way `refs/caos/dev` is. No
+// network, no server, no client.
 //
-// WHAT IT IS REALLY FOR is the two failures that cost a session each and are
-// invisible from inside one: a substitution that silently matches nothing (the
-// session starts and every tool call dies for want of --llm-step), and a dev
-// mode that installs a dev client while the tools still resolve through the
-// committed pin.
+// WHAT IT GUARDS are two failures that are invisible from inside a session: a
+// substitution that silently matches nothing (the session starts and every tool
+// call dies for want of --llm-step), and a dev mode that installs a dev client
+// while the tools still resolve through the committed pin.
 package main
 
 import (
@@ -262,7 +261,7 @@ func main() {
 		bootstrap := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base,
 			"--server="+ticket,
-			"--dev-server="+ticket,
+			"--dev-mode",
 			"--dev-tree="+devTree,
 			"--dev-rev="+devRev,
 			"--prefix=/tmp/prefix1",
@@ -321,6 +320,22 @@ func main() {
 		w.True(!strings.Contains(git(repo, "for-each-ref", "--format=%(objectname)"), seedCommit),
 			"a ref points at the seed commit, so a push could carry the ticket")
 		w.True(git(repo, "rev-parse", "HEAD") == head, "stage 1 moved the branch")
+
+		w.Step("stage 1 refuses to run without a server to point the session at")
+		// ONE TICKET, NAMED ONCE: `--server` is the only place a server is named,
+		// and nothing falls back to the environment. A setup line that names none
+		// must fail HERE rather than produce a session whose every tool call dies
+		// on a missing remote.
+		noServer := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
+			"--base="+base, "--dev-mode",
+			"--dev-tree="+devTree, "--dev-rev="+devRev,
+			"--prefix=/tmp/prefix2", "--share-dir=/tmp/share2", "--homes=/tmp/home1")
+		noServer.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+repo)
+		noServer.Dir = "/tmp"
+		refusal, err := noServer.CombinedOutput()
+		w.True(err != nil, "stage 1 accepted a setup line that names no server:\n%s", refusal)
+		w.True(strings.Contains(string(refusal), "--server"),
+			"the refusal does not name --server, so nobody can act on it:\n%s", refusal)
 
 		w.Step("stage 1 leaves a session ready to start")
 		w.True(git(repo, "remote", "get-url", "caos") == ticket,

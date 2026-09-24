@@ -3,30 +3,30 @@
 //
 //	B=https://raw.githubusercontent.com/Metta-AI/caos/main
 //	curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
-//	go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
+//	go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> [--dev-mode]
 //
 // `--base` says where THIS FILE came from and nothing else. Which caos gets
 // installed comes from the repository the environment opens -- a client repo,
 // whose flake.lock pins a commit and whose root .caos-expr mounts that commit's
-// std. A repo that pins nothing is a misconfigured environment and fails here,
-// rather than being installed from `--base`'s branch: the step a session runs
-// resolves through the pinned commit, so a client from a moving head would be a
-// client from a different tree than its own tools.
+// std. A repo that pins nothing fails here rather than falling back to
+// `--base`'s branch: the step a session runs resolves through the pinned commit,
+// so a client from a moving head would drive tools from another tree.
 //
 // STAGE 2 COMES FROM THE PAYLOAD, not from `--base`. This file downloads the
 // release (or, in dev mode, fetches refs/caos/dev) and then `go run`s the
-// install.go it finds there. That is what lets an edit to the installer reach
+// install.go it finds there, which is what lets an edit to the installer reach
 // the next session with no push: in dev mode the payload is your working tree.
 //
-// EVERYTHING ARRIVES AS AN ARGUMENT, including the server ticket. This phase
-// does not get the environment's variables -- measured: a session stamped `off`
-// while the environment plainly set CAOS_DEV=1.
+// EVERYTHING ARRIVES AS AN ARGUMENT, including the server ticket: this phase
+// does not get the environment's variables.
 //
-// STDLIB ONLY, and `curl`/`git` rather than `net/http`. A module fetch would
-// have to reach proxy.golang.org, which is the phase that answers 503 for every
-// n0 relay; and importing net/http drags in the TLS stack and doubles the cold
-// `go run` compile (5.7s against 2.8s, measured) for something curl already
-// does and git needs anyway.
+// THE TICKET IS NAMED ONCE. `--dev-mode` is a mode, not a second server -- it
+// takes the install package from the server this session already runs against.
+//
+// STDLIB ONLY, and `curl`/`git` rather than `net/http`: a module fetch would
+// have to reach proxy.golang.org, which this phase cannot, and net/http drags
+// in the TLS stack and doubles the cold `go run` compile (5.7s against 2.8s)
+// for something curl already does and git needs anyway.
 package main
 
 import (
@@ -78,7 +78,7 @@ func curlTo(url, dest string) error {
 type args struct {
 	base       string
 	server     string
-	devServer  string
+	devMode    bool
 	devTree    string
 	devRev     string
 	enableBash bool
@@ -96,11 +96,14 @@ func parseArgs(argv []string) args {
 			a.base = strings.TrimRight(value, "/")
 		case "--server":
 			a.server = value
-		case "--dev-server":
-			a.devServer = value
+		// A MODE, not a second server: the install package comes from the
+		// server `--server` already names, rather than from a GitHub release.
+		// A second ticket argument would be one more place to keep in step.
+		case "--dev-mode":
+			a.devMode = true
 		// Passed only by this file's re-exec of the dev tree's own copy, which
-		// has already paid for the fetch. Named rather than inferred from an
-		// environment variable, so the second pass says what it is skipping.
+		// has already paid for the fetch. An argument rather than an environment
+		// variable, so the second pass says what it is skipping.
 		case "--dev-tree":
 			a.devTree = value
 		case "--dev-rev":
@@ -344,7 +347,7 @@ func fetchDevTree(server string) (string, string) {
 		if helper == "" {
 			helper = "NOT ON PATH"
 		}
-		fatal("--dev-server named a server this phase could not use.\n"+
+		fatal("--dev-mode, but this phase could not use the server.\n"+
 			"  git-remote-caos: %s\n"+
 			"  Empty with no error means the stack is up but published no\n"+
 			"  refs/caos/dev: run `caosd up --iroh`. An error instead usually means\n"+
@@ -444,13 +447,12 @@ func installHelper(prefix, slug, tag string) {
 // The conversation's seed: the checkout as it stands, with `.caos-expr` and
 // `flake.lock` repointed at the dev server, as ONE unreferenced commit.
 //
-// NOTHING IS WRITTEN TO THE WORKTREE. The rewrite is built in a throwaway index
-// instead, so the checkout stays clean and the `caos://` ticket -- a credential
-// -- never enters a file an agent can be asked to commit. It used to be written
-// to disk because the tool server resolved `--llm-step:@=<std>/llm-step` by
-// ingesting ".", which meant the worktree decided which tools a session got;
-// `resolve_cli_image_arg_in_tree` now resolves it in the commit the conversation
-// seeds from, so this commit is the only place the dev pin has to exist.
+// NOTHING IS WRITTEN TO THE WORKTREE. The rewrite is built in a throwaway index,
+// so the checkout stays clean and the `caos://` ticket -- a credential -- never
+// enters a file an agent can be asked to commit. This works only because the
+// session resolves `--llm-step:@=<std>/llm-step` in the commit it seeds from
+// (`resolve_cli_image_arg_in_tree`); a client that resolved it against the
+// working directory would need the files on disk.
 //
 // UNREFERENCED: nothing points at it, so `git push` cannot carry it. The branch
 // and the working tree are left exactly as they were found.
@@ -600,10 +602,14 @@ func main() {
 	if !strings.HasPrefix(a.base, raw+"/") || len(strings.Split(strings.TrimPrefix(a.base, raw+"/"), "/")) < 3 {
 		fatal("--base must look like\n  %s/<owner>/<repo>/<ref>\n  got: %s", raw, a.base)
 	}
-	// In dev mode the two are the same server, and saying it twice in a settings
-	// form is a way to get them out of step.
+	// REQUIRED, and the only place a server is named: the client reaches caos
+	// through the `caos` git remote, and this phase is the only one that can add
+	// it before Claude Code starts. Nothing reads the environment for a fallback,
+	// so an unnamed server is a question, not a default.
 	if a.server == "" {
-		a.server = a.devServer
+		fatal("--server=<url> is required: it names the caos server this session\n" +
+			"  runs against, and nothing else does. `caosd ticket` prints it, or\n" +
+			"  pass an http:// URL for a server reachable without one.")
 	}
 
 	repoDir := findCheckout()
@@ -667,9 +673,9 @@ func main() {
 	var pkg assets
 	devTree, devRev := a.devTree, a.devRev
 	switch {
-	case a.devServer != "" && devTree == "":
+	case a.devMode && devTree == "":
 		installHelper(a.prefix, p.slug(), resolveBuild(p.slug(), p.rev))
-		devTree, devRev = fetchDevTree(a.devServer)
+		devTree, devRev = fetchDevTree(a.server)
 		// THIS FILE, from the dev tree, once. An edit to stage 1 is part of the
 		// package and would otherwise be the one file still needing a push. The
 		// fetched tree is handed over rather than re-fetched, which is also what
@@ -697,7 +703,7 @@ func main() {
 
 	seed := ""
 	if devRev != "" {
-		seed = seedWithDevPin(repoDir, a.devServer, devRev)
+		seed = seedWithDevPin(repoDir, a.server, devRev)
 	}
 
 	// STAGE 2, from the payload. `go run` rather than an exec of a built binary:
@@ -745,23 +751,21 @@ func main() {
 		fatal("could not write %s: %v", launcherPath, err)
 	}
 
-	// The `caos` remote, from the argument. The client finds caos through it and
-	// an arbitrary checkout has none, so this is what makes the arrangement
+	// The `caos` remote, from `--server`. The client finds caos through it and an
+	// arbitrary checkout has none, so this is what makes the arrangement
 	// repo-independent -- nothing has to be committed to a session repo.
-	if a.server != "" {
-		// Absent is this probe's expected answer, so its stderr is not inherited:
-		// git's `No such remote 'caos'` on the ordinary path reads as a failure.
-		probe := exec.Command("git", "remote", "get-url", "caos")
-		probe.Dir = repoDir
-		if err := probe.Run(); err != nil {
-			if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
-				say("could not add the caos remote; the session will have no server")
-			}
+	//
+	// An existing remote is left alone: a checkout that already names a server
+	// was set up deliberately, and repointing it would move someone's work to a
+	// different stack. Absent is this probe's expected answer, so its stderr is
+	// not inherited -- git's `No such remote 'caos'` on the ordinary path reads
+	// as a failure.
+	probe := exec.Command("git", "remote", "get-url", "caos")
+	probe.Dir = repoDir
+	if err := probe.Run(); err != nil {
+		if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
+			say("could not add the caos remote; the session will have no server")
 		}
-	} else {
-		say("no --server, so this checkout has no caos remote. The hook falls back\n" +
-			"  to $CAOS_SERVER_URL, which this phase cannot read -- pass the ticket\n" +
-			"  as --server=<url> on the setup line to have it set before the session.")
 	}
 
 	// Unshallowed here rather than in the hook: caos pushes the workspace commit

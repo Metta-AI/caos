@@ -345,10 +345,10 @@ if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
   mkdir -p "$IROH_STATE"
   # FATAL HERE, where the message is read, rather than minting a ticket that
   # cannot be reached. n0's relays are never used (caos_iroh::endpoint_builder),
-  # so there is nothing to fall back to -- and the failure a fallback produced
-  # was the worst shape available: same endpoint id, same token, so the ticket
-  # already in someone's environment still LOOKED current while every session
-  # against it timed out a whole phase away from here.
+  # so there is nothing to fall back to -- and a ticket carrying an unreachable
+  # relay keeps its endpoint id and token, so it is indistinguishable from the
+  # one already in someone's environment while every session against it times
+  # out a whole phase away from here.
   if [ -z "${CAOS_IROH_RELAY:-}" ]; then
     fail "CAOS_STACK_IROH=yes but no CAOS_IROH_RELAY: a caos:// endpoint needs a
   relay of its own to be reached through. Run 'iroh-relay --dev' on a host you

@@ -550,23 +550,19 @@ fn diagnostics() -> String {
     // Where the env came from, stamped once at setup.
     d.push_str("env stamp (/usr/local/share/caos/setup-stamp):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
-    // WHAT THE ENVIRONMENT NAMED, before what the repo got. A missing `caos`
-    // remote is nearly always one of these two lines: nothing named a server, or
-    // the variable that names one has moved and the environment still sets the
-    // old one. That failure is otherwise explained only in a hook log, which a
-    // cloud session cannot read -- this tool is the surface it has.
-    d.push_str(&format!(
-        "CAOS_SERVER_URL: {}\n",
-        match std::env::var("CAOS_SERVER_URL") {
-            Ok(url) => redact_secrets(&url),
-            Err(_) => "<unset>".to_string(),
+    // A VARIABLE NOTHING READS IS NAMED, not silently ignored. The server is
+    // named by the setup line's `--server=<url>`, which adds the `caos` remote
+    // below; an environment still setting one of these is configuration left
+    // behind. Reported here because a cloud session cannot read the hook's log,
+    // and a missing remote reported on its own sends whoever is debugging it to
+    // the repository, which is the one thing that is not wrong.
+    for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
+        if std::env::var_os(name).is_some() {
+            d.push_str(&format!(
+                "{name}: set, and nothing reads it -- the setup line's \
+                 --server=<url> is what names the server now\n"
+            ));
         }
-    ));
-    if std::env::var_os("CAOS_IROH_TICKET").is_some() {
-        d.push_str(
-            "CAOS_IROH_TICKET: set, and nothing reads it \
-             -- set CAOS_SERVER_URL to the ticket instead\n",
-        );
     }
     // The remote the client dials -- present means session-start added it.
     // REDACTED, because a `caos://` remote is the capability itself and this
@@ -1069,20 +1065,22 @@ mod redaction_tests {
 
 #[cfg(test)]
 mod env_diagnostic_tests {
-    /// The status text must NAME the variable that moved, because a cloud
-    /// session cannot read the hook's log and this tool is all it has. A
-    /// misconfigured environment reported only as "no caos remote" sends whoever
-    /// is debugging it looking at the repository instead of the env.
+    /// The status text must NAME a variable nothing reads, because a cloud session
+    /// cannot read the hook's log and this tool is all it has. A misconfigured
+    /// environment reported only as "no caos remote" sends whoever is debugging
+    /// it looking at the repository instead of the env.
     #[test]
-    fn the_diagnostics_mention_both_server_variables() {
+    fn the_diagnostics_name_the_variables_that_moved() {
         let source = include_str!("serve.rs");
+        for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
+            assert!(
+                source.contains(name),
+                "the status text no longer names {name}"
+            );
+        }
         assert!(
-            source.contains("CAOS_SERVER_URL: {}"),
-            "the status text no longer reports CAOS_SERVER_URL"
-        );
-        assert!(
-            source.contains("CAOS_IROH_TICKET: set, and nothing reads it"),
-            "the status text no longer names the variable that moved"
+            source.contains("set, and nothing reads it"),
+            "the status text no longer says the variable is unread"
         );
     }
 }

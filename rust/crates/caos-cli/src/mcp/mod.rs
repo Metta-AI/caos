@@ -332,18 +332,12 @@ fn tool_resolution_scope(
 /// which worker ran its tools -- and the tui can pick the turn up, because what
 /// it names is an ordinary step.
 /// The tree a `--llm-step:@=<path>` is looked up in: the conversation's OWN BASE
-/// COMMIT, not the working directory.
+/// COMMIT, not the working directory, so the step and the conversation come from
+/// one tree by construction.
 ///
-/// The step and the conversation then come from one tree by construction. They
-/// did not before: content came from `resolve_base` while the step was resolved
-/// by ingesting `.`, so the two could disagree — and dev mode had to rewrite the
-/// checkout ON DISK to hold them together, which left a `caos://` ticket in a
-/// file an agent could be asked to commit. With the tree named, the dev rewrite
-/// lives only in the unreferenced commit this reads.
-///
-/// `seed_content` rather than a bare tree lookup, deliberately: it is what
-/// `root_commit` uses for the conversation's content, so the same commit is
-/// pushed and checked once and both readers get the same answer.
+/// `seed_content` rather than a bare tree lookup: it is what [`root_commit`] uses
+/// for the conversation's content, so the commit is pushed and checked once and
+/// both readers get the same answer.
 fn step_tree(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
     let base = oid(&resolve_base(t, options)?, "conversation base")?;
     let mut store = open_store(t)?;

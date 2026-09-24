@@ -5,10 +5,10 @@ hook` records the conversation, `caos mcp serve` is the tool server — one
 downloaded binary), and a **caos server** to point it at. Neither requires the
 repository to carry anything.
 
-The caos server is named by a **ticket**: `CAOS_SERVER_URL=caos://<ticket>`, and
-the client speaks that transport itself (`design/iroh-transport.md`). The
-container only ever connects OUT — nothing listens for an inbound shell, which
-is what the sandbox refuses.
+The caos server is named by a **ticket**, once, on the setup line —
+`--server=caos://<ticket>` — and the client speaks that transport itself
+(`design/iroh-transport.md`). The container only ever connects OUT; nothing
+listens for an inbound shell, which is what the sandbox refuses.
 
 There is no tunnel process and no local port. This used to be a `dumbpipe`
 connector the session hook started on `127.0.0.1:19090`, with a liveness poll, a
@@ -105,9 +105,9 @@ All three are written anyway; it costs nothing.
 
 Nothing has to be committed to a session repo for it to reach a server, either.
 The client finds caos through a `caos` git remote and an arbitrary checkout has
-none, so stage 1 adds it from its `--server` argument — before Claude Code
-starts. The hook adds it from `$CAOS_SERVER_URL` when the setup line names no
-server, which is the one thing the setup phase cannot read for itself.
+none, so stage 1 adds it from its `--server` argument, before Claude Code starts.
+That is the only place a server is named: the hook reports a missing remote and
+does not repair one.
 
 **The checkout is there before the setup script runs**, which is what lets the
 pin be read that early — and reading it early matters, because work done after
@@ -158,17 +158,19 @@ pins no caos does not fall back to this branch; setup fails, naming what is
 missing. The line above then never needs editing
 again.
 
-**The server**: `--server=` on the line above, holding either —
+**The server**: `--server=` on the line above, **required**, holding either —
 - `caos://<ticket>` — what `caosd ticket` prints on the machine running the
   server (brought up with `caosd up --iroh`). Reachable from anywhere.
 - a plain `http://…` URL, when the server is reachable without one.
 
-`CAOS_SERVER_URL` still works, as an environment variable, and is what the hook
-falls back to. The argument is preferred because the setup phase cannot read the
-environment's variables — measured — so a server named only there is a `caos`
-remote that does not exist until after Claude Code has started.
+**No environment variable.** `CAOS_SERVER_URL` is not read. The setup phase
+cannot see the environment's variables, so a server named there would produce a
+`caos` remote that appears only after Claude Code has started without one — and
+one ticket in one place cannot fall out of step with itself. A setup line with no
+`--server` fails immediately; an environment still setting the variable is
+reported by `caos_status` as unread rather than ignored.
 
-Either way it is a **credential** when it is a ticket: whoever holds it can drive
+It is a **credential** when it is a ticket: whoever holds it can drive
 that server, which runs containers and holds every secret. The status tool
 redacts it rather than printing it for a model to quote, and the stamps stage 1
 writes carry the revision but never the ticket.
@@ -216,7 +218,7 @@ machine, with no push and no CI:
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
-  --dev-server=caos://<ticket>
+  --dev-mode
 ```
 
 `caosd up --iroh` publishes the working checkout to `refs/caos/dev` on that
@@ -230,17 +232,13 @@ repoints the checkout's `.caos-expr` and `flake.lock` at
 
 **The CHECKOUT IS LEFT CLEAN.** The rewrite exists only in that unreferenced
 commit, built through a throwaway index, so nothing puts a `caos://` ticket — a
-credential — in a file an agent can be asked to commit. It used to be written to
-disk, because the tool server resolved `--llm-step:@=<std>/llm-step` by ingesting
-`"."`: the worktree decided which tools a session got, so rewriting only the seed
-would have given a dev client the *committed* tools. `resolve_cli_image_arg_in_tree`
-now resolves the step in the commit the conversation seeds from, which is the
-same tree the session records — so one place holds the dev pin, and a session's
-`git status` is empty.
+credential — in a file an agent can be asked to commit. This works because the
+session resolves `--llm-step:@=<std>/llm-step` in the commit it seeds from
+(`resolve_cli_image_arg_in_tree`) rather than by ingesting `"."`: one place holds
+the dev pin, and a session's `git status` is empty.
 
 It is an **argument, not an environment variable**: the setup phase does not get
-the environment's variables. Measured — a session stamped `off` while the
-environment plainly set `CAOS_DEV=1`, which is why that variable is gone.
+the environment's variables at all.
 
 Two things are less obvious and both cost a session to find:
 
@@ -266,11 +264,10 @@ uses them — not as a relay, not for discovery — and there is no default to f
 back to: `caos-iroh serve --relay` takes the URL, `caosd up --iroh` refuses to
 start without `CAOS_IROH_RELAY`, and the stack's bring-up refuses too.
 
-Refusing beats defaulting because of the shape of the failure. A bring-up that
-silently fell back kept the endpoint id and the token, so the ticket already in
-an environment still LOOKED current while every session against it died in its
-setup phase with `connecting to <id>: timed out` — a whole phase away from the
-cause. Observed, and it cost a session to find.
+Refusing beats defaulting because of the shape of the failure: a ticket carrying
+an unreachable relay keeps its endpoint id and token, so it is indistinguishable
+from the one already in an environment, while every session against it dies in its
+setup phase with `connecting to <id>: timed out` — a whole phase from the cause.
 
 Run `iroh-relay --dev` on a host of your own (`prod/caosd/configuration.nix` has
 a unit for it) and bring the stack up with

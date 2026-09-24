@@ -142,36 +142,32 @@ pub const DEFAULT_PORT: u16 = 11204;
 ///
 /// **N0'S RELAYS AND N0'S DNS ARE NEVER USED.** `presets::Minimal` sets the
 /// crypto provider and nothing else, where `presets::N0` would add the default
-/// relay map, a pkarr publisher and a resolver against `iroh.link`. Every one of
-/// those is a call to a host a caos deployment has no reason to depend on, and a
-/// Claude Code cloud container's SETUP phase cannot reach them anyway: all seven
-/// relays iroh ships answer `503` there with an Envoy `upstream connect error`,
-/// under h2 and http/1.1 alike and by bare IP, while `www.hetzner.com` answers
-/// 200 from the same phase and four of those relays ARE Hetzner-hosted. So the
-/// relay is named explicitly, by whoever runs the server, and nothing falls back.
+/// relay map, a pkarr publisher and a resolver against `iroh.link`. A Claude Code
+/// cloud container's SETUP phase cannot reach any of them: all seven relays iroh
+/// ships answer `503` there with an Envoy `upstream connect error`, under h2 and
+/// http/1.1 alike and by bare IP, while `www.hetzner.com` answers 200 from the
+/// same phase and four of those relays ARE Hetzner-hosted. The relay is named
+/// explicitly instead, by whoever runs the server, and nothing falls back.
 ///
-/// Nor is discovery needed: a `caos://` ticket carries the endpoint id, the
-/// relay and the direct addresses, which is everything a dial takes.
+/// Discovery is not needed either: a `caos://` ticket carries the endpoint id,
+/// the relay and the direct addresses, which is everything a dial takes.
 ///
 /// **THE OS TRUST STORE, not the copy of Mozilla's roots iroh compiles in.**
 /// Where egress goes through a TLS-intercepting proxy — a Claude Code cloud
 /// container is one — an `https://` relay presents that proxy's certificate,
-/// which chains to a CA only the system knows about. A default build reaches NO
-/// relay there ("Failed to connect to the home relay") on a host where curl and
-/// git work perfectly, which reads as iroh being broken rather than as a trust
-/// decision. This changes the RELAY HOP ONLY: payloads stay end-to-end encrypted
-/// between endpoint keys, so the relay could not read them before and cannot now.
+/// which chains to a CA only the system knows about, and a default build reaches
+/// NO relay there ("Failed to connect to the home relay") on a host where curl
+/// and git work perfectly. This changes the RELAY HOP ONLY: payloads stay
+/// end-to-end encrypted between endpoint keys.
 ///
-/// **NO PROXY, EITHER END.** It was `proxy_from_env()`, for reaching n0's TLS
-/// relays through an egress that forbids direct connections — and with n0 gone
-/// there is nothing left for it to serve. It actively hurt: iroh routes EVERY
-/// relay dial through a configured proxy (`dial_url` has no scheme test and no
-/// `no_proxy`, and takes HTTP_PROXY, http_proxy, HTTPS_PROXY, https_proxy in
-/// turn), so a plain `http://` relay was dialled as `CONNECT <host>:80` and timed
-/// out, while the SETUP phase — which sets no proxy variables — had reached the
-/// same relay directly seconds earlier. curl hid the difference: for an `http://`
-/// URL it consults only `http_proxy`, which is unset there, so it went direct and
-/// answered 200 while iroh could not connect at all.
+/// **NO PROXY, EITHER END.** iroh routes EVERY relay dial through a configured
+/// proxy — `dial_url` has no scheme test and no `no_proxy`, and it takes
+/// HTTP_PROXY, http_proxy, HTTPS_PROXY, https_proxy in turn — so a plain
+/// `http://` relay is dialled as `CONNECT <host>:80` and times out wherever a
+/// proxy variable is set. curl hides this, consulting only `http_proxy` for an
+/// `http://` URL, so a relay curl reaches directly is one iroh cannot reach at
+/// all. Nothing here needs a proxy: a relay named for this network is either
+/// directly reachable or unusable.
 fn base_endpoint_builder() -> iroh::endpoint::Builder {
     Endpoint::builder(presets::Minimal).ca_tls_config(iroh_relay::tls::CaTlsConfig::system())
 }
@@ -180,27 +176,24 @@ fn base_endpoint_builder() -> iroh::endpoint::Builder {
 ///
 /// An `http://` URL is legitimate and needs no certificate: the relay client
 /// reads TLS off the scheme (`use_tls()` is false for `http`) and defaults such a
-/// URL to port 80. That matters because a NON-STANDARD PORT is not carried by a
-/// cloud container's egress at all — the same relay on 3340 timed out from both
-/// the setup and the session phase, while port 80 answered from both — so 80 or
-/// 443 is the whole of the choice. The relay hop being plaintext costs nothing
-/// that was not already given away: payloads stay end-to-end encrypted between
-/// endpoint keys.
+/// URL to port 80. PORT 80 OR 443 AND NOTHING ELSE, because a cloud container's
+/// egress carries no other port — the same relay on 3340 times out from both the
+/// setup and the session phase. A plaintext relay hop gives nothing away:
+/// payloads stay end-to-end encrypted between endpoint keys.
 pub fn relay_map(relay: &iroh::RelayUrl) -> Result<iroh_relay::RelayMap, String> {
     iroh_relay::RelayMap::try_from_iter([relay.as_str()])
         .map_err(|error| format!("{relay} is not usable as a relay: {error}"))
 }
 
-/// The LISTENER's builder: the relay it will be reached through, which is
-/// REQUIRED and has no default.
+/// The LISTENER's builder: the relay it will be reached through, REQUIRED and
+/// with no default.
 ///
-/// Required because the alternative was measured and is worse than an error. With
-/// a fallback, a stack brought up without the setting minted a ticket carrying an
-/// n0 relay — same endpoint id, same token, so it LOOKED like the ticket already
-/// in someone's environment — and every cloud session against it then failed in
-/// its setup phase with `connecting to <id>: timed out`, a full phase away from
-/// the cause. A missing relay is a question with one right answer and nobody to
-/// guess it but the operator.
+/// A fallback here is worse than an error, because of the shape of the failure it
+/// produces: a ticket carrying an unreachable relay keeps its endpoint id and
+/// token, so it is indistinguishable from the ticket already in someone's
+/// environment, and every session against it fails a whole phase away with
+/// `connecting to <id>: timed out`. Which relay to use is a question only the
+/// operator can answer.
 pub fn endpoint_builder(relay: &iroh::RelayUrl) -> Result<iroh::endpoint::Builder, String> {
     Ok(base_endpoint_builder().relay_mode(iroh::RelayMode::Custom(relay_map(relay)?)))
 }
@@ -208,14 +201,13 @@ pub fn endpoint_builder(relay: &iroh::RelayUrl) -> Result<iroh::endpoint::Builde
 /// The CLIENT's builder: the relay comes from the TICKET, which is the only thing
 /// a client is given.
 ///
-/// The ticket's relay is used as the client's own relay map too, not just as the
-/// peer's address. With n0's defaults the client would connect to an n0 relay as
-/// its OWN home relay before dialling anything — pure latency on a network that
-/// permits it, and a failure on one that does not.
+/// The ticket's relay becomes the client's OWN relay map, not just the peer's
+/// address. Left at a default, the client connects to an n0 relay as its own home
+/// relay before dialling anything — latency where that is permitted, failure
+/// where it is not.
 ///
-/// A ticket with no relay is LAN-only and says so. That is a real state rather
-/// than a mistake: a stack brought up with no route out still serves the machine
-/// it runs on.
+/// A ticket with no relay is LAN-only and says so: a stack brought up with no
+/// route out still serves the machine it runs on.
 pub fn client_endpoint_builder(ticket: &Ticket) -> iroh::endpoint::Builder {
     let relays: Vec<String> = ticket
         .addr

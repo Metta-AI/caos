@@ -1,25 +1,17 @@
 // The SessionStart hook for a caos cloud session, run through
 // /usr/local/bin/caos-cloud-session-start.
 //
-// Almost nothing is left here. The client, the git helper, the configuration and
-// the checkout's own expression are all done by the setup phase, which runs
-// before Claude Code on EVERY session (design/cloud-setup.md) -- so the pin
-// re-read and the client re-install that used to live here were redoing work
-// done seconds earlier in the same container.
+// It does two things, because the setup phase runs on EVERY session
+// (design/cloud-setup.md) and has already installed the client, the git helper,
+// the configuration and the `caos` remote by the time Claude Code starts.
 //
-// TWO THINGS GENUINELY BELONG IN A SESSION.
+// THE REGISTRY WARM, which fills the cache `mcp serve` reads. It could run in
+// setup -- nothing stops it reaching the server from there -- but it is the step
+// that decides whether a first turn has tools, and it is proven here.
 //
-// The registry warm, because of where the NETWORK is: the setup phase egresses
-// through a TLS-terminating gateway that answers 503 for all seven n0 relays,
-// while a session egresses through a local CONNECT proxy and reaches them fine.
-// A dev ticket names a relay of one's own and so resolves in either phase, but an
-// ordinary `caos://` ticket is reachable only from here.
-//
-// And one line of STDOUT saying which caos this session is. A SessionStart hook
-// contributes its stdout to the session; its stderr is captured as a
-// non-transcript event and DROPPED, which is why a dev-mode trace written with
-// the rest of the logging cost exactly the debugging session it existed to
-// prevent.
+// ONE LINE OF STDOUT naming the build. A SessionStart hook contributes its
+// stdout to the session; its stderr is captured as a non-transcript event and
+// DROPPED, so anything a session must be able to read goes on stdout.
 package main
 
 import (
@@ -93,24 +85,13 @@ func main() {
 		}
 	}
 
-	// The setup phase adds this from its `--server` argument. The fallback is for
-	// an environment that names its server in CAOS_SERVER_URL instead, which the
-	// setup phase cannot read -- an existing remote is left alone, because a
-	// checkout that already names a server has been set up deliberately and
-	// repointing it would move someone's work to a different stack.
+	// REPORTED, NOT REPAIRED. The setup phase adds this from `--server` before
+	// Claude Code starts, and that is the only place a server is named. Adding it
+	// here instead would be a remote that appears after the tool server has
+	// already started without one.
 	if _, err := git("remote", "get-url", "caos"); err != nil {
-		server := os.Getenv("CAOS_SERVER_URL")
-		switch {
-		case server != "":
-			if _, err := git("remote", "add", "caos", server); err != nil {
-				log("could not add the caos remote")
-			} else {
-				log("caos remote -> %s", redact(server))
-			}
-		default:
-			log("no caos remote and no CAOS_SERVER_URL: nothing names a server.")
-			log("  Pass --server=<url> on the environment's setup line.")
-		}
+		log("no caos remote: the setup line named no --server=<url>, so nothing")
+		log("  points this checkout at a server. Every tool call will fail.")
 	}
 
 	stepPath := setup["std_path"]
@@ -124,9 +105,8 @@ func main() {
 	// CLAIMED BEFORE THE WARM STARTS, not by the warm itself. Claude Code spawns
 	// the tool server in PARALLEL with this hook and its first `tools/list` lands
 	// within a second; without a claim already on disk that server resolves the
-	// tools itself and the warm duplicates it -- measured at 8.5s and 8.2s side
-	// by side, colliding on a push of the same object. `mcp serve` waits for this
-	// file instead (`warm_in_flight`).
+	// tools itself, duplicating the warm and colliding with it on a push of the
+	// same object. `mcp serve` waits for this file instead (`warm_in_flight`).
 	//
 	// It carries the unix time by which the warm will have given up, so a warm
 	// that is killed cannot make every later serve wait for a process that is
@@ -202,18 +182,4 @@ func mustGetwd() string {
 		return "."
 	}
 	return dir
-}
-
-// A `caos://` URL ends in the token that authorizes driving that server, and
-// these lines are read back by whoever is debugging a session. The truncation is
-// only right for a ticket: the same cut on `http://10.0.0.5:9090` would remove
-// the address.
-func redact(server string) string {
-	if !strings.HasPrefix(server, "caos://") {
-		return server
-	}
-	if cut := strings.LastIndex(server, "."); cut > 0 {
-		return server[:cut] + "…"
-	}
-	return server
 }

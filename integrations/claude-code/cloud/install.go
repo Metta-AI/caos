@@ -16,11 +16,10 @@
 // repository), managed settings (ruled out -- an Anthropic-hosted session does
 // not read a device's MDM profile), and user-level settings written here.
 //
-// THE HOME IS /root, measured: the setup phase runs as root, the CLI runs as
-// root, and hooks resolve $HOME to /root even though the repo sits at
-// /home/user/repo and Claude's own state at /home/claude/.claude. All three are
-// written anyway -- it costs nothing and the day that changes, this keeps
-// working.
+// THE HOME IS /root: the setup phase runs as root, the CLI runs as root, and
+// hooks resolve $HOME to /root even though the repo sits at /home/user/repo and
+// Claude's own state at /home/claude/.claude. All three are written anyway --
+// it costs nothing and survives that changing.
 package main
 
 import (
@@ -120,12 +119,11 @@ func link(from, to string) {
 // so on its own it reports an empty rev. The wrapper puts the build back:
 // telling a stale client from a current one is the only reason it prints at all.
 //
-// The helper goes BESIDE THE REAL BINARY rather than beside the wrapper, and
-// that distinction is the whole of it: the client puts its OWN directory on PATH
-// before shelling out to git (`ensure_helper_on_path`), and its own directory is
-// lib/caos. A helper only in bin is invisible to the client's own git, which is
-// how this first failed -- a session resolved its server, pushed, and died on
-// `git: 'remote-caos' is not a git command`.
+// The helper goes BESIDE THE REAL BINARY rather than beside the wrapper: the
+// client puts its OWN directory on PATH before shelling out to git
+// (`ensure_helper_on_path`), and that directory is lib/caos. A helper only in
+// bin is invisible to the git the client itself runs, so a session resolves its
+// server and then dies on `git: 'remote-caos' is not a git command`.
 func installClient(a args) {
 	lib := filepath.Join(a.prefix, "lib/caos")
 	bin := filepath.Join(a.prefix, "bin")
@@ -238,11 +236,9 @@ func stepLocator(a args) string {
 	return "--llm-step:@@=github:" + a.repo + "?rev=" + a.commit + "&dir=std/llm-step"
 }
 
-// THE HOOK NEEDS `--base` TOO, and that is not a detail: the HOOK creates the
-// conversation (`on_user_prompt`), not the tool server. Putting the seed only on
-// `mcp serve` -- which is where it looks like it belongs -- left every
-// conversation seeded from HEAD, so a dev session rewrote its checkout, minted a
-// seed commit, installed a dev client, and still evaluated the committed pin.
+// THE HOOK NEEDS `--base` TOO: the HOOK creates the conversation
+// (`on_user_prompt`), not the tool server, so a seed put only on `mcp serve` --
+// where it looks like it belongs -- leaves every conversation seeded from HEAD.
 func settingsJSON(a args, locator string) []byte {
 	settings := readJSON(filepath.Join(a.assets, "settings.json"))
 	// In a hook command the locator is a SHELL WORD, so its `&` and `?` are
@@ -294,10 +290,9 @@ func settingsJSON(a args, locator string) []byte {
 	return data
 }
 
-// The tool server is named directly rather than through a generated shim. The
-// shim existed to re-install the client before exec'ing it, which was for an
-// environment whose setup ran once and was then frozen; setup runs every
-// session, so the binary it installed seconds earlier is the current one.
+// The tool server is named directly rather than through a generated shim: the
+// setup phase runs every session, so the binary it installed seconds earlier is
+// the current one and there is nothing for a shim to refresh.
 func mcpServers(a args, locator string) map[string]any {
 	mcp := readJSON(filepath.Join(a.assets, "mcp.json"))
 	walkStrings(mcp, func(s string) string {
@@ -313,7 +308,7 @@ func mcpServers(a args, locator string) map[string]any {
 	if caos == nil {
 		fatal("the mcp asset declares no `caos` server")
 	}
-	// Its own argv element. Appended to the locator's string it became a single
+	// ITS OWN ARGV ELEMENT. Appended to the locator's string it is a single
 	// argument (`--llm-step:@=… --base=…`), which the client reads as one flag
 	// with a nonsense value.
 	if a.seedCommit != "" {

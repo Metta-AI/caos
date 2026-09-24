@@ -65,7 +65,7 @@ Both redo work setup already did, in the same container, seconds earlier.
 # the environment's setup field, in full
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server="caos://<ticket>" \
-    --dev-server="caos://<ticket>" --enable-bash
+    --dev-mode --enable-bash
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, with
@@ -74,10 +74,11 @@ works and leaves no artifacts, **provided the program imports only the
 stdlib** — a module fetch would have to reach `proxy.golang.org`, and the setup
 phase is the phase that answers 503 for every n0 relay.
 
-**Everything arrives as an argument, including the server ticket.** Whether the
-setup phase can read the environment's variables is then not a question anyone
-has to answer, and setup can do the work that today waits for the hook because
-only the hook sees `CAOS_SERVER_URL`.
+**Everything arrives as an argument, including the server ticket, and the ticket
+is named ONCE.** The setup phase cannot read the environment's variables, so a
+server named only there is a remote that appears after the tool server has
+started without one. `--dev-mode` is a mode rather than a second server: it takes
+the install package from the server `--server` already names.
 
 ### Two stages, because the installer is part of the payload
 
@@ -237,11 +238,10 @@ dependency, that is the question they have to answer first.
 ## What remains for a `SessionStart` hook
 
 `session.go`, and not much of it. Setup adds the `caos` remote and unshallows
-before Claude Code starts; the hook warms the registry (see above — it needs a
-relay the setup phase cannot reach), adds the remote when only
-`$CAOS_SERVER_URL` names a server, and prints one line of stdout naming the
-build. Stdout, because that is the only stream a session keeps: hook stderr is
-captured as a non-transcript event and dropped.
+before Claude Code starts; the hook warms the registry, reports a missing remote
+without repairing it, and prints one line of stdout naming the build. Stdout,
+because that is the only stream a session keeps: hook stderr is captured as a
+non-transcript event and dropped.
 
 ## Testing
 
@@ -271,8 +271,9 @@ curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstr
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
 ```
 
-`--dev-server=caos://<ticket>` is the third argument, and `--enable-bash` the
-fourth. Deleting the four scripts means an environment still pointing at
+`--dev-mode` is the third argument, and `--enable-bash` the
+fourth. `CAOS_SERVER_URL` is not set at all. Deleting the four scripts means an
+environment still pointing at
 `setup.sh` gets a 404 — and `curl -f … | bash` exits ZERO on one, installing
 nothing and reporting success — so the line has to change in the same breath as
 the merge.
