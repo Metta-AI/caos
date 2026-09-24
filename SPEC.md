@@ -187,7 +187,12 @@ Three bare tags are flags:
   it is the safe reading of a tool that forgot to say
 - `@in` — bind the tree it is run on as `in`. Absent means DO NOT, and that is
   the point: see "Receiving args"
-- `@git` — bind the source tree commit and the turn's ref snapshot
+- `@git` — bind the input as a COMMIT (`wc`) plus the turn's ref snapshot
+  (`refs`), for a tool that must walk HISTORY rather than read content: `in` is
+  a tree, and a tree cannot say what its parent was, what the last commit
+  changed, or what `main` points at. Off by default because `wc` changes on
+  every accepted edit while the tree often does not, so binding it would make
+  every call a miss for a commit the tool never reads
 
 The tags live in the help rather than as their own args so that `tool_help` can
 report it WITHOUT EVALUATING: "will this change my tree?" is the second most
@@ -285,6 +290,24 @@ in` by hand: `in` is what the interpreter binds, and `@in` is how to ask for it.
 However it arrives, `in` is bound in exactly ONE place — the request — because
 `caos curry` refuses a rebind, and binding the caller's tree onto the tool's
 curry while the request bound the default would be exactly that.
+
+**`@git` reaches only a DISPATCHED READER, and both halves matter.** An
+in-process built-in is handed the conversation's store directly and ignores the
+tag — `log`, `show` and `diff` declared it for years and it did nothing for
+them. And a WRITER's input commit is not a caller's to choose: its proposal must
+descend from the commit whose pointer is being advanced, so the input commit is
+pinned to the scope rather than offered as a parameter. `merge`, the one tool
+that really needs it, takes it as `ours` bound by the launch — "a model naming
+it would be naming the conversation it is already in" — which is also why the
+generic tag has no users: the tool that needed the input commit predates it and
+binds it under a name of its own.
+
+So the four combinations are not symmetric:
+
+| | tree | commit |
+|---|---|---|
+| reader's input | `@in` — defaulted, overridable | `@git` — what it is for; no users yet |
+| writer's input | — | pinned to the scope, never a parameter |
 
 ## Returning a result
 

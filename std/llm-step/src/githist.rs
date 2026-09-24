@@ -1,4 +1,10 @@
 //! Read-only history tools over the existing Git store.
+//!
+//! These declared `@git` and it did nothing: that tag binds `wc`/`refs` for a
+//! DISPATCHED tool, and these run IN-PROCESS against the conversation's own
+//! store (`execute` takes it directly). `parsed_declarations_are_byte_identical`
+//! is the proof that dropping it changed nothing — a flag tag contributes
+//! neither description nor parameters.
 
 use conversation_protocol::v3::git_store::HistoryQuery;
 use conversation_protocol::v3::{GitStore, ObjectStore, Oid};
@@ -9,17 +15,14 @@ use crate::tools::{builtin_tool, tree_tool_declaration, TreeTool};
 const LOG_HELP: &str = "Show the source tree's first-parent commit history newest-first: one line per commit with its short hash, date, author and subject. Optionally start from a given revision and/or restrict to commits that changed a path. Reads git history the tree alone can't show.
 @param [rev] Where to start (default HEAD, the current source tree). A commit hash, a snapshot ref (e.g. main), or HEAD~N / ref^.
 @param [path] Only show commits that changed this source-tree-relative path.
-@param [count] Maximum number of commits to show (default 20).
-@git";
+@param [count] Maximum number of commits to show (default 20).";
 const SHOW_HELP: &str = "Show one commit: its hash, parents, author, full message, and the unified diff it introduced (against its first parent). Optionally scope the diff to a path.
 @param [rev] The commit to show (default HEAD, the current source tree). A commit hash, a snapshot ref, or HEAD~N / ref^.
-@param [path] Restrict the shown diff to this source-tree-relative path.
-@git";
+@param [path] Restrict the shown diff to this source-tree-relative path.";
 const DIFF_HELP: &str = "Unified diff between two revisions of the source tree, optionally scoped to a path. Defaults compare the previous commit to the current source tree (what the latest step changed). `from`/`to` accept a commit hash, a snapshot ref (e.g. main), HEAD/wc, or HEAD~N / ref^.
 @param [from] The base revision (default HEAD~1, the commit before the source tree).
 @param [to] The revision to compare against the base (default HEAD, the current source tree).
-@param [path] Restrict the diff to this source-tree-relative path.
-@git";
+@param [path] Restrict the diff to this source-tree-relative path.";
 
 /// The built-in tool names, reserved against project shadowing (`tools.rs`).
 pub const NAMES: [&str; 3] = ["log", "show", "diff"];

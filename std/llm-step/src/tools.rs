@@ -118,6 +118,8 @@ pub fn grep_declaration() -> Value {
 /// on every tool run, and `caos curry` errors on a rebind (SPEC, "Currying").
 /// `wc`/`refs` are bound only for `@git` tools, but reserved unconditionally
 /// so a tool can't declare a model arg the interpreter would then clobber.
+/// `in` is reserved for the same reason and asked for with `@in`, which turns
+/// it into a parameter the interpreter still binds.
 ///
 /// EVERY NAME HERE IS ONE SOMETHING BINDS. `std` used to be on this list and is
 /// not any more: there is no `std` arg, a dependency rides inside the tree as a
@@ -138,10 +140,11 @@ pub struct TreeTool {
     pub name: String,
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// The tool declared `@git`: bind the source tree commit (`wc`) and the
-    /// turn's ref snapshot (`refs`) so it can walk history. Off by default —
-    /// `wc` changes every step, so binding it into a tool that doesn't need it
-    /// (build/test) would turn every cache hit into a miss.
+    /// The tool declared `@git`: bind the input as a commit (`wc`) and the
+    /// turn's ref snapshot (`refs`), so it can walk history rather than read
+    /// content. See [`Help::git`] — including why it is opt-in, why it reaches
+    /// only DISPATCHED READERS, and why a writer's input commit can never be
+    /// one of these.
     pub git: bool,
     /// The tool declared `@writer`: its result is a PROPOSED CHANGE to the tree
     /// it was run on, not a value. Nothing reads this yet — the harness still
@@ -382,7 +385,35 @@ pub struct Help {
     /// placeholder.
     pub doc: String,
     pub args: Vec<TreeArg>,
-    /// `@git`: bind the source tree commit and the turn's ref snapshot.
+    /// `@git`: bind the input as a COMMIT (`wc`) and the turn's ref snapshot
+    /// (`refs`), as extra args alongside whatever else the tool asked for.
+    ///
+    /// For a tool that must walk HISTORY rather than read content. `in` is a
+    /// tree, and a tree has no history: it cannot say what its parent was, what
+    /// changed in the last commit, or what `main` points at. A commit answers
+    /// the first two and the ref snapshot the third.
+    ///
+    /// Off by default because `wc` changes on EVERY accepted edit — each
+    /// mutation mints a child commit — while the tree can be byte-identical
+    /// across them. Binding it into a build or test tool would turn every call
+    /// into a cache miss for a commit it never reads. Same argument as
+    /// [`Help::wants_in`], one level up.
+    ///
+    /// IT APPLIES ONLY TO A DISPATCHED READER, and both halves of that are
+    /// load-bearing:
+    /// - DISPATCHED: an in-process built-in gets the conversation's store
+    ///   directly and ignores this. `log`/`show`/`diff` declared it for exactly
+    ///   that reason and it did nothing for them.
+    /// - READER: a WRITER's input commit is not a caller's to choose. Its
+    ///   proposal must descend from the commit whose pointer is being advanced
+    ///   (`writer_callback`'s ancestry check, and `reconcile`'s own `before`),
+    ///   so it is pinned to the scope. `merge` — the one tool that really needs
+    ///   the input commit — takes it as `ours`, bound by the launch, and its
+    ///   help says why: a model naming it "would be naming the conversation it
+    ///   is already in".
+    ///
+    /// NO TOOL USES IT TODAY. `merge` predates it and binds `wc` itself under a
+    /// name of its own, which is why the generic form found no users.
     pub git: bool,
     /// `@writer`: this tool PROPOSES A CHANGE to the tree it is run on, rather
     /// than returning a value. Absent means read-only, which is the default
