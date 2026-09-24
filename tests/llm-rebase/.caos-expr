@@ -1,0 +1,1 @@
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh --stack-worker:@=DEEP-DEPS/git-stack --rebase-expr:@=DEEP-DEPS/rebase-tool/.caos-expr --add-layer-expr:@=DEEP-DEPS/add-layer-tool/.caos-expr

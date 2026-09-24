@@ -1,10 +1,12 @@
-//! Promote work snapshots into named stack layers.
+//! Object-only repository writers for promoting work and replaying stacks.
 mod add_layer;
 mod objects;
+mod rebase;
+mod rebase_plan;
 mod stack;
 
 use conversation_protocol::v3::{Mode, ObjectStore, Oid, TreeBuilder};
-use worker_common::{arg, caos, cas_hash, read_arg, run_worker};
+use worker_common::{arg, caos, cas_hash, read_arg, read_arg_opt, run_worker};
 
 fn run() -> Result<(), String> {
     let root = Oid::parse(&cas_hash(&arg("in"))?, "input conversation tree")?;
@@ -28,6 +30,20 @@ fn run() -> Result<(), String> {
                 message,
             },
         )?,
+        "rebase" => {
+            let context: rebase::Context = serde_json::from_str(&read_arg("writer-context")?)
+                .map_err(|e| format!("invalid writer context: {e}"))?;
+            rebase::propose(
+                &mut store,
+                &root,
+                &context,
+                &rebase::Parameters {
+                    stack: read_arg("stack")?,
+                    plan: read_arg_opt("plan")?,
+                    action: read_arg_opt("action")?,
+                },
+            )?
+        }
         operation => return Err(format!("unknown stack operation {operation}")),
     };
     let report = store
