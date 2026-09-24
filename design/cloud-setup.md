@@ -9,10 +9,10 @@ session hook.
 
 **This is built.** `bootstrap.go`, `install.go` and `session.go` replace the four
 scripts, `tests/cloud-setup` covers them, and
-`integrations/claude-code/cloud/README.md` documents the result. Two things this
-plan called for were REFUTED on the way, both by reading the code the plan
-assumed about; they are marked below rather than deleted, because the reasoning
-that produced them is easy to repeat.
+`integrations/claude-code/cloud/README.md` documents the result. Two of this
+plan's own proposals were refused on the way and then reached by a different
+route; both detours are recorded below rather than tidied away, because the
+reasoning that produced them is easy to repeat.
 
 ## What actually happens when a session starts
 
@@ -133,38 +133,43 @@ these scripts but a four-minute cloud round trip.
 
 ## Two design changes to make at the same time
 
-### REFUTED: the dev rewrite cannot move off the worktree
+### Done, but only after a detour worth recording
 
-`resolve_cli_image_with_store` (`rust/crates/caos/src/lib.rs`) resolves a
+The first attempt refused this, on a reading that was correct about the code and
+wrong about what to do. `resolve_cli_image_with_store` resolves a
 `--llm-step:@=<path>` by `t.ingest_path(".")` — the tracked working tree, dirty
 edits included — and nothing about `mcp serve`'s `--base` reaches that walk. So
-the seed commit decides what the CONVERSATION records and the worktree decides
-which tools the server resolves. Rewriting only the seed would have produced
+the seed commit decided what the CONVERSATION recorded while the worktree decided
+which tools the server resolved, and rewriting only the seed would have produced
 exactly the half-update the rewrite exists to prevent: a dev client evaluating the
 committed tools.
 
-The worktree rewrite therefore stays. What is mitigated instead: the seed commit
-is unreferenced, so no push can carry the ticket, and neither stamp contains it.
-Moving the rewrite would take a way to resolve a client image against a named
-tree rather than against `.` — a change in the Rust, worth its own note, not a
-line in a cleanup.
+The conclusion drawn from that — "the worktree rewrite stays" — treated the
+client's resolution rule as fixed. It is not, and it was the thing that was
+wrong: a recorded conversation has a base commit, and resolving its step anywhere
+else is a gap between what a session runs and what it records, dev mode or not.
+`resolve_cli_image_arg_in_tree` closes it, `mcp`'s two resolution sites pass the
+base commit's tree, and stage 1 now builds the rewrite in a throwaway index only.
 
-The original reasoning follows, since the dirty checkout it objects to is real.
+The checkout stays clean, and the Stop-hook friction below is gone with it.
 
-Setup
-rewrites `.caos-expr` and `flake.lock` on disk so that `caos-std/`
+The original reasoning follows, because it is what the change is for.
+
+Setup used to
+rewrite `.caos-expr` and `flake.lock` on disk so that `caos-std/`
 resolves from the dev stack. That leaves the checkout dirty with a `caos://`
 ticket, which is a credential. Observed in both test sessions: the client repo's
 Stop hook demanded the changes be committed, and the agent had to reason its way
 to declining — "it bakes an ephemeral dev-mode endpoint URL … into the repo, on
 `main`". Correct judgement, but judgement, not a mechanism.
 
-The seed commit is already minted through a throwaway index (`git commit-tree`,
+The seed commit was already minted through a throwaway index (`git commit-tree`,
 unreferenced, so no push can carry it). Building the rewritten content only in
-that index leaves the worktree untouched: the conversation still seeds from the
-dev pin through `caos mcp hook --base=<sha>`, and the ticket never enters a file
-anyone can commit. Verify first that nothing reads the worktree's expression
-directly.
+that index leaves the worktree untouched: the conversation seeds from the dev pin
+through `caos mcp hook --base=<sha>`, the step resolves in that same commit, and
+the ticket never enters a file anyone can commit. "Verify first that nothing
+reads the worktree's expression directly" was the right instruction; something
+did, and the answer was to change it.
 
 **The bootstrap shrinks to `git-remote-caos`.** In dev mode the pinned GitHub
 release is downloaded for one reason: the dev fetch speaks `caos://`, and git
@@ -188,15 +193,19 @@ speaks it only through that helper. Fetch the helper, not the whole client.
   might undo, against SPEC:426; 54-60% of these files is prose. The journey
   belongs in commit messages, which already carry it.
 
-## REFUTED: where the registry warm goes
+## Where the registry warm goes
 
-It stays in the hook, and the reason is the NETWORK rather than the ordering.
+It stays in the hook, and the reason was the NETWORK rather than the ordering.
 The setup phase egresses through a TLS-terminating gateway that answers 503 for
-all seven n0 relays; a session egresses through a local `CONNECT` proxy and
-reaches them fine. A dev ticket names a relay of one's own and so resolves in
-either phase, but an ordinary `caos://` ticket is reachable only from a session —
-so a warm moved into setup would silently fail for every non-dev environment and
-leave the first turn with no tools, which is the state it exists to prevent.
+all seven n0 relays, so a ticket carrying one of those was reachable only from a
+session, and a warm moved into setup would have silently failed for every such
+environment.
+
+That premise has since been removed rather than answered: n0's relays are no
+longer used at all, so every ticket now names a relay the operator runs and the
+setup phase can reach it. The warm COULD move. It has not, because nothing has
+measured it there, and an unmeasured move of the one step that decides whether a
+first turn has tools is not an improvement.
 
 The ordering argument was right and is not enough. What the hook keeps from it:
 the warm marker is claimed BEFORE the warm starts, because Claude Code spawns the
@@ -267,3 +276,34 @@ fourth. Deleting the four scripts means an environment still pointing at
 `setup.sh` gets a 404 — and `curl -f … | bash` exits ZERO on one, installing
 nothing and reporting success — so the line has to change in the same breath as
 the merge.
+
+## The relay is required, and n0's are never used
+
+Not a cleanup item — it came out of the cleanup breaking a live environment.
+Bringing the stack up without `CAOS_IROH_RELAY` re-minted its ticket with an n0
+relay: same endpoint id, same token, so the ticket sitting in the environment
+still looked current, while the next session died in its setup phase with
+`connecting to <id>: timed out`. The cause was a whole phase away from the
+symptom, and nothing on either side said the relay had moved.
+
+A default that can only ever be wrong is worth deleting rather than documenting.
+So:
+
+- `caos-iroh serve --relay <url>` is required, with no fallback.
+- `caosd up --iroh` refuses to start without `CAOS_IROH_RELAY`, and says how to
+  run one.
+- the stack's bring-up refuses too, since it is where the message gets read.
+- the endpoint builder uses `presets::Minimal` rather than `presets::N0`, so
+  nothing reaches n0 for a relay, a pkarr publisher or a DNS lookup. A `caos://`
+  ticket carries the endpoint id, the relay and the direct addresses, which is
+  everything a dial needs.
+- the client takes its relay map from the TICKET, so it no longer connects to an
+  n0 relay as its own home relay before dialling anything.
+- `proxy_from_env()` is gone from both ends. It existed to reach n0's TLS relays
+  through a restrictive egress, and it actively broke a plaintext relay: iroh
+  routes every relay dial through a configured proxy, so `http://<relay>/` was
+  dialled as `CONNECT <host>:80` and timed out, while curl — which consults only
+  `http_proxy` for an `http://` URL — went direct and answered 200.
+
+What stays is the OS trust store (`CaTlsConfig::system()`), for an `https://`
+relay behind a TLS-intercepting proxy.

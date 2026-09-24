@@ -1253,6 +1253,25 @@ sandbox = false''
               # keeps working — `caosd ticket` prints it.
               IROH=''${CAOS_IROH:-no}
               if [ "''${2:-}" = --iroh ]; then IROH=yes; fi
+              # A RELAY IS REQUIRED, and is refused here rather than defaulted.
+              # n0's relays are never used (caos_iroh::endpoint_builder), so a
+              # bring-up without one has nothing to fall back to — and when it
+              # DID fall back, the result was the worst shape available: the
+              # ticket kept its endpoint id and token, so the one already in an
+              # environment still looked current, while every cloud session
+              # against it died in its setup phase with `timed out`.
+              if [ "$IROH" = yes ] && [ -z "''${CAOS_IROH_RELAY:-}" ]; then
+                die "caosd up --iroh needs a relay to be reached through, and there is
+  no default: n0's relays answer 503 from a cloud container's setup phase.
+  Run 'iroh-relay --dev' on a host you control (port 80 or 443 — no other
+  port is carried), then:
+
+    CAOS_IROH_RELAY=http://<host>/ caosd up --iroh
+
+  prod/caosd/configuration.nix has a unit for it. The relay a ticket carries
+  is what a client dials, so changing it invalidates tickets already handed
+  out — 'caosd ticket' prints the current one."
+              fi
               # THE UDP PORT IS PUBLISHED, and it has to be: a client reaches
               # this listener directly or pays a relay round trip on every
               # request — measured at 0.4 ms against 174 ms, which turned a

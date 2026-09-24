@@ -2,7 +2,7 @@
 //! by hand.
 //!
 //! ```text
-//! caos-iroh serve --state <dir> --to <host:port> [--git-dir <dir>] [--port <n>]
+//! caos-iroh serve --state <dir> --to <host:port> --relay <url> [--git-dir <dir>] [--port <n>]
 //! caos-iroh ticket --state <dir>
 //! caos-iroh pipe <service> <url>
 //! ```
@@ -44,7 +44,8 @@ use iroh::SecretKey;
 
 const USAGE: &str = "\
 usage:
-  caos-iroh serve --state <dir> --to <host:port> [--git-dir <dir>] [--port <n>]
+  caos-iroh serve --state <dir> --to <host:port> --relay <url>
+                  [--git-dir <dir>] [--port <n>]
                   [--advertise <host:port> ...]
   caos-iroh ticket --state <dir>
   caos-iroh pipe <service> <url>
@@ -54,6 +55,10 @@ usage:
           from --git-dir, on UDP --port (default 11204; a FIXED port is what
           keeps the ticket stable). Writes the ticket to <dir>/ticket and
           prints it.
+          --relay is the relay clients reach this endpoint through, and is
+          REQUIRED: n0's are never used, and a default would mint a ticket
+          that looks right and reaches nothing. `http://<host>/` is fine
+          (port 80 or 443 and nothing else).
           --advertise REPLACES the addresses it finds for itself with ones it
           cannot discover — a published container port, say. Repeatable; it
           never removes the relays, so a client always has a way in.
@@ -107,6 +112,9 @@ struct Options {
     state: Option<PathBuf>,
     to: Option<String>,
     git_dir: Option<PathBuf>,
+    /// The relay clients reach this endpoint through. Required for `serve`; see
+    /// `caos_iroh::endpoint_builder` for why it has no default.
+    relay: Option<iroh::RelayUrl>,
 }
 
 impl Options {
@@ -122,6 +130,13 @@ impl Options {
                 "--state" => options.state = Some(value()?.into()),
                 "--to" => options.to = Some(value()?),
                 "--git-dir" => options.git_dir = Some(value()?.into()),
+                "--relay" => {
+                    let raw = value()?;
+                    let url = raw
+                        .parse()
+                        .map_err(|error| format!("--relay {raw:?}: {error}\n{USAGE}"))?;
+                    options.relay = Some(url);
+                }
                 "--port" => {
                     let raw = value()?;
                     let port = raw
@@ -146,6 +161,19 @@ impl Options {
         self.state
             .as_deref()
             .ok_or_else(|| format!("--state is required\n{USAGE}"))
+    }
+
+    /// The relay to be reached through. No default, and no fallback to n0's:
+    /// see `caos_iroh::endpoint_builder`.
+    fn relay(&self) -> Result<&iroh::RelayUrl, String> {
+        self.relay.as_ref().ok_or_else(|| {
+            format!(
+                "--relay is required: it is the relay clients reach this endpoint\n  \
+                 through, and n0's are never used -- a cloud container's setup phase\n  \
+                 answers 503 for all seven of them. Run `iroh-relay --dev` on a host\n  \
+                 of your own, on port 80 or 443, and name it here.\n{USAGE}"
+            )
+        })
     }
 
     /// The persisted identity and shared token, created on first use.
@@ -179,7 +207,8 @@ async fn serve(options: Options) -> Result<(), String> {
         git_dir: options.git_dir.clone(),
         token,
     });
-    let mut builder = caos_iroh::endpoint_builder()
+    let relay = options.relay()?.clone();
+    let mut builder = caos_iroh::endpoint_builder(&relay)?
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()]);
     // A FIXED PORT, so the addresses this endpoint advertises are the same ones
@@ -236,17 +265,16 @@ async fn serve(options: Options) -> Result<(), String> {
     //
     // The relays stay either way, so a client that can use none of these
     // addresses still connects.
-    // THE CONFIGURED RELAY GOES IN WHETHER OR NOT IT HAS BEEN REACHED. `addr()`
-    // reports relays this endpoint has CONNECTED to, so a caosd brought up with
-    // no route out -- an ordinary thing to do -- mints a ticket with no relay in
-    // it: usable from its own LAN and nowhere else, and nothing in the ticket
-    // says so. `CAOS_IROH_RELAY` is a statement of intent, so it is trusted
-    // here and the connection can happen whenever the network does.
-    let discovered = match caos_iroh::configured_relay() {
-        Some(relay) if !endpoint.addr().relay_urls().any(|u| *u == relay) => {
-            endpoint.addr().with_relay_url(relay)
-        }
-        _ => endpoint.addr(),
+    // THE RELAY GOES IN WHETHER OR NOT IT HAS BEEN REACHED. `addr()` reports
+    // relays this endpoint has CONNECTED to, so a caosd brought up with no route
+    // out -- an ordinary thing to do -- would mint a ticket with no relay in it:
+    // usable from its own LAN and nowhere else, with nothing in the ticket saying
+    // so. `--relay` is a statement of intent, so it is trusted here and the
+    // connection can happen whenever the network does.
+    let discovered = if endpoint.addr().relay_urls().any(|u| *u == relay) {
+        endpoint.addr()
+    } else {
+        endpoint.addr().with_relay_url(relay)
     };
     let addr = if options.advertise.is_empty() {
         discovered

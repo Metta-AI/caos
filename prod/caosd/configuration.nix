@@ -61,7 +61,9 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Run an iroh relay here, for clients whose network cannot reach n0's.
+        Run an iroh relay here. caos uses no other: n0's are never dialled,
+        for a relay or for discovery, so SOMEONE has to run one and every
+        `caos://` endpoint is required to name it.
 
         A Claude Code cloud container's SETUP phase is one such network: all
         seven relays iroh ships answer 503 there with an Envoy upstream connect
@@ -71,8 +73,11 @@ in
         relay run HERE answered 200 from that phase, on the host and port where
         an ordinary HTTP server had.
 
-        A dev stack points at it with CAOS_IROH_RELAY, and its ticket then
-        carries this relay instead of n0's.
+        A dev stack points at it with CAOS_IROH_RELAY, which `caosd up --iroh`
+        requires and passes to `caos-iroh serve --relay`. There is no fallback:
+        one that existed minted a ticket carrying the same endpoint id and
+        token as the one already in someone's environment, so it looked current
+        while reaching nothing.
       '';
     };
 
