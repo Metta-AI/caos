@@ -26,6 +26,9 @@
 #   drive --env-create NAME --from Caos     # create (optionally cloning an env)
 #   drive --env-delete NAME                 # delete an environment
 #
+# A NEW session opens the CURRENT directory's repo, which must be a caos CLIENT
+# repo (it is checked before one is started; --any-repo skips the check).
+#
 # The --env-update/-create/-delete modes WRITE the environment over the same web
 # API as --env-config (same $CLAUDE_SESSION_KEY cookie). --init-script FILE reads
 # the setup script from FILE; --set-env/--unset-env edit env vars; --rename
@@ -67,6 +70,7 @@ set -euo pipefail
 session=""
 file=""
 probe=0
+any_repo=0
 env_read=0
 conv_read=0
 env_config=0
@@ -82,6 +86,7 @@ declare -a unset_env=()
 for ((i = 1; i <= $#; i++)); do
     case "${!i}" in
         --probe) probe=1 ;;
+        --any-repo) any_repo=1 ;;
         --env) env_read=1 ;;
         --conv) conv_read=1 ;;
         --env-config) env_config=1 ;;
@@ -118,6 +123,57 @@ web() {
         nix run nixpkgs#curl-impersonate -- --impersonate chrome110 --compressed -sS -m 25 -H "Cookie: sessionKey=$_cookie" "$@"
     fi
 }
+# A NEW SESSION OPENS THE CURRENT DIRECTORY'S REPO, and that repo has to be a
+# caos CLIENT repo. `claude --cloud` bundles the cwd's repository and takes no
+# repo argument, so the only thing that chooses what a session opens is where
+# this was run from -- and the natural place to run it from is the caos checkout
+# you are working in, which is the one repo that cannot be it.
+#
+# caos is not a client repo: its flake.lock has no `caos` input, so stage 1
+# refuses the environment and the session dies in its setup phase. That is the
+# correct answer to the wrong question, four minutes and one container after the
+# mistake, and it has been made twice. Ask here instead, where it costs nothing.
+#
+# The pin test is `bootstrap.go`'s own (`readLock`): `nodes.<root>.inputs.caos`
+# names a node KEY, and only that node's `locked.rev` is authoritative. A
+# `follows` input is an array rather than a key and carries no lock, so it is not
+# a pin -- which is why this asks for the rev rather than for the input's mere
+# presence.
+require_client_repo() {
+    if [ "$any_repo" = 1 ]; then
+        return 0
+    fi
+    local root lock rev
+    if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+        echo "drive: $PWD is not a git repository, so there is nothing to open." >&2
+        exit 1
+    fi
+    lock="$root/flake.lock"
+    rev=""
+    if [ -r "$lock" ]; then
+        rev="$(jqf -r '
+            (.root // "root") as $r
+            | (.nodes[$r].inputs.caos // empty) as $k
+            | if ($k | type) == "string" then (.nodes[$k].locked.rev // empty) else empty end
+        ' "$lock" 2>/dev/null)"
+    fi
+    if [ -n "$rev" ]; then
+        return 0
+    fi
+    echo "drive: $root does not pin caos, so a session started here cannot run." >&2
+    echo "  A cloud session opens the CURRENT directory's repo, and it must be a" >&2
+    echo "  caos CLIENT repo: flake.lock pinning a 'caos' input by revision, a root" >&2
+    echo "  .caos-expr mounting that input's std, AGENTS.md and .caos-secrets." >&2
+    echo "  Fork Metta-AI/caos-session and run this from that clone." >&2
+    echo >&2
+    echo "  The code to work on is NOT cloned into the container -- the agent's" >&2
+    echo "  import_source tool fetches it into the conversation, so opening caos" >&2
+    echo "  itself is never what you want." >&2
+    echo "  Pass --any-repo to start one anyway (it will fail in setup; that is" >&2
+    echo "  the point of doing it deliberately)." >&2
+    exit 1
+}
+
 require_cookie() {
     if [ -z "$_cookie" ]; then
         echo "drive: set CLAUDE_SESSION_KEY (or CLAUDE_SESSION_ID) to your claude.ai" >&2
@@ -437,6 +493,7 @@ if [ -n "$session" ]; then
     # Continue: no TTY needed. `-p` posts a message into the running session.
     claude --cloud "$session" -p "$(cat "$tmp")"
 else
+    require_client_repo
     # Start: `--cloud` needs a TTY, so run it under script(1). The prompt is
     # read inside the single-quoted -c string, so nothing in it is parsed by
     # the shell that assembles the command.
