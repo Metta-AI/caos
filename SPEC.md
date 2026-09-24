@@ -396,7 +396,7 @@ When a user uses caos with an agent harness, caos creates a conversation commit 
 contain helpful tools, and the readmes describe those tools 
 
 When starting a session:
-- The claude cloud env's setup script reads the flake/expression's caos url and runs `<url>/integrations/claude-code/cloud/install.sh --base=... --caos-std-path=<path to caos std>`. This installs everything
+- The claude cloud env's setup field runs `go run <url>/integrations/claude-code/cloud/bootstrap.go --base=... --server=...`. That reads the flake/expression's caos pin, fetches the payload that pin names, and runs the `install.go` from it — which installs everything. Two stages because the installer is part of the payload, so dev mode can replace it
 - We start the conversation commit from this repo's default branch, or whatever branch the user chooses. The repo's TREE becomes the conversation's content, at the root — its readmes, its agents.md and its `.caos-secrets` are conversation files, not a source tree. A fresh conversation therefore carries the client repo and nothing else; there are no source trees until something is imported.
 
 The user will then say something like "import <repo name>" and the agent will find the repo in github, import it as a source tree in the conversation commit and then start working on it 
