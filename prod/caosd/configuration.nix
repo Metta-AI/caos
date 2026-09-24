@@ -90,10 +90,49 @@ in
         setup and the session phase, while port 80 answered from both.
       '';
     };
+
+    relay.url = lib.mkOption {
+      type = lib.types.str;
+      default =
+        if cfg.relay.enable then
+          "http://${cfg.advertiseAddress}${
+            lib.optionalString (cfg.relay.port != 80) ":${toString cfg.relay.port}"
+          }/"
+        else
+          "";
+      description = ''
+        The relay this stack's endpoint is reached through, baked into its
+        ticket. Required: caos dials no relay it was not given, so `caosd up
+        --iroh` refuses to start without one.
+
+        THE PUBLIC ADDRESS, not localhost, because this one string does two
+        jobs: it is what this endpoint connects to AND what every client dials
+        out of the ticket. A loopback URL would leave the ticket naming a relay
+        only this machine can reach.
+
+        It defaults to the relay this host runs (relay.enable). A machine that
+        runs none must name someone else's, and the assertion below says so
+        rather than letting the service fail at start.
+      '';
+      example = "http://34.200.32.255/";
+    };
   };
 
   config = {
     system.stateVersion = "25.11";
+
+    # Refused at BUILD time, where the option is named, rather than at start
+    # where the failure is a dead service on a machine that was serving.
+    assertions = [
+      {
+        assertion = cfg.relay.url != "";
+        message = ''
+          caos.relay.url is empty: this host runs no relay of its own
+          (caos.relay.enable = false), so it must name one to be reached
+          through. n0's relays are not used by caos at all.
+        '';
+      }
+    ];
 
     # A flake-managed machine must NOT also be user-data-managed. The NixOS EC2
     # image runs amazon-init on EVERY boot, which copies user-data over
@@ -247,6 +286,7 @@ in
       environment = {
         CAOS_DATA = "/data/caos";
         CAOS_IROH_ADVERTISE = "${cfg.advertiseAddress}:${toString cfg.irohPort}";
+        CAOS_IROH_RELAY = cfg.relay.url;
       };
       serviceConfig = {
         Type = "oneshot";
