@@ -18,9 +18,10 @@ fail() { echo "BUILD FAIL: $*" >&2; exit 1; }
 caos get -r /cas/args/in || fail "materializing the source tree"
 cd /cas/args/in
 
-# WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-build is registered on
-# every conversation (it is one of the harness's own tools), so it is offered
-# even when the source tree is not caos. There it has nothing to build: rather
+# WRONG SOURCE TREE — a CLEAN RESULT, not an error. This tool is reachable as
+# `caos-std/caos-build` from any conversation whose tree mounts caos, and `in`
+# defaults to whatever tree the path selected, so it will be run on trees that
+# are not caos. There it has nothing to build: rather
 # than fail the turn, put a plain log saying so and exit 0, so the model reads a
 # calm "not applicable here" tool_result instead of a red one.
 if [ ! -f flake.nix ]; then
@@ -42,6 +43,23 @@ fi
 # same whether or not some later step has made this a repo.
 status=0
 nix build "path:$PWD" > /tmp/build.log 2>&1 || status=$?
+
+# THE OTHER WRONG TREE: one that HAS a flake, just not caos'. The `flake.nix`
+# check above cannot see that, and the conversation root of an ordinary session
+# is exactly this case — a repo pinning caos has a flake of its own, so a
+# no-argument call landed on nix's `does not provide attribute
+# 'packages.x86_64-linux.default'` where the help promises a calm answer. Nix's
+# own message is the cheapest reliable test for it; asking first would mean an
+# evaluation of its own.
+if [ "$status" -ne 0 ] && grep -q "does not provide attribute" /tmp/build.log; then
+  { echo "caos-build compiles the caos source tree with nix, and this tree's flake"
+    echo "builds something else — it has no default package."
+    echo "caos-build is specific to the caos codebase; run it there, or pass the"
+    echo "caos tree's conversation path as \`in\`."
+  } > /tmp/build.log
+  caos put /tmp/build.log /cas/out
+  exit 0
+fi
 
 # A FAILED BUILD IS A VALUE, not a job error. SPEC is explicit that a tool's
 # expected failures are results the model can read and act on, and a build tool

@@ -129,6 +129,22 @@ makes a client that ignores `tools/list_changed` correct rather than stale. The
 price is real and deliberate: an undocumented tool is invisible. Prose may drift
 from the tool; `tool_help` is the authority.
 
+**WHAT IS REGISTERED IS WHAT HAS NO PATH.** A tool that lives in caos' `std/` is
+reachable as `caos-std/<name>` from any conversation whose tree mounts caos
+through `std/flake-input-loader` (`design/flake-inputs.md`), so `tool_help`
+describes it and `run_tool` runs it. Registering it as well would be a second way
+to call one thing, and the two can disagree about which version runs — the
+harness's copy against the tree's. So the registry holds only what implements no
+entry and therefore has no path: the file tools, `grep`, the git readers, the
+subagent and async tools, `import_source`, `publish_source`, and
+`tool_help`/`run_tool` themselves. `std/README.md` is the index for the rest.
+
+`merge` is the one exception, and the reason is what its target is. Every other
+std tool reads a TREE, which `@in` lets a caller name; `merge` writes a merge
+commit INTO a source tree and so needs that tree's commit as `ours`. Nothing but
+the step's own routing supplies one and `run_tool` names no source tree, so merge
+cannot be reached by path yet and registering it is the only way to have it.
+
 ## Resolution
 
 A path names a tree and a tool within it: the conversation-path prefix selects
@@ -275,8 +291,7 @@ in a row. `grep` has always done this right — it binds only the scope it
 searches, which is why a scoped grep is cheap — and every reader now follows it.
 
 A tool whose `in` is something it BUILDS rather than the tree it was run on
-declares no `@in`: `bash`'s is a `{tree, cmd, cwd, paths}` envelope and `grep`'s
-is the scope, and each is bound by its own dispatch.
+declares no `@in`: `grep`'s is the scope it searches, bound by its own dispatch.
 
 **`@in` makes the input a PARAMETER, so a caller can redirect it.** The tag
 gives the tool an optional `{tree}` argument named `in`, listed by `tool_help`;
@@ -349,9 +364,9 @@ instead of returning a value. Its result is `{prop, out, message?, failed?}`:
   in `out`, because `out` is arbitrary logs and a build that printed `FAILED`
   in passing would condemn a good proposal
 
-**NO TOOL'S WRITER-NESS DEPENDS ON ITS NAME.** Every writer declares itself,
-built-ins included: `bash` and `merge` carry `@writer` in their own
-`.caos-expr`, and the harness reads it there. What remains keyed by name in
+**NO TOOL'S WRITER-NESS DEPENDS ON ITS NAME.** Every writer declares itself:
+`std/bash-tool` and `std/merge` carry `@writer` in their own `.caos-expr`, and
+the harness reads it there. What remains keyed by name in
 `callback_result` is `grep`'s renderer for its sparse match tree and the
 subagent join — presentation and plumbing, not the right to change a tree.
 
@@ -383,18 +398,13 @@ on any of it, and each is written down because the reason is easy to lose.
 - **Describing a tool evaluates it.** `tool_help` reads help from the evaluated
   ArgTree, so describing a compiled tool may build it. Skipping the target
   expression is a possible performance optimization when help is in its text.
-- **The std tools (`caos-build`, `caos-test`, `caos-test-result`) are addressed
-  by NAME, and that is now a CHOICE rather than a gap.** Path-addressing them
-  was planned and dropped: `--base:@=std/caos-test` evaluates against the
-  selected source tree's root, and an ordinary repository has no `std/`, so it
-  would work for caos' own tree and for one that mounts caos' std through a
-  `:@@=` locator and break `caos-test` everywhere else — while also losing the
-  guarantee that a harness-provided tool is always offered. The reason
-  path-addressing was right for REPOSITORY tools does not apply here either:
-  enumeration scaled badly because the set grew and changed per source tree,
-  and these are a fixed three whose declarations never move. They already read
-  their help from their images like `bash` and `merge` do, so nothing is
-  inconsistent. Revisit only if a repository needs to REPLACE one.
+- **`caos-std/README.md` cannot be READ.** It is the index a model is pointed at,
+  and `caos-std/` exists only in the EVALUATED conversation tree, so the file
+  tools — which do not evaluate — cannot open it. The system prompt names the std
+  tools inline instead of naming the file.
+- **`merge` is still reached by NAME**, for the reason under "What is registered
+  is what has no path" above: it needs its source tree's commit, and `run_tool`
+  binds a tree.
 - **`caos-cli run-tool` and `caos-cli run` are still separate verbs**, and
   `run-tool` does not validate against the help, so "both callers build the same
   ArgTree" is a goal rather than an invariant.
@@ -651,10 +661,11 @@ their refs, reconciliation, and publication. Conversation commits hold
 protocol state; source tree commits hold code. They are connected by hashes
 in conversation records, never by parent edges.
 
-File tools, grep, and bash start at the conversation root and traverse
-commit-valued source-tree entries. Bash can edit ordinary conversation files
-and several source trees together. Source-tree directories preserve commit
-identity through `mv` and `cp -a`; changes produce child code commits.
+File tools, grep, and a shell reached at a conversation-root path start at the
+conversation root and traverse commit-valued source-tree entries. Such a shell
+can edit ordinary conversation files and several source trees together; one
+reached inside a source tree sees only that tree. Source-tree directories preserve
+commit identity through `mv` and `cp -a`; changes produce child code commits.
 Repository tools are addressed with `run_tool` and one conversation-relative
 path. Git operations such as merge still name their target source tree.
 
@@ -670,7 +681,7 @@ contained source tree's commit boundary.
 
 - **Read-only tools** (`read`, `ls`, `grep`) return the input
   commit UNCHANGED — no new object, no no-op commit.
-- **Mutations** (`write`, `edit`, `bash`) create a single-parent
+- **Mutations** (`write`, `edit`, a shell) create a single-parent
   code commit for each changed source tree. Ordinary conversation-file
   changes stay in the conversation tree.
 - **`merge`** returns a two-parent commit `commit(merged tree, parents =
