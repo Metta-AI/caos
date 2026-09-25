@@ -1,3 +1,6 @@
+> Why did the content-addressable OS never lose an argument?
+> Because every time you changed its mind, it just got a new hash.
+
 # caos
 
 Caos is a Content-Addressable Operating System. It's functional programming with git as the values and docker as the
