@@ -31,10 +31,20 @@ llm_test_setup
 rm -rf /tmp/ws
 mkdir -p /tmp/ws/notes
 echo "hello notes" > /tmp/ws/notes/todo.txt
+# A TOOL IN THE TREE, because that is the only way a shell is reachable: nothing
+# registers std/bash-tool, so the model runs it as `run_tool main/tools/sh`.
+# Curried by hash rather than mounted through DEPS, so the fixture tree needs no
+# deep-deps of its own and the tool's own help (`@writer`, `@in`) comes along.
+mkdir -p /tmp/ws/tools/sh
+printf 'curry --base:hash=%s\n' "$(caos hash /cas/args/bash-tool)" \
+  > /tmp/ws/tools/sh/.caos-expr
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
-R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"cmd":"echo hi > main/out.txt","paths":["main"]},"name":"bash","type":"tool_use"}]'
-R2='[{"id":"toolu_03","input":{"cmd":"echo boom >&2; exit 3","paths":[]},"name":"bash","type":"tool_use"}]'
+# `cmd` is relative to the SOURCE TREE the tool's path selected, which is what
+# `@in` buys: the tree is an argument, so the tool sees that tree's root as its
+# working directory rather than the conversation root.
+R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"arguments":{"cmd":"echo hi > out.txt"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
+R2='[{"id":"toolu_03","input":{"arguments":{"cmd":"echo boom >&2; exit 3"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
 EARLY_INTERJECTION_TEXT="also keep the notes subtree"
 INTERJECTION_TEXT="one more thing before you finish"
 STALE_T2_TEXT="the source tree still holds out.txt"

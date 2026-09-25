@@ -42,6 +42,9 @@ llm_test_setup
 # — here by `:hash=`, because this fixture source tree holds no std to name by
 # path. `--bash` is this TEST's mount, already evaluated to an image.
 bash_img=$(caos hash /cas/args/bash)
+# And std/bash-tool's image, for the fixture's own shell tool below: nothing
+# registers it, so a shell is reached by path like any other tree tool.
+bash_tool_img=$(caos hash /cas/args/bash-tool)
 
 # Write tool `$1` from the script on stdin, with `$2` as its javadoc help.
 tool() {
@@ -160,6 +163,14 @@ cp /tmp/ws/caos-tools/hello/worker.sh /tmp/ws/caos-tools/undocumented/worker.sh
 printf 'curry --base:hash=%s --worker1:@=worker.sh\n' "$bash_img" \
   > /tmp/ws/caos-tools/undocumented/.caos-expr
 
+# THE SHELL, as a tool of the tree. std/bash-tool declares its own help
+# (`@writer`, `@in`), so re-currying its image is the whole definition: a
+# repository that wants a shell puts this one line somewhere and the model
+# reaches it by path.
+mkdir -p /tmp/ws/caos-tools/sh
+printf 'curry --base:hash=%s\n' "$bash_tool_img" \
+  > /tmp/ws/caos-tools/sh/.caos-expr
+
 # An ancestor computes a tools/ directory absent from the stored source tree.
 # The target's input must still be the ORIGINAL source tree, with this marker.
 printf 'original-source' > /tmp/ws/input-marker
@@ -197,7 +208,7 @@ stage "script the stub LLM (describe; edit; bad call; dead sub-run; good; write)
 # describe the path, then run it. The missing arg must be answered in place, and
 # the dead sub-run must preserve the bash-edited source tree, so the final valid
 # hello call can still run the v2 script.
-R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"cmd":"sed -i s/v1/v2/ main/caos-tools/hello/worker.sh","paths":["main/caos-tools/hello/worker.sh"]},"name":"bash","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_09","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_10","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/nope"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_11","input":{"path":"main/caos-tools/whichtree"},"name":"run_tool","type":"tool_use"},{"id":"toolu_12","input":{"path":"main/caos-tools/whichtree","arguments":{"in":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_13","input":{"path":"main/caos-tools/whichtree"},"name":"tool_help","type":"tool_use"}]'
+R1='[{"id":"generated-help","input":{"path":"main/generator/tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"generated-run","input":{"path":"main/generator/tools/hello","arguments":{"word":"supplied"}},"name":"run_tool","type":"tool_use"},{"id":"generated-missing","input":{"path":"main/generator/tools/missing"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00","input":{"path":"main/caos-tools/hello"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00b","input":{"path":"main/caos-tools/undocumented"},"name":"tool_help","type":"tool_use"},{"id":"toolu_00c","input":{"path":"main/caos-tools/nope"},"name":"tool_help","type":"tool_use"},{"id":"toolu_01","input":{"arguments":{"cmd":"sed -i s/v1/v2/ caos-tools/hello/worker.sh","paths":["caos-tools/hello/worker.sh"]},"path":"main/caos-tools/sh"},"name":"run_tool","type":"tool_use"},{"id":"toolu_02","input":{"path":"main/caos-tools/hello"},"name":"run_tool","type":"tool_use"},{"id":"toolu_03","input":{"path":"main/caos-tools/boom"},"name":"run_tool","type":"tool_use"},{"id":"toolu_04","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_05","input":{"path":"main/caos-tools/writer"},"name":"tool_help","type":"tool_use"},{"id":"toolu_06","input":{"path":"main/caos-tools/writer"},"name":"run_tool","type":"tool_use"},{"id":"toolu_07","input":{"path":"main/caos-tools/orphan"},"name":"run_tool","type":"tool_use"},{"id":"toolu_08","input":{"path":"main/caos-tools/hello","arguments":{"word":"banana","suffix":"-split"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_09","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_10","input":{"path":"main/caos-tools/countdir","arguments":{"src":"main/nope"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_11","input":{"path":"main/caos-tools/whichtree"},"name":"run_tool","type":"tool_use"},{"id":"toolu_12","input":{"path":"main/caos-tools/whichtree","arguments":{"in":"main/caos-tools/hello"}},"name":"run_tool","type":"tool_use"},{"id":"toolu_13","input":{"path":"main/caos-tools/whichtree"},"name":"tool_help","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' "$R1" > /tmp/stub/response-1.json
 printf '{"content":[{"text":"tools done","type":"text"}],"stop_reason":"end_turn"}' \
@@ -310,11 +321,7 @@ $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/caos-too
 # NOT "the source tree at the end of the turn", which it used to compare
 # against: those matched only while toolu_04 was the last call to move the
 # tree, and a writer after it makes the final tree a commit that did not exist
-# when toolu_04 ran. And NOT bash's own resolution `output` either -- bash is
-# UNSCOPED (it may edit conversation files and several trees at once), so
-# `plan_file_changes` records its gitlink move under `files` and leaves
-# `source_tree_resolution` null. Only a source-tree-SCOPED call carries an
-# `output`.
+# when toolu_04 ran.
 hello_input=$(jq -r 'select(.id == "toolu_04") | .input_commit' /tmp/caos-tools.records)
 writer_input=$(jq -r 'select(.id == "toolu_06") | .input_commit' /tmp/caos-tools.records)
 assert_oid "$hello_input" "the source commit the queued hello call ran on"

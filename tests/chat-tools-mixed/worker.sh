@@ -16,10 +16,18 @@ cp -R /tmp/ws /tmp/feat
 echo "merged" > /tmp/feat/feature.txt
 feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 
+# THE SHELL IS A TOOL AT THE CONVERSATION ROOT, and that position is the whole
+# point of this test: a path outside every source tree runs over the conversation
+# tree, which is the one scope from which `cp -a main side`, `mv side review` and
+# a write into `memories/` are all reachable at once. A tool inside `main` would
+# see only `main`. The model stages it here with `write`, which is all a tool is
+# -- a directory whose `.caos-expr` names an image (std/bash-tool's, by hash).
+bash_tool_img=$(caos hash /cas/args/bash-tool)
 MIXED_CALLS='[
+ {"id":"tu_tool","input":{"file-path":"tools/sh/.caos-expr","content":"curry --base:hash='"$bash_tool_img"'\n"},"name":"write","type":"tool_use"},
  {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
- {"id":"tu_create","input":{"cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"name":"bash","type":"tool_use"},
- {"id":"tu_mb","input":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"name":"bash","type":"tool_use"},
+ {"id":"tu_create","input":{"arguments":{"cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_mb","input":{"arguments":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
  {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
  {"id":"tu_mm","input":{"source_tree":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
@@ -54,7 +62,7 @@ git merge-base --is-ancestor "$feature" "$source_tree" \
 
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/mixed-tools.jsonl
 jq -s -e '
-  (map(.id) | sort) == (["tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_create","tu_side"] | sort) and
+  (map(.id) | sort) == (["tu_tool","tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_create","tu_side"] | sort) and
   (map(select(.id == "tu_mb"))[0] |
     .status == "complete" and .task != null and
     .input_commit != null and .source_tree_name == null and (.files_outcome.applied | sort) == ["main","review","side"]) and

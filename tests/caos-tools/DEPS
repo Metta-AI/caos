@@ -1,6 +1,7 @@
 # DEPS format and dependency-closure rules are documented in
 # design/caos-expr.md.
 ../../std/bash bash
+../../std/bash-tool bash-tool
 ../../std/llm-step llm-step
 ../../std/llm-stub llm-stub
 # The image this client test runs in, with the client-repo setup as its

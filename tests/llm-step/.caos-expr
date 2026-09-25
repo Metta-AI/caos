@@ -9,4 +9,4 @@
 # `admit_turn`/`start_turn` rather than `dispatch_turn` for the first turn: the
 # pre-start interjection has to land between the admission and the dispatch,
 # which is the case being tested.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --llm-step:@=DEEP-DEPS/llm-step --bash-tool:@=DEEP-DEPS/bash-tool --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

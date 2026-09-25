@@ -63,6 +63,12 @@ llm_test_setup
 rm -rf /tmp/ws
 mkdir -p /tmp/ws
 echo "hello tools" > /tmp/ws/greeting.txt
+# The shell, as a tool of the tree: nothing registers std/bash-tool, so the
+# mutating call below reaches it by path. Curried by hash, so the fixture needs
+# no deep-deps of its own.
+mkdir -p /tmp/ws/tools/sh
+printf 'curry --base:hash=%s\n' "$(caos hash /cas/args/bash-tool)" \
+  > /tmp/ws/tools/sh/.caos-expr
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the workspace")
 
 # EMPTY on purpose: the stub has no scripted response, so a step that reaches
@@ -87,7 +93,8 @@ grep -qF "hello tools" /tmp/read.observation || fail "the read did not return th
   || fail "a tools-only run left the request $(request_status), not running"
 
 stage "a second call, in its own run, mutating the source tree"
-declare_call toolu_write bash '{"cmd":"echo written > main/out.txt","paths":["main"]}'
+declare_call toolu_write run_tool \
+  '{"arguments":{"cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
 write_round=$round
 [ "$write_round" != "$read_round" ] || fail "the second call declared the same round"
 run_tools_only toolu_write

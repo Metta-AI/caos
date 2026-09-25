@@ -1,5 +1,6 @@
 ../../std/llm-step llm-step
 ../../std/bash bash
+../../std/bash-tool bash-tool
 ../../std/llm-stub llm-stub
 ../../std/llm-test llm-test
 ../../std/llm-test-tool llm-test-tool
