@@ -116,7 +116,9 @@ func main() {
 	os.WriteFile(marker, []byte(fmt.Sprintf("%d\n", deadline)), 0o644)
 	defer os.Remove(marker)
 
-	warm(locator)
+	if !warm(locator, gitDir) {
+		reportNoTools()
+	}
 
 	// STDOUT, because it is the only stream a session keeps. The stamp is the
 	// authority rather than anything this hook can test: dev mode happens
@@ -138,10 +140,14 @@ func main() {
 // uses) is left with no caos tools however fast the resolve then finishes.
 // Resolve them here, while this hook still blocks the session from starting, and
 // leave them in the cache `mcp serve` reads when it launches.
-func warm(locator string) {
+//
+// Reports whether it left a registry behind. That is the FILE, not the exit
+// status: `caos mcp warm` is non-fatal by contract and exits 0 having cached
+// nothing, so a status check would call a cold session warm.
+func warm(locator, gitDir string) bool {
 	if _, err := exec.LookPath("caos"); err != nil {
 		log("no caos on PATH; the setup phase installed no client")
-		return
+		return false
 	}
 	// ITS OUTPUT GOES TO A FILE, and that is not tidiness: Claude Code holds the
 	// session at "starting" until this hook's output stream reaches EOF, so a warm
@@ -151,7 +157,7 @@ func warm(locator string) {
 	out, err := os.Create("/tmp/caos-warm.log")
 	if err != nil {
 		log("could not open the warm log: %v", err)
-		return
+		return false
 	}
 	defer out.Close()
 
@@ -174,6 +180,36 @@ func warm(locator string) {
 			}
 		}
 	}
+	_, err = os.Stat(filepath.Join(gitDir, "caos-cc-registry.json"))
+	return err == nil
+}
+
+// A cold registry means the session may have NO caos tools, and nothing else
+// says so anywhere a reader can see: the drop happens inside Claude Code, and
+// the warm's own account of it goes to this hook's STDERR, which a SessionStart
+// hook has dropped. Hence stdout, the one stream a session keeps.
+//
+// It names what NOT to investigate, because the two things a reader reaches for
+// first both look like the fault and are not it. `claude mcp list` is the trap:
+// run from a shell it dials a server that by then has a warm cache and answers
+// Connected, which is a different question from the one the client asked at
+// startup.
+func reportNoTools() {
+	fmt.Print("caos: THE TOOL REGISTRY DID NOT RESOLVE IN TIME, so this session may have\n" +
+		"no caos tools at all -- not even caos_status. Claude Code starts the tool\n" +
+		"server in parallel with this hook, and with no cached registry that server\n" +
+		"must resolve and build std/llm-step before it can answer its first\n" +
+		"tools/list. A startup that overruns the client's MCP timeout drops the\n" +
+		"whole server rather than leaving it empty.\n" +
+		"The work is NOT lost. Building std/llm-step and running it to list its tools\n" +
+		"happens on the caos SERVER, which carries on after this hook's client is\n" +
+		"killed and memoizes the result, so the next session's warm is a fast memo hit\n" +
+		"and starts with the tools. A NEW session is the fix. Another turn in THIS one\n" +
+		"will not bring them back: the client reads its tool list when it starts, and\n" +
+		"the dropped server is not asked again.\n" +
+		"The configuration is not the fault: the declaration in ~/.claude.json is\n" +
+		"correct, and `claude mcp list` reports caos as Connected once the cache\n" +
+		"lands. Neither of those contradicts this.\n")
 }
 
 func mustGetwd() string {
