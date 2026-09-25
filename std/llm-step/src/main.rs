@@ -31,9 +31,9 @@ use conversation_protocol::v3::{
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
-    arg, caos, caos_curry, caos_recurry, cas_hash, eval_then_catching, link, own_args_tree, path,
-    prepare_request, read_arg, read_arg_opt, run_request_then, run_request_then_catching,
-    run_worker, scratch, secret, Arg,
+    arg, caos, caos_curry, caos_recurry, cas_hash, cas_kind, eval_then_catching, link,
+    own_args_tree, path, prepare_request, read_arg, read_arg_opt, run_request_then,
+    run_request_then_catching, run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -296,7 +296,12 @@ fn callback(
     let tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
     timing::phase(&format!("tool wait {tool}"));
 
-    if read_arg_opt("tool-lookup")?.is_some() {
+    // WHICH LEG. `run_tool`/`tool_help` carry `tool-lookup` only while they are
+    // waiting for their own EVALUATION -- `self_curry` unbinds it before the
+    // evaluated tool is dispatched -- so its presence is what tells a tool's two
+    // legs apart. `eval_path` has one leg and binds nothing of its own, so it
+    // routes by name.
+    if tool == tools::EVAL_PATH || read_arg_opt("tool-lookup")?.is_some() {
         if Path::new(&arg("error")).exists() {
             let mut error = read_arg("error")?;
             let target = pending_call_target(state, request, round, &id)?;
@@ -1140,7 +1145,7 @@ fn drive_call(
     };
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let mut scoped_call = call.clone();
-    if matches!(call.name.as_str(), "run_tool" | "tool_help") {
+    if path_is_scoped(&call.name) {
         scoped_call.input["path"] = json!(tool_path_in_scope(call, name.as_deref())?);
     }
     let conversation = state.conversation()?.tree().clone();
@@ -1206,13 +1211,24 @@ fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String
         if tools::is_inline(&call.name) {
             return Ok(Target::Files);
         }
-        if matches!(call.name.as_str(), "run_tool" | "tool_help") {
-            let path = call.input["path"]
-                .as_str()
-                .ok_or("run_tool requires path")?;
-            paths::validate_tree_path(path)?;
+        if path_is_scoped(&call.name) {
+            // `eval_path` reads its own `root`: when the model gave one, that
+            // object IS the thing evaluated and no source tree selects it.
+            if call.name == tools::EVAL_PATH && eval_root(call).is_some() {
+                return Ok(Target::Files);
+            }
+            let path = scoped_path(call)?;
+            if path.is_empty() {
+                return Ok(Target::Files);
+            }
+            paths::validate_tree_path(&path)?;
             for name in view.source_tree_names()?.into_iter().rev() {
-                if path.starts_with(&format!("{name}/")) {
+                // The bare name is a match for `eval_path` and only for it:
+                // evaluating a source tree's own root is a question worth
+                // asking, while running the tree as a tool is not.
+                if path.starts_with(&format!("{name}/"))
+                    || (path == name && call.name == tools::EVAL_PATH)
+                {
                     let commit = view
                         .source_tree(&name)?
                         .ok_or("reference disappeared")?
@@ -1263,16 +1279,55 @@ fn source_tree_target(
 ///
 /// `None` scope is the conversation tree, where there is no prefix to strip.
 fn tool_path_in_scope(call: &Call, source_tree: Option<&str>) -> Result<String, String> {
-    let path = call.input["path"]
-        .as_str()
-        .ok_or("run_tool requires path")?;
+    let path = scoped_path(call)?;
     match source_tree {
+        // The tree's own root: the prefix WAS the whole path, so what is left
+        // to evaluate within it is nothing. Only `eval_path` gets here — see
+        // `resolve_target`.
+        Some(name) if path == name => Ok(String::new()),
         Some(name) => path
             .strip_prefix(&format!("{name}/"))
             .map(str::to_string)
             .ok_or_else(|| "tool path is outside its source tree".to_string()),
-        None => Ok(path.to_string()),
+        None => Ok(path),
     }
+}
+
+/// The tools whose `path` is CONVERSATION-relative and therefore has a source
+/// tree to be scoped into: `run_tool`/`tool_help` name a tool, `eval_path`
+/// names anything at all.
+fn path_is_scoped(name: &str) -> bool {
+    matches!(name, "run_tool" | "tool_help") || name == tools::EVAL_PATH
+}
+
+/// A scoped tool's `path` argument. Required for `run_tool`/`tool_help`, which
+/// have nothing to do without one; optional for `eval_path`, whose empty path
+/// is the root.
+///
+/// The normalization is `eval_path`'s alone, deliberately: it is the one of the
+/// three with a meaningful empty path, so it is the one that has to recognise
+/// every shape a model writes for "the root" — absent, empty, whitespace, `/`.
+/// Applying it to a tool path would quietly start accepting `main/tool/`, which
+/// `validate_tree_path` refuses today.
+fn scoped_path(call: &Call) -> Result<String, String> {
+    match call.input.get("path").and_then(Value::as_str) {
+        Some(path) if call.name == tools::EVAL_PATH => {
+            Ok(path.trim().trim_matches('/').to_string())
+        }
+        Some(path) => Ok(path.to_string()),
+        None if call.name == tools::EVAL_PATH => Ok(String::new()),
+        None => Err(format!("{} requires path", call.name)),
+    }
+}
+
+/// `eval_path`'s `root`: the object to evaluate instead of the conversation
+/// tree, if the model named one.
+fn eval_root(call: &Call) -> Option<&str> {
+    call.input
+        .get("root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
 }
 
 fn inline_files_path(call: &Call) -> Option<(&'static str, String)> {
@@ -1364,6 +1419,51 @@ fn prepare_compute(
             } else {
                 eval_then_catching(ws, relative, Arg::Hash(&me))?;
             }
+            Ok(Prepared::Evaluation)
+        }
+        // `eval_path`: the SERVER walks `.caos-expr` and hands the answer back,
+        // exactly as a tool's own resolution does -- a worker cannot evaluate.
+        // `--catch` is what makes an unevaluatable path the MODEL's error
+        // instead of the worker's, which matters more here than for a tool: the
+        // model is asking what a path evaluates to, so "it doesn't" is an
+        // answer.
+        name if name == tools::EVAL_PATH => {
+            // Already scoped into its source tree by `tool_path_in_scope`, so
+            // this is relative to whatever root the walk starts from.
+            let relative = clean["input"]["path"].as_str().unwrap_or("").to_string();
+            let root = clean["input"]["root"]
+                .as_str()
+                .map(str::trim)
+                .filter(|hash| !hash.is_empty());
+            // `eval-path-then` starts the walk at its input's tree, so a
+            // commit-valued root has to be dereferenced first. `caos resolve`
+            // with an empty relative path is exactly that, and the identity on a
+            // tree. A hash the server does not hold is the model's mistake, not
+            // this worker's, so it comes back as a tool error.
+            let start = match root {
+                Some(hash) => {
+                    let at = fresh("eval-root");
+                    if let Err(error) = caos(["resolve", hash, "", &at]) {
+                        return Ok(Prepared::Result(error_block(
+                            &call.id,
+                            &format!("root {hash}: {error}"),
+                        )));
+                    }
+                    at
+                }
+                None => ws.to_string(),
+            };
+            // `tool-lookup` is bound for the ERROR MESSAGE: `callback` prefixes
+            // a failed evaluation with it, turning the server's report of the
+            // scoped `tests/nope` into the `main/tests/nope` the model wrote.
+            // Only when there is one -- an empty literal is a shape nothing else
+            // in this file relies on, and the root needs no prefix anyway.
+            let mut extras = vec![("current-tool", Arg::Lit(name))];
+            if !relative.is_empty() {
+                extras.push(("tool-lookup", Arg::Lit(&relative)));
+            }
+            let me = self_curry(Some(wc), request, round.declaring_round, &call.id, &extras)?;
+            eval_then_catching(&start, &relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
@@ -1587,6 +1687,23 @@ fn launch_resolved_tool(
     };
     let commit = Oid::parse(&cas_hash(&arg("wc"))?, "tool lookup input commit")?;
     if current_input != commit {
+        return resume(cfg, state, request, request_head);
+    }
+    // `eval_path` asked for the evaluated object's IDENTITY, not for a tool, so
+    // it answers here -- ahead of `materialize_source_tree`, which this answer
+    // does not need, and ahead of `evaluated_tool`, which would reject every
+    // result that is not a tool ArgTree.
+    if call.name == tools::EVAL_PATH {
+        let result = arg("result");
+        let report = tools::eval_path_report(&cas_kind(&result)?, &cas_hash(&result)?);
+        let site = CallSite::at(request, round, &call, &current.declaration_message);
+        site.complete(
+            state,
+            result_block(id, &report, false),
+            name.map(|name| (name, commit)),
+            None,
+            None,
+        )?;
         return resume(cfg, state, request, request_head);
     }
     let (ws, wc) = materialize_source_tree(state, &commit)?;
@@ -4335,6 +4452,84 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn eval_path_scopes_a_conversation_path_and_yields_to_an_explicit_root() {
+        let mut store = MemoryStore::new();
+        let source = test_oid('a');
+        let head = root_with(
+            &mut store,
+            BTreeMap::from([("project/revision".into(), source.clone())]),
+        )
+        .unwrap();
+        let view = Conversation::open(&store, &head).unwrap();
+        let eval = |input| Call {
+            id: "eval".into(),
+            name: tools::EVAL_PATH.into(),
+            input,
+        };
+
+        // A path under a source tree selects it, and what is evaluated within
+        // it is the path MINUS the prefix -- the same rule `run_tool` follows,
+        // so the walk starts at the repository's own root expression.
+        let under = eval(json!({"path": "project/revision/tests/hello"}));
+        let target = resolve_target(&view, &under).unwrap();
+        assert!(matches!(&target,
+            Target::SourceTree { name, commit } if name == "project/revision" && *commit == source));
+        assert_eq!(
+            tool_path_in_scope(&under, Some("project/revision")).unwrap(),
+            "tests/hello"
+        );
+
+        // The BARE name is the source tree's own root: `eval_path` alone
+        // accepts it, and nothing is left to evaluate within the tree.
+        let bare = eval(json!({"path": "project/revision"}));
+        assert!(matches!(resolve_target(&view, &bare).unwrap(),
+            Target::SourceTree { name, .. } if name == "project/revision"));
+        assert_eq!(
+            tool_path_in_scope(&bare, Some("project/revision")).unwrap(),
+            ""
+        );
+        let as_tool = Call {
+            id: "run".into(),
+            name: "run_tool".into(),
+            input: json!({"path": "project/revision"}),
+        };
+        assert!(matches!(
+            resolve_target(&view, &as_tool).unwrap(),
+            Target::Files
+        ));
+
+        // No path at all is the conversation root, and is not an error the way
+        // it is for a tool that has nothing to run without one.
+        let root = eval(json!({}));
+        assert!(matches!(
+            resolve_target(&view, &root).unwrap(),
+            Target::Files
+        ));
+        assert_eq!(tool_path_in_scope(&root, None).unwrap(), "");
+        assert!(scoped_path(&as_tool).is_ok());
+        assert!(scoped_path(&Call {
+            id: "run".into(),
+            name: "run_tool".into(),
+            input: json!({}),
+        })
+        .is_err());
+
+        // An explicit `root` IS the object to evaluate, so no source tree gets
+        // to select it and the path stays relative to that root.
+        let rooted = eval(json!({"path": "project/revision/tests/hello", "root": test_oid('b').to_string()}));
+        assert!(matches!(
+            resolve_target(&view, &rooted).unwrap(),
+            Target::Files
+        ));
+        assert_eq!(
+            tool_path_in_scope(&rooted, None).unwrap(),
+            "project/revision/tests/hello"
+        );
+        assert_eq!(eval_root(&rooted), Some(test_oid('b').to_string().as_str()));
+        assert_eq!(eval_root(&eval(json!({"root": "  "}))), None);
     }
 
     fn test_oid(character: char) -> Oid {
