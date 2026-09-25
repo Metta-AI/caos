@@ -1,13 +1,13 @@
-# Importing and PRs
+# GitHub interactions
 
-Imports use three layers: the server endpoint, `caos import-git`, and the
-agent's `import_source` tool. PR publication and merge drafts come later.
+Import source commits, prepare their history with a replay plan, and publish
+the resulting branches. GitHub PRs describe how those branches should be reviewed.
 
 ## Importing
 
 `import_source(source, revision?, into)` runs inline in `std/llm-step`.
 It accepts an HTTPS repository and a branch, full ref, or full commit hash.
-Omitting `revision` selects the default branch. Keep `/import` for local paths.
+Omitting `revision` selects the default branch. `/import` handles local paths.
 
 For each tool call:
 
@@ -51,13 +51,8 @@ reader=std/llm-step
 Keep the value file ignored and run `caos secrets` to initialize its entropy.
 The agent uses `/secret/github-token` for GitHub ref lookup and passes
 `--github-token-file=/secret/github-token` to `import-git`. The command
-forwards it in the sensitive `X-Caos-Git-Token` header; the server does not look
-up the calling job's secrets.
-
-Ref lookup and fetch share a repository-scoped Git credential helper. Tokens
-stay out of URLs, Git config, saved arguments, provenance, and logs. Automatic
-GitHub credentials apply only to `github.com` on the default HTTPS port.
-Public imports need no token. Importing needs neither `gh` nor another worker.
+forwards it in the `X-Caos-Git-Token` header. The token authenticates HTTPS
+requests to GitHub; public imports need no token.
 
 ## PRs
 
@@ -67,77 +62,29 @@ the same `github-token` secret, exposed to `gh` as `GH_TOKEN`.
 
 Expose a general `gh` operation accepting arguments, repository, stdin, and
 input/output files. Return exit status, stdout, stderr, and requested files.
-Use a small `git_push` helper to publish a selected source commit and its history,
-requiring the remote branch to match an expected head. The server can later
-perform this transfer directly, as it does imports.
+Use [branch publication](agent-publish.md) to push source commits directly
+from the server, requiring the remote branch to match an expected head.
 
 Create PRs with explicit repository, head, and base. Inspect existing PRs before
 creating duplicates or replacing human-edited metadata. Conversation data and
-merge bookkeeping stay outside published history. Once agent publication works,
-remove `/pr`, `/publish-branch`, and their UI.
+merge bookkeeping stay outside published history.
 
 ### Stacks
 
-Keep each stack boundary as a source gitlink:
+CAOS represents a stack as numbered source gitlinks and recorded `.base` files.
+A replay plan prepares its commits and rebuilds later layers after a predecessor
+changes. See [agent stacks and replay](agent-rebase.md) for the representation,
+plan commands, and conflict workflow.
 
-```text
-imports/repo/base   -> H
-feature/01-core     -> A   parent H
-feature/02-tests    -> B   parent A
-```
+Push each prepared tip to its remote branch. PR metadata is separate: the first
+PR targets the base branch, and each later PR targets the preceding branch.
+Link existing PR URLs in order with `gh stack link --base main <first-PR> <second-PR>`.
+This requires no local branches. CAOS replay manages the commit history; GitHub
+stack linking records the review relationships.
 
-Start each layer by copying the preceding snapshot with `cp -a`, then editing
-the copy. Git ancestry records the dependency. Push A and B to corresponding
-remote branches; the first PR targets `main`, the second targets the first
-branch. If A changes, merge its new commit into B, test, and push.
-
-Link the existing PR URLs in order with
-[`gh stack link`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands#gh-stack-link):
-
-```sh
-GH_REPO=owner/repo gh stack link --base main \
-  https://github.com/owner/repo/pull/123 \
-  https://github.com/owner/repo/pull/124
-```
-
-This needs no local stack branches. Commands such as `push`, `submit`, and
-`rebase` do require local branches and stack metadata. Supporting them would
-mean reconstructing that local repository from gitlinks and returning any
-rewritten commits to CAOS. Use CAOS's copy, edit, and merge operations initially,
-and `link` to publish the relationship. `modify` additionally requires linear
-history, so it cannot restructure stacks containing merge commits.
-
-### Merges
-
-Clean merges use the existing merge worker. On conflict, preserve the source O
-and keep the attempt beside it in the conversation:
-
-```text
-feature/01-core            gitlink -> O
-merges/update-main/
-  ours                    gitlink -> O
-  theirs                  gitlink -> T
-  work                    gitlink -> D
-  conflicts               Git's complete conflict report
-```
-
-D starts with Git's proposed merged tree and O as its single parent. The agent
-edits this separate draft gitlink and tests it. The report stays outside the
-code tree; newly created sources and drafts contain no `.caos/conflicts`.
-
-`finish_merge(attempt="merges/update-main", target="feature/01-core")` takes
-the draft's current tree R and creates `M = commit(tree=R, parents=[O,T])`.
-Verify O and T against the attempt's creation record, recheck the draft, and
-advance the target only if it still points to O. Otherwise retain the result
-for reconciliation. Draft commits stay in conversation history, outside M's
-ancestry. Test the final source before publication.
-
-Finishing explicitly asserts resolution. Preserve Git's complete conflict
-report, including messages and stage objects; deleting markers or report rows
-is not proof that structural conflicts are resolved. Delegate by copying the
-whole attempt with `cp -a`, harvesting the edited draft, and then finishing.
-Abandoning an attempt leaves the source unchanged. Handle old source-tree
-conflict ledgers before removing their compatibility cleanup.
+The ordinary `merge` tool remains available for a two-parent source merge.
+Stack replay instead applies selected tree differences and keeps conflict drafts
+under the feature's `rebase/` directory, outside the source tree.
 
 ### Retrying GitHub writes
 
