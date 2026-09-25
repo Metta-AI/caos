@@ -7,8 +7,14 @@ edition = "2021"
 name = "git_stack"
 path = "src/objects.rs"
 
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
 [dependencies]
+worker-common = { path = "worker-common" }
 conversation-protocol = { path = "conversation-protocol" }
+serde_json = "1"
 caos = { path = "caos" }
 
 [dev-dependencies]

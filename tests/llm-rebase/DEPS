@@ -1,0 +1,8 @@
+# DEPS format and dependency-closure rules are documented in design/caos-expr.md
+../../std/llm-step llm-step
+../../std/llm-stub llm-stub
+../../std/llm-test llm-test
+../../std/llm-test-tool llm-test-tool
+../../std/git-stack git-stack
+../../std/git-rebase-i rebase-tool
+../../dev/worker-test worker-test
