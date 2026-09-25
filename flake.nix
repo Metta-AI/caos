@@ -129,6 +129,34 @@
             craneLib.filterCargoSources path type || isCrateScript;
         };
 
+        # THE VENDORED CRATE SOURCES, named here rather than left to crane so
+        # the path is known at EVALUATION time -- the remap flag below needs it.
+        # It is the same derivation crane would compute, and every arg set in
+        # this flake shares one `src`, so one vendor dir serves all of them.
+        cargoVendorDir = craneLib.vendorCargoDeps { inherit src; };
+
+        # DO NOT WRITE THE VENDOR PATHS INTO THE BINARIES IN THE FIRST PLACE.
+        #
+        # Nix decides a store path's runtime dependencies by scanning its bytes
+        # for store paths, and rustc writes the vendored crate's source path
+        # into every panic site and -- with line-tables-only -- into the DWARF
+        # line table. Left alone, all ~498 vendored crate sources become
+        # runtime dependencies of every caos binary, so they follow it into
+        # every closure, image and `nix copy`.
+        #
+        # crane's answer is removeReferencesToVendoredSources, which blanks
+        # them afterwards with one sed whose regex carries a branch per crate.
+        # That runs in postInstallHooks, BEFORE fixupPhase strips, so it scans
+        # 411 MB of line-table-carrying binaries with a 499-way alternation:
+        # 67s on a laptop and ~6 minutes on the dev box, twice per deploy.
+        #
+        # Remapping removes the work instead of making it cheaper: rustc writes
+        # `/vendor/...`, which is not a store path, so there is nothing to
+        # record and nothing to blank. It costs no debuggability -- the store
+        # path it replaces does not exist on a machine running the binary
+        # either, so a backtrace naming /vendor is exactly as useful.
+        vendorRemap = "--remap-path-prefix=${cargoVendorDir}=/vendor";
+
         # Build for musl so the binary is fully static (crt-static is on by
         # default for musl targets) — its runtime closure is just itself.
         # Target the build host's architecture, no arch-cross: aarch64 on Apple
@@ -152,7 +180,7 @@
         '';
         crossLinkerEnv = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
           "CARGO_TARGET_${muslEnvTarget}_LINKER" = "${muslCrossLinker}";
-          "CARGO_TARGET_${muslEnvTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
+          "CARGO_TARGET_${muslEnvTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes ${vendorRemap}";
         };
 
         # A musl C cross-compiler: rustc links musl self-contained, but
@@ -173,8 +201,17 @@
             "${muslCrossCC}/bin/${muslCrossCC.targetPrefix}cc";
         };
 
+        # With the remap above there are no vendored store paths left in the
+        # output, so crane's blanking pass has nothing to find. Verified after
+        # the change: zero of the 498 vendor hashes appear in any binary, and
+        # nix records no reference to the vendor dir.
+        noVendorRefsToRemove = {
+          doNotRemoveReferencesToVendorDir = true;
+        };
+
         commonArgs = {
-          inherit src;
+          inherit src cargoVendorDir;
+          RUSTFLAGS = vendorRemap;
           strictDeps = true;
 
           # Shared across deps + every crate so crane keys the dep cache the
@@ -239,6 +276,7 @@
         # nothing extra ever lands in an image.
         workspaceBins = craneLib.buildPackage (
           commonArgs
+          // noVendorRefsToRemove
           // {
             inherit cargoArtifacts;
             cargoExtraArgs = "--workspace";
@@ -269,6 +307,7 @@
         # exact opposite of the intent.
         testWorkspaceBins = craneLib.buildPackage (
           commonArgs
+          // noVendorRefsToRemove
           // {
             inherit cargoArtifacts;
             cargoExtraArgs = "--workspace";
@@ -652,7 +691,8 @@ sandbox = false''
         # out of the caos-cli package; on macOS that's a Linux
         # binary, so build a native `caos-cli` for the host instead.
         nativeArgs = {
-          inherit src;
+          inherit src cargoVendorDir;
+          RUSTFLAGS = vendorRemap;
           strictDeps = true;
           pname = "caos-host-tools";
           version = "0.1.0";
@@ -751,10 +791,11 @@ sandbox = false''
                 # `caos-iroh` for aarch64 on an x86_64 host, with `cc` named as
                 # the linker in the failing command.
                 "CARGO_TARGET_${envTarget}_LINKER" = "${crossLd}";
-                "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes";
+                "CARGO_TARGET_${envTarget}_RUSTFLAGS" = "-Clinker-flavor=ld.lld -Clink-self-contained=yes ${vendorRemap}";
               };
             built = crossCrane.buildPackage (
               targetArgs
+              // noVendorRefsToRemove
               // {
                 cargoArtifacts = crossCrane.buildDepsOnly (
                   targetArgs // { cargoExtraArgs = cliPackages; }
@@ -792,6 +833,7 @@ sandbox = false''
           else
             craneLib.buildPackage (
               nativeArgs
+              // noVendorRefsToRemove
               // {
                 cargoArtifacts = nativeCliArtifacts;
                 cargoExtraArgs = cliPackages;

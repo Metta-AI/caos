@@ -155,6 +155,24 @@ in
       # when the root gets tight rather than dying with ENOSPC mid-build.
       min-free = 10 * 1024 * 1024 * 1024;
       max-free = 50 * 1024 * 1024 * 1024;
+
+      # How long nix may reuse its answer to "what commit is this branch at".
+      # The default is an hour, and a deploy names a BRANCH:
+      #
+      #   nix run github:Metta-AI/caos#deploy-caosd-prod
+      #
+      # so within that hour a push is invisible here and the deploy silently
+      # rebuilds the revision it already has. That does not fail — it succeeds
+      # against the wrong commit, which is worse, and it reads as a suspiciously
+      # fast deploy. Observed: the box stayed pinned to 1cff83e while the branch
+      # had moved on, until --refresh was passed.
+      #
+      # This is a deploy target that is told to fetch, not a build farm keeping
+      # an index warm, so the cost of asking again is one ls-remote against a
+      # push we are deliberately waiting for. Five seconds keeps that
+      # near-immediate while still collapsing the several lookups a single
+      # `nix run` makes.
+      tarball-ttl = 5;
     };
 
     # Docker gives every container a host-side veth. dhcpcd treats it as an
