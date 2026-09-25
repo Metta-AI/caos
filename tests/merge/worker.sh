@@ -4,8 +4,7 @@
 # Drives the std/merge worker directly (SPEC "Merging and conflict
 # resolution"): build two commits, merge them, and assert the two-parent result
 # — a conflicted merge (inline markers + .caos/conflicts) and a clean one. The
-# git-bearing worker fetches both commit closures from the server's own
-# transport, so this also exercises that path.
+# server performs the merge directly over its stored Git objects.
 #
 # GIT WAS A LOCAL TOOL HERE, NOT A SUBJECT, which is why this needs none.
 # `caos put-commit` mints a commit — the raw object, validated client-side and

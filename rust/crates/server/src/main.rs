@@ -43,6 +43,7 @@
 
 mod compute;
 mod git;
+mod git_objects;
 mod import;
 mod push;
 mod remote_git;
@@ -716,6 +717,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_end(&mut body)?;
             storage::post_object(config, &body)
         }
+        Method::Post if path == "/git/merge-tree" => git_objects::merge_endpoint(config, request),
         Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/git/push" => push::endpoint(config, request),
         Method::Post if path == "/sub-run" => {
