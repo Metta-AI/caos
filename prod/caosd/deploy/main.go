@@ -153,11 +153,31 @@ func buildSystem(flakeRef, addr string) string {
 			` modules = [ { caos.advertiseAddress = "%s"; } ]; })`+
 			`.config.system.build.toplevel`,
 		flakeRef, hostAttr, addr)
-	return run("nix", "build", "--impure", "--no-link", "--print-out-paths", "--expr", expr)
+
+	// STREAM nix's stderr rather than capturing it. `run` keeps stderr for the
+	// failure message, which is right for a command that either works or does
+	// not -- but this one is the long pole, and while it runs its stderr is the
+	// only account of WHAT is being built. Swallowing it made a 260s deploy
+	// that rebuilt 498 crates look indistinguishable from a cache hit, which
+	// is exactly the question anyone timing a deploy is asking.
+	//
+	// stdout still has to be captured: --print-out-paths writes the store path
+	// there, and that is the return value.
+	cmd := exec.Command("nix", "build", "--impure", "--no-link", "--print-out-paths", "--expr", expr)
+	var out strings.Builder
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	w.Must(cmd.Run())
+	return strings.TrimRight(out.String(), "\n")
 }
 
 func main() {
 	w.Main(func() {
+		started := time.Now()
+		// Elapsed per step, because the reason to watch a deploy at all is to
+		// find which part is slow.
+		since := func() string { return fmt.Sprintf("[%6.1fs]", time.Since(started).Seconds()) }
+
 		flakeRef := defaultFlake
 		if len(os.Args) > 1 {
 			flakeRef = os.Args[1]
@@ -171,14 +191,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "advertising  %s:%d\n", addr, irohPort)
 		fmt.Fprintf(os.Stderr, "flake        %s\n", flakeRef)
 
-		w.Step("building " + hostAttr)
+		w.Step(since() + " building " + hostAttr)
 		system := buildSystem(flakeRef, addr)
 		fmt.Fprintf(os.Stderr, "built        %s\n", system)
 
-		w.Step("switching")
+		w.Step(since() + " switching")
 		stream("sudo", "nix-env", "-p", "/nix/var/nix/profiles/system", "--set", system)
 		stream("sudo", system+"/bin/switch-to-configuration", "switch")
 
-		fmt.Fprintln(os.Stderr, "\ndone. 'systemctl status caosd' for the stack.")
+		fmt.Fprintf(os.Stderr, "\ndone in %.1fs. 'systemctl status caosd' for the stack.\n",
+			time.Since(started).Seconds())
 	})
 }
