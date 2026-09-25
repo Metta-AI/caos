@@ -414,13 +414,16 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn payload(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.optional_payload(path)?
+            .ok_or_else(|| format!("required path {path} is absent"))
+    }
+
+    pub fn optional_payload(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
         paths::validate_tree_path(path)?;
         if let Some(bytes) = self.execution()?.payloads.get(path) {
-            return Ok(bytes.clone());
+            return Ok(Some(bytes.clone()));
         }
-        self.snapshot
-            .read(path)?
-            .ok_or_else(|| format!("required path {path} is absent"))
+        self.snapshot.read(path)
     }
 
     pub fn async_task(&self, task: &Oid) -> Result<Option<AsyncRecord>, String> {

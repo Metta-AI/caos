@@ -1007,6 +1007,9 @@ fn apply_files(
                 builder.put(&path, *mode, bytes.clone());
             }
             Some((mode @ (Mode::Tree | Mode::Commit), bytes)) => {
+                if *mode == Mode::Tree {
+                    builder.delete(&path);
+                }
                 builder.put_oid(&path, *mode, Oid::parse_line(bytes, "content object")?);
             }
             None => builder.delete(&path),
