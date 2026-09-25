@@ -840,6 +840,15 @@ nothing; run `/pr` again after integration. Successful pushes and PR operations
 are recorded as CAOS transcript entries. No snapshot has a special working or
 sealed state.
 
-Per-mutation commits remain in the published source tree history. Only the
-previewed PR tip is checked for unresolved conflicts and reserved state;
-intermediate commits may contain conflict markers or fail to build.
+Publication sends the selected commit without rewriting its history. Prepare
+that history with a replay plan before publishing. Only the previewed PR tip
+is checked for unresolved conflicts and reserved state; intermediate commits
+may contain conflict markers or fail to build.
+
+## Stack replay
+
+Numbered source gitlinks pair with text `.base` files recording their original
+predecessors. `std/git-rebase-i` runs a deterministic plan over one feature
+directory, returning a replacement subtree through `run_tool`'s scoped writer
+path. It runs from the beginning on every invocation; conflicts are resolved
+by editing a draft and updating the plan. See [agent stacks and replay](design/agent-rebase.md).

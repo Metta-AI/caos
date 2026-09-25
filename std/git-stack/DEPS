@@ -1,0 +1,6 @@
+../rustc rustc
+../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator
+../../rust/crates/caos caos
+../../rust/crates/caos-eval caos-eval
+../../rust/crates/caos-world caos-world

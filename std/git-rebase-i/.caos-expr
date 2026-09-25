@@ -1,0 +1,13 @@
+HELP=<<END
+Replay rebase/plan within the selected stack directory without checking out its sources
+The plan starts with onto=COMMIT and committer=Name <email> <unix-seconds> <+/-HHMM>
+pick=COMMIT replays one change; pick=A..B applies the endpoint tree difference as one commit
+message=path replaces the latest unsealed commit message with that scope-relative file's bytes
+branch=name records a layer, numbered automatically from 00
+Each run starts from the beginning and deterministically recreates the same commits
+Conflicts leave rebase/work and rebase/conflicts; resolve the draft to R, replace the failed pick with pick=H..R using the reported output tip H, then run again
+Completion replaces numbered entries, preserves other files and removes rebase
+@writer
+@in
+END
+curry --base:@=DEEP-DEPS/git-stack --help=$HELP

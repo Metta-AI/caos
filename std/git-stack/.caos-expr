@@ -1,0 +1,1 @@
+run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/conversation-protocol --dep1:@=DEEP-DEPS/git-locator --dep2:@=DEEP-DEPS/caos --dep3:@=DEEP-DEPS/caos-eval --dep4:@=DEEP-DEPS/caos-world
