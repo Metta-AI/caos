@@ -287,7 +287,7 @@ fn as_address(url: &str) -> String {
     })();
     match resolved {
         Some(addr) => {
-            eprintln!("caos-runnerd: serving workers {url} as {addr}");
+            eprintln!("caos-runnerd: serving workers {url} as {addr} [scratch timing probe]");
             addr
         }
         None => url.to_string(),
