@@ -1,0 +1,21 @@
+[package]
+name = "git-stack"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "git_stack"
+path = "src/objects.rs"
+
+[dependencies]
+conversation-protocol = { path = "conversation-protocol" }
+caos = { path = "caos" }
+
+[dev-dependencies]
+conversation-protocol = { path = "conversation-protocol", features = ["memory-store"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0
