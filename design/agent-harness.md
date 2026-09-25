@@ -146,6 +146,28 @@ Tool classes:
   inline-tools-only round costs zero containers. Failures (missing file,
   non-unique `old_string`) are `is_error` tool_results, not errors. Parameter
   shapes mirror Claude Code's file tools, which models know well.
+- **Evaluation tools** (implemented — `tool_help`, `run_tool`'s first leg,
+  `eval_path`): no container of their own. The step records an
+  `eval-path-then` continuation and exits, the server walks `.caos-expr` from a
+  root down to the path on a request thread, and the callback receives the
+  object it produced. `eval_path` is the one that HANDS THAT OBJECT TO THE
+  MODEL: `<kind> <hash>` for a path (conversation-relative, so a source-tree
+  prefix scopes it exactly as `run_tool`'s does) within a root that defaults to
+  the conversation tree. That closes a real gap — a build product exists at no
+  path in any tree, so before this a model could ask a tool to build something
+  and then had no way to look at what came out. The hash it returns is a `root`
+  for `read`, `ls`, `grep` and `eval_path` itself, and every one of those
+  accepts ANY object the server holds, not only a revision of the conversation
+  (`tests/llm-eval-path`). `--catch` makes a path that cannot be evaluated an
+  `is_error` tool_result, which matters more here than for a tool: the model
+  asked what a path evaluates to, and "it doesn't" is an answer.
+  *Known gap:* the walk is the SERVER's, and the server refuses a `:@@=`
+  locator by design (only a client has the secret-availability model), so
+  `eval_path` cannot yet evaluate a tree whose expressions pin another repo by
+  locator. `run_tool`/`tool_help` get around that with the client handoff in
+  `mcp::dispatch_call` (`--client-tool-root`/`-path`/`-tree`); extending it to
+  `eval_path` needs a kind-preserving `eval_tree_tool`, since an eval_path
+  answer may legitimately be a blob.
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
   includes the source tree **with `.caos/` stripped** — tools never see
   transcripts, and tool cache keys stay identical to real source trees.

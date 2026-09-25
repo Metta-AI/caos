@@ -1,0 +1,13 @@
+# tests/llm-eval-path, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. The subject is `eval_path` — the tool that turns a path into
+# the hash of what that path EVALUATES to — and the hash-rooted reads that make
+# the answer useful. Every call is declared by the test itself and run in
+# `--tools-only` mode, because each call's argument is the PREVIOUS call's
+# result: a scripted stub can only replay a batch it was written before the
+# batch ran, and there is no model here to script.
+#
+# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# and refs on the server are the one thing caos gives a worker no verb for.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

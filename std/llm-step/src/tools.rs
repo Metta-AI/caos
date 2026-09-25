@@ -26,6 +26,11 @@ use crate::{fresh, fresh_name, result_block};
 const MAX_READ_BYTES: usize = 100_000;
 const MAX_ENTRIES: usize = 1_000;
 
+/// The `eval_path` tool's name. It is neither inline nor a tree tool: it is
+/// answered by a server-side evaluation the worker tail-calls, so `main` routes
+/// on this name in several places and a literal in each would drift.
+pub const EVAL_PATH: &str = "eval_path";
+
 /// True if `name` is one of the inline tools this module executes.
 pub fn is_inline(name: &str) -> bool {
     matches!(
@@ -67,6 +72,10 @@ const GREP_HELP: &str = "Search the conversation tree, including code references
 @param [path] Directory or file to search (relative to `root`, or to the conversation root); omit for everything.
 @param [root] Optional commit or tree hash to search as of another revision. Omit for the current conversation tree.";
 
+const EVAL_PATH_HELP: &str = "Evaluate a path and return the hash of what it produces — the BUILD PRODUCT of a tree, without having to know which tool makes it. Every `.caos-expr` from the root down to the path is applied, so a directory that declares a build evaluates to the built thing and a directory that declares none evaluates to itself. Paths are conversation-relative, and a source-tree prefix selects that tree with the rest evaluated against its own root: feature/dirty/tests/hello evaluates tests/hello inside feature/dirty. The answer is a `<kind> <hash>` line — pass that hash as `root` to `read`, `ls` or `grep` to look inside the result, or back to this tool to evaluate a path within it.
+@param [path] Conversation-relative path to evaluate, such as feature/dirty/tests/hello. Omit to evaluate the root itself.
+@param [root] Optional tree or commit hash to evaluate within instead of the conversation tree — one this tool printed, or any object hash. `path` is then relative to it.";
+
 /// Build a built-in tool's registry entry from its help text, through the very
 /// same `parse_help` → `tree_tool_declaration` path a discovered caos-tools
 /// tool takes. A std entry that declares `@git` gets the same builder.
@@ -87,6 +96,7 @@ pub fn declarations() -> Vec<Value> {
         ("edit", EDIT_HELP),
         ("import_source", crate::import_source::HELP),
         ("tool_help", TOOL_HELP_HELP),
+        (EVAL_PATH, EVAL_PATH_HELP),
     ]
     .iter()
     .map(|(name, help)| builtin_declaration(name, help))
@@ -649,6 +659,20 @@ pub fn evaluated_tool(image: &str, display: &str) -> Result<TreeTool, String> {
     }
     std_tool(display, image)?
         .ok_or_else(|| format!("{display} is not a tool: its evaluated image binds no `--help`"))
+}
+
+/// `eval_path`'s answer: the evaluated object's identity, plus the one thing the
+/// model has to be told to make use of it — that the hash goes in `root`.
+///
+/// The first line is the `<kind> <hash>` shape `caos-cli eval-path` and
+/// `caos-cli run` print, so a hash the model reports is one a human can paste
+/// straight back into either.
+pub fn eval_path_report(kind: &str, hash: &str) -> String {
+    let inside = match kind {
+        "blob" => format!("read it with root={hash} and no file-path"),
+        _ => format!("ls, read or grep it with root={hash}"),
+    };
+    format!("{kind} {hash}\n\n{inside}.")
 }
 
 /// `tool_help`'s description of one tool, as prose rather than JSON: the model
@@ -1275,40 +1299,58 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
 // SourceTree plumbing.
 // ---------------------------------------------------------------------------
 
-/// Like [`components`] but for an OPTIONAL path: an absent or blank argument
-/// yields the empty path (the root), rather than an error.
+/// Like [`components`] but for an OPTIONAL path: anything that names no
+/// component — absent, blank, `/`, `.` — is the ROOT, not a parse failure.
+///
+/// **`.` is the case that matters**, because nothing sends it deliberately:
+/// `normalize_inline_call` substitutes it when an `ls` names no path at all. So
+/// routing it through [`components`] made the two shapes that have no path to
+/// name fail with "`path` names no path: \".\"" — `ls` at the conversation root,
+/// and `ls` of a `root` hash, which is every build product, since a product
+/// exists at no path in any tree.
 fn components_opt(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
-    match call["input"][key]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    match call["input"][key].as_str() {
         None => Ok(Vec::new()),
-        Some(_) => components(call, key),
+        Some(raw) => {
+            let comps = split_path(raw);
+            reject_parent(&comps)?;
+            Ok(comps)
+        }
     }
 }
 
-/// Validate and split a source-tree-relative path argument. A leading `/` is
-/// tolerated (treated as the source tree root); `..` and the reserved `.caos`
-/// are refused.
+/// Validate and split a REQUIRED source-tree-relative path argument. A leading
+/// `/` is tolerated (treated as the source tree root); `..` and the reserved
+/// `.caos` are refused.
 fn components(call: &Value, key: &str) -> Result<Vec<String>, Fail> {
     let raw = call["input"][key]
         .as_str()
         .ok_or_else(|| User(format!("missing string `{key}`")))?;
-    let comps: Vec<String> = raw
-        .trim()
+    let comps = split_path(raw);
+    if comps.is_empty() {
+        return Err(User(format!("`{key}` names no path: {raw:?}")));
+    }
+    reject_parent(&comps)?;
+    Ok(comps)
+}
+
+/// A path argument's components: a leading `/` is tolerated, and empty and `.`
+/// segments drop out. Whether an empty result is an error is the CALLER's
+/// question — the two callers above answer it differently.
+fn split_path(raw: &str) -> Vec<String> {
+    raw.trim()
         .trim_start_matches('/')
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .map(str::to_string)
-        .collect();
-    if comps.is_empty() {
-        return Err(User(format!("`{key}` names no path: {raw:?}")));
-    }
+        .collect()
+}
+
+fn reject_parent(comps: &[String]) -> Result<(), Fail> {
     if comps.iter().any(|c| c == "..") {
         return Err(User("`..` is not allowed in source tree paths".to_string()));
     }
-    Ok(comps)
+    Ok(())
 }
 
 /// Walk `comps` down from the source tree root, materializing each level (`caos
@@ -1635,6 +1677,66 @@ mod tests {
             .find(|d| d["name"] == "read")
             .unwrap();
         assert!(read["input_schema"].get("required").is_none());
+    }
+
+    #[test]
+    fn a_dot_path_is_the_root_rather_than_a_parse_failure() {
+        // `.` is EVERY `ls` of a root hash, because `normalize_inline_call`
+        // substitutes it when an `ls` names no path -- and a build product is
+        // reached only by hash, since it exists at no path in any tree. It used
+        // to be rejected with "`path` names no path".
+        // `Fail` is deliberately not `Debug` (it carries a message for the
+        // model, not for a panic), so these read through `ok()`.
+        for blank in [".", "", "  ", "/", "./", "././", "/."] {
+            let call = json!({"input": {"path": blank}});
+            assert_eq!(
+                components_opt(&call, "path").ok(),
+                Some(Vec::new()),
+                "{blank:?} should be the root"
+            );
+        }
+        assert_eq!(
+            components_opt(&json!({"input": {}}), "path").ok(),
+            Some(Vec::new())
+        );
+        // A REQUIRED path stays required: `write` cannot target a root.
+        assert!(components(&json!({"input": {"path": "."}}), "path").is_err());
+        assert_eq!(
+            components(&json!({"input": {"path": "/a/./b"}}), "path").ok(),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // `..` is refused whichever way in.
+        let up = json!({"input": {"path": "a/../b"}});
+        assert!(components_opt(&up, "path").is_err());
+        assert!(components(&up, "path").is_err());
+    }
+
+    #[test]
+    fn eval_path_is_declared_with_both_arguments_optional() {
+        // Not inline: a worker cannot evaluate, so the answer comes from a
+        // server-side walk the step tail-calls.
+        assert!(!is_inline(EVAL_PATH));
+        let declared = declarations()
+            .into_iter()
+            .find(|d| d["name"] == EVAL_PATH)
+            .expect("eval_path is offered");
+        // Nothing is required: no path is the root, and no root is the
+        // conversation tree.
+        assert!(declared["input_schema"].get("required").is_none());
+        for param in ["path", "root"] {
+            assert!(declared["input_schema"]["properties"][param]["type"] == "string");
+        }
+    }
+
+    #[test]
+    fn eval_path_report_names_the_kind_and_where_the_hash_goes() {
+        let tree = eval_path_report("tree", "c0ffee");
+        assert!(tree.starts_with("tree c0ffee\n"));
+        assert!(tree.contains("root=c0ffee"));
+        // A blob has nothing to list and no file within it.
+        let blob = eval_path_report("blob", "dec0de");
+        assert!(blob.starts_with("blob dec0de\n"));
+        assert!(blob.contains("no file-path"));
     }
 
     #[test]
