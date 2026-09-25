@@ -15,11 +15,7 @@
 ../git-runner git-runner
 ../llm-client llm-client
 ../../rust/crates/conversation-protocol conversation-protocol
-../bash-tool bash-tool
 ../rgrep rgrep
 ../merge merge
-../caos-build caos-build
-../caos-test caos-test
-../caos-test-result caos-test-result
 ../run-and-update-ref run-and-update-ref
 ../../rust/crates/git-locator git-locator

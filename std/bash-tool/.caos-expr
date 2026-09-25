@@ -27,6 +27,7 @@ editable.
 @param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root.
 @param {array} [paths] Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees.
 @writer
+@in
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=.
 curry --base=$IMAGE --help=$HELP

@@ -14,12 +14,8 @@
 # already knows its tools — it never has to name bash-tool, rgrep, merge,
 # caos-build, caos-test or caos-test-result, which are llm-step's dependencies
 # and not the caller's business.
-BASH_TOOL=curry --base:@=DEEP-DEPS/bash-tool
 GREP=curry --base:@=DEEP-DEPS/rgrep
 MERGE=curry --base:@=DEEP-DEPS/merge
-CAOS_BUILD=curry --base:@=DEEP-DEPS/caos-build
-CAOS_TEST=curry --base:@=DEEP-DEPS/caos-test
-CAOS_TEST_RESULT=curry --base:@=DEEP-DEPS/caos-test-result
 ASYNC_WORKER=curry --base:@=DEEP-DEPS/run-and-update-ref
 STEP=run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/llm-client --dep1:@=DEEP-DEPS/conversation-protocol --dep2:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
-curry --base=$STEP --bash-image=$BASH_TOOL --grep-image=$GREP --merge-image=$MERGE --caos-build-image=$CAOS_BUILD --caos-test-image=$CAOS_TEST --caos-test-result-image=$CAOS_TEST_RESULT --run-and-update-ref-image=$ASYNC_WORKER
+curry --base=$STEP --grep-image=$GREP --merge-image=$MERGE --run-and-update-ref-image=$ASYNC_WORKER

@@ -9,11 +9,11 @@
 # untouched placeholder subtrees intact by hash; a failing command is a VALUE
 # ({exit, stdout, stderr, tree}), never a run error; and the exec bit survives.
 #
-# THE REQUEST IS A BUNDLE, which is the worker's OWN preferred shape rather than
-# an accommodation: std/bash-tool reads `{tree, cmd, paths}` out of `--in` when
-# it has one and falls back to three loose args only when it does not — "how a
-# run-then sub-run passes it", says the comment there. This IS a run-then
-# sub-run, so it takes the first branch.
+# THE TREE IS `in`. Every arg is loose under /cas/args -- `cmd`, `paths` -- and
+# the tree the command runs over is `in`, which is the one name the interpreter
+# binds on a tool run and therefore the only one a caller can redirect (`@in` in
+# the tool's help). A tool reached at `caos-std/bash-tool` sits in a tree that is
+# never the tree a caller means, so it has to be nameable.
 #
 # SIX STAGES: a run cannot be waited on, so each assertion is the `then` of the
 # run it is about. Trees are compared by OID — a caos object hash IS a git
@@ -30,23 +30,30 @@ next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
 
 ws_oid() { caos hash /cas/args/ws; }
 
-# `{tree, cmd, paths}`, published so it can be a run's subject.
-req() { # <cmd> [paths] -> a /cas path
-  rm -rf /tmp/req && mkdir -p /tmp/req
-  caos get -r /cas/args/ws || fail "reading the fixture"
-  cp -rL /cas/args/ws /tmp/req/tree && chmod -R u+w /tmp/req/tree
-  printf '%s' "$1" > /tmp/req/cmd
-  if [ $# -ge 2 ]; then printf '%s\n' "$2" > /tmp/req/paths; fi
-  caos put /tmp/req /cas/req || fail "publishing the request"
-  echo /cas/req
+# The request the tool runs from: `in` (the tree) plus its parameters.
+req() { # <cmd> [paths] -> a request hash
+  # THE TREE IS `in`, beside `cmd` and `paths` -- the shape every tool with `@in`
+  # has, and the reason it is `in` rather than a name of its own: `in` is what the
+  # interpreter binds on a tool run, so naming it is what lets a caller redirect
+  # the tree (llm-step's RESERVED_ARGS, and `@in` in this tool's help).
+  #
+  # `prepare-request` + `run-request-then` rather than `run-then`, because
+  # `run-then` INVENTS an `--in` around the tree it is given -- which is how the
+  # envelope `{tree, cmd, paths}` this used to build arrived at `in` in the first
+  # place, and would now shadow the tree.
+  local paths=()
+  if [ $# -ge 2 ]; then paths=(--paths="$2"); fi
+  caos prepare-request --base:hash="$(caos hash /cas/args/tool)" \
+    --in:@=/cas/args/ws --cmd="$1" "${paths[@]}" \
+    || fail "forming the request"
 }
 
 case "$stage" in
 
 start)
   echo "== targeted read: declared path only; source_tree round-trips by hash ==" >&2
-  caos run-then "$(req 'cat a/one.txt' 'a/one.txt')" \
-    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next read)"
+  caos run-request-then "$(req 'cat a/one.txt' 'a/one.txt')" \
+    --then:hash="$(next read)"
   ;;
 
 read)
@@ -59,8 +66,8 @@ read)
   echo "  ok: read its file; tree unchanged (identical hash)" >&2
 
   echo "== undeclared touch: EACCES + structured retry hint ==" >&2
-  caos run-then "$(req 'cat a/b/two.txt' 'top.txt')" \
-    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next denied)"
+  caos run-request-then "$(req 'cat a/b/two.txt' 'top.txt')" \
+    --then:hash="$(next denied)"
   ;;
 
 denied)
@@ -72,8 +79,8 @@ denied)
   echo "  ok: EACCES surfaced, denied names a/b/two.txt" >&2
 
   echo "== writes staged back; untouched placeholder subtree intact by hash ==" >&2
-  caos run-then "$(req 'echo hi > new.txt && echo edited >> a/one.txt' 'a/one.txt')" \
-    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next write)"
+  caos run-request-then "$(req 'echo hi > new.txt && echo edited >> a/one.txt' 'a/one.txt')" \
+    --then:hash="$(next write)"
   ;;
 
 write)
@@ -88,8 +95,8 @@ write)
   echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
 
   echo "== a failing command is a value, not a run error ==" >&2
-  caos run-then "$(req 'echo oops >&2; exit 7')" \
-    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next failed)"
+  caos run-request-then "$(req 'echo oops >&2; exit 7')" \
+    --then:hash="$(next failed)"
   ;;
 
 failed)
@@ -103,8 +110,8 @@ failed)
   echo "  ok: exit 7 + stderr returned as a value" >&2
 
   echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
-  caos run-then "$(req './run.sh' 'run.sh')" \
-    --run:hash="$(caos hash /cas/args/tool)" --then:hash="$(next execbit)"
+  caos run-request-then "$(req './run.sh' 'run.sh')" \
+    --then:hash="$(next execbit)"
   ;;
 
 execbit)

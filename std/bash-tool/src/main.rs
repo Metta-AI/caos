@@ -21,20 +21,28 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    // Locate the input: an `in` tree ({tree, cmd, paths} — how a run-then
-    // sub-run passes it), or the three direct args under /cas/args.
-    let base = if Path::new(&arg("in")).exists() {
-        caos(["get", &arg("in")])?;
-        arg("in")
-    } else {
-        ARGS.to_string()
-    };
+    // THE TREE IS `in`, and its parameters are ordinary args beside it.
+    //
+    // `in` is the one arg name the interpreter binds on every tool run
+    // (`RESERVED_ARGS` in llm-step), and declaring `@in` is how a tool asks for
+    // it AS A PARAMETER — which is what lets a caller redirect it. That matters
+    // here: this tool is reached at `caos-std/bash-tool`, a path in the
+    // conversation's own evaluated tree, so the tree it SITS in is never the
+    // tree a caller means. Without `in` naming the tree there is no way to say
+    // which.
+    //
+    // It used to be an ENVELOPE — `in` holding `{tree, cmd, paths}` — built by
+    // the step's own bash arm, back when the step registered this tool and bound
+    // its input itself. Nothing builds that now.
+    let tree = arg("in");
+    if !Path::new(&tree).exists() {
+        return Err(format!(
+            "no input tree at {tree}: bash-tool runs over the tree bound as `in`"
+        ));
+    }
+    let base = ARGS.to_string();
     let cmd = read_blob(&format!("{base}/cmd"))?;
     let paths = read_paths(&format!("{base}/paths"))?;
-    let tree = format!("{base}/tree");
-    if !Path::new(&tree).exists() {
-        return Err(format!("no source tree at {tree}"));
-    }
     let work = scratch("work")?;
     worker_common::files::materialize(&tree, &work, &paths)?;
     let cwd = if Path::new(&format!("{base}/cwd")).exists() {

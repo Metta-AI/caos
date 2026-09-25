@@ -40,11 +40,6 @@ const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
 const MAX_SPINE_WALK: usize = 4096;
 static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
-const STD_TOOLS: [(&str, &str); 3] = [
-    ("caos-build", "caos-build-image"),
-    ("caos-test", "caos-test-image"),
-    ("caos-test-result", "caos-test-result-image"),
-];
 
 fn main() -> std::process::ExitCode {
     timing::start();
@@ -57,10 +52,8 @@ fn main() -> std::process::ExitCode {
 struct Config {
     api_key: String,
     system: String,
-    bash_image: String,
     grep_image: Option<String>,
     merge_image: Option<String>,
-    std_tool_images: BTreeMap<&'static str, Option<String>>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
     /// do not terminate the request.
@@ -121,13 +114,8 @@ impl Config {
                 true => read_arg("system")?,
                 false => String::new(),
             },
-            bash_image: image_arg("bash-image")?.ok_or("--bash-image is required")?,
             grep_image: image_arg("grep-image")?,
             merge_image: image_arg("merge-image")?,
-            std_tool_images: STD_TOOLS
-                .iter()
-                .map(|&(name, argument)| Ok((name, image_arg(argument)?)))
-                .collect::<Result<_, String>>()?,
             run_and_update_ref_image,
             tools_only,
             list_tools,
@@ -1336,7 +1324,6 @@ fn prepare_compute(
 ) -> Result<Prepared, String> {
     let clean = call_without_source_tree(call);
     match call.name.as_str() {
-        "bash" => prepare_bash(cfg, &clean, ws),
         "run_tool" | "tool_help" => {
             let relative = clean["input"]["path"].as_str().unwrap_or("");
             let me = self_curry(
@@ -1368,9 +1355,6 @@ fn prepare_compute(
         }
         "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
-        name if std_tool_image(cfg, name).is_some() => {
-            prepare_std_tool(cfg, &clean, name, ws, conversation)
-        }
         name => Ok(Prepared::Result(error_block(
             &call.id,
             &format!("unavailable tool {name:?}; use run_tool with its conversation-relative path"),
@@ -1378,45 +1362,6 @@ fn prepare_compute(
     }
 }
 
-fn prepare_bash(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
-    let Some(cmd) = call["input"]["cmd"].as_str() else {
-        return Ok(Prepared::Result(error_block(
-            call["id"].as_str().unwrap_or(""),
-            "bash call has no string `cmd`",
-        )));
-    };
-    let paths: Vec<&str> = match &call["input"]["paths"] {
-        Value::Null => Vec::new(),
-        Value::Array(items) => match items.iter().map(Value::as_str).collect::<Option<Vec<_>>>() {
-            Some(paths) => paths,
-            None => {
-                return Ok(Prepared::Result(error_block(
-                    call["id"].as_str().unwrap_or(""),
-                    "bash call `paths` has a non-string entry",
-                )))
-            }
-        },
-        _ => {
-            return Ok(Prepared::Result(error_block(
-                call["id"].as_str().unwrap_or(""),
-                "bash call `paths` is not an array",
-            )))
-        }
-    };
-    let dir = scratch("toolin")?;
-    link(ws, dir.join("tree"))?;
-    if let Some(cwd) = call["input"].get("cwd").and_then(Value::as_str) {
-        fs::write(dir.join("cwd"), cwd).map_err(|error| format!("writing cwd: {error}"))?;
-    }
-    fs::write(dir.join("cmd"), cmd).map_err(|error| format!("writing cmd: {error}"))?;
-    fs::write(dir.join("paths"), paths.join("\n"))
-        .map_err(|error| format!("writing paths: {error}"))?;
-    let input = fresh("toolin");
-    caos(["put", path(&dir), &input])?;
-    // bash's `in` is the ENVELOPE built just above -- {tree, cmd, cwd, paths} --
-    // not the tree it was run on, which is why its help declares no `@in`.
-    prepared_request(&cfg.bash_image, &[], Some(&input))
-}
 
 fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepared, String> {
     let theirs = match resolve_theirs(cfg, call) {
@@ -1451,29 +1396,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     prepared_request(&curried, &[], Some(&scope))
 }
 
-fn prepare_std_tool(
-    cfg: &Config,
-    call: &Value,
-    name: &str,
-    ws: &str,
-    conversation: &str,
-) -> Result<Prepared, String> {
-    let (image, arg_name) = std_tool_image(cfg, name).ok_or("std tool image is absent")?;
-    let tool = tools::std_tool(name, &arg(arg_name))?
-        .ok_or_else(|| format!("{name} image carries no help"))?;
-    let bound = match tools::tree_tool_args(call, &tool, Some(conversation)) {
-        Ok(bound) => bound,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    let ready: Vec<(String, tools::ReadyArg)> = bound
-        .iter()
-        .map(|(name, value)| Ok((name.clone(), value.ready()?)))
-        .collect::<Result<_, String>>()?;
-    let (args, input) = split_input(&ready, tool.wants_in, ws);
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    let task = prepare_request(Arg::Hash(&curried), &input)?;
-    Ok(Prepared::Task(Oid::parse(&task, "std tool task")?))
-}
 
 /// Form the runnable request. `input` is bound as `in` when there is one, and
 /// there is one only when the tool asked for it — the tree is the biggest thing
@@ -3131,6 +3053,17 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(tools::grep_declaration());
     }
+    // MERGE IS THE EXCEPTION, and the reason is what its target is. Every other
+    // std tool reads a TREE, which `@in` lets a caller name; merge writes a
+    // merge commit into a source tree and so needs that tree's COMMIT (`ours`,
+    // from `wc`). Nothing but the step's own routing supplies one, and
+    // `run_tool` takes no source tree — so merge cannot yet be reached by path,
+    // and until it can, registering it is the only way to have it at all.
+    if cfg.merge_image.is_some() {
+        if let Some(tool) = tools::std_tool("merge", &arg("merge-image"))? {
+            registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
+        }
+    }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
     registry.push(json!({
         "name":"run_tool",
@@ -3188,15 +3121,6 @@ fn with_source_tree(mut declaration: Value) -> Value {
     declaration
 }
 
-fn std_tool_image<'a>(cfg: &'a Config, name: &str) -> Option<(&'a str, &'static str)> {
-    let arg_name = STD_TOOLS
-        .iter()
-        .find_map(|&(tool, argument)| (tool == name).then_some(argument))?;
-    cfg.std_tool_images
-        .get(name)?
-        .as_deref()
-        .map(|image| (image, arg_name))
-}
 
 fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
     let id = call["id"].as_str().unwrap_or("");
