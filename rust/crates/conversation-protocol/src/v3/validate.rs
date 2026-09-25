@@ -304,10 +304,14 @@ fn reconstruct(
                 paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
             Ok(Transition::ToolComplete {
                 payloads: payload_changes(kind, child_snapshot, changes, &payload_dir)?,
-                files: file_changes(child_snapshot, changes)?
-                    .into_iter()
-                    .filter(|(path, _)| record.files.contains(path))
-                    .collect(),
+                // A recorded edit can replace a whole directory. The tree diff
+                // expands directories into leaves, so reconstruct at the recorded
+                // paths instead; reapplication below still checks the whole tree.
+                files: recorded_file_changes(
+                    parent_snapshot.expect("non-root parent checked above"),
+                    child_snapshot,
+                    &record.files,
+                )?,
                 record,
             })
         }
@@ -537,6 +541,35 @@ fn payload_changes(
             Ok((name, bytes))
         })
         .collect()
+}
+
+fn recorded_file_changes(
+    parent: &Conversation<'_>,
+    child: &Conversation<'_>,
+    paths: &[String],
+) -> Result<FileChanges, String> {
+    let changes = paths
+        .iter()
+        .map(|path| {
+            let before = parent
+                .snapshot()
+                .entry(path)?
+                .map(|entry| (entry.mode, entry.oid));
+            let after = child
+                .snapshot()
+                .entry(path)?
+                .map(|entry| (entry.mode, entry.oid));
+            if before == after {
+                return Err(format!("recorded tool file {path:?} did not change"));
+            }
+            Ok(Change {
+                path: path.clone(),
+                before,
+                after,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    file_changes(child, &changes)
 }
 
 fn file_changes(child: &Conversation<'_>, changes: &[Change]) -> Result<FileChanges, String> {
