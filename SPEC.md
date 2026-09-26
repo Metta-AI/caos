@@ -739,33 +739,15 @@ limits of commit-based fetch negotiation.
 
 ## `merge --theirs=<commit>`
 
-- Takes exactly one commit arg (`theirs`). The other side (`ours`) is the
-  selected source tree commit at dispatch, including earlier accepted edits.
-- The merge is index-free and worktree-free: `git merge-tree --write-tree
-  <ours> <theirs>` is a pure `(commit, commit) -> (tree, conflict report)`,
-  which memoizes like any other job and needs no materialized working copy
-  (the harness forbids one). The merge base is `merge-base(ours, theirs)`,
-  which `merge-tree` derives from the commit graph.
-- It runs the real `git` binary in its own worker. `.caos/conflicts`
-  and the inline markers are straight from git's own output (below), so we want
-  `merge-tree`'s exact notation, not a reimplementation. gix is a dependency
-  but carries no merge (`gix-merge` is not pulled in), and its output would not
-  match git's notation anyway. So `merge` is a decomposed compute tool like
-  `bash`/`build`/`test`; the file tools (`read`/`ls`/`write`/`edit`) are in-process.
-- Its image is a small git worker — a `std/merge` flake
-  (`nixpkgs.gitMinimal`) run as `curry(std/runner, worker1=<merge script>)`,
-  the same flake-image pattern as `std/bash`. Not `std/cargo` (which has git
-  but is a heavy image and the wrong home) and not folded into the bash-tool
-  image (whose surface stays minimal). The script reconstructs a git odb from
-  the `ours`/`theirs` commit closures in `/cas` (a merge is inherently a
-  both-whole-trees op — the one place laziness can't help), runs `merge-tree`,
-  writes `.caos/conflicts`, and `put-commit`s the two-parent commit as its
-  result.
-- Clean merge → `M`'s tree is the merged source tree and the merge is done.
-- Conflicts → `M`'s tree carries inline conflict markers in the text files
-  (what the agent edits), plus a reserved `.caos/conflicts` file (below). The
-  agent resolves over subsequent turns; each resolution is an ordinary
-  mutation commit on top of `M`.
+The source merge worker passes the selected source commit and `theirs` to
+`POST /git/merge-tree`. With two commits the endpoint lets Git find their merge
+base; with an explicit base it accepts three tree ids. Both use the same
+`git merge-tree --write-tree` implementation in the server's existing bare
+repository, returning the merged tree and native conflict report.
+
+The source merge worker creates the two-parent result commit. On conflict it
+adds Git's report at `.caos/conflicts`; a clean merge keeps the returned tree.
+It reads individual objects and does not clone or check out the source tree.
 
 ## Resolving `--theirs`
 
