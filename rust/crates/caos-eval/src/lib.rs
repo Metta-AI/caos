@@ -80,7 +80,7 @@ pub const EXPR_VAR: &str = "CAOS_EXPR";
 ///
 /// This is the ONE arg-type vocabulary, shared by the CLI/worker arg builder,
 /// the map-then image args, and the `.caos-expr` evaluator
-/// (`resolve_expr_args`), so all of them accept exactly the same types and
+/// (`eval_expr_args`), so all of them accept exactly the same types and
 /// emit the same errors. A resolver may still support only a subset, but they
 /// all *parse* through [`parse_arg`]. The grammar is extensible: a new type adds
 /// a variant here, a case in [`parse_arg`], and an arm in each resolver.
@@ -596,8 +596,8 @@ fn eval_command(
     }
     let (bty, bval) =
         base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
-    let image_ref = resolve_expr_base(host, input_tree, bty, bval, env)?;
-    let entries = resolve_expr_args(host, input_tree, &arg_toks, env)?;
+    let image_ref = eval_expr_base(host, input_tree, bty, bval, env)?;
+    let entries = eval_expr_args(host, input_tree, &arg_toks, env)?;
 
     if verb == "curry" {
         // Mark the returned arg tree, so a caller that embeds it is per-user too
@@ -617,7 +617,7 @@ fn eval_command(
 /// `:docker=<ref>` (a registry image), or `:hash=<oid>` (an object already in
 /// the store). A path is the only way to name another tree in THIS repo — there
 /// is no by-name lookup, so an expression reaches only what its own tree holds.
-fn resolve_expr_base(
+fn eval_expr_base(
     host: &dyn EvalHost,
     input_tree: &str,
     ty: ArgType,
@@ -625,7 +625,7 @@ fn resolve_expr_base(
     env: &HashMap<String, (String, String)>,
 ) -> Result<String, String> {
     // A `$VAR` base names an object a prior assignment produced, whatever its
-    // declared type — matched first, exactly as `resolve_expr_args` does.
+    // declared type — matched first, exactly as `eval_expr_args` does.
     if let Some(var) = value.strip_prefix('$') {
         let (kind, oid) = env
             .get(var)
@@ -702,7 +702,7 @@ fn resolve_expr_base(
 /// directory), a `:@@=` locator, a `:docker=` ref, or a `:hash=` object already
 /// in the store. (The reserved `base` arg is pulled out by [`eval_command`]
 /// before this.)
-fn resolve_expr_args(
+fn eval_expr_args(
     host: &dyn EvalHost,
     input_tree: &str,
     toks: &[&str],
@@ -724,7 +724,7 @@ fn resolve_expr_args(
                     EntryKind::Blob.into(),
                     host.post_object("blob", value.as_bytes())?,
                 ),
-                ArgType::Path => resolve_expr_path(host, input_tree, value)?,
+                ArgType::Path => eval_expr_path(host, input_tree, value)?,
                 // `:@@=<ref>` — a tree from ANOTHER repo. The client's resolver
                 // descends `dir=` through evaluation, so this is already the
                 // same rule `:@=` applies (an expression is evaluated, data is
@@ -773,7 +773,7 @@ fn resolve_expr_args(
 /// under a marked arg tree. Marking *here* would be wrong: an expression may be
 /// `run`-valued, and folding a `secret-hash` entry into a *data* tree would
 /// corrupt it.
-fn resolve_expr_path(
+fn eval_expr_path(
     host: &dyn EvalHost,
     input_tree: &str,
     value: &str,
@@ -787,7 +787,7 @@ fn resolve_expr_path(
 /// carrying a `.caos-expr` is an expression and is evaluated; anything else — a
 /// blob, or a tree without one — is data and is referenced raw.
 ///
-/// Shared by `:@=` (`resolve_expr_path`) and the client's `:@@=` resolver, so
+/// Shared by `:@=` (`eval_expr_path`) and the client's `:@@=` resolver, so
 /// where the tree CAME FROM makes no difference to what naming it means.
 pub fn eval_if_evaluable(
     host: &dyn EvalHost,

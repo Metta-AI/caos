@@ -202,7 +202,7 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
     // The caller's secret store, resolved once — so eval-path marks the `curry`
     // arg trees it returns, giving their callers per-user isolation, and carries
     // the store to any `run` it dispatches (design/secrets.md). A `:@=` target is
-    // NOT marked; see `caos_eval`'s `resolve_expr_path`.
+    // NOT marked; see `caos_eval`'s `eval_expr_path`.
     let store = build_secret_store(t)?;
     let (kind, hash) = eval_path(t, &start, path, &store)?;
     println!("{kind} {hash}");

@@ -137,7 +137,7 @@ these scripts but a four-minute cloud round trip.
 ### Done, but only after a detour worth recording
 
 The first attempt refused this, on a reading that was correct about the code and
-wrong about what to do. `resolve_cli_image_with_store` resolves a
+wrong about what to do. `eval_cli_image_with_store` resolves a
 `--llm-step:@=<path>` by `t.ingest_path(".")` — the tracked working tree, dirty
 edits included — and nothing about `mcp serve`'s `--base` reaches that walk. So
 the seed commit decided what the CONVERSATION recorded while the worktree decided

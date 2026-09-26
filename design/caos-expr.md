@@ -379,7 +379,7 @@ meantime, *this* project reaches std through deep-deps (`DEEP-DEPS/x`).
   resolve `/cas/std/bash-tool` instead. (One gotcha for future migrations: a std
   entry passed to a *worker* as an image ref — e.g. llm-step's `--bash-image` —
   must be **resolved to a built hash first** (`curry /cas/std/X --` in the caller,
-  or `resolve_cli_image` in `crates/caos/src/lib.rs`); a worker handed the raw `/cas/std/X` path
+  or `eval_cli_image` in `crates/caos/src/lib.rs`); a worker handed the raw `/cas/std/X` path
   resolves it to the source entry, not the built image.)
 - **Still binary-staged** (`stage_worker`): `llm-call`, `llm-step`, `deep-deps`.
   `llm-call`/`llm-step` await step 2 (they carry crates.io deps + `llm-client`);
@@ -552,7 +552,7 @@ No `refs/caos/std`, no `/cas/std/<name>`, no `std` arg. Each piece, and the rule
 it turned on:
 
 - **Clients resolve by descent.** An image is a PATH IN THE EVALUATED TREE, and
-  `resolve_cli_image` walks it from the root — so `--base:@=std/hello` works
+  `eval_cli_image` walks it from the root — so `--base:@=std/hello` works
   from this checkout with nothing declared, and a directory that needs another
   one reaches it through its own `DEPS`/`DEEP-DEPS/<name>`. Evaluating is not
   optional: a std entry's expression names its deps by mount (`run

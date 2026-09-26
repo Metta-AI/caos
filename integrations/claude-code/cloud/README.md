@@ -231,7 +231,7 @@ repoints the checkout's `.caos-expr` and `flake.lock` at
 `git+caos://…?rev=<dev>`, so the tools resolve from there too.
 
 **The WORKING TREE is rewritten, not only the conversation's seed**, and that is
-measured rather than preferred: `resolve_cli_image_with_store` ingests `"."`, so
+measured rather than preferred: `eval_cli_image_with_store` ingests `"."`, so
 the tool server's `--llm-step:@=<std>/llm-step` resolves against the checkout on
 disk and not against the `--base` the conversation seeds from. Rewriting only the
 seed commit would install a dev client that then evaluated the *committed* tools.

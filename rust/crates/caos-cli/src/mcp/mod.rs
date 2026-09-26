@@ -46,8 +46,8 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, fetch_validated_head, mint_transition, oid, open_store,
-    push_cas, resolve_base, resolve_username, seed_content, signature, update_local_cache,
+    conversation_ref, default_title, eval_base, fetch_validated_head, mint_transition, oid,
+    open_store, push_cas, resolve_username, seed_content, signature, update_local_cache,
     TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
@@ -82,7 +82,7 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
         // `--base=<full sha>` SEEDS THE CONVERSATION from a commit other than
         // HEAD, which is what dev mode needs: `setup.sh` rewrites the
         // checkout's `.caos-expr` to point at the dev stack, but the
-        // conversation's CONTENT comes from `resolve_base`, which without this
+        // conversation's CONTENT comes from `eval_base`, which without this
         // is unconditionally `HEAD` -- so the rewrite reached the checkout and
         // not the tree the session evaluates. Measured: a session ran the dev
         // client and dev step while every `caos-std/<entry>` still resolved
@@ -713,8 +713,8 @@ fn root_commit(
     signature: &Signature,
 ) -> Result<Oid, String> {
     let phase = std::time::Instant::now();
-    let base = oid(&resolve_base(t, options)?, "conversation base")?;
-    cc_timing("resolve_base", phase.elapsed());
+    let base = oid(&eval_base(t, options)?, "conversation base")?;
+    cc_timing("eval_base", phase.elapsed());
     let phase = std::time::Instant::now();
     // The client repo's own tree becomes the conversation's content, at the
     // root -- the same `seed_content` the tui uses, so a recorded session and a

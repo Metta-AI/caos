@@ -20,9 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use caos::{
-    build_secret_store, compute_client_request_with_store, curry_client_object,
-    prepare_client_request_with_store, resolve_cli_image_arg, run_client_request_with_store,
-    ClientSecret, GitTransport, Transport, CAOS_REMOTE,
+    build_secret_store, compute_client_request_with_store, curry_client_object, eval_cli_image_arg,
+    prepare_client_request_with_store, run_client_request_with_store, ClientSecret, GitTransport,
+    Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
     apply, client_signature, inherited_signature, mint, Transition,
@@ -82,7 +82,7 @@ pub struct TurnOptions {
     /// Explicit content imports. Absent or empty starts without code.
     pub initial_content: Option<String>,
     /// The `--llm-step:<type>=<value>` argument, verbatim — resolved lazily by
-    /// [`resolve_cli_image_arg`], so a broken locator is reported where it is
+    /// [`eval_cli_image_arg`], so a broken locator is reported where it is
     /// used rather than at parse time.
     pub llm_step: Option<String>,
     /// The `--llm-call:<type>=<value>` argument, verbatim (title generation).
@@ -123,7 +123,7 @@ fn resolve_image_arg(
     store: &[ClientSecret],
 ) -> Result<String, String> {
     let argument = argument.ok_or_else(|| missing_image_arg(name))?;
-    resolve_cli_image_arg(t, argument, store).map_err(|error| format!("--{name}: {error}"))
+    eval_cli_image_arg(t, argument, store).map_err(|error| format!("--{name}: {error}"))
 }
 
 /// What to tell someone who did not pass `--<name>`. Both spellings, because
@@ -2966,7 +2966,7 @@ pub fn describe_tool_set(
                 store.ensure_local(&commit)?;
                 commit.to_string()
             }
-            None => resolve_base(t, options)?,
+            None => eval_base(t, options)?,
         }
     };
     let source = format!("{source_commit}:caos-tools");
@@ -3067,7 +3067,7 @@ fn tool_call_summary(name: &str, args: &Value) -> String {
     }
 }
 
-fn resolve_base(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
+fn eval_base(t: &GitTransport, options: &TurnOptions) -> Result<String, String> {
     let rev = options.base.as_deref().unwrap_or("HEAD");
     t.resolve_revspec(rev)?
         .map(|object| object.to_string())

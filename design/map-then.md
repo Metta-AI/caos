@@ -42,7 +42,7 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 **Grammar note (flake-inputs 2C).** `<in>` stays positional — it is the DATA the
 continuation is over, not an image — and every image position is a typed arg
 (`:@=` a `/cas` path, `:docker=` a registry ref, `:hash=` an object in the
-store), resolved by the same `resolve_base` a `--base` goes through. There is no
+store), resolved by the same `eval_base` a `--base` goes through. There is no
 `--` separator: nothing needs separating once the verb's own operands are
 reserved NAMES rather than a region.
 

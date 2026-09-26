@@ -106,14 +106,16 @@ Every script here runs with it, and two constructs quietly break under it.
   which it never could before. The one casualty is `path:`, which names a live
   directory on the machine that WROTE the expression and is refused by name.
 - **`resolve_` is a LOOKUP that cannot evaluate; `eval_` may build things.**
-  Both senses were in this tree at once and it misleads: `gitlinks::resolve`
-  (the worker's `caos resolve`) is a raw tree walk, but `resolve_remote_arg`
-  fetched a repo and ran rustc. Reading one name as the other is how you
-  conclude a locator is a path lookup. `eval_remote_arg` and `GET /eval` say
-  what they do; `gitlinks::resolve` and `locator::resolve_root` (rev → tree,
-  nothing more) keep the word because they satisfy it. **Still inconsistent:**
-  `resolve_base`, `resolve_cli_image*` and `resolve_expr_*` all evaluate and
-  have not been renamed yet.
+  Both senses were in this tree at once and it misleads. `gitlinks::resolve`
+  (the worker's `caos resolve`) is a raw tree walk — but the function then
+  called `resolve_remote_arg` fetched a repository and ran rustc, and reading
+  the second name in the first sense is how you conclude that following a
+  locator is a path lookup. That is a real report, not a hypothetical.
+  Everything that evaluates now says so: `eval_remote_arg`, `eval_base`,
+  `eval_cli_image*`, `eval_expr_*`, and `GET /eval`. Only two keep the word,
+  because they earn it: `gitlinks::resolve`, and `locator::resolve_root`
+  (rev → tree, nothing more). **Check the rule before adding a `resolve_`** —
+  if it can dispatch a run, it is an `eval_`.
 - **Where "no network" is true it is a BUILD-level choice.** `std/cargo` builds
   `--offline` against a vendored registry (`std/cargo/bake.nix`,
   `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor

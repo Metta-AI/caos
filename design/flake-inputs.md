@@ -101,7 +101,7 @@ for "where a tree comes from," and it already covers remote-pinned and local.
 
 One parser, one `ArgType` enum, shared by the CLI (`crates/caos/src/lib.rs`,
 `parse_arg`) and the `.caos-expr` evaluator (`crates/caos/src/eval.rs`,
-`resolve_expr_args`). **Stage 1 already unified them**; the enum is now
+`eval_expr_args`). **Stage 1 already unified them**; the enum is now
 `ArgType { Literal, Path, Remote, Commit, Hash, Docker }` — `Hash` the rename
 of/over stage 1's `Tree`, `Docker` and `Hash` added by 2B, `Remote` (`:@@=`) by
 stage 4.
@@ -186,8 +186,8 @@ section describes is the shape, which did not change:
   commit to its tree, descend `dir=`.
 - **Wired in three places, each behaving like its `:@=` sibling** — that is the
   whole rule, so where a tree came from never changes what naming it means:
-  `build_arg_entries` (a plain arg → the oid), `resolve_base` (an image → the
-  oid, then evaluated), and `resolve_expr_args`/`resolve_expr_base` in the
+  `build_arg_entries` (a plain arg → the oid), `eval_base` (an image → the
+  oid, then evaluated), and `eval_expr_args`/`eval_expr_base` in the
   evaluator (evaluated if it carries a `.caos-expr`, raw if not — the
   worker-vs-data rule, factored out as `eval_if_evaluable` and shared).
 - **A rev is a pin, so re-resolving is free.** The fetch returns early when the
@@ -217,7 +217,7 @@ become an oid before the request carrying it is formed. Otherwise the URL sits
 inside content-addressing and two consumers pinning one rev through a fork, a
 mirror, or ssh-vs-https key identical content differently. That is still true,
 and the server resolves at the same point in the same walk — `caos_eval`'s
-`EvalHost::resolve_remote`, called while the args tree is being assembled.
+`EvalHost::eval_remote`, called while the args tree is being assembled.
 
 **What broke it:** the agent. A conversation's tree is evaluated SERVER-SIDE
 (`eval-path-then`, the `eval` continuation), and a session now starts from a
@@ -252,8 +252,14 @@ the defect: `resolve` elsewhere in this tree means a RAW lookup that cannot
 evaluate (`gitlinks::resolve`, `locator::resolve_root`), while `/eval-locator`
 took no locator at all — it was named after its caller. Typing the root says
 what both were for, in the vocabulary `--base:hash=`/`--base:@@=` already uses.
+
 The rule worth keeping: **`resolve_` is a lookup that cannot evaluate; `eval_`
-may build things.**
+may build things.** A second pass applied it to the functions, so names in
+this file's older stage logs may read anachronistically: `resolve_remote_arg`,
+`resolve_base{,_with_store}`, `resolve_cli_image{,_arg,_with_store}` and
+`resolve_expr_{base,args,path}` are now `eval_*`. Only `gitlinks::resolve` and
+`locator::resolve_root` keep the word, because a raw walk and `rev → tree` are
+what it should mean.
 
 **The casualty is `path:`**, which names a live directory on the machine that
 wrote the expression. Nothing resolves one; it is refused by name, because the
@@ -283,9 +289,9 @@ the outer stack kept answering. What changed:
   *or* blob by oid) and new `:docker=` (stores blob `docker://<ref>`). Wired in
   `build_arg_entries` (CLI/worker args) and the evaluator.
 - **Evaluator** (`eval.rs`): `eval_command` scans tokens for `--base` (no
-  positional, no `--`); `resolve_expr_image` → `resolve_expr_base`, dispatched on
+  positional, no `--`); `resolve_expr_image` → `eval_expr_base`, dispatched on
   the explicit `ArgType` (docker/hash/path/`$VAR`) — **no sniffing here anymore**.
-  `resolve_expr_args` handles `:docker=`/`:hash=`. Module grammar doc updated.
+  `eval_expr_args` handles `:docker=`/`:hash=`. Module grammar doc updated.
 - **Migrated every `.caos-expr`**: all 14 committed (`run <IMG> -- …` →
   `run --base:@=<path>|:docker=<sentinel> …`, incl. the multi-line `llm-step`
   curry/variable form), **plus the runtime-generated fixtures** in
@@ -294,7 +300,7 @@ the outer stack kept answering. What changed:
   new evaluator rejects them: `argument must look like --name=value, got: bash`).
 
 Deliberately left untouched at the time (isolated, hence low-risk): the
-CLI/worker sniffers `resolve_run_image`/`resolve_cli_image`, so
+CLI/worker sniffers `resolve_run_image`/`eval_cli_image`, so
 `caos-cli run <dir>` and `caos curry <img>` still used positional grammar.
 That was stage 2C, now done.
 
@@ -365,11 +371,11 @@ the last remnant of positional thinking. Consequences worth knowing:
 ### What changed
 
 - **`split_base_arg`** (`lib.rs`) pulls the reserved `--base` out of any verb's kv
-  list (exactly one required), and **`resolve_base`** resolves a typed image ref —
+  list (exactly one required), and **`eval_base`** resolves a typed image ref —
   the single function every image position now goes through: `--base` on both
   clients, and `--map`/`--run`/`--then` in `record_continuation`.
 - **The sniffers are gone.** `resolve_run_image` split into `resolve_cas_image`
-  (worker, `:@=` only) and `resolve_cli_image` (CLI, `:@=` only — a host dir to
+  (worker, `:@=` only) and `eval_cli_image` (CLI, `:@=` only — a host dir to
   ingest+evaluate, now an ERROR if it isn't a directory). Its `docker://`-prefix
   and hex-hash branches became the `:docker=`/`:hash=` types. What *stays* is
   reading a CAS file's CONTENT for a `docker://` ref: the path was typed `:@=` by
@@ -446,7 +452,7 @@ fetch cannot reproduce. Nothing about the model required this; `eval-path`
 already descends through evaluation everywhere else, which is exactly how
 `DEEP-DEPS/<x>` resolves inside this repo.
 
-`resolve_remote_arg` now descends with `eval::eval_path` from the fetched root,
+`eval_remote_arg` now descends with `eval::eval_path` from the fetched root,
 so a locator names a path in the **evaluated** tree. Measured after the change,
 same probe:
 

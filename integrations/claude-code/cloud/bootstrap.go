@@ -448,7 +448,7 @@ func installHelper(prefix, slug, tag string) {
 // tools resolve from there too.
 //
 // THE WORKTREE, not just the conversation's seed commit, and that is measured
-// rather than preferred: `resolve_cli_image_with_store` ingests ".", so the tool
+// rather than preferred: `eval_cli_image_with_store` ingests ".", so the tool
 // server's `--llm-step:@=<std>/llm-step` resolves against the working tree and
 // not against the `--base` the conversation seeds from. Rewriting only the seed
 // would install a dev client that then evaluated the COMMITTED tools -- the
@@ -506,7 +506,7 @@ func repointAtDev(repoDir, server, sha string) {
 }
 
 // THE CONVERSATION SEEDS FROM ITS OWN COMMIT, not from HEAD. The HOOK creates a
-// conversation (`on_user_prompt`), and its content comes from `resolve_base`,
+// conversation (`on_user_prompt`), and its content comes from `eval_base`,
 // which is HEAD unless told otherwise -- so the rewrite above reaches the
 // checkout and not the tree the conversation records.
 //

@@ -186,7 +186,7 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
     // else is taken as the hash it looks like, so a mistyped hash cannot
     // quietly become an ingest of a same-named directory.
     let hash = &if Path::new(hash).is_dir() {
-        resolve_cli_image(t, hash)?
+        eval_cli_image(t, hash)?
     } else {
         hash.to_string()
     };
@@ -3065,21 +3065,21 @@ pub(crate) fn split_base_arg<'a>(
 /// `cas` says which world we're in, and is the only difference between the two
 /// clients: `Some(dir)` is a worker, where a path names a materialized `/cas`
 /// node; `None` is the CLI, where a path is a host directory to ingest (and
-/// evaluate — see [`resolve_cli_image`]).
-fn resolve_base(
+/// evaluate — see [`eval_cli_image`]).
+fn eval_base(
     t: &dyn Transport,
     cas: Option<&Path>,
     ty: ArgType,
     value: &str,
 ) -> Result<String, String> {
-    resolve_base_with_store(t, cas, ty, value, &[])
+    eval_base_with_store(t, cas, ty, value, &[])
 }
 
-/// [`resolve_base`] carrying the caller's secret store through evaluation, so a
+/// [`eval_base`] carrying the caller's secret store through evaluation, so a
 /// tool the resolved expression embeds keeps its secret-dependent identity —
-/// see [`resolve_cli_image_arg`]. Only the two evaluating types read the store;
+/// see [`eval_cli_image_arg`]. Only the two evaluating types read the store;
 /// `:hash=` and `:docker=` name an object outright and evaluate nothing.
-fn resolve_base_with_store(
+fn eval_base_with_store(
     t: &dyn Transport,
     cas: Option<&Path>,
     ty: ArgType,
@@ -3103,7 +3103,7 @@ fn resolve_base_with_store(
         // `:@=<path>` — a `/cas` node in a worker, a host directory on the CLI.
         ArgType::Path => match cas {
             Some(cas) => resolve_cas_image(t, cas, value),
-            None => resolve_cli_image_with_store(t, value, store),
+            None => eval_cli_image_with_store(t, value, store),
         },
         // `:@@=<ref>` — the worker lives in ANOTHER repo: fetch it, then treat
         // the result exactly as a `:@=` directory, evaluating it if it carries a
@@ -3302,7 +3302,7 @@ pub fn run_client_request_with_store(
 pub fn caos_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let (bty, bval, kvs) = split_base_arg("prepare-request", kvs)?;
-    let image = resolve_base(t, Some(&cas), bty, bval)?;
+    let image = eval_base(t, Some(&cas), bty, bval)?;
     println!("{}", prepare_request(t, &image, Some(&cas), &kvs, &[])?);
     Ok(())
 }
@@ -3312,7 +3312,7 @@ pub fn caos_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), Str
 /// printed so another process can immediately run it.
 pub fn cli_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
     let (bty, bval, kvs) = split_base_arg("prepare-request", kvs)?;
-    let image = resolve_base(t, None, bty, bval)?;
+    let image = eval_base(t, None, bty, bval)?;
     let store = build_secret_store(t)?;
     println!("{}", prepare_request(t, &image, None, &kvs, &store)?);
     Ok(())
@@ -3408,7 +3408,7 @@ fn assemble_arg_tree(
 /// itself and must be the worker's final act. At least one of `--map`/`--then`
 /// is required; each names an ArgTree, TYPED like a `--base` — `:@=` a `/cas`
 /// path, `:docker=` a registry ref, `:hash=` an object already in the store —
-/// and resolved through the same path a `--base` takes (`resolve_base`).
+/// and resolved through the same path a `--base` takes (`eval_base`).
 /// (The user-facing CLI's blocking run is [`cli_run`]; the single-valued form
 /// is [`caos_run_then`].)
 ///
@@ -3792,8 +3792,7 @@ fn record_continuation(
         // Each of these flags names an ArgTree to run, typed exactly like a
         // `--base`: `:@=` a `/cas` path, `:docker=` a registry ref, `:hash=` an
         // object already in the store (typically what `caos curry` printed).
-        let resolved =
-            resolve_base(t, Some(&cas), ty, value).map_err(|e| format!("--{name}: {e}"))?;
+        let resolved = eval_base(t, Some(&cas), ty, value).map_err(|e| format!("--{name}: {e}"))?;
         entries.push(Entry {
             mode: EntryKind::Blob.into(),
             filename: name.as_bytes().to_vec().into(),
@@ -3820,11 +3819,11 @@ fn record_continuation(
 /// when you want the commit itself. There
 /// is no `/cas` here: path-valued args are host paths the transport ingests, and
 /// the worker is the reserved [`BASE_ARG`] — `--base:@=<host dir>` (ingested, and
-/// evaluated if it carries a `.caos-expr`; see [`resolve_cli_image`]),
+/// evaluated if it carries a `.caos-expr`; see [`eval_cli_image`]),
 /// `--base:docker=<ref>`, or `--base:hash=<oid>`.
 pub fn cli_run(t: &dyn Transport, output: Option<&str>, kvs: &[String]) -> Result<(), String> {
     let (bty, bval, kvs) = split_base_arg("run", kvs)?;
-    let image = resolve_base(t, None, bty, bval)?;
+    let image = eval_base(t, None, bty, bval)?;
     // Build the ephemeral secrets store from the caller's `.caos-secrets`
     // (design/secrets.md), resolving each reader here — where eval-path is
     // available — so the server never evals. Empty when there's no store.
@@ -4005,8 +4004,8 @@ fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// is created by the root expression; and in a repo carrying a root `.caos-expr`
 /// a `:@=` image deepens the whole tree first — a cached run, and exactly what
 /// `eval-path` and `run-tool` already do.
-pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    resolve_cli_image_with_store(t, image, &[])
+pub fn eval_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
+    eval_cli_image_with_store(t, image, &[])
 }
 
 /// Resolve one `--<name>:<type>=<value>` image argument as a CLIENT reads it —
@@ -4021,21 +4020,21 @@ pub fn resolve_cli_image(t: &dyn Transport, image: &str) -> Result<String, Strin
 /// under the names the client happened to use. Naming the image in the
 /// invocation moves that choice to the caller, and `:@@=` lets a repo that
 /// never mounted caos reach a tool at all.
-pub fn resolve_cli_image_arg(
+pub fn eval_cli_image_arg(
     t: &dyn Transport,
     argument: &str,
     store: &[ClientSecret],
 ) -> Result<String, String> {
     let (_, ty, value) = parse_arg(argument)?;
-    resolve_base_with_store(t, None, ty, value, store)
+    eval_base_with_store(t, None, ty, value, store)
 }
 
-/// [`resolve_cli_image`] carrying the caller's secret store into the walk, so a
+/// [`eval_cli_image`] carrying the caller's secret store into the walk, so a
 /// `run` the expression dispatches and any `curry` it returns are marked with
 /// the caller's identity (design/secrets.md). Conversation setup uses this
 /// form: the step it resolves embeds tools whose arg trees have to match the
 /// readers granting the model key, and an unmarked resolution would not.
-pub fn resolve_cli_image_with_store(
+pub fn eval_cli_image_with_store(
     t: &dyn Transport,
     image: &str,
     store: &[ClientSecret],
@@ -4083,7 +4082,7 @@ pub fn caos_curry(t: &dyn Transport, rest: &[String]) -> Result<(), String> {
     let cas = cas_dir();
     let (unbind, kvs) = split_curry_args(rest);
     let (bty, bval, kvs) = split_base_arg("curry", &kvs)?;
-    let arg_tree = resolve_base(t, Some(&cas), bty, bval)?;
+    let arg_tree = eval_base(t, Some(&cas), bty, bval)?;
     println!("{}", curry_object(t, &arg_tree, Some(&cas), &unbind, &kvs)?);
     Ok(())
 }
@@ -4095,7 +4094,7 @@ pub fn caos_curry(t: &dyn Transport, rest: &[String]) -> Result<(), String> {
 pub fn cli_curry(t: &dyn Transport, rest: &[String]) -> Result<(), String> {
     let (unbind, kvs) = split_curry_args(rest);
     let (bty, bval, kvs) = split_base_arg("curry", &kvs)?;
-    let arg_tree = resolve_base(t, None, bty, bval)?;
+    let arg_tree = eval_base(t, None, bty, bval)?;
     let curried = curry_object(t, &arg_tree, None, &unbind, &kvs)?;
     t.ensure_pushed(&curried.to_string())?;
     if is_hex_hash(&arg_tree) {

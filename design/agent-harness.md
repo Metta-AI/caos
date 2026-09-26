@@ -347,7 +347,7 @@ suites for the tool set).
 
 All three name the workers they run — `--llm-step:@=<path>` and, where titles
 are generated, `--llm-call:@=<path>` — as ordinary image args, resolved by
-`resolve_cli_image_arg`. There is no default: which path holds caos' entry
+`eval_cli_image_arg`. There is no default: which path holds caos' entry
 points is the caller's tree's business, not this client's (`design/chat.md`,
 "Host and launcher inputs").
 
