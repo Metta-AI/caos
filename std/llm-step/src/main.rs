@@ -5,6 +5,7 @@ mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod scoped;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -1663,15 +1664,62 @@ fn launch_resolved_tool(
             return resume(cfg, state, request, request_head);
         }
     };
+    let scope = match call.input.get("scope") {
+        None => None,
+        Some(Value::String(scope)) if tool.writer && tool.wants_in && !tool.git => {
+            Some(scope.clone())
+        }
+        _ => {
+            site.failed(
+                state,
+                &error_block(id, "scope requires a writer with @in and without @git"),
+                name.map(|name| (name, commit)),
+            )?;
+            return resume(cfg, state, request, request_head);
+        }
+    };
+    let scoped_input = match scope.as_deref() {
+        Some(scope) => match scoped::input(state.store(), &conversation, scope) {
+            Ok(tree) if !bound.iter().any(|(name, _)| name == "in") => Some(tree),
+            Ok(_) => {
+                site.failed(
+                    state,
+                    &error_block(
+                        id,
+                        "scope selects the writer input; do not also pass arguments.in",
+                    ),
+                    name.map(|name| (name, commit)),
+                )?;
+                return resume(cfg, state, request, request_head);
+            }
+            Err(error) => {
+                site.failed(
+                    state,
+                    &error_block(id, &error),
+                    name.map(|name| (name, commit)),
+                )?;
+                return resume(cfg, state, request, request_head);
+            }
+        },
+        None => None,
+    };
     let tool_tree = cas_hash(&image)?;
-    let source_tree_name = name;
+    let source_tree_name = if scope.is_some() { None } else { name };
+    let commit = if scope.is_some() {
+        state.head().clone()
+    } else {
+        commit
+    };
     // Each argument binds at its OWN kind: a literal as bytes, a tree by hash,
     // a commit as a materialized path (which preserves the kind).
     let ready: Vec<(String, tools::ReadyArg)> = bound
         .iter()
         .map(|(key, value)| Ok((key.clone(), value.ready()?)))
         .collect::<Result<_, String>>()?;
-    let (args, input) = split_input(&ready, tool.wants_in, ws.as_str());
+    let (args, mut input) = split_input(&ready, tool.wants_in, ws.as_str());
+    if let Some(tree) = scoped_input.as_ref() {
+        input = vec![("in", Arg::Hash(tree.as_str()))];
+    }
     let mut args = args;
     if tool.git {
         args.push(("wc", Arg::Path(&wc)));
@@ -1715,7 +1763,9 @@ fn launch_resolved_tool(
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
-            payloads: Vec::new(),
+            payloads: scope
+                .map(|scope| vec![("scope.txt".into(), scope.into_bytes())])
+                .unwrap_or_default(),
             record: started.clone(),
         },
     )? {
@@ -1886,34 +1936,57 @@ fn writer_callback(
         .input_commit
         .as_ref()
         .ok_or("a writer's tool.start has no input commit")?;
-    let proposal = match result.kind.as_str() {
-        // The common case: the tool hands back a tree and never has to know
-        // what a commit is. Parentage is ours, so it descends by construction.
-        "tree" => {
-            let tree = Oid::parse(&cas_hash(&result.prop)?, "writer result tree")?;
-            let message = result.message.as_deref().unwrap_or(tool);
-            mint_source_tree_commit(state, &tree, base, message.trim())?
+    let scope = scoped::saved(state, record)?;
+    let proposal = if let Some(scope) = scope {
+        if result.kind != "tree" {
+            return fail(format!("{tool}: a scoped writer must return a tree"));
         }
-        // A commit the tool built itself, which only a second parent justifies.
-        // `reconcile` ERRORS rather than conflicts when a proposal does not
-        // descend from its base, so check it here, where the model can be told
-        // which two commits disagree instead of losing the turn to it.
-        _ => {
-            let proposal = Oid::parse(&cas_hash(&result.prop)?, "writer result commit")?;
-            state.fetch_object(&proposal)?;
-            let descends = conversation_protocol::v3::CodeOps::is_ancestor(
-                state.store(),
-                base,
-                &proposal,
-            )?;
-            if !descends {
-                return fail(format!(
-                    "{tool}: the returned commit {proposal} does not descend from the commit \
+        let tree = Oid::parse(&cas_hash(&result.prop)?, "writer scope result")?;
+        // Git packing needs the returned directory objects locally. Fetching
+        // this tree does not follow its source gitlinks into repository history.
+        state.fetch_object(&tree)?;
+        let base_tree = state.store().tree_of(base)?;
+        let tree = scoped::graft(state.store_mut(), &base_tree, &scope, tree)?;
+        let commit = mint_source_tree_commit(
+            state,
+            &tree,
+            base,
+            result.message.as_deref().unwrap_or(tool),
+        )?;
+        // The returned subtree is already on the server. Publish the small
+        // enclosing conversation trees built here before recording the proposal.
+        state.push_code(&commit)?;
+        commit
+    } else {
+        match result.kind.as_str() {
+            // The common case: the tool hands back a tree and never has to know
+            // what a commit is. Parentage is ours, so it descends by construction.
+            "tree" => {
+                let tree = Oid::parse(&cas_hash(&result.prop)?, "writer result tree")?;
+                let message = result.message.as_deref().unwrap_or(tool);
+                mint_source_tree_commit(state, &tree, base, message.trim())?
+            }
+            // A commit the tool built itself, which only a second parent justifies.
+            // `reconcile` ERRORS rather than conflicts when a proposal does not
+            // descend from its base, so check it here, where the model can be told
+            // which two commits disagree instead of losing the turn to it.
+            _ => {
+                let proposal = Oid::parse(&cas_hash(&result.prop)?, "writer result commit")?;
+                state.fetch_object(&proposal)?;
+                let descends = conversation_protocol::v3::CodeOps::is_ancestor(
+                    state.store(),
+                    base,
+                    &proposal,
+                )?;
+                if !descends {
+                    return fail(format!(
+                        "{tool}: the returned commit {proposal} does not descend from the commit \
                      it was given ({base}). A writer must build on its input; return a tree \
                      instead and the commit will be made for you."
-                ));
+                    ));
+                }
+                proposal
             }
-            proposal
         }
     };
     Ok((
@@ -1962,7 +2035,12 @@ fn complete_compute(
         .input_commit
         .as_ref()
         .ok_or("tool has no input commit")?;
-    let changes = if let Some(name) = &started.source_tree_name {
+    let scope = scoped::saved(state, started)?;
+    let changes = if let Some(scope) = scope {
+        let before = state.store().tree_of(base)?;
+        let after = state.store().tree_of(&proposal)?;
+        vec![scoped::change(state.store(), &before, &after, &scope)?]
+    } else if let Some(name) = &started.source_tree_name {
         vec![conversation_protocol::v3::tree::Change {
             path: name.clone(),
             before: Some((Mode::Commit, base.clone())),
@@ -3186,7 +3264,8 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
         "name":"run_tool",
         "description":"Run a repository tool by conversation-relative path, e.g. feature/dirty/caos-tools/test. The tool runs with the containing source tree as its input. Nothing lists the available tools: each repository documents its own, and `tool_help` at a path gives that tool's parameters. Pass them under `arguments` as strings.",
         "input_schema":{"type":"object","properties":{
-            "path":{"type":"string"}, "arguments":{"type":"object"}
+            "path":{"type":"string"}, "arguments":{"type":"object"},
+            "scope":{"type":"string","description":"For a writer with @in: conversation directory to replace atomically. The worker receives only this subtree. Concurrent edits inside it reject the proposal."}
         },"required":["path"]}
     }));
     Ok(registry)

@@ -375,6 +375,14 @@ source tree returns a source commit; one run on the conversation returns a
 conversation commit. The path the caller named already decides which, so the
 declaration says only WHETHER a tool writes, never where.
 
+A `run_tool` call may select `scope=<conversation-directory>` for a writer
+that declares `@in` without `@git`. The tool receives that directory's tree and returns
+its replacement as `prop`. Scope and the conversation input commit stay in the
+invocation record, outside the worker's cache key. The ordinary proposal apply
+path treats this as one directory replacement: any concurrent change inside
+it rejects the replacement, while edits elsewhere are preserved. An empty
+replacement tree deletes the directory, since Git does not store empty folders.
+
 A writer's `out` SHALL be its own. Composing it in the harness — as the merge
 conflict report once was — makes the tool's answer depend on who ran it, which
 is the same reason the `help` lives in the expression.

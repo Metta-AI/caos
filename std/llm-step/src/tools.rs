@@ -350,7 +350,6 @@ impl Bound {
             _ => None,
         }
     }
-
 }
 
 /// Parse one `@param` tag's payload (everything after the tag) into a
@@ -489,6 +488,9 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             git = true;
         } else if trimmed == "@writer" {
             in_tags = true;
+            if writer {
+                eprintln!("{ctx}: duplicate @writer tag ignored");
+            }
             writer = true;
         } else if trimmed == "@in" {
             in_tags = true;
@@ -758,13 +760,15 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
     let prop = path(&prop).to_string();
     let kind = worker_common::cas_kind(&prop)?;
     if kind != "tree" && kind != "commit" {
-        return Err(format!("a writer's `prop` must be a tree or a commit, not a {kind}"));
+        return Err(format!(
+            "a writer's `prop` must be a tree or a commit, not a {kind}"
+        ));
     }
     // `out` is REQUIRED. Substituting a generic line for a tool that forgot it
     // would hide the tool's silence behind the harness's voice, and the whole
     // point of the entry is that the model learns what happened.
-    let out = blob("out")?
-        .ok_or("a writer's result has no `out` entry — the text for the model")?;
+    let out =
+        blob("out")?.ok_or("a writer's result has no `out` entry — the text for the model")?;
     Ok(WriterResult {
         prop,
         kind,
@@ -1445,7 +1449,10 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(doc.contains("The tree to test."), "keeps the author's text");
-        assert!(doc.contains("conversation-relative path"), "says how to name one");
+        assert!(
+            doc.contains("conversation-relative path"),
+            "says how to name one"
+        );
         let doc = d["input_schema"]["properties"]["against"]["description"]
             .as_str()
             .unwrap();
@@ -1498,7 +1505,10 @@ mod tests {
         assert_eq!(tester.args[0].name, "in");
         assert_eq!(tester.args[0].ty, ArgType::Tree);
         assert!(!tester.args[0].required, "it defaults, so it is optional");
-        assert!(text.contains("in (optional)"), "listed for the model: {text}");
+        assert!(
+            text.contains("in (optional)"),
+            "listed for the model: {text}"
+        );
 
         // A tool may not declare it by hand: `in` is what the interpreter
         // binds, and `@in` is the way to ask for it.
@@ -1585,7 +1595,11 @@ mod tests {
         // `@params x` is NOT `@param` with `s x` after it — that once minted an
         // arg named `s` and silently lost the real one.
         let h = parse_help("t", "d\n@params hash The hash.");
-        assert!(h.args.is_empty(), "got {:?}", h.args.first().map(|a| &a.name));
+        assert!(
+            h.args.is_empty(),
+            "got {:?}",
+            h.args.first().map(|a| &a.name)
+        );
 
         // An `@` inside prose is not a tag. Both of these appear in help and
         // commit text today.
@@ -1842,8 +1856,7 @@ mod tests {
 
         // Scalars are stringified, since a `{string}` arg reaches the script as
         // a blob.
-        let bound =
-            tree_tool_args(&call(json!({"word": 7, "suffix": true})), &tool, None).unwrap();
+        let bound = tree_tool_args(&call(json!({"word": 7, "suffix": true})), &tool, None).unwrap();
         assert_eq!(
             bound,
             vec![
