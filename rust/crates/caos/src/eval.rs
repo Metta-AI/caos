@@ -19,7 +19,7 @@
 //! ArgTree IS the cache key, so a locator must become an oid *before* the
 //! request is formed — otherwise the URL sits inside the key and two consumers
 //! pinning the same rev through different URLs (a fork, a mirror, ssh vs https)
-//! key identical content differently. `caos_eval::EvalHost::resolve_remote`
+//! key identical content differently. `caos_eval::EvalHost::eval_remote`
 //! therefore refuses by default, and only this host overrides it.
 //!
 //! The grammar, the here-string form, the `$CAOS_EXPR` binding and the
@@ -32,8 +32,8 @@ use caos_eval::MemoKind;
 use gix::objs::tree::Entry;
 
 use super::{
-    assemble_arg_tree, build_secret_store, fetch_tree_entries, mark_arg_tree, post_object,
-    post_tree, request_compute, resolve_remote_arg, secret_store_header, store_key, ClientSecret,
+    assemble_arg_tree, build_secret_store, eval_remote_arg, fetch_tree_entries, mark_arg_tree,
+    post_object, post_tree, request_compute, secret_store_header, store_key, ClientSecret,
     Transport,
 };
 
@@ -140,14 +140,14 @@ impl caos_eval::EvalHost for ClientEvalHost<'_> {
     fn mark_curry(&self, oid: &str) -> Result<String, String> {
         mark_arg_tree(self.t, self.store, oid)
     }
-    fn resolve_remote(
+    fn eval_remote(
         &self,
         value: &str,
     ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
-        // `dir=` descends through EVALUATION (see `resolve_remote_arg`), so a
+        // `dir=` descends through EVALUATION (see `eval_remote_arg`), so a
         // pinned consumer reaches `dir=std/<x>` exactly as caos reaches its own
         // entries. It carries its own memo, on the locator.
-        resolve_remote_arg(self.t, value, self.store)
+        eval_remote_arg(self.t, value, self.store)
     }
     fn memo_get(&self, kind: MemoKind, key: &str) -> Option<(String, String)> {
         memo_for(kind).get(&self.memo_key(key))

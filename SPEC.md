@@ -165,11 +165,15 @@ definition's evaluated tree is separate from the input: what invocation binds as
 when no source-tree prefix was selected — and it binds it ONLY for a tool that
 declared `@in`.
 
-MCP resolves the requested `path` against that same snapshot on the client,
-where pinned `:@@=` dependencies can be fetched. It hands the evaluated tool
-to both callers. The handoff names its input tree and path, so a changed snapshot
-cannot consume a stale result. Workers continue to use evaluation continuations
-and do not fetch locators themselves.
+Resolution is the SERVER's. `caos mcp` records the call and hands it to the
+step, which asks for the tool's path exactly as `eval_path` does — an
+evaluation continuation the server walks. Nothing about a tool is worked out on
+the client, which is what lets a session run entirely from the commit it was
+started from: a client repo mounts caos through a `:@@=` pin, and caosd
+resolves that pin (design/flake-inputs.md). The client used to pre-resolve tool
+paths against its own checkout, because the server could not follow a locator;
+that was a second resolver, and two resolvers can disagree about which version
+of a tool runs.
 
 ## Help text
 
@@ -246,8 +250,9 @@ An object parameter is still a STRING to the model — it NAMES one:
 - `{commit}` takes a hash, and only a hash. A path cannot name a commit because
   `caos resolve` traverses a gitlink to the tree inside it, so a path is
   refused with that explanation rather than quietly yielding a tree
-- `:@@=` is never offered to an agent: a locator is resolved by the CLIENT
-  only, and an agent's evaluation runs server-side
+- `:@@=` is never offered to an agent. The server resolves locators, so it
+  could be — what it cannot be is SAFE: a locator says fetch this URL, and an
+  argument is the one part of a call the model writes freely
 
 The naming rule rides in the parameter's DESCRIPTION, since that is all the
 model sees. Resolution happens when the call is validated, and what is carried
@@ -408,10 +413,10 @@ on any of it, and each is written down because the reason is easy to lose.
 - **`caos-cli run-tool` and `caos-cli run` are still separate verbs**, and
   `run-tool` does not validate against the help, so "both callers build the same
   ArgTree" is a goal rather than an invariant.
-- **Locator resolution requires a client.** MCP pre-resolves the requested
-  tool path, including pinned ancestor dependencies. A turn driven entirely
-  by workers still cannot resolve a new `:@@=` locator; its dependencies must
-  already be available as content. There is no worker-side remote fetch.
+- **A `path:` locator has no answer any more.** It names a live directory on
+  the machine that wrote the expression, and the only resolver is the server,
+  which is not that machine. Refused by name; `:@=` covers a path in the
+  repository being evaluated, which is what it was almost always used for.
 
 # Secrets
 
@@ -736,6 +741,34 @@ and completion markers do not root them.
 
 See [Git import endpoint](design/git-import.md) for the request flow and
 limits of commit-based fetch negotiation.
+
+## Evaluating a path: GET /eval
+
+GET /eval walks `.caos-expr` from a root down to a path and returns what falls
+out as `"<type> <hash>"`. The ROOT is a typed argument, named by the caller in
+the same vocabulary as every other typed value, because the root is the only
+thing the two forms differ in:
+
+- `root:hash=<oid>&path=<p>` starts from an object the store already holds.
+- `root:@@=<locator>` starts from a pin. A locator carries its own `dir=`, so it
+  already says which path and `&path=` alongside it is refused.
+
+The locator form is the ONLY thing that resolves a `:@@=`: a client and a
+worker both ask here. The server answers from
+`refs/caos/locator-trees/<rev>`, then from the pinned commit if its store
+already holds it — which is how a `git+caos://` locator, naming the server
+itself, is answered — and otherwise by a `--depth=1` fetch of which only the
+TREE closure is published, so no shallow boundary or incomplete commit enters
+the store. `dir=` descends through evaluation, not a raw tree walk. It takes
+the same optional X-Caos-Git-Token header /git/import does, scoped by git's
+credential helper to one HTTPS URL. A `path:` locator names a directory on the
+machine that wrote the expression and is refused.
+
+Resolution happening here, rather than on a client, is what lets a SERVER-SIDE
+evaluation follow a pin — an agent's, which is every conversation's. The
+content-addressing rule it used to be justified by is unchanged: the locator
+becomes an oid before the ArgTree carrying it is assembled, so a URL never
+enters a cache key. See [flake inputs](design/flake-inputs.md).
 
 ## `merge --theirs=<commit>`
 

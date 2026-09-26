@@ -263,7 +263,7 @@ the tui against the same conversation.
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   entries say `claude-code` rather than naming a model. Better than a
   plausible-looking string nothing verified.
-- **A cold server build.** Resolving the step is now ONE `GET /eval-locator`
+- **A cold server build.** Resolving the step is now ONE `GET /eval?root:@@=`
   request to the caos server, which walks `.caos-expr` there — where each hop is
   sub-millisecond — instead of the ~54 chatty round trips the client used to
   make (measured over the dumbpipe tunnel this replaced: the difference between

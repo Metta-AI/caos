@@ -114,46 +114,109 @@ pub(crate) fn resolve_image_endpoint(config: &Config, query: &str) -> Result<Vec
     Ok(reference.into_bytes())
 }
 
-/// `GET /eval-locator?in=<tree oid>&eval=<path>` — walk `.caos-expr` from the
-/// tree `in` down to `<path>` SERVER-SIDE, returning the resolved `"<type>
-/// <hash>"`, and memoize it.
+/// `GET /eval?root:<type>=<value>[&path=<path>]` — walk `.caos-expr` from a root
+/// down to a path SERVER-SIDE, returning what falls out as `"<type> <hash>"`,
+/// and memoize it.
 ///
-/// This exists because that walk is otherwise re-run by EVERY client that names
-/// the same pinned tree and path -- and a caos session names it three times over
-/// (its `serve` resolver for `tools/list`, its `UserPromptSubmit` hook, and each
-/// tool call's dispatch), in separate processes whose in-memory eval memo
-/// (`caos-eval`) cannot be shared. Worse, the client walk is CHATTY: measured,
-/// ~54 fresh HTTP round trips, each a new connection -- 0.1s over a loopback,
-/// but ~30s over a cloud session's iroh tunnel, where every connection pays the
-/// relay's setup and latency. Resolving here does the whole walk where each hop
-/// is sub-millisecond, so the client makes ONE request, not fifty-four.
+/// **The ROOT is a typed argument, because the root is the only thing that
+/// varies.** Both forms evaluate a path; they differ in where the walk starts,
+/// so the type is named by the caller in the vocabulary every other typed value
+/// in caos uses (`--base:hash=`, `--base:@@=`) rather than sniffed from a
+/// value's shape:
+///
+/// * `root:hash=<oid>&path=<p>` — start from an object this store already holds.
+/// * `root:@@=<locator>` — start from a PIN, fetching the commit if this store
+///   lacks it ([`crate::locator`]). A locator carries its own `dir=`, so it
+///   already says which path and `&path=` is refused alongside it; that
+///   asymmetry is the difference between the two kinds of reference, not a wart.
+///
+/// This was two endpoints, `/eval-locator` and `/resolve-locator`, and the names
+/// were the problem: `resolve` elsewhere in this tree means a RAW lookup that
+/// cannot evaluate (`gitlinks::resolve`, `locator::resolve_root`), and
+/// `/eval-locator` took no locator at all — it was named after its caller. One
+/// operation with a typed root says what both were for.
+///
+/// **It exists because the walk is otherwise re-run by every client** that names
+/// the same tree and path — a caos session names it three times over (its
+/// `serve` resolver for `tools/list`, its `UserPromptSubmit` hook, and each tool
+/// call's dispatch), in separate processes whose in-memory eval memo
+/// (`caos-eval`) cannot be shared. And a client-side walk is CHATTY: measured,
+/// ~54 fresh HTTP round trips — 0.1s over a loopback, ~30s over a cloud
+/// session's tunnel. Here each hop is sub-millisecond and the client makes ONE
+/// request.
 ///
 /// The walk is [`resolve_promise`]'s `eval` step ([`ServerEvalHost`]); its
 /// sub-builds already ride `/run`'s single-flight and memo, so concurrent
-/// callers are correct and cheap on repeat even before the small result cache
-/// below skips the re-walk. Secret marking is a no-op through eval (it happens
-/// when the step RUNS, not when it resolves -- measured: a marked and an
-/// unmarked resolve of `std/llm-step` produce the identical oid), so the object
-/// is byte-identical to a client `eval-path`. Scoped by the caller's secrets
+/// callers are correct and cheap on repeat even before the result cache below
+/// skips the re-walk. Secret marking is a no-op through eval (it happens when
+/// the step RUNS, not when it resolves — measured: a marked and an unmarked
+/// resolve of `std/llm-step` produce the identical oid), so the object is
+/// byte-identical to a client `eval-path`. Scoped by the caller's secrets
 /// anyway, like `/run`, against the day that stops holding.
-pub(crate) fn eval_locator_endpoint(
+pub(crate) fn eval_endpoint(
     config: &Config,
     query: &str,
+    secrets_header: &str,
+    token: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    let by_hash = query_param(query, "root:hash");
+    let by_locator = query_param(query, "root:@@");
+    let path = query_param(query, "path");
+    match (by_hash, by_locator) {
+        (Some(_), Some(_)) => Err(HttpError::new(
+            400,
+            "eval names one root: root:hash=<oid> or root:@@=<locator>, not both",
+        )),
+        (None, None) => Err(HttpError::new(
+            400,
+            "eval needs a root: ?root:hash=<oid>&path=<p> or ?root:@@=<locator>",
+        )),
+        (Some(root), None) => {
+            let path = path.ok_or_else(|| {
+                HttpError::new(400, "root:hash=<oid> needs &path=<p> to evaluate within it")
+            })?;
+            eval_in_tree(config, &root, &path, secrets_header)
+        }
+        (None, Some(locator)) => {
+            // A locator IS a path: `dir=` says which. Taking `&path=` as well
+            // would leave two answers to one question.
+            if path.is_some() {
+                return Err(HttpError::new(
+                    400,
+                    "a locator carries its own `dir=`, so &path= has nothing to add",
+                ));
+            }
+            let git_ref =
+                git_locator::parse_git_ref(&locator).map_err(|e| HttpError::new(400, e))?;
+            let root = crate::locator::resolve_root(config, &git_ref, token)
+                .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+            let dir = git_ref.dir.as_deref().unwrap_or("");
+            eval_in_tree(config, &root.to_string(), dir, secrets_header).map_err(|e| {
+                HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message()))
+            })
+        }
+    }
+}
+
+/// [`eval_endpoint`]'s body once the root is an object this store holds: the
+/// `{in, eval}` continuation, memoized on (tree, path, secret scope). Both root
+/// types land here, so a locator's descent and a direct one over the same
+/// fetched root are ONE memo entry rather than two.
+fn eval_in_tree(
+    config: &Config,
+    root: &str,
+    path: &str,
     secrets_header: &str,
 ) -> Result<Vec<u8>, HttpError> {
     use gix::objs::tree::{Entry, EntryKind};
 
-    let root = query_param(query, "in")
-        .ok_or_else(|| HttpError::new(400, "eval-locator needs ?in=<tree oid>"))?;
-    let path = query_param(query, "eval")
-        .ok_or_else(|| HttpError::new(400, "eval-locator needs &eval=<path>"))?;
     let root_oid = gix::ObjectId::from_hex(root.as_bytes())
-        .map_err(|_| HttpError::new(400, format!("in={root:?} is not an object id")))?;
+        .map_err(|_| HttpError::new(400, format!("root:hash={root:?} is not an object id")))?;
     let secrets = crate::secrets::parse_header(secrets_header);
 
-    // The memo identity: the pinned input tree, the path, and the secret scope.
+    // The memo identity: the input tree, the path, and the secret scope.
     // Content-addressed by storing it, so the redis key is fixed-length.
-    let identity = format!("eval-locator\u{0}{root}\u{0}{path}\u{0}{secrets_header}");
+    let identity = format!("eval\u{0}{root}\u{0}{path}\u{0}{secrets_header}");
     let id = store_git_blob(config, identity.as_bytes()).map_err(|e| HttpError::new(500, e))?;
     let key = result_key(config, &id.to_string());
     if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
@@ -966,6 +1029,34 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
     }
     fn post_tree(&self, entries: Vec<gix::objs::tree::Entry>) -> Result<gix::ObjectId, String> {
         store_git_tree(self.config, entries)
+    }
+    /// `:@@=`. This is what a worker's `eval` continuation ultimately reaches,
+    /// and it is why a conversation can evaluate a repository that pins caos:
+    /// the walk is the server's, so the fetch has to be too (`crate::locator`).
+    ///
+    /// The content-addressing rule is unchanged — the locator becomes an oid
+    /// BEFORE the ArgTree it goes into is assembled, which is the same point in
+    /// the same walk the client resolved at. What moved is WHO fetches, not
+    /// when.
+    ///
+    /// `dir=` descends through EVALUATION, never a raw tree walk: a bare
+    /// `std/<x>` names `DEEP-DEPS/…` mounts that only exist once the root
+    /// expression has deepened the tree (design/flake-inputs.md, 4a).
+    fn eval_remote(
+        &self,
+        value: &str,
+    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+        let git_ref = git_locator::parse_git_ref(value)?;
+        let root = crate::locator::resolve_root(self.config, &git_ref, None)
+            .map_err(|e| format!("git ref {value:?}: {e}"))?;
+        let dir = git_ref.dir.as_deref().unwrap_or("");
+        let (kind, hash) = caos_eval::eval_path(self, &root.to_string(), dir)
+            .map_err(|e| format!("git ref {value:?}: {e}"))?;
+        Ok((
+            caos_eval::mode_of_kind(&kind),
+            gix::ObjectId::from_hex(hash.as_bytes())
+                .map_err(|_| format!("git ref {value:?}: {hash:?} is not an object id"))?,
+        ))
     }
     fn dispatch(
         &self,

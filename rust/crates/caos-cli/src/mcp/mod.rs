@@ -228,16 +228,7 @@ fn run_tool(
     let (request, request_head, round) =
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    dispatch_call(
-        t,
-        options,
-        &id,
-        name,
-        &declared,
-        &request,
-        &request_head,
-        &call,
-    )?;
+    dispatch_call(t, options, &id, &request, &request_head, &call)?;
     read_outcome(t, &id, &request, round, &call)
 }
 
@@ -248,81 +239,34 @@ fn run_tool(
 /// would be answered from the first's memo. `--tools-only` carries the call id
 /// for exactly that reason, and the step checks it ran before returning.
 ///
-/// Repository tools resolve against their conversation path, client-side so
-/// pinned locators use the existing fetch/evaluation machinery. Both calls
-/// receive the evaluated tool; the worker describes it or validates arguments
-/// before invocation. The handoff is pinned to the input tree and path.
-#[allow(clippy::too_many_arguments)]
+/// NOTHING ABOUT A TOOL IS RESOLVED HERE. `tool_help` and `run_tool` used to
+/// arrive with the tool already evaluated — `--client-tool-root`/`-path`/
+/// `-tree`, worked out against the conversation snapshot in this process — and
+/// the whole reason was that the server refused a `:@@=` locator, so a
+/// repository that pins caos could not be evaluated where the walk otherwise
+/// happens. The server resolves locators now (`server::locator`), so the step
+/// evaluates every tool the same way it evaluates `eval_path`, and there is one
+/// answer to "which version of this tool runs" rather than two that can
+/// disagree. It also means a session needs nothing of the tool on its own disk:
+/// what a conversation runs comes from the commit it was started from.
 fn dispatch_call(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
-    name: &str,
-    arguments: &Value,
     request: &Oid,
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
     let store = caos::build_secret_store(t)?;
     let configuration = tools_configuration(t, options, id, &store)?;
-    let mut kvs = vec![
+    let kvs = vec![
         format!("--head:commit={request_head}"),
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    if matches!(name, "tool_help" | "run_tool") {
-        let object_store = open_store(t)?;
-        let (_, head) =
-            fetch_validated_head(t, &object_store, id)?.ok_or("tool conversation disappeared")?;
-        let view = Conversation::open(&object_store, &head)?;
-        match tool_resolution_scope(&object_store, &view, arguments) {
-            Ok((root, path)) => {
-                kvs.push(format!("--client-tool-root={root}"));
-                kvs.push(format!("--client-tool-path={path}"));
-                let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
-                    .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
-                if let Err(error) = resolved {
-                    // Deliver a recoverable tool error. Falling back to the server
-                    // would discard the actual client-side evaluation error.
-                    kvs.push(format!("--client-tool-error={error}"));
-                }
-            }
-            // SAY SO. Skipping quietly pushes no handoff at all, which is
-            // indistinguishable at the worker from a client too old to send
-            // one -- llm-step reports `no client tool handoff` for both. The
-            // step then evaluates server-side, the server refuses the `:@@=`
-            // it finds there, and the error names the repository's expression
-            // rather than the scope that could not be worked out here.
-            Err(error) => eprintln!(
-                "caos mcp serve: no resolution scope for {name} ({error}); \
-                 letting the step evaluate server-side"
-            ),
-        }
-    }
     let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
     let server = t.server_url()?;
     caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
-}
-
-/// Match the worker's input selection against the conversation snapshot, not
-/// the client's checkout. Generated definitions never become the tool's input.
-fn tool_resolution_scope(
-    store: &dyn ObjectStore,
-    view: &Conversation<'_>,
-    arguments: &Value,
-) -> Result<(Oid, String), String> {
-    let path = arguments["path"].as_str().ok_or("tool requires path")?;
-    paths::validate_tree_path(path)?;
-    for name in view.source_tree_names()?.into_iter().rev() {
-        if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
-            let source = view.source_tree(&name)?.ok_or("source tree disappeared")?;
-            return Ok((
-                store.read_commit(&source.commit)?.tree,
-                relative.to_string(),
-            ));
-        }
-    }
-    Ok((view.tree().clone(), path.to_string()))
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -443,7 +387,7 @@ fn read_outcome(
 
 /// The last successful tool discovery's phase timings, for `caos_status` to
 /// report -- the one place a locked-down session can see WHERE the wait went.
-/// Discovery is not just the `:@@=` eval walk `/eval-locator` sped up; it also
+/// Discovery is not just the `:@@=` resolve `/resolve-locator` does; it also
 /// runs `llm-step` in a worker, and only a measurement says which dominates.
 /// Written once per successful resolve.
 static DISCOVERY_TIMING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);

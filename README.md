@@ -581,7 +581,7 @@ there is no positional image anywhere, and nothing sniffs a bare token:
 - `:docker=<ref>` — a **digest-pinned docker image** (`<name>@sha256:<digest>`),
   stored as the blob `docker://<ref>`;
 - `:@@=<git ref>` — a worker that lives in **another repo**, pinned by commit
-  sha and fetched by the client (see the arg types below). This is how a project
+  sha and fetched by caosd (see the arg types below). This is how a project
   depends on caos without vendoring it.
 
 ### Arguments: literals, paths and pinned refs
@@ -619,18 +619,22 @@ so a value is never misread and may contain anything (no escaping):
 - `--name:docker=<ref>` → the blob `docker://<ref>` (when used as an image,
   `<ref>` must contain `@sha256:<digest>`);
 - `--name:@@=<git ref>` → a tree in **another repo**, named by a nix-style
-  flake-reference (`git+https://host/repo?rev=<40-hex>&dir=sub`, `git+ssh://…`,
-  `git+file://…`, `github:owner/repo`, or a local `path:./dir`). **A URL is a
-  name; a hash is content**, so `rev` is mandatory and must be a full commit
+  flake-reference (`git+https://host/repo?rev=<40-hex>&dir=sub`, `git+http://…`,
+  `git+git://…`, `git+ssh://…`, `git+file://…`, or `github:owner/repo`). **A URL
+  is a name; a hash is content**, so `rev` is mandatory and must be a full commit
   sha — a `ref=` naming a branch is refused, because a mutable input has no
-  business in a cache key. The **client** resolves url+rev → oid at eval time
-  (fetching the closure), and the arg entry is that oid, byte-for-byte what a
-  local `:@=` of the same content would produce: the URL never enters an
-  ArgTree, so two consumers pinning the same rev share the whole subgraph by
-  hash. Resolving a locator is a **client** step — not because a worker lacks a
-  network (it has one), but because the ArgTree is the cache key: the locator
-  has to become an oid before the request exists, or a name would sit inside
-  content-addressing. See `design/flake-inputs.md`.
+  business in a cache key. That pin is also why the unauthenticated transports
+  are in the list: an object's name is the hash of its bytes and `index-pack`
+  recomputes every name it receives, so no server can substitute content under a
+  pinned rev, whatever it authenticated as. **caosd** resolves url+rev → oid at eval time (fetching the closure), and
+  the arg entry is that oid, byte-for-byte what a local `:@=` of the same content
+  would produce: the URL never enters an ArgTree, so two consumers pinning the
+  same rev share the whole subgraph by hash. A client or a worker that meets a
+  locator asks the server (`GET /eval?root:@@=`) rather than fetching, which
+  is what lets an agent's server-side evaluation follow a pin at all. The one
+  form with no answer is `path:<dir>`: it names a live directory on the machine
+  that wrote the expression, and the server is not that machine. See
+  `design/flake-inputs.md`.
 
 The grammar is `--name[:type]=value` and extensible: a new type is a variant, a
 parse arm and a case in each resolver. The worker `caos` has no host filesystem

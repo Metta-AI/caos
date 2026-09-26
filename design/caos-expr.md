@@ -76,9 +76,12 @@ Examples:
   (design/map-then.md). Both drive the same walk (the `caos-eval` crate, behind
   an `EvalHost` that differs only in how a `run` is dispatched), so the object
   the server builds is byte-identical to the client's — `tests/eval-then`
-  asserts it. The exception is `:@@=`: a locator is resolved by the CLIENT only,
-  because it must become an oid before the request is formed, or the URL would
-  sit inside the cache key (design/flake-inputs.md).
+  asserts it. The exception is `:@@=`: a locator is resolved by the SERVER only,
+  which fetches the pinned commit and descends `dir=` through evaluation. It
+  still becomes an oid before the request carrying it is formed — that is what
+  keeps the URL out of the cache key — and a client or a worker that meets one
+  asks `GET /eval?root:@@=` rather than resolving it itself
+  (design/flake-inputs.md).
 - There is no lazy evaluation here
 - `eval-path` converts the expression into an arg tree and then requests that the arg tree is run, providing normal caching
 

@@ -161,13 +161,15 @@ Tool classes:
   (`tests/llm-eval-path`). `--catch` makes a path that cannot be evaluated an
   `is_error` tool_result, which matters more here than for a tool: the model
   asked what a path evaluates to, and "it doesn't" is an answer.
-  *Known gap:* the walk is the SERVER's, and the server refuses a `:@@=`
-  locator by design (only a client has the secret-availability model), so
-  `eval_path` cannot yet evaluate a tree whose expressions pin another repo by
-  locator. `run_tool`/`tool_help` get around that with the client handoff in
-  `mcp::dispatch_call` (`--client-tool-root`/`-path`/`-tree`); extending it to
-  `eval_path` needs a kind-preserving `eval_tree_tool`, since an eval_path
-  answer may legitimately be a blob.
+  The walk is the SERVER's, and the server RESOLVES a `:@@=` locator
+  (`server::locator`), so `eval_path ./caos-std` in a client repo evaluates the
+  repository's root expression, follows its pin, and hands the model the mounted
+  tree. That was the gap this closed: the server used to refuse a locator, so
+  `run_tool`/`tool_help` needed a client handoff
+  (`--client-tool-root`/`-path`/`-tree` in `mcp::dispatch_call`) that resolved
+  the path against the session's own checkout — a second resolver, which
+  `eval_path` could not use anyway because its answer may legitimately be a
+  blob. The handoff is gone; all three tools take the same route.
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
   includes the source tree **with `.caos/` stripped** — tools never see
   transcripts, and tool cache keys stay identical to real source trees.

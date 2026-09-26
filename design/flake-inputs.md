@@ -17,11 +17,12 @@ traps have already been sprung.
 | 2B | `.caos-expr` grammar collapse: `run`/`curry` take `--base`, no positional/`--`; add `:docker=`/`:hash=`; migrate all `.caos-expr` | ✅ done (33/33), **no redeploy needed** |
 | 3 | `:@@=` remote git-ref *parse* (`GitRef{url,rev,dir}` + validation) | ✅ done (33/33), **no redeploy needed** |
 | 2C | CLI + worker `caos` grammar collapse: drop the positional image (and the `--`) everywhere; type the map-then positions; delete the last sniffers | ✅ done (33/33), **needed a redeploy** |
-| 4 | `:@@=` *resolution* (client-side fetch → oid) | ✅ done (34/34), **no redeploy needed** |
+| 4 | `:@@=` *resolution* (fetch → oid) | ✅ done (34/34), **no redeploy needed** |
 | 4a | `dir=` descends through EVALUATION, not a raw tree walk — the fix that makes an ordinary `std/<x>` reachable by locator | ✅ done (35/35) |
 | 4b | `$CAOS_EXPR` — an expression's own blob, pre-bound; the only way a worker can see the directive that launched it | ✅ done (35/35) |
 | 5 | `std/flake-input-loader` — mount a pinned input into a consumer's tree, checking the pin against `flake.lock` | ✅ done (36/36) |
 | 6 | Docs + tests (README, `tests/remote-ref`, `tests/flake-input-loader`) | ✅ done |
+| 7 | Resolution moves to **caosd** — one resolver, so a server-side eval can follow a pin | ✅ done, **needed a redeploy** |
 
 The goal is met: a consumer repo pins caos with a `git+https://…caos?rev=<sha>`
 locator and reaches `std/*` by descent — nothing committed, all
@@ -76,16 +77,21 @@ whose pin is a content hash, so it caches like everything else.
 ## Core principle (holds for all remaining stages)
 
 A **URL is a name; a hash is content.** A remote ref MUST carry a mandatory
-`rev` (a full commit sha), and the client resolves `url + rev → oid` **at eval
-time**, fetching the closure into the CAS. From that point it is an ordinary
-oid. **A URL never sits inside an ArgTree / cache key.** Resolution is a
-**client** step — NOT because a worker lacks a network (it has one; see
-AGENTS.md "Workers"), and NOT for determinism (the mandatory full `rev` gives
-that wherever it resolves), but because the ArgTree IS the cache key: the
-locator must become an oid before the request exists, or the URL sits in the key
-and two consumers pinning the same rev through different URLs get different keys
-for identical content. The resolved arg entry is a plain tree/blob oid, so they
-share the whole deepened subgraph by hash instead.
+`rev` (a full commit sha), and `url + rev → oid` is resolved **at eval time**,
+fetching the closure into the CAS. From that point it is an ordinary oid. **A
+URL never sits inside an ArgTree / cache key.** The constraint is on WHEN, not
+on who: the ArgTree IS the cache key, so the locator must become an oid before
+the request exists, or the URL sits in the key and two consumers pinning the
+same rev through different URLs get different keys for identical content. The
+resolved arg entry is a plain tree/blob oid, so they share the whole deepened
+subgraph by hash instead.
+
+Resolution happens on the **server** (stage 7). It was the client's at first,
+and the argument above was misread as requiring that; it never did — the server
+resolves at the same point in the same walk. What forced the move is that a
+server-side evaluation (an agent's) has no client to ask, and a session now
+starts from a client repo whose root expression is a pin. Determinism was never
+the reason either: the mandatory full `rev` gives that wherever it resolves.
 
 We borrow **nix's flake-reference string grammar** as the locator *syntax only*.
 No nix runs; nothing evaluates a flake. It is just a well-specified string format
@@ -113,7 +119,9 @@ stage 4.
 Notes:
 - **`:@=` vs `:@@=` — two operators, deliberately.** `:@=` stays a bare path
   (the common case; no `path:` prefix to type). `:@@=` takes the full ref
-  grammar. Local refs *can* be `:@@=path:./x`, but you'd rarely bother.
+  grammar. `path:` parses but no longer RESOLVES: it names a live directory on
+  the machine that wrote the expression, and the only resolver is the server
+  (stage 7). `:@=` is the operator for a path.
 - **`:docker=` / "stop sniffing" is a parse-time change only.** `:docker=alpine`
   still *stores* the blob `docker://alpine`, so the downstream
   `docker://`-prefix checks — `resolve_cas_image` reading a CAS file's content,
@@ -130,7 +138,9 @@ Canonical:
 ```
 git+https://github.com/company/repo?rev=<40-hex>&dir=std/deep-deps
 git+ssh://git@github.com/company/repo?rev=<40-hex>&dir=x
-path:./some/dir            # local, no rev
+git+http://host:port/repo?rev=<40-hex>&dir=x
+git+git://host:port/repo?rev=<40-hex>&dir=x
+path:./some/dir            # parsed, but no longer resolvable — see stage 7
 git+file:///abs/repo?rev=<40-hex>&dir=x
 ```
 
@@ -165,32 +175,26 @@ value; the `:`-type split runs on the **key** only, so `://` is untouched; and
 `.caos-expr` comments are **full-line only** (`eval.rs` trims then checks
 `starts_with('#')`), so a value may contain anything.
 
-## Stage 4: `:@@=` resolution — ✅ DONE
+## Stage 4: `:@@=` resolution — ✅ DONE (server-side since stage 7)
 
-Client-side only, so it landed with **no redeploy**; 34/34 with a new
-`tests/remote-ref`. `ArgType::Remote` + the `parse_arg` arm, and one resolver —
-`resolve_remote_arg` — behind every `:@@=` position:
+`ArgType::Remote` + the `parse_arg` arm, and one resolver behind every `:@@=`
+position. **The resolver moved to the server in stage 7** (below); what this
+section describes is the shape, which did not change:
 
-- **`Transport::fetch_git_ref(url, rev)`**, defaulting to `Ok(None)`. That
-  default is not an oversight: the worker's `HttpTransport` has no repo to fetch
-  INTO, and resolution belongs before the request exists so the key stays
-  content-addressed. (Not a sandbox — a worker has a network and uses it.) By
-  the time a worker sees a `:@@=` arg it is an ordinary oid. `tests/remote-ref/check.sh` asserts the refusal from inside a
-  worker.
 - **Pin, fetch, then select** — the order is the content-addressing argument.
   `git fetch <url> <rev>` (the granularity a host will serve), peel the
-  commit to its tree, descend `dir=`. A `path:` skips the fetch and ingests a
-  live local directory, exactly as `:@=` does.
+  commit to its tree, descend `dir=`.
 - **Wired in three places, each behaving like its `:@=` sibling** — that is the
   whole rule, so where a tree came from never changes what naming it means:
   `build_arg_entries` (a plain arg → the oid), `resolve_base` (an image → the
   oid, then evaluated), and `resolve_expr_args`/`resolve_expr_base` in the
   evaluator (evaluated if it carries a `.caos-expr`, raw if not — the
-  worker-vs-data rule, now factored out as `eval_if_evaluable` and shared).
-- **A rev is a pin, so re-resolving is free.** `fetch_git_ref` returns early when
-  the commit is already local or a previous fetch retained its tree under
-  refs/caos/locator-trees/<commit>. That ref is both a commit-to-tree cache
-  and a GC root. The test deletes the source repository and resolves again.
+  worker-vs-data rule, factored out as `eval_if_evaluable` and shared).
+- **A rev is a pin, so re-resolving is free.** The fetch returns early when the
+  commit is already in the store, or when a previous fetch retained its tree
+  under `refs/caos/locator-trees/<commit>`. That ref is both a commit-to-tree
+  cache and a retention root. `tests/remote-ref` deletes the source repository
+  and resolves again.
 
 ### ⚠️ `git fetch` and a partial ALTERNATE object store
 
@@ -199,8 +203,69 @@ Client-side only, so it landed with **no redeploy**; 34/34 with a new
 alternate holds a deliberate SUBSET then fails with `missing blob object <x>`
 naming an object that has nothing to do with the fetch, blamed on the fetch.
 The old test harness created this shape; it no longer gives client repositories
-an alternate. Locator fetching now uses a fresh temporary repository, so it
-cannot accidentally walk the caller's alternate tips. Other fetches must decide
+an alternate. Locator fetching uses a fresh temporary repository with no
+alternate at all, so it cannot walk anyone's tips. Other fetches must decide
+whether alternate history is part of the closure they are completing.
+
+## Stage 7: the resolver is the SERVER's — ✅ DONE
+
+Stage 4 put resolution on the client and argued at length for it. The argument
+was right about the WHAT and wrong about the WHO.
+
+**What it was right about:** the ArgTree is the cache key, so a locator has to
+become an oid before the request carrying it is formed. Otherwise the URL sits
+inside content-addressing and two consumers pinning one rev through a fork, a
+mirror, or ssh-vs-https key identical content differently. That is still true,
+and the server resolves at the same point in the same walk — `caos_eval`'s
+`EvalHost::resolve_remote`, called while the args tree is being assembled.
+
+**What broke it:** the agent. A conversation's tree is evaluated SERVER-SIDE
+(`eval-path-then`, the `eval` continuation), and a session now starts from a
+commit in a client repo — a handful of text files that pin caos and mount its
+`std/` (`integrations/claude-code/cloud/README.md`). There is no source tree on
+anyone's disk to fall back to, so a walk that reaches the pin and cannot follow
+it has nowhere to go. Measured, before: `eval_path ./caos-std` died with
+`cannot resolve "github:…&dir=std/flake-input-loader": a :@@= locator is
+resolved by the CLIENT`, and `run_tool`/`tool_help` only worked because
+`caos mcp serve` pre-resolved their paths against the session's own checkout and
+shipped the answer as `--client-tool-root`/`-path`/`-tree`. That handoff was a
+second resolver, reading a different tree from the one the conversation records,
+and the two could disagree about which version of a tool runs.
+
+**What it is now.** `server::locator` turns a pin into a tree three ways, in
+order: the memo ref `refs/caos/locator-trees/<rev>`; `<rev>^{tree}` for a commit
+the server already holds (which is the whole of how `git+caos://` — a dev
+session's rewritten pin — resolves, since that URL names the server itself); and
+otherwise a `--depth=1` fetch into a disposable bare repo, of which only the
+TREE closure is published. That last point matters: a shallow boundary or an
+incomplete commit in the live store would fail the server's own startup
+connectivity check, and a locator wants a snapshot rather than a history anyway.
+`GET /eval?root:@@=<locator>` exposes the whole thing, so `caos-cli` and a
+worker both ask rather than resolve — and a worker can now `curry` a `:@@=` arg,
+which `tests/remote-ref/check.sh` used to assert it could not.
+
+**One endpoint, because the root is the only difference.** `/eval` also takes
+`root:hash=<oid>&path=<p>`, which starts the same walk from an object the store
+already holds; the locator form fetches first and then descends `dir=`. These
+were two endpoints, `/eval-locator` and `/resolve-locator`, and the names were
+the defect: `resolve` elsewhere in this tree means a RAW lookup that cannot
+evaluate (`gitlinks::resolve`, `locator::resolve_root`), while `/eval-locator`
+took no locator at all — it was named after its caller. Typing the root says
+what both were for, in the vocabulary `--base:hash=`/`--base:@@=` already uses.
+The rule worth keeping: **`resolve_` is a lookup that cannot evaluate; `eval_`
+may build things.**
+
+**The casualty is `path:`**, which names a live directory on the machine that
+wrote the expression. Nothing resolves one; it is refused by name, because the
+alternative is telling an author that a directory they are looking at does not
+exist. `:@=` covers a path in the repository being evaluated.
+
+**Credentials** ride the same `X-Caos-Git-Token` header `POST /git/import` takes,
+scoped by git's credential helper to the one HTTPS URL. A public pin needs none.
+`git-locator::locator::fetch_command` keeps `import`'s hardening — cleared
+environment, no ambient credential helper, no config injection, no redirects, a
+timeout — and widens only the protocol set to the schemes the locator grammar
+names.
 whether alternate history is part of the closure they are completing.
 
 
@@ -240,12 +305,14 @@ redeploy** and no stack fixture: `GitRef { url, rev: Option, dir: Option }` plus
 `parse_git_ref` in `lib.rs`, with a `git_ref_tests` module covering each rule.
 The validation *is* the feature — it is what makes a URL behave like content:
 
-- a git scheme (`git+https://`, `git+ssh://`, `git+file://`, `github:`) **must**
+- a git scheme (`git+https://`, `git+http://`, `git+git://`, `git+ssh://`,
+  `git+file://`, `github:`) **must**
   carry `rev=<40-hex>`; no rev is an error, and a short rev is an error;
 - a `ref=` (branch/tag) is **rejected outright**, even alongside a `rev=` —
   mutable input never enters a cache key, and refusing the ambiguous both-form
   keeps there from being a "which won?" question;
-- `path:` is a plain local directory: **no** rev (hashed live, like `:@=`);
+- `path:` is a plain local directory: **no** rev. The PARSER still accepts it;
+  nothing resolves it any more (stage 7), so it is refused by name;
 - unknown scheme, unknown query key, a non-`key=value` query part and a repeated
   `rev=`/`dir=` are all errors — the grammar is closed, so a typo can't be
   silently ignored into a wrong-but-plausible fetch.
@@ -493,11 +560,11 @@ them. What is left is optional polish or a deliberate refusal:
   object reference, not text you can splice into a value. If `--k=…$PIN…`
   substituted a string, the pin could be written once. Nice, not needed: the
   loader's check is what stops the two from drifting.
-- **Worker-side locator resolution** stays out of scope — not for confinement
-  (workers have a network), but because it would move resolution AFTER the
-  ArgTree is formed, putting a URL inside the cache key. The `Ok(None)` default
-  on `Transport::fetch_git_ref` holds that line, and `tests/remote-ref` asserts
-  it from inside a worker.
+- **A worker RESOLVES a locator now**, by asking the server, so the old refusal
+  is gone. It never was about confinement (workers have a network); it was about
+  resolution landing before the ArgTree is formed, and a worker that asks the
+  server gets its oid at exactly that point. `tests/remote-ref/check.sh` asserts
+  a worker's resolve lands on the same oid the client's does.
 - **`ref=` (a branch/tag) stays refused**, with no plan to relax it. Anyone who
   wants a lockfile — and `std/flake-input-loader` now CHECKS the expression
   against one. The refusal is the invariant, not a missing feature.

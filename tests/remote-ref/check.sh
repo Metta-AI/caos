@@ -6,11 +6,15 @@
 # caller needs to check its claim: that a locator resolves to the foreign repo's
 # own oid, and to the same oid a local `:@=` of the same bytes produces.
 #
-# It also asserts, from in here, that a WORKER cannot resolve a locator at all.
-# Not because a worker lacks a network — it has one, and uses it — but because
-# the ArgTree is the cache key: a locator must become an oid BEFORE the request
-# is formed, or a URL would sit inside content-addressing and one key would mean
-# different things at different times (design/flake-inputs.md).
+# It also resolves one FROM IN HERE. That used to be the assertion that a worker
+# CANNOT: resolution was the client's, so `caos curry --x:@@=…` in a worker was
+# refused on principle. The principle was always about the cache key — a locator
+# must become an oid before the request is formed — and never about a sandbox;
+# a worker has a network and uses it. What it lacks is a repository to fetch
+# into, and now it does not need one: the SERVER resolves, and a worker reaches
+# the server over the same HTTP it uses for everything else. The oid this
+# produces has to be the one the client got, or "the URL is not in the key" is
+# not true.
 set -euo pipefail
 
 out=/tmp/report
@@ -19,25 +23,22 @@ for name in tree file whole local; do
   printf '%s %s\n' "$name" "$(caos hash "/cas/args/$name")" >> "$out"
 done
 
-# Not just resolved — DELIVERED. The oids came from a repo the server has never
-# heard of, so reading the content here proves the client pushed the fetched
-# closure along with the request, exactly as it does for a local path arg.
+# Not just resolved — DELIVERED. The oids came from a repo neither this worker
+# nor the client has ever held, so reading the content here proves the server's
+# fetch published into the object store every consumer reads from.
 caos get -r /cas/args/tree
 printf 'note %s\n' "$(cat /cas/args/tree/note.txt)" >> "$out"
 
-# A well-formed locator, refused for WHO is asking rather than for what it says:
-# the host is never contacted (`example.invalid` is reserved as unresolvable, so
-# a regression that did try to fetch fails here too, just more slowly).
-rev=$(printf 'a%.0s' {1..40})
-if caos curry --base:@=/cas/args/base "--x:@@=git+https://example.invalid/r?rev=$rev" \
-     >/dev/null 2>/tmp/err; then
-  echo "FAIL: a worker resolved a remote ref" >&2
-  exit 1
-fi
-if ! grep -q 'CLIENT capability' /tmp/err; then
-  echo "FAIL: a worker's :@@= failed for the wrong reason: $(cat /tmp/err)" >&2
-  exit 1
-fi
-printf 'worker-refused ok\n' >> "$out"
+caos get /cas/args/repo
+caos get /cas/args/sha
+repo=$(cat /cas/args/repo)
+sha=$(cat /cas/args/sha)
+worker_node=$(caos curry --base:@=/cas/args/base "--x:@@=$repo?rev=$sha&dir=payload") \
+  || { echo "FAIL: a worker could not resolve a remote ref" >&2; exit 1; }
+# Read the binding back off the curried node as a PLACEHOLDER — `resolve` records
+# the hash without fetching the content, which is the same way the four args
+# above are read.
+caos resolve "$worker_node" args/x /cas/worker-x
+printf 'worker-tree %s\n' "$(caos hash /cas/worker-x)" >> "$out"
 
 caos put "$out" /cas/out

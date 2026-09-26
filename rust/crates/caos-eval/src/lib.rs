@@ -18,7 +18,7 @@
 //! curry assembly — which is what lets a worker request eval server-side and get
 //! the exact object a client `eval-path` would build.
 //!
-//! One capability is deliberately client-only: `EvalHost::resolve_remote`
+//! One capability is deliberately client-only: `EvalHost::eval_remote`
 //! (`:@@=`). A locator has to become an oid before the request is formed, or the
 //! URL would sit inside the cache key and two consumers pinning the same rev
 //! through different URLs would key differently. The default implementation
@@ -185,7 +185,7 @@ pub trait EvalHost {
     /// and — the real reason — a locator must become an oid *before* the request
     /// is formed, or its URL would sit in the cache key. Hosts that cannot fetch
     /// keep this default, whose error says where the resolution belongs.
-    fn resolve_remote(&self, value: &str) -> Result<(EntryMode, gix::ObjectId), String> {
+    fn eval_remote(&self, value: &str) -> Result<(EntryMode, gix::ObjectId), String> {
         Err(format!(
             "cannot resolve {value:?}: a `:@@=` locator is resolved by the CLIENT, \
              so it must already be an oid by the time this host evaluates it"
@@ -679,7 +679,7 @@ fn resolve_expr_base(
         // EVALUATION, so a pinned consumer reaches `dir=std/<x>` exactly as caos
         // reaches its own entries (design/flake-inputs.md).
         ArgType::Remote => {
-            let (mode, oid) = host.resolve_remote(value)?;
+            let (mode, oid) = host.eval_remote(value)?;
             if !mode.is_tree() {
                 return Err(format!(
                     "eval-path: git ref {value:?} names a file, not an image tree"
@@ -729,7 +729,7 @@ fn resolve_expr_args(
                 // descends `dir=` through evaluation, so this is already the
                 // same rule `:@=` applies (an expression is evaluated, data is
                 // referenced raw) — just to a tree that arrived from elsewhere.
-                ArgType::Remote => host.resolve_remote(value)?,
+                ArgType::Remote => host.eval_remote(value)?,
                 // `:docker=<ref>` — the blob `docker://<ref>`.
                 ArgType::Docker => (
                     EntryKind::Blob.into(),

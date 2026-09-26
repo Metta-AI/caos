@@ -126,22 +126,6 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     report_conventions(t, &name, &result)
 }
 
-/// Evaluate a tool path against its selected source or conversation snapshot.
-/// Locator resolution and secret marking remain client-side.
-pub fn eval_tree_tool(
-    t: &dyn Transport,
-    root: &str,
-    path: &str,
-    store: &[ClientSecret],
-) -> Result<String, String> {
-    let (kind, oid) = eval::eval_path(t, root, path, store)?;
-    if kind != "tree" {
-        return Err(format!("{path} evaluates to a {kind}, not a tool ArgTree"));
-    }
-    t.ensure_pushed(&oid)?;
-    Ok(oid)
-}
-
 /// Print a tool result's report conventions, reading ONLY the objects they
 /// name: the top tree and a `report` blob, or the result itself when it is one.
 /// A tool with no `report` (`build` returns an image) costs exactly one object.
@@ -400,27 +384,6 @@ pub trait Transport {
     /// reaches it as a hash or a `/cas` path); the git transport overrides this
     /// to resolve against the working repo.
     fn resolve_revspec(&self, _rev: &str) -> Result<Option<gix::ObjectId>, String> {
-        Ok(None)
-    }
-
-    /// Fetch the tree of a pinned commit into local storage and return its OID,
-    /// or None if this transport has no repository to fetch into.
-    ///
-    /// `None` is the default because the worker's [`HttpTransport`] speaks only
-    /// `/object`: there is no working repo and no `caos` remote to negotiate
-    /// with. NOT because a worker lacks a network — it plainly has one (it
-    /// reaches the server over HTTP, and `std/llm-client` and
-    /// `std/flake-builder` both call out to the internet).
-    ///
-    /// What resolution being CLIENT-side buys is that the KEY IS CONTENT rather
-    /// than a name — not determinism, which the mandatory full `rev` already
-    /// gives wherever it is resolved. The ArgTree *is* the cache key, so the
-    /// locator must become an oid before the request is formed; otherwise the
-    /// URL sits in the key and two consumers pinning the same rev through
-    /// different URLs get different keys for identical content. By the time a
-    /// worker sees this arg it is an ordinary oid, resolved before the request
-    /// existed (design/flake-inputs.md).
-    fn fetch_git_ref(&self, _url: &str, _rev: &str) -> Result<Option<gix::ObjectId>, String> {
         Ok(None)
     }
 
@@ -863,71 +826,6 @@ impl Transport for GitTransport {
             )
             .map_err(|e| format!("resolving {rev:?} to a commit: {e}"))?;
         parse_oid(out.trim()).map(Some)
-    }
-
-    fn fetch_git_ref(&self, url: &str, rev: &str) -> Result<Option<gix::ObjectId>, String> {
-        let tree_ref = format!("refs/caos/locator-trees/{rev}");
-        for name in [rev, tree_ref.as_str()] {
-            if let Ok(tree) = self.git_capture(
-                &["rev-parse", "--verify", &format!("{name}^{{tree}}")],
-                None,
-            ) {
-                return parse_oid(tree.trim()).map(Some);
-            }
-        }
-        // A locator needs a snapshot, not history. Keep the shallow boundary
-        // and incomplete commit in a disposable repo; copy only its tree closure.
-        let scratch = scratch_dir()?;
-        let result = (|| {
-            let git = |args: &[&str]| git_capture_in(args, None, &scratch);
-            git(&["init", "--bare", "--quiet"])?;
-            git(&[
-                "fetch",
-                "--quiet",
-                "--depth=1",
-                "--no-tags",
-                "--no-write-fetch-head",
-                "--",
-                url,
-                rev,
-            ])?;
-            let tree = git(&[
-                "rev-parse",
-                "--verify",
-                &format!("{rev}^{{commit}}^{{tree}}"),
-            ])?;
-            let tree = tree.trim();
-            let pack = scratch.join("tree.pack");
-            let mut writer = std::process::Command::new("git")
-                .current_dir(&scratch)
-                .args(["pack-objects", "--stdout", "--revs"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::fs::File::create(&pack).map_err(|e| e.to_string())?)
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            let written = writeln!(writer.stdin.take().unwrap(), "{tree}");
-            let status = writer.wait().map_err(|e| e.to_string())?;
-            written.map_err(|e| e.to_string())?;
-            if !status.success() {
-                return Err("packing locator tree failed".into());
-            }
-            let status = std::process::Command::new("git")
-                .current_dir(&self.work_dir)
-                .args(["index-pack", "--stdin"])
-                .stdin(std::fs::File::open(&pack).map_err(|e| e.to_string())?)
-                .stdout(std::process::Stdio::null())
-                .status()
-                .map_err(|e| e.to_string())?;
-            if !status.success() {
-                return Err("storing locator tree failed".into());
-            }
-            // The ref maps the pin to its tree across processes and retains the
-            // complete tree for GC. No foreign commit enters the caller's store.
-            self.run_git(&["update-ref", &tree_ref, tree])?;
-            parse_oid(tree).map(Some)
-        })();
-        let _ = std::fs::remove_dir_all(scratch);
-        result.map_err(|e| format!("fetching {rev} from {url}: {e}"))
     }
 
     fn server_url(&self) -> Result<String, String> {
@@ -3051,7 +2949,7 @@ fn build_arg_entries(
             // only) and reduced to its oid, so what the request carries is
             // indistinguishable from a local path arg.
             ArgType::Remote => {
-                resolve_remote_arg(t, value, &[]).map_err(|e| format!("`{name}`: {e}"))?
+                eval_remote_arg(t, value, &[]).map_err(|e| format!("`{name}`: {e}"))?
             }
         };
 
@@ -3213,7 +3111,7 @@ fn resolve_base_with_store(
         // names caos' `std/<x>` by locator and gets a runnable image, with only
         // the oid entering its cache key (design/flake-inputs.md).
         ArgType::Remote => {
-            let (mode, oid) = resolve_remote_arg(t, value, store)?;
+            let (mode, oid) = eval_remote_arg(t, value, store)?;
             if !mode.is_tree() {
                 return Err(format!("git ref {value:?} names a file, not an image tree"));
             }
@@ -3230,150 +3128,94 @@ fn resolve_base_with_store(
 pub use git_locator::{parse_git_ref, GitRef};
 
 /// Resolve a `--name:@@=<ref>` argument to the `(mode, oid)` of the tree (or
-/// blob) it names, fetching from another repo if that is what the locator says.
-/// The oid is all that survives: URL and rev are fetch coordinates, so the arg
-/// entry is byte-for-byte what a local `:@=` of the same content would produce
-/// and two consumers pinning the same rev share the whole subgraph by hash
+/// blob) it names, by ASKING THE SERVER (`GET /eval?root:@@=`). The oid is all
+/// that survives: URL and rev are fetch coordinates, so the arg entry is
+/// byte-for-byte what a local `:@=` of the same content would produce and two
+/// consumers pinning the same rev share the whole subgraph by hash
 /// (design/flake-inputs.md).
 ///
-/// Three steps, and the ORDER is the content-addressing argument: pin (the rev,
-/// already validated by [`parse_git_ref`]), fetch, then select (`dir=`). We fetch
-/// a COMMIT because that is what a host will serve, and descend within it —
-/// rather than naming a subtree hash, which nothing would hand us.
+/// **The fetch is the SERVER's, and the content-addressing argument is
+/// unchanged by that.** What the argument requires is that a locator become an
+/// oid BEFORE the ArgTree carrying it is assembled — otherwise the URL sits in
+/// the cache key and two consumers pinning one rev through a fork, a mirror or
+/// ssh-vs-https key identical content differently. That is still exactly where
+/// this happens; only the process doing the fetching moved. What moving it buys
+/// is the case that had no client at all: an agent's tree is evaluated
+/// server-side, so a conversation whose root expression pins caos used to die on
+/// its own repository (`eval_path ./caos-std`), and `caos mcp serve` had to
+/// pre-resolve tool paths on the session's disk to work around it.
 ///
-/// **`dir=` names a path in the EVALUATED tree**, not the raw one: the descent
-/// goes through [`eval::eval_path`], which applies every `.caos-expr` from the
-/// repo root down, exactly as `eval-path` does for a local tree. That is not a
-/// convenience — it is what makes an ordinary std entry reachable at all. A raw
-/// walk hands the evaluator a bare `std/<x>` directory whose expression names
-/// `DEEP-DEPS/<dep>` mounts that only exist once the ROOT expression has
-/// deepened the tree, so it fails with `base path "DEEP-DEPS/…" not found in
-/// tree`; and a seeded entry like `std/rustc` forms its key from its *deepened*
-/// entry, which a raw fetch cannot reproduce. Descending through evaluation
-/// makes a pinned consumer see caos exactly as caos sees itself.
-fn resolve_remote_arg(
+/// **`dir=` names a path in the EVALUATED tree**, not the raw one: the server
+/// descends it with the same `.caos-expr` walk `eval-path` runs, from the repo
+/// root down. That is not a convenience — it is what makes an ordinary std entry
+/// reachable at all. A raw walk hands the evaluator a bare `std/<x>` directory
+/// whose expression names `DEEP-DEPS/<dep>` mounts that only exist once the ROOT
+/// expression has deepened the tree, so it fails with `base path "DEEP-DEPS/…"
+/// not found in tree`; and a seeded entry like `std/rustc` forms its key from
+/// its *deepened* entry, which a raw fetch cannot reproduce. Descending through
+/// evaluation makes a pinned consumer see caos exactly as caos sees itself.
+///
+/// One request, not a walk: `/eval` does the fetch and the descent
+/// inside the server, where each hop is sub-millisecond. The local walk this
+/// replaced was measured at ~54 round trips, which over a cloud session's
+/// tunnel was ~30s.
+fn eval_remote_arg(
     t: &dyn Transport,
     value: &str,
     store: &[ClientSecret],
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
+    // Parsed here as well as on the server so a malformed locator — no rev, a
+    // mutable `ref=`, a short sha — is refused without a round trip, and the
+    // error quotes what the caller wrote.
     let git_ref = parse_git_ref(value)?;
-
-    // MEMOIZED FOR THE FETCH SCHEMES ONLY, and the split is the pin: a `git+` /
-    // `github:` locator carries a mandatory full commit sha, so the whole
-    // resolution — fetch, peel, descend — is immutable and the locator string is
-    // a content key like any other. A `path:` locator reads a LIVE directory,
-    // whose bytes change under an editor, so it is re-ingested every time.
-    //
-    // Worth its own memo on top of `eval_path`'s: a repeat here also skips the
-    // `git cat-file` that `fetch_git_ref` probes with and the commit peel, so a
-    // consumer naming one pin twice touches git once.
-    let memo_key = (!git_ref.is_plain_dir()).then(|| format!("{}\u{0}{value}", store_key(store)));
-    if let Some(key) = &memo_key {
-        if let Some(hit) = REMOTE_ARG_MEMO.get(key) {
-            return Ok(hit);
-        }
+    if git_ref.is_plain_dir() {
+        return Err(format!(
+            "git ref {value:?}: a `path:` locator names a directory on this machine, \
+             and locators are resolved by the caos server. Use `:@=<path>` for a \
+             path in this repository, or pin the tree with `git+…?rev=<sha>`"
+        ));
     }
 
-    // `path:` — a live local directory, hashed now, exactly like a `:@=` path
-    // (so "only what git tracks is visible" still holds). No rev: there is
-    // nothing to pin, because there is no fetch.
-    let root = if git_ref.is_plain_dir() {
-        let dir = git_ref
-            .url
-            .strip_prefix("path:")
-            .expect("is_plain_dir checked the prefix");
-        let (mode, oid) = t.ingest_path(dir)?.ok_or_else(|| {
-            format!("`:@@=path:` reads a host directory, which this client cannot do ({dir})")
-        })?;
-        // A file has nothing to descend into and no expression to apply.
-        if !mode.is_tree() {
-            if let Some(dir) = &git_ref.dir {
-                return Err(format!(
-                    "git ref {value:?}: `dir={dir}` but {} names a file",
-                    git_ref.url
-                ));
-            }
-            return Ok((mode, oid));
-        }
-        oid
-    } else {
-        let rev = git_ref
-            .rev
-            .as_deref()
-            .expect("parse_git_ref requires a rev for every fetch scheme");
-        let url = git_ref.fetch_url();
-        t.fetch_git_ref(&url, rev)?.ok_or_else(|| {
-            format!(
-                "cannot fetch {value:?}: resolving a remote ref is a CLIENT capability; \\
-                 a remote locator must already be an oid by the time a worker sees it"
-            )
-        })?
-    };
+    // A `git+`/`github:` locator carries a mandatory full commit sha, so the
+    // whole resolution — fetch, peel, descend — is immutable and the locator
+    // string is a content key like any other. The server memoizes it too (a ref
+    // per pin, plus `/eval`'s result cache); this one saves the request.
+    let key = format!("{}\u{0}{value}", store_key(store));
+    if let Some(hit) = REMOTE_ARG_MEMO.get(&key) {
+        return Ok(hit);
+    }
 
-    let dir = git_ref.dir.as_deref().unwrap_or("");
-    // Evaluate SERVER-SIDE, not with a local `.caos-expr` walk. The walk is
-    // CHATTY -- measured ~54 round trips -- which is 0.1s over a loopback and
-    // costs whatever the link costs otherwise. `/eval-locator` does the whole
-    // walk inside the server, where each hop is sub-millisecond, so this makes
-    // ONE request. The result is byte-identical to `eval_path` (secret marking
-    // is a no-op through eval; it happens when the step RUNS).
-    //
-    // WORTH MORE THAN IT LOOKS, and worth keeping even though the transport it
-    // was written for is gone. Over the dumbpipe tunnel this replaced, those 54
-    // round trips were 54 fresh CONNECTIONS — dumbpipe dials the far endpoint
-    // per accepted socket — and took ~30s. `caos://` costs a stream rather than
-    // a handshake and reaches the server directly
-    // (design/iroh-transport.md), so the same walk is now well under a second;
-    // one request still beats 54, and over a genuinely distant server the
-    // difference is the round trips, which nothing local can remove.
-    //
-    // Falls back to the local walk on any failure: an older server without the
-    // endpoint, or a real eval error, both land here, and the local walk then
-    // either succeeds (slowly) or reproduces the same error to report.
-    let (kind, hash) = eval_locator_on_server(t, &root.to_string(), dir, store)
-        .or_else(|_| eval::eval_path(t, &root.to_string(), dir, store))
-        .map_err(|e| format!("git ref {value:?}: {e}"))?;
+    let (kind, hash) = request_compute_url(
+        &t.server_url()?,
+        &format!("/eval?root:@@={}", percent_encode(value)),
+        &secret_store_header(store),
+    )
+    .map_err(|e| format!("git ref {value:?}: {e}"))?;
     let resolved = (eval::mode_of_kind(&kind), parse_oid(&hash)?);
-    if let Some(key) = memo_key {
-        REMOTE_ARG_MEMO.put(key, resolved);
-    }
+    REMOTE_ARG_MEMO.put(key, resolved);
     Ok(resolved)
 }
 
-/// [`resolve_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`, for the
-/// pinned schemes only. See the split at the top of that function.
+/// [`eval_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`. Scoped
+/// by the secret store because the descent may `curry`, and a curry is marked
+/// with the caller's identity (design/secrets.md).
 static REMOTE_ARG_MEMO: eval::Memo<(gix::objs::tree::EntryMode, gix::ObjectId)> = eval::Memo::new();
 
-/// Evaluate `dir` within the tree `root` on the SERVER, via `/eval-locator` --
-/// [`resolve_remote_arg`]'s fast path. Pushes `root` so the server can read it,
-/// then makes ONE request in place of the local walk's ~54. Returns
-/// `(kind, hash)`, exactly as [`eval::eval_path`] does, so the two are
-/// interchangeable and the caller can fall back to the walk on any failure.
-fn eval_locator_on_server(
-    t: &dyn Transport,
-    root: &str,
-    dir: &str,
-    store: &[ClientSecret],
-) -> Result<(String, String), String> {
-    // The server percent-decodes a query value and splits on `&`; a `#` ends the
-    // query. A path carrying any of those (or a `%`) is left to the local walk.
-    if dir.chars().any(|c| matches!(c, '&' | '#' | '%')) {
-        return Err(format!("eval dir {dir:?} has a query-unsafe character"));
+/// Percent-encode a URL component: everything but the unreserved set, so a
+/// locator carrying `&`, `=`, `#` or `%` survives being spliced into a query.
+/// The server decodes the same way (`compute::percent_decode`).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
     }
-    t.ensure_pushed(root)?;
-    request_compute_url(
-        &t.server_url()?,
-        &format!("/eval-locator?in={root}&eval={dir}"),
-        &secret_store_header(store),
-    )
+    out
 }
-
-/// Resolve curry layers, build the args tree, bundle + push the request, and run
-/// it — the CLI's blocking run. Ordinary worker sub-runs are continuations the
-/// server resolves; detached worker work uses `sub-run` to retain the current
-/// server-side run context. Returns the server's
-/// `(kind, result-hash)`. `cas` is `None` here: every path arg is a host path to
-/// ingest.
 fn run_request(
     t: &dyn Transport,
     image: &str,
@@ -6060,8 +5902,6 @@ mod tool_resolution_tests {
     #[derive(Default)]
     struct Store {
         objects: RefCell<HashMap<String, (String, Vec<u8>)>>,
-        remote: RefCell<Option<gix::ObjectId>>,
-        fetches: Cell<usize>,
         computes: Cell<usize>,
     }
     impl Transport for Store {
@@ -6085,10 +5925,6 @@ mod tool_resolution_tests {
         fn server_url(&self) -> Result<String, String> {
             self.computes.set(self.computes.get() + 1);
             Err("fixture forbids dispatch: target expression was evaluated".into())
-        }
-        fn fetch_git_ref(&self, _: &str, _: &str) -> Result<Option<gix::ObjectId>, String> {
-            self.fetches.set(self.fetches.get() + 1);
-            Ok(*self.remote.borrow())
         }
     }
     fn tree(t: &Store, entries: &[(&str, &str, &str)]) -> String {
@@ -6119,8 +5955,19 @@ mod tool_resolution_tests {
         expr(t, &format!("curry --base=fixture --tool:hash={tool}"))
     }
 
+    /// What resolving a tool path is: the ordinary `.caos-expr` walk, which the
+    /// step asks the SERVER for. A tool that does not evaluate to an ArgTree is
+    /// the caller's mistake, not a crash.
+    fn evaluate(t: &Store, root: &str, path: &str) -> Result<String, String> {
+        let (kind, oid) = eval::eval_path(t, root, path, &[])?;
+        if kind != "tree" {
+            return Err(format!("{path} evaluates to a {kind}, not a tool ArgTree"));
+        }
+        Ok(oid)
+    }
+
     fn evaluated_help(t: &Store, root: &str, path: &str) -> (String, String) {
-        let image = eval_tree_tool(t, root, path, &[]).unwrap();
+        let image = evaluate(t, root, path).unwrap();
         let mut node = image.clone();
         for name in ["args", "help"] {
             node = fetch_tree_entries(t, &node)
@@ -6157,7 +6004,7 @@ mod tool_resolution_tests {
         let t = Store::default();
         let target = expr(&t, "run --base=forbidden --help=Failing");
         let root = generated(&t, &target);
-        assert!(eval_tree_tool(&t, &root, "args/tool", &[])
+        assert!(evaluate(&t, &root, "args/tool")
             .unwrap_err()
             .contains("target expression was evaluated"));
         assert_eq!(t.computes.get(), 1);
@@ -6168,7 +6015,7 @@ mod tool_resolution_tests {
         let t = Store::default();
         let target = expr(&t, "HELP=<<END\nGenerated runner.\n@param word The word.\nEND\ncurry --base=fixture --help=$HELP");
         let root = generated(&t, &target);
-        let evaluated = eval_tree_tool(&t, &root, "args/tool", &[]).unwrap();
+        let evaluated = evaluate(&t, &root, "args/tool").unwrap();
         assert_eq!(evaluated_help(&t, &root, "args/tool").0, evaluated);
         assert_ne!(evaluated, target);
         let word = t.put_object("blob", b"supplied").unwrap();
@@ -6205,22 +6052,41 @@ mod tool_resolution_tests {
         let target = expr(&t, "curry --base=fixture --help=Ordinary");
         let root = tree(&t, &[("tool", "tree", &target)]);
         assert_eq!(evaluated_help(&t, &root, "tool").1, "Ordinary");
-        let error = eval_tree_tool(&t, &root, "missing", &[]).unwrap_err();
+        let error = evaluate(&t, &root, "missing").unwrap_err();
         assert!(error.contains("no such path:"));
         assert!(error.contains("missing"));
         assert!(error.contains("Directories in .: tool"));
         assert!(reader_path_absent(&error));
     }
 
+    /// A pinned ancestor dependency is resolved by the SERVER, and the client's
+    /// only part in it is asking. The fixture holds no repository at all, which
+    /// is the point: before this, resolution ran `git fetch` against the host,
+    /// so a locator in an ancestor expression was a thing only a machine with a
+    /// checkout and the right credentials could follow. The claim here is that
+    /// nothing local is consulted — the walk goes straight to `server_url`, and
+    /// what comes back is that fixture's refusal rather than a "path not found".
+    /// The end-to-end shape is `tests/remote-ref`.
     #[test]
-    fn pinned_ancestor_dependencies_are_resolved_by_the_client() {
+    fn a_pinned_dependency_is_resolved_by_asking_the_server() {
         let t = Store::default();
-        let target = expr(&t, "curry --base=fixture --help=Pinned");
-        let repo = tree(&t, &[("tool", "tree", &target)]);
-        *t.remote.borrow_mut() = Some(parse_oid(&repo).unwrap());
         let root = expr(&t, "curry --base=fixture --repo:@@=git+https://example.invalid/tool-fixture?rev=1234567890123456789012345678901234567890");
-        assert_eq!(evaluated_help(&t, &root, "args/repo/tool").1, "Pinned");
-        assert_eq!(t.fetches.get(), 1);
+        let error = evaluate(&t, &root, "args/repo/tool").unwrap_err();
+        assert!(error.contains("fixture forbids dispatch"), "{error}");
+        assert_eq!(t.computes.get(), 1);
+    }
+
+    /// A `path:` locator is the one shape the server cannot answer, and the
+    /// refusal has to say why: it names a directory on the machine that WROTE
+    /// the expression. Reported without a round trip, so the message quotes the
+    /// locator rather than a transport error.
+    #[test]
+    fn a_path_locator_is_refused_by_name() {
+        let t = Store::default();
+        let root = expr(&t, "curry --base=fixture --repo:@@=path:./somewhere");
+        let error = evaluate(&t, &root, "args/repo").unwrap_err();
+        assert!(error.contains("resolved by the caos server"), "{error}");
+        assert_eq!(t.computes.get(), 0, "a path: locator must not be sent");
     }
 }
 

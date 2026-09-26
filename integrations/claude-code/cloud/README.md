@@ -15,7 +15,7 @@ connector the session hook started on `127.0.0.1:19090`, with a liveness poll, a
 `pkill` for a stale one holding the port, and `setsid` to survive Claude Code's
 teardown of the hook's process group; all of that is gone. What replaced it is
 smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
-every request paid a fresh connection — the reason `/eval-locator` exists — while
+every request paid a fresh connection — the reason `/eval` exists — while
 the client now holds ONE connection and opens a stream per request.
 
 ## Three programs, run by `go run`

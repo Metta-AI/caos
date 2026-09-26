@@ -32,8 +32,8 @@ use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
 use worker_common::{
     arg, caos, caos_curry, caos_recurry, cas_hash, cas_kind, eval_then_catching, link,
-    own_args_tree, path, prepare_request, read_arg, read_arg_opt, run_request_then,
-    run_request_then_catching, run_worker, scratch, secret, Arg,
+    own_args_tree, path, prepare_request, read_arg, read_arg_opt, run_request_then_catching,
+    run_worker, scratch, secret, Arg,
 };
 
 const MAX_TOKENS: u64 = 64000;
@@ -1391,21 +1391,16 @@ fn prepare_compute(
                     ("tool-lookup", Arg::Lit(relative)),
                 ],
             )?;
-            if client_tool_matches(ws, relative)? {
-                if let Some(error) = read_arg_opt("client-tool-error")? {
-                    return Ok(Prepared::Result(error_block(&call.id, &error)));
-                }
-                let task = prepare_request(
-                    Arg::Hash(&me),
-                    &[
-                        ("in", Arg::Path(ws)),
-                        ("result", Arg::Path(&arg("client-tool-tree"))),
-                    ],
-                )?;
-                run_request_then(&task, None)?;
-            } else {
-                eval_then_catching(ws, relative, Arg::Hash(&me))?;
-            }
+            // SERVER-SIDE, like every other evaluation this worker asks for.
+            // There used to be a client handoff here — `caos mcp serve`
+            // pre-resolved the tool's path against the session's checkout and
+            // sent the evaluated tree — and it existed for exactly one reason:
+            // the server refused a `:@@=` locator, so a repository that pins
+            // caos could not be evaluated where the walk actually happens. The
+            // server resolves locators now (`server::locator`), so the handoff
+            // was a second resolver that could disagree with this one about
+            // which version of a tool runs.
+            eval_then_catching(ws, relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
         // `eval_path`: the SERVER walks `.caos-expr` and hands the answer back,
@@ -1546,40 +1541,6 @@ fn prepared_request(
         .unwrap_or_default();
     let task = prepare_request(Arg::Hash(&curried), &bound)?;
     Ok(Prepared::Task(Oid::parse(&task, "tool task")?))
-}
-
-/// A client handoff is usable only for this exact snapshot and relative path.
-///
-/// SAYS WHY WHEN IT REFUSES, because the fallback is a server-side eval and the
-/// server cannot resolve a `:@@=` locator at all. So a handoff that quietly does
-/// not match presents as "this tool is unevaluatable" -- an error about the
-/// TREE, pointing at the repository -- rather than as a handoff that was
-/// dropped, which is the thing that is actually wrong. Measured: three runs of
-/// `tool_help caos-std/caos-build` died on `cannot resolve "github:...&dir=std/
-/// flake-input-loader"` with nothing anywhere saying the client had been asked
-/// to pre-resolve it, and the two candidate causes below want opposite fixes.
-fn client_tool_matches(ws: &str, path: &str) -> Result<bool, String> {
-    let sent_path = read_arg_opt("client-tool-path")?;
-    let sent_root = read_arg_opt("client-tool-root")?;
-    let want_root = cas_hash(ws)?;
-    if sent_path.as_deref() == Some(path) && sent_root.as_deref() == Some(want_root.as_str()) {
-        return Ok(true);
-    }
-    if sent_path.is_none() && sent_root.is_none() {
-        // The client never pre-resolved: `caos mcp serve` did not take the
-        // repository-tool branch, or is not a build that has one.
-        eprintln!("llm-step: no client tool handoff for {path:?}; evaluating server-side");
-    } else {
-        // It did, and the guard rejected it. A root disagreement here is the
-        // conversation snapshot moving between dispatch and this worker, which
-        // would reject EVERY handoff rather than only a stale one.
-        eprintln!(
-            "llm-step: client tool handoff refused for {path:?}: \
-             path {sent_path:?} (wanted {path:?}), root {sent_root:?} (wanted {want_root:?}); \
-             evaluating server-side"
-        );
-    }
-    Ok(false)
 }
 
 /// Resume with the evaluated tool image; describe it or validate and invoke it.

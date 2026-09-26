@@ -91,16 +91,29 @@ Every script here runs with it, and two constructs quietly break under it.
   `std/flake-builder`'s worker runs `nix build` (fetching flake inputs from the
   internet) and `skopeo copy` to the registry. A worker that wants the network
   has it.
-- **What is genuinely client-side is `:@@=` RESOLUTION, and the reason is that
-  the KEY MUST BE CONTENT, not a name.** Not determinism: a locator carries a
-  mandatory full commit sha, so `url + rev` is deterministic and could be
-  resolved anywhere. The point is that the ArgTree *is* the cache key, so the
-  locator has to become an oid before the request is formed — otherwise the URL
-  sits inside the key and two consumers pinning the same rev through different
-  URLs (a fork, a mirror, ssh vs https) get different keys for identical
-  content. Mechanically, the worker's `HttpTransport` also has no git repo or
-  remote to fetch INTO, which is why `Transport::fetch_git_ref` defaults to
-  `Ok(None)`. Neither of those is a sandbox.
+- **`:@@=` RESOLUTION IS THE SERVER'S, and nobody else's.** It used to be the
+  client's, and the reason given was that the KEY MUST BE CONTENT: the ArgTree
+  *is* the cache key, so a locator has to become an oid before the request is
+  formed, or the URL sits inside the key and two consumers pinning the same rev
+  through different URLs (a fork, a mirror, ssh vs https) get different keys for
+  identical content. That argument is intact and says nothing about WHO — the
+  server resolves at the same point in the same walk. What broke the old
+  arrangement is the agent: a conversation's tree is evaluated server-side, so a
+  client repo that mounts caos through a pin had no client in the loop and
+  `eval_path ./caos-std` died on its own root expression. `server::locator` is
+  the one resolver now; `caos-cli` and a worker both ask it over
+  `GET /eval?root:@@=`, and a worker can therefore `curry` a `:@@=` arg,
+  which it never could before. The one casualty is `path:`, which names a live
+  directory on the machine that WROTE the expression and is refused by name.
+- **`resolve_` is a LOOKUP that cannot evaluate; `eval_` may build things.**
+  Both senses were in this tree at once and it misleads: `gitlinks::resolve`
+  (the worker's `caos resolve`) is a raw tree walk, but `resolve_remote_arg`
+  fetched a repo and ran rustc. Reading one name as the other is how you
+  conclude a locator is a path lookup. `eval_remote_arg` and `GET /eval` say
+  what they do; `gitlinks::resolve` and `locator::resolve_root` (rev → tree,
+  nothing more) keep the word because they satisfy it. **Still inconsistent:**
+  `resolve_base`, `resolve_cli_image*` and `resolve_expr_*` all evaluate and
+  have not been renamed yet.
 - **Where "no network" is true it is a BUILD-level choice.** `std/cargo` builds
   `--offline` against a vendored registry (`std/cargo/bake.nix`,
   `vendorCargoDeps`) — which is why a crates.io dep missing from the bake anchor
