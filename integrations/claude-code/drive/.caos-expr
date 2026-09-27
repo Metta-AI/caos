@@ -25,4 +25,45 @@
 # moves, a second `start` answers with the first session's id and creates
 # nothing, and a second `list` answers with a listing from whenever the first
 # one ran. A coarser time (`date +%Y%m%d%H%M`) deliberately reuses an answer.
-curry --base:@=DEEP-DEPS/go --worker1:@=drive.go
+#
+# THE HELP IS BOUND HERE, so this describes itself to any harness offering it
+# and there is no second copy to drift (the note std/merge/.caos-expr carries,
+# for the same reason). The description is joined into ONE line by `parse_help`,
+# so it is prose rather than a table.
+#
+# `at` is a parameter a model must fill, and that is deliberate: it is what
+# makes the call reach the API rather than the memo. `salt` is a RESERVED arg
+# name and could not have been used for it.
+#
+# No `@writer` and no `@in`: nothing here advances the conversation tree.
+HELP=<<END
+Start and inspect Claude Code cloud sessions. A session runs in a named cloud
+environment, on a named GitHub repository, and answers prompts. `verb` chooses
+what to do, and the other parameters belong to the verb: `start` takes env, repo
+and prompt and returns a session id; `send` takes session and prompt; `list`
+takes nothing and returns recent sessions with their status and environment;
+`info` takes session and returns its environment, its source and its
+provisioning trace; `conv` takes session and locates the caos conversation it
+records into; `archive` takes session and ends it, freeing its container.
+Environments are separately addressable: `env-list` takes nothing, `env-show`
+takes env, and `env-update`, `env-create` and `env-delete` CHANGE, CREATE and
+DESTROY an environment that other sessions may be using. A session id is
+`cse_...` or `session_...`, two spellings of the same session, and either is
+accepted wherever one is asked for. Starting a session costs a container and
+about two minutes before it can answer, so read the reply back with `info`
+rather than expecting one from `start`.
+@param verb One of start, send, list, info, conv, archive, env-list, env-show, env-update, env-create, env-delete.
+@param at The current time as seconds since the epoch. The result is memoized on the arguments, so a value used before returns that earlier answer instead of asking again — pass the time now, not a constant.
+@param {string} [env] Cloud environment, by name or by its env_... id.
+@param {string} [repo] Repository the session opens: owner/repo, owner/repo@ref, or a full URL.
+@param {string} [prompt] Prompt text, for start and send.
+@param {string} [session] Session id (cse_... or session_...) or a claude.ai/code URL.
+@param {string} [ref] Branch, tag or commit to check out; the repository's default when omitted.
+@param {string} [title] The session's title; the prompt's first line when omitted.
+@param {string} [from] env-create only: an existing environment to copy.
+@param {string} [rename] env-update only: a new name for the environment.
+@param {string} [init-script] env-update only: the environment's new setup script, in full.
+@param {array} [set-env] env-update only: environment variables to set, each as KEY=VALUE.
+@param {array} [unset-env] env-update only: names of environment variables to remove.
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=drive.go --help=$HELP

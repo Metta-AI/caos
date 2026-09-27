@@ -1446,7 +1446,7 @@ func runWorker() error {
 	}[verb]
 	for _, pair := range [][2]string{
 		{"env", "--env"}, {"repo", "--repo"}, {"ref", "--ref"}, {"title", "--title"},
-		{"from", "--from"}, {"rename", "--rename"}, {"init-script", "--init-script"},
+		{"from", "--from"}, {"rename", "--rename"},
 	} {
 		v, err := workerArg(pair[0])
 		if err != nil {
@@ -1456,6 +1456,14 @@ func runWorker() error {
 			continue
 		}
 		argv = append(argv, pair[1], v)
+	}
+	// `init-script` is the SCRIPT, not a path to one: it arrives as a blob like
+	// any other argument, and --init-script reads a file, so what is passed is
+	// where the runner put it.
+	if _, err := workerArg("init-script"); err != nil {
+		return err
+	} else if _, err := os.Stat(filepath.Join(argsDir, "init-script")); err == nil {
+		argv = append(argv, "--init-script", filepath.Join(argsDir, "init-script"))
 	}
 	for _, pair := range [][2]string{{"set-env", "--set-env"}, {"unset-env", "--unset-env"}} {
 		v, err := workerArg(pair[0])

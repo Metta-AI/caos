@@ -580,23 +580,27 @@ fn expr_help(expr: &str) -> Option<String> {
 /// sourced differently. `dir` is the materialized arg-tree path
 /// (`/cas/args/<name>-image`).
 ///
-/// THE HELP IS AT `args/help`, not `help`. That path is the curry node's own
-/// layout — `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`) — and the
-/// tool's `.caos-expr` binds `--help=` like any other argument. Looking at the
-/// top level finds nothing, which is exactly what happened: `registry` skipped
-/// a tool it could not describe, so every std tool silently vanished from the
-/// registry and the harness offered six tools where it meant to offer thirteen.
-///
 /// `None` when the image carries no `help` — a configuration error, since the
 /// harness itself curried the image, and its callers now say so.
+///
+/// BOTH ARGTREE SHAPES ARE ACCEPTED, because both occur. A curry node lays its
+/// bindings out as `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`), and
+/// that is what most tools evaluate to. A tool that READS A SECRET does not:
+/// granting one folds `secret-hash` into the arg tree, and folding flattens it
+/// to `{base, <name>…}` with no `args/` at all. Reading only `args/help` finds
+/// nothing there, and the tool is refused as "not a tool" — for carrying a
+/// secret, which has nothing to do with whether it describes itself.
+///
+/// Measured: `tests/exec-bit` and this tool's entry curry identically onto
+/// std/go, and only the one with a `reader=` line comes back flat.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
     let args = format!("{dir}/args");
-    if !Path::new(&args).exists() {
-        return Ok(None);
+    if Path::new(&args).exists() {
+        caos(["get", &args])?;
+        return tool_from_help(name, &format!("{args}/help"));
     }
-    caos(["get", &args])?;
-    tool_from_help(name, &format!("{args}/help"))
+    tool_from_help(name, &format!("{dir}/help"))
 }
 
 /// The tool a FLAT REQUEST runs, described by the `help` the request carries.
