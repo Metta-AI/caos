@@ -193,6 +193,11 @@ func run(argv []string) error {
 			o.ref, err = next(&i, a)
 		case "--authorize":
 			o.mode = "authorize"
+		case "--scopes":
+			var s string
+			if s, err = next(&i, a); err == nil && strings.TrimSpace(s) != "" {
+				authorizeScopes = strings.Fields(s)
+			}
 		case "--check-reuse":
 			o.checkReuse = true
 		case "--days":
@@ -1242,6 +1247,7 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
   --any-repo   skip the caos-pin warning on the cwd fallback
   --days N     --mint only: the lifetime to ask for (default 365; the server decides)
   --check-reuse  --mint only: spend the refresh token twice, to learn if it is single-use
+  --scopes "..."  --authorize only: override the scopes asked for
 
 <env> is an environment's name or its env_… id; <session> is cse_…, session_…,
 or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
@@ -1914,9 +1920,17 @@ func randomURLSafe(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// authorizeScopes is the set the client itself requests at either authorize
-// URL — the console scope and the claude.ai ones together. It is sent whole
-// because the endpoint refuses a subset, and the GRANT is what narrows it:
-// consenting at claude.ai yields the claude.ai scopes and drops
-// org:create_api_key, which is exactly the set a CLI login carries.
-var authorizeScopes = append([]string{"org:create_api_key"}, wantedScopes...)
+// authorizeScopes is what --authorize asks for, and it is DELIBERATELY NARROW.
+// A long lifetime is not available on every scope: the token endpoint answers
+//
+//	Custom expires_in not allowed for scope 'user:mcp_servers'
+//
+// so the client's own seven-scope set cannot carry one. Only what the session
+// and environment routes need is asked for. `user:profile` rides along because
+// it is in the console set, which is the set setup-token already mints with a
+// custom lifetime.
+//
+// An earlier narrowed set was refused as "Invalid request format", which read
+// like the endpoint rejecting a subset. It was the STATE LENGTH; narrowing is
+// fine. --scopes overrides this when the server names another scope to drop.
+var authorizeScopes = []string{"user:profile", sessionsScope}
