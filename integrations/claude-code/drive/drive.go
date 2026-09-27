@@ -1811,18 +1811,32 @@ func authorize(o opts) error {
 	sum := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
-	q := url.Values{}
-	q.Set("code", "true")
-	q.Set("client_id", oauthClientID)
-	q.Set("response_type", "code")
-	q.Set("redirect_uri", oauthRedirectURL)
-	q.Set("scope", strings.Join(wantedScopes, " "))
-	q.Set("code_challenge", challenge)
-	q.Set("code_challenge_method", "S256")
-	q.Set("state", state)
+	// BUILT IN THE CLIENT'S OWN ORDER, and with its own scope list. The
+	// endpoint answers "Authorization failed / Invalid request format" to a
+	// narrowed scope set — a subset of what the client is registered for is not
+	// a smaller ask, it is a malformed one — so the whole of `authorizeScopes`
+	// goes out and the grant narrows it. Order is preserved for the same reason:
+	// url.Values.Encode sorts, and nothing here needs to find out whether that
+	// matters.
+	var q strings.Builder
+	for i, kv := range [][2]string{
+		{"code", "true"},
+		{"client_id", oauthClientID},
+		{"response_type", "code"},
+		{"redirect_uri", oauthRedirectURL},
+		{"scope", strings.Join(authorizeScopes, " ")},
+		{"code_challenge", challenge},
+		{"code_challenge_method", "S256"},
+		{"state", state},
+	} {
+		if i > 0 {
+			q.WriteByte('&')
+		}
+		q.WriteString(kv[0] + "=" + url.QueryEscape(kv[1]))
+	}
 
 	fmt.Fprintf(os.Stderr, "Open this, approve, and paste back what the page shows:\n\n%s?%s\n\ncode: ",
-		claudeAIAuthorizeURL, q.Encode())
+		claudeAIAuthorizeURL, q.String())
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && strings.TrimSpace(line) == "" {
 		return fmt.Errorf("reading the pasted code: %v", err)
@@ -1895,3 +1909,10 @@ func randomURLSafe(n int) (string, error) {
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
+
+// authorizeScopes is the set the client itself requests at either authorize
+// URL — the console scope and the claude.ai ones together. It is sent whole
+// because the endpoint refuses a subset, and the GRANT is what narrows it:
+// consenting at claude.ai yields the claude.ai scopes and drops
+// org:create_api_key, which is exactly the set a CLI login carries.
+var authorizeScopes = append([]string{"org:create_api_key"}, wantedScopes...)
