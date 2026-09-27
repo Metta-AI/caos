@@ -583,16 +583,17 @@ fn expr_help(expr: &str) -> Option<String> {
 /// `None` when the image carries no `help` — a configuration error, since the
 /// harness itself curried the image, and its callers now say so.
 ///
-/// BOTH ARGTREE SHAPES ARE ACCEPTED, because both occur. A curry node lays its
-/// bindings out as `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`), and
-/// that is what most tools evaluate to. A tool that READS A SECRET does not:
-/// granting one folds `secret-hash` into the arg tree, and folding flattens it
-/// to `{base, <name>…}` with no `args/` at all. Reading only `args/help` finds
-/// nothing there, and the tool is refused as "not a tool" — for carrying a
-/// secret, which has nothing to do with whether it describes itself.
+/// BOTH ARGTREE SHAPES ARE ACCEPTED, because both occur. An ArgTree has three
+/// equivalent forms — a curry node `{base, args/<name>…, .caos-curry}`, a flat
+/// args tree `{base, <name>…}`, or a bare image — and `caos::caos_curry`
+/// normalizes whichever it is given. A tool image can be either of the first
+/// two: `tests/exec-bit` evaluates to a curry node, and
+/// `integrations/claude-code/drive` to a flat one carrying `secret-hash`, which
+/// is the shape `assemble_arg_tree` builds ("the request object IS the args
+/// tree").
 ///
-/// Measured: `tests/exec-bit` and this tool's entry curry identically onto
-/// std/go, and only the one with a `reader=` line comes back flat.
+/// Reading only `args/help` finds nothing in the flat form and refuses the tool
+/// as "not a tool" — over its SHAPE rather than over anything it declares.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
     let args = format!("{dir}/args");
