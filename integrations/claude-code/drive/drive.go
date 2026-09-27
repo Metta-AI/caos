@@ -1354,7 +1354,7 @@ func verbDid(verb string) string {
 	case "env-update", "env-create", "env-delete":
 		return "change that was never made"
 	}
-	return "reading of state as it was then, not now"
+	return "reading"
 }
 
 // report writes the worker's result to /cas/out.
