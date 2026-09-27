@@ -1372,7 +1372,7 @@ func render(v any) string {
 // back into the flags above.
 //
 //	caos-cli run --base:@=integrations/claude-code/drive \
-//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt:@=./p.txt \
+//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt='a prompt' \
 //	  --at="$(date +%s)"
 //
 // EVERY VERB TAKES `at`, AND IT IS THE CURRENT TIME. Nothing here is a pure

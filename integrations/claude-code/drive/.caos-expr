@@ -12,8 +12,11 @@
 #   caos-cli run --base:@=integrations/claude-code/drive \
 #     --verb=list --at="$(date +%s)"
 #   caos-cli run --base:@=integrations/claude-code/drive --verb=start \
-#     --env=Caos --repo=Metta-AI/caos-session --prompt:@=./prompt.txt \
+#     --env=Caos --repo=Metta-AI/caos-session --prompt='the first prompt' \
 #     --at="$(date +%s)"
+#
+# The prompt is a plain string argument. `:@=` would ingest a FILE, and it
+# ingests only git-tracked paths — an ad-hoc prompt is not one.
 #
 # `at` IS REQUIRED BY EVERY VERB. A worker's result is memoized on its ArgTree
 # and nothing here is a pure function of its arguments, so without a value that

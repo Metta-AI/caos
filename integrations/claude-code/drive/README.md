@@ -7,7 +7,7 @@ go run integrations/claude-code/drive/drive.go \
   --env Caos --repo Metta-AI/caos-session 'the first prompt'
 
 caos-cli run --base:@=integrations/claude-code/drive --verb=start \
-  --env=Caos --repo=Metta-AI/caos-session --prompt:@=./prompt.txt \
+  --env=Caos --repo=Metta-AI/caos-session --prompt='the first prompt' \
   --at="$(date +%s)"
 ```
 
