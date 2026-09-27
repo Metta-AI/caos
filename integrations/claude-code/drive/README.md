@@ -1,18 +1,29 @@
 # drive
 
-Start and inspect Claude Code cloud sessions. One program, two ways to run it:
+Start and inspect Claude Code cloud sessions, as a caos worker.
 
 ```
-go run integrations/claude-code/drive/drive.go \
-  --env Caos --repo Metta-AI/caos-session 'the first prompt'
-
 caos-cli run --base:@=integrations/claude-code/drive --verb=start \
   --env=Caos --repo=Metta-AI/caos-session --prompt='the first prompt' \
   --at="$(date +%s)"
 ```
 
-`go run` needs `go`, which the dev shell carries; outside it,
-`nix run nixpkgs#go -- run …`. `--help` lists every mode.
+```
+drive.go       the worker. Refuses to run on the host: the verbs reach the API
+               with the token at /secret, and a host run would reach it with
+               whatever login the machine happens to hold.
+authorize.go   mints that token. Runs ONLY on the host — it needs a browser
+               and a paste, and a worker has neither.
+.caos-expr     makes this directory an entry; DEPS names std/go.
+```
+
+Set the secret up once with `go run integrations/claude-code/drive/authorize.go`
+(see *The credential* below). `go` is in the dev shell; outside it,
+`nix run nixpkgs#go -- run …`.
+
+The verbs are `start send list info conv archive env-list env-show env-update
+env-create env-delete`, each a mode of one command line — `drive.go --help`
+lists them with their arguments.
 
 ## A session names its environment and its repository
 
@@ -38,26 +49,40 @@ source directly.
 claude.ai/code URL carries `session_<suffix>`. Both resolve on the API, and
 every mode takes either, or the URL.
 
-## One credential
+## The credential
 
-An Anthropic OAuth token with the `user:sessions:claude_code` scope runs all of
-it — sessions and environments alike, including an environment's whole
-definition. It is looked for in three places, first hit wins:
+An Anthropic OAuth token carrying `user:sessions:claude_code` runs all of it —
+sessions and environments alike, including an environment's whole definition.
+Measured: those two scopes alone answer 200 on both route families.
+
+```
+go run integrations/claude-code/drive/authorize.go
+```
+
+It prints a claude.ai URL, you approve in a browser and paste back the code it
+shows, and it prints a token for `.caos-secrets/claude-oauth-token`. The
+consent page says **"Claude Code"** is asking: that is the OAuth client's
+registration, held by Anthropic, and not a parameter of the request — nothing
+sent from here can change it.
+
+**30 days is the ceiling.** 60 and above are refused as `Invalid expiry for
+scope`, so this is a monthly chore, not a one-off. Re-run it and replace
+`value=`; `reader=` and `entropy=` stay.
+
+Three routes that look like they should work and do not:
 
 | | |
 |---|---|
-| `$CLAUDE_CODE_OAUTH_TOKEN` | a token you supply |
-| `/secret/claude-oauth-token` | the caos secret, dropped by the runner |
-| `~/.claude/.credentials.json` | the running CLI's own login — it EXPIRES |
+| `claude setup-token` | consents at the CONSOLE, so the grant is the console scopes; every route answers `401 oauth_scope_insufficient` |
+| a `refresh_token` exchange | right scopes, but `expires_in` is ignored there (8 hours) and the refresh token is SINGLE-USE — only something that can persist the replacement can spend it, and a worker cannot |
+| a browser `sessionKey` | a cookie, not a bearer; it reaches claude.ai's environment-definition service and nothing else |
 
-**`claude setup-token` does not mint a usable one.** Its flow asks for the
-console scopes, and every session and environment route answers a token
-without `user:sessions:claude_code` with `401 oauth_scope_insufficient`. What
-carries the scope is the CLI's own claude.ai login, which is short-lived —
-so `drive --mint` trades that login's refresh token for a long-lived access
-token with the same scopes, and writes back a rotated refresh token so the
-CLI keeps working.
+An API key (`sk-ant-api03-…`) is refused outright: "Cloud sessions are only
+available on the first-party Anthropic API provider".
 
+At run time the token is looked for in `$CLAUDE_CODE_OAUTH_TOKEN`, then
+`/secret/claude-oauth-token`, then `~/.claude/.credentials.json`. A worker only
+ever has the second.
 An API key (`sk-ant-api03-…`) is **not** one of these: the service answers
 "Cloud sessions are only available on the first-party Anthropic API provider".
 Nothing here needs the claude.ai `sessionKey` cookie, and nothing shells out to
@@ -83,15 +108,13 @@ POST /v1/environment_providers/<id>/delete  delete one
 
 `.caos-expr` and `DEPS` make this directory an entry: `std/go` `go run`s
 `drive.go` as `/worker`, it reads its arguments from `/cas/args` and its token
-from `/secret/claude-oauth-token`, and it reports what it printed. The verbs
-are `start send list info conv archive env-list env-show env-update env-create
-env-delete`, each one a mode of the same command line.
+from `/secret/claude-oauth-token`, and it reports what it printed.
 
 The secret is granted to a job whose ArgTree is a superset of one of the
 secret's readers, so `.caos-secrets/claude-oauth-token` needs:
 
 ```
-value=<what `drive --mint` prints>
+value=<what authorize.go prints>
 reader=integrations/claude-code/drive
 entropy=<`caos secrets` fills this>
 ```

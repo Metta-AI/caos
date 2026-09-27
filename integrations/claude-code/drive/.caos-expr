@@ -1,11 +1,13 @@
 # integrations/claude-code/drive, as an ENTRY (design/caos-expr.md, Phase 3):
 # evaluating this directory yields the image that runs drive.go as a worker.
 #
-# std/go's /worker `go run`s whatever is bound as `worker1`, so the program is
-# the SAME FILE a terminal runs — one surface, one set of behaviours. It reads
-# its arguments from /cas/args and its token from /secret/claude-oauth-token,
-# and it imports nothing outside the standard library, so the prelude module
-# std/go copies beside it is never consulted.
+# std/go's /worker `go run`s whatever is bound as `worker1`. drive.go REFUSES
+# to run outside a worker, so this entry is the only way to reach the verbs. It
+# reads its arguments from /cas/args and its token from
+# /secret/claude-oauth-token — minted by authorize.go beside it, which runs on
+# the HOST because it needs a browser and a paste (see README.md) — and it
+# imports nothing outside the standard library, so the prelude module std/go
+# copies beside it is never consulted.
 #
 # NOTHING IS BOUND HERE. A caller curries the verb, its arguments, and the time:
 #

@@ -1,38 +1,35 @@
-// Drive a Claude Code cloud session from a terminal (or another Claude session).
+// Drive Claude Code cloud sessions, AS A CAOS WORKER. std/go runs this file as
+// /worker; it reads its arguments from /cas/args and its token from /secret,
+// and runWorker at the bottom turns them back into the command line below. It
+// REFUSES to run on the host — see requireWorker — so there is one way to
+// reach these verbs and it leaves a job behind.
 //
-//	go run drive.go --env Caos --repo Metta-AI/caos-session 'a prompt'
+//	caos-cli run --base:@=integrations/claude-code/drive --verb=start \
+//	  --env=Caos --repo=Metta-AI/caos-session --prompt='a prompt' \
+//	  --at="$(date +%s)"
 //
-// A NEW SESSION NAMES ITS ENVIRONMENT AND ITS REPOSITORY, and neither is a
-// property of the directory this runs in. `claude --cloud` cannot do that:
-// its `--environment` takes only a self-hosted `ccpool_…` id, it has no repo
-// flag at all, and the repository it sends is whatever `git remote get-url
-// origin` says in the current directory. So the create goes straight to the
-// API underneath it — POST /v1/code/sessions, which takes `environment_id`
-// and a `git_repository` source — and the prompt is delivered afterwards over
-// the ordinary continue path. The caos checkout stops being the wrong place
-// to start a session from: there is nothing left for the cwd to decide.
+// The token is minted by authorize.go beside this, which runs only on the host.
 //
-// Without --env/--repo the old behaviour is unchanged: `claude --cloud` under
-// script(1), opening the cwd's repo, which then has to be a caos CLIENT repo.
+// A SESSION NAMES ITS ENVIRONMENT AND ITS REPOSITORY, and neither is a property
+// of a directory. `claude --cloud` can express neither: its `--environment`
+// takes only a self-hosted `ccpool_…` id, and it has no repository flag at all
+// — the repository is whatever `git remote get-url origin` says where it ran.
+// So the create goes straight to the API underneath it: POST /v1/code/sessions
+// takes `environment_id` and a `git_repository` source.
 //
-//	drive --env Caos --repo Metta-AI/caos-session 'prompt'
-//	drive --env Caos --repo Metta-AI/caos-session@some-branch 'prompt'
-//	drive 'a brand new session prompt'      # cwd's repo, default environment
-//	drive -c <session> 'a follow-up'        # inject into an existing session
-//	drive -f prompt.txt                     # read the prompt from a file
-//	drive --probe                           # dump the cloud env (new session)
-//	drive -c <session> --probe              # dump the env of a running session
-//	drive --list                            # recent sessions (id, env, status)
-//	drive --archive <session>               # end a session and free its container
-//	drive --info <session>                  # a session's env, from OUTSIDE
-//	drive --conv <session>                  # the session's CONVERSATION on caosd
-//	drive --env-config                      # LIST cloud environments (id + name)
-//	drive --env-config Caos                 # print an env's setup script + vars
-//	drive --env-update Caos --init-script F # replace an env's setup script
-//	drive --env-update Caos --set-env K=V   # set/unset env vars (--unset-env K)
-//	drive --env-create NAME --from Caos     # create (optionally cloning an env)
-//	drive --env-delete NAME                 # delete an environment
-//	drive --mint                            # mint the token a caos secret holds
+// The verbs, as the command line runWorker builds:
+//
+//	start        --env --repo[@ref] --prompt [--ref --title]
+//	send         --session --prompt
+//	list         recent sessions (id, status, env, title)
+//	info         --session: env, source, provisioning trace, from OUTSIDE
+//	conv         --session: the conversation it records into, on caosd
+//	archive      --session: end it and free its container
+//	env-list     cloud environments (id + name)
+//	env-show     --env: its setup script and variables
+//	env-update   --env [--init-script --set-env --unset-env --rename]
+//	env-create   --env [--from]
+//	env-delete   --env
 //
 // A SESSION ID HAS TWO SPELLINGS of the same session: the API and this tool
 // print `cse_<suffix>`, and claude.ai/code URLs carry `session_<suffix>`. The
@@ -75,18 +72,14 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -123,8 +116,6 @@ type opts struct {
 	repo       string // --repo: owner/repo[@ref]
 	ref        string // --ref
 	title      string
-	days       string // --mint: how long the minted token should last
-	checkReuse bool   // --mint: spend the refresh token twice, to learn if it is single-use
 	probe      bool
 	anyRepo    bool
 	arg        string // the bare token
@@ -151,7 +142,7 @@ func run(argv []string) error {
 		a := argv[i]
 		switch a {
 		case "-h", "--help":
-			fmt.Print(usage)
+			os.Stdout.WriteString(usage)
 			return nil
 		case "--probe":
 			o.probe = true
@@ -171,8 +162,6 @@ func run(argv []string) error {
 			o.mode = "env-update"
 		case "--env-create":
 			o.mode = "env-create"
-		case "--mint":
-			o.mode = "mint"
 		case "--env-delete":
 			o.mode = "env-delete"
 		case "--env":
@@ -191,17 +180,6 @@ func run(argv []string) error {
 			o.repo, err = next(&i, a)
 		case "--ref":
 			o.ref, err = next(&i, a)
-		case "--authorize":
-			o.mode = "authorize"
-		case "--scopes":
-			var s string
-			if s, err = next(&i, a); err == nil && strings.TrimSpace(s) != "" {
-				authorizeScopes = strings.Fields(s)
-			}
-		case "--check-reuse":
-			o.checkReuse = true
-		case "--days":
-			o.days, err = next(&i, a)
 		case "--title":
 			o.title, err = next(&i, a)
 		case "--init-script":
@@ -235,6 +213,9 @@ func run(argv []string) error {
 		}
 	}
 
+	if err := requireWorker(o); err != nil {
+		return err
+	}
 	switch o.mode {
 	case "env-config":
 		return envConfig(o)
@@ -248,10 +229,6 @@ func run(argv []string) error {
 		return conv(o)
 	case "info":
 		return info(o)
-	case "authorize":
-		return authorize(o)
-	case "mint":
-		return mint(o)
 	case "list":
 		return list()
 	case "archive":
@@ -1239,22 +1216,22 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
   drive --env-create <name> [--from <env>]
   drive --env-delete <env>
 
-  drive --authorize [--days N]      consent at claude.ai for a long-lived token
-  drive --mint [--days N]           exchange the CLI login's refresh token instead
+  (the token these need is minted by authorize.go, on the host)
 
   --title T    the session's title (default: the prompt's first line)
   --ref R      the revision to check out (same as --repo owner/repo@R)
   --any-repo   skip the caos-pin warning on the cwd fallback
-  --days N     --mint only: the lifetime to ask for (default 365; the server decides)
-  --check-reuse  --mint only: spend the refresh token twice, to learn if it is single-use
-  --scopes "..."  --authorize only: override the scopes asked for
 
 <env> is an environment's name or its env_… id; <session> is cse_…, session_…,
 or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
 and omitting --env to the default environment.
 
-Every mode needs one Anthropic OAuth token: $CLAUDE_CODE_OAUTH_TOKEN, else
-/secret/claude-oauth-token, else the CLI's own ~/.claude/.credentials.json.
+These run as a caos WORKER, not on the host. The verb form is
+  caos-cli run --base:@=integrations/claude-code/drive --verb=… --at="$(date +%s)"
+
+The token comes from $CLAUDE_CODE_OAUTH_TOKEN, else
+/secret/claude-oauth-token, else the CLI's own ~/.claude/.credentials.json;
+authorize.go mints one that works.
 `
 
 // defaultEnvSeed is what --env-create starts from with no --from: the same
@@ -1573,416 +1550,35 @@ func report(body string) error {
 	return nil
 }
 
-// ---------------------------------------------------------------- minting
-
-// mint trades the CLI's refresh token for a LONG-LIVED access token carrying
-// the scopes this needs, and prints it for a caos secret to hold.
+// requireWorker refuses the verbs outside a caos job.
 //
-// `claude setup-token` is the obvious thing and produces the wrong token: its
-// flow asks for the console scopes, and every session and environment route
-// answers a token without `user:sessions:claude_code` with
+// Every one of them reaches the API with the token at /secret, and a run on
+// the host reaches it with whatever ~/.claude/.credentials.json happens to
+// hold — a DIFFERENT account's, a stale one, or one with the wrong scopes.
+// Two ways to drive the same sessions is one more than there should be, and
+// the second one leaves no job to look at afterwards.
 //
-//	401 OAuth token lacks a scope this endpoint accepts (oauth_scope_insufficient)
-//
-// The CLI's own login has the right scopes but a short life and a refresh
-// token beside it. This asks the token endpoint for the same scope set with a
-// long `expires_in`, which is what makes the result something a secret can
-// hold rather than something that goes stale in hours.
-//
-// THE REFRESH TOKEN MAY ROTATE. The response carries a new one when it does,
-// and this writes it back to ~/.claude/.credentials.json — without that, the
-// running CLI's login would be the thing this broke. The write is skipped
-// when the value is unchanged, and it is temp-and-rename so a crash cannot
-// leave a half-written credentials file.
-func mint(o opts) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(home, ".claude", ".credentials.json")
-	var creds map[string]any
-	if err := readJSON(path, &creds); err != nil {
-		return fmt.Errorf("%s: %v — run `claude /login` first", path, err)
-	}
-	oauth, _ := creds["claudeAiOauth"].(map[string]any)
-	first, _ := dig(oauth, "refreshToken").(string)
-	if first == "" {
-		return fmt.Errorf("no refreshToken in %s — run `claude /login` first", path)
-	}
-
-	days := 365
-	if o.days != "" {
-		if _, err := fmt.Sscanf(o.days, "%d", &days); err != nil || days < 1 {
-			return fmt.Errorf("--days %q is not a positive number of days", o.days)
-		}
-	}
-
-	tok, err := exchange(first, days)
-	if err != nil {
-		return err
-	}
-	// The write-back comes FIRST: a rotated refresh token that reaches nothing
-	// is a broken CLI login, and that matters more than printing a token.
-	if err := writeRefresh(path, creds, oauth, first, tok.RefreshToken); err != nil {
-		return err
-	}
-	rotated := tok.RefreshToken != "" && tok.RefreshToken != first
-
-	// THE SERVER DECIDES THE LIFETIME, and it has ignored `expires_in` here —
-	// a 365-day request came back as a token good for about a day. Say so
-	// rather than let a secret be filled with something that dies tomorrow.
-	life := time.Duration(tok.ExpiresIn) * time.Second
-	fmt.Fprintf(os.Stderr, "granted: %s\nexpires: %s (%s from now; %d days requested)\n",
-		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute), days)
-	if !slicesContains(strings.Fields(tok.Scope), sessionsScope) {
-		return fmt.Errorf("the token endpoint granted %q, which does not include %s.\n"+
-			"  A token without it is refused by every session and environment route, so this\n"+
-			"  is not the credential to store.", tok.Scope, sessionsScope)
-	}
-
-	// IS A ROTATED-AWAY REFRESH TOKEN STILL USABLE? The whole shape of this
-	// depends on the answer. If the one just spent still works, a secret can
-	// hold a refresh token and a worker can exchange it for an access token on
-	// every run, never storing a credential anywhere. If it is single-use,
-	// only something that can PERSIST the replacement can do the exchanging,
-	// and a worker cannot.
-	//
-	// Spending it again is the only way to ask, and it is safe: whichever
-	// refresh token is newest and valid ends up in the credentials file.
-	if o.checkReuse {
-		if !rotated {
-			fmt.Fprintln(os.Stderr, "\nreuse: the refresh token did not rotate, so it stays usable.")
-		} else if again, err := exchange(first, days); err != nil {
-			fmt.Fprintf(os.Stderr, "\nreuse: the spent refresh token is REFUSED (%v).\n"+
-				"  It is single-use, so whatever exchanges it must be able to store the\n"+
-				"  replacement — which a worker cannot.\n", err)
-		} else {
-			if err := writeRefresh(path, creds, oauth, tok.RefreshToken, again.RefreshToken); err != nil {
-				return err
-			}
-			fmt.Fprintln(os.Stderr, "\nreuse: the spent refresh token STILL WORKS, so it is not single-use.\n"+
-				"  A secret can hold one and a worker can exchange it every run.")
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
-		"reader= and entropy= lines:\n\n", secretName)
-	fmt.Println(tok.AccessToken)
-	return nil
-}
-
-// oauthToken is what the token endpoint answers with.
-type oauthToken struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int64  `json:"expires_in"`
-	Scope        string `json:"scope"`
-}
-
-// exchange trades a refresh token for an access token carrying the scopes this
-// needs. `expires_in` is a REQUEST, not a setting: the server has answered a
-// 365-day one with a token good for about a day.
-func exchange(refresh string, days int) (oauthToken, error) {
-	var tok oauthToken
-	body := map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": refresh,
-		"client_id":     oauthClientID,
-		"scope":         strings.Join(wantedScopes, " "),
-		"expires_in":    days * 24 * 60 * 60,
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return tok, err
-	}
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
-		oauthTokenURL, "application/json", bytes.NewReader(raw))
-	if err != nil {
-		return tok, err
-	}
-	defer resp.Body.Close()
-	answer, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return tok, err
-	}
-	if resp.StatusCode != 200 {
-		return tok, fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
-	}
-	if err := json.Unmarshal(answer, &tok); err != nil {
-		return tok, err
-	}
-	if tok.AccessToken == "" {
-		return tok, errors.New("the token endpoint returned no access_token")
-	}
-	return tok, nil
-}
-
-// writeRefresh stores a rotated refresh token, temp-and-rename so a crash
-// cannot leave a half-written credentials file. Unchanged is a no-op.
-func writeRefresh(path string, creds, oauth map[string]any, old, new string) error {
-	if new == "" || new == old {
+// The host path is not a convenience worth keeping: `caos-cli run` is barely
+// longer, and it records what it did.
+func requireWorker(o opts) error {
+	if inWorker() {
 		return nil
 	}
-	oauth["refreshToken"] = new
-	updated, err := json.MarshalIndent(creds, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".drive-mint"
-	if err := os.WriteFile(tmp, updated, 0o600); err != nil {
-		return fmt.Errorf("writing %s: %v", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("replacing %s: %v (the new refresh token is in %s)", path, err, tmp)
-	}
-	fmt.Fprintln(os.Stderr, "the refresh token rotated; wrote the new one back to "+path)
-	return nil
-}
-
-const (
-	oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
-	// Consent at CLAUDE.AI, not the console: both authorize URLs request the
-	// same scope set, and it is the grant that narrows. The console grants the
-	// console scopes, which is why setup-token's token has no sessions scope.
-	claudeAIAuthorizeURL = "https://claude.com/cai/oauth/authorize"
-	// The MANUAL redirect, so no local port has to be opened.
-	oauthRedirectURL = "https://platform.claude.com/oauth/code/callback"
-	// The PROD client. Claude Code carries three OAuth configs and the other
-	// two are a localhost dev factory and a staging one; the prod block is the
-	// one with an empty OAUTH_FILE_SUFFIX and mcp-proxy.anthropic.com. A dev
-	// client id reaches the real token endpoint and is answered "Client with id
-	// … not found", which reads like a revoked client rather than a wrong one.
-	oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-	sessionsScope = "user:sessions:claude_code"
-)
-
-// wantedScopes is the set the CLI's own claude.ai login carries. The sessions
-// one is the only one this program needs; the rest ride along so the minted
-// token is not narrower than the login it came from.
-var wantedScopes = []string{
-	"user:profile", "user:inference", sessionsScope,
-	"user:mcp_servers", "user:file_upload", "user:plugins",
-}
-
-func slicesContains(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
+	verb := "start"
+	for name, flag := range workerVerbs {
+		if flag != "" && flag == "--"+o.mode {
+			verb = name
 		}
 	}
-	return false
-}
+	if o.mode == "" && o.session != "" {
+		verb = "send"
+	}
+	return fmt.Errorf(`this runs as a caos worker, not on the host. The same call is
 
-// ------------------------------------------------------- the browser flow
+    caos-cli run --base:@=integrations/claude-code/drive \
+      --verb=%s ... --at="$(date +%%s)"
 
-// authorize runs the OAuth authorization-code flow against CLAUDE.AI and asks
-// for a long-lived token. It is the only route to a credential a worker can
-// hold, and every other one is measured shut:
-//
-//   - `claude setup-token` consents at the CONSOLE, which grants the console
-//     scopes; the session and environment routes refuse the result with
-//     401 oauth_scope_insufficient.
-//   - a refresh exchange consents nowhere and grants the claude.ai scopes,
-//     but the server ignores `expires_in` there — 365 days asked, 8 hours
-//     given — and the refresh token is SINGLE-USE: spending it rotates it, and
-//     the spent one is answered `invalid_grant`. So nothing that cannot store
-//     the replacement can do the exchanging, and a worker cannot store.
-//   - a claude.ai browser `sessionKey` is a cookie, not a bearer; the session
-//     routes answer it 401 whichever host it is presented to.
-//
-// `expires_in` rides the CODE exchange rather than the authorize URL, which is
-// where setup-token's year comes from. Consenting at claude.ai rather than the
-// console is what should keep `user:sessions:claude_code` on the grant. If the
-// answer comes back short-lived or narrow anyway, this says so and stores
-// nothing.
-//
-// The redirect is the MANUAL one, so no local port is opened and nothing has
-// to survive a browser handing back to a listener: claude.ai shows a code,
-// and it is pasted here.
-func authorize(o opts) error {
-	days := 365
-	if o.days != "" {
-		if _, err := fmt.Sscanf(o.days, "%d", &days); err != nil || days < 1 {
-			return fmt.Errorf("--days %q is not a positive number of days", o.days)
-		}
-	}
-	verifier, err := randomURLSafe(32)
-	if err != nil {
-		return err
-	}
-	// 32 bytes, not 16: the client mints both the verifier and the state as
-	// base64url of 32 random bytes, and a 22-character state is the one
-	// parameter claude.ai answers "Invalid request format" to once the scope
-	// list and the parameter order match.
-	state, err := randomURLSafe(32)
-	if err != nil {
-		return err
-	}
-	sum := sha256.Sum256([]byte(verifier))
-	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
-
-	// BUILT IN THE CLIENT'S OWN ORDER, and with its own scope list. The
-	// endpoint answers "Authorization failed / Invalid request format" to a
-	// narrowed scope set — a subset of what the client is registered for is not
-	// a smaller ask, it is a malformed one — so the whole of `authorizeScopes`
-	// goes out and the grant narrows it. Order is preserved for the same reason:
-	// url.Values.Encode sorts, and nothing here needs to find out whether that
-	// matters.
-	var q strings.Builder
-	for i, kv := range [][2]string{
-		{"code", "true"},
-		{"client_id", oauthClientID},
-		{"response_type", "code"},
-		{"redirect_uri", oauthRedirectURL},
-		{"scope", strings.Join(authorizeScopes, " ")},
-		{"code_challenge", challenge},
-		{"code_challenge_method", "S256"},
-		{"state", state},
-	} {
-		if i > 0 {
-			q.WriteByte('&')
-		}
-		q.WriteString(kv[0] + "=" + url.QueryEscape(kv[1]))
-	}
-
-	fmt.Fprintf(os.Stderr, "Open this, approve, and paste back what the page shows:\n\n%s?%s\n\ncode: ",
-		claudeAIAuthorizeURL, q.String())
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && strings.TrimSpace(line) == "" {
-		return fmt.Errorf("reading the pasted code: %v", err)
-	}
-	// The callback page shows `<code>#<state>`; either half alone is accepted
-	// so a paste that drops the fragment still works.
-	code, pastedState, _ := strings.Cut(strings.TrimSpace(line), "#")
-	if code == "" {
-		return errors.New("no code pasted")
-	}
-	if pastedState != "" {
-		state = pastedState
-	}
-
-	// ONE CONSENT, MANY EXCHANGES. The server caps how long a token may live
-	// and says only "Invalid expiry for scope" — it does not name the ceiling.
-	// Finding it by consenting again per guess would spend a browser round trip
-	// each time, so the ladder is walked against the code already in hand, from
-	// the lifetime asked for down to none at all. A code survives a REFUSED
-	// exchange; only a granted one consumes it.
-	var tok oauthToken
-	var granted int
-	for _, try := range ladder(days) {
-		body := map[string]any{
-			"grant_type":    "authorization_code",
-			"code":          code,
-			"redirect_uri":  oauthRedirectURL,
-			"client_id":     oauthClientID,
-			"code_verifier": verifier,
-			"state":         state,
-		}
-		if try > 0 {
-			body["expires_in"] = try * 24 * 60 * 60
-		}
-		var err error
-		tok, err = postToken(body)
-		if err == nil {
-			granted = try
-			break
-		}
-		if !strings.Contains(err.Error(), "xpiry") && !strings.Contains(err.Error(), "expires_in") {
-			return err
-		}
-		if try > 0 {
-			fmt.Fprintf(os.Stderr, "  %d days: refused\n", try)
-		} else {
-			return err
-		}
-	}
-	if granted > 0 {
-		fmt.Fprintf(os.Stderr, "  %d days: accepted\n", granted)
-	} else {
-		fmt.Fprintln(os.Stderr, "  no custom lifetime accepted; took the default")
-	}
-
-	life := time.Duration(tok.ExpiresIn) * time.Second
-	fmt.Fprintf(os.Stderr, "\ngranted: %s\nexpires: %s (%s from now)\n",
-		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute))
-	if !slicesContains(strings.Fields(tok.Scope), sessionsScope) {
-		return fmt.Errorf("the grant does not include %s, so this token is refused by every\n"+
-			"  session and environment route. Consenting at claude.ai did not widen it.", sessionsScope)
-	}
-	if life < 24*time.Hour {
-		fmt.Fprintf(os.Stderr, "\nNOTE: %s is not a lifetime a secret can hold. The ceiling above is\n"+
-			"what this server allows on these scopes, so a worker-held token is not\n"+
-			"reachable this way.\n", life.Round(time.Minute))
-	}
-	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
-		"reader= and entropy= lines:\n\n", secretName)
-	fmt.Println(tok.AccessToken)
-	return nil
-}
-
-func randomURLSafe(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
-}
-
-// authorizeScopes is what --authorize asks for, and it is DELIBERATELY NARROW.
-// A long lifetime is not available on every scope: the token endpoint answers
-//
-//	Custom expires_in not allowed for scope 'user:mcp_servers'
-//
-// so the client's own seven-scope set cannot carry one. Only what the session
-// and environment routes need is asked for. `user:profile` rides along because
-// it is in the console set, which is the set setup-token already mints with a
-// custom lifetime.
-//
-// An earlier narrowed set was refused as "Invalid request format", which read
-// like the endpoint rejecting a subset. It was the STATE LENGTH; narrowing is
-// fine. --scopes overrides this when the server names another scope to drop.
-var authorizeScopes = []string{"user:profile", sessionsScope}
-
-// ladder is the sequence of lifetimes to try, longest first, ending in 0 —
-// no `expires_in` at all, which takes whatever the server defaults to. Values
-// at or above the one asked for are skipped so an explicit --days is a ceiling
-// rather than a suggestion.
-func ladder(days int) []int {
-	out := []int{days}
-	for _, d := range []int{365, 180, 90, 60, 30, 14, 7, 1} {
-		if d < days {
-			out = append(out, d)
-		}
-	}
-	return append(out, 0)
-}
-
-// postToken sends one token request and returns the server's own message on a
-// refusal — which is the thing that names the scope or the limit.
-func postToken(body map[string]any) (oauthToken, error) {
-	var tok oauthToken
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return tok, err
-	}
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
-		oauthTokenURL, "application/json", bytes.NewReader(raw))
-	if err != nil {
-		return tok, err
-	}
-	defer resp.Body.Close()
-	answer, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return tok, err
-	}
-	if resp.StatusCode != 200 {
-		return tok, fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
-	}
-	if err := json.Unmarshal(answer, &tok); err != nil {
-		return tok, err
-	}
-	if tok.AccessToken == "" {
-		return tok, errors.New("the token endpoint returned no access_token")
-	}
-	return tok, nil
+  so the job is recorded, and the token comes from /secret/%s rather than
+  from whichever login this machine happens to hold. Minting that token is
+  the one thing that does run here: see authorize.go.`, verb, secretName)
 }
