@@ -2,10 +2,13 @@
 # the Go script worker, which supplies the interpreter and the container.
 # std/deep-deps mounts it at DEEP-DEPS/go, which `.caos-expr` names as --base.
 #
-# std/go's OWN DEPS name ../flake-builder and ../../flake.lock, and the tests
-# that use std/go declare flake-builder too — but it is not needed here, and
-# measured: this entry evaluates and RUNS without it, and tests/exec-bit
-# evaluates to the byte-identical hash either way. std/go carries no
-# `.caos-expr`, so nothing ever evaluates it; it is ingested as a flake
-# directory and built as one.
+# ITS OWN DEPS COME WITH IT. std/go is evaluable (`run
+# --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock`), so
+# it needs a flake-builder and a lock of its own — and deepening is RECURSIVE,
+# filling DEEP-DEPS/go/DEEP-DEPS/{flake-builder,flake.lock} from std/go's DEPS
+# without this file naming either. Measured in the deepened tree.
+#
+# So a consumer declares only what its OWN expression names. Declaring a
+# mount's dependencies as well is redundant, which is what 26 test DEPS files
+# were doing with flake-builder.
 ../../../std/go go
