@@ -1804,7 +1804,11 @@ func authorize(o opts) error {
 	if err != nil {
 		return err
 	}
-	state, err := randomURLSafe(16)
+	// 32 bytes, not 16: the client mints both the verifier and the state as
+	// base64url of 32 random bytes, and a 22-character state is the one
+	// parameter claude.ai answers "Invalid request format" to once the scope
+	// list and the parameter order match.
+	state, err := randomURLSafe(32)
 	if err != nil {
 		return err
 	}
