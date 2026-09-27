@@ -32,6 +32,7 @@
 //	drive --env-update Caos --set-env K=V   # set/unset env vars (--unset-env K)
 //	drive --env-create NAME --from Caos     # create (optionally cloning an env)
 //	drive --env-delete NAME                 # delete an environment
+//	drive --mint                            # mint the token a caos secret holds
 //
 // A SESSION ID HAS TWO SPELLINGS of the same session: the API and this tool
 // print `cse_<suffix>`, and claude.ai/code URLs carry `session_<suffix>`. The
@@ -118,6 +119,7 @@ type opts struct {
 	repo       string // --repo: owner/repo[@ref]
 	ref        string // --ref
 	title      string
+	days       string // --mint: how long the minted token should last
 	probe      bool
 	anyRepo    bool
 	arg        string // the bare token
@@ -164,6 +166,8 @@ func run(argv []string) error {
 			o.mode = "env-update"
 		case "--env-create":
 			o.mode = "env-create"
+		case "--mint":
+			o.mode = "mint"
 		case "--env-delete":
 			o.mode = "env-delete"
 		case "--env":
@@ -182,6 +186,8 @@ func run(argv []string) error {
 			o.repo, err = next(&i, a)
 		case "--ref":
 			o.ref, err = next(&i, a)
+		case "--days":
+			o.days, err = next(&i, a)
 		case "--title":
 			o.title, err = next(&i, a)
 		case "--init-script":
@@ -228,6 +234,8 @@ func run(argv []string) error {
 		return conv(o)
 	case "info":
 		return info(o)
+	case "mint":
+		return mint(o)
 	case "list":
 		return list()
 	case "archive":
@@ -1215,9 +1223,12 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
   drive --env-create <name> [--from <env>]
   drive --env-delete <env>
 
+  drive --mint [--days N]           mint a long-lived token for the caos secret
+
   --title T    the session's title (default: the prompt's first line)
   --ref R      the revision to check out (same as --repo owner/repo@R)
   --any-repo   skip the caos-pin warning on the cwd fallback
+  --days N     --mint only: how long the token lasts (default 365)
 
 <env> is an environment's name or its env_… id; <session> is cse_…, session_…,
 or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
@@ -1342,20 +1353,27 @@ func render(v any) string {
 // back into the flags above.
 //
 //	caos-cli run --base:@=integrations/claude-code/drive \
-//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt=<file> --salt=<unique>
+//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt:@=./p.txt \
+//	  --at="$(date +%s)"
 //
-// A CREATE MUST CARRY A SALT. A worker's result is memoized on its ArgTree, so
-// a second `start` with identical arguments would answer with the FIRST
-// session's id and create nothing — the session would look started and no
-// container would exist. `salt` is refused-if-missing rather than defaulted,
-// because a default that varies (a clock, a random) would make every read
-// uncacheable too, and one that does not vary would not fix anything.
+// EVERY VERB TAKES `at`, AND IT IS THE CURRENT TIME. Nothing here is a pure
+// function of its arguments: `start` and `send` change a session, and `list`,
+// `info` and the env reads ask a service that moves on its own. A worker's
+// result is memoized on its ArgTree, so without something that differs, a
+// second `start` answers with the FIRST session's id and creates nothing —
+// the session looks started and no container exists — and a second `list`
+// answers with a listing from whenever the first one ran.
 //
-// THE READ VERBS ARE CACHEABLE AND ACCOUNT-SCOPED. `list` answers with this
-// account's sessions, which is a result that depends on WHICH token was
-// granted — allowed only because the secret's entropy pins that identity in
-// `secret-hash` (SPEC.md, "Correctness requirements"). Rotate the entropy when
-// the token starts naming a different account.
+// It is a TIME rather than a nonce so that staleness is the caller's to
+// choose: `date +%s` is always fresh, `date +%Y%m%d%H%M` reuses an answer for
+// up to a minute, and a fixed value deliberately pins one. Refused when
+// missing rather than defaulted — a default that varies would take that choice
+// away, and one that does not vary would fix nothing.
+//
+// THE READ VERBS ARE ACCOUNT-SCOPED, which a memoized result may only be
+// because the secret's entropy pins that identity in `secret-hash` (SPEC.md,
+// "Correctness requirements"). Rotate the entropy when the token starts naming
+// a different account.
 const argsDir = "/cas/args"
 
 const secretsDir = "/secret"
@@ -1408,14 +1426,16 @@ func runWorker() error {
 		return fmt.Errorf("unknown verb %q", verb)
 	}
 
-	salt, err := workerArg("salt")
+	// `at` is read and then dropped: it is in the ArgTree, which is where it
+	// does its work, and the command line below never sees it.
+	at, err := workerArg("at")
 	if err != nil {
 		return err
 	}
-	if mutates(verb) && salt == "" {
-		return fmt.Errorf("verb %q changes something, so it needs a `salt` argument holding a value "+
-			"no earlier run used.\n  Without one this job's ArgTree repeats and the memo answers with "+
-			"the earlier run's result, having done nothing.", verb)
+	if at == "" {
+		return fmt.Errorf("verb %q needs an `at` argument holding the current time, e.g. "+
+			"--at=\"$(date +%%s)\".\n  Without one this job's ArgTree repeats and the memo answers "+
+			"with the earlier run's result — a %s that never reached the API.", verb, verbDid(verb))
 	}
 
 	var argv []string
@@ -1506,12 +1526,20 @@ func runWorker() error {
 	return report(out.String())
 }
 
-func mutates(verb string) bool {
+// verbDid names what a memo hit would have silently skipped, so the error says
+// what did not happen rather than only what is missing.
+func verbDid(verb string) string {
 	switch verb {
-	case "start", "send", "archive", "env-update", "env-create", "env-delete":
-		return true
+	case "start":
+		return "session that was never created"
+	case "send":
+		return "prompt that was never delivered"
+	case "archive":
+		return "session that was never archived"
+	case "env-update", "env-create", "env-delete":
+		return "change that was never made"
 	}
-	return false
+	return "reading of state as it was then, not now"
 }
 
 // report writes the worker's result to /cas/out.
@@ -1524,4 +1552,140 @@ func report(body string) error {
 		return fmt.Errorf("caos put: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- minting
+
+// mint trades the CLI's refresh token for a LONG-LIVED access token carrying
+// the scopes this needs, and prints it for a caos secret to hold.
+//
+// `claude setup-token` is the obvious thing and produces the wrong token: its
+// flow asks for the console scopes, and every session and environment route
+// answers a token without `user:sessions:claude_code` with
+//
+//	401 OAuth token lacks a scope this endpoint accepts (oauth_scope_insufficient)
+//
+// The CLI's own login has the right scopes but a short life and a refresh
+// token beside it. This asks the token endpoint for the same scope set with a
+// long `expires_in`, which is what makes the result something a secret can
+// hold rather than something that goes stale in hours.
+//
+// THE REFRESH TOKEN MAY ROTATE. The response carries a new one when it does,
+// and this writes it back to ~/.claude/.credentials.json — without that, the
+// running CLI's login would be the thing this broke. The write is skipped
+// when the value is unchanged, and it is temp-and-rename so a crash cannot
+// leave a half-written credentials file.
+func mint(o opts) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".claude", ".credentials.json")
+	var creds map[string]any
+	if err := readJSON(path, &creds); err != nil {
+		return fmt.Errorf("%s: %v — run `claude /login` first", path, err)
+	}
+	oauth, _ := creds["claudeAiOauth"].(map[string]any)
+	refresh, _ := dig(oauth, "refreshToken").(string)
+	if refresh == "" {
+		return fmt.Errorf("no refreshToken in %s — run `claude /login` first", path)
+	}
+
+	days := 365
+	if o.days != "" {
+		if _, err := fmt.Sscanf(o.days, "%d", &days); err != nil || days < 1 {
+			return fmt.Errorf("--days %q is not a positive number of days", o.days)
+		}
+	}
+	body := map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": refresh,
+		"client_id":     oauthClientID,
+		"scope":         strings.Join(wantedScopes, " "),
+		"expires_in":    days * 24 * 60 * 60,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
+		oauthTokenURL, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
+	}
+	var tok struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Scope        string `json:"scope"`
+	}
+	if err := json.Unmarshal(answer, &tok); err != nil {
+		return err
+	}
+	if tok.AccessToken == "" {
+		return errors.New("the token endpoint returned no access_token")
+	}
+
+	// The write-back comes FIRST: a rotated refresh token that reaches nothing
+	// is a broken CLI login, and that matters more than printing a token.
+	if tok.RefreshToken != "" && tok.RefreshToken != refresh {
+		oauth["refreshToken"] = tok.RefreshToken
+		updated, err := json.MarshalIndent(creds, "", "  ")
+		if err != nil {
+			return err
+		}
+		tmp := path + ".drive-mint"
+		if err := os.WriteFile(tmp, updated, 0o600); err != nil {
+			return fmt.Errorf("writing %s: %v", tmp, err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return fmt.Errorf("replacing %s: %v (the new refresh token is in %s)", path, err, tmp)
+		}
+		fmt.Fprintln(os.Stderr, "the refresh token rotated; wrote the new one back to "+path)
+	}
+
+	granted := strings.Fields(tok.Scope)
+	fmt.Fprintf(os.Stderr, "granted: %s\nexpires: %s\n",
+		strings.Join(granted, " "),
+		time.Now().Add(time.Duration(tok.ExpiresIn)*time.Second).Format(time.RFC3339))
+	if !slicesContains(granted, sessionsScope) {
+		return fmt.Errorf("the token endpoint granted %q, which does not include %s.\n"+
+			"  A token without it is refused by every session and environment route, so this\n"+
+			"  is not the credential to store.", tok.Scope, sessionsScope)
+	}
+	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
+		"reader= and entropy= lines:\n\n", secretName)
+	fmt.Println(tok.AccessToken)
+	return nil
+}
+
+const (
+	oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
+	oauthClientID = "22422756-60c9-4084-8eb7-27705fd5cf9a"
+	sessionsScope = "user:sessions:claude_code"
+)
+
+// wantedScopes is the set the CLI's own claude.ai login carries. The sessions
+// one is the only one this program needs; the rest ride along so the minted
+// token is not narrower than the login it came from.
+var wantedScopes = []string{
+	"user:profile", "user:inference", sessionsScope,
+	"user:mcp_servers", "user:file_upload", "user:plugins",
+}
+
+func slicesContains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
 }

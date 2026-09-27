@@ -8,7 +8,7 @@ go run integrations/claude-code/drive/drive.go \
 
 caos-cli run --base:@=integrations/claude-code/drive --verb=start \
   --env=Caos --repo=Metta-AI/caos-session --prompt:@=./prompt.txt \
-  --salt="$(date +%s%N)"
+  --at="$(date +%s)"
 ```
 
 `go run` needs `go`, which the dev shell carries; outside it,
@@ -46,9 +46,17 @@ definition. It is looked for in three places, first hit wins:
 
 | | |
 |---|---|
-| `$CLAUDE_CODE_OAUTH_TOKEN` | what `claude setup-token` mints — long-lived |
+| `$CLAUDE_CODE_OAUTH_TOKEN` | a token you supply |
 | `/secret/claude-oauth-token` | the caos secret, dropped by the runner |
 | `~/.claude/.credentials.json` | the running CLI's own login — it EXPIRES |
+
+**`claude setup-token` does not mint a usable one.** Its flow asks for the
+console scopes, and every session and environment route answers a token
+without `user:sessions:claude_code` with `401 oauth_scope_insufficient`. What
+carries the scope is the CLI's own claude.ai login, which is short-lived —
+so `drive --mint` trades that login's refresh token for a long-lived access
+token with the same scopes, and writes back a rotated refresh token so the
+CLI keeps working.
 
 An API key (`sk-ant-api03-…`) is **not** one of these: the service answers
 "Cloud sessions are only available on the first-party Anthropic API provider".
@@ -83,17 +91,24 @@ The secret is granted to a job whose ArgTree is a superset of one of the
 secret's readers, so `.caos-secrets/claude-oauth-token` needs:
 
 ```
-value=<what `claude setup-token` prints>
+value=<what `drive --mint` prints>
 reader=integrations/claude-code/drive
 entropy=<`caos secrets` fills this>
 ```
 
-**A verb that changes something requires a `salt`.** A worker's result is
-memoized on its ArgTree, so a second `start` with identical arguments answers
-with the first session's id and creates nothing — the session would look
-started and no container would exist. `salt` is refused-if-missing rather than
-defaulted: a default that varies would make every read uncacheable too, and one
-that does not vary would fix nothing.
+**Every verb requires `at`, the current time.** A worker's result is memoized
+on its ArgTree, and nothing here is a pure function of its arguments: `start`
+and `send` change a session, and `list`, `info` and the env reads ask a service
+that moves on its own. Without a value that moves, a second `start` answers
+with the first session's id and creates nothing — the session looks started
+and no container exists — and a second `list` answers with a listing from
+whenever the first one ran.
+
+A time rather than a nonce, so staleness is the caller's to choose:
+`date +%s` is always fresh, `date +%Y%m%d%H%M` reuses an answer for up to a
+minute, and a fixed value deliberately pins one. Refused when missing rather
+than defaulted — a default that varies takes that choice away, and one that
+does not vary fixes nothing.
 
 **The read verbs are account-scoped**, which a cached result may only be
 because the secret's entropy pins that identity in `secret-hash` (SPEC.md,

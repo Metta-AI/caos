@@ -157,6 +157,10 @@
             # throwaway index, in tests/cloud-setup). ~50MB against the build
             # cache's ~500MB, and the alternative was a second Go image.
             pkgs.gitMinimal
+            # The CA bundle, for a worker that makes an HTTPS request. Without
+            # it Go trusts nothing: an outbound call dies with "certificate
+            # signed by unknown authority" on a certificate that is fine.
+            pkgs.cacert
           ];
           config = {
             Env = [
@@ -180,6 +184,12 @@
               # Must match the prime (see goCache): CGO_ENABLED is part of the
               # build cache key, and there is no C compiler here anyway.
               "CGO_ENABLED=0"
+              # NAMED EXPLICITLY, because cacert installs `ca-bundle.crt` and
+              # none of the six paths Go searches by default is that one
+              # (`/etc/ssl/certs/ca-certificates.crt` is the closest). A pure-Go
+              # x509 with no match trusts nothing and says so only at the first
+              # request.
+              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
             ];
           };
         };

@@ -7,14 +7,17 @@
 # and it imports nothing outside the standard library, so the prelude module
 # std/go copies beside it is never consulted.
 #
-# NOTHING IS BOUND HERE. A caller curries the verb and its arguments:
+# NOTHING IS BOUND HERE. A caller curries the verb, its arguments, and the time:
 #
-#   caos-cli run --base:@=integrations/claude-code/drive --verb=list
+#   caos-cli run --base:@=integrations/claude-code/drive \
+#     --verb=list --at="$(date +%s)"
 #   caos-cli run --base:@=integrations/claude-code/drive --verb=start \
 #     --env=Caos --repo=Metta-AI/caos-session --prompt:@=./prompt.txt \
-#     --salt="$(date +%s%N)"
+#     --at="$(date +%s)"
 #
-# A verb that CHANGES something requires `salt`. A worker's result is memoized
-# on its ArgTree, so a second `start` with identical arguments answers with the
-# first session's id and creates nothing.
+# `at` IS REQUIRED BY EVERY VERB. A worker's result is memoized on its ArgTree
+# and nothing here is a pure function of its arguments, so without a value that
+# moves, a second `start` answers with the first session's id and creates
+# nothing, and a second `list` answers with a listing from whenever the first
+# one ran. A coarser time (`date +%Y%m%d%H%M`) deliberately reuses an answer.
 curry --base:@=DEEP-DEPS/go --worker1:@=drive.go
