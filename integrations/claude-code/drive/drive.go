@@ -120,6 +120,7 @@ type opts struct {
 	ref        string // --ref
 	title      string
 	days       string // --mint: how long the minted token should last
+	checkReuse bool   // --mint: spend the refresh token twice, to learn if it is single-use
 	probe      bool
 	anyRepo    bool
 	arg        string // the bare token
@@ -186,6 +187,8 @@ func run(argv []string) error {
 			o.repo, err = next(&i, a)
 		case "--ref":
 			o.ref, err = next(&i, a)
+		case "--check-reuse":
+			o.checkReuse = true
 		case "--days":
 			o.days, err = next(&i, a)
 		case "--title":
@@ -1228,7 +1231,8 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
   --title T    the session's title (default: the prompt's first line)
   --ref R      the revision to check out (same as --repo owner/repo@R)
   --any-repo   skip the caos-pin warning on the cwd fallback
-  --days N     --mint only: how long the token lasts (default 365)
+  --days N     --mint only: the lifetime to ask for (default 365; the server decides)
+  --check-reuse  --mint only: spend the refresh token twice, to learn if it is single-use
 
 <env> is an environment's name or its env_… id; <session> is cse_…, session_…,
 or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
@@ -1586,8 +1590,8 @@ func mint(o opts) error {
 		return fmt.Errorf("%s: %v — run `claude /login` first", path, err)
 	}
 	oauth, _ := creds["claudeAiOauth"].(map[string]any)
-	refresh, _ := dig(oauth, "refreshToken").(string)
-	if refresh == "" {
+	first, _ := dig(oauth, "refreshToken").(string)
+	if first == "" {
 		return fmt.Errorf("no refreshToken in %s — run `claude /login` first", path)
 	}
 
@@ -1597,6 +1601,74 @@ func mint(o opts) error {
 			return fmt.Errorf("--days %q is not a positive number of days", o.days)
 		}
 	}
+
+	tok, err := exchange(first, days)
+	if err != nil {
+		return err
+	}
+	// The write-back comes FIRST: a rotated refresh token that reaches nothing
+	// is a broken CLI login, and that matters more than printing a token.
+	if err := writeRefresh(path, creds, oauth, first, tok.RefreshToken); err != nil {
+		return err
+	}
+	rotated := tok.RefreshToken != "" && tok.RefreshToken != first
+
+	// THE SERVER DECIDES THE LIFETIME, and it has ignored `expires_in` here —
+	// a 365-day request came back as a token good for about a day. Say so
+	// rather than let a secret be filled with something that dies tomorrow.
+	life := time.Duration(tok.ExpiresIn) * time.Second
+	fmt.Fprintf(os.Stderr, "granted: %s\nexpires: %s (%s from now; %d days requested)\n",
+		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute), days)
+	if !slicesContains(strings.Fields(tok.Scope), sessionsScope) {
+		return fmt.Errorf("the token endpoint granted %q, which does not include %s.\n"+
+			"  A token without it is refused by every session and environment route, so this\n"+
+			"  is not the credential to store.", tok.Scope, sessionsScope)
+	}
+
+	// IS A ROTATED-AWAY REFRESH TOKEN STILL USABLE? The whole shape of this
+	// depends on the answer. If the one just spent still works, a secret can
+	// hold a refresh token and a worker can exchange it for an access token on
+	// every run, never storing a credential anywhere. If it is single-use,
+	// only something that can PERSIST the replacement can do the exchanging,
+	// and a worker cannot.
+	//
+	// Spending it again is the only way to ask, and it is safe: whichever
+	// refresh token is newest and valid ends up in the credentials file.
+	if o.checkReuse {
+		if !rotated {
+			fmt.Fprintln(os.Stderr, "\nreuse: the refresh token did not rotate, so it stays usable.")
+		} else if again, err := exchange(first, days); err != nil {
+			fmt.Fprintf(os.Stderr, "\nreuse: the spent refresh token is REFUSED (%v).\n"+
+				"  It is single-use, so whatever exchanges it must be able to store the\n"+
+				"  replacement — which a worker cannot.\n", err)
+		} else {
+			if err := writeRefresh(path, creds, oauth, tok.RefreshToken, again.RefreshToken); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stderr, "\nreuse: the spent refresh token STILL WORKS, so it is not single-use.\n"+
+				"  A secret can hold one and a worker can exchange it every run.")
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
+		"reader= and entropy= lines:\n\n", secretName)
+	fmt.Println(tok.AccessToken)
+	return nil
+}
+
+// oauthToken is what the token endpoint answers with.
+type oauthToken struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int64  `json:"expires_in"`
+	Scope        string `json:"scope"`
+}
+
+// exchange trades a refresh token for an access token carrying the scopes this
+// needs. `expires_in` is a REQUEST, not a setting: the server has answered a
+// 365-day one with a token good for about a day.
+func exchange(refresh string, days int) (oauthToken, error) {
+	var tok oauthToken
 	body := map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": refresh,
@@ -1606,64 +1678,49 @@ func mint(o opts) error {
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return tok, err
 	}
 	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
 		oauthTokenURL, "application/json", bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return tok, err
 	}
 	defer resp.Body.Close()
 	answer, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return tok, err
 	}
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
-	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresIn    int64  `json:"expires_in"`
-		Scope        string `json:"scope"`
+		return tok, fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
 	}
 	if err := json.Unmarshal(answer, &tok); err != nil {
-		return err
+		return tok, err
 	}
 	if tok.AccessToken == "" {
-		return errors.New("the token endpoint returned no access_token")
+		return tok, errors.New("the token endpoint returned no access_token")
 	}
+	return tok, nil
+}
 
-	// The write-back comes FIRST: a rotated refresh token that reaches nothing
-	// is a broken CLI login, and that matters more than printing a token.
-	if tok.RefreshToken != "" && tok.RefreshToken != refresh {
-		oauth["refreshToken"] = tok.RefreshToken
-		updated, err := json.MarshalIndent(creds, "", "  ")
-		if err != nil {
-			return err
-		}
-		tmp := path + ".drive-mint"
-		if err := os.WriteFile(tmp, updated, 0o600); err != nil {
-			return fmt.Errorf("writing %s: %v", tmp, err)
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			return fmt.Errorf("replacing %s: %v (the new refresh token is in %s)", path, err, tmp)
-		}
-		fmt.Fprintln(os.Stderr, "the refresh token rotated; wrote the new one back to "+path)
+// writeRefresh stores a rotated refresh token, temp-and-rename so a crash
+// cannot leave a half-written credentials file. Unchanged is a no-op.
+func writeRefresh(path string, creds, oauth map[string]any, old, new string) error {
+	if new == "" || new == old {
+		return nil
 	}
-
-	granted := strings.Fields(tok.Scope)
-	fmt.Fprintf(os.Stderr, "granted: %s\nexpires: %s\n",
-		strings.Join(granted, " "),
-		time.Now().Add(time.Duration(tok.ExpiresIn)*time.Second).Format(time.RFC3339))
-	if !slicesContains(granted, sessionsScope) {
-		return fmt.Errorf("the token endpoint granted %q, which does not include %s.\n"+
-			"  A token without it is refused by every session and environment route, so this\n"+
-			"  is not the credential to store.", tok.Scope, sessionsScope)
+	oauth["refreshToken"] = new
+	updated, err := json.MarshalIndent(creds, "", "  ")
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
-		"reader= and entropy= lines:\n\n", secretName)
-	fmt.Println(tok.AccessToken)
+	tmp := path + ".drive-mint"
+	if err := os.WriteFile(tmp, updated, 0o600); err != nil {
+		return fmt.Errorf("writing %s: %v", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replacing %s: %v (the new refresh token is in %s)", path, err, tmp)
+	}
+	fmt.Fprintln(os.Stderr, "the refresh token rotated; wrote the new one back to "+path)
 	return nil
 }
 
