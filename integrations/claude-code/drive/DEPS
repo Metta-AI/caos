@@ -1,6 +1,11 @@
 # What this reaches for (format `<path> <name>`, path relative to this dir):
 # the Go script worker, which supplies the interpreter and the container.
+# std/deep-deps mounts it at DEEP-DEPS/go, which `.caos-expr` names as --base.
+#
+# std/go's OWN DEPS name ../flake-builder and ../../flake.lock, and the tests
+# that use std/go declare flake-builder too — but it is not needed here, and
+# measured: this entry evaluates and RUNS without it, and tests/exec-bit
+# evaluates to the byte-identical hash either way. std/go carries no
+# `.caos-expr`, so nothing ever evaluates it; it is ingested as a flake
+# directory and built as one.
 ../../../std/go go
-# The builder that turns std/go's flake into an image. Declared here because a
-# deep-dep's own deps resolve against the CONSUMER's tree, not against std/.
-../../../std/flake-builder flake-builder
