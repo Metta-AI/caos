@@ -1669,7 +1669,12 @@ func mint(o opts) error {
 
 const (
 	oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
-	oauthClientID = "22422756-60c9-4084-8eb7-27705fd5cf9a"
+	// The PROD client. Claude Code carries three OAuth configs and the other
+	// two are a localhost dev factory and a staging one; the prod block is the
+	// one with an empty OAUTH_FILE_SUFFIX and mcp-proxy.anthropic.com. A dev
+	// client id reaches the real token endpoint and is answered "Client with id
+	// … not found", which reads like a revoked client rather than a wrong one.
+	oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	sessionsScope = "user:sessions:claude_code"
 )
 
