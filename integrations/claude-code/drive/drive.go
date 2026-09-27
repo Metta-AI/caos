@@ -1,74 +1,38 @@
-// Drive Claude Code cloud sessions, AS A CAOS WORKER. std/go runs this file as
-// /worker; it reads its arguments from /cas/args and its token from /secret,
-// and runWorker at the bottom turns them back into the command line below. It
-// REFUSES to run on the host — see requireWorker — so there is one way to
-// reach these verbs and it leaves a job behind.
+// The caos worker behind the `integrations/claude-code/drive` entry. std/go
+// runs this file as /worker: it reads its arguments from /cas/args and its
+// token from /secret/claude-oauth-token, and runWorker at the bottom turns
+// them back into the command line the rest of this file parses.
 //
-//	caos-cli run --base:@=integrations/claude-code/drive --verb=start \
-//	  --env=Caos --repo=Metta-AI/caos-session --prompt='a prompt' \
-//	  --at="$(date +%s)"
+// WHAT IT TAKES, AND WHAT EACH VERB DOES, IS IN `.caos-expr` — bound there as
+// the tool's `help`, which is the copy a harness reads and the copy a person
+// reads. This comment is about how it works, not about how to call it.
 //
-// The token is minted by authorize.go beside this, which runs only on the host.
+// It REFUSES to run on the host (requireWorker), so that entry is the only way
+// in. The token is minted by authorize.go beside this, which for the opposite
+// reason runs ONLY on the host.
 //
-// A SESSION NAMES ITS ENVIRONMENT AND ITS REPOSITORY, and neither is a property
-// of a directory. `claude --cloud` can express neither: its `--environment`
-// takes only a self-hosted `ccpool_…` id, and it has no repository flag at all
-// — the repository is whatever `git remote get-url origin` says where it ran.
-// So the create goes straight to the API underneath it: POST /v1/code/sessions
-// takes `environment_id` and a `git_repository` source.
+// WHY IT SPEAKS THE API RATHER THAN `claude --cloud`: a session names its
+// environment and its repository, and the CLI can express neither — its
+// `--environment` takes only a self-hosted `ccpool_…` id, and it has no
+// repository flag at all, so the repository is whatever `git remote get-url
+// origin` says where it ran. POST /v1/code/sessions takes `environment_id` and
+// a `git_repository` source directly.
 //
-// The verbs, as the command line runWorker builds:
+// ONE CREDENTIAL REACHES ALL OF IT. Sessions and environments are both
+// api.anthropic.com and both answer to an OAuth token carrying
+// `user:sessions:claude_code`; readCreds is where it is looked for, and
+// authorize.go is why no other kind of token will do. An environment's
+// variables are not secrets ("visible to anyone using this environment"), so
+// they print in full.
 //
-//	start        --env --repo[@ref] --prompt [--ref --title]
-//	send         --session --prompt
-//	list         recent sessions (id, status, env, title)
-//	info         --session: env, source, provisioning trace, from OUTSIDE
-//	conv         --session: the conversation it records into, on caosd
-//	archive      --session: end it and free its container
-//	env-list     cloud environments (id + name)
-//	env-show     --env: its setup script and variables
-//	env-update   --env [--init-script --set-env --unset-env --rename]
-//	env-create   --env [--from]
-//	env-delete   --env
+// A SESSION ID HAS TWO SPELLINGS of the same session: the API and this print
+// `cse_<suffix>`, and claude.ai/code URLs carry `session_<suffix>`. Either
+// resolves, so anything here takes either, or the URL — see sessionID. A
+// pattern matching only `session_` finds nothing in an id the API itself
+// minted.
 //
-// A SESSION ID HAS TWO SPELLINGS of the same session: the API and this tool
-// print `cse_<suffix>`, and claude.ai/code URLs carry `session_<suffix>`. The
-// API accepts either, so anything here takes either, or the URL — see
-// sessionID. A pattern that matches only `session_` finds nothing in an id the
-// API itself minted.
-//
-// `--info` reads a session's environment from OUTSIDE the session, over the
-// code API -- no prompt, no in-container shell. It prints the environment id
-// and kind, the container Claude Code version, the repo branches, the worker's
-// tool set, the auto summary, and the env_manager_log trace (sandbox alloc,
-// repo clone, mounted-vs-installed client, setup-script run). NOTE: this API
-// does NOT serve the environment DEFINITION -- the setup-script text and
-// env-var VALUES are not exposed to a session-scoped token; for those use
-// --env-config, or --probe.
-//
-// `--probe` reads the ENVIRONMENT from INSIDE the session, with no dependence
-// on caos being installed or healthy: it asks the session's own Claude Code to
-// report the container. On any env that allows a shell (the default) it dumps
-// env vars, the Claude/MCP config, installed binaries, processes, listening
-// ports and the caos logs; on an env that denies the shell it falls back to
-// listing the MCP servers, tools, skills and cwd it can see. The answer comes
-// back in the run log, not here -- read it with the run-log API, or, in Claude
-// Code, RemoteTrigger get_run_log.
-//
-// ONE API, ONE CREDENTIAL. Sessions and environments are both api.anthropic.com,
-// and both answer to an Anthropic OAuth token carrying the
-// `user:sessions:claude_code` scope — creating a session, prompting it,
-// listing, archiving, and reading or writing an environment's whole definition
-// including its setup script and its variables. An API key is not one of
-// these; see readCreds for where the token is looked for.
-//
-// An environment's variables are not secrets ("visible to anyone using this
-// environment"), so they print in full.
-//
-// IT IS ALSO A CAOS WORKER. Run with no command line and /cas/args present, it
-// reads the same arguments from there and its token from /secret — see
-// runWorker at the bottom. Stdlib only, so the prelude std/go copies beside it
-// is never consulted, there is no vendorHash, and no module to keep in step.
+// Stdlib only, so the prelude module std/go copies beside it is never
+// consulted and there is no vendorHash to keep in step.
 package main
 
 import (
@@ -117,7 +81,6 @@ type opts struct {
 	ref        string // --ref
 	title      string
 	probe      bool
-	anyRepo    bool
 	arg        string // the bare token
 	initScript string
 	from       string
@@ -146,8 +109,6 @@ func run(argv []string) error {
 			return nil
 		case "--probe":
 			o.probe = true
-		case "--any-repo":
-			o.anyRepo = true
 		case "--info", "--env-of":
 			o.mode = "info"
 		case "--conv":
@@ -446,6 +407,10 @@ func environments(c creds) ([]environment, error) {
 // resolveEnv turns a name or an id into an id. An id is passed through
 // unchecked so a pool or a brand-new environment does not need to be listable.
 func resolveEnv(c creds, want string) (string, error) {
+	if want == "" {
+		return "", errors.New("`env` is required: a session runs in a cloud environment, and a\n" +
+			"  worker has no settings to read a default from — verb=env-list lists them")
+	}
 	if strings.HasPrefix(want, "env_") || strings.HasPrefix(want, "ccpool_") {
 		return want, nil
 	}
@@ -491,18 +456,15 @@ func newOrContinue(o opts) error {
 // so there is one way for a prompt to reach a session rather than two. An
 // `events` entry in the create body works too.
 func start(c creds, o opts, prompt string) error {
-	warnUnpinned(o)
-	envID, err := chooseEnv(c, o)
+	envID, err := resolveEnv(c, o.env)
 	if err != nil {
 		return err
 	}
-	repo := o.repo
-	if repo == "" {
-		if repo, err = originRepo(); err != nil {
-			return err
-		}
+	if o.repo == "" {
+		return errors.New("`repo` is required: a session opens a repository, and a worker has no\n" +
+			"  checkout to fall back on — name it, e.g. repo=Metta-AI/caos-session")
 	}
-	repoURL, ref, err := parseRepo(repo, o.ref)
+	repoURL, ref, err := parseRepo(o.repo, o.ref)
 	if err != nil {
 		return err
 	}
@@ -541,55 +503,6 @@ func start(c creds, o opts, prompt string) error {
 	}
 	fmt.Fprintf(os.Stderr, "\nview: %s\n", sessionURL(id))
 	return sendPrompt(c, id, prompt)
-}
-
-// chooseEnv resolves --env, or picks the one a bare `claude --cloud` would:
-// the `remote.defaultEnvironmentId` settings key, else the first hosted
-// environment the account has. A worker has no settings, so there it is the
-// list or nothing.
-func chooseEnv(c creds, o opts) (string, error) {
-	if o.env != "" {
-		return resolveEnv(c, o.env)
-	}
-	if id := defaultEnvFromSettings(); id != "" {
-		return id, nil
-	}
-	envs, err := environments(c)
-	if err != nil {
-		return "", err
-	}
-	for _, e := range envs {
-		if e.Kind == "anthropic_cloud" {
-			fmt.Fprintf(os.Stderr, "env:  %s (%s), the first hosted one — name it with --env\n", e.Name, e.ID)
-			return e.ID, nil
-		}
-	}
-	return "", errors.New("--env was not given and this account has no hosted environment to fall back on")
-}
-
-// defaultEnvFromSettings reads the key `/remote-env` writes. Only the user and
-// policy files are consulted: a project or local settings file travels with a
-// checkout, and where a session RUNS is not a property of the code it opens.
-func defaultEnvFromSettings() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	var s struct {
-		Remote struct {
-			DefaultEnvironmentID string `json:"defaultEnvironmentId"`
-		} `json:"remote"`
-	}
-	for _, p := range []string{
-		"/Library/Application Support/ClaudeCode/managed-settings.json",
-		"/etc/claude-code/managed-settings.json",
-		filepath.Join(home, ".claude", "settings.json"),
-	} {
-		if readJSON(p, &s) == nil && s.Remote.DefaultEnvironmentID != "" {
-			return s.Remote.DefaultEnvironmentID
-		}
-	}
-	return ""
 }
 
 // parseRepo accepts owner/repo, owner/repo@ref, or a full URL. An omitted ref
@@ -666,75 +579,6 @@ func uuidV4() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
-// originRepo is the repository of the checkout this runs in, used when --repo
-// is not given. It is the one thing the cwd still decides, and it decides it
-// explicitly rather than by being the directory a subprocess happened to run in.
-func originRepo() (string, error) {
-	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
-	if err != nil {
-		wd, _ := os.Getwd()
-		return "", fmt.Errorf("--repo was not given and %s has no `origin` remote to fall back on", wd)
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// warnUnpinned is advice, not a gate: a session on a repository that does not
-// pin caos dies in its setup phase, four minutes and one container later, and
-// that is worth saying before the container is paid for rather than after.
-//
-// The pin test is bootstrap.go's own (readLock): nodes.<root>.inputs.caos
-// names a node KEY, and only that node's locked.rev is authoritative. A
-// `follows` input is an array rather than a key and carries no lock, so it is
-// not a pin — which is why this asks for the rev rather than for the input's
-// mere presence. It can only be asked of a repository that is checked out
-// here, so a named --repo is never checked.
-func warnUnpinned(o opts) {
-	if o.anyRepo || o.repo != "" {
-		return
-	}
-	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return
-	}
-	dir := strings.TrimSpace(string(root))
-	if lockRev(filepath.Join(dir, "flake.lock")) != "" {
-		return
-	}
-	fmt.Fprintf(os.Stderr, `warning: %s does not pin caos, so its setup script will fail.
-  A caos client repo has flake.lock pinning a 'caos' input by revision, a root
-  .caos-expr mounting that input's std, AGENTS.md and .caos-secrets. The code to
-  work on is imported into the conversation, not cloned, so --repo names the
-  client repo — e.g. --repo Metta-AI/caos-session.
-`, dir)
-}
-func lockRev(path string) string {
-	var lock struct {
-		Root  string `json:"root"`
-		Nodes map[string]struct {
-			Inputs map[string]json.RawMessage `json:"inputs"`
-			Locked struct {
-				Rev string `json:"rev"`
-			} `json:"locked"`
-		} `json:"nodes"`
-	}
-	if err := readJSON(path, &lock); err != nil {
-		return ""
-	}
-	root := lock.Root
-	if root == "" {
-		root = "root"
-	}
-	raw, ok := lock.Nodes[root].Inputs["caos"]
-	if !ok {
-		return ""
-	}
-	var key string
-	if json.Unmarshal(raw, &key) != nil {
-		return "" // an array is a `follows`, which carries no lock
-	}
-	return lock.Nodes[key].Locked.Rev
 }
 
 func promptText(o opts) (string, error) {
@@ -1198,40 +1042,16 @@ func trunc(s string, n int) string {
 
 // ------------------------------------------------------------------- text
 
-const usage = `drive — start and inspect Claude Code cloud sessions.
-
-  drive --env <env> --repo <owner/repo[@ref]> 'prompt'   start one (no cwd needed)
-  drive 'prompt'                    start one on the cwd's repo, default env
-  drive -c <session> 'follow-up'    inject a prompt into a running session
-  drive -f <file>                   read the prompt from a file (with either)
-  drive --probe [-c <session>]      ask a session to dump its container
-
-  drive --list                      recent sessions (id, status, env, title)
-  drive --archive <session>         end a session and free its container
-  drive --info <session>            a session's environment, from outside
-  drive --conv <session>            the conversation it records into, on caosd
-
-  drive --env-config [<env>]        list environments, or print one's definition
-  drive --env-update <env> [--init-script F] [--set-env K=V] [--unset-env K] [--rename N]
-  drive --env-create <name> [--from <env>]
-  drive --env-delete <env>
-
-  (the token these need is minted by authorize.go, on the host)
-
-  --title T    the session's title (default: the prompt's first line)
-  --ref R      the revision to check out (same as --repo owner/repo@R)
-  --any-repo   skip the caos-pin warning on the cwd fallback
-
-<env> is an environment's name or its env_… id; <session> is cse_…, session_…,
-or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
-and omitting --env to the default environment.
-
-These run as a caos WORKER, not on the host. The verb form is
+// usage is the INTERNAL command line runWorker builds, for reading the code
+// and nothing else — every one of these is refused on the host. What the verbs
+// mean, and which arguments each takes, is the `help` in `.caos-expr`.
+const usage = `drive — the worker's own flags. Callers use the entry:
   caos-cli run --base:@=integrations/claude-code/drive --verb=… --at="$(date +%s)"
 
-The token comes from $CLAUDE_CODE_OAUTH_TOKEN, else
-/secret/claude-oauth-token, else the CLI's own ~/.claude/.credentials.json;
-authorize.go mints one that works.
+  --env --repo --ref --title --prompt-bearing positional | -f <file> | -c <session>
+  --probe --list --archive --info --conv
+  --env-config --env-update --env-create --env-delete
+  --init-script --set-env --unset-env --rename --from
 `
 
 // defaultEnvSeed is what --env-create starts from with no --from: the same
@@ -1343,32 +1163,19 @@ func render(v any) string {
 
 // ------------------------------------------------------------------ worker
 
-// AS A CAOS WORKER, this same program reads its arguments from /cas/args and
-// its token from /secret. The runner gives a worker no command line, so the
-// arguments the caller curried become files, one per name, and this turns them
-// back into the flags above.
+// AS A CAOS WORKER, this reads its arguments from /cas/args. The runner gives
+// a worker no command line, so the arguments the caller curried arrive as
+// files, one per name, and this turns them back into the flags above.
 //
-//	caos-cli run --base:@=integrations/claude-code/drive \
-//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt='a prompt' \
-//	  --at="$(date +%s)"
-//
-// EVERY VERB TAKES `at`, AND IT IS THE CURRENT TIME. Nothing here is a pure
-// function of its arguments: `start` and `send` change a session, and `list`,
-// `info` and the env reads ask a service that moves on its own. A worker's
-// result is memoized on its ArgTree, so without something that differs, a
-// second `start` answers with the FIRST session's id and creates nothing —
-// the session looks started and no container exists — and a second `list`
-// answers with a listing from whenever the first one ran.
-//
-// It is a TIME rather than a nonce so that staleness is the caller's to
-// choose: `date +%s` is always fresh, `date +%Y%m%d%H%M` reuses an answer for
-// up to a minute, and a fixed value deliberately pins one. Refused when
-// missing rather than defaulted — a default that varies would take that choice
-// away, and one that does not vary would fix nothing.
+// `at` is refused when missing rather than defaulted: a default that varies
+// would take the choice of staleness away from the caller, and one that does
+// not vary would fix nothing. What it is for is in `.caos-expr`, with the rest
+// of the calling contract.
 //
 // THE READ VERBS ARE ACCOUNT-SCOPED, which a memoized result may only be
 // because the secret's entropy pins that identity in `secret-hash` (SPEC.md,
 // "Correctness requirements"). Rotate the entropy when the token starts naming
+// a different account.
 // a different account.
 const argsDir = "/cas/args"
 
@@ -1402,7 +1209,7 @@ func workerArg(name string) (string, error) {
 // surface is deliberately the same surface, so there is one set of behaviours
 // to reason about and one set to document.
 var workerVerbs = map[string]string{
-	"start": "", "send": "", "list": "--list", "info": "--info", "conv": "--conv",
+	"start": "", "send": "", "probe": "--probe", "list": "--list", "info": "--info", "conv": "--conv",
 	"archive": "--archive", "env-list": "--env-config", "env-show": "--env-config",
 	"env-update": "--env-update", "env-create": "--env-create", "env-delete": "--env-delete",
 }
@@ -1486,15 +1293,19 @@ func runWorker() error {
 		}
 		argv = append(argv, v)
 	}
-	if verb == "send" {
+	if verb == "send" || verb == "probe" {
 		session, err := workerArg("session")
 		if err != nil {
 			return err
 		}
-		if session == "" {
+		// `probe` carries its own prompt, so it may either target a session or
+		// start one; `send` has nothing to say without a session.
+		if session == "" && verb == "send" {
 			return errors.New("verb \"send\" needs a `session` argument")
 		}
-		argv = append(argv, "-c", session)
+		if session != "" {
+			argv = append(argv, "-c", session)
+		}
 	}
 	if verb == "start" || verb == "send" {
 		// The prompt is a FILE argument, never a curried string: a prompt

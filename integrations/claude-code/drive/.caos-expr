@@ -1,13 +1,12 @@
 # integrations/claude-code/drive, as an ENTRY (design/caos-expr.md, Phase 3):
 # evaluating this directory yields the image that runs drive.go as a worker.
+# std/go's /worker `go run`s whatever is bound as `worker1`.
 #
-# std/go's /worker `go run`s whatever is bound as `worker1`. drive.go REFUSES
-# to run outside a worker, so this entry is the only way to reach the verbs. It
-# reads its arguments from /cas/args and its token from
-# /secret/claude-oauth-token — minted by authorize.go beside it, which runs on
-# the HOST because it needs a browser and a paste (see README.md) — and it
-# imports nothing outside the standard library, so the prelude module std/go
-# copies beside it is never consulted.
+# THIS FILE IS WHERE CALLING IT IS DOCUMENTED. The `help` below is the tool's
+# own description — the copy a harness offers a model, and the copy a person
+# reads — so there is no second one to drift (the note std/merge/.caos-expr
+# carries, for the same reason). drive.go's comments cover how it works;
+# README.md is an overview and points here.
 #
 # NOTHING IS BOUND HERE. A caller curries the verb, its arguments, and the time:
 #
@@ -20,39 +19,35 @@
 # The prompt is a plain string argument. `:@=` would ingest a FILE, and it
 # ingests only git-tracked paths — an ad-hoc prompt is not one.
 #
-# `at` IS REQUIRED BY EVERY VERB. A worker's result is memoized on its ArgTree
-# and nothing here is a pure function of its arguments, so without a value that
-# moves, a second `start` answers with the first session's id and creates
-# nothing, and a second `list` answers with a listing from whenever the first
-# one ran. A coarser time (`date +%Y%m%d%H%M`) deliberately reuses an answer.
-#
-# THE HELP IS BOUND HERE, so this describes itself to any harness offering it
-# and there is no second copy to drift (the note std/merge/.caos-expr carries,
-# for the same reason). The description is joined into ONE line by `parse_help`,
-# so it is prose rather than a table.
-#
-# `at` is a parameter a model must fill, and that is deliberate: it is what
-# makes the call reach the API rather than the memo. `salt` is a RESERVED arg
-# name and could not have been used for it.
+# `at` IS REQUIRED BY EVERY VERB, and it is the current time. A worker's result
+# is memoized on its ArgTree and nothing here is a pure function of its
+# arguments, so without a value that moves, a second `start` answers with the
+# first session's id and creates nothing, and a second `list` answers with a
+# listing from whenever the first one ran. A coarser time (`date +%Y%m%d%H%M`)
+# deliberately reuses an answer for up to a minute. It could not be called
+# `salt`: that is a RESERVED arg name (llm-step's RESERVED_ARGS).
 #
 # No `@writer` and no `@in`: nothing here advances the conversation tree.
 HELP=<<END
 Start and inspect Claude Code cloud sessions. A session runs in a named cloud
 environment, on a named GitHub repository, and answers prompts. `verb` chooses
-what to do, and the other parameters belong to the verb: `start` takes env, repo
-and prompt and returns a session id; `send` takes session and prompt; `list`
-takes nothing and returns recent sessions with their status and environment;
-`info` takes session and returns its environment, its source and its
-provisioning trace; `conv` takes session and locates the caos conversation it
-records into; `archive` takes session and ends it, freeing its container.
-Environments are separately addressable: `env-list` takes nothing, `env-show`
-takes env, and `env-update`, `env-create` and `env-delete` CHANGE, CREATE and
-DESTROY an environment that other sessions may be using. A session id is
-`cse_...` or `session_...`, two spellings of the same session, and either is
-accepted wherever one is asked for. Starting a session costs a container and
-about two minutes before it can answer, so read the reply back with `info`
-rather than expecting one from `start`.
-@param verb One of start, send, list, info, conv, archive, env-list, env-show, env-update, env-create, env-delete.
+what to do, and the other parameters belong to the verb: `start` takes env,
+repo and prompt and returns a session id; `send` takes session and prompt;
+`list` takes nothing and returns recent sessions with their status and
+environment; `info` takes session and returns its environment, its source and
+its provisioning trace, read from outside the container; `conv` takes session
+and locates the caos conversation it records into; `archive` takes session and
+ends it, freeing its container; `probe` asks a session to dump what it can see
+of its own container, into its transcript rather than into this result, and
+takes either a session or an env and repo to start a fresh one. Environments
+are separately addressable: `env-list` takes nothing, `env-show` takes env, and
+`env-update`, `env-create` and `env-delete` CHANGE, CREATE and DESTROY an
+environment that other sessions may be using. A session id is `cse_...` or
+`session_...`, two spellings of the same session, and either is accepted
+wherever one is asked for. Starting a session costs a container and about two
+minutes before it can answer, so read the reply back with `info` rather than
+expecting one from `start`.
+@param verb One of start, send, list, info, conv, archive, probe, env-list, env-show, env-update, env-create, env-delete.
 @param at The current time as seconds since the epoch. The result is memoized on the arguments, so a value used before returns that earlier answer instead of asking again — pass the time now, not a constant.
 @param {string} [env] Cloud environment, by name or by its env_... id.
 @param {string} [repo] Repository the session opens: owner/repo, owner/repo@ref, or a full URL.
