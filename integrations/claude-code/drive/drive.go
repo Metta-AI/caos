@@ -75,14 +75,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -187,6 +191,8 @@ func run(argv []string) error {
 			o.repo, err = next(&i, a)
 		case "--ref":
 			o.ref, err = next(&i, a)
+		case "--authorize":
+			o.mode = "authorize"
 		case "--check-reuse":
 			o.checkReuse = true
 		case "--days":
@@ -237,6 +243,8 @@ func run(argv []string) error {
 		return conv(o)
 	case "info":
 		return info(o)
+	case "authorize":
+		return authorize(o)
 	case "mint":
 		return mint(o)
 	case "list":
@@ -1226,7 +1234,8 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
   drive --env-create <name> [--from <env>]
   drive --env-delete <env>
 
-  drive --mint [--days N]           mint a long-lived token for the caos secret
+  drive --authorize [--days N]      consent at claude.ai for a long-lived token
+  drive --mint [--days N]           exchange the CLI login's refresh token instead
 
   --title T    the session's title (default: the prompt's first line)
   --ref R      the revision to check out (same as --repo owner/repo@R)
@@ -1726,6 +1735,12 @@ func writeRefresh(path string, creds, oauth map[string]any, old, new string) err
 
 const (
 	oauthTokenURL = "https://platform.claude.com/v1/oauth/token"
+	// Consent at CLAUDE.AI, not the console: both authorize URLs request the
+	// same scope set, and it is the grant that narrows. The console grants the
+	// console scopes, which is why setup-token's token has no sessions scope.
+	claudeAIAuthorizeURL = "https://claude.com/cai/oauth/authorize"
+	// The MANUAL redirect, so no local port has to be opened.
+	oauthRedirectURL = "https://platform.claude.com/oauth/code/callback"
 	// The PROD client. Claude Code carries three OAuth configs and the other
 	// two are a localhost dev factory and a staging one; the prod block is the
 	// one with an empty OAUTH_FILE_SUFFIX and mcp-proxy.anthropic.com. A dev
@@ -1750,4 +1765,133 @@ func slicesContains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ------------------------------------------------------- the browser flow
+
+// authorize runs the OAuth authorization-code flow against CLAUDE.AI and asks
+// for a long-lived token. It is the only route to a credential a worker can
+// hold, and every other one is measured shut:
+//
+//   - `claude setup-token` consents at the CONSOLE, which grants the console
+//     scopes; the session and environment routes refuse the result with
+//     401 oauth_scope_insufficient.
+//   - a refresh exchange consents nowhere and grants the claude.ai scopes,
+//     but the server ignores `expires_in` there — 365 days asked, 8 hours
+//     given — and the refresh token is SINGLE-USE: spending it rotates it, and
+//     the spent one is answered `invalid_grant`. So nothing that cannot store
+//     the replacement can do the exchanging, and a worker cannot store.
+//   - a claude.ai browser `sessionKey` is a cookie, not a bearer; the session
+//     routes answer it 401 whichever host it is presented to.
+//
+// `expires_in` rides the CODE exchange rather than the authorize URL, which is
+// where setup-token's year comes from. Consenting at claude.ai rather than the
+// console is what should keep `user:sessions:claude_code` on the grant. If the
+// answer comes back short-lived or narrow anyway, this says so and stores
+// nothing.
+//
+// The redirect is the MANUAL one, so no local port is opened and nothing has
+// to survive a browser handing back to a listener: claude.ai shows a code,
+// and it is pasted here.
+func authorize(o opts) error {
+	days := 365
+	if o.days != "" {
+		if _, err := fmt.Sscanf(o.days, "%d", &days); err != nil || days < 1 {
+			return fmt.Errorf("--days %q is not a positive number of days", o.days)
+		}
+	}
+	verifier, err := randomURLSafe(32)
+	if err != nil {
+		return err
+	}
+	state, err := randomURLSafe(16)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	q := url.Values{}
+	q.Set("code", "true")
+	q.Set("client_id", oauthClientID)
+	q.Set("response_type", "code")
+	q.Set("redirect_uri", oauthRedirectURL)
+	q.Set("scope", strings.Join(wantedScopes, " "))
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("state", state)
+
+	fmt.Fprintf(os.Stderr, "Open this, approve, and paste back what the page shows:\n\n%s?%s\n\ncode: ",
+		claudeAIAuthorizeURL, q.Encode())
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && strings.TrimSpace(line) == "" {
+		return fmt.Errorf("reading the pasted code: %v", err)
+	}
+	// The callback page shows `<code>#<state>`; either half alone is accepted
+	// so a paste that drops the fragment still works.
+	code, pastedState, _ := strings.Cut(strings.TrimSpace(line), "#")
+	if code == "" {
+		return errors.New("no code pasted")
+	}
+	if pastedState != "" {
+		state = pastedState
+	}
+
+	body := map[string]any{
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"redirect_uri":  oauthRedirectURL,
+		"client_id":     oauthClientID,
+		"code_verifier": verifier,
+		"state":         state,
+		"expires_in":    days * 24 * 60 * 60,
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
+		oauthTokenURL, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
+	}
+	var tok oauthToken
+	if err := json.Unmarshal(answer, &tok); err != nil {
+		return err
+	}
+	if tok.AccessToken == "" {
+		return errors.New("the token endpoint returned no access_token")
+	}
+
+	life := time.Duration(tok.ExpiresIn) * time.Second
+	fmt.Fprintf(os.Stderr, "\ngranted: %s\nexpires: %s (%s from now; %d days requested)\n",
+		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute), days)
+	if !slicesContains(strings.Fields(tok.Scope), sessionsScope) {
+		return fmt.Errorf("the grant does not include %s, so this token is refused by every\n"+
+			"  session and environment route. Consenting at claude.ai did not widen it.", sessionsScope)
+	}
+	if life < 24*time.Hour {
+		fmt.Fprintf(os.Stderr, "\nNOTE: %s is not a lifetime a secret can hold — the server ignored\n"+
+			"the request here too, and a worker-held token is not reachable this way.\n", life.Round(time.Minute))
+	}
+	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
+		"reader= and entropy= lines:\n\n", secretName)
+	fmt.Println(tok.AccessToken)
+	return nil
+}
+
+func randomURLSafe(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
