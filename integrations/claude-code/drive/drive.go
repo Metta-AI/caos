@@ -1861,50 +1861,58 @@ func authorize(o opts) error {
 		state = pastedState
 	}
 
-	body := map[string]any{
-		"grant_type":    "authorization_code",
-		"code":          code,
-		"redirect_uri":  oauthRedirectURL,
-		"client_id":     oauthClientID,
-		"code_verifier": verifier,
-		"state":         state,
-		"expires_in":    days * 24 * 60 * 60,
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
-		oauthTokenURL, "application/json", bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	answer, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
-	}
+	// ONE CONSENT, MANY EXCHANGES. The server caps how long a token may live
+	// and says only "Invalid expiry for scope" — it does not name the ceiling.
+	// Finding it by consenting again per guess would spend a browser round trip
+	// each time, so the ladder is walked against the code already in hand, from
+	// the lifetime asked for down to none at all. A code survives a REFUSED
+	// exchange; only a granted one consumes it.
 	var tok oauthToken
-	if err := json.Unmarshal(answer, &tok); err != nil {
-		return err
+	var granted int
+	for _, try := range ladder(days) {
+		body := map[string]any{
+			"grant_type":    "authorization_code",
+			"code":          code,
+			"redirect_uri":  oauthRedirectURL,
+			"client_id":     oauthClientID,
+			"code_verifier": verifier,
+			"state":         state,
+		}
+		if try > 0 {
+			body["expires_in"] = try * 24 * 60 * 60
+		}
+		var err error
+		tok, err = postToken(body)
+		if err == nil {
+			granted = try
+			break
+		}
+		if !strings.Contains(err.Error(), "xpiry") && !strings.Contains(err.Error(), "expires_in") {
+			return err
+		}
+		if try > 0 {
+			fmt.Fprintf(os.Stderr, "  %d days: refused\n", try)
+		} else {
+			return err
+		}
 	}
-	if tok.AccessToken == "" {
-		return errors.New("the token endpoint returned no access_token")
+	if granted > 0 {
+		fmt.Fprintf(os.Stderr, "  %d days: accepted\n", granted)
+	} else {
+		fmt.Fprintln(os.Stderr, "  no custom lifetime accepted; took the default")
 	}
 
 	life := time.Duration(tok.ExpiresIn) * time.Second
-	fmt.Fprintf(os.Stderr, "\ngranted: %s\nexpires: %s (%s from now; %d days requested)\n",
-		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute), days)
+	fmt.Fprintf(os.Stderr, "\ngranted: %s\nexpires: %s (%s from now)\n",
+		tok.Scope, time.Now().Add(life).Format(time.RFC3339), life.Round(time.Minute))
 	if !slicesContains(strings.Fields(tok.Scope), sessionsScope) {
 		return fmt.Errorf("the grant does not include %s, so this token is refused by every\n"+
 			"  session and environment route. Consenting at claude.ai did not widen it.", sessionsScope)
 	}
 	if life < 24*time.Hour {
-		fmt.Fprintf(os.Stderr, "\nNOTE: %s is not a lifetime a secret can hold — the server ignored\n"+
-			"the request here too, and a worker-held token is not reachable this way.\n", life.Round(time.Minute))
+		fmt.Fprintf(os.Stderr, "\nNOTE: %s is not a lifetime a secret can hold. The ceiling above is\n"+
+			"what this server allows on these scopes, so a worker-held token is not\n"+
+			"reachable this way.\n", life.Round(time.Minute))
 	}
 	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
 		"reader= and entropy= lines:\n\n", secretName)
@@ -1934,3 +1942,47 @@ func randomURLSafe(n int) (string, error) {
 // like the endpoint rejecting a subset. It was the STATE LENGTH; narrowing is
 // fine. --scopes overrides this when the server names another scope to drop.
 var authorizeScopes = []string{"user:profile", sessionsScope}
+
+// ladder is the sequence of lifetimes to try, longest first, ending in 0 —
+// no `expires_in` at all, which takes whatever the server defaults to. Values
+// at or above the one asked for are skipped so an explicit --days is a ceiling
+// rather than a suggestion.
+func ladder(days int) []int {
+	out := []int{days}
+	for _, d := range []int{365, 180, 90, 60, 30, 14, 7, 1} {
+		if d < days {
+			out = append(out, d)
+		}
+	}
+	return append(out, 0)
+}
+
+// postToken sends one token request and returns the server's own message on a
+// refusal — which is the thing that names the scope or the limit.
+func postToken(body map[string]any) (oauthToken, error) {
+	var tok oauthToken
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return tok, err
+	}
+	resp, err := (&http.Client{Timeout: 60 * time.Second}).Post(
+		oauthTokenURL, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return tok, err
+	}
+	defer resp.Body.Close()
+	answer, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return tok, err
+	}
+	if resp.StatusCode != 200 {
+		return tok, fmt.Errorf("token endpoint: HTTP %d: %s", resp.StatusCode, trunc(string(answer), 300))
+	}
+	if err := json.Unmarshal(answer, &tok); err != nil {
+		return tok, err
+	}
+	if tok.AccessToken == "" {
+		return tok, errors.New("the token endpoint returned no access_token")
+	}
+	return tok, nil
+}
