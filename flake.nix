@@ -1729,7 +1729,7 @@ sandbox = false''
             pkgs.flyctl
             pkgs.jless
             # The host-side Go programs are run, not built: `go run
-            # integrations/claude-code/cloud/drive.go`, and the same for
+            # integrations/claude-code/drive/drive.go`, and the same for cloud/
             # bootstrap.go, install.go and session.go when testing them by hand.
             # They are stdlib-only single files with no go.mod, so this is the
             # whole toolchain they need.

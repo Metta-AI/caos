@@ -57,32 +57,31 @@
 // back in the run log, not here -- read it with the run-log API, or, in Claude
 // Code, RemoteTrigger get_run_log.
 //
-// TWO APIS, TWO CREDENTIALS. Everything about SESSIONS and the environment
-// LIST is api.anthropic.com with the CLI's own OAuth token, read from
-// ~/.claude/.credentials.json. An environment DEFINITION (its setup script and
-// env-var values) lives only behind the claude.ai WEB api, which is
-// cookie-authed and Cloudflare-fronted: set $CLAUDE_SESSION_KEY (or
-// $CLAUDE_SESSION_ID) to the browser's `sessionKey` cookie (DevTools >
-// Application > Cookies > claude.ai > sessionKey -- it is HttpOnly, so it is
-// NOT in document.cookie), and those requests go through curl-impersonate (a
-// real Chrome TLS fingerprint) so Cloudflare does not serve its bot challenge.
-// The env vars are not secrets ("visible to anyone using this environment"),
-// so they print in full.
+// ONE API, ONE CREDENTIAL. Sessions and environments are both api.anthropic.com,
+// and both answer to an Anthropic OAuth token carrying the
+// `user:sessions:claude_code` scope — creating a session, prompting it,
+// listing, archiving, and reading or writing an environment's whole definition
+// including its setup script and its variables. An API key is not one of
+// these; see readCreds for where the token is looked for.
 //
-// Stdlib only, like the three programs beside it, so there is no vendorHash
-// and no module to keep in step. The one exception is curl-impersonate, which
-// exists precisely because net/http's TLS fingerprint is the thing Cloudflare
-// rejects.
+// An environment's variables are not secrets ("visible to anyone using this
+// environment"), so they print in full.
+//
+// IT IS ALSO A CAOS WORKER. Run with no command line and /cas/args present, it
+// reads the same arguments from there and its token from /secret — see
+// runWorker at the bottom. Stdlib only, so the prelude std/go copies beside it
+// is never consulted, there is no vendorHash, and no module to keep in step.
 package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,7 +94,13 @@ import (
 const apiBase = "https://api.anthropic.com"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	// A worker gets no command line, so the mode is decided by whether the
+	// runner laid out /cas/args rather than by a flag a caller must remember.
+	runner := run
+	if inWorker() && len(os.Args) == 1 {
+		runner = func([]string) error { return runWorker() }
+	}
+	if err := runner(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "drive: "+err.Error())
 		os.Exit(1)
 	}
@@ -259,48 +264,94 @@ func sessionURL(id string) string {
 
 // ------------------------------------------------------------- anthropic api
 
-// creds are what api.anthropic.com wants: the CLI's own OAuth token, and the
-// organization to act in. Both are read from the files the CLI maintains, so
-// `claude /login` is the only thing that ever refreshes them.
+// ONE CREDENTIAL RUNS ALL OF THIS: an Anthropic OAuth token with the
+// `user:sessions:claude_code` scope. Sessions and environments are both served
+// by api.anthropic.com to that token — creating, prompting, listing, archiving,
+// and reading or writing an environment's whole definition including its setup
+// script and its variables. An API key (`sk-ant-api03-…`) is NOT one of these:
+// the service answers "Cloud sessions are only available on the first-party
+// Anthropic API provider" to it.
+//
+// `x-organization-uuid` is optional. Sent when known, it selects the org; left
+// out, the account's default answers.
 type creds struct{ token, org string }
 
+// secretName is the caos secret this reads its token from. A worker gets it at
+// /secret/<name>, dropped there by the runner when the job's ArgTree is a
+// superset of one of the secret's readers.
+const secretName = "claude-oauth-token"
+
+// readCreds finds the token in the first of three places that holds one.
+// A worker has only the secret; a terminal usually has only the CLI's own
+// login. Neither is required to know about the other.
+//
+// The CLI's token EXPIRES (`expiresAt`, refreshed by the running CLI), so it
+// is the wrong thing to copy into a secret. `claude setup-token` mints the
+// long-lived one that belongs there.
 func readCreds() (creds, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return creds{}, err
-	}
 	var c creds
-	var credFile struct {
-		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
-			ExpiresAt   int64  `json:"expiresAt"`
-		} `json:"claudeAiOauth"`
+	var from string
+	switch {
+	case os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "":
+		c.token, from = os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"), "$CLAUDE_CODE_OAUTH_TOKEN"
+	default:
+		if b, err := os.ReadFile(filepath.Join(secretsDir, secretName)); err == nil {
+			// Verbatim, no trimming: a token is used as-is (design/secrets.md).
+			c.token, from = string(b), secretsDir+"/"+secretName
+		}
 	}
-	if err := readJSON(filepath.Join(home, ".claude", ".credentials.json"), &credFile); err != nil {
-		return creds{}, fmt.Errorf("no OAuth token in ~/.claude/.credentials.json (%v) — run `claude /login`", err)
-	}
-	c.token = credFile.ClaudeAiOauth.AccessToken
 	if c.token == "" {
-		return creds{}, errors.New("no OAuth token in ~/.claude/.credentials.json — run `claude /login`")
+		if tok, err := tokenFromCLI(); err == nil {
+			c.token, from = tok, "~/.claude/.credentials.json"
+		} else if inWorker() {
+			return creds{}, fmt.Errorf("no token at %s/%s, and $CLAUDE_CODE_OAUTH_TOKEN is unset.\n"+
+				"  The secret is granted only to a job whose ArgTree is a superset of one of\n"+
+				"  its readers, so check `reader=` in .caos-secrets/%s.", secretsDir, secretName, secretName)
+		} else {
+			return creds{}, fmt.Errorf("no token: %v.\n"+
+				"  Set $CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token` mints a long-lived one),\n"+
+				"  or run `claude /login` so the CLI has one.", err)
+		}
 	}
-	if exp := credFile.ClaudeAiOauth.ExpiresAt; exp > 0 && time.UnixMilli(exp).Before(time.Now()) {
-		return creds{}, errors.New("the OAuth token in ~/.claude/.credentials.json has expired — run `claude /login`")
-	}
+	_ = from
 	if c.org = os.Getenv("CLAUDE_ORG_ID"); c.org == "" {
 		var cfg struct {
 			OauthAccount struct {
 				OrganizationUUID string `json:"organizationUuid"`
 			} `json:"oauthAccount"`
 		}
-		if err := readJSON(filepath.Join(home, ".claude.json"), &cfg); err != nil {
-			return creds{}, fmt.Errorf("no organization uuid in ~/.claude.json (%v); set CLAUDE_ORG_ID", err)
+		if home, err := os.UserHomeDir(); err == nil {
+			readJSON(filepath.Join(home, ".claude.json"), &cfg)
+			c.org = cfg.OauthAccount.OrganizationUUID
 		}
-		c.org = cfg.OauthAccount.OrganizationUUID
-	}
-	if c.org == "" {
-		return creds{}, errors.New("no organization uuid in ~/.claude.json; set CLAUDE_ORG_ID")
 	}
 	return c, nil
+}
+
+// tokenFromCLI reads the token the running CLI maintains, and refuses an
+// expired one rather than letting the first call fail as a 401.
+func tokenFromCLI() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	var credFile struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+			ExpiresAt   int64  `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
+	}
+	path := filepath.Join(home, ".claude", ".credentials.json")
+	if err := readJSON(path, &credFile); err != nil {
+		return "", fmt.Errorf("~/.claude/.credentials.json: %v", err)
+	}
+	if credFile.ClaudeAiOauth.AccessToken == "" {
+		return "", errors.New("~/.claude/.credentials.json holds no accessToken")
+	}
+	if exp := credFile.ClaudeAiOauth.ExpiresAt; exp > 0 && time.UnixMilli(exp).Before(time.Now()) {
+		return "", errors.New("the token in ~/.claude/.credentials.json has expired")
+	}
+	return credFile.ClaudeAiOauth.AccessToken, nil
 }
 
 func readJSON(path string, v any) error {
@@ -330,9 +381,12 @@ func api(c creds, method, path string, body any, out any) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("anthropic-version", "2023-06-01")
-	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	// The byoc beta gates the environment writes; the session routes ignore it.
+	req.Header.Set("anthropic-beta", "ccr-byoc-2025-07-29")
 	req.Header.Set("anthropic-client-platform", "cli")
-	req.Header.Set("x-organization-uuid", c.org)
+	if c.org != "" {
+		req.Header.Set("x-organization-uuid", c.org)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -374,8 +428,8 @@ type environment struct {
 	State string `json:"state"`
 }
 
-// environments lists what this account can run a session on. This is the OAuth
-// route, not the cookie one: it answers with ids, names and state but a null
+// environments lists what this account can run a session on. The listing
+// answers with ids, names and state but a null
 // `config`, so it resolves a NAME and nothing more. A definition still needs
 // --env-config.
 func environments(c creds) ([]environment, error) {
@@ -416,41 +470,38 @@ func newOrContinue(o opts) error {
 	if err != nil {
 		return err
 	}
+	c, err := readCreds()
+	if err != nil {
+		return err
+	}
 	if o.session != "" {
 		id, err := wantSession(o, "-c")
 		if err != nil {
 			return err
 		}
-		return sendPrompt(id, prompt)
+		return sendPrompt(c, id, prompt)
 	}
-	if o.env == "" && o.repo == "" {
-		return legacyStart(o, prompt)
-	}
-	return apiStart(o, prompt)
+	return start(c, o, prompt)
 }
 
-// apiStart creates the session with the environment and the repository named
-// here, then delivers the prompt over the same path `-c` uses.
+// start creates the session, then delivers the prompt.
 //
 // The prompt is a SECOND call rather than an initial event in the create body,
 // so there is one way for a prompt to reach a session rather than two. An
 // `events` entry in the create body works too.
-func apiStart(o opts, prompt string) error {
-	c, err := readCreds()
+func start(c creds, o opts, prompt string) error {
+	warnUnpinned(o)
+	envID, err := chooseEnv(c, o)
 	if err != nil {
 		return err
 	}
-	if o.env == "" {
-		return errors.New("--repo needs --env: an API-created session names its environment (see --env-config for the list)")
+	repo := o.repo
+	if repo == "" {
+		if repo, err = originRepo(); err != nil {
+			return err
+		}
 	}
-	envID, err := resolveEnv(c, o.env)
-	if err != nil {
-		return err
-	}
-	if o.repo == "" {
-		return errors.New("--env needs --repo: an API-created session names its repository, e.g. --repo Metta-AI/caos-session")
-	}
-	repoURL, ref, err := parseRepo(o.repo, o.ref)
+	repoURL, ref, err := parseRepo(repo, o.ref)
 	if err != nil {
 		return err
 	}
@@ -483,12 +534,61 @@ func apiStart(o opts, prompt string) error {
 		return errors.New("the API created a session but returned no id")
 	}
 	fmt.Println(id)
-	fmt.Fprintf(os.Stderr, "env:  %s (%s)\nrepo: %s", o.env, envID, repoURL)
+	fmt.Fprintf(os.Stderr, "env:  %s\nrepo: %s", envID, repoURL)
 	if ref != "" {
 		fmt.Fprintf(os.Stderr, "@%s", ref)
 	}
-	fmt.Fprintf(os.Stderr, "\nView: %s\n", sessionURL(id))
-	return sendPrompt(id, prompt)
+	fmt.Fprintf(os.Stderr, "\nview: %s\n", sessionURL(id))
+	return sendPrompt(c, id, prompt)
+}
+
+// chooseEnv resolves --env, or picks the one a bare `claude --cloud` would:
+// the `remote.defaultEnvironmentId` settings key, else the first hosted
+// environment the account has. A worker has no settings, so there it is the
+// list or nothing.
+func chooseEnv(c creds, o opts) (string, error) {
+	if o.env != "" {
+		return resolveEnv(c, o.env)
+	}
+	if id := defaultEnvFromSettings(); id != "" {
+		return id, nil
+	}
+	envs, err := environments(c)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range envs {
+		if e.Kind == "anthropic_cloud" {
+			fmt.Fprintf(os.Stderr, "env:  %s (%s), the first hosted one — name it with --env\n", e.Name, e.ID)
+			return e.ID, nil
+		}
+	}
+	return "", errors.New("--env was not given and this account has no hosted environment to fall back on")
+}
+
+// defaultEnvFromSettings reads the key `/remote-env` writes. Only the user and
+// policy files are consulted: a project or local settings file travels with a
+// checkout, and where a session RUNS is not a property of the code it opens.
+func defaultEnvFromSettings() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		Remote struct {
+			DefaultEnvironmentID string `json:"defaultEnvironmentId"`
+		} `json:"remote"`
+	}
+	for _, p := range []string{
+		"/Library/Application Support/ClaudeCode/managed-settings.json",
+		"/etc/claude-code/managed-settings.json",
+		filepath.Join(home, ".claude", "settings.json"),
+	} {
+		if readJSON(p, &s) == nil && s.Remote.DefaultEnvironmentID != "" {
+			return s.Remote.DefaultEnvironmentID
+		}
+	}
+	return ""
 }
 
 // parseRepo accepts owner/repo, owner/repo@ref, or a full URL. An omitted ref
@@ -523,89 +623,91 @@ func firstLine(s string, n int) string {
 }
 
 // sendPrompt posts a message into an existing session. `-p` needs no TTY, and
-// it is a different route from the interactive attach, which is not enabled
-// for this account ("Attaching to an existing cloud session is not enabled").
-func sendPrompt(id, prompt string) error {
-	cmd := exec.Command("claude", "--cloud", id, "-p", prompt)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	return cmd.Run()
-}
-
-// legacyStart is `claude --cloud` with no environment or repository named: the
-// session opens the CURRENT directory's repo, on the account's default
-// environment. `--cloud` refuses a pipe and would silently run locally, so it
-// runs under script(1) for a TTY, and the prompt is passed through the
-// environment rather than through the command string script(1) parses.
-func legacyStart(o opts, prompt string) error {
-	if err := requireClientRepo(o); err != nil {
+// sendPrompt posts a user message into an existing session. The event is the
+// same shape the CLI sends, and the session takes a turn on it.
+//
+// An ARCHIVED session refuses messages; the API says so, and that is the usual
+// reason a follow-up lands nowhere.
+func sendPrompt(c creds, id, prompt string) error {
+	payload := map[string]any{
+		"uuid":               uuidV4(),
+		"session_id":         id,
+		"type":               "user",
+		"parent_tool_use_id": nil,
+		"message":            map[string]any{"role": "user", "content": prompt},
+	}
+	body := map[string]any{"events": []any{map[string]any{"payload": payload}}}
+	var out struct {
+		Results []struct {
+			Duplicate bool   `json:"duplicate"`
+			EventID   string `json:"event_id"`
+		} `json:"results"`
+	}
+	if err := api(c, "POST", "/v1/code/sessions/"+id+"/events", body, &out); err != nil {
 		return err
 	}
-	pf, err := os.CreateTemp("", "drive-prompt-*")
-	if err != nil {
-		return err
+	if len(out.Results) > 0 && out.Results[0].Duplicate {
+		fmt.Fprintln(os.Stderr, "note: the server treated this as a duplicate event")
 	}
-	defer os.Remove(pf.Name())
-	if _, err := pf.WriteString(prompt); err != nil {
-		return err
-	}
-	pf.Close()
-	out, err := os.CreateTemp("", "drive-out-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(out.Name())
-	out.Close()
-
-	cmd := exec.Command("script", "-qec", `claude --cloud "$(cat "$CAOS_DRIVE_PROMPT")"`, out.Name())
-	cmd.Env = append(os.Environ(), "CAOS_DRIVE_PROMPT="+pf.Name())
-	cmd.Run() // the banner is the result; script(1)'s own status is not.
-
-	banner, _ := os.ReadFile(out.Name())
-	if id, ok := sessionID(string(banner)); ok {
-		fmt.Println(id)
-	}
-	for _, line := range strings.Split(string(banner), "\n") {
-		if strings.Contains(line, "session_") || strings.Contains(line, "cse_") ||
-			strings.Contains(line, "View:") || strings.Contains(line, "Resume") {
-			fmt.Fprintln(os.Stderr, strings.TrimRight(line, "\r"))
-		}
-	}
+	fmt.Fprintln(os.Stderr, "sent to "+id)
 	return nil
 }
 
-// requireClientRepo guards the legacy path only. A session started that way
-// opens the cwd's repository, and for caos that has to be a caos CLIENT repo:
-// caos itself is not one, so the session would die in its setup phase four
-// minutes and one container later.
+// uuidV4 names the event. The server rejects a repeat of one, which is what
+// makes a retried send idempotent rather than a second turn.
+func uuidV4() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// A UUID that is not random is still unique enough to name one event.
+		binary.BigEndian.PutUint64(b[0:], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(b[8:], uint64(os.Getpid()))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// originRepo is the repository of the checkout this runs in, used when --repo
+// is not given. It is the one thing the cwd still decides, and it decides it
+// explicitly rather than by being the directory a subprocess happened to run in.
+func originRepo() (string, error) {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		wd, _ := os.Getwd()
+		return "", fmt.Errorf("--repo was not given and %s has no `origin` remote to fall back on", wd)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// warnUnpinned is advice, not a gate: a session on a repository that does not
+// pin caos dies in its setup phase, four minutes and one container later, and
+// that is worth saying before the container is paid for rather than after.
 //
 // The pin test is bootstrap.go's own (readLock): nodes.<root>.inputs.caos
 // names a node KEY, and only that node's locked.rev is authoritative. A
 // `follows` input is an array rather than a key and carries no lock, so it is
 // not a pin — which is why this asks for the rev rather than for the input's
-// mere presence.
-func requireClientRepo(o opts) error {
-	if o.anyRepo {
-		return nil
+// mere presence. It can only be asked of a repository that is checked out
+// here, so a named --repo is never checked.
+func warnUnpinned(o opts) {
+	if o.anyRepo || o.repo != "" {
+		return
 	}
 	root, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		wd, _ := os.Getwd()
-		return fmt.Errorf("%s is not a git repository, so there is nothing to open", wd)
+		return
 	}
 	dir := strings.TrimSpace(string(root))
 	if lockRev(filepath.Join(dir, "flake.lock")) != "" {
-		return nil
+		return
 	}
-	return fmt.Errorf(`%s does not pin caos, so a session started here cannot run.
-  Name the environment and the repository instead, and the cwd stops mattering:
-      drive --env Caos --repo Metta-AI/caos-session 'prompt'
-  Started from a directory, a cloud session opens THAT repo, and it must be a
-  caos CLIENT repo: flake.lock pinning a 'caos' input by revision, a root
-  .caos-expr mounting that input's std, AGENTS.md and .caos-secrets.
-  Pass --any-repo to start one anyway (it will fail in setup; that is the
-  point of doing it deliberately).`, dir)
+	fmt.Fprintf(os.Stderr, `warning: %s does not pin caos, so its setup script will fail.
+  A caos client repo has flake.lock pinning a 'caos' input by revision, a root
+  .caos-expr mounting that input's std, AGENTS.md and .caos-secrets. The code to
+  work on is imported into the conversation, not cloned, so --repo names the
+  client repo — e.g. --repo Metta-AI/caos-session.
+`, dir)
 }
-
 func lockRev(path string) string {
 	var lock struct {
 		Root  string `json:"root"`
@@ -872,119 +974,51 @@ func conv(o opts) error {
 	return nil
 }
 
-// ------------------------------------------- claude.ai web api (definitions)
+// ---------------------------------------------- environment definitions
 
-// web runs one cookie-authed request against claude.ai through
-// curl-impersonate. A plain client gets a 200 whose body is Cloudflare's "Just
-// a moment..." interstitial, so the TLS fingerprint has to be a real Chrome's
-// — which is the whole reason this is not net/http.
-func web(args ...string) ([]byte, error) {
-	cookie := os.Getenv("CLAUDE_SESSION_KEY")
-	if cookie == "" {
-		cookie = os.Getenv("CLAUDE_SESSION_ID")
-	}
-	if cookie == "" {
-		return nil, errors.New(`set CLAUDE_SESSION_KEY (or CLAUDE_SESSION_ID) to your claude.ai
-  'sessionKey' cookie — DevTools > Application > Cookies > claude.ai >
-  sessionKey (HttpOnly, so it is not in document.cookie).`)
-	}
-	base := []string{"--impersonate", "chrome110", "--compressed", "-sS", "-m", "25",
-		"-H", "Cookie: sessionKey=" + cookie}
-	var cmd *exec.Cmd
-	if p, err := exec.LookPath("curl-impersonate-chrome"); err == nil {
-		cmd = exec.Command(p, append(base, args...)...)
-	} else {
-		cmd = exec.Command("nix", append([]string{"run", "nixpkgs#curl-impersonate", "--"}, append(base, args...)...)...)
-	}
-	cmd.Stderr = os.Stderr
-	return cmd.Output()
-}
-
-func webJSON(v any, args ...string) error {
-	b, err := web(args...)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(b, v)
-}
-
-// orgsAll is every org the account belongs to: an environment can live in a
-// non-default one, so a single guessed org is wrong.
-func orgsAll() []string {
-	if o := os.Getenv("CLAUDE_ORG_ID"); o != "" {
-		return []string{o}
-	}
-	var orgs []struct {
-		UUID string `json:"uuid"`
-	}
-	if err := webJSON(&orgs, "https://claude.ai/api/organizations"); err != nil {
-		return nil
-	}
-	var out []string
-	for _, o := range orgs {
-		out = append(out, o.UUID)
-	}
-	return out
-}
-
-func envBase(org string) string {
-	return "https://claude.ai/v1/environment_providers/private/organizations/" + url.PathEscape(org)
-}
-
-// envLocate resolves a name or an id to its org and id, across every org.
-func envLocate(want string) (org, id string, err error) {
-	for _, o := range orgsAll() {
-		var page struct {
-			Environments []environment `json:"environments"`
-		}
-		if err := webJSON(&page, envBase(o)+"/environments?limit=1000"); err != nil {
-			continue
-		}
-		for _, e := range page.Environments {
-			if e.ID == want || e.Name == want {
-				return o, e.ID, nil
-			}
-		}
-	}
-	return "", "", fmt.Errorf("no environment matching %q", want)
-}
-
-func envGet(org, id string) (map[string]any, error) {
+// An environment's DEFINITION — its setup script, its variables, its network
+// config — is served to the same token as everything else. The listing answers
+// `config: null`; the per-environment route is what carries it.
+//
+//	GET  /v1/environment_providers            list (id, name, kind, state)
+//	GET  /v1/environment_providers/<id>       the whole definition
+//	POST /v1/environment_providers/cloud/create
+//	POST /v1/environment_providers/<id>       replace name/description/config
+//	POST /v1/environment_providers/<id>/delete
+func envGet(c creds, id string) (map[string]any, error) {
 	var env map[string]any
-	if err := webJSON(&env, envBase(org)+"/environments/"+url.PathEscape(id)); err != nil {
-		return nil, fmt.Errorf("could not read %s: %v", id, err)
+	if err := api(c, "GET", "/v1/environment_providers/"+id, nil, &env); err != nil {
+		return nil, err
 	}
 	if _, ok := env["config"].(map[string]any); !ok {
-		return nil, fmt.Errorf("could not read %s (cookie expired?)", id)
+		return nil, fmt.Errorf("%s came back without a config", id)
 	}
 	return env, nil
 }
 
 func envConfig(o opts) error {
-	if o.arg == "" {
-		any := false
-		for _, org := range orgsAll() {
-			var page struct {
-				Environments []environment `json:"environments"`
-			}
-			if webJSON(&page, envBase(org)+"/environments?limit=1000") != nil {
-				continue
-			}
-			for _, e := range page.Environments {
-				fmt.Printf("%s   %s   [%s]   org=%s\n", e.ID, e.Name, e.State, org)
-				any = true
-			}
-		}
-		if !any {
-			return errors.New("--env-config: no environments found (cookie expired?)")
-		}
-		return nil
-	}
-	org, id, err := envLocate(o.arg)
+	c, err := readCreds()
 	if err != nil {
 		return err
 	}
-	env, err := envGet(org, id)
+	if o.arg == "" {
+		envs, err := environments(c)
+		if err != nil {
+			return err
+		}
+		if len(envs) == 0 {
+			return errors.New("--env-config: this account has no environments")
+		}
+		for _, e := range envs {
+			fmt.Printf("%s   %s   [%s]   %s\n", e.ID, e.Name, e.State, e.Kind)
+		}
+		return nil
+	}
+	id, err := resolveEnv(c, o.arg)
+	if err != nil {
+		return err
+	}
+	env, err := envGet(c, id)
 	if err != nil {
 		return err
 	}
@@ -996,26 +1030,31 @@ func envUpdate(o opts) error {
 	if o.arg == "" {
 		return errors.New("--env-update: give the name or id to update")
 	}
-	org, id, err := envLocate(o.arg)
+	c, err := readCreds()
 	if err != nil {
 		return err
 	}
-	env, err := envGet(org, id)
+	id, err := resolveEnv(c, o.arg)
+	if err != nil {
+		return err
+	}
+	env, err := envGet(c, id)
 	if err != nil {
 		return err
 	}
 	if err := envMutate(env, o); err != nil {
 		return err
 	}
-	// Update takes name+description+config; the API rejects an extra `kind`.
+	// The update REPLACES name, description and config, so it is sent the
+	// definition just read with the requested edits folded in. A field left
+	// out of `config` is a field cleared.
 	body := map[string]any{"name": env["name"], "description": describe(env), "config": env["config"]}
-	if err := webPost(envBase(org)+"/environments/"+url.PathEscape(id), body, nil); err != nil {
+	var out map[string]any
+	if err := api(c, "POST", "/v1/environment_providers/"+id, body, &out); err != nil {
 		return err
 	}
 	fmt.Println("updated " + id + ":")
-	if env, err := envGet(org, id); err == nil {
-		envPrint(env)
-	}
+	envPrint(out)
 	return nil
 }
 
@@ -1023,29 +1062,21 @@ func envCreate(o opts) error {
 	if o.arg == "" {
 		return errors.New("--env-create: give a name (and optionally --from <env> to clone)")
 	}
-	org := os.Getenv("CLAUDE_ORG_ID")
+	c, err := readCreds()
+	if err != nil {
+		return err
+	}
 	var seed map[string]any
 	if o.from != "" {
-		var id string
-		var err error
-		if org, id, err = envLocate(o.from); err != nil {
-			return fmt.Errorf("--from %q not found", o.from)
+		id, err := resolveEnv(c, o.from)
+		if err != nil {
+			return fmt.Errorf("--from %q: %v", o.from, err)
 		}
-		if seed, err = envGet(org, id); err != nil {
+		if seed, err = envGet(c, id); err != nil {
 			return err
 		}
-	} else {
-		if org == "" {
-			if all := orgsAll(); len(all) > 0 {
-				org = all[0]
-			}
-		}
-		if err := json.Unmarshal([]byte(defaultEnvSeed), &seed); err != nil {
-			return err
-		}
-	}
-	if org == "" {
-		return errors.New("--env-create: could not resolve an org; set CLAUDE_ORG_ID")
+	} else if err := json.Unmarshal([]byte(defaultEnvSeed), &seed); err != nil {
+		return err
 	}
 	o.rename = o.arg // envMutate names the new environment
 	if err := envMutate(seed, o); err != nil {
@@ -1056,11 +1087,11 @@ func envCreate(o opts) error {
 		"description": describe(seed), "config": seed["config"],
 	}
 	var resp map[string]any
-	if err := webPost(envBase(org)+"/cloud/create", body, &resp); err != nil {
+	if err := api(c, "POST", "/v1/environment_providers/cloud/create", body, &resp); err != nil {
 		return err
 	}
 	if resp["environment_id"] == nil {
-		return fmt.Errorf("--env-create failed: %v", resp)
+		return fmt.Errorf("--env-create: no environment_id in the answer: %v", resp)
 	}
 	fmt.Printf("created %v (%s)\n", resp["environment_id"], o.arg)
 	envPrint(resp)
@@ -1071,50 +1102,18 @@ func envDelete(o opts) error {
 	if o.arg == "" {
 		return errors.New("--env-delete: give the name or id to delete")
 	}
-	org, id, err := envLocate(o.arg)
+	c, err := readCreds()
 	if err != nil {
 		return err
 	}
-	if err := webPost(envBase(org)+"/environments/"+url.PathEscape(id)+"/delete", nil, nil); err != nil {
+	id, err := resolveEnv(c, o.arg)
+	if err != nil {
+		return err
+	}
+	if err := api(c, "POST", "/v1/environment_providers/"+id+"/delete", map[string]any{}, nil); err != nil {
 		return err
 	}
 	fmt.Println("deleted " + id)
-	return nil
-}
-
-func webPost(u string, body any, out any) error {
-	args := []string{"-o", "/dev/stdout", "-w", "\n%{http_code}", "-X", "POST", u}
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		f, err := os.CreateTemp("", "drive-body-*.json")
-		if err != nil {
-			return err
-		}
-		defer os.Remove(f.Name())
-		if _, err := f.Write(b); err != nil {
-			return err
-		}
-		f.Close()
-		args = append([]string{"-H", "Content-Type: application/json", "--data", "@" + f.Name()}, args...)
-	}
-	raw, err := web(args...)
-	if err != nil {
-		return err
-	}
-	cut := bytes.LastIndexByte(raw, '\n')
-	if cut < 0 {
-		return fmt.Errorf("no status in response: %s", raw)
-	}
-	payload, code := raw[:cut], strings.TrimSpace(string(raw[cut+1:]))
-	if code != "200" {
-		return fmt.Errorf("HTTP %s: %s", code, trunc(string(payload), 300))
-	}
-	if out != nil {
-		return json.Unmarshal(payload, out)
-	}
 	return nil
 }
 
@@ -1154,7 +1153,6 @@ func envMutate(env map[string]any, o opts) error {
 	}
 	return nil
 }
-
 func describe(env map[string]any) any {
 	if d, ok := env["description"].(string); ok && d != "" {
 		return d
@@ -1219,11 +1217,14 @@ const usage = `drive — start and inspect Claude Code cloud sessions.
 
   --title T    the session's title (default: the prompt's first line)
   --ref R      the revision to check out (same as --repo owner/repo@R)
-  --any-repo   start from the cwd even when it does not pin caos
+  --any-repo   skip the caos-pin warning on the cwd fallback
 
 <env> is an environment's name or its env_… id; <session> is cse_…, session_…,
-or a claude.ai/code URL. --env-config and the --env-* writes need
-$CLAUDE_SESSION_KEY; everything else uses the CLI's own login.
+or a claude.ai/code URL. Omitting --repo falls back to the cwd's origin remote,
+and omitting --env to the default environment.
+
+Every mode needs one Anthropic OAuth token: $CLAUDE_CODE_OAUTH_TOKEN, else
+/secret/claude-oauth-token, else the CLI's own ~/.claude/.credentials.json.
 `
 
 // defaultEnvSeed is what --env-create starts from with no --from: the same
@@ -1331,4 +1332,196 @@ func render(v any) string {
 		return fmt.Sprint(v)
 	}
 	return string(b)
+}
+
+// ------------------------------------------------------------------ worker
+
+// AS A CAOS WORKER, this same program reads its arguments from /cas/args and
+// its token from /secret. The runner gives a worker no command line, so the
+// arguments the caller curried become files, one per name, and this turns them
+// back into the flags above.
+//
+//	caos-cli run --base:@=integrations/claude-code/drive \
+//	  --verb=start --env=Caos --repo=Metta-AI/caos-session --prompt=<file> --salt=<unique>
+//
+// A CREATE MUST CARRY A SALT. A worker's result is memoized on its ArgTree, so
+// a second `start` with identical arguments would answer with the FIRST
+// session's id and create nothing — the session would look started and no
+// container would exist. `salt` is refused-if-missing rather than defaulted,
+// because a default that varies (a clock, a random) would make every read
+// uncacheable too, and one that does not vary would not fix anything.
+//
+// THE READ VERBS ARE CACHEABLE AND ACCOUNT-SCOPED. `list` answers with this
+// account's sessions, which is a result that depends on WHICH token was
+// granted — allowed only because the secret's entropy pins that identity in
+// `secret-hash` (SPEC.md, "Correctness requirements"). Rotate the entropy when
+// the token starts naming a different account.
+const argsDir = "/cas/args"
+
+const secretsDir = "/secret"
+
+// inWorker is true when this is running as a caos worker: /cas/args is the
+// runner's doing and exists nowhere else.
+func inWorker() bool {
+	st, err := os.Stat(argsDir)
+	return err == nil && st.IsDir()
+}
+
+// workerArg reads one curried argument, absent as "". `caos get` materializes
+// the placeholder the runner left; a name that was never bound has no file.
+func workerArg(name string) (string, error) {
+	path := filepath.Join(argsDir, name)
+	if _, err := os.Stat(path); err != nil {
+		return "", nil
+	}
+	if out, err := exec.Command("caos", "get", path).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("caos get %s: %v: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %v", path, err)
+	}
+	return strings.TrimRight(string(b), "\n"), nil
+}
+
+// workerVerbs maps `verb` to the flags `run` already dispatches on. The worker
+// surface is deliberately the same surface, so there is one set of behaviours
+// to reason about and one set to document.
+var workerVerbs = map[string]string{
+	"start": "", "send": "", "list": "--list", "info": "--info", "conv": "--conv",
+	"archive": "--archive", "env-list": "--env-config", "env-show": "--env-config",
+	"env-update": "--env-update", "env-create": "--env-create", "env-delete": "--env-delete",
+}
+
+// runWorker turns the curried args into a command line, runs it, and reports
+// what it printed as the job's result.
+func runWorker() error {
+	verb, err := workerArg("verb")
+	if err != nil {
+		return err
+	}
+	if verb == "" {
+		return errors.New("no `verb` argument: bind --verb=start|send|list|info|conv|archive|env-list|env-show|env-update|env-create|env-delete")
+	}
+	flag, known := workerVerbs[verb]
+	if !known {
+		return fmt.Errorf("unknown verb %q", verb)
+	}
+
+	salt, err := workerArg("salt")
+	if err != nil {
+		return err
+	}
+	if mutates(verb) && salt == "" {
+		return fmt.Errorf("verb %q changes something, so it needs a `salt` argument holding a value "+
+			"no earlier run used.\n  Without one this job's ArgTree repeats and the memo answers with "+
+			"the earlier run's result, having done nothing.", verb)
+	}
+
+	var argv []string
+	if flag != "" {
+		argv = append(argv, flag)
+	}
+	// The bare token carries the subject of the verb: a session for `info`,
+	// `conv` and `archive`, an environment for the env verbs.
+	subject := map[string]string{
+		"info": "session", "conv": "session", "archive": "session",
+		"env-show": "env", "env-update": "env", "env-create": "env", "env-delete": "env",
+	}[verb]
+	for _, pair := range [][2]string{
+		{"env", "--env"}, {"repo", "--repo"}, {"ref", "--ref"}, {"title", "--title"},
+		{"from", "--from"}, {"rename", "--rename"}, {"init-script", "--init-script"},
+	} {
+		v, err := workerArg(pair[0])
+		if err != nil {
+			return err
+		}
+		if v == "" || pair[0] == subject {
+			continue
+		}
+		argv = append(argv, pair[1], v)
+	}
+	for _, pair := range [][2]string{{"set-env", "--set-env"}, {"unset-env", "--unset-env"}} {
+		v, err := workerArg(pair[0])
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(v, "\n") {
+			if strings.TrimSpace(line) != "" {
+				argv = append(argv, pair[1], line)
+			}
+		}
+	}
+	if subject != "" {
+		v, err := workerArg(subject)
+		if err != nil {
+			return err
+		}
+		if v == "" {
+			return fmt.Errorf("verb %q needs a `%s` argument", verb, subject)
+		}
+		argv = append(argv, v)
+	}
+	if verb == "send" {
+		session, err := workerArg("session")
+		if err != nil {
+			return err
+		}
+		if session == "" {
+			return errors.New("verb \"send\" needs a `session` argument")
+		}
+		argv = append(argv, "-c", session)
+	}
+	if verb == "start" || verb == "send" {
+		// The prompt is a FILE argument, never a curried string: a prompt
+		// carries newlines and quotes, and a blob holds them unchanged.
+		if _, err := os.Stat(filepath.Join(argsDir, "prompt")); err != nil {
+			return errors.New("verb " + verb + " needs a `prompt` argument")
+		}
+		if _, err := workerArg("prompt"); err != nil {
+			return err
+		}
+		argv = append(argv, "-f", filepath.Join(argsDir, "prompt"))
+	}
+
+	// Both streams are the report: a worker's stderr is where the session id's
+	// context and every warning goes, and a reader of the result wants them.
+	var out strings.Builder
+	stdout, stderr := os.Stdout, os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	os.Stdout, os.Stderr = w, w
+	done := make(chan struct{})
+	go func() { io.Copy(&out, r); close(done) }()
+	runErr := run(argv)
+	w.Close()
+	<-done
+	os.Stdout, os.Stderr = stdout, stderr
+	fmt.Fprint(os.Stderr, out.String())
+	if runErr != nil {
+		return runErr
+	}
+	return report(out.String())
+}
+
+func mutates(verb string) bool {
+	switch verb {
+	case "start", "send", "archive", "env-update", "env-create", "env-delete":
+		return true
+	}
+	return false
+}
+
+// report writes the worker's result to /cas/out.
+func report(body string) error {
+	const path = "/tmp/drive-report"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return err
+	}
+	if out, err := exec.Command("caos", "put", path, "/cas/out").CombinedOutput(); err != nil {
+		return fmt.Errorf("caos put: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

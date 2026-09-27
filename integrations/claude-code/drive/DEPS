@@ -1,0 +1,6 @@
+# What this reaches for (format `<path> <name>`, path relative to this dir):
+# the Go script worker, which supplies the interpreter and the container.
+../../../std/go go
+# The builder that turns std/go's flake into an image. Declared here because a
+# deep-dep's own deps resolve against the CONSUMER's tree, not against std/.
+../../../std/flake-builder flake-builder

@@ -18,9 +18,9 @@ smaller AND faster: dumbpipe dials the far endpoint once per accepted socket, so
 every request paid a fresh connection — the reason `/eval-locator` exists — while
 the client now holds ONE connection and opens a stream per request.
 
-## Four programs, run by `go run`
+## Three programs, run by `go run`
 
-Three of them run in the container. [`design/cloud-setup.md`](../../../design/cloud-setup.md)
+All three run in the container. [`design/cloud-setup.md`](../../../design/cloud-setup.md)
 has the measurements behind their shape: the setup script runs on EVERY session,
 not once before a snapshot, so there is no cheap phase to defer work to.
 
@@ -29,7 +29,6 @@ not once before a snapshot, so there is no cheap phase to defer work to.
 | `bootstrap.go` | stage 1: read the repo's pin, fetch the payload, run stage 2, leave the session ready |
 | `install.go` | stage 2: put the package in place and write Claude Code's configuration |
 | `session.go` | the `SessionStart` hook: warm the tool registry, say which caos this is |
-| `drive.go` | the host side: start a session on a named environment and repository, and read it back |
 
 **Two stages, because the installer is part of the payload.** Stage 1 is the only
 thing fetched from `--base`; it then runs the `install.go` it finds in the
@@ -117,39 +116,7 @@ naming what is missing. It does not fall back to the `--base` in the settings
 form: that names a branch, and a client installed from a moving head would be a
 client from a different tree than the tools it drives.
 
-## Starting one: `drive.go`
-
-A session names its **environment** and its **repository**, and neither comes
-from the directory it is started in:
-
-```
-go run integrations/claude-code/cloud/drive.go \
-  --env Caos --repo Metta-AI/caos-session 'the first prompt'
-```
-
-`--env` takes an environment's name or its `env_…` id (`--env-config` lists
-them); `--repo` takes `owner/repo`, `owner/repo@ref`, or a URL. An omitted ref
-leaves the branch to the server rather than guessing a name for the default.
-The session id is printed on stdout, and `-c <id> 'more'` injects a follow-up.
-
-**`claude --cloud` cannot express either of those**, which is why the create
-goes to the API under it. Its `--environment` flag takes only a self-hosted
-`ccpool_…` id — a hosted environment is chosen by the settings key
-`remote.defaultEnvironmentId`, one per machine — and it has no repository flag
-at all: the repository is `git remote get-url origin` in the current directory,
-full stop. So the tree you are working in decides what the session opens, and
-for caos that is the one repository it must not be (below). `POST
-/v1/code/sessions` takes `environment_id` and a `git_repository` source
-directly; the prompt is then delivered over the same `-p` route `-c` uses.
-
-Started with neither flag, `drive.go` runs `claude --cloud` under `script(1)`
-(it refuses a pipe and would otherwise run locally), opening
-the cwd's repo, which is then checked for a caos pin before a container is paid
-for.
-
-**A session id has two spellings.** The API and `drive.go` print `cse_<suffix>`;
-a claude.ai/code URL carries `session_<suffix>`. Both resolve on the API, and
-every mode here takes either, or the URL.
+See [`../drive`](../drive) for starting one.
 
 ## Configuring the environment
 
