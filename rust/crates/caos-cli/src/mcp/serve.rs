@@ -252,13 +252,15 @@ fn warm_in_flight(t: &GitTransport) -> bool {
 }
 
 /// The cache the previous function's path holds, IF it is for the step this
-/// server was configured with. Keyed by `--llm-step` so a client rebuilt to
+/// server was configured with. Keyed by `--llm-step` and `--base` so a client rebuilt to
 /// drive a different step cannot be handed the old step's tools; a mismatch or
 /// an empty list reads as "no cache" and the caller resolves from scratch.
 fn read_cached_registry(t: &GitTransport, options: &TurnOptions) -> Option<Vec<Value>> {
     let bytes = std::fs::read(registry_cache_path(t)).ok()?;
     let cached: Value = serde_json::from_slice(&bytes).ok()?;
-    if cached.get("llm_step").and_then(Value::as_str) != options.llm_step.as_deref() {
+    if cached.get("llm_step").and_then(Value::as_str) != options.llm_step.as_deref()
+        || cached.get("base").and_then(Value::as_str) != options.base.as_deref()
+    {
         return None;
     }
     let tools = cached.get("tools")?.as_array()?.clone();
@@ -274,7 +276,7 @@ fn read_cached_registry(t: &GitTransport, options: &TurnOptions) -> Option<Vec<V
 /// never a half-written one; a failure to write just means the next server
 /// resolves from scratch, which is the behaviour before any cache existed.
 fn write_cached_registry(t: &GitTransport, options: &TurnOptions, tools: &[Value]) {
-    let payload = json!({ "llm_step": options.llm_step, "tools": tools });
+    let payload = json!({ "llm_step": options.llm_step, "base": options.base, "tools": tools });
     let Ok(bytes) = serde_json::to_vec(&payload) else {
         return;
     };

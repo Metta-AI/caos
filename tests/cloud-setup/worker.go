@@ -250,7 +250,7 @@ func main() {
 			"the tool server does not seed the conversation as its own argument: %v", args)
 
 		// -------------------------------------------------------------------
-		w.Step("stage 1 in dev mode repoints the checkout and seeds a conversation")
+		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
 		devTree := fixtureDevTree("/tmp/dev-tree", assets)
@@ -269,22 +269,14 @@ func main() {
 		out, err := bootstrap.CombinedOutput()
 		w.True(err == nil, "stage 1 failed: %v\n%s", err, out)
 
-		expr := read(filepath.Join(repo, ".caos-expr"))
-		w.True(!strings.Contains(expr, pinRev),
-			"the checkout still resolves caos through the committed pin:\n%s", expr)
-		for _, dir := range []string{"std/flake-input-loader", "std"} {
-			want := ":@@=git+" + ticket + "?rev=" + devRev + "&dir=" + dir
-			w.True(strings.Contains(expr, want),
-				"the expression does not reach the dev server for %s:\n%s", dir, expr)
-		}
-		locked := readJSON(filepath.Join(repo, "flake.lock"))["nodes"].(map[string]any)["caos"].(map[string]any)["locked"].(map[string]any)
-		w.True(locked["rev"] == devRev && locked["url"] == ticket,
-			"flake.lock disagrees with the expression, which the loader refuses: %v", locked)
+		w.True(git(repo, "status", "--porcelain") == "",
+			"stage 1 left the checkout dirty, which Claude Code's stop hook reports:\n%s",
+			git(repo, "status", "--porcelain"))
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
 		w.True(dev["std_path"] == "caos-std" && dev["repo"] == repo,
-			"the dev stamp does not describe the checkout it rewrote: %v", dev)
+			"the dev stamp does not describe the checkout it seeded from: %v", dev)
 		// A stamp is quoted verbatim into a model's context by `caos_status`.
 		for _, name := range []string{"dev-stamp", "setup-stamp"} {
 			body := read("/tmp/share/" + name)
@@ -294,13 +286,26 @@ func main() {
 		w.True(stamp("/tmp/share/setup-stamp")["client"] == "dev-"+devRev[:12],
 			"the setup stamp does not say the client came from the dev server")
 
-		w.Step("the conversation's seed commit is the rewritten tree, and unreferenced")
+		w.Step("the conversation's seed commit carries the dev pin, and is unreferenced")
 		seedCommit := dev["seed"]
 		w.True(len(seedCommit) == 40, "the dev stamp carries no seed commit: %q", seedCommit)
 		w.True(git(repo, "rev-parse", seedCommit+"^") == head,
 			"the seed commit is not a child of HEAD")
-		w.True(git(repo, "show", seedCommit+":.caos-expr") == strings.TrimRight(expr, "\n"),
-			"the conversation would evaluate an expression other than the rewritten one")
+		expr := git(repo, "show", seedCommit+":.caos-expr")
+		w.True(!strings.Contains(expr, pinRev),
+			"the seed still resolves caos through the committed pin:\n%s", expr)
+		for _, dir := range []string{"std/flake-input-loader", "std"} {
+			want := ":@@=git+" + ticket + "?rev=" + devRev + "&dir=" + dir
+			w.True(strings.Contains(expr, want),
+				"the seed's expression does not reach the dev server for %s:\n%s", dir, expr)
+		}
+		var lock map[string]any
+		json.Unmarshal([]byte(git(repo, "show", seedCommit+":flake.lock")), &lock)
+		locked := lock["nodes"].(map[string]any)["caos"].(map[string]any)["locked"].(map[string]any)
+		w.True(locked["rev"] == devRev && locked["url"] == ticket,
+			"the seed's flake.lock disagrees with its expression, which the loader refuses: %v", locked)
+		w.True(git(repo, "diff", "--name-only", head, seedCommit) == ".caos-expr\nflake.lock",
+			"the seed differs from HEAD in more than the pin:\n%s", git(repo, "diff", "--stat", head, seedCommit))
 		// Nothing points at it, so `git push` cannot carry the ticket it holds.
 		w.True(!strings.Contains(git(repo, "for-each-ref", "--format=%(objectname)"), seedCommit),
 			"a ref points at the seed commit, so a push could carry the ticket")

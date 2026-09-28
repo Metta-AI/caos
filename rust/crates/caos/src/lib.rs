@@ -4020,13 +4020,21 @@ pub fn eval_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> 
 /// under the names the client happened to use. Naming the image in the
 /// invocation moves that choice to the caller, and `:@@=` lets a repo that
 /// never mounted caos reach a tool at all.
+///
+/// `tree` is where a `:@=` path is looked up: the tracked workspace when
+/// `None`. Dev mode passes the commit its setup minted, so a cloud session's
+/// step resolves from that commit and the checkout on disk is never rewritten.
 pub fn eval_cli_image_arg(
     t: &dyn Transport,
     argument: &str,
     store: &[ClientSecret],
+    tree: Option<&str>,
 ) -> Result<String, String> {
     let (_, ty, value) = parse_arg(argument)?;
-    eval_base_with_store(t, None, ty, value, store)
+    match (ty, tree) {
+        (ArgType::Path, Some(tree)) => eval_image_in_tree(t, tree, value, store),
+        _ => eval_base_with_store(t, None, ty, value, store),
+    }
 }
 
 /// [`eval_cli_image`] carrying the caller's secret store into the walk, so a
@@ -4047,11 +4055,20 @@ pub fn eval_cli_image_with_store(
     let (_, ws) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
+    eval_image_in_tree(t, &ws.to_string(), image, store)
+}
+
+fn eval_image_in_tree(
+    t: &dyn Transport,
+    tree: &str,
+    image: &str,
+    store: &[ClientSecret],
+) -> Result<String, String> {
     // Descend THROUGH evaluation: each `.caos-expr` from the root down is
     // applied, and `image` is looked up in what the one above it produced. A
     // tree with no `.caos-expr` (a plain flake dir, a git-docker image)
     // evaluates to itself and nothing changes.
-    eval::eval_path(t, &ws.to_string(), image, store)
+    eval::eval_path(t, tree, image, store)
         .map(|(_kind, hash)| hash)
         .map_err(|e| format!("resolving {image:?}: {e}"))
 }

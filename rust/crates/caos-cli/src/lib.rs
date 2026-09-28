@@ -121,9 +121,10 @@ fn resolve_image_arg(
     argument: Option<&str>,
     name: &str,
     store: &[ClientSecret],
+    tree: Option<&str>,
 ) -> Result<String, String> {
     let argument = argument.ok_or_else(|| missing_image_arg(name))?;
-    eval_cli_image_arg(t, argument, store).map_err(|error| format!("--{name}: {error}"))
+    eval_cli_image_arg(t, argument, store, tree).map_err(|error| format!("--{name}: {error}"))
 }
 
 /// What to tell someone who did not pass `--<name>`. Both spellings, because
@@ -2658,7 +2659,7 @@ fn resolve_llm(
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
+    let llm_base = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store, None)?;
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
 }
 
@@ -2839,7 +2840,7 @@ pub fn generate_conversation_title(
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = resolve_image_arg(t, options.llm_call.as_deref(), LLM_CALL_ARG, &store)?;
+    let llm_base = resolve_image_arg(t, options.llm_call.as_deref(), LLM_CALL_ARG, &store, None)?;
     let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;

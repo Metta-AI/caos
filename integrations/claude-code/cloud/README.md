@@ -226,17 +226,16 @@ Stage 1 fetches that commit and takes **everything** from it — the client,
 `git-remote-caos`, `settings.json`, `mcp.json`, the installer, the session hook,
 and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already
 fetched, so an edit to stage 1 is in the package like anything else). It then
-repoints the checkout's `.caos-expr` and `flake.lock` at
-`git+caos://…?rev=<dev>`, so the tools resolve from there too.
+mints a commit that is HEAD with `.caos-expr` and `flake.lock` pointed at
+`git+caos://…?rev=<dev>`, and hands it to the client as `--base=<full sha>`.
 
-**The WORKING TREE is rewritten, not only the conversation's seed**, and that is
-measured rather than preferred: `eval_cli_image_with_store` ingests `"."`, so
-the tool server's `--llm-step:@=<std>/llm-step` resolves against the checkout on
-disk and not against the `--base` the conversation seeds from. Rewriting only the
-seed commit would install a dev client that then evaluated the *committed* tools.
-The cost is a dirty checkout holding a ticket, which is why the seed commit is
-unreferenced and the stamps carry no ticket — but an agent in that session will
-see the diff and should be told not to commit it.
+**Only that commit carries the dev pin; the checkout is left as cloned.** Blobs
+go in with `hash-object`, the tree through a throwaway index, the commit through
+`commit-tree`, so nothing on disk changes and Claude Code's stop hook has no diff
+to report. What makes that sufficient is on the client: with `--base`, `caos mcp`
+resolves `--llm-step:@=<std>/llm-step` in that commit's tree rather than
+ingesting `"."`. Before it did, the tool server read the checkout, so the files
+had to be rewritten in place — a dirty checkout holding a ticket.
 
 It is an **argument, not an environment variable**: the setup phase does not get
 the environment's variables at all.
@@ -246,13 +245,12 @@ Two things are less obvious and both cost a session to find:
 - **The committed GitHub pin is still required**, as a bootstrap. Fetching over
   `caos://` needs `git-remote-caos`, and the release install is what puts it on
   PATH; the dev package then replaces everything it laid down.
-- **The conversation seeds from an unreferenced commit**, minted by
-  `commit-tree` from the rewritten checkout and passed to the hook as
-  `--base=<full sha>`. The hook — not `mcp serve` — is what creates a
-  conversation, and without this it would seed from `HEAD`: the session would
-  run your client while evaluating the *committed* tools, the half-update the
-  whole arrangement exists to prevent. Nothing points at that commit, so a
-  `git push` cannot carry the ticket it contains.
+- **`--base` goes on the hook, the tool server and the warm alike.** The hook —
+  not `mcp serve` — is what creates a conversation, and without it the
+  conversation would seed from `HEAD`; the tool server and the warm resolve the
+  step from it. Any one missing runs your client against the *committed* tools,
+  the half-update the whole arrangement exists to prevent. Nothing points at
+  that commit, so a `git push` cannot carry the ticket it contains.
 
 `/usr/local/share/caos/dev-stamp` is written last, once every step has
 succeeded; `caos_status` and the session hook both report from it, and each
