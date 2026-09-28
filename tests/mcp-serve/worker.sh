@@ -142,10 +142,24 @@ case "$listing" in
   *) fail "caos_status vanished once the real tools resolved" ;;
 esac
 
-echo "== MCP resolves pinned generated paths on the client ==" >&2
-# This foreign repo exists only in THIS client container. Server evaluation
-# cannot fetch it; both help and invocation must consume the client handoff.
-foreign=$(mktemp -d)
+echo "== MCP reaches a tool at a PINNED GENERATED path ==" >&2
+# Two things at once, and the pin is what makes the second one real:
+#   - the tool is at a path that exists only in the EVALUATION result
+#     (`generated/args/tools/hello`), never in any stored tree;
+#   - reaching it needs a `:@@=` locator resolved, and NOTHING HERE RESOLVES
+#     ONE. `caos mcp` records the call and the step asks the server to evaluate
+#     the path, so the fetch is the server's.
+#
+# This used to assert the opposite. The foreign repo was a client-container
+# temp dir, unreachable from the server on purpose, and the test's subject was
+# that both help and invocation consumed a CLIENT HANDOFF — `caos mcp serve`
+# pre-resolving the path against the session's own checkout. That handoff is
+# gone: it was a second resolver, and two resolvers can disagree about which
+# version of a tool runs. So the repo is served where the server can fetch it,
+# over this container's own address — the same route `chat-offline` points a
+# stub at, reachable because a job's containers sit in the stack's netns.
+foreign_base=$(mktemp -d)
+foreign=$foreign_base/tools
 mkdir -p "$foreign/hello" generated
 bash_image=$("$CAOS_CLI" curry --base:@=DEEP-DEPS/bash)
 cat > "$foreign/hello/.caos-expr" <<EXPR
@@ -166,11 +180,36 @@ printf 'pinned %s %s' "$(cat /cas/args/word)" "$(cat /cas/args/in/mcp-marker)" >
 caos put /tmp/out /cas/out
 WORKER
 git -C "$foreign" init -q
+git -C "$foreign" config uploadpack.allowReachableSHA1InWant true
 git -C "$foreign" add -A
 git -C "$foreign" -c user.name=test -c user.email=test@caos commit -qm pinned-tools
 revision=$(git -C "$foreign" rev-parse HEAD)
-printf 'curry --base:docker=unused --tools:@@=git+file://%s?rev=%s\n' \
-  "$foreign" "$revision" > generated/.caos-expr
+
+# Serve it where the SERVER can fetch it. Its own address, not 127.0.0.1: the
+# fetch happens in the stack, so loopback here would be the wrong container.
+[ -n "${CAOS_STUB_HOST:-}" ] || fail "dev/cli-test did not supply CAOS_STUB_HOST"
+daemon_pid=""
+stop_daemon() {
+  if [ -n "$daemon_pid" ]; then kill "$daemon_pid" 2>/dev/null || true; fi
+  daemon_pid=""
+}
+trap stop_daemon EXIT
+for _ in 1 2 3 4 5; do
+  git_port=$((20000 + RANDOM % 20000))
+  git daemon --reuseaddr --export-all --listen=0.0.0.0 --port="$git_port" \
+    --base-path="$foreign_base" "$foreign_base" >/tmp/tools-daemon.log 2>&1 &
+  daemon_pid=$!
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then break; fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/$git_port") 2>/dev/null; then exec 3>&-; break 2; fi
+    sleep 0.1
+  done
+  stop_daemon
+done
+[ -n "$daemon_pid" ] || fail "could not serve the pinned tools: $(cat /tmp/tools-daemon.log)"
+
+printf 'curry --base:docker=unused --tools:@@=git+git://%s:%s/tools?rev=%s\n' \
+  "$CAOS_STUB_HOST" "$git_port" "$revision" > generated/.caos-expr
 printf 'original-input' > mcp-marker
 git add generated mcp-marker
 git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools

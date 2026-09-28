@@ -116,7 +116,13 @@ func main() {
 	os.WriteFile(marker, []byte(fmt.Sprintf("%d\n", deadline)), 0o644)
 	defer os.Remove(marker)
 
-	if !warm(locator, gitDir) {
+	// The same `--base` the hook and the tool server were given: the step resolves
+	// in that commit, and the cache this leaves is keyed by it.
+	warmArgs := []string{"mcp", "warm", locator}
+	if seed := dev["seed"]; seed != "" {
+		warmArgs = append(warmArgs, "--base="+seed)
+	}
+	if !warm(warmArgs, gitDir) {
 		reportNoTools()
 	}
 
@@ -127,7 +133,7 @@ func main() {
 	if rev := dev["rev"]; rev != "" {
 		fmt.Printf("caos dev mode: ON -- the whole install package came from "+
 			"refs/caos/dev at %s, and this session's conversation seeds from %s "+
-			"(the checkout as setup left it).\n", short(rev), short(dev["seed"]))
+			"(HEAD pointed at the dev server; the checkout is untouched).\n", short(rev), short(dev["seed"]))
 	} else {
 		fmt.Printf("caos dev mode: off -- this session runs the caos its repo pins (%s).\n",
 			setup["client"])
@@ -144,7 +150,7 @@ func main() {
 // Reports whether it left a registry behind. That is the FILE, not the exit
 // status: `caos mcp warm` is non-fatal by contract and exits 0 having cached
 // nothing, so a status check would call a cold session warm.
-func warm(locator, gitDir string) bool {
+func warm(args []string, gitDir string) bool {
 	if _, err := exec.LookPath("caos"); err != nil {
 		log("no caos on PATH; the setup phase installed no client")
 		return false
@@ -163,7 +169,7 @@ func warm(locator, gitDir string) bool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), warmBudget)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "caos", "mcp", "warm", locator)
+	cmd := exec.CommandContext(ctx, "caos", args...)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+mustGetwd())
 	// A resolve blocked on a network read can ignore the cancel; without this the

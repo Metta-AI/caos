@@ -42,7 +42,7 @@ gone — with **promises** (server-side scheduled sub-runs), not stack frames:
 **Grammar note (flake-inputs 2C).** `<in>` stays positional — it is the DATA the
 continuation is over, not an image — and every image position is a typed arg
 (`:@=` a `/cas` path, `:docker=` a registry ref, `:hash=` an object in the
-store), resolved by the same `resolve_base` a `--base` goes through. There is no
+store), resolved by the same `eval_base` a `--base` goes through. There is no
 `--` separator: nothing needs separating once the verb's own operands are
 reserved NAMES rather than a region.
 
@@ -145,9 +145,10 @@ The object it returns is byte-identical to what a client `eval-path` would
 build, because both drive the SAME walk — the `caos-eval` crate, behind an
 `EvalHost` whose only difference is where a `run` is dispatched (the client's
 `request_compute`, the server's `run_image`). `tests/eval-then` asserts that
-identity on a `run`-valued expression rather than trusting it. The one thing the
-server host cannot do is resolve a `:@@=` locator: that stays client-side, so
-the URL never enters a cache key (design/flake-inputs.md).
+identity on a `run`-valued expression rather than trusting it. `:@@=` is the one
+capability only the server host has: it fetches the pinned commit and descends
+`dir=` through evaluation, so a locator becomes an oid before the request it
+rides in exists and the URL never enters a cache key (design/flake-inputs.md).
 
 ## Catch: a failing single-valued step as a value
 

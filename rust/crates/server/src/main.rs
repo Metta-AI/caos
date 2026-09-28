@@ -15,6 +15,13 @@
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
 //!   existing server-side run stack and secret store.
+//! * `GET /eval?root:<type>=<value>[&path=<p>]` — walk `.caos-expr` from a root
+//!   down to a path and return what falls out as `"<type> <hash>"`. The root is
+//!   a TYPED argument, named by the caller as everything else in caos is:
+//!   `root:hash=<oid>` starts from an object this store holds, `root:@@=<locator>`
+//!   from a pin, fetching the commit if the store lacks it (see [`mod locator`]).
+//!   A client and a worker both ask here rather than following a pin themselves,
+//!   which is what lets a server-side evaluation reach one at all.
 //!
 //! The server runs no workers itself. Dispatch is pull-based (see
 //! `design/runner-protocol.md`): runners long-poll `POST /runner/poll` with
@@ -44,6 +51,7 @@
 mod compute;
 mod git;
 mod import;
+mod locator;
 mod push;
 mod remote_git;
 mod repair;
@@ -493,6 +501,11 @@ fn verify_object_closure(git_dir: &str) -> Result<(), String> {
 
 fn configure_ref_advertisements(git_dir: &str) -> Result<(), String> {
     ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/req/")?;
+    // A locator's pin→tree memo (`mod locator`). It retains the fetched closure
+    // and survives a restart, but it is not a name anyone fetches BY, and a
+    // server that has resolved many pins would otherwise advertise one ref per
+    // pin to every client that dials it.
+    ensure_git_config_value(git_dir, "uploadpack.hideRefs", locator::TREE_REF_PREFIX)?;
     ensure_git_config_value(git_dir, "uploadpack.hideRefs", "refs/caos/res/")?;
     // Undo the setting written by the first exact-ref implementation. Server
     // repositories survive binary upgrades, so merely ceasing to add it would
@@ -692,7 +705,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             status::serve(config, path.trim_start_matches("/status/"), &query)
         }
         Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
-        Method::Get if path == "/eval-locator" => {
+        Method::Get if path == "/eval" => {
             // Secrets ride the same out-of-band header as `/run`, since an eval
             // may mark a `curry` with the caller's identity (design/secrets.md).
             let secrets_header = request
@@ -701,7 +714,25 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 .find(|h| h.field.equiv(secrets::HEADER))
                 .map(|h| h.value.as_str().to_string())
                 .unwrap_or_default();
-            compute::eval_locator_endpoint(config, &query, &secrets_header)
+            // The same sensitive header `POST /git/import` takes, for the same
+            // reason: a private repository's token is the caller's, scoped to
+            // one URL, and never looked up from the calling job's secrets. Only
+            // a `root:@@=` root can use it; the others need no credential.
+            let tokens: Vec<_> = request
+                .headers()
+                .iter()
+                .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
+                .map(|h| h.value.as_str().to_owned())
+                .collect();
+            if tokens.len() > 1 {
+                return Err(HttpError::new(400, "duplicate Git token header"));
+            }
+            compute::eval_endpoint(
+                config,
+                &query,
+                &secrets_header,
+                tokens.first().map(String::as_str),
+            )
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
@@ -894,6 +925,10 @@ mod tests {
             "refs/caos/req/request",
             "refs/caos/res/result",
             "refs/caos/v2/users/u-1/conversations/active/c-74657374",
+            // A resolved locator's pin→tree memo (`mod locator`). One per pin, so
+            // a server that has resolved a few hundred would advertise a few
+            // hundred to every client that dials it.
+            &format!("{}{}", crate::locator::TREE_REF_PREFIX, "a".repeat(40)),
         ] {
             git(&["-C", dir.to_str().unwrap(), "update-ref", refname, blob]);
         }
@@ -906,7 +941,7 @@ mod tests {
             "--get-all",
             "uploadpack.hideRefs",
         ]);
-        assert_eq!(hidden.lines().count(), 3, "{hidden}");
+        assert_eq!(hidden.lines().count(), 4, "{hidden}");
         assert!(hidden.lines().any(|value| value == "refs/private/"));
         let receive_hidden = git(&[
             "-C",
@@ -925,6 +960,7 @@ mod tests {
         ]);
         assert!(!upload.contains("refs/caos/req/"));
         assert!(!upload.contains("refs/caos/res/"));
+        assert!(!upload.contains(crate::locator::TREE_REF_PREFIX));
         assert!(upload.contains("refs/caos/v2/users/"));
 
         let receive = git(&[

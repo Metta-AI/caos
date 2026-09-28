@@ -1,6 +1,7 @@
 //! Shared parser for pinned Git locators and local directory locators.
 
 pub mod import;
+pub mod locator;
 pub mod publish;
 /// A parsed `:@@=` locator — a git tree named by WHERE to fetch it, pinned by a
 /// content hash (design/flake-inputs.md). The syntax is nix's flake-reference
@@ -15,8 +16,10 @@ pub mod publish;
 /// fields drive.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GitRef {
-    /// The fetch URL — everything before `?`: `git+https://…`, `git+ssh://…`,
-    /// `git+file://…`, `github:owner/repo`, or `path:<dir>`.
+    /// The fetch URL — everything before `?`: `git+https://…`, `git+http://…`,
+    /// `git+git://…`, `git+ssh://…`, `git+file://…`, `github:owner/repo`, or
+    /// `path:<dir>`. The fetchable set is `locator::PROTOCOLS`; the two must
+    /// agree.
     pub url: String,
     /// The pinned commit sha: `Some` (and 40-hex) for a git fetch, `None` for a
     /// `path:` plain directory.
@@ -65,8 +68,8 @@ pub fn parse_git_ref(value: &str) -> Result<GitRef, String> {
     let is_plain_dir = url.starts_with("path:");
     if !is_git_fetch && !is_plain_dir {
         return Err(format!(
-            "git ref {value:?}: unknown scheme; use git+https://…, git+ssh://…, \
-             git+file://…, github:owner/repo, or path:<dir>"
+            "git ref {value:?}: unknown scheme; use git+https://…, git+http://…, \
+             git+git://…, git+ssh://…, git+file://…, github:owner/repo, or path:<dir>"
         ));
     }
 

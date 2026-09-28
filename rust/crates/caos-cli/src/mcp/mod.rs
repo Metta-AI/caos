@@ -46,8 +46,8 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, fetch_validated_head, mint_transition, oid, open_store,
-    push_cas, resolve_base, resolve_username, seed_content, signature, update_local_cache,
+    conversation_ref, default_title, eval_base, fetch_validated_head, mint_transition, oid,
+    open_store, push_cas, resolve_username, seed_content, signature, update_local_cache,
     TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
@@ -80,13 +80,12 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
     let mut rest = Vec::new();
     for argument in args {
         // `--base=<full sha>` SEEDS THE CONVERSATION from a commit other than
-        // HEAD, which is what dev mode needs: `setup.sh` rewrites the
-        // checkout's `.caos-expr` to point at the dev stack, but the
-        // conversation's CONTENT comes from `resolve_base`, which without this
-        // is unconditionally `HEAD` -- so the rewrite reached the checkout and
-        // not the tree the session evaluates. Measured: a session ran the dev
-        // client and dev step while every `caos-std/<entry>` still resolved
-        // through the committed pin.
+        // HEAD, and resolves `--llm-step` in that commit's tree rather than
+        // the workspace (`step_image`). Dev mode needs both: `bootstrap.go`
+        // mints a commit whose `.caos-expr` points at the dev stack and leaves
+        // the checkout clean. Measured before this existed: a session ran the
+        // dev client and dev step while every `caos-std/<entry>` still
+        // resolved through the committed pin.
         //
         // A FULL SHA AND NOTHING ELSE. A revspec here would reintroduce
         // "resolved through a moving head" in a place nobody would think to
@@ -228,16 +227,7 @@ fn run_tool(
     let (request, request_head, round) =
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
-    dispatch_call(
-        t,
-        options,
-        &id,
-        name,
-        &declared,
-        &request,
-        &request_head,
-        &call,
-    )?;
+    dispatch_call(t, options, &id, &request, &request_head, &call)?;
     read_outcome(t, &id, &request, round, &call)
 }
 
@@ -248,81 +238,34 @@ fn run_tool(
 /// would be answered from the first's memo. `--tools-only` carries the call id
 /// for exactly that reason, and the step checks it ran before returning.
 ///
-/// Repository tools resolve against their conversation path, client-side so
-/// pinned locators use the existing fetch/evaluation machinery. Both calls
-/// receive the evaluated tool; the worker describes it or validates arguments
-/// before invocation. The handoff is pinned to the input tree and path.
-#[allow(clippy::too_many_arguments)]
+/// NOTHING ABOUT A TOOL IS RESOLVED HERE. `tool_help` and `run_tool` used to
+/// arrive with the tool already evaluated — `--client-tool-root`/`-path`/
+/// `-tree`, worked out against the conversation snapshot in this process — and
+/// the whole reason was that the server refused a `:@@=` locator, so a
+/// repository that pins caos could not be evaluated where the walk otherwise
+/// happens. The server resolves locators now (`server::locator`), so the step
+/// evaluates every tool the same way it evaluates `eval_path`, and there is one
+/// answer to "which version of this tool runs" rather than two that can
+/// disagree. It also means a session needs nothing of the tool on its own disk:
+/// what a conversation runs comes from the commit it was started from.
 fn dispatch_call(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
-    name: &str,
-    arguments: &Value,
     request: &Oid,
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
     let store = caos::build_secret_store(t)?;
     let configuration = tools_configuration(t, options, id, &store)?;
-    let mut kvs = vec![
+    let kvs = vec![
         format!("--head:commit={request_head}"),
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    if matches!(name, "tool_help" | "run_tool") {
-        let object_store = open_store(t)?;
-        let (_, head) =
-            fetch_validated_head(t, &object_store, id)?.ok_or("tool conversation disappeared")?;
-        let view = Conversation::open(&object_store, &head)?;
-        match tool_resolution_scope(&object_store, &view, arguments) {
-            Ok((root, path)) => {
-                kvs.push(format!("--client-tool-root={root}"));
-                kvs.push(format!("--client-tool-path={path}"));
-                let resolved = caos::eval_tree_tool(t, root.as_str(), &path, &store)
-                    .map(|tree| kvs.push(format!("--client-tool-tree:hash={tree}")));
-                if let Err(error) = resolved {
-                    // Deliver a recoverable tool error. Falling back to the server
-                    // would discard the actual client-side evaluation error.
-                    kvs.push(format!("--client-tool-error={error}"));
-                }
-            }
-            // SAY SO. Skipping quietly pushes no handoff at all, which is
-            // indistinguishable at the worker from a client too old to send
-            // one -- llm-step reports `no client tool handoff` for both. The
-            // step then evaluates server-side, the server refuses the `:@@=`
-            // it finds there, and the error names the repository's expression
-            // rather than the scope that could not be worked out here.
-            Err(error) => eprintln!(
-                "caos mcp serve: no resolution scope for {name} ({error}); \
-                 letting the step evaluate server-side"
-            ),
-        }
-    }
     let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
     let server = t.server_url()?;
     caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
-}
-
-/// Match the worker's input selection against the conversation snapshot, not
-/// the client's checkout. Generated definitions never become the tool's input.
-fn tool_resolution_scope(
-    store: &dyn ObjectStore,
-    view: &Conversation<'_>,
-    arguments: &Value,
-) -> Result<(Oid, String), String> {
-    let path = arguments["path"].as_str().ok_or("tool requires path")?;
-    paths::validate_tree_path(path)?;
-    for name in view.source_tree_names()?.into_iter().rev() {
-        if let Some(relative) = path.strip_prefix(&format!("{name}/")) {
-            let source = view.source_tree(&name)?.ok_or("source tree disappeared")?;
-            return Ok((
-                store.read_commit(&source.commit)?.tree,
-                relative.to_string(),
-            ));
-        }
-    }
-    Ok((view.tree().clone(), path.to_string()))
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -357,8 +300,41 @@ fn tools_configuration(
     // merge tools resolve against the conversation's own Git store, so a ref
     // snapshot passed from here would be a second, staler source of truth.
     let config = vec![format!("--conversation={id}")];
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store)?;
+    let base = step_image(t, options, store)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
+}
+
+/// The step, resolved from the tree the conversation seeds from: `--base`'s
+/// when given, the workspace otherwise.
+///
+/// ONE TREE FOR BOTH. Dev mode's `--base` is a commit whose `.caos-expr` points
+/// at the dev stack, and nothing else carries that pin -- the checkout is left
+/// as it was cloned. Resolved from the workspace instead, the session would run
+/// a dev client against the committed tools.
+fn step_image(
+    t: &GitTransport,
+    options: &TurnOptions,
+    store: &[caos::ClientSecret],
+) -> Result<String, String> {
+    let tree = match &options.base {
+        Some(base) => Some(
+            t.git_capture(
+                &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
+                None,
+            )
+            .map_err(|e| format!("reading --base {base}: {e}"))?
+            .trim()
+            .to_string(),
+        ),
+        None => None,
+    };
+    crate::resolve_image_arg(
+        t,
+        options.llm_step.as_deref(),
+        LLM_STEP_ARG,
+        store,
+        tree.as_deref(),
+    )
 }
 
 /// Wait, bounded, for the caos server to answer -- the hook's counterpart to
@@ -443,7 +419,7 @@ fn read_outcome(
 
 /// The last successful tool discovery's phase timings, for `caos_status` to
 /// report -- the one place a locked-down session can see WHERE the wait went.
-/// Discovery is not just the `:@@=` eval walk `/eval-locator` sped up; it also
+/// Discovery is not just the `:@@=` resolve `/resolve-locator` does; it also
 /// runs `llm-step` in a worker, and only a measurement says which dominates.
 /// Written once per successful resolve.
 static DISCOVERY_TIMING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -464,7 +440,7 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     let total = std::time::Instant::now();
     let store = caos::build_secret_store(t)?;
     let mark = std::time::Instant::now();
-    let base = crate::resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, &store)?;
+    let base = step_image(t, options, &store)?;
     let resolve_step = mark.elapsed();
     // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
     // A repository's own tools are reached by PATH (`tool_help` to describe one,
@@ -823,8 +799,8 @@ fn root_commit(
     signature: &Signature,
 ) -> Result<Oid, String> {
     let phase = std::time::Instant::now();
-    let base = oid(&resolve_base(t, options)?, "conversation base")?;
-    cc_timing("resolve_base", phase.elapsed());
+    let base = oid(&eval_base(t, options)?, "conversation base")?;
+    cc_timing("eval_base", phase.elapsed());
     let phase = std::time::Instant::now();
     // The client repo's own tree becomes the conversation's content, at the
     // root -- the same `seed_content` the tui uses, so a recorded session and a
