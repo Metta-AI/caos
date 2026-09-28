@@ -10,11 +10,12 @@ Anthropic's Claude Code, wired to caos — in both directions, sharing one confi
 ```
 shared/   the deny list, hooks, and server declaration both paths consume
 cli/      launch Claude Code locally against caos (run)
+drive/    start and inspect cloud sessions, from a terminal or as a caos worker
+            drive.go          the program; .caos-expr + DEPS make it an entry
 cloud/    configure a claude.ai/code cloud environment
-            install.sh        the installer: binary + user-level config, pinned
-            setup.sh          the env's "Setup script" field: install once, wire the hook
-            session-start.sh  per-session: remote, client refresh, unshallow, warm
-            drive             drive a cloud session from a terminal
+            bootstrap.go      stage 1: read the repo's pin, fetch the payload, run stage 2
+            install.go        stage 2: put the package in place, write Claude Code's config
+            session.go        the SessionStart hook: warm the tool registry
 ```
 
 The rust side — `caos mcp` — is compiled into the client (`rust/crates/caos-cli/`,

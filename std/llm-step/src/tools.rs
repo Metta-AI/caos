@@ -580,23 +580,28 @@ fn expr_help(expr: &str) -> Option<String> {
 /// sourced differently. `dir` is the materialized arg-tree path
 /// (`/cas/args/<name>-image`).
 ///
-/// THE HELP IS AT `args/help`, not `help`. That path is the curry node's own
-/// layout — `{base, args/<name>…, .caos-curry}` (`caos::caos_curry`) — and the
-/// tool's `.caos-expr` binds `--help=` like any other argument. Looking at the
-/// top level finds nothing, which is exactly what happened: `registry` skipped
-/// a tool it could not describe, so every std tool silently vanished from the
-/// registry and the harness offered six tools where it meant to offer thirteen.
-///
 /// `None` when the image carries no `help` — a configuration error, since the
 /// harness itself curried the image, and its callers now say so.
+///
+/// BOTH ARGTREE SHAPES ARE ACCEPTED, because both occur. An ArgTree has three
+/// equivalent forms — a curry node `{base, args/<name>…, .caos-curry}`, a flat
+/// args tree `{base, <name>…}`, or a bare image — and `caos::caos_curry`
+/// normalizes whichever it is given. A tool image can be either of the first
+/// two: `tests/exec-bit` evaluates to a curry node, and
+/// `integrations/claude-code/drive` to a flat one carrying `secret-hash`, which
+/// is the shape `assemble_arg_tree` builds ("the request object IS the args
+/// tree").
+///
+/// Reading only `args/help` finds nothing in the flat form and refuses the tool
+/// as "not a tool" — over its SHAPE rather than over anything it declares.
 pub fn std_tool(name: &str, dir: &str) -> Result<Option<TreeTool>, String> {
     caos(["get", dir])?;
     let args = format!("{dir}/args");
-    if !Path::new(&args).exists() {
-        return Ok(None);
+    if Path::new(&args).exists() {
+        caos(["get", &args])?;
+        return tool_from_help(name, &format!("{args}/help"));
     }
-    caos(["get", &args])?;
-    tool_from_help(name, &format!("{args}/help"))
+    tool_from_help(name, &format!("{dir}/help"))
 }
 
 /// The tool a FLAT REQUEST runs, described by the `help` the request carries.

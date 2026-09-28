@@ -17,5 +17,4 @@
 ../../std/runner runner
 ../../std/bash bash
 ../../std/cargo cargo
-../../std/flake-builder flake-builder
 ../../std/rustc rustc

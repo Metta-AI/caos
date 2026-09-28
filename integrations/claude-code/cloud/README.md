@@ -20,12 +20,9 @@ the client now holds ONE connection and opens a stream per request.
 
 ## Three programs, run by `go run`
 
-What was four bash scripts (1833 lines) is now three Go programs (about 1100,
-comments included), because the assumption they were arranged around was false:
-**the setup script runs on every session**, not once before a snapshot. So the
-pin re-read and the client re-install that a session hook was doing were redoing
-work done seconds earlier in the same container.
-[`design/cloud-setup.md`](../../../design/cloud-setup.md) has the measurements.
+All three run in the container. [`design/cloud-setup.md`](../../../design/cloud-setup.md)
+has the measurements behind their shape: the setup script runs on EVERY session,
+not once before a snapshot, so there is no cheap phase to defer work to.
 
 | | |
 |---|---|
@@ -118,6 +115,8 @@ A repo that pins no caos is a misconfigured environment and setup **fails**,
 naming what is missing. It does not fall back to the `--base` in the settings
 form: that names a branch, and a client installed from a moving head would be a
 client from a different tree than the tools it drives.
+
+See [`../drive`](../drive) for starting one.
 
 ## Configuring the environment
 

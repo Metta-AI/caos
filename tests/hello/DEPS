@@ -3,4 +3,3 @@
 ../../std/hello hello
 ../../std/rustc rustc
 ../../std/cargo cargo
-../../std/flake-builder flake-builder

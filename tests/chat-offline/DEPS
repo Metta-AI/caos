@@ -5,7 +5,6 @@
 ../../std/rgrep rgrep
 ../../std/cargo cargo
 ../../std/bash bash
-../../std/flake-builder flake-builder
 ../../std/llm-stub llm-stub
 ../../std/llm-test-tool llm-test-tool
 # The image this client test runs in, with the client-repo setup as its
