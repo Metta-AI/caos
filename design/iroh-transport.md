@@ -197,20 +197,27 @@ with the same shape: a small answer works, a real one hangs.
   does not help.
 
   What reaches it is THIS MACHINE's address with the UDP port published into the
-  container, so `caosd` passes those in: loopback, plus every address the kernel
-  says this host answers to, read from `/proc/net/fib_trie` in pure bash (that
-  command is coreutils and bash and nothing else). None of it is inferred about
-  the outside world — a host's own addresses are a local fact, and on a machine
-  with a public address that is also what a remote client needs, with no
-  configuration at all. `CAOS_IROH_ADVERTISE` adds anything else, such as a
-  forwarded port on a router.
+  container, and only something outside the container knows it. `caosd` passes
+  through whatever `CAOS_IROH_ADVERTISE` names and nothing else, so the direct
+  set in a ticket is exactly what an operator stated.
 
-  Advertising REPLACES the PRIVATE addresses the endpoint discovered and keeps
-  the rest (`reachable_from_elsewhere`). Dropping the private ones is what keeps
-  the ticket stable — a container gets a new address every time it is created,
-  and it names nothing reachable — while keeping the public one matters because
-  the relay's view of this machine is exactly what a client on another network
-  can use.
+  NOTHING IS INFERRED, and that is the point. This used to seed loopback and add
+  every address the kernel said the host answered to, read from
+  `/proc/net/fib_trie`. On a LAN that is a useful local fact; behind NAT it is
+  four wrong answers and one right one. Measured on the caosd-prod box: the
+  sweep produced the VPC address, the `docker0` gateway and the gateway of
+  `caos-net` -- a bridge caos creates itself -- while only the Elastic IP
+  reached anything. The caos-net gateway moves when that bridge is recreated, so
+  a ticket for a server whose identity had not changed changed with it;
+  `127.0.0.1` names the client's own machine; a client on a colliding 10.x range
+  probes its neighbours; and every holder of a ticket learned the internal
+  addressing.
+
+  An endpoint's own discovered addresses are not used either, for the same
+  reason they were being overridden: in a container it sees only its container
+  address, which reaches it from nowhere and changes on every create. With
+  nothing advertised a ticket carries only relays, and every client is relayed
+  -- the honest result when no one has said which address reaches the host.
 
 ## What this does not fix
 

@@ -243,28 +243,24 @@ async fn serve(options: Options) -> Result<(), String> {
     // that goes stale — a machine that changed networks — costs a failed probe
     // and falls back to the relay, so a ticket outlives the addresses in it.
     //
-    // `--advertise` REPLACES what the endpoint found for itself, rather than
-    // adding to it, and both halves of that matter.
+    // THE DIRECT SET IS EXACTLY WHAT WAS NAMED. Nothing here infers an address,
+    // and `--advertise` is the only way one gets into a ticket.
     //
-    // It is needed at all because an endpoint's view of itself can be wrong: in a
-    // container on a rootless podman network it discovers only its own
-    // `10.89.x.y`, which has no route to it from anywhere — not even the host —
-    // while the address that DOES reach it is the host's, forwarded by a
-    // published port. Something outside has to say so.
+    // An endpoint's view of itself is not usable: in a container it discovers
+    // only its address on the container network, which reaches it from nowhere --
+    // not even from the host -- and changes every time the container is created.
+    // caosd used to make up the difference by sweeping the host's own addresses
+    // into `--advertise`, which on a NAT'd box meant a ticket naming a VPC
+    // address, two docker bridge gateways and loopback against one address that
+    // worked. Each cost something: a bridge gateway moves when the bridge is
+    // recreated, so a ticket for an unchanged server changed; loopback points a
+    // client at its own machine; and the set told whoever held the ticket what
+    // the internal addressing was.
     //
-    // Advertising REPLACES the PRIVATE half of what was discovered and keeps the
-    // rest (`reachable_from_elsewhere`). Both halves of that matter:
+    // The relays stay either way, so a client that can use none of these still
+    // connects -- and with nothing advertised, every client is relayed, which is
+    // the honest outcome when no one has said which address reaches this host.
     //
-    // * a container's own `10.89.x.y` is unreachable from anywhere and changes
-    //   every time the container is created, so keeping it would put a value in
-    //   the ticket that moves on every `caosd up` while naming nothing — the
-    //   durability problem that pinning the port was meant to end;
-    // * the public address the relay observed is the one a client on another
-    //   network needs, and dropping it would send every remote client through a
-    //   relay for ever.
-    //
-    // The relays stay either way, so a client that can use none of these
-    // addresses still connects.
     // THE RELAY GOES IN WHETHER OR NOT IT HAS BEEN REACHED. `addr()` reports
     // relays this endpoint has CONNECTED to, so a caosd brought up with no route
     // out -- an ordinary thing to do -- would mint a ticket with no relay in it:
@@ -276,18 +272,26 @@ async fn serve(options: Options) -> Result<(), String> {
     } else {
         endpoint.addr().with_relay_url(relay)
     };
+    // NO `--advertise`, NO ADDRESSES. What an endpoint discovers about itself in
+    // a container is its address on the container network, which reaches it from
+    // nowhere -- not even from the host -- and changes every time the container
+    // is created. Publishing it put a value in the ticket that moved on every
+    // `caosd up` while naming nothing.
+    //
+    // So the direct set is now exactly what was named, and the relay carries
+    // everything else. A caller that wants a direct path says which address
+    // reaches it; nothing here guesses, because the guess is only right on a LAN
+    // and is wrong, durably and invisibly, behind any NAT.
     let addr = if options.advertise.is_empty() {
-        discovered
-    } else {
         let mut addr = iroh::EndpointAddr::new(discovered.id);
         for relay in discovered.relay_urls() {
             addr = addr.with_relay_url(relay.clone());
         }
-        for kept in discovered
-            .ip_addrs()
-            .filter(|a| caos_iroh::reachable_from_elsewhere(a))
-        {
-            addr = addr.with_ip_addr(*kept);
+        addr
+    } else {
+        let mut addr = iroh::EndpointAddr::new(discovered.id);
+        for relay in discovered.relay_urls() {
+            addr = addr.with_relay_url(relay.clone());
         }
         for extra in &options.advertise {
             addr = addr.with_ip_addr(*extra);
