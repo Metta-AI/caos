@@ -1330,55 +1330,32 @@ sandbox = false''
               iroh_publish=()
               if [ "$IROH" = yes ]; then iroh_publish=(-p 11204:11204/udp); fi
 
-              # WHAT TO PUT IN THE TICKET ON TOP of what the listener finds for
-              # itself, which in a container is only its address on the container
-              # network — unroutable from anywhere, the host included (rootless
-              # podman's network is user-mode: `/proc/net/route` on the host has
-              # no entry for it). The address that reaches it is THIS machine's,
-              # with the port published above, and only something out here knows
-              # that.
+              # WHAT GOES IN THE TICKET: exactly what the operator names,
+              # and nothing else.
               #
-              # THIS MACHINE'S OWN ADDRESSES, which it knows as a local fact and
-              # the container cannot: loopback (a client here, through the
-              # published port) plus whatever the kernel says is assigned to this
-              # host (a client on the LAN, or anywhere at all when that address is
-              # public — a server on a VPS needs no configuration for this to
-              # work). Nothing is inferred about the outside world; the listener
-              # keeps the relay's view of its public address separately.
+              # This used to seed loopback and then add every local /32 the
+              # kernel reported, on the theory that a host's own addresses are a
+              # local fact worth publishing -- true on a LAN, and on a bare VPS
+              # it meant a public address needed no configuration.
               #
-              # PURE BASH, because this command is coreutils and bash and that is
-              # all (see runtimeInputs) — reading `/proc/net/fib_trie`, where a
-              # `|-- <addr>` line followed by `/32 host LOCAL` is an address this
-              # machine answers to. No /proc (macOS) simply yields none, and
-              # loopback still covers the local client, since the engine forwards
-              # the published port there too.
-              IROH_ADVERTISE="127.0.0.1:11204"
-              if [ "$IROH" = yes ] && [ -r /proc/net/fib_trie ]; then
-                candidate=""
-                while read -r line; do
-                  case "$line" in
-                    *"|-- "*) candidate=''${line##*|-- } ;;
-                    *"/32 host LOCAL"*)
-                      # Skipped: loopback (already there) and DUPLICATES — this
-                      # file lists every address once per routing table, so a
-                      # plain append would name each of them twice.
-                      case "$candidate" in
-                        127.*|"") ;;
-                        *)
-                          case " $IROH_ADVERTISE " in
-                            *" $candidate:11204 "*) ;;
-                            *) IROH_ADVERTISE="$IROH_ADVERTISE $candidate:11204" ;;
-                          esac
-                          ;;
-                      esac
-                      candidate=""
-                      ;;
-                  esac
-                done < /proc/net/fib_trie
-              fi
-              # Anything else the operator wants in the ticket — a forwarded
-              # public address, say. Added last; the rest is not a guess.
-              IROH_ADVERTISE="$IROH_ADVERTISE ''${CAOS_IROH_ADVERTISE:-}"
+              # Behind NAT it is wrong, and expensively so. On the caosd-prod box
+              # the sweep found three: 10.42.1.140 (the VPC address, reachable
+              # only inside the VPC) and 10.200.0.1 and 10.200.1.1 -- the
+              # gateways of docker0 and of caos-net, a bridge caos creates
+              # itself. With loopback that is four entries naming nothing a
+              # client can reach, against one that works.
+              #
+              # Each of them costs something. caos-net's gateway moves when the
+              # bridge is recreated, so a ticket for a server whose identity has
+              # not changed does; 127.0.0.1 points a client at its own machine,
+              # which is a trap for anyone running a stack on the same port; a
+              # client on a colliding 10.x range probes its own neighbours; and
+              # all of it tells whoever holds the ticket what the internal
+              # addressing is.
+              #
+              # A guess that is right on a LAN and wrong everywhere else is not
+              # worth it. Name the address, or use the relay.
+              IROH_ADVERTISE="''${CAOS_IROH_ADVERTISE:-}"
 
               # ONE container runs the whole daemon group (design/
               # one-stack-image.md), and it BUILDS WHAT IT RUNS: its entrypoint

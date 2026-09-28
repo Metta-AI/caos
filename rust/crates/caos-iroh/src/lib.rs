@@ -229,48 +229,6 @@ pub fn client_endpoint_builder(ticket: &Ticket) -> iroh::endpoint::Builder {
     }
 }
 
-/// Could `addr` be reached from another machine?
-///
-/// Used to decide which of the addresses an endpoint DISCOVERED about itself
-/// survive when something outside also tells it where it can be reached
-/// (`caos-iroh serve --advertise`). The discovered set is then a mixture: an
-/// address on the container's own private network, which nothing outside can
-/// route to and which changes every time the container is created; and, if the
-/// relay's view of it got through, the public address its traffic comes from,
-/// which is exactly what a client elsewhere needs. Keeping the second and
-/// dropping the first is the whole of this predicate.
-///
-/// Private ranges are dropped rather than kept because the advertised addresses
-/// replace them: whoever passed them in knows this machine's own addresses,
-/// which the endpoint inside a container cannot see.
-pub fn reachable_from_elsewhere(addr: &std::net::SocketAddr) -> bool {
-    match addr.ip() {
-        std::net::IpAddr::V4(ip) => {
-            // 100.64.0.0/10 is carrier-grade NAT: a private range in all but
-            // name, and `Ipv4Addr::is_shared` is still unstable.
-            let cgnat = ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]);
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || ip.is_documentation()
-                || cgnat)
-        }
-        std::net::IpAddr::V6(ip) => {
-            let unique_local = ip.segments()[0] & 0xfe00 == 0xfc00;
-            // 2001:db8::/32, the v6 documentation range — `is_documentation` is
-            // still unstable, and leaving it out would be an asymmetry with v4.
-            let documentation = ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8;
-            let link_local = ip.segments()[0] & 0xffc0 == 0xfe80;
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || unique_local
-                || link_local
-                || documentation)
-        }
-    }
-}
-
 /// What a stream asks the listener for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Service {
@@ -924,25 +882,6 @@ mod tests {
         let ticket = EndpointTicket::new(a_ticket().addr);
         let error = Ticket::parse(&format!("{URL_SCHEME}{ticket}")).expect_err("no token");
         assert!(error.contains("no token"), "{error}");
-    }
-
-    #[test]
-    fn only_addresses_another_machine_could_use_survive_advertising() {
-        let keep = |addr: &str| reachable_from_elsewhere(&addr.parse().expect("an address"));
-        // What a container discovers about itself, and what a relay observes
-        // about it: the first is unreachable and changes per container, the
-        // second is what a client on another network needs.
-        assert!(!keep("10.89.0.25:11204"), "container network");
-        assert!(!keep("192.168.1.10:11204"), "home LAN");
-        assert!(!keep("172.17.0.2:11204"), "docker bridge");
-        assert!(!keep("127.0.0.1:11204"), "loopback");
-        assert!(!keep("169.254.7.7:11204"), "link-local");
-        assert!(!keep("100.100.1.1:11204"), "carrier-grade NAT");
-        assert!(keep("69.181.90.11:11204"), "a public address");
-        assert!(!keep("[2001:db8::1]:11204"), "documentation v6");
-        assert!(!keep("[fe80::1]:11204"), "v6 link-local");
-        assert!(!keep("[fc00::1]:11204"), "v6 unique-local");
-        assert!(keep("[2606:4700::1111]:11204"), "a public v6 address");
     }
 
     #[test]
