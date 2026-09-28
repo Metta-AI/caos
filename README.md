@@ -489,13 +489,20 @@ Everything then works as above — `git fetch`/`push` through the
 connection. The ticket is a bearer capability: anyone holding it can drive that
 server, and it stays valid across restarts.
 
-`--iroh` publishes UDP 11204 and puts this machine's own addresses in the
-ticket, which is what lets a client reach the stack
-directly instead of through a relay — the difference between ~100 ms and ~4.6 s
-for a cached run, since every request is a round trip. Clients on other machines
-get that too when one of those addresses reaches this machine; add another (a
-forwarded port on a router, say) with `CAOS_IROH_ADVERTISE=<ip>:11204` to
-put that address in the ticket. Without it they still work, relayed.
+`--iroh` publishes UDP 11204. A ticket carries a direct address only if you name
+one: `CAOS_IROH_ADVERTISE=<ip>:11204` puts exactly that address in, and nothing
+else goes in. With none set the ticket carries only the relay, and every client
+is relayed — the difference between ~100 ms and ~4.6 s for a cached run, since
+every request is a round trip.
+
+Nothing is guessed, and that is deliberate. This used to publish every address
+the kernel said the host answered to, which is right on a LAN and wrong behind
+NAT: on an EC2 box it named the VPC address, both docker bridge gateways and
+loopback, against one address that worked. A bridge gateway moves when the
+bridge is recreated, so the ticket for an unchanged server changed; loopback
+points a client at its own machine; and the set disclosed the internal
+addressing to whoever held the ticket. So name the address that reaches this
+host, or accept the relay.
 
 ### The CAS and `/cas`
 
