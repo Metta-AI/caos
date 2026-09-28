@@ -214,6 +214,72 @@ case "$missing" in
   *) fail "a missing generated path was not a recoverable tool error: $missing" ;;
 esac
 
+echo "== a call still running at Stop keeps its request, and its result ==" >&2
+# Claude Code moves any MCP call past 120s to the background and ends the turn,
+# so `Stop` fires while the call runs and the result arrives in a later turn --
+# which Claude Code opens with a `UserPromptSubmit`. A Stop that closed the
+# request left the call nowhere to record its completion, and the result reached
+# the model as an EMPTY error ("Task failed: no detail"), while a re-run was an
+# instant memo hit. The sleep stands in for the 120s.
+mkdir -p slow
+cat > slow/.caos-expr <<EXPR
+HELP=<<END
+Sleeps, then answers.
+@param seconds How long to sleep.
+@param nonce Makes each call a new job.
+END
+curry --base:hash=$bash_image --worker1:@=worker.sh --help=\$HELP
+EXPR
+cat > slow/worker.sh <<'WORKER'
+#!/usr/bin/env bash
+set -euo pipefail
+caos get /cas/args/seconds
+caos get /cas/args/nonce
+sleep "$(cat /cas/args/seconds)"
+printf 'slept %s' "$(cat /cas/args/seconds)" > /tmp/out
+caos put /tmp/out /cas/out
+WORKER
+git add slow
+git -c user.name=test -c user.email=test@caos commit -qm slow-tool
+held="mcp-held-$(date +%s)-$$"
+hook() { # <event JSON>
+  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+}
+hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
+held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
+send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg nonce "$held" \
+  '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run_tool",arguments:{
+    caos_session:$session,caos_tool_use_id:"held-30",path:$path,
+    arguments:{seconds:"25",nonce:$nonce}}}}')"
+# The Stop must land AFTER the call is declared, as a backgrounded call's does.
+declared=""
+for _ in $(seq 60); do
+  if [ "$(git log -1 --format=%s "$held_ref")" = model.complete ]; then
+    declared=yes
+    break
+  fi
+  sleep 1
+done
+if [ -z "$declared" ]; then fail "the call was never declared"; fi
+hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"moved to the background\"}"
+if [ "$(git log -1 --format=%s "$held_ref")" = request.terminal ]; then
+  fail "Stop closed a request whose call was still running"
+fi
+answer=$(await '"id":30' 300) || fail "the held call never answered"
+case "$answer" in
+  *'"isError":false'*'slept 25'*|*'slept 25'*'"isError":false'*) ;;
+  *) fail "a call that outlived its turn lost its result: $answer" ;;
+esac
+# The turn that delivers the result closes the held request and opens its own,
+# and that one's Stop closes it as usual.
+hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"the result arrived\"}"
+hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"done\"}"
+subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
+case "$subjects" in
+  "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;
+  *) fail "the held request was not closed before the next one opened: $subjects" ;;
+esac
+
 close_server
 
 echo "== an unreachable caos server is named, not waited on ==" >&2

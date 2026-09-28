@@ -37,8 +37,8 @@ use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::oid::{Oid, G3};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    Block, DeclaredCall, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome, TurnRecord,
-    TurnStatus,
+    Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome,
+    TurnRecord, TurnStatus,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::tree::Signature;
@@ -667,10 +667,47 @@ fn record_prompt(
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
         let observed = fetch_validated_head(t, &store, id)?.map(|(_, head)| head);
-        let head = match &observed {
+        let mut head = match &observed {
             Some(head) => head.clone(),
             None => root_commit(t, &mut store, id, prompt, options, &signature)?,
         };
+
+        // A request `on_stop` left open for a backgrounded call. While that
+        // call still runs, the prompt joins its request, as a prompt typed into
+        // a running tui turn does. Once the call has finished -- and the turn
+        // Claude Code opens to deliver its result is one such prompt -- the
+        // request has nothing left to wait for and closes, and the prompt
+        // opens a request of its own.
+        let held = {
+            let view = Conversation::open(&store, &head)?;
+            match view.active_turn()? {
+                Some(active) => {
+                    let running = outstanding_call(&view, &active)?.is_some();
+                    Some((active.id, running))
+                }
+                None => None,
+            }
+        };
+        let mut interject_into = None;
+        if let Some((active, running)) = held {
+            if running {
+                interject_into = Some(active);
+            } else {
+                let closing = inherited_signature(&store, &head)?;
+                head = mint_transition(
+                    &mut store,
+                    &head,
+                    &Transition::TurnTerminal {
+                        request: active,
+                        outcome: TurnOutcome::Idle {
+                            result: None,
+                            interrupted: false,
+                        },
+                    },
+                    &closing,
+                )?;
+            }
+        }
 
         // The message. Its id is fresh entropy, as the client's own is: a
         // transcript entry is addressed by it, and two prompts in one session
@@ -681,7 +718,7 @@ fn record_prompt(
             conversation: id.to_string(),
             role: Role::User,
             actor: username.clone(),
-            request: None,
+            request: interject_into.clone(),
             round: None,
             model: None,
             blocks: vec![Block::Text {
@@ -690,6 +727,23 @@ fn record_prompt(
             proposal: None,
             source_tree_resolution: None,
         };
+        if let Some(request) = interject_into {
+            let joined = mint_transition(
+                &mut store,
+                &head,
+                &Transition::TurnInterject {
+                    request,
+                    entry,
+                    payloads: Vec::new(),
+                },
+                &signature,
+            )?;
+            if push_cas(&store, &refname, observed.as_ref(), &joined)? {
+                let _ = update_local_cache(t, &refname, joined.as_str());
+                return Ok(());
+            }
+            continue;
+        }
         let message = mint_transition(
             &mut store,
             &head,
@@ -839,6 +893,34 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A call of `request` that has not finished, if there is one: one that
+/// started and has no result yet, or one the current round declared that has
+/// not started. A call is recorded in the round BEFORE `request.round`, which
+/// is the one its `model.complete` opened.
+fn outstanding_call(
+    view: &Conversation<'_>,
+    request: &TurnRecord,
+) -> Result<Option<String>, String> {
+    for round in 0..request.round {
+        if let Some(call) = view
+            .tools(&request.id, round)?
+            .into_iter()
+            .find(|call| call.status == CallStatus::Started)
+        {
+            return Ok(Some(call.id));
+        }
+    }
+    let Some(declaring) = request.round.checked_sub(1) else {
+        return Ok(None);
+    };
+    for call in &request.calls {
+        if view.tool(&request.id, declaring, &call.id)?.is_none() {
+            return Ok(Some(call.id.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
 fn conversation_id(payload: &Value) -> Result<String, String> {
@@ -922,6 +1004,24 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
             // not an error: an interrupted session can leave one behind.
             return Ok(None);
         };
+        // Claude Code ends a turn with a call still running when it has moved
+        // that call to the background (it does so to any MCP call past 120s),
+        // and it delivers the result in a later turn. Only a RUNNING request
+        // accepts the call's completion, so the request stays open for it,
+        // and the prompt hook closes it once the call is done.
+        //
+        // The closing message is not recorded either. `model.complete` would
+        // open a new round, and the step checks a finishing call against the
+        // round current AT THE FINISH (`require_completed_call`), so it would
+        // fail the call as undeclared -- and a declared call that had not yet
+        // started would never start.
+        if let Some(call) = outstanding_call(&view, &request)? {
+            eprintln!(
+                "caos mcp hook: call {call} is still running; \
+                 leaving its request open for the result"
+            );
+            return Ok(None);
+        }
         let ordinal = view.transcript_len()?;
         let round = request.round;
         drop(view);
@@ -1000,6 +1100,9 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
         };
         let ordinal = view.transcript_len()?;
         let round = request.round;
+        // A backgrounded call still has its result to deliver, as in `on_stop`,
+        // so the failure is recorded but the request is left running for it.
+        let holding = outstanding_call(&view, &request)?.is_some();
         drop(view);
 
         // The outcome names a TRANSCRIPT ENTRY, not the text: `apply` validates
@@ -1029,6 +1132,9 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
             },
             &signature,
         )?;
+        if holding {
+            return Ok(Some(recorded));
+        }
         let terminal = mint_transition(
             store,
             &recorded,

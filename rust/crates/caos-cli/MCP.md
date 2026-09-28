@@ -213,10 +213,22 @@ nowhere else.
 
 | Hook | Transitions |
 |---|---|
-| `UserPromptSubmit` | `message.append` (the prompt), `request.admit`, `request.claim` |
+| `UserPromptSubmit` | `message.append` (the prompt), `request.admit`, `request.claim` — or, while a request is held open, `request.interject` or a `request.terminal` first (below) |
 | tool call | `model.complete` declaring the call — then the step's own `tool.start` and `tool.complete` |
-| `Stop` | `model.complete` (the closing message), `request.terminal` idle |
-| `StopFailure` | `message.append` (the error), `request.terminal` failed |
+| `Stop` | `model.complete` (the closing message), `request.terminal` idle — nothing, while a call is still running |
+| `StopFailure` | `message.append` (the error), `request.terminal` failed — the terminal only once no call is running |
+
+**A call can outlive its turn.** Claude Code moves any MCP call still running
+after 120s to the background, ends the turn, and delivers the result later in a
+turn of its own, which it opens with a `UserPromptSubmit`. Only a running
+request accepts a call's `tool.complete`, so a `Stop` that finds a call
+outstanding leaves the request open, and records no closing message, since a
+`model.complete` would open a new round the finishing call is then checked
+against. The next prompt closes that request if its calls have finished, and
+otherwise joins it as an interjection. A request closed under a running call
+has nowhere to record its result: the step finds it terminal and records
+nothing, and the model receives an empty error ("Task failed: no detail") for
+a call that succeeded.
 
 A session's first prompt creates the conversation, taking its `base` from the
 current `HEAD` and its fallback title from that prompt. Only a prompt may create
