@@ -1277,7 +1277,7 @@ sandbox = false''
 
             usage() {
               echo "caosd ($CAOS_REV)"
-              echo "usage: caosd [up [--iroh]|down|reset|logs|ticket|image-cleanup|version]"
+              echo "usage: caosd [up [--iroh=false]|down|reset|logs|ticket|image-cleanup|version]"
             }
 
             case "''${1:-up}" in
