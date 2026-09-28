@@ -968,10 +968,11 @@ sandbox = false''
         #   caosd reset  stop and wipe CAOS_DATA state for a clean slate.
         #   caosd logs   follow the running stack's logs (Ctrl-C returns; the stack
         #                keeps running).
-        #   caosd up --iroh  also answer `caos://` clients (design/
-        #                iroh-transport.md), so a client anywhere reaches this
-        #                stack with a TICKET and no address. Off by default: it
-        #                makes the stack reachable from outside this machine.
+        #   caosd up     also answers `caos://` clients (design/
+        #                iroh-transport.md) by default, so a client anywhere
+        #                reaches this stack with a TICKET and no address. That
+        #                makes the stack reachable from outside this machine;
+        #                `caosd up --iroh=false` (or CAOS_IROH=no) turns it off.
         #   caosd ticket that ticket — the whole of what a client configures
         #                (`git remote add caos <ticket>`). Stable across
         #                restarts; needs a stack brought up with --iroh.
