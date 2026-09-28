@@ -1286,15 +1286,21 @@ sandbox = false''
               exit 0
               ;;
             up)
-              # REACHABLE BY TICKET ONLY IF ASKED. `caosd up --iroh` (or
-              # CAOS_IROH=yes) adds the `caos://` listener
-              # (design/iroh-transport.md), which publishes this machine's
-              # endpoint and answers anyone holding the ticket. Off by default
-              # because bringing a local stack up should not also put it on the
-              # internet; on, it persists its key under CAOS_DATA so one ticket
-              # keeps working — `caosd ticket` prints it.
-              IROH=''${CAOS_IROH:-no}
-              if [ "''${2:-}" = --iroh ]; then IROH=yes; fi
+              # REACHABLE BY TICKET UNLESS TOLD OTHERWISE. `caosd up` adds the
+              # `caos://` listener (design/iroh-transport.md), which publishes
+              # this machine's endpoint and answers anyone holding the ticket.
+              # `caosd up --iroh=false` (or CAOS_IROH=no) leaves it off; on, it
+              # persists its key under CAOS_DATA so one ticket keeps working —
+              # `caosd ticket` prints it. `--iroh` alone is accepted and means
+              # the default, so existing invocations keep working.
+              IROH=''${CAOS_IROH:-yes}
+              for arg in "''${@:2}"; do
+                case "$arg" in
+                --iroh | --iroh=true | --iroh=yes) IROH=yes ;;
+                --iroh=false | --iroh=no) IROH=no ;;
+                *) die "caosd up: unknown argument '$arg'" ;;
+                esac
+              done
               # A RELAY IS REQUIRED, and is refused here rather than defaulted.
               # n0's relays are never used (caos_iroh::endpoint_builder), so a
               # bring-up without one has nothing to fall back to — and a ticket
