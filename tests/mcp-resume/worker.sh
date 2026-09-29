@@ -56,7 +56,11 @@ head_f=$(head_of "cc/$f")
 [ -n "$head_f" ] || fail "the fork has no conversation of its own"
 [ "$(head_of "cc/$a")" = "$head_a" ] || fail "forking moved the original"
 git merge-base --is-ancestor "$head_a" "$head_f" || fail "the fork does not descend from $head_a"
-git show "$head_f:.caos/identity.json" | grep -q fork || fail "the fork's identity is not a fork"
+identity=$(git show "$head_f:.caos/identity.json")
+case "$identity" in
+  *fork*) ;;
+  *) fail "the fork's identity is not a fork: $identity" ;;
+esac
 git grep -q "first prompt of the original" "$head_f" -- .caos/transcript \
   || fail "the fork lost the original's transcript"
 case "$(subjects "$head_f")" in
