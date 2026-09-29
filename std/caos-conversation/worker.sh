@@ -78,7 +78,13 @@ while :; do
   # one line of JSON), so the first match is the first parent.
   parent=$(grep -m1 '^parent ' "/cas/c$n" | cut -d' ' -f2 || true)
   # The event JSON is the message's last line.
-  tail -n 1 "/cas/c$n" > "/tmp/ev/$(printf '%06d' "$n").json"
+  evfile="/tmp/ev/$(printf '%06d' "$n").json"
+  tail -n 1 "/cas/c$n" > "$evfile"
+  if ! jq -e . "$evfile" > /dev/null 2>&1; then
+    printf 'commit %s: no readable event record; message ends: %s\n' "$cur" \
+      "$(tail -n 3 "/cas/c$n" | head -c 300 | tr '\n' '|')" >> /tmp/notes
+    : > "$evfile"
+  fi
   n=$((n + 1))
   if [ -z "$parent" ]; then break; fi
   cur=$parent
