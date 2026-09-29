@@ -1,0 +1,27 @@
+# The `caos-conversation` tool (SPEC, "Tools"): the std/bash worker image with
+# this directory's script curried onto it, plus the `help` the agent registers
+# it by. Like caos-test-result it reads BY HASH and touches no source tree, so
+# it needs no `@in` and runs on plain std/bash.
+#
+# The docs are a HERE-STRING, so they live in the `.caos-expr` — which is
+# STRIPPED from the tree the expression is evaluated against. Editing them
+# re-keys this tool's arg tree and nothing else: no build sees these bytes.
+HELP=<<END
+Read a recorded conversation — for example a Claude Code session that `caos mcp hook`
+recorded — given the hash of the commit at its tip (`caos head <hash>`, or the `C` a
+conversation ref points to). Prints it in order: each user message, each assistant
+message, and each tool call with its arguments and result. Arguments and results are
+cut to `width` characters; pass `call` to see one call in full. Use it to review how a
+session went and to find what the docs or tools should have said.
+
+WHAT IS NOT IN THE RECORD. The hooks record only the user's prompts, the calls to caos
+tools with their results, and each turn's final assistant message. The model's own
+text and reasoning between tool calls are not recorded, nor are calls to tools that
+are not caos's, nor calls that never reached one (a misnamed tool, a denied call).
+Commit timestamps are fixed, so there are no timings. A gap in the story usually
+means an unrecorded step, not a missing one.
+@param hash The full 40-character hash of the conversation's tip commit.
+@param [call] Print only this tool call (its `toolu_...` id, as this tool prints it), untruncated.
+@param [width] Cut each tool call's arguments and result to this many characters (default 300; 0 for no cut).
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
