@@ -425,6 +425,11 @@ func writeUserConfig(a args, locator string) {
 		if writeIfChanged(filepath.Join(home, ".claude/settings.json"), settings) {
 			changed = true
 		}
+		for name, body := range commands {
+			if writeIfChanged(filepath.Join(home, ".claude/commands", name), []byte(body)) {
+				changed = true
+			}
+		}
 		// settings.json cannot declare an MCP server -- that lives in the user
 		// config beside it, MERGED, because it also holds account state a
 		// session put there.
