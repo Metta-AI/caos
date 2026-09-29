@@ -372,6 +372,44 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
+// The two slash commands that start a session from an earlier recorded
+// conversation. THE HOOK is what acts on them -- `caos mcp hook` sees the
+// first prompt and forks or resumes the conversation before the model's first
+// turn (rust/crates/caos-cli/src/mcp/resume.rs) -- so the marker line below is
+// load-bearing: it is what the hook finds if Claude Code hands it the command's
+// expansion rather than the `/name <hash>` that was typed. The rest is for the
+// MODEL, which starts empty and has to be told to go and read what happened.
+//
+// They live here rather than as files in the release for the same reason
+// install.go itself comes from the payload: an edit reaches the next session
+// with nothing else to publish.
+const commandFooter = `
+The earlier session's context is not in your head, so recover it before doing anything else:
+
+1. Read the recorded history of commit $ARGUMENTS. Use the conversation-history tool if this workspace provides one, and read its output. Failing that, read the transcript directly: "ls" with root set to $ARGUMENTS and path ".caos/transcript", then "read" the entries (a tool call's result is under ".caos/tools/").
+2. The last turn may be unfinished. A call the earlier session never got a result for is recorded as cancelled ("the session that ran this call ended before it finished"). If its result matters, run it again.
+3. Tell me in a few lines what the conversation was doing and where it stopped, then wait for my next instruction.
+`
+
+var commands = map[string]string{
+	"fork-caos-conversation.md": `---
+description: Fork a recorded caos conversation into this session (a new branch from the same commit)
+argument-hint: <conversation-commit-hash>
+---
+caos-conversation-command: fork $ARGUMENTS
+
+You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original.
+` + commandFooter,
+	"resume-from-caos-conversation.md": `---
+description: Continue a recorded caos conversation in this new session (the same branch)
+argument-hint: <conversation-commit-hash>
+---
+caos-conversation-command: resume $ARGUMENTS
+
+You are picking up work recorded in another caos conversation, and this session CONTINUES it: what you do is appended to that same conversation, on top of commit $ARGUMENTS, so its history and workspace (imports/, feature/, and so on) are already here.
+` + commandFooter,
+}
+
 func writeUserConfig(a args, locator string) {
 	settings := settingsJSON(a, locator)
 	servers := mcpServers(a, locator)
