@@ -58,8 +58,8 @@ head_f=$(head_of "cc/$f")
 git merge-base --is-ancestor "$head_a" "$head_f" || fail "the fork does not descend from $head_a"
 identity=$(git show "$head_f:.caos/identity.json")
 case "$identity" in
-  *fork*) ;;
-  *) fail "the fork's identity is not a fork: $identity" ;;
+  *"\"id\":\"cc/$f\""*) ;;
+  *) fail "the fork carries the wrong conversation id: $identity" ;;
 esac
 git grep -q "first prompt of the original" "$head_f" -- .caos/transcript \
   || fail "the fork lost the original's transcript"
