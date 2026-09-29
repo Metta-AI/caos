@@ -902,8 +902,18 @@ fn outstanding_call(
     Ok(None)
 }
 
+/// The conversation a hook payload's session records into: the one it was
+/// resumed onto (`resume`), or else the one its id derives.
+fn recorded_conversation(t: &GitTransport, payload: &Value) -> Result<String, String> {
+    resume::conversation_for_session(t, string_field(payload, "session_id")?)
+}
+
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
+/// (The one exception is a session RESUMED onto an existing conversation, which
+/// keeps that conversation's id; `resume` owns that, and this is what every
+/// other session gets.)
+#[cfg(test)]
 fn conversation_id(payload: &Value) -> Result<String, String> {
     conversation_id_for(string_field(payload, "session_id")?)
 }
