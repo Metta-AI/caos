@@ -24,6 +24,7 @@
 //! result; the request a prompt admits is claimed here rather than by a worker,
 //! because the turn is already running by the time the hook fires.
 
+mod resume;
 mod serve;
 
 use std::io::Read;
