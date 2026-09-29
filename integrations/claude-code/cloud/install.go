@@ -135,7 +135,17 @@ func installClient(a args) {
 
 	// `#!/bin/bash`, NOT `#!/bin/sh`: `exec -a` is a bash builtin and /bin/sh is
 	// dash on Debian and Ubuntu, where it is `exec: -a: not found` on every call.
+	//
+	// THE STALE MARKER FAILS EVERY CALL. The session hook writes it when this
+	// install is a dev commit the server no longer serves (session.go), and a
+	// SessionStart hook cannot stop a session on its own -- but every prompt and
+	// every caos tool call runs `caos mcp hook` through this file, and exit 2 is
+	// what makes Claude Code block the prompt or the call and show the reason.
+	// Removed here because it describes one session, never an install.
+	stale := filepath.Join(a.prefix, "share/caos/stale-dev")
+	os.Remove(stale)
 	wrapper := "#!/bin/bash\n" +
+		"if [ -e " + stale + " ]; then cat " + stale + " >&2; exit 2; fi\n" +
 		"export CAOS_REV=\"${CAOS_REV:-" + a.version + "}\"\n" +
 		"exec -a \"$(basename \"$0\")\" " + filepath.Join(lib, "caos") + " \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(bin, "caos"), []byte(wrapper), 0o755); err != nil {

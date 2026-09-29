@@ -32,6 +32,9 @@ import (
 
 const shareDir = "/usr/local/share/caos"
 
+// The `caos` wrapper refuses every call while this exists (install.go).
+const staleMarker = shareDir + "/stale-dev"
+
 // Long enough for the observed resolve (~110s in a cloud session, which talks to
 // the server and may run the step to list its tools), so a cap short enough to be
 // "tight" would time out every warm and cache nothing.
@@ -83,6 +86,8 @@ func main() {
 		return
 	}
 
+	// A marker describes one session's check, so it never outlives it.
+	os.Remove(staleMarker)
 	setup := stamp("setup-stamp")
 	dev := stamp("dev-stamp")
 	for _, key := range []string{"built", "base", "pin", "client"} {
@@ -100,20 +105,23 @@ func main() {
 		log("  points this checkout at a server. Every tool call will fail.")
 	}
 
-	stepPath := setup["std_path"]
-	if stepPath == "" {
-		log("the setup stamp names no std path, so nothing can name the step;")
-		log("  leaving the tools to mcp serve's background resolve")
-		return
-	}
-	locator := "--llm-step:@=" + stepPath + "/llm-step"
-
 	// Beside the warm rather than before it, so a session pays for one round
 	// trip to the server, not two.
 	served := make(chan devProbe, 1)
 	if dev["rev"] != "" {
 		go func() { served <- probeDev() }()
 	}
+
+	stepPath := setup["std_path"]
+	if stepPath == "" {
+		log("the setup stamp names no std path, so nothing can name the step;")
+		log("  leaving the tools to mcp serve's background resolve")
+		if rev := dev["rev"]; rev != "" {
+			reportDev(rev, <-served)
+		}
+		return
+	}
+	locator := "--llm-step:@=" + stepPath + "/llm-step"
 
 	// CLAIMED BEFORE THE WARM STARTS, not by the warm itself. Claude Code spawns
 	// the tool server in PARALLEL with this hook and its first `tools/list` lands
@@ -178,8 +186,13 @@ func probeDev() devProbe {
 	return devProbe{sha: fields[0]}
 }
 
-// A mismatch goes to STDOUT: it is the state in which everything else about
-// the session looks right and the tree under test is not the one running.
+// A mismatch FAILS THE SESSION: it is the state in which everything else
+// looks right and the tree under test is not the one running. A SessionStart
+// hook cannot refuse a session, so it writes `staleMarker`, which the `caos`
+// wrapper (install.go) turns into exit 2 on every call -- blocking each prompt
+// and each caos tool call with this text. Also on STDOUT, the one stream a
+// session keeps from this hook.
+//
 // A probe that failed only goes to stderr -- the warm reports an unreachable
 // server on its own, and a dev check that cannot be made is not a mismatch.
 func reportDev(installed string, p devProbe) {
@@ -191,12 +204,16 @@ func reportDev(installed string, p devProbe) {
 		log("dev check: the server still serves %s", short(installed))
 		return
 	}
-	fmt.Printf("caos: STALE DEV INSTALL -- this session runs dev commit %s, but the server\n"+
+	msg := fmt.Sprintf("caos: STALE DEV INSTALL -- this session runs dev commit %s, but the server\n"+
 		"now serves %s at refs/caos/dev. The environment's setup is cached from an\n"+
 		"earlier session and re-runs only when its setup text changes, so it is still\n"+
-		"on the old commit. Put the --dev-commit=<sha> that the latest\n"+
-		"`caosd up --iroh` printed on the environment's setup line, then start a new\n"+
-		"session.\n", short(installed), short(p.sha))
+		"on the old commit. Every caos call in this session is refused. Put the\n"+
+		"--dev-commit=<sha> that the latest `caosd up --iroh` printed on the\n"+
+		"environment's setup line, then start a new session.\n", short(installed), short(p.sha))
+	if err := os.WriteFile(staleMarker, []byte(msg), 0o644); err != nil {
+		log("could not write %s, so this session is NOT blocked: %v", staleMarker, err)
+	}
+	fmt.Print(msg)
 }
 
 // `mcp serve` cannot resolve the tools before it must answer the client's first

@@ -229,8 +229,10 @@ install from whichever publish it last ran against. Stage 1 refuses to run
 unless the server's `refs/caos/dev` is the named commit, so a line that is
 behind the stack fails in setup, naming both commits, rather than running an
 older tree. A CACHED setup is not asked again, so the session hook repeats the
-comparison every session and prints `STALE DEV INSTALL` into the session when
-the stack has been republished since.
+comparison every session. When the stack has been republished since, it prints
+`STALE DEV INSTALL` into the session and leaves a marker that makes the `caos`
+wrapper exit 2 on every call, so each prompt and each caos tool call is blocked
+with that message until a new session starts from an updated setup line.
 
 Stage 1 fetches that commit and takes **everything** from it — the client,
 `git-remote-caos`, `settings.json`, `mcp.json`, the installer, the session hook,

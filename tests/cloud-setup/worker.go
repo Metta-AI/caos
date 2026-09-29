@@ -219,6 +219,23 @@ func main() {
 		w.True(stamp("/tmp/prefix/share/caos/build")["commit"] == pinRev,
 			"the build record does not name the commit that was installed")
 
+		// The session hook marks a dev install the server no longer serves, and
+		// the wrapper is what turns that into a failure: exit 2 is the code that
+		// makes Claude Code block a prompt or a tool call and show the reason.
+		const staleMsg = "caos: STALE DEV INSTALL -- test\n"
+		write("/tmp/prefix/share/caos/stale-dev", staleMsg, 0o644)
+		refused := exec.Command("/tmp/prefix/bin/caos", "mcp", "hook")
+		var refusedErr strings.Builder
+		refused.Stderr = &refusedErr
+		err := refused.Run()
+		w.True(refused.ProcessState != nil && refused.ProcessState.ExitCode() == 2,
+			"a stale-marked client did not exit 2, so Claude Code would not block on it: %v", err)
+		w.True(refusedErr.String() == staleMsg,
+			"a stale-marked client did not say why: %q", refusedErr.String())
+		w.Must(os.Remove("/tmp/prefix/share/caos/stale-dev"))
+		w.True(strings.Contains(output("/tmp/prefix/bin/caos"), "usage:"),
+			"the client does not run again once the stale marker is gone")
+
 		settings := readJSON("/tmp/home/.claude/settings.json")
 		prompt := hookCommand(settings, "UserPromptSubmit")
 		// THE HOOK CREATES THE CONVERSATION, so it is the hook that must carry
