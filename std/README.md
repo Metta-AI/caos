@@ -16,7 +16,6 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. |
 | `caos-test` | Build the caos test stack from the tree and run the whole suite — unit tests and every `tests/<name>`. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
-| `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `merge` | Three-way merge another commit into the current source tree. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
