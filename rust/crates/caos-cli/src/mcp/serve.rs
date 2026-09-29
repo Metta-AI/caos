@@ -495,7 +495,7 @@ fn diagnostics() -> String {
     // which cost a debugging session a single line here would have ended.
     //
     // FROM THE SETUP SCRIPT'S STAMP, because that is where dev mode happens:
-    // `setup.sh --dev-server=<ticket>` takes the whole install package from a
+    // `bootstrap.go --dev-commit=<sha>` takes the whole install package from a
     // caosd of one's own, and writes this file only once every step of it has
     // succeeded. The stamp carries no ticket -- a `caos://` URL is the
     // capability to drive that server, and this text is quoted verbatim into a
@@ -541,8 +541,8 @@ fn diagnostics() -> String {
                  stamp -- a snapshot older than the stamp, or a hand-placed binary"
                 .to_string(),
             (None, false) => "off -- this session runs the caos its client repo pins. Pass \
-                 --dev-server=<ticket> on the environment's setup line to run \
-                 your own."
+                 the --dev-commit=<sha> that `caosd up --iroh` prints on the \
+                 environment's setup line to run your own."
                 .to_string(),
         }
     ));

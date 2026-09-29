@@ -1,9 +1,15 @@
 // The SessionStart hook for a caos cloud session, run through
 // /usr/local/bin/caos-cloud-session-start.
 //
-// It does two things, because the setup phase runs on EVERY session
-// (design/cloud-setup.md) and has already installed the client, the git helper,
-// the configuration and the `caos` remote by the time Claude Code starts.
+// It does three things. The setup phase has already installed the client, the
+// git helper, the configuration and the `caos` remote by the time Claude Code
+// starts -- but it may have done so in an EARLIER session: an environment caches
+// its setup and re-runs it only when the setup text changes
+// (design/cloud-setup.md).
+//
+// THE DEV CHECK, which is the one thing that has to be per-session for that
+// reason. Setup refuses a `--dev-commit` the server is not serving, but a cached
+// setup is not asked again, so a stack republished since is caught only here.
 //
 // THE REGISTRY WARM, which fills the cache `mcp serve` reads. It could run in
 // setup -- nothing stops it reaching the server from there -- but it is the step
@@ -102,6 +108,13 @@ func main() {
 	}
 	locator := "--llm-step:@=" + stepPath + "/llm-step"
 
+	// Beside the warm rather than before it, so a session pays for one round
+	// trip to the server, not two.
+	served := make(chan devProbe, 1)
+	if dev["rev"] != "" {
+		go func() { served <- probeDev() }()
+	}
+
 	// CLAIMED BEFORE THE WARM STARTS, not by the warm itself. Claude Code spawns
 	// the tool server in PARALLEL with this hook and its first `tools/list` lands
 	// within a second; without a claim already on disk that server resolves the
@@ -134,10 +147,56 @@ func main() {
 		fmt.Printf("caos dev mode: ON -- the whole install package came from "+
 			"refs/caos/dev at %s, and this session's conversation seeds from %s "+
 			"(HEAD pointed at the dev server; the checkout is untouched).\n", short(rev), short(dev["seed"]))
+		reportDev(rev, <-served)
 	} else {
 		fmt.Printf("caos dev mode: off -- this session runs the caos its repo pins (%s).\n",
 			setup["client"])
 	}
+}
+
+type devProbe struct {
+	sha string
+	err error
+}
+
+// What the server hands out as refs/caos/dev NOW. Bounded, because an
+// unreachable server over iroh waits out a connect timeout and this hook holds
+// the session at "starting".
+func probeDev() devProbe {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", "caos", "refs/caos/dev")
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
+	if err != nil {
+		return devProbe{err: err}
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return devProbe{err: fmt.Errorf("the server has no refs/caos/dev")}
+	}
+	return devProbe{sha: fields[0]}
+}
+
+// A mismatch goes to STDOUT: it is the state in which everything else about
+// the session looks right and the tree under test is not the one running.
+// A probe that failed only goes to stderr -- the warm reports an unreachable
+// server on its own, and a dev check that cannot be made is not a mismatch.
+func reportDev(installed string, p devProbe) {
+	if p.err != nil {
+		log("could not read the server's refs/caos/dev to check the dev install: %v", p.err)
+		return
+	}
+	if p.sha == installed {
+		log("dev check: the server still serves %s", short(installed))
+		return
+	}
+	fmt.Printf("caos: STALE DEV INSTALL -- this session runs dev commit %s, but the server\n"+
+		"now serves %s at refs/caos/dev. The environment's setup is cached from an\n"+
+		"earlier session and re-runs only when its setup text changes, so it is still\n"+
+		"on the old commit. Put the --dev-commit=<sha> that the latest\n"+
+		"`caosd up --iroh` printed on the environment's setup line, then start a new\n"+
+		"session.\n", short(installed), short(p.sha))
 }
 
 // `mcp serve` cannot resolve the tools before it must answer the client's first

@@ -1,9 +1,9 @@
 // Stage 1 of a caos cloud session's install, run from the environment's setup
-// field on every session (design/cloud-setup.md):
+// field (design/cloud-setup.md):
 //
 //	B=https://raw.githubusercontent.com/Metta-AI/caos/main
 //	curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
-//	go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> [--dev-mode]
+//	go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> [--dev-commit=<sha>]
 //
 // `--base` says where THIS FILE came from and nothing else. Which caos gets
 // installed comes from the repository the environment opens -- a client repo,
@@ -13,15 +13,21 @@
 // so a client from a moving head would drive tools from another tree.
 //
 // STAGE 2 COMES FROM THE PAYLOAD, not from `--base`. This file downloads the
-// release (or, in dev mode, fetches refs/caos/dev) and then `go run`s the
+// release (or, in dev mode, fetches the named dev commit) and then `go run`s the
 // install.go it finds there, which is what lets an edit to the installer reach
 // the next session with no push: in dev mode the payload is your working tree.
 //
 // EVERYTHING ARRIVES AS AN ARGUMENT, including the server ticket: this phase
 // does not get the environment's variables.
 //
-// THE TICKET IS NAMED ONCE. `--dev-mode` is a mode, not a second server -- it
-// takes the install package from the server this session already runs against.
+// THE TICKET IS NAMED ONCE. `--dev-commit` names a commit, not a second server
+// -- it takes the install package from the server this session already runs
+// against.
+//
+// THE DEV COMMIT IS NAMED IN THE SETUP LINE rather than read from the server's
+// moving ref. A cloud environment caches its setup and generally does NOT re-run
+// it per session; what re-runs it is the setup text changing. A line that names
+// the commit therefore changes, and re-runs, exactly when the dev package moves.
 //
 // STDLIB ONLY, and `curl`/`git` rather than `net/http`: a module fetch would
 // have to reach proxy.golang.org, which this phase cannot, and net/http drags
@@ -78,9 +84,8 @@ func curlTo(url, dest string) error {
 type args struct {
 	base       string
 	server     string
-	devMode    bool
+	devCommit  string
 	devTree    string
-	devRev     string
 	enableBash bool
 	repoFiles  bool
 	prefix     string
@@ -96,18 +101,24 @@ func parseArgs(argv []string) args {
 			a.base = strings.TrimRight(value, "/")
 		case "--server":
 			a.server = value
-		// A MODE, not a second server: the install package comes from the
+		// A COMMIT, not a second server: the install package comes from the
 		// server `--server` already names, rather than from a GitHub release.
 		// A second ticket argument would be one more place to keep in step.
+		// `caosd up --iroh` prints the setup line carrying it.
+		case "--dev-commit":
+			a.devCommit = value
+		// Refused by name: a line still carrying it is an environment that has
+		// not been updated, and "unknown argument" would not say to what.
 		case "--dev-mode":
-			a.devMode = true
+			fatal("--dev-mode is gone: pass --dev-commit=<sha> instead.\n" +
+				"  `caosd up --iroh` prints the setup line carrying it. The commit is\n" +
+				"  named because a cloud environment re-runs its setup only when the\n" +
+				"  setup text changes, so a line reading a moving ref went stale.")
 		// Passed only by this file's re-exec of the dev tree's own copy, which
 		// has already paid for the fetch. An argument rather than an environment
 		// variable, so the second pass says what it is skipping.
 		case "--dev-tree":
 			a.devTree = value
-		case "--dev-rev":
-			a.devRev = value
 		case "--enable-bash":
 			a.enableBash = true
 		case "--repo-files":
@@ -335,7 +346,13 @@ func assetsFromRelease(slug, tag, dir string) assets {
 // `caosd up --iroh` publishes the working checkout to refs/caos/dev: one commit
 // carrying the tree and the x86_64 binaries built from it, which is exactly what
 // the release workflow copies into its assets.
-func fetchDevTree(server string) (string, string) {
+//
+// THE SERVER MUST BE HANDING OUT THE COMMIT THE LINE NAMES. A mismatch is fatal
+// rather than a fetch of the named commit regardless: it means the stack was
+// republished (or reset, or is another stack behind the same ticket) since the
+// line was written, so this environment is not the tree whoever wrote the line
+// is testing -- the silent staleness naming the commit exists to end.
+func fetchDevTree(server, want string) string {
 	sha, err := run("", "git", "ls-remote", server, "refs/caos/dev")
 	if err != nil || sha == "" {
 		// SAY WHICH FAILURE. An empty result has two very different causes and
@@ -347,7 +364,7 @@ func fetchDevTree(server string) (string, string) {
 		if helper == "" {
 			helper = "NOT ON PATH"
 		}
-		fatal("--dev-mode, but this phase could not use the server.\n"+
+		fatal("--dev-commit, but this phase could not use the server.\n"+
 			"  git-remote-caos: %s\n"+
 			"  Empty with no error means the stack is up but published no\n"+
 			"  refs/caos/dev: run `caosd up --iroh`. An error instead usually means\n"+
@@ -355,6 +372,13 @@ func fetchDevTree(server string) (string, string) {
 			"  the one CAOS_IROH_RELAY names.", helper)
 	}
 	sha = strings.Fields(sha)[0]
+	if sha != want {
+		fatal("the setup line names dev commit %s, but the server's\n"+
+			"  refs/caos/dev is %s: the stack was republished (or reset) after\n"+
+			"  the line was written, so this session would not run the tree you\n"+
+			"  are testing. Put the setup line the latest `caosd up --iroh`\n"+
+			"  printed into the environment.", want, sha)
+	}
 
 	gitDir := filepath.Join(shareDir, "dev.git")
 	tree := filepath.Join(shareDir, "dev-tree")
@@ -387,7 +411,7 @@ func fetchDevTree(server string) (string, string) {
 		fatal("could not read %s out of %s: %v", sha, gitDir, err)
 	}
 	say("dev package: %s from the dev server", sha)
-	return tree, sha
+	return tree
 }
 
 func assetsFromDev(tree, sha, dir string) assets {
@@ -587,6 +611,12 @@ func main() {
 	// through the `caos` git remote, and this phase is the only one that can add
 	// it before Claude Code starts. Nothing reads the environment for a fallback,
 	// so an unnamed server is a question, not a default.
+	// Checked before anything is fetched: an abbreviated sha would never equal
+	// the server's ref, and the refusal would then blame the server.
+	if a.devCommit != "" && !isSha(a.devCommit) {
+		fatal("--dev-commit=%q is not a full 40-hex commit sha; paste the one\n"+
+			"  `caosd up --iroh` printed", a.devCommit)
+	}
 	if a.server == "" {
 		fatal("--server=<url> is required: it names the caos server this session\n" +
 			"  runs against, and nothing else does. `caosd ticket` prints it, or\n" +
@@ -627,7 +657,7 @@ func main() {
 			"  pin, or clone a checkout whose flake.lock has not been rewritten.",
 			firstNonEmpty(p.url, p.typ))
 	}
-	if len(p.rev) != 40 || strings.Trim(p.rev, "0123456789abcdef") != "" {
+	if !isSha(p.rev) {
 		fatal("the caos input is pinned to %q, which is not a full commit sha", p.rev)
 	}
 	p.stdPath, err = readOutputPath(filepath.Join(repoDir, ".caos-expr"))
@@ -652,11 +682,13 @@ func main() {
 	// needs neither the tag nor the network -- which is also what lets a test
 	// drive this stage with no GitHub at all.
 	var pkg assets
-	devTree, devRev := a.devTree, a.devRev
+	devTree, devRev := a.devTree, a.devCommit
 	switch {
-	case a.devMode && devTree == "":
+	case devTree != "" && devRev == "":
+		fatal("--dev-tree is the second pass of --dev-commit and means nothing alone")
+	case devRev != "" && devTree == "":
 		installHelper(a.prefix, p.slug(), resolveBuild(p.slug(), p.rev))
-		devTree, devRev = fetchDevTree(a.server)
+		devTree = fetchDevTree(a.server, devRev)
 		// THIS FILE, from the dev tree, once. An edit to stage 1 is part of the
 		// package and would otherwise be the one file still needing a push. The
 		// fetched tree is handed over rather than re-fetched, which is also what
@@ -665,7 +697,7 @@ func main() {
 		if _, err := os.Stat(self); err == nil {
 			say("re-running the dev tree's own bootstrap.go")
 			argv := append([]string{"run", self}, os.Args[1:]...)
-			argv = append(argv, "--dev-tree="+devTree, "--dev-rev="+devRev)
+			argv = append(argv, "--dev-tree="+devTree)
 			cmd := exec.Command("go", argv...)
 			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			if err := cmd.Run(); err != nil {
@@ -777,6 +809,10 @@ func main() {
 			"repo":     repoDir,
 		})
 	}
+}
+
+func isSha(s string) bool {
+	return len(s) == 40 && strings.Trim(s, "0123456789abcdef") == ""
 }
 
 func firstNonEmpty(values ...string) string {

@@ -258,9 +258,8 @@ func main() {
 		bootstrap := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base,
 			"--server="+ticket,
-			"--dev-mode",
+			"--dev-commit="+devRev,
 			"--dev-tree="+devTree,
-			"--dev-rev="+devRev,
 			"--prefix=/tmp/prefix1",
 			"--share-dir=/tmp/share",
 			"--homes=/tmp/home1")
@@ -317,8 +316,7 @@ func main() {
 		// must fail HERE rather than produce a session whose every tool call dies
 		// on a missing remote.
 		noServer := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
-			"--base="+base, "--dev-mode",
-			"--dev-tree="+devTree, "--dev-rev="+devRev,
+			"--base="+base, "--dev-commit="+devRev, "--dev-tree="+devTree,
 			"--prefix=/tmp/prefix2", "--share-dir=/tmp/share2", "--homes=/tmp/home1")
 		noServer.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+repo)
 		noServer.Dir = "/tmp"
@@ -326,6 +324,25 @@ func main() {
 		w.True(err != nil, "stage 1 accepted a setup line that names no server:\n%s", refusal)
 		w.True(strings.Contains(string(refusal), "--server"),
 			"the refusal does not name --server, so nobody can act on it:\n%s", refusal)
+
+		w.Step("stage 1 refuses a dev line that does not name one full commit")
+		// A cloud environment re-runs setup only when its text changes, so the
+		// line has to NAME the commit. The old mode flag is refused by name, and
+		// an abbreviated sha is refused before it could be blamed on the server.
+		for _, bad := range []struct{ arg, says string }{
+			{"--dev-mode", "--dev-commit"},
+			{"--dev-commit=" + devRev[:12], "40-hex"},
+		} {
+			cmd := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
+				"--base="+base, "--server="+ticket, bad.arg, "--dev-tree="+devTree,
+				"--prefix=/tmp/prefix3", "--share-dir=/tmp/share3", "--homes=/tmp/home1")
+			cmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+repo)
+			cmd.Dir = "/tmp"
+			refusal, err := cmd.CombinedOutput()
+			w.True(err != nil, "stage 1 accepted %s:\n%s", bad.arg, refusal)
+			w.True(strings.Contains(string(refusal), bad.says),
+				"the refusal of %s does not say %q:\n%s", bad.arg, bad.says, refusal)
+		}
 
 		w.Step("stage 1 leaves a session ready to start")
 		w.True(git(repo, "remote", "get-url", "caos") == ticket,

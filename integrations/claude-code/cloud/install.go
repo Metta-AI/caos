@@ -5,7 +5,7 @@
 //	    --repo=<owner/name> --commit=<sha> --version=<build tag>
 //
 // IT COMES FROM THE PAYLOAD, which is the whole reason it is a second stage:
-// bootstrap.go downloads the release (or fetches refs/caos/dev) and runs the
+// bootstrap.go downloads the release (or fetches the dev commit) and runs the
 // install.go it finds THERE, so an edit here reaches the next session with no
 // push and no CI. Everything it needs has already been resolved and downloaded;
 // there is no release lookup here and no network access at all.

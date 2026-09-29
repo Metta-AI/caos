@@ -49,6 +49,15 @@ two consecutive sessions with nothing changed between them:
 Whatever a cached environment caches, it is not script execution. For
 `anthropic/ccr` the setup script runs every session.
 
+**Correction, 2026-09-28: it generally does NOT.** The two runs above were real,
+but later sessions on the same environment log `Setup script cached from
+previous run` and keep the previous run's install: every session on CaosLocal1
+reported a client from 2026-09-25 across two fresh `caosd up --iroh`
+publishes. Editing the setup text re-ran it on the next session. So setup
+re-runs when its text changes, and dev mode names its commit in that text
+(`--dev-commit=<sha>`, below) rather than reading a moving ref. The per-session
+costs below are what an uncached run pays.
+
 **"Work after the snapshot is paid by every session, so do it in setup."** The
 premise was right and the conclusion inverted: *everything* here is paid every
 session, setup included. ~15s per session buys a GitHub release download, a
@@ -65,7 +74,7 @@ Both redo work setup already did, in the same container, seconds earlier.
 # the environment's setup field, in full
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server="caos://<ticket>" \
-    --dev-mode --enable-bash
+    --dev-commit=<sha> --enable-bash
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, with
@@ -77,8 +86,9 @@ phase is the phase that answers 503 for every n0 relay.
 **Everything arrives as an argument, including the server ticket, and the ticket
 is named ONCE.** The setup phase cannot read the environment's variables, so a
 server named only there is a remote that appears after the tool server has
-started without one. `--dev-mode` is a mode rather than a second server: it takes
-the install package from the server `--server` already names.
+started without one. `--dev-commit` names a commit rather than a second server:
+it takes the install package from the server `--server` already names, and
+refuses to run unless that server's `refs/caos/dev` is the named commit.
 
 ### Two stages, because the installer is part of the payload
 
@@ -87,7 +97,7 @@ Stage 1 is the only thing that comes from GitHub, and it stays small and stable:
 1. parse args; find the checkout; read the `caos` pin from `flake.lock`
 2. download `git-remote-caos` from that pin's release — the ONLY reason a dev
    session touches a GitHub release, since git speaks `caos://` through it
-3. fetch the payload: `refs/caos/dev` over the dev server, or the pinned
+3. fetch the payload: the `--dev-commit` over the dev server, or the pinned
    release otherwise
 4. `go run <payload>/install.go` with the same arguments
 
@@ -260,8 +270,9 @@ have produced a session with a working client and no tools.
 ordinary shape here, and the alternative was a second Go image.
 
 Per step: `nix build` (the flake's `src` filter does not see what cargo sees),
-`run-tool caos-test`, then one session. No environment bump is needed to pick up
-a new `refs/caos/dev` — setup re-fetches it every session.
+`run-tool caos-test`, then one session. A new `refs/caos/dev` DOES need an
+environment edit: put the `--dev-commit=<sha>` that `caosd up --iroh` printed on
+the setup line. That edit is also what makes the environment re-run its setup.
 
 ## What the settings form now holds
 
@@ -271,7 +282,7 @@ curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstr
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
 ```
 
-`--dev-mode` is the third argument, and `--enable-bash` the
+`--dev-commit=<sha>` is the third argument, and `--enable-bash` the
 fourth. `CAOS_SERVER_URL` is not set at all. Deleting the four scripts means an
 environment still pointing at
 `setup.sh` gets a 404 — and `curl -f … | bash` exits ZERO on one, installing

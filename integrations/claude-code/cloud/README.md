@@ -32,7 +32,7 @@ not once before a snapshot, so there is no cheap phase to defer work to.
 
 **Two stages, because the installer is part of the payload.** Stage 1 is the only
 thing fetched from `--base`; it then runs the `install.go` it finds in the
-release (or, in dev mode, in `refs/caos/dev`), so an edit to the installer
+release (or, in dev mode, in the `--dev-commit`), so an edit to the installer
 reaches the next session with no push. Stage 1 re-execs the dev tree's own copy
 of itself for the same reason.
 
@@ -217,11 +217,21 @@ machine, with no push and no CI:
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
-  --dev-mode
+  --dev-commit=<sha>
 ```
 
 `caosd up --iroh` publishes the working checkout to `refs/caos/dev` on that
-server: one commit carrying the tree and the x86_64 binaries built from it.
+server: one commit carrying the tree and the x86_64 binaries built from it. It
+prints `--dev-commit=<sha>` for that commit; **put it on the setup line after
+every publish.** A cloud environment caches its setup and re-runs it only when
+the setup text changes, so a line that did not name the commit kept serving the
+install from whichever publish it last ran against. Stage 1 refuses to run
+unless the server's `refs/caos/dev` is the named commit, so a line that is
+behind the stack fails in setup, naming both commits, rather than running an
+older tree. A CACHED setup is not asked again, so the session hook repeats the
+comparison every session and prints `STALE DEV INSTALL` into the session when
+the stack has been republished since.
+
 Stage 1 fetches that commit and takes **everything** from it — the client,
 `git-remote-caos`, `settings.json`, `mcp.json`, the installer, the session hook,
 and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already

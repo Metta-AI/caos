@@ -1563,6 +1563,10 @@ sandbox = false''
                   if git push --quiet --force http://localhost:9090 \
                        "$dev_commit:refs/caos/dev"; then
                     echo "==> published this tree to refs/caos/dev ($dev_commit)" >&2
+                    # A cloud environment re-runs its setup only when the
+                    # setup text changes, so the line names the commit.
+                    echo "==> cloud setup line argument (replaces any older one):" >&2
+                    echo "      --dev-commit=$dev_commit" >&2
                   else
                     echo "==> could not publish to refs/caos/dev; the stack is up regardless" >&2
                   fi
