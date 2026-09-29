@@ -19,7 +19,8 @@ tools with their results, and each turn's final assistant message. The model's o
 text and reasoning between tool calls are not recorded, nor are calls to tools that
 are not caos's, nor calls that never reached one (a misnamed tool, a denied call).
 Commit timestamps are fixed, so there are no timings. A gap in the story usually
-means an unrecorded step, not a missing one.
+means an unrecorded step, not a missing one. The known gaps are listed in this tool's
+recording-gaps.md.
 @param hash The full 40-character hash of the conversation's tip commit.
 @param [call] Print only this tool call (its `toolu_...` id, as this tool prints it), untruncated.
 @param [width] Cut each tool call's arguments and result to this many characters (default 300; 0 for no cut).
