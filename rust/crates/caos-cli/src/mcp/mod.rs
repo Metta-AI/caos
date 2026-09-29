@@ -159,7 +159,7 @@ fn run_tool(
     let fresh = GitTransport::from_cwd()
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
     let t = &fresh;
-    let id = conversation_id_for(session)?;
+    let id = resume::conversation_for_session(t, session)?;
     // The prompt hook that opens this conversation runs in another process and
     // takes seconds; the first tool call can beat it. Wait for the record
     // rather than refuse the call. A no-op on every turn but the racing first.
