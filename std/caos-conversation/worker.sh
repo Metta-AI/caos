@@ -49,6 +49,7 @@ case "$width" in ''|*[!0-9]*) width=300 ;; esac
 
 # ---- walk the first-parent chain, tip to root ------------------------------
 mkdir -p /tmp/ev /tmp/pay
+: > /tmp/notes
 n=0
 cur=$hash
 while :; do
