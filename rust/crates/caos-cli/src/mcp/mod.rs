@@ -610,10 +610,14 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    record_prompt(t, options, &id, prompt)
+    if record_prompt(t, options, &id, prompt)? {
+        announce(&format!("caos conversation ref {}", conversation_ref(&id)?))?;
+    }
+    Ok(())
 }
 
-/// Record a user's prompt, creating the conversation on the session's first one.
+/// Record a user's prompt, creating the conversation on the session's first one;
+/// true when this prompt is the one that created it.
 ///
 /// THREE TRANSITIONS, minted in one compare-and-swap: the message, the request
 /// it opens, and the claim that puts the request in `running`. v3 requires the
@@ -631,7 +635,7 @@ fn record_prompt(
     options: &TurnOptions,
     id: &str,
     prompt: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let username = resolve_username(t, None)?;
     let signature = signature(&username)?;
     let refname = conversation_ref(id)?;
@@ -716,7 +720,7 @@ fn record_prompt(
             )?;
             if push_cas(&store, &refname, observed.as_ref(), &joined)? {
                 let _ = update_local_cache(t, &refname, joined.as_str());
-                return Ok(());
+                return Ok(false);
             }
             continue;
         }
@@ -781,7 +785,7 @@ fn record_prompt(
         cc_timing("push_cas", phase.elapsed());
         if pushed {
             let _ = update_local_cache(t, &refname, claimed.as_str());
-            return Ok(());
+            return Ok(observed.is_none());
         }
     }
     Err(format!(
@@ -925,11 +929,14 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
 /// a hook that fires for a turn this session never opened, say. The retries are
 /// not a concurrency model: the tool server handles one call at a time. They
 /// protect against ANOTHER writer, such as an interjection typed into the tui.
+///
+/// Returns the head it leaves: the one it pushed, or the one it read when there
+/// was nothing to record.
 fn append(
     t: &GitTransport,
     id: &str,
     mut step: impl FnMut(&mut GitStore, &Oid) -> Result<Option<Oid>, String>,
-) -> Result<(), String> {
+) -> Result<Oid, String> {
     let refname = conversation_ref(id)?;
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
@@ -940,11 +947,11 @@ fn append(
             ));
         };
         let Some(candidate) = step(&mut store, &head)? else {
-            return Ok(());
+            return Ok(head);
         };
         if push_cas(&store, &refname, Some(&head), &candidate)? {
             let _ = update_local_cache(t, &refname, candidate.as_str());
-            return Ok(());
+            return Ok(candidate);
         }
     }
     Err(format!(
@@ -972,7 +979,7 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
         .to_string();
     let username = resolve_username(t, None)?;
     let conversation = id.clone();
-    append(t, &id, move |store, head| {
+    let head = append(t, &id, move |store, head| {
         let _ = &conversation;
         let view = Conversation::open(store, head)?;
         let Some(request) = view.active_turn()? else {
@@ -1049,7 +1056,24 @@ fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
             &signature,
         )?;
         Ok(Some(terminal))
-    })
+    })?;
+    announce(&format!("caos head {}", head.as_str()))
+}
+
+/// Show the person running the session where it is recorded: the conversation's
+/// ref once, when the first prompt creates it, and its head after every turn.
+///
+/// A `systemMessage` goes to the USER, not the model. Without it the head is
+/// reachable only by asking the model to call `caos_status`, and the id itself
+/// (`cc/<Claude Code's internal session id>`) appears in no URL.
+fn announce(text: &str) -> Result<(), String> {
+    let message = json!({ "systemMessage": text });
+    println!(
+        "{}",
+        serde_json::to_string(&message)
+            .map_err(|error| format!("encoding hook response: {error}"))?
+    );
+    Ok(())
 }
 
 /// A turn that ended badly closes its request as failed.
@@ -1124,6 +1148,7 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
         )?;
         Ok(Some(terminal))
     })
+    .map(|_| ())
 }
 
 #[cfg(test)]

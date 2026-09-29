@@ -455,7 +455,38 @@ fn tools_list_reply(id: Value, registry: &Registry) -> Value {
     }
 }
 
-fn status_result(registry: &Registry) -> Value {
+/// The conversation this session records into, and its head commit -- the hash
+/// the `log` and `show` tools take. From inside a cloud session this is the only
+/// way to learn it: the id is `cc/<Claude Code's internal session id>`, which
+/// appears in no URL, so without this line finding it means reading the session's
+/// events from outside with `drive --verb=conv`.
+///
+/// A FRESH transport, for the reason `run_tool` gives: the one `serve` opened at
+/// spawn can predate the hook that adds the `caos` remote.
+fn conversation_status(session: Option<&str>) -> String {
+    let Some(session) = session else {
+        return format!(
+            "conversation: unknown -- this call carried no {SESSION_ARG}, so the \
+             PreToolUse hook that supplies it is not installed\n"
+        );
+    };
+    let id = match super::conversation_id_for(session) {
+        Ok(id) => id,
+        Err(error) => return format!("conversation: session {session:?} is unusable: {error}\n"),
+    };
+    let head = GitTransport::from_cwd().and_then(|t| {
+        let store = crate::open_store(&t)?;
+        crate::fetch_validated_head(&t, &store, &id)
+    });
+    let head = match head {
+        Ok(Some((_, head))) => head.as_str().to_string(),
+        Ok(None) => "none yet -- no turn has been recorded".to_string(),
+        Err(error) => format!("<unreadable: {error}>"),
+    };
+    format!("conversation: {id}\nconversation head: {head}\n")
+}
+
+fn status_result(registry: &Registry, conversation: &str) -> Value {
     let text = match registry.lock() {
         Err(_) => "the caos tool registry lock is poisoned; this server is broken".to_string(),
         Ok(found) => match (&found.status, found.tools.is_empty()) {
@@ -466,7 +497,7 @@ fn status_result(registry: &Registry) -> Value {
                 .to_string(),
         },
     };
-    let text = format!("{text}\n{}", diagnostics());
+    let text = format!("{text}\n{conversation}{}", diagnostics());
     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }
 
@@ -876,7 +907,11 @@ fn call(
         // that opens with a diagnostic) still reports what happened rather than
         // "not resolved yet" -- the unreachable-server case names the server here.
         ensure_resolved(Some(t), options, registry);
-        return Ok(status_result(registry));
+        let session = params
+            .get("arguments")
+            .and_then(|args| args.get(SESSION_ARG))
+            .and_then(Value::as_str);
+        return Ok(status_result(registry, &conversation_status(session)));
     }
     let args = params
         .get("arguments")
