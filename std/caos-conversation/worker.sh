@@ -225,6 +225,11 @@ say "NOT RECORDED: the model's text and reasoning between tool calls, calls to t
 say "that are not caos's (and calls that never reached one), and timings. Gaps in the"
 say "story below may be unrecorded steps."
 say ""
+if [ -s /tmp/notes ]; then
+  say "Commits skipped while reading the history:"
+  while IFS= read -r line; do say "  $line"; done < /tmp/notes
+  say ""
+fi
 say "----"
 render_entries "$width"
 
