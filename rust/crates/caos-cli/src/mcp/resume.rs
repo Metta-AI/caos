@@ -437,9 +437,7 @@ mod tests {
 
     #[test]
     fn the_slash_forms_are_recognised_on_the_first_line() {
-        let want = |resume: bool| {
-            Some(command(resume, Some(HASH)).unwrap())
-        };
+        let want = |resume: bool| Some(command(resume, Some(HASH)).unwrap());
         assert_eq!(
             parse_command(&format!("/{RESUME_COMMAND} {HASH}")).unwrap(),
             want(true)
