@@ -1,0 +1,3 @@
+# This tool's worker image: the program runs on std/go, named by a local
+# deep-deps mount (design/caos-expr.md).
+../../std/go go
