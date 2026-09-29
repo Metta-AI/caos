@@ -251,7 +251,10 @@ enum Action {
     /// A call that started and never finished, or was declared and never started.
     Cancel(Box<CallRecord>),
     /// Every call is closed; end the request.
-    Terminal { request: Oid, result: Option<String> },
+    Terminal {
+        request: Oid,
+        result: Option<String>,
+    },
     /// A background computation nobody is waiting on any more.
     Async(Oid),
     Done,
