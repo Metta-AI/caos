@@ -996,7 +996,7 @@ fn payload_bytes(value: &Value) -> Result<Vec<u8>, String> {
 
 /// The assistant's closing message, and the end of the request it answered.
 fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
+    let id = recorded_conversation(t, payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
