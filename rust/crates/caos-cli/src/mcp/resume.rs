@@ -52,7 +52,7 @@ use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
 
 use crate::{
-    conversation_ref, fetch_validated_head, mint_transition, open_store, oid, push_cas,
+    conversation_ref, fetch_validated_head, mint_transition, oid, open_store, push_cas,
     resolve_username, update_local_cache, validate_cached,
 };
 
