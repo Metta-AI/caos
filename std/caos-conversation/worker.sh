@@ -73,9 +73,12 @@ while :; do
     break
   fi
   if [ "$n" -eq 0 ]; then cp /cas/c0 /tmp/tip.raw; fi
-  parent=$(sed '/^$/q' "/cas/c$n" | grep -m1 '^parent ' | cut -d' ' -f2 || true)
-  # The message is `<kind>\n\n<json>`; drop the headers, then the kind line.
-  sed '1,/^$/d' "/cas/c$n" | sed '1,/^$/d' > "/tmp/ev/$(printf '%06d' "$n").json"
+  # The image has no sed or awk. A header line starting `parent ` precedes the
+  # message, and no message line does (a message is `<kind>`, a blank line, then
+  # one line of JSON), so the first match is the first parent.
+  parent=$(grep -m1 '^parent ' "/cas/c$n" | cut -d' ' -f2 || true)
+  # The event JSON is the message's last line.
+  tail -n 1 "/cas/c$n" > "/tmp/ev/$(printf '%06d' "$n").json"
   n=$((n + 1))
   if [ -z "$parent" ]; then break; fi
   cur=$parent
