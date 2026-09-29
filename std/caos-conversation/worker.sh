@@ -82,8 +82,11 @@ while :; do
   evfile="/tmp/ev/$(printf '%06d' "$n").json"
   tail -n 1 "/cas/c$n" > "$evfile"
   if ! jq -e . "$evfile" > /dev/null 2>&1; then
-    printf 'commit %s: no readable event record; message ends: %s\n' "$cur" \
-      "$(tail -n 3 "/cas/c$n" | head -c 300 | tr '\n' '|')" >> /tmp/notes
+    # The root commit's message is a bare genesis marker, with no events.
+    if [ -n "$parent" ]; then
+      printf 'commit %s: no readable event record; message ends: %s\n' "$cur" \
+        "$(tail -n 3 "/cas/c$n" | head -c 300 | tr '\n' '|')" >> /tmp/notes
+    fi
     : > "$evfile"
   fi
   n=$((n + 1))
