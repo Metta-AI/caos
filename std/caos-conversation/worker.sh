@@ -205,7 +205,7 @@ if [ -n "$want_call" ]; then
     say "no call $want_call in this conversation."
     say ""
     say "Calls it recorded (ids as the default listing prints them):"
-    jq -r 'keys[]' /tmp/calls.json | sed 's/^/  /' >> "$out"
+    jq -r 'keys[] | "  " + .' /tmp/calls.json >> "$out"
   fi
   finish
 fi
