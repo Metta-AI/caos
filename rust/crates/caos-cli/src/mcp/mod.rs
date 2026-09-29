@@ -606,13 +606,27 @@ fn debug_log_hook(
 /// the first prompt of a session establishes its base and fallback title
 /// exactly as the TUI's first message does.
 fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
         return Ok(());
     }
+    // `/fork-caos-conversation <hash>` and `/resume-from-caos-conversation <hash>`
+    // decide WHICH conversation this session records into, so they run before it
+    // is looked up. Both are no-ops once the session has its conversation.
+    let note = match resume::parse_command(prompt)? {
+        Some(command) => {
+            // Both talk to the server before anything below would have proven it
+            // reachable.
+            wait_server_reachable(t)?;
+            resume::begin(t, string_field(payload, "session_id")?, &command)?
+        }
+        None => None,
+    };
+    let id = recorded_conversation(t, payload)?;
     if record_prompt(t, options, &id, prompt)? {
         announce(&format!("caos conversation ref {}", conversation_ref(&id)?))?;
+    } else if let Some(note) = note {
+        announce(&note)?;
     }
     Ok(())
 }
