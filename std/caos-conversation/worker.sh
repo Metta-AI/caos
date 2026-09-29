@@ -123,7 +123,7 @@ trunc() { # <width> <call id>; text on stdin
        then .[0:$w] + "… [" + ((length - $w) | tostring) + " more chars; pass call=" + $id + " to see all]"
        else . end'
 }
-indent() { sed 's/^/      /'; }
+indent() { jq -Rr '"      " + .'; }
 
 payload_text() { # <payload path> -> the text a tool_result carries
   local f="/tmp/pay/${1//\//__}"
