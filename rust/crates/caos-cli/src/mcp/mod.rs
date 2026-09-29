@@ -1103,7 +1103,7 @@ fn announce(text: &str) -> Result<(), String> {
 
 /// A turn that ended badly closes its request as failed.
 fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
+    let id = recorded_conversation(t, payload)?;
     let kind = payload
         .get("error_type")
         .and_then(Value::as_str)
