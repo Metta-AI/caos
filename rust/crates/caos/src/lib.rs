@@ -30,7 +30,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::objs::WriteTo;
@@ -104,13 +104,10 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     let (_, ws) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
-    let store = build_secret_store(t)?;
-    let (kind, arg_tree) = eval::eval_path(t, &ws.to_string(), &dir, &store)?;
-    if kind != "tree" {
-        return Err(format!(
-            "{dir}/.caos-expr evaluates to a {kind}, not an ArgTree"
-        ));
-    }
+    let base = Base::Path {
+        root: ws.to_string(),
+        path: dir.clone(),
+    };
 
     // Do not add a `--bins` carrying the deploy's nix-built binaries. A tool
     // gets the tree under test and builds from source; handing it prebuilt host
@@ -118,7 +115,7 @@ pub fn cli_run_tool(t: &dyn Transport, args: &[String]) -> Result<(), String> {
     // pass against something other than the tree it was given.
     let mut all: Vec<String> = vec!["--in:@=.".to_string()];
     all.extend(kvs.iter().cloned());
-    let (kind, result) = run_request(t, &arg_tree, None, &all, &store)?;
+    let (kind, result) = run_request(t, &base, None, &all, &Secrets::current())?;
     // The result's identity, on stdout, so a script can thread it onward — the
     // same "<kind> <hash>" line `caos-cli run` prints.
     println!("{kind} {result}");
@@ -248,9 +245,66 @@ pub fn cli_status(t: &dyn Transport, arg_tree: &str, all: bool) -> Result<(), St
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
-/// Header carrying the ephemeral secrets store on `GET /run` (design/secrets.md),
-/// out of band from the content-addressed ArgTree. Must match the server's.
-const SECRETS_HEADER: &str = "X-Caos-Secrets";
+/// What a request presents for secrets (SPEC, "Secrets"): SecretReaderKeys,
+/// and the conversation it is for. Sent as headers, never in an ArgTree — a
+/// key is a credential.
+#[derive(Clone, Debug, Default)]
+pub struct Secrets {
+    readers: Vec<String>,
+    conversation: Option<String>,
+}
+
+static SECRET_READERS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// The SecretReaderKeys this process presents. A host binary sets them once,
+/// early; `CAOS_SECRET_READERS` (space-separated) is read when it did not.
+pub fn set_secret_readers(keys: Vec<String>) {
+    let _ = SECRET_READERS.set(keys);
+}
+
+impl Secrets {
+    /// This process's SecretReaderKeys, for no particular conversation.
+    pub fn current() -> Secrets {
+        let readers = match SECRET_READERS.get() {
+            Some(keys) => keys.clone(),
+            None => std::env::var("CAOS_SECRET_READERS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        };
+        Secrets {
+            readers,
+            conversation: None,
+        }
+    }
+
+    /// The same keys, for conversation `id`.
+    pub fn for_conversation(&self, id: &str) -> Secrets {
+        Secrets {
+            readers: self.readers.clone(),
+            conversation: Some(id.to_string()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.readers.is_empty()
+    }
+
+    fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = Vec::new();
+        if !self.readers.is_empty() {
+            headers.push((caos_world::secrets::READERS_HEADER, self.readers.join(" ")));
+        }
+        if let Some(conversation) = &self.conversation {
+            headers.push((
+                caos_world::secrets::CONVERSATION_HEADER,
+                conversation.clone(),
+            ));
+        }
+        headers
+    }
+}
 
 /// An opaque cache-busting value mixed into every run's ArgTree — and so into its
 /// arg-tree hash and cache key. Empty by default, so runs are cached purely by
@@ -2948,9 +3002,8 @@ fn build_arg_entries(
             // `--name:@@=ref` — a tree in another repo, fetched here (client
             // only) and reduced to its oid, so what the request carries is
             // indistinguishable from a local path arg.
-            ArgType::Remote => {
-                eval_remote_arg(t, value, &[]).map_err(|e| format!("`{name}`: {e}"))?
-            }
+            ArgType::Remote => eval_remote_arg(t, value, &Secrets::default())
+                .map_err(|e| format!("`{name}`: {e}"))?,
         };
 
         entries.push(Entry {
@@ -3072,19 +3125,48 @@ fn eval_base(
     ty: ArgType,
     value: &str,
 ) -> Result<String, String> {
-    eval_base_with_store(t, cas, ty, value, &[])
+    eval_base_with(t, cas, ty, value, &Secrets::current())
 }
 
-/// [`eval_base`] carrying the caller's secret store through evaluation, so a
-/// tool the resolved expression embeds keeps its secret-dependent identity —
-/// see [`eval_cli_image_arg`]. Only the two evaluating types read the store;
+/// A request's base as a client names it: an image already resolved (an oid,
+/// or a `docker://` ref), or one the server evaluates while forming the
+/// request (SPEC, "Submitting work").
+#[derive(Clone, Debug)]
+pub enum Base {
+    Ref(String),
+    /// A path in `root`, evaluated.
+    Path {
+        root: String,
+        path: String,
+    },
+    Locator(String),
+}
+
+/// A CLI `--base:<type>=<value>`, left for the server to evaluate.
+fn client_base(t: &dyn Transport, ty: ArgType, value: &str) -> Result<Base, String> {
+    match ty {
+        ArgType::Path => {
+            let (_, root) = t
+                .ingest_path(".")?
+                .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
+            Ok(Base::Path {
+                root: root.to_string(),
+                path: value.to_string(),
+            })
+        }
+        ArgType::Remote => Ok(Base::Locator(value.to_string())),
+        _ => eval_base_with(t, None, ty, value, &Secrets::default()).map(Base::Ref),
+    }
+}
+
+/// [`eval_base`] presenting `secrets` to whatever evaluation it asks for.
 /// `:hash=` and `:docker=` name an object outright and evaluate nothing.
-fn eval_base_with_store(
+fn eval_base_with(
     t: &dyn Transport,
     cas: Option<&Path>,
     ty: ArgType,
     value: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
     match ty {
         // `:docker=<ref>` — a registry image, carried as the `docker://` ref the
@@ -3103,7 +3185,7 @@ fn eval_base_with_store(
         // `:@=<path>` — a `/cas` node in a worker, a host directory on the CLI.
         ArgType::Path => match cas {
             Some(cas) => resolve_cas_image(t, cas, value),
-            None => eval_cli_image_with_store(t, value, store),
+            None => eval_cli_image_with(t, value, secrets),
         },
         // `:@@=<ref>` — the worker lives in ANOTHER repo: fetch it, then treat
         // the result exactly as a `:@=` directory, evaluating it if it carries a
@@ -3111,7 +3193,7 @@ fn eval_base_with_store(
         // names caos' `std/<x>` by locator and gets a runnable image, with only
         // the oid entering its cache key (design/flake-inputs.md).
         ArgType::Remote => {
-            let (mode, oid) = eval_remote_arg(t, value, store)?;
+            let (mode, oid) = eval_remote_arg(t, value, secrets)?;
             if !mode.is_tree() {
                 return Err(format!("git ref {value:?} names a file, not an image tree"));
             }
@@ -3162,7 +3244,7 @@ pub use git_locator::{parse_git_ref, GitRef};
 fn eval_remote_arg(
     t: &dyn Transport,
     value: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
     // Parsed here as well as on the server so a malformed locator — no rev, a
     // mutable `ref=`, a short sha — is refused without a round trip, and the
@@ -3179,26 +3261,27 @@ fn eval_remote_arg(
     // A `git+`/`github:` locator carries a mandatory full commit sha, so the
     // whole resolution — fetch, peel, descend — is immutable and the locator
     // string is a content key like any other. The server memoizes it too (a ref
-    // per pin, plus `/eval`'s result cache); this one saves the request.
-    let key = format!("{}\u{0}{value}", store_key(store));
-    if let Some(hit) = REMOTE_ARG_MEMO.get(&key) {
+    // per pin, plus `/eval`'s result cache); this one saves the request. Not
+    // with secrets: a grant is decided, and recorded, by evaluating.
+    let memo = secrets.is_empty();
+    if let Some(hit) = memo.then(|| REMOTE_ARG_MEMO.get(value)).flatten() {
         return Ok(hit);
     }
 
     let (kind, hash) = request_compute_url(
         &t.server_url()?,
         &format!("/eval?root:@@={}", percent_encode(value)),
-        &secret_store_header(store),
+        secrets,
     )
     .map_err(|e| format!("git ref {value:?}: {e}"))?;
     let resolved = (eval::mode_of_kind(&kind), parse_oid(&hash)?);
-    REMOTE_ARG_MEMO.put(key, resolved);
+    if memo {
+        REMOTE_ARG_MEMO.put(value.to_string(), resolved);
+    }
     Ok(resolved)
 }
 
-/// [`eval_remote_arg`]'s memo: `<store>\0<locator>` → `(mode, oid)`. Scoped
-/// by the secret store because the descent may `curry`, and a curry is marked
-/// with the caller's identity (design/secrets.md).
+/// [`eval_remote_arg`]'s memo: locator → `(mode, oid)`.
 static REMOTE_ARG_MEMO: eval::Memo<(gix::objs::tree::EntryMode, gix::ObjectId)> = eval::Memo::new();
 
 /// Percent-encode a URL component: everything but the unreserved set, so a
@@ -3216,15 +3299,15 @@ fn percent_encode(s: &str) -> String {
     }
     out
 }
+
 fn run_request(
     t: &dyn Transport,
-    image: &str,
+    base: &Base,
     cas: Option<&Path>,
     kvs: &[String],
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    let arg_tree = prepare_request(t, image, cas, kvs, store)?;
-    let header = secret_store_header(store);
+    let arg_tree = prepare_request(t, base, cas, kvs, secrets)?;
     // Trigger compute; the server runs the container and returns the result's
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
@@ -3234,7 +3317,7 @@ fn run_request(
     // than two, and a caller that is not a person (the suite, a worker) gets
     // nothing started on its behalf — see `watch::Watch::start`.
     let _watch = watch::Watch::start(&server, &arg_tree);
-    request_compute(&server, &arg_tree, &header)
+    request_compute(&server, &arg_tree, secrets)
 }
 
 /// Everything in [`run_request`] up to (and including) getting the ArgTree onto
@@ -3243,53 +3326,157 @@ fn run_request(
 /// [`request_compute`] on its own thread (it needs only the arg-tree hash and the
 /// server URL, both plain strings) while it watches the turn's progress ref from
 /// the main one.
+///
+/// A worker (`cas`) forms the ArgTree itself: its base is always resolved, and
+/// its secrets come from the job it runs in. A client pushes what the request
+/// needs and the server forms it (SPEC, "Submitting work").
 fn prepare_request(
     t: &dyn Transport,
-    image: &str,
+    base: &Base,
     cas: Option<&Path>,
     kvs: &[String],
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
-    // Build the call's args (paths resolve per `cas`), then hand them to the
-    // shared assembler, which folds in the image, salt, std and secret-hash.
-    let call = build_arg_entries(t, cas, kvs)?;
-    assemble_arg_tree(t, image, call, store)
+    if cas.is_some() {
+        let Base::Ref(image) = base else {
+            return Err("a worker names its base resolved".to_string());
+        };
+        let call = build_arg_entries(t, cas, kvs)?;
+        return assemble_arg_tree(t, image, call);
+    }
+    submit_request(t, base, kvs, secrets).map(|(arg_tree, _)| arg_tree)
 }
 
-/// Build and push a host-side request with scalar/commit arguments and no
-/// secret store. Higher-level clients can durably record the returned request
-/// id before dispatching it.
+/// `POST /submit`: one push of a bundle holding the call's args (and the tree
+/// a path base is evaluated in), then one call.
+fn submit_request(
+    t: &dyn Transport,
+    base: &Base,
+    kvs: &[String],
+    secrets: &Secrets,
+) -> Result<(String, Vec<String>), String> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let mut locators = serde_json::Map::new();
+    let mut objects = Vec::new();
+    for kv in kvs {
+        match parse_arg(kv)? {
+            (name, ArgType::Remote, value) => {
+                locators.insert(name.to_string(), value.into());
+            }
+            _ => objects.push(kv.clone()),
+        }
+    }
+    let args = post_tree(t, build_arg_entries(t, None, &objects)?)?;
+    let mut bundle = vec![Entry {
+        mode: EntryKind::Tree.into(),
+        filename: "args".into(),
+        oid: args,
+    }];
+    let base_json = match base {
+        Base::Ref(image) => match image.strip_prefix(DOCKER_SCHEME) {
+            Some(docker) => serde_json::json!({"type": "docker", "value": docker}),
+            None => serde_json::json!({"type": "hash", "value": image}),
+        },
+        Base::Path { root, path } => {
+            bundle.push(Entry {
+                mode: EntryKind::Tree.into(),
+                filename: "root".into(),
+                oid: parse_oid(root)?,
+            });
+            serde_json::json!({"type": "path", "value": path})
+        }
+        Base::Locator(locator) => serde_json::json!({"type": "locator", "value": locator}),
+    };
+    let bundle = post_tree(t, bundle)?.to_string();
+    t.ensure_pushed(&bundle)?;
+    let body = serde_json::json!({
+        "bundle": bundle,
+        "base": base_json,
+        "locators": locators,
+        "salt": run_salt(),
+    })
+    .to_string();
+    let mut headers = secrets.headers();
+    headers.push(("content-type", "application/json".to_string()));
+    let answer = server_call(
+        &t.server_url()?,
+        &ServerRequest {
+            method: "POST",
+            path: "/submit",
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: None,
+        },
+    )?;
+    let text =
+        String::from_utf8(answer).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+    let mut lines = text.lines();
+    let arg_tree = match lines.next().and_then(|line| line.split_once(' ')) {
+        Some(("tree", arg_tree)) if is_hex_hash(arg_tree) => arg_tree.to_string(),
+        _ => {
+            return Err(format!(
+                "server returned a malformed request: {:?}",
+                text.trim()
+            ))
+        }
+    };
+    let granted = lines
+        .find_map(|line| line.strip_prefix("granted"))
+        .map(|names| names.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+    Ok((arg_tree, granted))
+}
+
+/// Build and push a host-side request presenting no secrets. Higher-level
+/// clients can durably record the returned request id before dispatching it.
 pub fn prepare_client_request(
     t: &dyn Transport,
     image: &str,
     kvs: &[String],
 ) -> Result<String, String> {
-    prepare_request(t, image, None, kvs, &[])
+    prepare_request(
+        t,
+        &Base::Ref(image.to_string()),
+        None,
+        kvs,
+        &Secrets::default(),
+    )
 }
 
-/// Build and push a host-side request while folding the supplied local secret
-/// store's identities into the ArgTree. Secret values remain out of band.
-pub fn prepare_client_request_with_store(
+/// Build and push a host-side request presenting `secrets`.
+pub fn prepare_client_request_with_secrets(
     t: &dyn Transport,
     image: &str,
     kvs: &[String],
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
-    prepare_request(t, image, None, kvs, store)
+    prepare_request(t, &Base::Ref(image.to_string()), None, kvs, secrets)
 }
 
-/// Prepare and synchronously run one host-side request with an already-resolved
-/// local secret store. This is the non-streaming client equivalent of
-/// [`cli_run`], for callers that need the result identity rather than CLI output
-/// handling. Durable conversation turns deliberately use the split prepare and
-/// compute APIs instead so they can record the request before dispatching it.
-pub fn run_client_request_with_store(
+/// [`prepare_client_request_with_secrets`], also returning the names of the
+/// secrets a run of it would be given.
+pub fn prepare_client_request_granted(
     t: &dyn Transport,
     image: &str,
     kvs: &[String],
-    store: &[ClientSecret],
+    secrets: &Secrets,
+) -> Result<(String, Vec<String>), String> {
+    submit_request(t, &Base::Ref(image.to_string()), kvs, secrets)
+}
+
+/// Prepare and synchronously run one host-side request presenting `secrets`.
+/// This is the non-streaming client equivalent of [`cli_run`], for callers
+/// that need the result identity rather than CLI output handling. Durable
+/// conversation turns deliberately use the split prepare and compute APIs
+/// instead so they can record the request before dispatching it.
+pub fn run_client_request_with_secrets(
+    t: &dyn Transport,
+    image: &str,
+    kvs: &[String],
+    secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    run_request(t, image, None, kvs, store)
+    run_request(t, &Base::Ref(image.to_string()), None, kvs, secrets)
 }
 
 /// `prepare-request --base:<type>=<image-or-arg-tree> [--name=value | --name:@=path ...]`
@@ -3303,7 +3490,8 @@ pub fn caos_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), Str
     let cas = cas_dir();
     let (bty, bval, kvs) = split_base_arg("prepare-request", kvs)?;
     let image = eval_base(t, Some(&cas), bty, bval)?;
-    println!("{}", prepare_request(t, &image, Some(&cas), &kvs, &[])?);
+    let request = prepare_request(t, &Base::Ref(image), Some(&cas), &kvs, &Secrets::default())?;
+    println!("{request}");
     Ok(())
 }
 
@@ -3312,23 +3500,23 @@ pub fn caos_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), Str
 /// printed so another process can immediately run it.
 pub fn cli_prepare_request(t: &dyn Transport, kvs: &[String]) -> Result<(), String> {
     let (bty, bval, kvs) = split_base_arg("prepare-request", kvs)?;
-    let image = eval_base(t, None, bty, bval)?;
-    let store = build_secret_store(t)?;
-    println!("{}", prepare_request(t, &image, None, &kvs, &store)?);
+    let base = client_base(t, bty, bval)?;
+    println!(
+        "{}",
+        prepare_request(t, &base, None, &kvs, &Secrets::current())?
+    );
     Ok(())
 }
 
 /// Assemble a runnable ArgTree from a base image ref and the caller's already
-/// resolved `call` args, folding in the reserved `base`/`salt`/`std` entries,
+/// resolved `call` args, folding in the reserved `base`/`salt` entries,
 /// storing it, and getting it onto the server. Returns the ArgTree hash (the
-/// request id and cache key). Shared by [`prepare_request`] (which resolves
-/// `call` from kvs) and the `.caos-expr` evaluator (which resolves `call`
-/// against a git tree).
+/// request id and cache key). A worker's; a client asks the server to
+/// ([`submit_request`]), which forms the same tree.
 fn assemble_arg_tree(
     t: &dyn Transport,
     image: &str,
     call: Vec<gix::objs::tree::Entry>,
-    store: &[ClientSecret],
 ) -> Result<String, String> {
     // Expand any curry layers: pull the underlying image out and collect the args
     // bound into it. The image is folded into the args tree below, so the server
@@ -3361,30 +3549,6 @@ fn assemble_arg_tree(
     let salt = run_salt();
     if !salt.is_empty() {
         arg_entries = merge_entries(arg_entries, vec![salt_arg_entry(t, &salt)?]);
-    }
-
-    // Cache-isolation tag (design/secrets.md): fold in `secret-hash` when this
-    // run is granted a secret — matched against the entries built so far, so two
-    // callers with different secrets don't share a cache entry, while a
-    // secret-free run stays globally shared. Byte-identical to what the server
-    // folds into an equivalent sub-run ArgTree.
-    let base: std::collections::BTreeMap<String, String> = arg_entries
-        .iter()
-        .map(|e| {
-            (
-                String::from_utf8_lossy(e.filename.as_ref()).into_owned(),
-                e.oid.to_string(),
-            )
-        })
-        .collect();
-    if let Some(hash) = client_secret_hash(store, &base)? {
-        let oid = post_object(t, "blob", hash.as_bytes())?;
-        let entry = gix::objs::tree::Entry {
-            mode: gix::objs::tree::EntryKind::Blob.into(),
-            filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
-            oid,
-        };
-        arg_entries = merge_entries(arg_entries, vec![entry]);
     }
 
     // The request object IS the args tree — the ArgTree — so its hash *is* the
@@ -3823,12 +3987,8 @@ fn record_continuation(
 /// `--base:docker=<ref>`, or `--base:hash=<oid>`.
 pub fn cli_run(t: &dyn Transport, output: Option<&str>, kvs: &[String]) -> Result<(), String> {
     let (bty, bval, kvs) = split_base_arg("run", kvs)?;
-    let image = eval_base(t, None, bty, bval)?;
-    // Build the ephemeral secrets store from the caller's `.caos-secrets`
-    // (design/secrets.md), resolving each reader here — where eval-path is
-    // available — so the server never evals. Empty when there's no store.
-    let store = build_secret_store(t)?;
-    let (kind, result) = run_request(t, &image, None, &kvs, &store)?;
+    let base = client_base(t, bty, bval)?;
+    let (kind, result) = run_request(t, &base, None, &kvs, &Secrets::current())?;
 
     let Some(output) = output else {
         // No output path: stream a file result to stdout. A tree has no single
@@ -4005,7 +4165,7 @@ fn resolve_cas_image(t: &dyn Transport, cas: &Path, image: &str) -> Result<Strin
 /// a `:@=` image deepens the whole tree first — a cached run, and exactly what
 /// `eval-path` and `run-tool` already do.
 pub fn eval_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> {
-    eval_cli_image_with_store(t, image, &[])
+    eval_cli_image_with(t, image, &Secrets::current())
 }
 
 /// Resolve one `--<name>:<type>=<value>` image argument as a CLIENT reads it —
@@ -4027,25 +4187,23 @@ pub fn eval_cli_image(t: &dyn Transport, image: &str) -> Result<String, String> 
 pub fn eval_cli_image_arg(
     t: &dyn Transport,
     argument: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
     tree: Option<&str>,
 ) -> Result<String, String> {
     let (_, ty, value) = parse_arg(argument)?;
     match (ty, tree) {
-        (ArgType::Path, Some(tree)) => eval_image_in_tree(t, tree, value, store),
-        _ => eval_base_with_store(t, None, ty, value, store),
+        (ArgType::Path, Some(tree)) => eval_image_in_tree(t, tree, value, secrets),
+        _ => eval_base_with(t, None, ty, value, secrets),
     }
 }
 
-/// [`eval_cli_image`] carrying the caller's secret store into the walk, so a
-/// `run` the expression dispatches and any `curry` it returns are marked with
-/// the caller's identity (design/secrets.md). Conversation setup uses this
-/// form: the step it resolves embeds tools whose arg trees have to match the
-/// readers granting the model key, and an unmarked resolution would not.
-pub fn eval_cli_image_with_store(
+/// [`eval_cli_image`] presenting `secrets`, so the image comes back marked
+/// wherever a grant matches (SPEC, "Secrets"). Conversation setup uses this
+/// form: the step it resolves is what the model key is granted to.
+pub fn eval_cli_image_with(
     t: &dyn Transport,
     image: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
     // The tracked workspace (dirty edits included), exactly as `eval-path` with
     // no `--tree` starts. A flake dir is NOT special-cased here or on the
@@ -4055,20 +4213,20 @@ pub fn eval_cli_image_with_store(
     let (_, ws) = t
         .ingest_path(".")?
         .ok_or_else(|| "this client cannot ingest the source tree".to_string())?;
-    eval_image_in_tree(t, &ws.to_string(), image, store)
+    eval_image_in_tree(t, &ws.to_string(), image, secrets)
 }
 
 fn eval_image_in_tree(
     t: &dyn Transport,
     tree: &str,
     image: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
     // Descend THROUGH evaluation: each `.caos-expr` from the root down is
     // applied, and `image` is looked up in what the one above it produced. A
     // tree with no `.caos-expr` (a plain flake dir, a git-docker image)
     // evaluates to itself and nothing changes.
-    eval::eval_path(t, tree, image, store)
+    eval::eval_path(t, tree, image, secrets)
         .map(|(_kind, hash)| hash)
         .map_err(|e| format!("resolving {image:?}: {e}"))
 }
@@ -4372,23 +4530,7 @@ fn merge_entries(
     by_name.into_values().collect()
 }
 
-/// Trigger compute for ArgTree `arg_tree` (its hash) and return the result's
-/// `(type, hash)`. The server runs the container (resolving any promise it leaves
-/// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
-/// param's historical name; its value is the arg-tree hash.)
-/// Directory of the caller's git-ignored secrets store (design/secrets.md).
-/// Public so clients that *write* the store (the tui's first-run key setup)
-/// name the same directory the loader reads.
-pub const SECRETS_DIR: &str = ".caos-secrets";
-
-/// Minimum entropy length (chars) not flagged weak. A `secret-hash` is only
-/// unguessable if the entropy is: below this, it's brute-forceable out of the
-/// hash (like GitHub Actions refusing to mask short secrets).
-const MIN_ENTROPY_LEN: usize = 16;
-
-/// Fresh entropy for a secret: 128 random bits as 32 hex chars. Public so a
-/// client writing a new secret file can include the entropy up front (what
-/// `secrets` would otherwise add on a second pass) with the one policy.
+/// 128 random bits as 32 hex chars.
 pub fn fresh_entropy() -> Result<String, String> {
     use std::io::Read;
     let mut file =
@@ -4399,663 +4541,30 @@ pub fn fresh_entropy() -> Result<String, String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// `caos-cli secrets [--check]` — tend the local `.caos-secrets` store: fill a
-/// missing `entropy=` with fresh entropy and warn on a weak one, so a secret's
-/// cache isolation is safe by default (design/secrets.md). `--check` writes
-/// nothing and errors on any issue (a CI gate). Offline — reads/writes only the
-/// local dir.
-pub fn cli_secrets(check: bool) -> Result<(), String> {
-    let dir = Path::new(SECRETS_DIR);
-    if !dir.is_dir() {
-        println!("no {SECRETS_DIR} directory — nothing to do");
-        return Ok(());
-    }
-
-    let mut issues = 0;
-    let mut env_entropy_missing = false;
-    for (name, path) in local_secret_files(dir)? {
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {name}: {e}"))?;
-        let spec = parse_local_secret_spec(&name, &text)?;
-        // `entropy:env=` is already specified, so there is nothing to fill in
-        // and nothing to write. Its LENGTH is still worth checking when the
-        // variable happens to be set here, but its absence is not an issue:
-        // this command is an offline lint that a CI gate runs, and CI is
-        // exactly where a user's entropy variable is not going to be set.
-        if let Some(LocalEntropy::Env(var)) = &spec.entropy {
-            if let Some(value) = non_empty_env(var) {
-                if value.len() < MIN_ENTROPY_LEN {
-                    eprintln!(
-                        "{name}: weak entropy in ${var} ({} chars < {MIN_ENTROPY_LEN})",
-                        value.len()
-                    );
-                    issues += 1;
-                }
-            }
-            continue;
-        }
-        match spec.entropy.as_ref().map(|e| match e {
-            LocalEntropy::Literal(literal) => literal.as_str(),
-            LocalEntropy::Env(var) => var.as_str(),
-        }) {
-            // A `value:env=` file is the COMMITTED form, so the entropy this
-            // would otherwise generate must not be written into it — and this
-            // command cannot pick the variable to read it from either. Say what
-            // to add instead of writing something the loader will then refuse.
-            None if matches!(spec.value, Some(LocalSecretValue::Env(_))) => {
-                eprintln!(
-                    "{name}: value:env= with no entropy — add `entropy:env=<VAR>` \
-                     (a committed file cannot carry a literal one)"
-                );
-                issues += 1;
-                env_entropy_missing = true;
-            }
-            None => {
-                if check {
-                    eprintln!("{name}: missing entropy");
-                    issues += 1;
-                } else {
-                    let value = fresh_entropy()?;
-                    let sep = if text.is_empty() || text.ends_with('\n') {
-                        ""
-                    } else {
-                        "\n"
-                    };
-                    std::fs::write(&path, format!("{text}{sep}entropy={value}\n"))
-                        .map_err(|e| format!("writing {name}: {e}"))?;
-                    println!("{name}: added entropy");
-                }
-            }
-            Some(value) if value.len() < MIN_ENTROPY_LEN => {
-                // Never overwrite a user's value; just flag it.
-                eprintln!(
-                    "{name}: weak entropy ({} chars < {MIN_ENTROPY_LEN})",
-                    value.len()
-                );
-                issues += 1;
-            }
-            Some(_) => {}
-        }
-    }
-    // A `value:env=` file with no entropy is an error whether or not `--check`
-    // was asked for: nothing was written to fix it, so returning success would
-    // report a store this command has just declined to repair as tended.
-    if issues > 0 && (check || env_entropy_missing) {
-        return Err(format!("{issues} secret(s) with missing or weak entropy"));
-    }
-    if !check && issues > 0 {
-        eprintln!("warning: {issues} secret(s) have weak entropy (edit them; not overwritten)");
-    }
-    Ok(())
-}
-
-/// A resolved secret from the caller's store: its value, its entropy (the
-/// cache-isolation capability), and each reader resolved to a partial arg tree.
-pub struct ClientSecret {
-    name: String,
-    value: String,
-    entropy: String,
-    readers: Vec<std::collections::BTreeMap<String, String>>,
-}
-
-impl ClientSecret {
-    /// Worker-visible name used for `/secret/<name>`.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-/// Check local configuration without evaluating reader expressions or building
-/// worker images. Grants are resolved when preparing an actual request.
-pub fn local_secret_present(dir: &Path, name: &str) -> Result<bool, String> {
-    if !dir.is_dir() {
-        return Ok(false);
-    }
-    let mut present = false;
-    for (file_name, path) in local_secret_files(dir)? {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
-        let spec = parse_local_secret_spec(&file_name, &text)?;
-        let value = resolve_local_secret_value(&file_name, &path, spec.value)?;
-        // A declared secret whose environment variable is not set is not
-        // present: the caller asks this to decide whether a credential is
-        // available, and a declaration without bytes is not one.
-        present |= spec.name == name && value.is_some();
-    }
-    Ok(present)
-}
-
-/// Read and resolve the caller's `.caos-secrets` store (design/secrets.md):
-/// each reader resolved HERE (via eval-path, against the store's pinned tree)
-/// to a partial arg tree of name → oid — so the server only subset-matches,
-/// never evals. Empty when there is no store.
-pub fn build_secret_store(t: &dyn Transport) -> Result<Vec<ClientSecret>, String> {
-    let dir = Path::new(SECRETS_DIR);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let pinned = secrets_pinned_tree(t, dir)?;
-    let mut store = Vec::new();
-    for (file_name, path) in local_secret_files(dir)? {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading secret {file_name}: {e}"))?;
-        let spec = parse_local_secret_spec(&file_name, &text)?;
-        let Some(value) = resolve_local_secret_value(&file_name, &path, spec.value)? else {
-            warn_unset_secret_env(&file_name, "value");
-            continue;
-        };
-        // No entropy, no secret. An empty `entropy` would put every user of
-        // this declaration on the same `secret-hash`, so a declaration whose
-        // entropy variable is unset is dropped exactly as a valueless one is —
-        // the isolation is not optional, and silently running without it is
-        // the failure this form was added to avoid.
-        let entropy = match spec.entropy {
-            Some(LocalEntropy::Literal(literal)) => literal,
-            Some(LocalEntropy::Env(var)) => match non_empty_env(&var) {
-                Some(entropy) => entropy,
-                None => {
-                    warn_unset_secret_env(&file_name, "entropy");
-                    continue;
-                }
-            },
-            None => String::new(),
-        };
-        let mut readers = Vec::new();
-        for reader in &spec.readers {
-            match resolve_reader_client(t, &pinned, reader)? {
-                Some(entries) => readers.push(entries),
-                // A reader naming a path the tree does not carry grants nothing
-                // — no arg tree can be a superset of an image that does not
-                // exist — so it is DROPPED rather than failing the load. A store
-                // is read by every client on every turn, so a reader that has
-                // outlived the directory it named (a tool moved from
-                // `caos-tools/` into `std/`) would otherwise take down `tui`,
-                // `talk` and `run-tool` alike, over a grant that was already
-                // inert. Dropping only narrows access, so it is fail-closed.
-                None => warn_absent_reader(&file_name, reader),
-            }
-        }
-        store.push(ClientSecret {
-            name: spec.name,
-            value,
-            entropy,
-            readers,
-        });
-    }
-    Ok(store)
-}
-
-/// Serialize the store for the `X-Caos-Secrets` header — a JSON array of
-/// `{name, value, entropy, readers}`. Empty string for an empty store.
-pub(crate) fn secret_store_header(store: &[ClientSecret]) -> String {
-    if store.is_empty() {
-        return String::new();
-    }
-    let array: Vec<serde_json::Value> = store
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "value": s.value,
-                "entropy": s.entropy,
-                "readers": s.readers,
-            })
-        })
-        .collect();
-    serde_json::to_string(&array).unwrap_or_default()
-}
-
-/// The `secret-hash` cache-isolation tag for an ArgTree whose base entries are
-/// `base` (design/secrets.md): the git-blob digest of the `(name, entropy)`
-/// pairs of the store's secrets whose readers match — `None` when none match.
-/// Byte-identical to the server's [`crate::secrets`] side (both hash the shared
-/// `caos_world::secret_hash_material`), so a computation shares one cache entry
-/// whether the client or the server assembles it.
-fn client_secret_hash(
-    store: &[ClientSecret],
-    base: &std::collections::BTreeMap<String, String>,
-) -> Result<Option<String>, String> {
-    let pairs: Vec<(&str, &str)> = store
-        .iter()
-        .filter(|s| s.readers.iter().any(|r| reader_subset(r, base)))
-        .map(|s| (s.name.as_str(), s.entropy.as_str()))
-        .collect();
-    if pairs.is_empty() {
-        return Ok(None);
-    }
-    let material = caos_world::secret_hash_material(&pairs);
-    Ok(Some(hash_bytes("blob", &material)?.to_string()))
-}
-
-/// Check the same reader and isolation conditions used by server injection.
-/// Callers that require a credential can reject a prepared request before
-/// admitting durable work. Merely having a secret in the store, or a hash from
-/// some other secret in the request, does not authorize this credential.
-pub fn client_request_has_secret(
-    t: &dyn Transport,
-    request: &str,
-    store: &[ClientSecret],
-    name: &str,
-) -> Result<bool, String> {
-    let entries = fetch_tree_entries(t, request)?
-        .ok_or_else(|| format!("request {request} is not an ArgTree"))?
-        .into_iter()
-        .map(|entry| {
-            (
-                String::from_utf8_lossy(entry_name(&entry)).into_owned(),
-                entry.oid.to_string(),
-            )
-        })
-        .collect();
-    request_has_secret(&entries, store, name)
-}
-
-fn request_has_secret(
-    entries: &std::collections::BTreeMap<String, String>,
-    store: &[ClientSecret],
-    name: &str,
-) -> Result<bool, String> {
-    if !store.iter().any(|secret| {
-        secret.name == name
-            && secret
-                .readers
-                .iter()
-                .any(|reader| reader_subset(reader, entries))
-    }) {
-        return Ok(false);
-    }
-    let Some(digest) = client_secret_hash(store, entries)? else {
-        return Ok(false);
-    };
-    let expected = hash_bytes("blob", digest.as_bytes())?.to_string();
-    Ok(entries.get(caos_world::SECRET_HASH_ARG) == Some(&expected))
-}
-
-/// A stable in-process identity for a secret store: everything about it that can
-/// change an evaluation's answer, and nothing else.
-///
-/// Used to key the evaluation memos ([`eval::Memo`]), which must not let a run
-/// resolved under one store answer for another. What a store contributes to a
-/// result is exactly what [`client_secret_hash`] reads — each secret's `name`,
-/// its `entropy`, and the readers deciding whether it matches — so those are the
-/// key. **The `value` is deliberately absent**: it is not in the arg tree the
-/// server caches on either (only the digest is), so including it would key on
-/// something that cannot change the answer while putting secret material into a
-/// long-lived map.
-pub(crate) fn store_key(store: &[ClientSecret]) -> String {
-    let mut key = String::new();
-    for secret in store {
-        key.push_str(&secret.name);
-        key.push('\u{1}');
-        key.push_str(&secret.entropy);
-        for reader in &secret.readers {
-            key.push('\u{2}');
-            for (name, oid) in reader {
-                key.push_str(name);
-                key.push('=');
-                key.push_str(oid);
-                key.push('\u{3}');
-            }
-        }
-        key.push('\u{4}');
-    }
-    key
-}
-
-/// Is `reader` (a partial arg tree) a subset of `base`? (The client-side twin of
-/// the server's match — kept identical so both compute the same `secret-hash`.)
-fn reader_subset(
-    reader: &std::collections::BTreeMap<String, String>,
-    base: &std::collections::BTreeMap<String, String>,
-) -> bool {
-    reader.iter().all(|(name, oid)| base.get(name) == Some(oid))
-}
-
-/// Fold `secret-hash` into an existing arg tree `oid` when the carried store
-/// grants it a secret — the caller-propagation mark (design/secrets.md): a
-/// worker embedded (as a `:@=` arg, or returned by a `curry` expression) carries
-/// its per-user identity, so whoever embeds it is per-user too. Unwraps any
-/// curry layers, matches the store's readers against the flattened entries, and
-/// on a match returns a flat args tree `{image, …bound, secret-hash}`; otherwise
-/// returns `oid` unchanged. Idempotent (re-marking recomputes the same digest;
-/// the merge dedups), and a no-op for an empty store.
-pub(crate) fn mark_arg_tree(
-    t: &dyn Transport,
-    store: &[ClientSecret],
-    oid: &str,
-) -> Result<String, String> {
-    if store.is_empty() {
-        return Ok(oid.to_string());
-    }
-    let (image_ref, bound) = unwrap_curry(t, oid)?;
-    let image_entry = base_arg_entry(t, &image_ref)?;
-    let mut base: std::collections::BTreeMap<String, String> = bound
-        .iter()
-        .map(|e| {
-            (
-                String::from_utf8_lossy(entry_name(e)).into_owned(),
-                e.oid.to_string(),
-            )
-        })
-        .collect();
-    base.insert("base".to_string(), image_entry.oid.to_string());
-    let Some(digest) = client_secret_hash(store, &base)? else {
-        return Ok(oid.to_string());
-    };
-    let secret_hash = gix::objs::tree::Entry {
-        mode: gix::objs::tree::EntryKind::Blob.into(),
-        filename: caos_world::SECRET_HASH_ARG.as_bytes().to_vec().into(),
-        oid: post_object(t, "blob", digest.as_bytes())?,
-    };
-    let entries = merge_entries(merge_entries(bound, vec![image_entry]), vec![secret_hash]);
-    Ok(post_tree(t, entries)?.to_string())
-}
-
-/// The tree tree-relative readers resolve against: the `.tree` file in the store
-/// (a hash or ref), else the caller's current working tree (ingested — which
-/// also gets it onto the server so eval-path can walk it).
-fn secrets_pinned_tree(t: &dyn Transport, dir: &Path) -> Result<String, String> {
-    if let Ok(spec) = std::fs::read_to_string(dir.join(".tree")) {
-        let spec = spec.trim();
-        if !spec.is_empty() {
-            return if is_hex_hash(spec) {
-                Ok(spec.to_string())
-            } else {
-                resolve_ref(spec)
-            };
-        }
-    }
-    let (_, oid) = t
-        .ingest_path(".")?
-        .ok_or_else(|| "this transport cannot ingest the source tree for secrets".to_string())?;
-    Ok(oid.to_string())
-}
-
-/// Sorted, visible secret files shared by the offline `secrets` command and the
-/// runtime loader. Dotfiles (`.tree`, editor backups) and non-files are metadata,
-/// not secrets.
-fn local_secret_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("reading {SECRETS_DIR}: {e}"))? {
-        let path = entry
-            .map_err(|e| format!("reading {SECRETS_DIR}: {e}"))?
-            .path();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        if !name.starts_with('.') && path.is_file() {
-            files.push((name, path));
-        }
-    }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(files)
-}
-
-enum LocalSecretValue {
-    Inline(String),
-    File(String),
-    /// `value:env=<VAR>` — the bytes come from the process environment, so the
-    /// file declaring them carries no secret and can be COMMITTED. That is the
-    /// point of the form: a shared starter repo ships the declaration (the
-    /// name, the readers) and each user supplies their own value.
-    Env(String),
-}
-
-/// A secret's cache-isolation entropy: a literal, or `entropy:env=<VAR>`.
-///
-/// It gets the same env form as the value because it is a capability and not a
-/// label — SPEC: "the entropy is a bearer capability for the cache: knowing it
-/// reconstructs the key of any run that used it". A committed literal beside a
-/// committed `value:env=` would hand every fork of that repo one `secret-hash`,
-/// which is the isolation `secret-hash` exists to provide.
-enum LocalEntropy {
-    Literal(String),
-    Env(String),
-}
-
-struct LocalSecretSpec {
-    name: String,
-    value: Option<LocalSecretValue>,
-    entropy: Option<LocalEntropy>,
-    readers: Vec<String>,
-}
-
-/// Parse the repeated-key secret-file format once for both `caos-cli secrets`
-/// and runtime loading. Value files remain unresolved here so the offline
-/// entropy command does not need to read secret material.
-fn parse_local_secret_spec(file_name: &str, text: &str) -> Result<LocalSecretSpec, String> {
-    let mut name = file_name.to_string();
-    let mut value = None;
-    let mut entropy = None;
-    let mut readers = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, val) = line
-            .split_once('=')
-            .ok_or_else(|| format!("secret {file_name}: line {line:?} is not key=value"))?;
-        match key {
-            "name" => name = val.trim().to_string(),
-            "entropy" => entropy = Some(LocalEntropy::Literal(val.trim().to_string())),
-            "entropy:env" => entropy = Some(LocalEntropy::Env(val.trim().to_string())),
-            "value" => value = Some(LocalSecretValue::Inline(val.to_string())),
-            "value:@" => value = Some(LocalSecretValue::File(val.to_string())),
-            "value:env" => value = Some(LocalSecretValue::Env(val.trim().to_string())),
-            "reader" => readers.push(val.trim().to_string()),
-            other => return Err(format!("secret {file_name}: unknown key {other:?}")),
-        }
-    }
-    // THE ONE COMBINATION THAT IS REFUSED, and it is refused here so that every
-    // caller refuses it: a value from the environment is the committed-file
-    // form, and a literal `entropy=` in a committed file is the same bearer
-    // capability in every clone of it. Two users with different tokens would
-    // then compute the SAME `secret-hash` and share cache keys — exactly what
-    // SPEC's "avoid accidentally sharing data derived from secrets through the
-    // cache" forbids.
-    //
-    // An ERROR rather than the drop-with-warning an absent reader gets, because
-    // the two fail in opposite directions: dropping a reader only narrows
-    // access, while a shared entropy widens what one user's cache exposes to
-    // another. Fail-closed means stopping here.
-    if let (Some(LocalSecretValue::Env(var)), Some(LocalEntropy::Literal(_))) = (&value, &entropy) {
-        return Err(format!(
-            "secret {file_name}: value:env={var} with a literal entropy= — a file whose VALUE \
-             comes from the environment is meant to be committed, and a committed entropy is a \
-             cache capability every clone would share. Use entropy:env=<VAR> as well."
-        ));
-    }
-    Ok(LocalSecretSpec {
-        name,
-        value,
-        entropy,
-        readers,
-    })
-}
-
-/// The secret's bytes, or `None` when an `:env=` form names a variable this
-/// process does not have.
-///
-/// `None` is not an error, and that is deliberate. The committed-file form
-/// exists so a shared starter repo can DECLARE a secret that most users will
-/// never set — a `github-token` that only private imports need. Erroring on an
-/// unset variable would make that declaration break every turn for everyone
-/// who does not need it. Dropping it instead leaves the worker to fail on a
-/// missing `/secret/<name>` if it really wanted one, which is the contract SPEC
-/// already states ("A worker must fail if the secret is missing or invalid").
-fn resolve_local_secret_value(
-    file_name: &str,
-    path: &Path,
-    value: Option<LocalSecretValue>,
-) -> Result<Option<String>, String> {
-    match value.ok_or_else(|| format!("secret {file_name}: no value= line"))? {
-        LocalSecretValue::Inline(value) => Ok(Some(value)),
-        LocalSecretValue::File(value_path) => {
-            let file = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&value_path);
-            let bytes = std::fs::read(&file)
-                .map_err(|e| format!("secret {file_name} value:@={value_path}: {e}"))?;
-            String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|e| format!("secret {file_name} value not UTF-8: {e}"))
-        }
-        // TRIMMED, unlike the other two forms, which are verbatim by contract.
-        // An environment variable is set by a shell, and `export T=$(cat tok)`
-        // or a copied-in value carrying a newline is far likelier than a token
-        // that genuinely ends in whitespace. Untrimmed, that newline rides into
-        // the Authorization header and comes back as a 401 that reads as a bad
-        // token rather than a bad variable.
-        LocalSecretValue::Env(var) => Ok(non_empty_env(&var)),
-    }
-}
-
-/// A trimmed environment variable, or `None` when it is unset or blank. Blank
-/// counts as unset: an exported-but-empty variable is a value nothing can use,
-/// and treating it as present would ship an empty credential.
-fn non_empty_env(var: &str) -> Option<String> {
-    match std::env::var(var) {
-        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
-        _ => None,
-    }
-}
-
-/// Resolve a reader — a single path/expression, no argument pins
-/// (design/secrets.md: a reader names an *expression*; narrow by pointing at a
-/// narrower one, not by pinning args here) — to the partial arg tree it stands
-/// for: eval-path the path (so a flake/`.caos-expr` tool resolves to the same
-/// arg tree the run uses), unwrap any curry layers, and take its entries. That
-/// tree already carries whatever the expression bakes in (e.g. a curried
-/// `worker1` script), so it is as specific as the expression is.
-///
-/// `None` when the tree carries no such path: an OPTIONAL reader, see
-/// [`build_secret_store`].
-fn resolve_reader_client(
-    t: &dyn Transport,
-    pinned: &str,
-    reader: &str,
-) -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
-    if reader.split_whitespace().count() != 1 {
-        return Err(format!(
-            "reader {reader:?} must be a single path (argument pins are not supported — \
-             point at a narrower expression instead)"
-        ));
-    }
-    let Some(image) = resolve_reader_image(t, pinned, reader.trim())? else {
-        return Ok(None);
-    };
-    let (base, bound) = unwrap_curry(t, &image)?;
-    let mut entries = std::collections::BTreeMap::new();
-    for entry in bound {
-        entries.insert(
-            String::from_utf8_lossy(entry_name(&entry)).into_owned(),
-            entry.oid.to_string(),
-        );
-    }
-    // The image entry wins over any like-named bound arg, mirroring assembly.
-    entries.insert("base".to_string(), base);
-    Ok(Some(entries))
-}
-
-/// Whether an `eval-path` failure means the TREE simply does not carry the
-/// reader's path, as opposed to the expression at that path being broken.
-///
-/// The walk reports a missing component as `eval-path: "<name>" not found in
-/// <tree oid>`; the other "not found" messages name a path *inside* an
-/// expression and end in `in tree`. Only the first is an absent reader — a
-/// reader that resolves to a `.caos-expr` which then fails must stay loud.
-fn reader_path_absent(error: &str) -> bool {
-    error
-        .strip_prefix("eval-path: ")
-        .and_then(|rest| rest.rsplit_once(" not found in "))
-        .is_some_and(|(_, node)| is_hex_hash(node))
-}
-
-/// Report an absent reader ONCE per process. Once, because the store is rebuilt
-/// on every turn while an interactive client owns the terminal: the first load
-/// happens before the TUI takes the screen, so the notice lands at the shell
-/// prompt instead of being repainted over inside a frame.
-/// Once per process, like [`warn_absent_reader`]: a store is rebuilt on every
-/// turn and every tool call, so an unset variable would otherwise print on each
-/// one. Said at all because the alternative — a declared secret that quietly
-/// is not in the store — is the kind of absence a worker reports much later as
-/// a permission error against GitHub.
-fn warn_unset_secret_env(secret: &str, field: &str) {
-    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
-    let mut warned = WARNED
-        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert(format!("{secret}\u{0}{field}")) {
-        eprintln!(
-            "caos: secret {secret}: its {field}:env= variable is unset or empty — the secret is \
-             not in this store (set it to use the secret; ignore this if you do not need it)"
-        );
-    }
-}
-
-fn warn_absent_reader(secret: &str, reader: &str) {
-    static WARNED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
-    let mut warned = WARNED
-        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert(format!("{secret}\u{0}{reader}")) {
-        eprintln!(
-            "caos: secret {secret}: reader {reader:?} names no path in this tree — ignored \
-             (it grants nothing; drop the line or point it at the path that replaced it)"
-        );
-    }
-}
-
-/// Resolve a reader's image token: a bare hash, or a path in the pinned tree
-/// (via eval-path — so a flake/`.caos-expr` tool resolves to the same oid the
-/// run uses).
-///
-/// A path only: there is no ambient library to name, so a reader says
-/// `std/github-push` and it is read out of the tree, exactly as an expression
-/// reaches a dependency. That is also why it converges with the run's own
-/// resolution — the root `.caos-expr` deepens the tree, and the entry a reader
-/// descends to is the same node a `DEEP-DEPS/<name>` mount points at.
-///
-/// `None` when that path is not in the tree ([`reader_path_absent`]).
-fn resolve_reader_image(
-    t: &dyn Transport,
-    pinned: &str,
-    expr: &str,
-) -> Result<Option<String>, String> {
-    if is_hex_hash(expr) {
-        return Ok(Some(expr.to_string()));
-    }
-    // Empty store: a reader's own resolution must not be marked (its arg tree is
-    // what the match compares against; marking it would be circular).
-    match eval::eval_path(t, pinned, expr, &[]) {
-        Ok((_, oid)) => Ok(Some(oid)),
-        Err(error) if reader_path_absent(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn request_compute(base: &str, arg_tree: &str, secrets: &str) -> Result<(String, String), String> {
+/// Trigger compute for ArgTree `arg_tree` (its hash) and return the result's
+/// `(type, hash)`. The server runs the container (resolving any promise it leaves
+/// behind) and replies with the final `"<type> <hash>"`. (`req` is the query
+/// param's historical name; its value is the arg-tree hash.)
+fn request_compute(
+    base: &str,
+    arg_tree: &str,
+    secrets: &Secrets,
+) -> Result<(String, String), String> {
     request_compute_url(base, &run_path(arg_tree), secrets)
 }
 
-/// Run an already-prepared request without a secret-store header.
+/// Run an already-prepared request presenting no secrets.
 pub fn compute_client_request(base: &str, arg_tree: &str) -> Result<(String, String), String> {
-    request_compute(base, arg_tree, "")
+    request_compute(base, arg_tree, &Secrets::default())
 }
 
-/// Run an already-prepared request with the supplied local secret store carried
-/// in ephemeral request context.
-pub fn compute_client_request_with_store(
+/// Run an already-prepared request presenting `secrets`.
+pub fn compute_client_request_with_secrets(
     base: &str,
     arg_tree: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    request_compute(base, arg_tree, &secret_store_header(store))
+    request_compute(base, arg_tree, secrets)
 }
 
 /// `caos resolve-image <hex hash | docker://ref>` — print the reference a
@@ -5108,15 +4617,14 @@ fn request_sub_run(base: &str, arg_tree: &str, nonce: &str) -> Result<(), String
     Ok(())
 }
 
-/// Issue the compute `GET /run`, carrying the ephemeral secrets store in the
-/// [`SECRETS_HEADER`] header when non-empty (design/secrets.md) — out of band
+/// Issue a compute `GET` (`/run`, `/eval`) presenting `secrets`, out of band
 /// from the content-addressed ArgTree in the URL.
-fn request_compute_url(base: &str, path: &str, secrets: &str) -> Result<(String, String), String> {
-    let headers = if secrets.is_empty() {
-        Vec::new()
-    } else {
-        vec![(SECRETS_HEADER, secrets.to_string())]
-    };
+fn request_compute_url(
+    base: &str,
+    path: &str,
+    secrets: &Secrets,
+) -> Result<(String, String), String> {
+    let headers = secrets.headers();
     // NO TIMEOUT, deliberately: this is the call that waits for the work. A run
     // takes as long as the worker does.
     let body = server_call(
@@ -5273,11 +4781,12 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         std::os::unix::fs::symlink(&original, root.join("dirty")).unwrap();
         std::fs::write(root.join("memory"), "remember").unwrap();
         let (_, tree) = store(&t, Some(&cas), &root).unwrap();
-        let (kind, resolved) = eval::eval_path(&t, &tree.to_string(), "dirty/code", &[]).unwrap();
+        let (kind, resolved) =
+            eval::eval_path_locally(&t, &tree.to_string(), "dirty/code").unwrap();
         assert_eq!(kind, "blob");
         assert_eq!(t.get_object(&resolved).unwrap().0, "blob");
         assert_eq!(
-            eval::eval_path(&t, &tree.to_string(), "dirty", &[]).unwrap(),
+            eval::eval_path_locally(&t, &tree.to_string(), "dirty").unwrap(),
             ("commit".into(), base.clone())
         );
         let projection = dir.path().join("projection");
@@ -5355,7 +4864,8 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         std::fs::create_dir(&metadata).unwrap();
         std::fs::write(metadata.join("conflicts"), "unresolved code\n").unwrap();
         let (_, unresolved) = store(&t, Some(&cas), &projection).unwrap();
-        let (_, unresolved) = eval::eval_path(&t, &unresolved.to_string(), "dirty", &[]).unwrap();
+        let (_, unresolved) =
+            eval::eval_path_locally(&t, &unresolved.to_string(), "dirty").unwrap();
         assert_eq!(
             git(
                 dir.path(),
@@ -5387,7 +4897,7 @@ gpgsig -----BEGIN PGP SIGNATURE-----
         .unwrap();
         let (_, unchanged) = store(&t, Some(&cas), &projection).unwrap();
         assert_eq!(
-            eval::eval_path(&t, &unchanged.to_string(), "dirty", &[])
+            eval::eval_path_locally(&t, &unchanged.to_string(), "dirty")
                 .unwrap()
                 .1,
             merge
@@ -5403,19 +4913,21 @@ gpgsig -----BEGIN PGP SIGNATURE-----
                 std::fs::write(metadata.join("conflicts"), "").unwrap();
             }
             let (_, cleaned) = store(&t, Some(&cas), &projection).unwrap();
-            let (_, source) = eval::eval_path(&t, &cleaned.to_string(), "dirty", &[]).unwrap();
+            let (_, source) = eval::eval_path_locally(&t, &cleaned.to_string(), "dirty").unwrap();
             assert!(git(dir.path(), &["ls-tree", &source, "--", ".caos"]).is_empty());
             assert_eq!(
                 git(dir.path(), &["rev-parse", &format!("{source}^")]).trim(),
                 merge
             );
-            assert!(eval::eval_path(&t, &cleaned.to_string(), ".caos/conflicts", &[]).is_ok());
+            assert!(eval::eval_path_locally(&t, &cleaned.to_string(), ".caos/conflicts").is_ok());
         }
         std::fs::write(metadata.join("conflicts"), "").unwrap();
         std::fs::write(metadata.join("other"), "keep").unwrap();
         let (_, retained) = store(&t, Some(&cas), &projection).unwrap();
-        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/conflicts", &[]).is_err());
-        assert!(eval::eval_path(&t, &retained.to_string(), "dirty/.caos/other", &[]).is_ok());
+        assert!(
+            eval::eval_path_locally(&t, &retained.to_string(), "dirty/.caos/conflicts").is_err()
+        );
+        assert!(eval::eval_path_locally(&t, &retained.to_string(), "dirty/.caos/other").is_ok());
     }
 
     #[test]
@@ -5670,235 +5182,10 @@ gpgsig -----BEGIN PGP SIGNATURE-----
 }
 
 #[cfg(test)]
-mod local_secret_tests {
-    use super::{parse_local_secret_spec, LocalEntropy, LocalSecretValue};
-
-    fn literal_entropy(spec: &super::LocalSecretSpec) -> Option<&str> {
-        match &spec.entropy {
-            Some(LocalEntropy::Literal(literal)) => Some(literal.as_str()),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn one_parser_serves_entropy_maintenance_and_runtime_loading() {
-        let spec = parse_local_secret_spec(
-            "token",
-            "name=api-key\nvalue:@=../key\nentropy=abc123\nreader=DEEP-DEPS/tool\n",
-        )
-        .unwrap();
-        assert_eq!(spec.name, "api-key");
-        assert_eq!(literal_entropy(&spec), Some("abc123"));
-        assert_eq!(spec.readers, ["DEEP-DEPS/tool"]);
-        match spec.value {
-            Some(LocalSecretValue::File(path)) => assert_eq!(path, "../key"),
-            _ => panic!("value:@ was not preserved as an unresolved file value"),
-        }
-    }
-
-    /// The committed-file form: both halves come from the environment, so the
-    /// file itself carries neither the bytes nor the cache capability.
-    #[test]
-    fn env_forms_name_variables_rather_than_carrying_values() {
-        let spec = parse_local_secret_spec(
-            "github-token",
-            "value:env=GITHUB_TOKEN\nentropy:env=CAOS_GITHUB_TOKEN_ENTROPY\nreader=caos-std/llm-step\n",
-        )
-        .unwrap();
-        assert_eq!(spec.name, "github-token");
-        assert_eq!(spec.readers, ["caos-std/llm-step"]);
-        match spec.value {
-            Some(LocalSecretValue::Env(var)) => assert_eq!(var, "GITHUB_TOKEN"),
-            _ => panic!("value:env was not parsed as an environment value"),
-        }
-        match spec.entropy {
-            Some(LocalEntropy::Env(var)) => assert_eq!(var, "CAOS_GITHUB_TOKEN_ENTROPY"),
-            _ => panic!("entropy:env was not parsed as an environment entropy"),
-        }
-    }
-
-    /// The whole reason `entropy:env=` exists: a committed literal would be one
-    /// bearer capability shared by every clone, so the pairing is refused at
-    /// parse time rather than warned about at use time.
-    #[test]
-    fn a_committed_value_may_not_carry_a_literal_entropy() {
-        let error = parse_local_secret_spec(
-            "github-token",
-            "value:env=GITHUB_TOKEN\nentropy=0123456789abcdef\n",
-        )
-        .err()
-        .expect("a committed literal entropy must be refused");
-        assert!(error.contains("value:env=GITHUB_TOKEN"), "{error}");
-        assert!(error.contains("entropy:env="), "{error}");
-    }
-
-    /// The reverse pairing is fine: a gitignored value file beside an entropy
-    /// the environment supplies narrows nothing and shares nothing.
-    #[test]
-    fn a_file_value_may_take_its_entropy_from_the_environment() {
-        let spec = parse_local_secret_spec("token", "value:@=../key\nentropy:env=E\n").unwrap();
-        assert!(matches!(spec.value, Some(LocalSecretValue::File(_))));
-        assert!(matches!(spec.entropy, Some(LocalEntropy::Env(_))));
-    }
-
-    #[test]
-    fn presence_checks_local_specs_and_values_without_evaluating_readers() {
-        let dir = std::env::temp_dir().join(format!(
-            "secret-presence-{}",
-            super::fresh_entropy().unwrap()
-        ));
-        assert!(!super::local_secret_present(&dir, "api-key").unwrap());
-        std::fs::create_dir(&dir).unwrap();
-        let file = dir.join("token");
-        std::fs::write(
-            &file,
-            "name=api-key\nvalue=test-value\nreader=missing-worker\n",
-        )
-        .unwrap();
-        assert!(super::local_secret_present(&dir, "api-key").unwrap());
-        assert!(!super::local_secret_present(&dir, "other").unwrap());
-        std::fs::write(&file, "name=api-key\nvalue:@=missing.value\n").unwrap();
-        assert!(super::local_secret_present(&dir, "api-key").is_err());
-        std::fs::write(&file, "not a spec\n").unwrap();
-        assert!(super::local_secret_present(&dir, "api-key").is_err());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn entropy_maintenance_can_parse_a_spec_before_its_value_is_complete() {
-        let spec = parse_local_secret_spec("token", "reader=DEEP-DEPS/tool\n").unwrap();
-        assert!(spec.value.is_none());
-        assert!(spec.entropy.is_none());
-    }
-
-    #[test]
-    fn shared_parser_rejects_unknown_fields() {
-        let error = parse_local_secret_spec("token", "wat=nope\n")
-            .err()
-            .expect("unknown field was accepted");
-        assert!(error.contains("unknown key \"wat\""), "{error}");
-    }
-
-    /// An optional reader is exactly "the tree has no such path", which is the
-    /// walk's message — naming the node it looked in. Everything else, up to
-    /// and including a `not found` raised by the reader's OWN expression, is a
-    /// broken reader and has to keep failing the load.
-    #[test]
-    fn only_a_missing_tree_path_makes_a_reader_optional() {
-        let oid = "2114331da99790fef932866de7176d408c5a6e19";
-        assert!(super::reader_path_absent(&format!(
-            "eval-path: \"caos-tools\" not found in {oid}"
-        )));
-        for loud in [
-            "eval-path: path \"src\" not found in tree",
-            "eval-path: base path \"std/bash\" not found in tree",
-            "eval-path: cannot descend into \"tool\": the prefix evaluated to a blob",
-            "eval-path: undefined variable $BASE",
-            "transport: connection refused",
-        ] {
-            assert!(!super::reader_path_absent(loud), "{loud}");
-        }
-    }
-}
-
-#[cfg(test)]
 mod memo_tests {
-    use super::{
-        client_secret_hash, eval::Memo, hash_bytes, request_has_secret, store_key, ClientSecret,
-    };
+    use super::eval::Memo;
 
-    fn secret(name: &str, value: &str, entropy: &str, reader: &[(&str, &str)]) -> ClientSecret {
-        ClientSecret {
-            name: name.to_string(),
-            value: value.to_string(),
-            entropy: entropy.to_string(),
-            readers: vec![reader
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect()],
-        }
-    }
-
-    #[test]
-    fn required_secret_checks_reader_and_isolation_before_dispatch() {
-        let image = "a".repeat(40);
-        let other_image = "b".repeat(40);
-        let mut entries = std::collections::BTreeMap::from([
-            ("base".to_string(), image.clone()),
-            ("extra".to_string(), "c".repeat(40)),
-        ]);
-        let store = vec![secret(
-            "model-key",
-            "private",
-            "entropy",
-            &[("base", &image)],
-        )];
-        // Matching the image alone must not authorize an old, unmarked request.
-        assert!(!request_has_secret(&entries, &store, "model-key").unwrap());
-        let digest = client_secret_hash(&store, &entries).unwrap().unwrap();
-        entries.insert(
-            caos_world::SECRET_HASH_ARG.to_string(),
-            hash_bytes("blob", digest.as_bytes()).unwrap().to_string(),
-        );
-        assert!(request_has_secret(&entries, &store, "model-key").unwrap());
-        assert!(!request_has_secret(&entries, &store, "other-key").unwrap());
-
-        let wrong_reader = vec![secret(
-            "model-key",
-            "private",
-            "entropy",
-            &[("base", &other_image)],
-        )];
-        assert!(!request_has_secret(&entries, &wrong_reader, "model-key").unwrap());
-        let mut absent_reader = secret("model-key", "private", "entropy", &[]);
-        absent_reader.readers.clear();
-        assert!(!request_has_secret(&entries, &[absent_reader], "model-key").unwrap());
-
-        let rotated = vec![secret(
-            "model-key",
-            "replacement",
-            "entropy",
-            &[("base", &image)],
-        )];
-        assert!(request_has_secret(&entries, &rotated, "model-key").unwrap());
-        let changed_identity = vec![secret(
-            "model-key",
-            "private",
-            "new entropy",
-            &[("base", &image)],
-        )];
-        assert!(!request_has_secret(&entries, &changed_identity, "model-key").unwrap());
-    }
-
-    /// The claim `store_key`'s doc comment makes: a store keys an evaluation by
-    /// what decides the answer, and a secret's VALUE is not that. Two callers
-    /// holding the same grant with different values form the same arg tree, so
-    /// they must share a memo entry rather than each paying the round trips.
-    #[test]
-    fn a_secrets_value_does_not_key_an_evaluation() {
-        let one = [secret("token", "hunter2", "e", &[("base", "abc")])];
-        let two = [secret("token", "correct-horse", "e", &[("base", "abc")])];
-        assert_eq!(store_key(&one), store_key(&two));
-    }
-
-    /// …and everything that DOES decide it separates the keys, so a run
-    /// resolved under one grant can never answer for another.
-    #[test]
-    fn name_entropy_and_readers_each_key_an_evaluation() {
-        let base = [secret("token", "v", "e", &[("base", "abc")])];
-        let key = store_key(&base);
-        for other in [
-            [secret("other", "v", "e", &[("base", "abc")])],
-            [secret("token", "v", "rotated", &[("base", "abc")])],
-            [secret("token", "v", "e", &[("base", "def")])],
-        ] {
-            assert_ne!(key, store_key(&other));
-        }
-        assert_ne!(key, store_key(&[]));
-    }
-
-    /// Distinct keys are distinct answers, and a stored one comes back — the
-    /// whole contract `eval_path` leans on.
+    /// Distinct keys are distinct answers, and a stored one comes back.
     #[test]
     fn memo_answers_only_the_key_it_stored() {
         static M: Memo<String> = Memo::new();
@@ -5975,7 +5262,7 @@ mod tool_resolution_tests {
     /// step asks the SERVER for. A tool that does not evaluate to an ArgTree is
     /// the caller's mistake, not a crash.
     fn evaluate(t: &Store, root: &str, path: &str) -> Result<String, String> {
-        let (kind, oid) = eval::eval_path(t, root, path, &[])?;
+        let (kind, oid) = eval::eval_path_locally(t, root, path)?;
         if kind != "tree" {
             return Err(format!("{path} evaluates to a {kind}, not a tool ArgTree"));
         }
@@ -6050,7 +5337,6 @@ mod tool_resolution_tests {
                     oid: parse_oid(&root).unwrap(),
                 },
             ],
-            &[],
         )
         .unwrap();
         let entries = fetch_tree_entries(&t, &request).unwrap().unwrap();
@@ -6072,24 +5358,6 @@ mod tool_resolution_tests {
         assert!(error.contains("no such path:"));
         assert!(error.contains("missing"));
         assert!(error.contains("Directories in .: tool"));
-        assert!(reader_path_absent(&error));
-    }
-
-    /// A pinned ancestor dependency is resolved by the SERVER, and the client's
-    /// only part in it is asking. The fixture holds no repository at all, which
-    /// is the point: before this, resolution ran `git fetch` against the host,
-    /// so a locator in an ancestor expression was a thing only a machine with a
-    /// checkout and the right credentials could follow. The claim here is that
-    /// nothing local is consulted — the walk goes straight to `server_url`, and
-    /// what comes back is that fixture's refusal rather than a "path not found".
-    /// The end-to-end shape is `tests/remote-ref`.
-    #[test]
-    fn a_pinned_dependency_is_resolved_by_asking_the_server() {
-        let t = Store::default();
-        let root = expr(&t, "curry --base=fixture --repo:@@=git+https://example.invalid/tool-fixture?rev=1234567890123456789012345678901234567890");
-        let error = evaluate(&t, &root, "args/repo/tool").unwrap_err();
-        assert!(error.contains("fixture forbids dispatch"), "{error}");
-        assert_eq!(t.computes.get(), 1);
     }
 
     /// A `path:` locator is the one shape the server cannot answer, and the

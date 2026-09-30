@@ -7,22 +7,18 @@
 //! directory's own subtree as the input — and continues descending into the
 //! *result*.
 //!
-//! ## Two backends, one walk
+//! ## One walk, behind a host
 //!
-//! Evaluation dispatches `run`s and BLOCKS on their results. Blocking is fine
-//! for a client (top-level, holds no worker slot) and for the server (a request
-//! thread resolving an `eval` continuation) — never for a worker. So the walk is
-//! generic over `EvalHost`: CAS read/write plus a blocking `EvalHost::dispatch`.
-//! The client backend dispatches via `request_compute`; the server backend via
-//! `run_image`. They are byte-identical by construction — the same walk, the same
-//! curry assembly — which is what lets a worker request eval server-side and get
-//! the exact object a client `eval-path` would build.
+//! Evaluation dispatches `run`s and BLOCKS on their results, which is fine for
+//! the server (a request thread) and never for a worker. The walk is generic
+//! over `EvalHost` — CAS read/write plus a blocking `EvalHost::dispatch` — and
+//! the server is the host that runs it: a client asks rather than walking
+//! (SPEC, "Submitting work"), because evaluation is where secrets are granted.
 //!
-//! One capability is deliberately client-only: `EvalHost::eval_remote`
-//! (`:@@=`). A locator has to become an oid before the request is formed, or the
-//! URL would sit inside the cache key and two consumers pinning the same rev
-//! through different URLs would key differently. The default implementation
-//! therefore refuses, and only the client overrides it.
+//! `EvalHost::eval_remote` (`:@@=`) turns a locator into an oid before the
+//! request is formed, or the URL would sit inside the cache key and two
+//! consumers pinning the same rev through different URLs would key
+//! differently. The default refuses.
 //!
 //! ## Grammar
 //!
@@ -174,20 +170,12 @@ pub trait EvalHost {
     /// returning the result's `(kind, hash)`. The client uses `request_compute`,
     /// the server `run_image`; both build a byte-identical ArgTree.
     fn dispatch(&self, image: &str, entries: Vec<Entry>) -> Result<(String, String), String>;
-    /// Mark a freshly-built curry ArgTree for this host's secret model
-    /// (design/secrets.md). A no-op when no secret is in play, so the common
-    /// (tool) path is byte-identical whether or not the host marks.
-    fn mark_curry(&self, oid: &str) -> Result<String, String> {
-        Ok(oid.to_string())
-    }
     /// Resolve a `:@@=` locator to the object it names, descending `dir=`
-    /// through evaluation. CLIENT-ONLY: the fetch needs a repo to fetch INTO,
-    /// and — the real reason — a locator must become an oid *before* the request
-    /// is formed, or its URL would sit in the cache key. Hosts that cannot fetch
-    /// keep this default, whose error says where the resolution belongs.
+    /// through evaluation. A locator must become an oid *before* the request is
+    /// formed, or its URL would sit in the cache key. The server overrides it.
     fn eval_remote(&self, value: &str) -> Result<(EntryMode, gix::ObjectId), String> {
         Err(format!(
-            "cannot resolve {value:?}: a `:@@=` locator is resolved by the CLIENT, \
+            "cannot resolve {value:?}: a `:@@=` locator is resolved by the caos server, \
              so it must already be an oid by the time this host evaluates it"
         ))
     }
@@ -658,11 +646,8 @@ fn eval_command(
     let entries = eval_expr_args(host, input_tree, &arg_toks, env)?;
 
     if verb == "curry" {
-        // Mark the returned arg tree, so a caller that embeds it is per-user too
-        // (design/secrets.md, caller-propagation) — a no-op without secrets.
         let oid = build_curry(host, &image_ref, entries)?;
-        let marked = host.mark_curry(&oid.to_string())?;
-        return Ok(("tree".to_string(), marked));
+        return Ok(("tree".to_string(), oid.to_string()));
     }
     host.dispatch(&image_ref, entries)
 }
@@ -1189,7 +1174,12 @@ mod origin_tests {
             let entries = entries
                 .into_iter()
                 .map(|(name, is_tree, oid)| Entry {
-                    mode: if is_tree { EntryKind::Tree } else { EntryKind::Blob }.into(),
+                    mode: if is_tree {
+                        EntryKind::Tree
+                    } else {
+                        EntryKind::Blob
+                    }
+                    .into(),
                     filename: name.into(),
                     oid,
                 })
@@ -1200,7 +1190,11 @@ mod origin_tests {
 
     impl EvalHost for Memory {
         fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
-            self.objects.borrow().get(oid).cloned().ok_or(format!("no {oid}"))
+            self.objects
+                .borrow()
+                .get(oid)
+                .cloned()
+                .ok_or(format!("no {oid}"))
         }
         fn post_object(&self, _kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
             Ok(self.put(gix::objs::Kind::Blob, bytes.to_vec()))

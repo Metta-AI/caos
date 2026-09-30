@@ -1967,10 +1967,13 @@ impl App {
             state.reconcile_after = None;
             let conversation = state.id.clone();
             let request_to_resume = request.clone();
+            let conversation_to_resume = conversation.clone();
             spawn(
                 repo_dir.clone(),
                 tx.clone(),
-                move |transport| resume_request(transport, &request_to_resume),
+                move |transport| {
+                    resume_request(transport, &conversation_to_resume, &request_to_resume)
+                },
                 move |result| UiMessage::Reconciled {
                     conversation,
                     request,

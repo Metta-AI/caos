@@ -117,6 +117,18 @@ fn parse_flags(args: &[String]) -> Result<(PathBuf, Option<String>), String> {
     Ok((dir, server))
 }
 
+/// The SecretReaderKeys this machine presents: `$CAOS_SECRET_READERS`
+/// (space-separated) when set, else the default directory's own.
+pub fn reader_keys() -> Vec<String> {
+    if let Ok(keys) = std::env::var("CAOS_SECRET_READERS") {
+        return keys.split_whitespace().map(str::to_string).collect();
+    }
+    default_dir()
+        .and_then(|dir| read_writer_key(&dir))
+        .map(|key| vec![hex(&key.verifying_key().to_bytes())])
+        .unwrap_or_default()
+}
+
 /// `$CAOS_SECRETS_DIR`, else `$XDG_CONFIG_HOME/caos/secrets`, else
 /// `~/.config/caos/secrets`.
 fn default_dir() -> Result<PathBuf, String> {

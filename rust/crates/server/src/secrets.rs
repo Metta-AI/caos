@@ -154,6 +154,24 @@ pub(crate) fn grant(
     context: &Context,
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
+    let names = granted_names(context, arg_entries);
+    let out: Vec<(String, String)> = context
+        .stored
+        .iter()
+        .filter(|s| names.contains(&s.name))
+        .map(|s| (s.name.clone(), s.value.clone()))
+        .collect();
+    for (name, _) in &out {
+        eprintln!("secret {name}: granted to this job");
+    }
+    out
+}
+
+/// The names [`grant`] would inject, sorted.
+pub(crate) fn granted_names(
+    context: &Context,
+    arg_entries: &BTreeMap<String, String>,
+) -> Vec<String> {
     if context.is_empty() {
         return Vec::new();
     }
@@ -167,17 +185,9 @@ pub(crate) fn grant(
             names.extend(granted.iter().cloned());
         }
     }
-    let mut out: Vec<(String, String)> = context
-        .stored
-        .iter()
-        .filter(|s| names.contains(&s.name))
-        .map(|s| (s.name.clone(), s.value.clone()))
-        .collect();
-    out.sort();
-    for (name, _) in &out {
-        eprintln!("secret {name}: granted to this job");
-    }
-    out
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names
 }
 
 fn matches(config: &Config, context: &Context, reader: &Reader, origin: &Origin) -> bool {

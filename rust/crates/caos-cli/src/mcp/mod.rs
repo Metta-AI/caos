@@ -256,16 +256,16 @@ fn dispatch_call(
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
-    let store = caos::build_secret_store(t)?;
-    let configuration = tools_configuration(t, options, id, &store)?;
+    let secrets = caos::Secrets::current().for_conversation(id);
+    let configuration = tools_configuration(t, options, id, &secrets)?;
     let kvs = vec![
         format!("--head:commit={request_head}"),
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
+    let dispatch = caos::prepare_client_request_with_secrets(t, &configuration, &kvs, &secrets)?;
     let server = t.server_url()?;
-    caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
+    caos::compute_client_request_with_secrets(&server, &dispatch, &secrets).map(drop)
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -278,7 +278,7 @@ fn tools_configuration(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
-    store: &[caos::ClientSecret],
+    secrets: &caos::Secrets,
 ) -> Result<String, String> {
     // REACHABLE FIRST, IN FRONT OF EVERYTHING BELOW. Resolving the step and
     // preparing a request both talk to the caos server, and in a cloud session
@@ -300,7 +300,7 @@ fn tools_configuration(
     // merge tools resolve against the conversation's own Git store, so a ref
     // snapshot passed from here would be a second, staler source of truth.
     let config = vec![format!("--conversation={id}")];
-    let base = step_image(t, options, store)?;
+    let base = step_image(t, options, secrets)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
 
@@ -314,7 +314,7 @@ fn tools_configuration(
 fn step_image(
     t: &GitTransport,
     options: &TurnOptions,
-    store: &[caos::ClientSecret],
+    secrets: &caos::Secrets,
 ) -> Result<String, String> {
     let tree = match &options.base {
         Some(base) => Some(
@@ -332,7 +332,7 @@ fn step_image(
         t,
         options.llm_step.as_deref(),
         LLM_STEP_ARG,
-        store,
+        secrets,
         tree.as_deref(),
     )
 }
@@ -438,9 +438,9 @@ pub(crate) fn discovery_timing() -> Option<String> {
 /// the tui.
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
     let total = std::time::Instant::now();
-    let store = caos::build_secret_store(t)?;
+    let secrets = caos::Secrets::current();
     let mark = std::time::Instant::now();
-    let base = step_image(t, options, &store)?;
+    let base = step_image(t, options, &secrets)?;
     let resolve_step = mark.elapsed();
     // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
     // A repository's own tools are reached by PATH (`tool_help` to describe one,
@@ -457,7 +457,7 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     // is empty, and `registry` never enumerated tree tools.
     let kvs = vec!["--list-tools=1".to_string()];
     let mark = std::time::Instant::now();
-    let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
+    let (_, result) = caos::run_client_request_with_secrets(t, &base, &kvs, &secrets)?;
     let run_list = mark.elapsed();
     let objects = open_store(t)?;
     let result = oid(&result, "tool registry")?;
@@ -639,7 +639,7 @@ fn record_prompt(
     let username = resolve_username(t, None)?;
     let signature = signature(&username)?;
     let refname = conversation_ref(id)?;
-    let secrets = caos::build_secret_store(t)?;
+    let secrets = caos::Secrets::current().for_conversation(id);
     let phase = std::time::Instant::now();
     let configuration = tools_configuration(t, options, id, &secrets)?;
     cc_timing("tools_configuration", phase.elapsed());
@@ -741,7 +741,7 @@ fn record_prompt(
         // the record says it was.
         let phase = std::time::Instant::now();
         let request = oid(
-            &caos::prepare_client_request_with_store(
+            &caos::prepare_client_request_with_secrets(
                 t,
                 &configuration,
                 &[format!("--head:commit={message}")],

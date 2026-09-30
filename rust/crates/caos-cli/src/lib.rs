@@ -21,9 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use caos::{
-    build_secret_store, compute_client_request_with_store, curry_client_object, eval_cli_image_arg,
-    prepare_client_request_with_store, run_client_request_with_store, ClientSecret, GitTransport,
-    Transport, CAOS_REMOTE,
+    compute_client_request_with_secrets, curry_client_object, eval_cli_image_arg,
+    run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
     apply, client_signature, inherited_signature, mint, Transition,
@@ -121,11 +120,11 @@ fn resolve_image_arg(
     t: &GitTransport,
     argument: Option<&str>,
     name: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
     tree: Option<&str>,
 ) -> Result<String, String> {
     let argument = argument.ok_or_else(|| missing_image_arg(name))?;
-    eval_cli_image_arg(t, argument, store, tree).map_err(|error| format!("--{name}: {error}"))
+    eval_cli_image_arg(t, argument, secrets, tree).map_err(|error| format!("--{name}: {error}"))
 }
 
 /// What to tell someone who did not pass `--<name>`. Both spellings, because
@@ -723,25 +722,25 @@ fn prepare_queued_request_detail(
     id: &str,
     queued_head: &str,
 ) -> Result<PreparedRequest, String> {
-    let store = conversation_secret_store(t)?;
-    let configuration = resolve_llm(t, options, id, queued_head, &store)?;
-    let request = prepare_client_request_with_store(
+    let secrets = conversation_secrets(id)?;
+    let configuration = resolve_llm(t, options, id, queued_head, &secrets)?;
+    let (request, granted) = caos::prepare_client_request_granted(
         t,
         &configuration,
         &[format!("--head:commit={queued_head}")],
-        &store,
+        &secrets,
     )?;
-    if !caos::client_request_has_secret(t, &request, &store, MODEL_API_SECRET)? {
+    if !granted.iter().any(|name| name == MODEL_API_SECRET) {
         let reader = options
             .llm_step
             .as_deref()
-            .and_then(image_arg_reader)
-            .map(|path| format!("reader={path}"))
-            .unwrap_or_else(|| "a reader= entry for the selected --llm-step image".to_string());
+            .map(|image| image_arg_reader(image, id))
+            .unwrap_or_else(|| "a reader for the selected --llm-step image".to_string());
         return Err(format!(
-            "{MODEL_API_SECRET} is configured but is not granted to this worker. \
-             Update .caos-secrets/{MODEL_API_SECRET} to include {reader}, \
-             then resend your message."
+            "{MODEL_API_SECRET} is not granted to this conversation's {LLM_STEP_ARG}. \
+             Add `{reader}` to {MODEL_API_SECRET} in your secret store, run \
+             `{} secrets-push`, then resend your message.",
+            invoked_as()
         ));
     }
     Ok(PreparedRequest {
@@ -2640,7 +2639,7 @@ fn resolve_llm(
     options: &TurnOptions,
     id: &str,
     queued_head: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<String, String> {
     let system = match (&options.system, &options.system_file) {
         (Some(system), None) => system.clone(),
@@ -2660,19 +2659,8 @@ fn resolve_llm(
     if let Some(base_url) = &options.base_url {
         config.push(format!("--base-url={base_url}"));
     }
-    let llm_base = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, store, None)?;
+    let llm_base = resolve_image_arg(t, options.llm_step.as_deref(), LLM_STEP_ARG, secrets, None)?;
     curry_client_object(t, &llm_base, &config).map(|hash| hash.to_string())
-}
-
-fn require_model_secret(store: &[ClientSecret]) -> Result<(), String> {
-    if store.iter().any(|secret| secret.name() == MODEL_API_SECRET) {
-        return Ok(());
-    }
-    Err(format!(
-        "conversations need an Anthropic API key. Run `{} tui` to be prompted for one (it writes the secret, its entropy, and the ignore rule for you), or {}",
-        invoked_as(),
-        model_secret_manual_setup()
-    ))
 }
 
 fn invoked_as() -> String {
@@ -2683,40 +2671,51 @@ fn invoked_as() -> String {
         .unwrap_or_else(|| "caos-cli".to_string())
 }
 
+/// How to give conversations a model key, for someone who has none.
 pub fn model_secret_manual_setup() -> String {
+    let cli = invoked_as();
     format!(
-        "create the git-ignored file `.caos-secrets/{MODEL_API_SECRET}` with:\n\nname={MODEL_API_SECRET}\nvalue:@={MODEL_API_SECRET_VALUE_FILE}\nreader=<the path you pass as --{LLM_STEP_ARG}:@=>\nreader=<the path you pass as --{LLM_CALL_ARG}:@=>\n\nA reader names the expression that may read the key, so those two lines are the paths those two args name — `std/{LLM_STEP_ARG}` and `std/{LLM_CALL_ARG}` in caos itself, `caos-std/…` in a repo that mounted it. Store the key in `.caos-secrets/{MODEL_API_SECRET_VALUE_FILE}` (no trailing newline — the value is used verbatim).\n\nThen run `{} secrets` to add cache-isolation entropy. See the README's Secrets section for details.",
-        invoked_as(),
+        "run `{cli} secrets-init` once, then create `{MODEL_API_SECRET}` in the directory it \
+         names with:\n\nvalue=<your key>\nreader:@@=<caos locator>&dir=std/{LLM_STEP_ARG}\n\
+         reader:@@=<caos locator>&dir=std/{LLM_CALL_ARG}\n\nand run `{cli} secrets-push`. The \
+         locator is the one your repository pins caos with (`git+https://…?rev=<sha>`). See \
+         SPEC.md, \"Secrets\"."
     )
 }
 
-/// The `reader=` line an image argument stands for, for the store `caos tui`
-/// writes on first run. A reader is resolved by [`caos::build_secret_store`] as
-/// a tree path or a bare oid, which is exactly the two arg types that name one:
-/// `:@@=` and `:docker=` have no reader spelling, so those are `None` and the
-/// caller is told to write the line by hand rather than handed a grant that
-/// silently matches nothing.
-pub fn image_arg_reader(argument: &str) -> Option<&str> {
-    let (key, value) = argument.strip_prefix("--")?.split_once('=')?;
-    match key.split_once(':')?.1 {
-        "@" | "hash" => Some(value),
-        _ => None,
+/// The reader line that grants the image an `--llm-step`-style argument
+/// names: that locator, or that path in this conversation.
+pub fn image_arg_reader(argument: &str, conversation: &str) -> String {
+    let value = argument
+        .strip_prefix("--")
+        .and_then(|a| a.split_once('='))
+        .map(|(key, value)| (key.split_once(':').map_or("", |(_, ty)| ty), value));
+    match value {
+        Some(("@@", locator)) => format!("reader:@@={locator}"),
+        Some(("@", path)) => format!("reader:@={path} conversation={conversation}"),
+        _ => format!("a reader for {argument}"),
     }
 }
 
+/// Whether this process presents no SecretReaderKey at all, so no
+/// conversation could be granted a model key.
 pub fn model_secret_missing() -> Result<bool, String> {
-    caos::local_secret_present(std::path::Path::new(caos::SECRETS_DIR), MODEL_API_SECRET)
-        .map(|present| !present)
+    Ok(Secrets::current().is_empty())
 }
 
-fn conversation_secret_store(t: &GitTransport) -> Result<Vec<ClientSecret>, String> {
-    let store = build_secret_store(t)?;
-    require_model_secret(&store)?;
-    Ok(store)
+fn conversation_secrets(id: &str) -> Result<Secrets, String> {
+    ensure_conversation_secret()?;
+    Ok(Secrets::current().for_conversation(id))
 }
 
-pub fn ensure_conversation_secret(t: &GitTransport) -> Result<(), String> {
-    conversation_secret_store(t).map(drop)
+pub fn ensure_conversation_secret() -> Result<(), String> {
+    if model_secret_missing()? {
+        return Err(format!(
+            "conversations need an Anthropic API key, granted from your secret store: {}",
+            model_secret_manual_setup()
+        ));
+    }
+    Ok(())
 }
 
 fn request_is_active(status: TurnStatus) -> bool {
@@ -2726,11 +2725,11 @@ fn request_is_active(status: TurnStatus) -> bool {
     )
 }
 
-pub fn resume_request(t: &GitTransport, request: &str) -> Result<(), String> {
+pub fn resume_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
     oid(request, "request")?;
-    let store = conversation_secret_store(t)?;
+    let secrets = conversation_secrets(id)?;
     let server = t.server_url()?;
-    compute_client_request_with_store(&server, request, &store).map(|_| ())
+    compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2771,11 +2770,12 @@ pub fn run_chat_turn(
     if let Some(request) = request {
         emit(TurnEvent::PhaseStarted(TurnPhase::Model));
         emit(TurnEvent::Status("waiting for agent".to_string()));
-        let store = conversation_secret_store(t)?;
+        let secrets = conversation_secrets(id)?;
         let server = t.server_url()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = compute_client_request_with_store(&server, &request, &store).map(|_| ());
+            let result =
+                compute_client_request_with_secrets(&server, &request, &secrets).map(|_| ());
             let _ = tx.send(result);
         });
         request_result = Some(rx);
@@ -2836,12 +2836,13 @@ pub fn generate_conversation_title(
     options: &TurnOptions,
     first_message: &str,
 ) -> Result<String, String> {
-    let store = conversation_secret_store(t)?;
+    ensure_conversation_secret()?;
+    let secrets = Secrets::current();
     let mut kvs = Vec::new();
     if let Some(url) = &options.base_url {
         kvs.push(format!("--base-url={url}"));
     }
-    let llm_base = resolve_image_arg(t, options.llm_call.as_deref(), LLM_CALL_ARG, &store, None)?;
+    let llm_base = resolve_image_arg(t, options.llm_call.as_deref(), LLM_CALL_ARG, &secrets, None)?;
     let llm = curry_client_object(t, &llm_base, &kvs)?.to_string();
     let messages = serde_json::to_string(&title_messages(first_message))
         .map_err(|error| format!("encoding title context: {error}"))?;
@@ -2854,7 +2855,7 @@ pub fn generate_conversation_title(
             options.model.as_deref().unwrap_or(DEFAULT_MODEL)
         ),
     ];
-    let (kind, hash) = run_client_request_with_store(t, &llm, &call, &store)?;
+    let (kind, hash) = run_client_request_with_secrets(t, &llm, &call, &secrets)?;
     if kind != "blob" {
         return Err(format!(
             "conversation title run returned a {kind}, expected a blob"
@@ -3243,7 +3244,7 @@ fn run_line_turn(
         .map_err(|error| (error, false))?;
     (|| {
         if let Some(request) = request {
-            resume_request(t, &request)?;
+            resume_request(t, id, &request)?;
         }
         let load = conversation_load(t, id)?
             .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;

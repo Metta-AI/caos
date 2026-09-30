@@ -707,6 +707,22 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
     )
 }
 
+/// A private repository's token for a `:@@=` fetch — the header
+/// `POST /git/import` takes, for the same reason: it is the caller's, scoped
+/// to one URL, and never looked up from the calling job's secrets.
+fn git_token(request: &Request) -> Result<Option<String>, HttpError> {
+    let tokens: Vec<_> = request
+        .headers()
+        .iter()
+        .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
+        .map(|h| h.value.as_str().to_owned())
+        .collect();
+    if tokens.len() > 1 {
+        return Err(HttpError::new(400, "duplicate Git token header"));
+    }
+    Ok(tokens.into_iter().next())
+}
+
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`, `/sub-run`), and the runner
 /// protocol (`/runner/poll`, `/runner/result`).
@@ -728,20 +744,15 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
         Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
         Method::Get if path == "/eval" => {
             let secrets = secret_context(config, request)?;
-            // The same sensitive header `POST /git/import` takes, for the same
-            // reason: a private repository's token is the caller's, scoped to
-            // one URL, and never looked up from the calling job's secrets. Only
-            // a `root:@@=` root can use it; the others need no credential.
-            let tokens: Vec<_> = request
-                .headers()
-                .iter()
-                .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
-                .map(|h| h.value.as_str().to_owned())
-                .collect();
-            if tokens.len() > 1 {
-                return Err(HttpError::new(400, "duplicate Git token header"));
-            }
-            compute::eval_endpoint(config, &query, &secrets, tokens.first().map(String::as_str))
+            let token = git_token(request)?;
+            compute::eval_endpoint(config, &query, &secrets, token.as_deref())
+        }
+        Method::Post if path == "/submit" => {
+            let secrets = secret_context(config, request)?;
+            let token = git_token(request)?;
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body)?;
+            compute::submit(config, &body, &secrets, token.as_deref())
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),

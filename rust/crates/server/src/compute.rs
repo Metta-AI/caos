@@ -188,9 +188,22 @@ pub(crate) fn eval_endpoint(
             let root = crate::locator::resolve_root(config, &git_ref, token)
                 .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
             let dir = git_ref.dir.as_deref().unwrap_or("");
-            eval_in_tree(config, &root.to_string(), dir, secrets).map_err(|e| {
+            let result = eval_in_tree(config, &root.to_string(), dir, secrets).map_err(|e| {
                 HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message()))
-            })
+            })?;
+            if let Some((_, hash)) = std::str::from_utf8(&result)
+                .ok()
+                .and_then(|r| r.split_once(' '))
+            {
+                crate::secrets::record_origin(
+                    hash.trim(),
+                    caos_eval::Origin {
+                        root: root.to_string(),
+                        path: dir.to_string(),
+                    },
+                );
+            }
+            Ok(result)
         }
     }
 }
@@ -205,10 +218,6 @@ fn eval_in_tree(
     path: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    use gix::objs::tree::{Entry, EntryKind};
-
-    let root_oid = gix::ObjectId::from_hex(root.as_bytes())
-        .map_err(|_| HttpError::new(400, format!("root:hash={root:?} is not an object id")))?;
     // The memo identity: the input tree and the path. Content-addressed by
     // storing it, so the redis key is fixed-length. Not with secrets: a grant
     // is decided, and recorded, by walking (SPEC, "Secrets").
@@ -222,7 +231,24 @@ fn eval_in_tree(
             return Ok(result.into_bytes());
         }
     }
+    let result = evaluate(config, root, path, secrets)?;
+    if let Some(key) = &key {
+        let _ = cache_set(&config.redis_addr, key, &result);
+    }
+    Ok(result.into_bytes())
+}
 
+/// Walk `root` down to `path`, returning `"<kind> <hash>"`.
+fn evaluate(
+    config: &Config,
+    root: &str,
+    path: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    use gix::objs::tree::{Entry, EntryKind};
+
+    let root_oid = gix::ObjectId::from_hex(root.as_bytes())
+        .map_err(|_| HttpError::new(400, format!("root:hash={root:?} is not an object id")))?;
     // The `{in, eval}` continuation `resolve_promise` walks: `in` is the tree,
     // `eval` a blob naming the path within it.
     let eval_blob = store_git_blob(config, path.as_bytes()).map_err(|e| HttpError::new(500, e))?;
@@ -249,10 +275,155 @@ fn eval_in_tree(
     // names itself.
     let cont = cont.to_string();
     let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], secrets)?;
-    if let Some(key) = &key {
-        let _ = cache_set(&config.redis_addr, key, &result);
+    Ok(result)
+}
+
+/// A locator's object: its `rev`'s tree, descended to `dir=` by evaluation.
+fn evaluate_locator(
+    config: &Config,
+    locator: &str,
+    token: Option<&str>,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
+    let root = crate::locator::resolve_root(config, &git_ref, token)
+        .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+    let dir = git_ref.dir.as_deref().unwrap_or("");
+    let result = evaluate(config, &root.to_string(), dir, secrets)
+        .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
+    if let Some((_, hash)) = result.split_once(' ') {
+        crate::secrets::record_origin(
+            hash,
+            caos_eval::Origin {
+                root: root.to_string(),
+                path: dir.to_string(),
+            },
+        );
     }
-    Ok(result.into_bytes())
+    Ok(result)
+}
+
+/// `POST /submit` — form a request (SPEC, "Submitting work") and return
+/// `tree <ArgTree>` and a `granted <name>…` line: the secrets a run of it
+/// would be given. The body is JSON:
+///
+/// - `bundle`: a tree the client pushed, holding `args` (the call's entries,
+///   ready) and, when `base` is a path, `root` (the tree it is a path in);
+/// - `base`: `{"type": "path"|"locator"|"hash"|"docker", "value": …}`;
+/// - `locators` (optional): `{name: locator}`, args evaluated here;
+/// - `salt` (optional).
+///
+/// Everything that needs evaluating is evaluated here, so the client's whole
+/// part is one push and this call.
+pub(crate) fn submit(
+    config: &Config,
+    body: &[u8],
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    let bad = |message: String| HttpError::new(400, message);
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad(format!("body is not JSON: {e}")))?;
+    let text = |value: &serde_json::Value, what: &str| {
+        value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| bad(format!("{what} must be a string")))
+    };
+    let bundle = text(&json["bundle"], "bundle")?;
+    let entry = |name: &str| -> Result<Option<gix::objs::tree::Entry>, HttpError> {
+        Ok(fetch_tree(config, &bundle)
+            .map_err(|e| bad(format!("bundle {bundle}: {e}")))?
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| named_entry(&e.name, e.mode, e.oid)))
+    };
+    let kind_hash = |result: String| -> Result<(String, String), HttpError> {
+        result
+            .split_once(' ')
+            .map(|(k, h)| (k.to_string(), h.to_string()))
+            .ok_or_else(|| HttpError::new(500, format!("malformed result {result:?}")))
+    };
+
+    let base_value = text(&json["base"]["value"], "base.value")?;
+    let image = match json["base"]["type"].as_str() {
+        Some("path") => {
+            let root = entry("root")?.ok_or_else(|| bad("a path base needs bundle/root".into()))?;
+            kind_hash(evaluate(
+                config,
+                &root.oid.to_string(),
+                &base_value,
+                secrets,
+            )?)?
+            .1
+        }
+        Some("locator") => kind_hash(evaluate_locator(config, &base_value, token, secrets)?)?.1,
+        Some("hash") => base_value,
+        Some("docker") => format!("docker://{base_value}"),
+        other => return Err(bad(format!("unknown base type {other:?}"))),
+    };
+
+    let mut call = match entry("args")? {
+        Some(args) => fetch_tree(config, &args.oid.to_string())
+            .map_err(|e| bad(format!("bundle args: {e}")))?
+            .into_iter()
+            .map(|e| named_entry(&e.name, e.mode, e.oid))
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(locators) = json["locators"].as_object() {
+        for (name, locator) in locators {
+            let locator = text(locator, "a locator")?;
+            let (kind, hash) = kind_hash(evaluate_locator(config, &locator, token, secrets)?)?;
+            let oid = gix::ObjectId::from_hex(hash.as_bytes())
+                .map_err(|_| HttpError::new(500, format!("{hash:?} is not an object id")))?;
+            call.push(named_entry(name, caos_eval::mode_of_kind(&kind), oid));
+        }
+    }
+    // A base may itself be a formed request, carried forward with more args.
+    let (image, call) = match flat_arg_tree(config, &image)? {
+        Some((inner, bound)) => (inner, merge_entries(bound, call)),
+        None => (image, call),
+    };
+    let salt = json["salt"].as_str().unwrap_or("");
+    let arg_tree = form_arg_tree(config, &image, call, salt)?;
+    let granted = crate::secrets::granted_names(secrets, &args_entries(config, &arg_tree)?);
+    Ok(format!("tree {arg_tree}\ngranted {}\n", granted.join(" ")).into_bytes())
+}
+
+/// A formed ArgTree's `base` and its other entries; `None` for anything else.
+/// A git-docker image carries a `base` of its own, and `config.json`, which no
+/// arg can be named.
+fn flat_arg_tree(
+    config: &Config,
+    hash: &str,
+) -> Result<Option<(String, Vec<gix::objs::tree::Entry>)>, HttpError> {
+    if !(hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Ok(None);
+    }
+    let Ok(entries) = fetch_tree(config, hash) else {
+        return Ok(None);
+    };
+    if entries
+        .iter()
+        .any(|e| e.name == CURRY_MARKER || e.name == "config.json")
+    {
+        return Ok(None);
+    }
+    let Some(base) = entries.iter().find(|e| e.name == "base") else {
+        return Ok(None);
+    };
+    let base = if base.mode.is_tree() {
+        base.oid.to_string()
+    } else {
+        blob_string(config, &base.oid.to_string())?
+    };
+    let bound = entries
+        .into_iter()
+        .filter(|e| e.name != "base")
+        .map(|e| named_entry(&e.name, e.mode, e.oid))
+        .collect();
+    Ok(Some((base, bound)))
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
@@ -1590,6 +1761,26 @@ fn run_image(
     secrets: &crate::secrets::Context,
     record: impl FnOnce(&str),
 ) -> Result<String, HttpError> {
+    let arg_tree = form_arg_tree(config, image_ref, call_args, salt)?;
+    record(&arg_tree);
+    run_work_request(
+        config,
+        &WorkRequest {
+            arg_tree: &arg_tree,
+            stack,
+            secrets,
+        },
+    )
+}
+
+/// The ArgTree `image_ref` with `call_args` makes: its bound args, the call's,
+/// its `base`, and the salt.
+fn form_arg_tree(
+    config: &Config,
+    image_ref: &str,
+    call_args: Vec<gix::objs::tree::Entry>,
+    salt: &str,
+) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
     let (image, bound) = unwrap_curry(config, image_ref)?;
@@ -1623,16 +1814,7 @@ fn run_image(
         args = merge_entries(args, vec![salt_entry]);
     }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
-    let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
-    record(&arg_tree);
-    run_work_request(
-        config,
-        &WorkRequest {
-            arg_tree: &arg_tree,
-            stack,
-            secrets,
-        },
-    )
+    Ok(store_git_tree(config, args).map_err(store_err)?.to_string())
 }
 
 /// The entries `run_image` puts in every ArgTree formed from `image_ref`,
