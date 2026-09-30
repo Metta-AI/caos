@@ -234,12 +234,18 @@ The wrapper is a new std tool, `std/actor`, laid out like `run-and-update-ref`
 (`rustc` factory, `git-runner` as `--output-runner`). It depends on
 `worker-common` and the shared ref code from item 4 above.
 
-0. **Spike (verify before building).**
-   - Build a root tree and a commit from oids alone, with no checkout
-     (`TreeBuilder` builds the tree; `worker-common` has `write_commit` and
-     `write_commit_as`, and I have not confirmed they take a tree oid or that
-     `TreeBuilder` can write to the store a wrapper has).
-   - Confirm the shallow-fetch-then-push path works for a commit built that way.
+0. **Spike (verify before building).** An integration test against the test
+   stack, using real `git`:
+   - **Push a commit whose new state tree exists only on the server.** Stage a
+     state tree with `caos put`, build a commit on the observed head that points
+     at it (`TreeBuilder` plus `write_commit`), and push it with a lease, without
+     ever fetching that tree into the scratch repo. My best guess is a partial
+     (promisor) scratch repo, where the missing objects are "promised" and the
+     push sends nothing the server lacks; I have not tried it. Fallbacks, both
+     worse: fetch the state closure (fine for small state, but it breaks the
+     no-manifest rule), or add a small push-by-oid endpoint to the server (which
+     breaks "no server change").
+   - Confirm the depth-1, `tree:0` head fetch reads the state oid cheaply.
    - Confirm a start/finish pair can carry the observed head through the
      callback.
 1. **Wrapper and a reference inner.** The inner is a small key-value actor
