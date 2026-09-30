@@ -1,6 +1,7 @@
 # Runner protocol — sequential jobs on warm workers
 
-**Status:** design agreed, not yet implemented. Replaces the existing
+**Status:** implemented (`rust/crates/server/src/runner.rs`: `/runner/poll`,
+`/runner/result`). Replaces the existing
 backends outright: `dispatch_docker`/`dispatch_serve`/`dispatch_fly`, the
 `Backend` enum, the worker-slot semaphore, `caos entrypoint`, and `caos serve`
 are all deleted, and the dev stack gains `caos runnerd` as a required daemon.
