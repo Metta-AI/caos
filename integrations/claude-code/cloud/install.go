@@ -386,7 +386,7 @@ func contains(haystack []string, needle string) bool {
 const commandFooter = `
 The earlier session's context is not in your head, so recover it before doing anything else:
 
-1. Read the recorded history of commit $ARGUMENTS. Use the conversation-history tool if this workspace provides one, and read its output. Failing that, read the transcript directly: "ls" with root set to $ARGUMENTS and path ".caos/transcript", then "read" the entries (a tool call's result is under ".caos/tools/").
+1. Read the recorded history of commit $ARGUMENTS with the std/caos-conversation tool: call "run_tool" with path "caos-std/caos-conversation" and arguments {"hash": "$ARGUMENTS"}, and read all of its output. It cuts long tool arguments and results; to see one call in full, run it again with "call" set to that call's toolu_ id ("tool_help" at the same path lists its parameters).
 2. The last turn may be unfinished. A call the earlier session never got a result for is recorded as cancelled ("the session that ran this call ended before it finished"). If its result matters, run it again.
 3. Tell me in a few lines what the conversation was doing and where it stopped, then wait for my next instruction.
 `
@@ -400,7 +400,7 @@ caos-conversation-command: fork $ARGUMENTS
 
 You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original.
 ` + commandFooter,
-	"resume-from-caos-conversation.md": `---
+	"resume-caos-conversation.md": `---
 description: Continue a recorded caos conversation in this new session (the same branch)
 argument-hint: <conversation-commit-hash>
 ---

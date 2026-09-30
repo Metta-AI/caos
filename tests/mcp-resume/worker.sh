@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `/fork-caos-conversation <hash>` and `/resume-from-caos-conversation <hash>`,
+# `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`,
 # as the hook sees them on a new session's first prompt.
 #
 #   fork    the new session gets its OWN conversation, whose history is <hash>'s;
@@ -73,7 +73,7 @@ stop "$f" "forked and done"
 
 echo "== resume: the same branch ==" >&2
 r="resume-r-$stamp"
-out=$(prompt "$r" "/resume-from-caos-conversation $head_a")
+out=$(prompt "$r" "/resume-caos-conversation $head_a")
 case "$out" in
   *"resumed at"*) ;;
   *) fail "the hook did not say it resumed: $out" ;;
@@ -90,11 +90,11 @@ esac
 
 echo "== resume needs the head, and says so ==" >&2
 old_head=$head_a   # the branch has moved past it now
-if prompt "resume-stale-$stamp" "/resume-from-caos-conversation $old_head" >/tmp/stale.out 2>/tmp/stale.err; then
+if prompt "resume-stale-$stamp" "/resume-caos-conversation $old_head" >/tmp/stale.out 2>/tmp/stale.err; then
   fail "resumed from a commit that is no longer the head"
 fi
 grep -q "not the head" /tmp/stale.err || fail "the refusal does not say why: $(cat /tmp/stale.err)"
-if prompt "resume-bad-$stamp" "/resume-from-caos-conversation main" >/dev/null 2>/tmp/bad.err; then
+if prompt "resume-bad-$stamp" "/resume-caos-conversation main" >/dev/null 2>/tmp/bad.err; then
   fail "accepted a branch name where a commit hash belongs"
 fi
 grep -q "40-character" /tmp/bad.err || fail "the refusal does not say what is wanted: $(cat /tmp/bad.err)"
@@ -121,7 +121,7 @@ esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
 
 h="resume-h-$stamp"
-prompt "$h" "/resume-from-caos-conversation $head_b" >/dev/null
+prompt "$h" "/resume-caos-conversation $head_b" >/dev/null
 case "$(subjects "$(ref_of "cc/$b")")" in
   "request.claim request.admit message.append request.terminal "*) ;;
   *) fail "the open request was not closed on the resumed branch: $(subjects "$(ref_of "cc/$b")")" ;;

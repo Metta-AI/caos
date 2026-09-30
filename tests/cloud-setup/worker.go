@@ -255,13 +255,15 @@ func main() {
 		// expansion rather than what was typed, so it is asserted, not just the
 		// file.
 		for name, mode := range map[string]string{
-			"fork-caos-conversation.md":        "fork",
-			"resume-from-caos-conversation.md": "resume",
+			"fork-caos-conversation.md":   "fork",
+			"resume-caos-conversation.md": "resume",
 		} {
 			body, err := os.ReadFile("/tmp/home/.claude/commands/" + name)
 			w.Must(err)
 			w.True(strings.Contains(string(body), "caos-conversation-command: "+mode+" $ARGUMENTS"),
 				"%s does not carry the marker line the hook keys on:\n%s", name, body)
+			w.True(strings.Contains(string(body), `"caos-std/caos-conversation"`),
+				"%s does not send the model to std/caos-conversation for the history:\n%s", name, body)
 		}
 
 		permissions, _ := settings["permissions"].(map[string]any)

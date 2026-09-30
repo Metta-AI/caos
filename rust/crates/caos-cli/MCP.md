@@ -276,7 +276,7 @@ start from — the `caos head <hash>` a turn prints, or `conversation head:` fro
 | Command | Result |
 |---|---|
 | `/fork-caos-conversation <hash>` | a NEW branch: the session's own `cc/<session>` conversation, made by `conversation.fork` on `<hash>`. The original does not move. |
-| `/resume-from-caos-conversation <hash>` | the SAME branch: the session records into the conversation `<hash>` belongs to, and gets none of its own. `<hash>` must be that conversation's current head; otherwise the hook refuses and names `/fork-caos-conversation`. |
+| `/resume-caos-conversation <hash>` | the SAME branch: the session records into the conversation `<hash>` belongs to, and gets none of its own. `<hash>` must be that conversation's current head; otherwise the hook refuses and names `/fork-caos-conversation`. |
 
 `cloud/install.go` writes both commands into Claude Code's user config. The hook
 acts on a session's **first prompt** (`resume.rs`): it recognises the command, sets

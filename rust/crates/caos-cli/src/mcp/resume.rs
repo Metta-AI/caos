@@ -5,12 +5,12 @@
 //! moves):
 //!
 //! ```text
-//! /fork-caos-conversation <hash>          a NEW branch: the new session's own
-//!                                         `cc/<session>` conversation, whose
-//!                                         history is <hash>'s, then diverges
-//! /resume-from-caos-conversation <hash>   the SAME branch: the new session
-//!                                         appends to the conversation <hash>
-//!                                         belongs to
+//! /fork-caos-conversation <hash>     a NEW branch: the new session's own
+//!                                    `cc/<session>` conversation, whose
+//!                                    history is <hash>'s, then diverges
+//! /resume-caos-conversation <hash>   the SAME branch: the new session
+//!                                    appends to the conversation <hash>
+//!                                    belongs to
 //! ```
 //!
 //! Both are recognised by the `UserPromptSubmit` hook on a session's first
@@ -56,7 +56,7 @@ use crate::{
     resolve_username, update_local_cache, validate_cached,
 };
 
-pub(super) const RESUME_COMMAND: &str = "resume-from-caos-conversation";
+pub(super) const RESUME_COMMAND: &str = "resume-caos-conversation";
 pub(super) const FORK_COMMAND: &str = "fork-caos-conversation";
 
 /// A line the slash commands' expanded text carries, so the hook still finds the
@@ -477,7 +477,10 @@ mod tests {
             format!("/{RESUME_COMMAND} {}", &HASH[..12]),
         ] {
             let error = parse_command(&prompt).unwrap_err();
-            assert!(error.contains("/fork-caos-conversation") || error.contains("/resume-from"));
+            assert!(
+                error.contains("/fork-caos-conversation")
+                    || error.contains("/resume-caos-conversation")
+            );
         }
         assert!(parse_command(&format!("{MARKER} sideways {HASH}")).is_err());
     }

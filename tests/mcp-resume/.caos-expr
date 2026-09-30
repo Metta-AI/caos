@@ -2,7 +2,7 @@
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A CLIENT TEST — it drives `caos mcp hook` the way Claude Code does, to pin what
-# `/fork-caos-conversation <hash>` and `/resume-from-caos-conversation <hash>`
+# `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
 # do on a NEW session's first prompt: a fork is a new branch from the same
 # commit, a resume appends to the SAME branch, and a head a session died on is
 # used as it is (its open request closed on top of it) rather than refused.

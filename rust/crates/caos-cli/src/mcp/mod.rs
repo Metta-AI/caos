@@ -610,7 +610,7 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    // `/fork-caos-conversation <hash>` and `/resume-from-caos-conversation <hash>`
+    // `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
     // decide WHICH conversation this session records into, so they run before it
     // is looked up. Both are no-ops once the session has its conversation.
     let note = match resume::parse_command(prompt)? {
