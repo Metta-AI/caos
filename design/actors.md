@@ -2,8 +2,14 @@
 
 **Status:** wrapper (`std/actor`) and a reference key-value inner
 (`tests/actor`) implemented; the spike is resolved (see [Spike results](#spike-results)).
-Still to do: the lost-race, crash-retry, laziness and cache-hit tests from the
-build plan, and the docs item. Daemons are deliberately set aside; see
+`tests/actor` covers the build plan's cases: concurrent writers converging, a
+forced lost race that fails uncached and succeeds on retry, an idempotent
+re-apply (which is also the crash-after-push retry), a read making no commit,
+the inner's lazy view of the state, and the inner's cache hit. Two caveats: a
+real crash between push and reply is not injected (a re-applied message is the
+same observable), and laziness is checked from inside the inner, not by
+counting server object reads. Open question 6 (history fetched on every write)
+is unresolved. Daemons are deliberately set aside; see
 [Deferred: daemons](#deferred-daemons).
 
 Builds on [client-owned conversation refs](client-owned-conversation-refs.md)
