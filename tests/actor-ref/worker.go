@@ -96,7 +96,7 @@ func main() {
 	w.Main(func() {
 		url := strings.TrimRight(os.Getenv("CAOS_SERVER_URL"), "/")
 		w.True(url != "", "this test needs CAOS_SERVER_URL from the runner")
-		w.Do(scriptCat("/cas/args/test-salt"))
+		run("caos", "get", "/cas/args/test-salt")
 		salt := strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/test-salt"))))
 		ref := fmt.Sprintf("refs/heads/actors/ref-%s-%d", salt, os.Getpid())
 
