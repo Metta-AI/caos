@@ -56,6 +56,7 @@ mod push;
 mod remote_git;
 mod repair;
 mod runner;
+mod secret_store;
 mod secrets;
 mod status;
 mod storage;
@@ -119,6 +120,8 @@ struct Config {
     /// Filesystem path to the git object database, passed to `git http-backend`
     /// as `GIT_PROJECT_ROOT` for the smart-HTTP transport (see [`mod git`]).
     git_dir: String,
+    /// `secrets.git`, which nothing else in this server links to.
+    secrets_git: String,
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
@@ -323,6 +326,12 @@ fn main() {
         std::process::exit(1);
     });
 
+    let secrets_git = env_or("CAOS_SECRETS_GIT_DIR", &secret_store::default_dir(&git_dir));
+    secret_store::init(&secrets_git).unwrap_or_else(|error| {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    });
+
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
         registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
@@ -330,6 +339,7 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         cache_namespace: env_or("CAOS_CACHE_NAMESPACE", ""),
         git_dir,
+        secrets_git,
         repo,
     });
 
@@ -749,6 +759,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
         }
         Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/git/push" => push::endpoint(config, request),
+        Method::Post if path == "/secrets/push" => secret_store::push_endpoint(config, request),
         Method::Post if path == "/sub-run" => {
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;

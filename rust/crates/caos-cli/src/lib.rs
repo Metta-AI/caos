@@ -6,6 +6,7 @@ pub use mcp::cli_mcp;
 pub mod filesystem;
 pub mod host_git;
 pub mod publication;
+pub mod secret_store;
 pub mod source_trees;
 
 #[cfg(test)]
