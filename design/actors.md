@@ -116,8 +116,10 @@ while the inner runs, and it needs `git` (selected through `git-runner` in its
 
 **Start**
 
-1. Read the branch head with an exact-ref, shallow, tree-filtered fetch. Absent
-   branch means empty state.
+1. Read the branch head's oid with `git ls-remote`, then fetch **only that
+   commit** (`--depth=1 --filter=tree:0`; the server allows filters and
+   fetch-by-oid). The commit names its root tree, and the `state/` entry in that
+   tree gives the state oid. Absent branch means empty state.
 2. Take the `state/` subtree oid from the head.
 3. Build the inner request R from `inner`, `state` (the oid) and `message`.
 4. Emit `run-request-then R`, carrying the observed head (and the branch name)
