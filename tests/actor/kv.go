@@ -1,4 +1,4 @@
-// Reference inner actor (design/actors.md): a key-value store. A pure function
+// Reference inner actor (std/actor/README.md): a key-value store. A pure function
 // of (state tree, message) -> {state, reply}. Messages are idempotent:
 //
 //	put <key> <value>   set key (applying twice is the same as once)
