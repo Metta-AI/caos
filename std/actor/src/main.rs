@@ -92,6 +92,14 @@ fn fetch_one(oid: &Oid, shallow: bool) -> Result<(), String> {
     let mut args = vec!["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
     // A shallow repository cannot push (the server refuses shallow pushes), so
     // only start, which merely reads, may cut the history off.
+    //
+    // KNOWN PROBLEM (design/actors.md, open question 6): finish therefore needs
+    // the branch's whole commit history, a "deep checkout", on every write.
+    // Pushing from a partial clone does not get around it. Even with a promisor
+    // remote and a depth-1 pack that git marks `.promisor`, deleting the `shallow`
+    // file and pushing a child fails with `Could not read <parent>`: the
+    // pack-objects that `git push` starts walks the head's parents and does not
+    // tolerate a promised (absent) one. `--no-thin` makes no difference.
     if shallow {
         args.push("--depth=1");
     }
