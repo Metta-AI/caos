@@ -1,4 +1,4 @@
-// tests/actor-ref — SPIKE for design/actors.md, open question 6.
+// tests/actor-ref — SPIKE for std/actor/README.md, open question 6.
 //
 // Can a worker move a branch with a compare-and-swap WITHOUT any scratch
 // repository and without fetching any history? A git push is a command line
