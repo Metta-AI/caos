@@ -1,0 +1,11 @@
+# What this test reaches for (format `<path> <name>`); see tests/mcp-serve/DEPS.
+# The hook resolves `--llm-step` to form a request, so the step and what it is
+# built from come with it.
+../../std/bash-tool bash-tool
+../../std/llm-step llm-step
+../../std/rgrep rgrep
+../../std/cargo cargo
+../../std/bash bash
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test

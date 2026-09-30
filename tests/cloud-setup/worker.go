@@ -250,6 +250,22 @@ func main() {
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
 			"nothing runs the session hook")
 
+		// The slash commands that start a session from a recorded conversation.
+		// The marker line is what the prompt hook keys on if it is handed the
+		// expansion rather than what was typed, so it is asserted, not just the
+		// file.
+		for name, mode := range map[string]string{
+			"fork-caos-conversation.md":   "fork",
+			"resume-caos-conversation.md": "resume",
+		} {
+			body, err := os.ReadFile("/tmp/home/.claude/commands/" + name)
+			w.Must(err)
+			w.True(strings.Contains(string(body), "caos-conversation-command: "+mode+" $ARGUMENTS"),
+				"%s does not carry the marker line the hook keys on:\n%s", name, body)
+			w.True(strings.Contains(string(body), `"caos-std/caos-conversation"`),
+				"%s does not send the model to std/caos-conversation for the history:\n%s", name, body)
+		}
+
 		permissions, _ := settings["permissions"].(map[string]any)
 		deny := fmt.Sprint(permissions["deny"])
 		allow := fmt.Sprint(permissions["allow"])

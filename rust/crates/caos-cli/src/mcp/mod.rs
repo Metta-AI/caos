@@ -24,6 +24,7 @@
 //! result; the request a prompt admits is claimed here rather than by a worker,
 //! because the turn is already running by the time the hook fires.
 
+mod resume;
 mod serve;
 
 use std::io::Read;
@@ -158,7 +159,7 @@ fn run_tool(
     let fresh = GitTransport::from_cwd()
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
     let t = &fresh;
-    let id = conversation_id_for(session)?;
+    let id = resume::conversation_for_session(t, session)?;
     // The prompt hook that opens this conversation runs in another process and
     // takes seconds; the first tool call can beat it. Wait for the record
     // rather than refuse the call. A no-op on every turn but the racing first.
@@ -605,13 +606,27 @@ fn debug_log_hook(
 /// the first prompt of a session establishes its base and fallback title
 /// exactly as the TUI's first message does.
 fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
         return Ok(());
     }
+    // `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
+    // decide WHICH conversation this session records into, so they run before it
+    // is looked up. Both are no-ops once the session has its conversation.
+    let note = match resume::parse_command(prompt)? {
+        Some(command) => {
+            // Both talk to the server before anything below would have proven it
+            // reachable.
+            wait_server_reachable(t)?;
+            resume::begin(t, string_field(payload, "session_id")?, &command)?
+        }
+        None => None,
+    };
+    let id = recorded_conversation(t, payload)?;
     if record_prompt(t, options, &id, prompt)? {
         announce(&format!("caos conversation ref {}", conversation_ref(&id)?))?;
+    } else if let Some(note) = note {
+        announce(&note)?;
     }
     Ok(())
 }
@@ -901,8 +916,18 @@ fn outstanding_call(
     Ok(None)
 }
 
+/// The conversation a hook payload's session records into: the one it was
+/// resumed onto (`resume`), or else the one its id derives.
+fn recorded_conversation(t: &GitTransport, payload: &Value) -> Result<String, String> {
+    resume::conversation_for_session(t, string_field(payload, "session_id")?)
+}
+
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
+/// (The one exception is a session RESUMED onto an existing conversation, which
+/// keeps that conversation's id; `resume` owns that, and this is what every
+/// other session gets.)
+#[cfg(test)]
 fn conversation_id(payload: &Value) -> Result<String, String> {
     conversation_id_for(string_field(payload, "session_id")?)
 }
@@ -971,7 +996,7 @@ fn payload_bytes(value: &Value) -> Result<Vec<u8>, String> {
 
 /// The assistant's closing message, and the end of the request it answered.
 fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
+    let id = recorded_conversation(t, payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
@@ -1078,7 +1103,7 @@ fn announce(text: &str) -> Result<(), String> {
 
 /// A turn that ended badly closes its request as failed.
 fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
-    let id = conversation_id(payload)?;
+    let id = recorded_conversation(t, payload)?;
     let kind = payload
         .get("error_type")
         .and_then(Value::as_str)

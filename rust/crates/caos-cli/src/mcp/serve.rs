@@ -470,14 +470,15 @@ fn conversation_status(session: Option<&str>) -> String {
              PreToolUse hook that supplies it is not installed\n"
         );
     };
-    let id = match super::conversation_id_for(session) {
+    let t = match GitTransport::from_cwd() {
+        Ok(t) => t,
+        Err(error) => return format!("conversation: cannot open the workspace: {error}\n"),
+    };
+    let id = match super::resume::conversation_for_session(&t, session) {
         Ok(id) => id,
         Err(error) => return format!("conversation: session {session:?} is unusable: {error}\n"),
     };
-    let head = GitTransport::from_cwd().and_then(|t| {
-        let store = crate::open_store(&t)?;
-        crate::fetch_validated_head(&t, &store, &id)
-    });
+    let head = crate::open_store(&t).and_then(|store| crate::fetch_validated_head(&t, &store, &id));
     let head = match head {
         Ok(Some((_, head))) => head.as_str().to_string(),
         Ok(None) => "none yet -- no turn has been recorded".to_string(),
