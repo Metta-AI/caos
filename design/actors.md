@@ -40,7 +40,7 @@ Cloudflare Durable Objects are the closest analogue. Four rules define it:
 Nothing in the server changes for this. An actor is a convention for workers
 (see [What caos changes](#what-caos-changes)).
 
-| flavour | process | when |
+| flavor | process | when |
 |---|---|---|
 | **pure** | one-shot worker per request | state is data; the rules above are all it needs |
 | **daemonic** | container that registers as a runner and stays up until idle | performance, or a live process (a test stack) |
