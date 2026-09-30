@@ -266,6 +266,25 @@ The wrapper is a new std tool, `std/actor`, laid out like `run-and-update-ref`
 3. **Docs.** Refresh the `runner-protocol.md` status line (it still says "not
    yet implemented", but `runner.rs` implements it), and link this doc.
 
+### Spike results
+
+Measured against the test stack with real `git`:
+
+- **The promisor guess works, with one addition.** A scratch repo configured as
+  a partial clone of the server (`extensions.partialClone=origin`,
+  `remote.origin.promisor=true`, filter `tree:0`) can push a commit whose new
+  state tree was never downloaded, but only if that tree's *root object* was
+  fetched through the filter first. A commit pointing at an object the repo has
+  never seen fails in pack-objects (`Could not read <oid>`); one fetched with
+  `--filter=tree:0 origin <state-oid>` makes its children "promised" and the
+  push goes through. Cost: one tree object per update.
+- **Shallow fetches cannot push.** The server answers `shallow pushes are not
+  accepted`. Start may read the head with `--depth=1`; finish, which pushes,
+  fetches the parent commit without depth (commits only, no trees). That is
+  linear in history length, so it sharpens open question 2 (history growth).
+- The start/finish pair carries the observed head and input state through the
+  callback by currying them onto the wrapper's own ArgTree.
+
 ## Non-goals
 
 - Server-side ordering, leases or ref policy. The server stays transport.
