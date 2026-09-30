@@ -1,4 +1,4 @@
-// The actor wrapper (design/actors.md): run an inner `(state, message) ->
+// The actor wrapper (README.md): run an inner `(state, message) ->
 // (state', reply)` request against state kept on a Git branch, and publish the
 // new state with a compare-and-swap.
 //
