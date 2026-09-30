@@ -1,0 +1,7 @@
+# Same shape as run-and-update-ref: the rustc worker factory compiles this source
+# with the shared conversation protocol (for GitStore/TreeBuilder-style plumbing)
+# and curries the result onto the opt-in Git runner.
+../rustc rustc
+../git-runner git-runner
+../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator
