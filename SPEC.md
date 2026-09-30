@@ -420,29 +420,9 @@ on any of it, and each is written down because the reason is easy to lose.
 
 # Secrets
 
-**Status:** partly built. The store is carried as ephemeral run context and
-resolved client-side; injection (gated by the double-check below), superset
-matching over path-only readers, the entropy/`secret-hash` cache-isolation tag,
-the output-scrub assertion, log masking, and the `caos secrets` entropy tooling
-all exist. **Cache isolation is now complete for the eval path**: the running
-worker, eval-path's `curry` returns, and — via the eval-path stripping rule —
-a worker embedded through a `:@=` arg, which makes its embedder per-user too.
-Builds on `.caos-expr` (eval-path, deep-deps) and map-then (server-mediated
-worker starts).
-
-**Since the ambient-`std` removal landed** (design/caos-expr.md, "Landed:
-ambient `/std` is gone"), a reader is a **tree path and nothing else** — there
-is no `/std/<name>` to name, so the two reader forms collapsed into one, which
-is what this note always wanted. It also briefly *widened* the
-caller-propagation gap: eval-path used to mark a `/std/<name>` `:@=` target, and
-that was the only `:@=` marking there was. Closing it properly covers all of
-`:@=` and needs no `/std` special case at all.
-
-The agent harness carries the same store: conversation preparation resolves
-`llm-step` with it, the admitted request includes the resulting isolation
-identity, and foreground or recovery dispatches send the store out of band.
-Both conversation LLM workers read `anthropic-api-key` from `/secret`, never
-from a curried arg. `value:@=` remains UTF-8 only; see "Remaining work".
+**Status:** designed, not built. The code implements the previous design: a
+`.caos-secrets` directory in the client tree, readers resolved by the client,
+the whole store sent with every request in `X-Caos-Secrets`.
 
 ## Problem
 
@@ -450,42 +430,98 @@ Some tools need secrets: the github-push tool needs an auth token, and there wil
 - we don't want secrets in content-addressed stores, where they might leak
 - we don't want secrets in keys, because we don't want to invalidate (most) keys if a secret is rotated
 - we don't want secrets in one worker/arg tree to be able to be read from it by another worker
+- a session must be able to use a secret, or a new grant, added after it started. A cloud session's environment is fixed when the session starts
 
-## Solution
+## Store
 
-`.caos-secrets`:
-- Secrets live in a git-ignored .caos-secrets directory
-- Each secret file contains the secret's value and a list of workers that can read the secret. This is formatted as a repeated-key file. For example:
+- A user's secrets are a directory on their own machine, identified by a key
+  pair: a private **SecretWriterKey** and its public **SecretReaderKey**. The
+  directory is the only copy they keep: the server never returns a value.
+- `caos-cli secrets-push` sends the directory as a git tree, signed with the
+  SecretWriterKey over `(SecretReaderKey, tree oid, sequence)`. The server rejects a sequence
+  not higher than the last it accepted for that key, so an old push cannot be
+  replayed to undo a revocation. caos-cli fills in a missing `entropy=` before
+  signing.
+- A push replaces the key's previous tree. The server keeps these trees in
+  `secrets.git`, under `refs/keys/<SecretReaderKey>`: a git store never linked to the
+  main one (no alternates, no fetch endpoint, unreachable from a worker), with
+  reflogs off and pruned after every push, so a replaced value is gone.
+- `caos-cli secrets-push` needs no caos tree: `nix run <caos>#caos-cli -- secrets-push
+  --server=…`. It never takes a value in argv.
+
+Each file in the directory is one secret, as a repeated-key file:
 ```
-# Optional name. Defalts to the name of the file. This is the name that is used in the worker for /secret/<name>
+# Optional. Defaults to the file name. The worker reads /secret/<name>
 name=<name>
-entropy=...
-# Inline secret
-value=<secret key>
-# External key. Relative paths resolve from this secret file's directory.
-value:@=<file containing key>
-# A reader is a PATH to an expression, without arguments. It is eval-path'd to
-# an arg tree
-reader=std/github-push
-reader=tools/deploy
-# Use `value:env=...` and `entropy:env=...` to pull from the environment. If value comes from the env, entropy must too
+entropy=<filled in by push>
+value=<secret>
+# or read from a file, relative to this one
+value:@=<file>
+reader:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step since=<sha>
+reader:@=imports/caos/std/llm-step conversation=<id>
 ```
-- When a call stack is started, such as `caos-cli run`, we read the current source tree and the list of secrets. Readers in secrets are matched against the tree. Any worker named as a reader is granted access to the secret. These workers have a hash of the names and entropy of all exposed secrets injected into them as /cas/args/secret-hash
-- A reader naming a path the tree does not carry is ignored, with a warning
-  on stderr. Otherwise, it's too easy for a bad edit to prevent the tui from running
-- Something is considered to be the same worker (ie, to have access to the secret) if it its arg tree is a superset of the reader's arg tree and secret-hash matches the set of secrets that the server computes for it
-- Each granted secret contributes its (worker-visible name, entropy) to a
-  `secret-hash` entry folded into the worker's arg tree (visible at
-  `/cas/args/secret-hash`). This makes two users with different secrets see
-  different cache keys — but keps the secret's *value* out (so rotating a value
-  doesn't bust the cache), and stores the *digest* of the entropy, never the
-  entropy itself (the entropy is a bearer capability for the cache: knowing it
-  reconstructs the key of any run that used it). The name is included because a
-  different mount name would make the worker run differently
-- `secret-hash` in the arg tree also means that the cache key of a worker will depend on the secrets exposed to things that it calls, which is required to avoid accidentally sharing data derived from secrets through the cache
 
-Worker experience:
-- If a secret is visible to a worker, it is injected into a worker in `/secret/<name>`
+## Readers
+
+- **`reader:@@=<locator> [since=<sha>]`** grants the image at `dir=` in the
+  locator's `rev` and in each of its first-parent ancestors, back to and
+  including `since` (or to the root without `since`). First-parent, so a branch forked
+  before `since` and merged after it does not bring back the code `since`
+  excluded. The range is content; the URL only says where to fetch it.
+- **`reader:@=<path> conversation=<id>`** grants whatever is at `path` in that
+  conversation's tree, and only in that conversation. The agent can edit that
+  code, so this exposes the secret to the agent.
+
+Matching happens during evaluation, where the server knows the root tree `T`
+it evaluates from and the path `P` within it. Evaluation is a function of `T`
+and `P` (a parent `.caos-expr` can reshape everything below it, so nothing less
+than the whole root identifies the result):
+- `reader:@@=` matches when `P` is `dir=` and `T` is `C^{tree}` for a commit `C`
+  in its range. The allowed set is `git log --first-parent --format=%T`,
+  computed once per pushed tree, and needs no evaluation. A root that differs
+  from every commit in the range, anywhere, matches nothing; modified code is
+  what `reader:@=` is for.
+- `reader:@=` matches when the evaluation is of `path` in conversation `id`'s
+  tree, for a request of that conversation.
+
+This check runs on every evaluation, including one that is a memo hit.
+
+## Using secrets
+
+- A request names one or more SecretReaderKeys, out of band (a request
+  header), never in anything content-addressed. Public in the cryptographic
+  sense only: a SecretReaderKey is a credential, and clients redact it like a
+  ticket. A cloud environment sets it once;
+  secrets and grants pushed later need no change to it.
+- At admission the server resolves each key to its current tree and merges
+  them; a name defined under two keys is an error. Those tree oids are fixed
+  for the run and passed to every sub-run. A sub-run whose tree has since been
+  replaced fails, saying so.
+
+## Isolation
+
+- Each granted secret contributes its (worker-visible name, entropy) to a
+  `secret-hash` entry folded into the granted image's arg tree (visible at
+  `/cas/args/secret-hash`). Two users with different secrets therefore see
+  different cache keys, but the value stays out, so rotating a value does not
+  bust the cache. It stores the digest of the entropy, never the entropy: the
+  entropy is a bearer capability for the cache, since knowing it reconstructs
+  the key of any run that used it. The name is included because a different
+  mount name would make the worker run differently.
+- `secret-hash` in the arg tree also means that the cache key of a worker
+  depends on the secrets exposed to things that it calls, which is required to
+  avoid sharing data derived from secrets through the cache.
+- When evaluation grants an image, the server records `(run's secret trees,
+  image oid) → granted names`. At dispatch it injects a secret only if **both**
+  (a) the worker's arg tree is a superset of a recorded image granted it, and
+  (b) the arg tree carries the `secret-hash` the server computes for that set.
+  (b) alone is no proof: `secret-hash` is visible to anyone who has seen a
+  granted run. A missing record refuses; the next evaluation writes it again.
+  A push invalidates every record, because the key includes the trees.
+
+## Worker experience
+
+- If a secret is granted to a worker, it is injected at `/secret/<name>`
 - We attempt to scrub secret values from the logs of workers
 - We attempt to check files that are added to git with `caos put` for secret values. Any new file (hash not in git) that contains the value of a secret that is visible to this worker is rejected
 
@@ -503,23 +539,11 @@ not. So:
   a listing filtered to what one value's account can see, unless that value's
   identity is pinned by the entropy.
 
-Server behavior:
-- The server passes the list of secrets and the tree against which to evaluate them from one work request to the next, along with the stack
-- When dispatching a work request, the server injects a secret into the worker only if **both**: (a) the worker's arg tree is a superset of one of the secret's readers (identity), **and** (b) the worker's arg tree already carries a `secret-hash` entry equal to the one the server computes for the granted set. Condition (b) proves the worker was produced by eval with this store — so a secret's value can only ever reach a worker whose cache key *already* reflects that secret. A reader-match without the matching `secret-hash` (a worker not built through eval, or a stale/forged tree) is refused, fail-closed. This ties injection to isolation: injection ⟹ the isolating hash is in the key.
-
-Note that this means that the server sees all secrets. We can revisit if this becomes a problem
+The server holds every pushed value. We can revisit if this becomes a problem.
 
 ## Remaining work
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
-
-- **`run`-form `.caos-expr` grants** are deliberately unresolved (a grant must
-  never trigger compute); likely permanent.
-
-- **Shared-server exposure.** Carrying the whole store means a shared server
-  sees values it never injects (sub-runs aren't known ahead of time, so the
-  client can't pre-filter to the granted subset). Moot for a per-user/local
-  server; a tighter hand-off is future work.
 
 # Agent/harness integration
 
@@ -531,7 +555,7 @@ contain helpful tools, and the readmes describe those tools
 
 When starting a session:
 - The claude cloud env's setup field runs `go run <url>/integrations/claude-code/cloud/bootstrap.go --base=... --server=...`. That reads the flake/expression's caos pin, fetches the payload that pin names, and runs the `install.go` from it — which installs everything. Two stages because the installer is part of the payload, so dev mode can replace it
-- We start the conversation commit from this repo's default branch, or whatever branch the user chooses. The repo's TREE becomes the conversation's content, at the root — its readmes, its agents.md and its `.caos-secrets` are conversation files, not a source tree. A fresh conversation therefore carries the client repo and nothing else; there are no source trees until something is imported.
+- We start the conversation commit from this repo's default branch, or whatever branch the user chooses. The repo's TREE becomes the conversation's content, at the root — its readmes and its agents.md are conversation files, not a source tree. A fresh conversation therefore carries the client repo and nothing else; there are no source trees until something is imported.
 
 The user will then say something like "import <repo name>" and the agent will find the repo in github, import it as a source tree in the conversation commit and then start working on it 
 
