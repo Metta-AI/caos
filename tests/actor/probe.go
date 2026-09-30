@@ -93,7 +93,7 @@ func main() {
 
 		// Then behave as kv: build the --kv program as a command inside the
 		// prelude module (this worker runs there, in /tmp/run) and run it.
-		w.Do(execCmd("", "caos", "get", "/cas/args/kv"))
+		w.Must(execCmd("", "caos", "get", "/cas/args/kv"))
 		dir := "/tmp/run/kvcmd"
 		w.Must(os.RemoveAll(dir))
 		w.Must(os.MkdirAll(dir, 0o755))
