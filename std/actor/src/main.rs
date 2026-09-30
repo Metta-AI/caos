@@ -185,6 +185,10 @@ fn publish(state_ref: &str, head: Option<Oid>, new_state: Oid) -> Result<(), Str
     // This container is not start's, so the scratch repo holds nothing: bring in
     // the parent commit and the new state's root tree, one object each, so the
     // push can traverse the new commit without reading the state's closure.
+    //
+    // The parent is fetched WITHOUT --depth, which pulls in every ancestor
+    // commit (trees excluded): the deep checkout described in `fetch_one`. A
+    // promisor remote does not avoid this for a push; see open question 6.
     if let Some(head) = &head {
         fetch_one(head, false)?;
     }
