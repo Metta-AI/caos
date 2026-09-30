@@ -1,7 +1,10 @@
 # Actors — persistent state in Git, single writer by compare-and-swap
 
-**Status:** proposal. Nothing here is implemented. Daemons are deliberately set
-aside; see [Deferred: daemons](#deferred-daemons).
+**Status:** wrapper (`std/actor`) and a reference key-value inner
+(`tests/actor`) implemented; the spike is resolved (see [Spike results](#spike-results)).
+Still to do: the lost-race, crash-retry, laziness and cache-hit tests from the
+build plan, and the docs item. Daemons are deliberately set aside; see
+[Deferred: daemons](#deferred-daemons).
 
 Builds on [client-owned conversation refs](client-owned-conversation-refs.md)
 (the Git protocol workers already use for conversation heads) and follows the
