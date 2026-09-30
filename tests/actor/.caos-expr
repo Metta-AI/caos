@@ -1,0 +1,4 @@
+# tests/actor, as an ENTRY: a worker test (dev/worker-test has git, which is how
+# it reads the actor's branch on the server) driving std/actor with a reference
+# key-value inner that runs in std/bash.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --actor:@=DEEP-DEPS/actor --kv:@=kv.sh
