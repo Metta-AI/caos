@@ -312,6 +312,24 @@ detection.
    contention on a hot actor?
 2. **History growth.** Every state change is a commit and GC is off. Options:
    periodic squash into a new root, or a per-actor compaction worker.
+6. **Finish fetches every commit on the branch.** The spike showed that a push
+   cannot come from a shallow repository, so finish fetches the parent commit
+   without `--depth` (`--filter=tree:0`, so commits only, no trees). That
+   downloads the actor's whole commit history on every write: cost and latency
+   grow linearly with the number of updates, and GC is off, so the history
+   never shrinks. Start is unaffected (it reads the head at depth 1). This is
+   the same problem as question 2 seen from the write path, and it is the
+   reason that question matters now rather than later. Options to investigate:
+   - make the parent promised rather than present: write the commit against a
+     parent the scratch repo has never seen, if git will push it with the
+     parent in a promisor pack (not tried);
+   - drop the `shallow` file after a depth-1 fetch, so the repository is
+     treated as complete while the grandparents stay absent. Pack-objects
+     walks parents to mark them uninteresting, so this may fail or lazily
+     fetch the whole chain anyway (not tried);
+   - squash periodically (question 2), which bounds the chain;
+   - add a small server-side push-by-oid endpoint, which breaks "no server
+     change".
 3. **Read consistency.** A read observes some head during its run and is not
    linearized against concurrent writes. Is that acceptable, or should a read
    optionally confirm the head at the end?
