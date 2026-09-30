@@ -23,222 +23,150 @@ Today a job that needs a daemon starts it as a child of its own container
 ## Model
 
 An **actor** is a worker with a durable name and its state in a Git branch.
-Cloudflare Durable Objects are the closest analogue. Three points define it:
+Cloudflare Durable Objects are the closest analogue. Four rules define it:
 
 1. **No Start message.** The container comes alive on the first request and
    exits after an idle period. So every request names the actor, and the
    worker finds the state itself.
 2. **State lives on a branch.** The request carries the branch name. The worker
    reads the branch, handles the request, and pushes the new head.
-3. **Concurrency control is Git's.** A push is a compare-and-swap on the ref
-   (`--force-with-lease=<ref>:<observed>`). A writer that loses the race fails
-   and retries, or fails the request. This is optimistic STM with commits as
-   the transaction log.
+3. **A lost race fails the request.** A push is a compare-and-swap on the ref
+   (`--force-with-lease=<ref>:<observed>`). If it loses, the request fails and
+   the caller retries. No retry loop inside the actor.
+4. **Messages are idempotent.** Applying a message twice has the same effect as
+   applying it once. That is the whole duplicate-delivery story: caos does not
+   dedupe for the actor, and the actor does not dedupe for itself.
 
 Nothing in the server changes for this. An actor is a convention for workers
-(see [What caos changes](#what-caos-changes)). Three flavours:
+(see [What caos changes](#what-caos-changes)).
 
 | flavour | process | when |
 |---|---|---|
-| **pure** | one-shot worker per request | state is data; handler has no external effects |
-| **effectful** | one-shot worker per request | handler acts on the outside world; needs a write-ahead claim |
+| **pure** | one-shot worker per request | state is data; the rules above are all it needs |
 | **daemonic** | container that registers as a runner and stays up until idle | performance, or a live process (a test stack) |
+
+An actor whose messages cannot be made idempotent, or whose handler has
+external effects, layers a pattern from [Patterns](#patterns) on top. None is
+built in.
 
 ## Research: what the existing code already gives us
 
 ### 1. Compare-and-swap on the server's Git transport — supported, in use
 
 - The server delegates smart-HTTP to `git http-backend`
-  (`rust/crates/server/src/git.rs`). Its repo config is set at startup in
-  `main.rs` (`http.receivepack`, `receive.fsckObjects`, …). It does **not** set
-  `receive.denyNonFastForwards`.
-- That is fine. The expected-old-value check comes from the push command, which
-  receive-pack applies under the ref lock. `--force-with-lease=<ref>:<observed>`
-  therefore gives a server-side atomic CAS. **Fast-forward-ness is not enforced
-  by the server**; the actor enforces it by always building its commit on the
-  observed head. This matches the stance of
+  (`rust/crates/server/src/git.rs`). It does **not** set
+  `receive.denyNonFastForwards`, and does not need to. The expected-old-value
+  check comes from the push command, which receive-pack applies under the ref
+  lock, so `--force-with-lease=<ref>:<observed>` is a server-side atomic CAS.
+  **Fast-forward-ness is not enforced by the server**; the actor keeps a linear
+  chain by always committing on the head it observed. This matches
   [client-owned conversation refs](client-owned-conversation-refs.md): "the
   server provides transport, not policy."
-- That design already specifies the exact client protocol we need: a scratch
-  repo whose `origin` is `CAOS_SERVER_URL`; read with an exact-ref fetch;
-  append with `git push --force-with-lease=<ref>:<observed> <new>:<ref>`; several
-  refs at once with `--atomic`; after an ambiguous failure, **fetch again** and
-  treat "my object is visible" as success, "head changed" as a lost race, and
-  "head unchanged" as an infrastructure failure. Actors reuse this verbatim.
+- That design already specifies the client protocol: a scratch repo whose
+  `origin` is `CAOS_SERVER_URL`; read with an exact-ref fetch; append with
+  `git push --force-with-lease=<ref>:<observed> <new>:<ref>`; after an
+  ambiguous failure, **fetch again** and treat "my object is visible" as
+  success, "head changed" as a lost race, and "head unchanged" as an
+  infrastructure failure. Actors reuse this verbatim.
 - Git is opt-in: only workers bound to the `git-runner` image have `git`.
-  Actor workers select it in their `.caos-expr`, so it shows up in the
-  ArgTree like any other dependency.
-- `/git/push` (`push.rs`) is a different thing: it publishes a pinned commit to
-  an *external* remote, with `expected` and `Complete/Conflict/Uncertain`
-  receipts. Actors do not use it, but `Uncertain` is the same ambiguity we have
-  to handle.
+  Actor workers select it in their `.caos-expr`.
 
 **Caveats.**
 
 - The Git paths are **unauthenticated**. `handle()` in `main.rs` routes them
-  before anything else, and only `/runner/*` checks a token. Any worker (or
-  anyone who can reach the server) can rewrite an actor branch. We accept that
-  today for conversation refs. Actors inherit it, so an actor branch is
-  integrity-protected only against *accidents*, not against a hostile worker.
-- Git advertises every ref on every push and fetch. Stale `refs/caos/req/*`
-  are swept every 10 minutes for exactly this reason. Actor refs are
-  permanent, so the number of actors is a (soft) scaling limit.
+  before anything else, and only `/runner/*` checks a token. Any worker can
+  rewrite an actor branch. We accept that today for conversation refs; actors
+  inherit it.
+- Git advertises every ref on every push and fetch. Actor refs are permanent,
+  so the number of actors is a (soft) scaling limit.
 - GC is deliberately off, so actor history is never reclaimed. See
   [Open questions](#open-questions).
 
-### 2. Are failures cached? — no; successes are, forever
+### 2. Failures are not cached; successes are
 
-In `compute.rs` (`run_dispatch_inner`), only an `Ok` result is passed to
-`cache_set`. An `Err` is returned without caching, and a result that folded in
-a caught sub-run failure is explicitly not cached. So:
+In `compute.rs` (`run_dispatch_inner`), only an `Ok` result reaches
+`cache_set`. An `Err` is returned uncached, so **re-requesting a failed
+request re-runs it.** That is what makes "lose the race, fail, retry" work.
 
-- **Retrying a failed request with the same request ID re-runs it.** Good: a
-  lost CAS race can simply be a failed job that the caller retries unchanged.
-- **Retrying a succeeded request with the same ID is a cache hit** and replays
-  the reply without running the worker. That is the idempotent replay we
-  wanted — but it is **best-effort only**. The cache is Redis `SET` with no
-  expiry, but a lookup error "just means we run uncached", and the key is
-  namespaced by `cache_namespace`, so a stack change silently empties it.
-  **Exactly-once therefore must not depend on the cache.** The actor records
-  the request IDs it has applied, in its own state (see below).
-- Single-flight (in-memory, per server) coalesces *concurrent* identical
-  requests into one run, and a waiter never re-runs "merely because a valid run
-  is slow". That is useful for duplicate delivery but is not a substitute for
-  the state-based dedupe, since it does not survive a server restart.
+A successful result is cached under the ArgTree hash with no expiry (Redis is
+best-effort). That matters for one reason: **an identical request would be
+answered from the cache without reaching the actor**, so a read-style message
+would return a stale reply. Every request therefore carries a `nonce` to keep
+the ArgTree unique (see the contract below).
+
+I did not find the server retrying a failed job by itself. The retry in rule 3
+is the **caller's**, and this design assumes callers retry failed requests.
 
 ### 3. Credentials for the branch — none needed in-stack
 
-Because Git transport is unauthenticated (caveat above), an actor worker needs
-only `CAOS_SERVER_URL`, which every worker already has
-(`run-and-update-ref/src/refs.rs` reads it). Credentials are needed only for
-*external* remotes or services, and those use the existing secret store
-(SPEC.md "secrets": injected only when the worker's arg tree is a superset of
-the secret's reader *and* carries the matching `secret-hash`). Two consequences:
-
-- Secrets are injected out of band and never enter the cache key, so an actor's
-  external credentials do not perturb request caching.
-- If we later authenticate Git pushes, actor branches should be the first
-  namespace to get per-branch writers.
+Because Git transport is unauthenticated, an actor worker needs only
+`CAOS_SERVER_URL`, which every worker already has. Credentials are needed only
+for *external* remotes or services, and those use the existing secret store
+(SPEC.md "secrets"), which injects out of band and never enters the cache key.
 
 ### 4. Runner routing — already symmetric
 
 `runner.rs::matches` is pure oid equality in both directions. A job entry whose
 name starts with `REQUIRED_ARG_PREFIX` must equal the runner's entry of the
-same name; conversely every entry a runner requires must equal the job's. A
-job carrying `required-actor=<oid>` therefore reaches only a runner that polls
-with `required: {required-actor: <oid>}`, and never leaks to the generic pool.
-This is the routing half of daemonic actors and needs no server change. (Note
-the header of `runner-protocol.md` still says "not yet implemented"; the
-server side is in `runner.rs`.)
+same name, and every entry a runner requires must equal the job's. A job
+carrying `required-actor=<oid>` therefore reaches only a runner polling with
+`required: {required-actor: <oid>}`, and never leaks to the generic pool. This
+is the routing half of daemonic actors and needs no server change. (The header
+of `runner-protocol.md` still says "not yet implemented"; the server side is in
+`runner.rs`.)
 
 ## Request contract
-
-Every request to an actor carries, in its ArgTree:
 
 | arg | meaning |
 |---|---|
 | `actor` | the branch: `refs/heads/actors/<name>` |
-| `request-id` | minted **once per logical request by the caller** and reused on every retry |
-| `payload` | the message |
+| `nonce` | any value that makes this ArgTree unique, so the cache does not answer it |
+| `payload` | the message; **must be idempotent** |
 
-`request-id` doubles as the cache discriminator (two distinct requests never
-collide) and the idempotency key (a retry is recognisably the same request).
-Do not generate a fresh random nonce per *attempt*: that would defeat both.
-
-No caching switch is needed. Caching a reply is correct exactly when the
-request is a replay.
-
-## State layout
-
-```
-actor.json        { "schema": 1, "kind": "pure" | "effectful" | "daemon" }
-gen               integer; incremented by every commit on the chain
-state/            the actor's own data (opaque to caos)
-applied/<id>      reply blob for each recently applied request-id (bounded window)
-claim             present only while an effect or a daemon is in flight:
-                  { "request-id", "owner", "gen", "lease-until" }
-```
-
-Every update is **one commit whose parent is the observed head** — a linear
-chain. `gen` is the fencing token: strictly increasing along the chain, and
-available to external systems that can reject stale tokens.
+Because messages are idempotent, the nonce is just a cache-buster. Reusing it
+across retries or minting a fresh one per attempt are both correct.
 
 ## Pure actors
 
 ```
-loop:
-  head  = fetch(actor)                      # observed head
-  if head.applied[request-id]: return it    # replay: already applied
-  (state', reply) = handle(head.state, payload)
-  new = commit(parent=head, state', applied+={request-id: reply}, gen+1)
-  push --force-with-lease=actor:head  new:actor
-    ok        -> return reply
-    rejected  -> continue                   # lost the race: re-read and re-apply
-    ambiguous -> fetch; if new visible return reply, else continue
+head = fetch(actor)                        # observed head
+(state', reply) = handle(head.state, payload)
+new = commit(parent=head, state')
+push --force-with-lease=actor:head  new:actor
+  ok        -> return reply
+  rejected  -> fail the request            # lost the race; the caller retries
+  ambiguous -> fetch; if new visible return reply, else fail
 ```
 
-- The handler is pure, so the worker retries **internally**; the caller never
-  sees contention, only latency.
-- The crash window (push succeeded, reply never delivered) is closed by the
-  `applied/` lookup: the retry finds its own request-id and returns the recorded
-  reply without applying it twice.
-- `applied/` is a bounded window (oldest pruned in the same commit). A retry
-  older than the window is the caller's problem; choose the window to exceed
-  any realistic retry horizon.
-
-## Effectful actors
-
-Effects cannot be retried by re-running the handler, so the worker first wins a
-**write-ahead claim**:
-
-```
-head = fetch(actor)
-if head.applied[request-id]: return it
-if head.claim and not expired(head.claim):
-    if head.claim.request-id == request-id: # our own earlier attempt, see below
-    else: fail(retry-later)                 # someone else is mid-effect
-claim = commit(parent=head, claim={request-id, owner, gen+1, lease-until})
-push --force-with-lease=actor:head claim:actor   # FAILS -> abandon; do NOT run the effect
-perform effect (idempotency key = request-id; fencing token = gen)
-done  = commit(parent=claim, state', applied+=..., claim removed, gen+1)
-push --force-with-lease=actor:claim done:actor
-```
-
-- Only one worker can win the claim push for a given head, so only one performs
-  the effect. That is the single-writer guarantee for effects.
-- The claim carries `lease-until`. A later worker that finds an **expired**
-  claim may take it over with a new commit on top; it judges expiry by its own
-  clock. Clock skew only affects *when a takeover is attempted*. Safety still
-  comes from the CAS chain: a zombie's `done` push fails because the head moved.
-- **Crash between claim and done** leaves the tip at "claimed, not done". The
-  takeover path must reconcile. Which policy applies is the actor's choice:
-  - *at-most-once*: never redo; mark the request failed and surface it;
-  - *at-least-once*: redo, relying on the request-id as the external
-    idempotency key, or first ask the external system what happened.
-- A zombie that already performed the effect cannot be undone by the CAS.
-  Where the external system can check it, pass `gen` as a fencing token so it
-  rejects the zombie.
+- The branch tree is the actor's own data. caos reserves nothing in it.
+- A duplicate delivery re-applies an idempotent message. A crash after the push
+  but before the reply is posted is the same thing: the retry re-applies and
+  reaches the same state.
+- If the handler reads state that another request just changed, the loser fails
+  and retries against the new head. That is the entire concurrency story.
 
 ## Daemonic actors
 
-A daemonic actor is the same worker, except it stays up:
+A daemonic actor is the same worker, except it stays up, so it needs a **lock**
+to keep a second container from also serving. The lock is a commit:
 
-1. On its first request it takes a **claim commit** as `owner=<container>` with
-   a lease, then registers as a runner polling with
-   `required: {required-actor: <oid>}`.
-2. It serves requests from memory. Every state change is a normal commit
-   pushed with the lease. Commit cadence is the actor's choice — per request
-   (durable, slower) or batched (fast, bounded loss on crash) — and the lease
-   must be renewed (by any commit) before `lease-until`.
+1. On its first request it pushes a **claim commit** (with lease) that records
+   `owner=<container>` and `lease-until`, then registers as a runner polling
+   with `required: {required-actor: <oid>}`. If the claim push loses, it exits.
+2. It serves requests from memory. Every state change is a normal commit pushed
+   with the lease, and any commit renews the claim before `lease-until`. Commit
+   cadence is the actor's choice: per request (durable, slower) or batched
+   (fast, bounded loss on crash).
 3. When its poll returns `idle`, it pushes a **release commit** (state flushed,
    claim removed) and exits. This is the existing ski-rental rule: the poll TTL
-   is the idle budget. No new caos op is needed to "persist after an idle
-   period"; the release commit is the persist.
-4. A second container for the same actor fails its claim push and exits. A
-   crashed daemon's claim simply expires, and the next request takes over.
+   is the idle budget. The release commit is the persist; caos needs no
+   checkpoint operation.
+4. A crashed daemon's claim simply expires, and a later request takes over by
+   pushing a new claim on top. A zombie's next push then fails because the head
+   moved.
 
-There is no checkpoint operation in caos. The chain *is* the checkpoint log; an
-actor that wants stronger durability pushes more often.
+The claim lives in one reserved file, `.actor/claim`
+(`{"owner", "lease-until"}`), so pure actors never see it.
 
 ### Routing and cold start (needs a decision)
 
@@ -247,26 +175,47 @@ daemon is parked it waits, then fails at the pending deadline. So callers
 cannot send such requests blindly. Sketch: callers send a **front request**
 without the required arg. A one-shot front worker reads the branch:
 
-- no live claim: it handles the request itself (pure or effectful), or starts
-  the daemon and claims on its behalf;
+- no live claim: it handles the request itself as a pure actor, or starts the
+  daemon and claims on its behalf;
 - live claim: it forwards the same request as a sub-run with the
   `required-actor` arg set, then returns the reply.
 
 The forwarding hop costs a worker start per request, which defeats part of the
 point of a warm daemon. The alternative is callers that know a daemon is up
-(from the actor's own state) and address it directly, falling back to the
-front request on failure. See open question 1.
+(from the actor's own state) and address it directly, falling back to the front
+request on failure. See open question 1.
+
+## Patterns
+
+These are conventions an actor may adopt. caos provides none of them.
+
+**Dedupe by request ID.** For a message that is not naturally idempotent, put
+the request ID in each commit message and have the worker scan the last few
+commits for its own ID before applying. A retry that finds it returns
+"already applied". This closes the crash window between push and reply without
+a stored reply cache.
+
+**Write-ahead claim for external effects.** If the handler acts on the outside
+world, push a claim commit (request ID, owner, lease) **first** and abandon if
+the push loses, perform the effect, then push a done commit on top of the claim.
+Only one worker can win the claim for a given head, so only one performs the
+effect. After a crash the tip is "claimed, not done", and a later worker may
+take over an expired claim and either redo the effect (at-least-once, with the
+request ID as the external idempotency key) or surface it as failed
+(at-most-once). Keep a monotonic counter in the chain and pass it as a fencing
+token where the external system can check it, since the CAS cannot undo an
+effect a zombie already performed.
 
 ## Use case: the test stack
 
 Today `caos-test` brings a stack up as children of one job and it dies with
-that job. As an actor:
+that job. As a daemonic actor:
 
-- **State** is a small manifest: the stack's address, the image digest it runs,
-  a generation. It is *not* the stack's data (Redis, volumes); those are
-  rebuilt or left in the persistent volume the runner already mounts.
+- **State** is a small manifest: the stack's address and the image digest it
+  runs. It is *not* the stack's data (Redis, volumes); those are rebuilt or
+  left in the persistent volume the runner already mounts.
 - **The daemon** is the container running `stack/serve`. It claims the actor,
-  publishes its address into `state/`, and serves "run this" requests.
+  publishes its address into the branch, and serves "run this" requests.
 - **Conversations driving the stack** read the address from the branch, then
   talk to the stack over the runner network. Only the coordination (who owns
   the stack, where it is) is in Git.
@@ -277,9 +226,9 @@ This decouples the stack's lifetime from any single test job.
 
 | change | needed for | notes |
 |---|---|---|
-| **None** in the server | pure, effectful | CAS push, routing and non-caching of failures already exist |
+| **None** in the server | pure | CAS push, routing and non-caching of failures already exist |
 | Bind actor workers to `git-runner` in their `.caos-expr` | all | same as `llm-step`, `run-and-update-ref` |
-| An `actor` helper in `worker-common` (fetch, claim, lease, `applied/` window, ambiguous-push handling) | all | so authors do not each reimplement the loop above |
+| A small `actor` helper in `worker-common` (fetch, CAS push, ambiguous-push handling, claim/lease for daemons) | all | so authors do not each reimplement it |
 | A worker can register as a runner (poll/result with the runner token the job payload carries) | daemonic | confirm what `caos runner` exposes to a worker; `runner-protocol.md` describes the nesting rule |
 | Refresh the `runner-protocol.md` status line | docs | |
 
@@ -287,7 +236,7 @@ This decouples the stack's lifetime from any single test job.
 
 - Server-side ordering, leases or ref policy. The server stays transport.
 - A built-in checkpoint or Start message.
-- Multi-ref atomic actor updates (possible with `git push --atomic` later).
+- Built-in dedupe, reply caching or exactly-once delivery.
 - Strong isolation between actors (Git transport is unauthenticated today).
 
 ## Open questions
@@ -295,17 +244,15 @@ This decouples the stack's lifetime from any single test job.
 1. **Cold start and routing** for daemons (above): front request with a
    forwarding hop, or caller-side addressing? Does forwarding via `/sub-run`
    work when the target is a parked runner?
-2. **Lease source.** Workers judge expiry by their own clocks. Is that enough,
-   or should the server expose a time/lease primitive? The runner protocol
-   already lists lease-based dead-worker detection as future work; actors make
-   it more valuable.
-3. **History growth.** Every request is a commit and GC is off. Pure actors
-   with a hot path will grow the store. Options: periodic squash into a new
-   root (resets the chain, which breaks `gen` monotonicity unless it is carried
-   over), or a per-actor compaction worker.
-4. **`applied/` window sizing**, and what a caller sees for a retry that
-   falls outside it.
+2. **Lease source.** Workers judge expiry by their own clocks. Clock skew only
+   affects *when a takeover is attempted*; safety comes from the CAS chain. Is
+   that enough, or should the server expose a time/lease primitive? The runner
+   protocol already lists lease-based dead-worker detection as future work.
+3. **History growth.** Every state change is a commit and GC is off. A hot actor
+   will grow the store. Options: periodic squash into a new root, or a
+   per-actor compaction worker.
+4. **Caller retry.** The design assumes callers retry a failed request. Which
+   layer owns that for conversations and `map-then`, and does it back off under
+   contention on a hot actor?
 5. **Authorization.** Do we want per-namespace write control on Git pushes
    before actors hold anything sensitive?
-6. **Crash policy default** for effectful actors: at-most-once or
-   at-least-once? I would make the actor choose explicitly in `actor.json`.
