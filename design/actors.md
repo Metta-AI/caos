@@ -130,8 +130,9 @@ while the inner runs, and it needs `git` (selected through `git-runner` in its
 1. If `state` equals the input state, return `reply`. Nothing to publish.
 2. Otherwise build the root tree `{state: <new state oid>}` by oid, with no
    checkout, and a commit on the observed head.
-3. Store the commit through the object API, then fetch just that commit into a
-   throwaway scratch repository (origin `CAOS_SERVER_URL`).
+3. Make the commit available to a throwaway scratch repository (origin
+   `CAOS_SERVER_URL`) **without downloading the new state tree**. The new state
+   exists only on the server, so this is the main technical risk; see the spike.
 4. Push with `git push --force-with-lease=<ref>:<observed> <commit>:<ref>`.
    - ok: return `reply`;
    - lease rejected: **fail the request**; the caller retries;
