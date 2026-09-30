@@ -23,7 +23,8 @@ if [ -e /cas/args/error ]; then
 fi
 
 if [ -e /cas/args/msg ]; then msg=/cas/args/msg; else caos get /cas/args/in; msg=/cas/args/in; fi
-caos get /cas/args/state-ref /cas/args/test-salt
+caos get /cas/args/state-ref
+caos get /cas/args/test-salt
 state_ref=$(cat /cas/args/state-ref)
 nonce="$(caos hash "$msg")-$attempt-$(cat /cas/args/test-salt)"
 
