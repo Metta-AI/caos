@@ -50,6 +50,7 @@
 
 mod compute;
 mod git;
+mod grant_history;
 mod import;
 mod locator;
 mod push;
@@ -689,6 +690,23 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     }
 }
 
+/// The secrets a request's SecretReaderKeys hold, for its conversation.
+/// Headers, never the ArgTree: a key is a credential.
+fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context, HttpError> {
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    secrets::Context::admit(
+        config,
+        &header(caos_world::secrets::READERS_HEADER).unwrap_or_default(),
+        header(caos_world::secrets::CONVERSATION_HEADER).as_deref(),
+    )
+}
+
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`, `/sub-run`), and the runner
 /// protocol (`/runner/poll`, `/runner/result`).
@@ -701,29 +719,15 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
 
     match request.method() {
         Method::Get if path == "/run" => {
-            // The carried secrets store rides in a header (design/secrets.md),
-            // out of band from the content-addressed ArgTree.
-            let secrets_header = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv(secrets::HEADER))
-                .map(|h| h.value.as_str().to_string())
-                .unwrap_or_default();
-            compute::run(config, &query, &secrets_header)
+            let secrets = secret_context(config, request)?;
+            compute::run(config, &query, &secrets)
         }
         Method::Get if path.starts_with("/status/") => {
             status::serve(config, path.trim_start_matches("/status/"), &query)
         }
         Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
         Method::Get if path == "/eval" => {
-            // Secrets ride the same out-of-band header as `/run`, since an eval
-            // may mark a `curry` with the caller's identity (design/secrets.md).
-            let secrets_header = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv(secrets::HEADER))
-                .map(|h| h.value.as_str().to_string())
-                .unwrap_or_default();
+            let secrets = secret_context(config, request)?;
             // The same sensitive header `POST /git/import` takes, for the same
             // reason: a private repository's token is the caller's, scoped to
             // one URL, and never looked up from the calling job's secrets. Only
@@ -737,12 +741,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             if tokens.len() > 1 {
                 return Err(HttpError::new(400, "duplicate Git token header"));
             }
-            compute::eval_endpoint(
-                config,
-                &query,
-                &secrets_header,
-                tokens.first().map(String::as_str),
-            )
+            compute::eval_endpoint(config, &query, &secrets, tokens.first().map(String::as_str))
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),

@@ -4,6 +4,8 @@
 /// Names one or more SecretReaderKeys, space-separated, on a request. Out of
 /// band because a key is a credential and an ArgTree is readable by anyone.
 pub const READERS_HEADER: &str = "X-Caos-Secret-Readers";
+/// The conversation a request is for, which `reader:@=` grants are scoped to.
+pub const CONVERSATION_HEADER: &str = "X-Caos-Conversation";
 
 /// The SecretReaderKey a push replaces the tree of.
 pub const PUSH_KEY_HEADER: &str = "X-Caos-Secret-Reader-Key";

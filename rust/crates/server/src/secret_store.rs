@@ -18,7 +18,6 @@ use crate::{Config, HttpError};
 static PUSH: Mutex<()> = Mutex::new(());
 
 /// A secret as the server holds it.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct Stored {
     pub(crate) name: String,
@@ -113,7 +112,6 @@ pub(crate) fn push_endpoint(
 /// The secrets under each SecretReaderKey, merged, with the tree each key
 /// resolved to. A name under two keys is an error; an unknown key holds
 /// nothing.
-#[allow(dead_code)]
 pub(crate) fn load(config: &Config, keys: &[String]) -> Result<(Vec<Stored>, Vec<String>), String> {
     let dir = &config.secrets_git;
     let mut merged: Vec<Stored> = Vec::new();

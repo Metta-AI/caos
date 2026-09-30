@@ -206,6 +206,51 @@ pub trait EvalHost {
     /// Record `value` as the answer for `key`. Paired with [`EvalHost::memo_get`];
     /// a host that keeps no memo ignores it.
     fn memo_put(&self, _kind: MemoKind, _key: &str, _value: &(String, String)) {}
+    /// Origins this host already knows for `oid` — the result of a `:@@=`
+    /// resolution keeps the one it had upstream (SPEC, "Secrets").
+    fn origins_of(&self, _oid: &str) -> Vec<Origin> {
+        Vec::new()
+    }
+    /// Called with each value a `.caos-expr` produced and every origin of the
+    /// node it was applied at. What it returns replaces the value; it may only
+    /// mark, never change what the value computes.
+    fn evaluated(
+        &self,
+        _origins: &[Origin],
+        value: (String, String),
+    ) -> Result<(String, String), String> {
+        Ok(value)
+    }
+}
+
+/// Where a node sits: a root tree and its path there (SPEC, "Secrets").
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Origin {
+    pub root: String,
+    pub path: String,
+}
+
+impl Origin {
+    fn child(&self, name: &str) -> Origin {
+        Origin {
+            root: self.root.clone(),
+            path: if self.path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{name}", self.path)
+            },
+        }
+    }
+}
+
+/// A node's origins: the ones its parent's imply, plus any the host knows.
+fn with_known(host: &dyn EvalHost, mut origins: Vec<Origin>, oid: &str) -> Vec<Origin> {
+    for known in host.origins_of(oid) {
+        if !origins.contains(&known) {
+            origins.push(known);
+        }
+    }
+    origins
 }
 
 /// Which question a memoized answer answers. The two are *different* questions
@@ -268,19 +313,27 @@ fn eval_path_uncached(
         .collect();
     let mut node_kind = String::from("tree");
     let mut node_oid = start_tree.to_string();
+    let mut origins = with_known(
+        host,
+        vec![Origin {
+            root: start_tree.to_string(),
+            path: String::new(),
+        }],
+        start_tree,
+    );
     let mut i = 0usize;
     loop {
         // A gitlink stays a commit value unless the path enters its tree.
         if node_kind == "commit" && i < comps.len() {
             node_oid = commit_tree(host, &node_oid)?;
             node_kind = "tree".into();
+            origins = with_known(host, origins, &node_oid);
         }
         // A `.caos-expr` at the root of this tree node transforms the node — from
         // the node's contents WITHOUT the directive (see `strip_caos_expr`).
         if node_kind == "tree" {
-            if let Some((k, o)) = eval_node(host, &node_oid)? {
-                node_kind = k;
-                node_oid = o;
+            if let Some(value) = eval_node(host, &node_oid)? {
+                (node_kind, node_oid) = host.evaluated(&origins, value)?;
             }
         }
         if i == comps.len() {
@@ -318,6 +371,11 @@ fn eval_path_uncached(
         let (mode, oid) = (entry.mode, entry.oid);
         node_kind = kind_of_mode(mode).to_string();
         node_oid = oid.to_string();
+        origins = origins
+            .iter()
+            .map(|origin| origin.child(comps[i]))
+            .collect();
+        origins = with_known(host, origins, &node_oid);
         i += 1;
     }
     Ok((node_kind, node_oid))
@@ -863,6 +921,15 @@ fn commit_tree(host: &dyn EvalHost, oid: &str) -> Result<String, String> {
 /// `curry --base=$VAR …` over a prior curry flattens into one layer. This mirrors
 /// the client's `curry_from_entries` (unbind-free) exactly, so an expression
 /// curries to the same object whichever host walks it.
+/// Bind `new` onto `image_ref`, exactly as a `curry` expression does.
+pub fn curry(
+    host: &dyn EvalHost,
+    image_ref: &str,
+    new: Vec<Entry>,
+) -> Result<gix::ObjectId, String> {
+    build_curry(host, image_ref, new)
+}
+
 fn build_curry(
     host: &dyn EvalHost,
     image_ref: &str,
@@ -1093,5 +1160,111 @@ mod tests {
         assert!(parse_arg("--k:nope=v").is_err());
         assert!(parse_arg("--a/b=v").is_err());
         assert!(parse_arg("no-dashes=v").is_err());
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::{eval_path, EvalHost, Origin};
+    use gix::objs::tree::{Entry, EntryKind};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Memory {
+        objects: RefCell<HashMap<String, (String, Vec<u8>)>>,
+        known: HashMap<String, Vec<Origin>>,
+        seen: RefCell<Vec<Vec<Origin>>>,
+    }
+
+    impl Memory {
+        fn put(&self, kind: gix::objs::Kind, bytes: Vec<u8>) -> gix::ObjectId {
+            let oid = gix::objs::compute_hash(gix::hash::Kind::Sha1, kind, &bytes).unwrap();
+            self.objects
+                .borrow_mut()
+                .insert(oid.to_string(), (kind.to_string(), bytes));
+            oid
+        }
+        fn tree(&self, entries: Vec<(&str, bool, gix::ObjectId)>) -> gix::ObjectId {
+            let entries = entries
+                .into_iter()
+                .map(|(name, is_tree, oid)| Entry {
+                    mode: if is_tree { EntryKind::Tree } else { EntryKind::Blob }.into(),
+                    filename: name.into(),
+                    oid,
+                })
+                .collect();
+            self.post_tree(entries).unwrap()
+        }
+    }
+
+    impl EvalHost for Memory {
+        fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
+            self.objects.borrow().get(oid).cloned().ok_or(format!("no {oid}"))
+        }
+        fn post_object(&self, _kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
+            Ok(self.put(gix::objs::Kind::Blob, bytes.to_vec()))
+        }
+        fn fetch_tree_entries(&self, tree: &str) -> Result<Option<Vec<Entry>>, String> {
+            let (kind, bytes) = self.get_object(tree)?;
+            if kind != "tree" {
+                return Ok(None);
+            }
+            let parsed = gix::objs::TreeRef::from_bytes(&bytes, gix::hash::Kind::Sha1).unwrap();
+            Ok(Some(parsed.entries.iter().map(|e| (*e).into()).collect()))
+        }
+        fn post_tree(&self, mut entries: Vec<Entry>) -> Result<gix::ObjectId, String> {
+            use gix::objs::WriteTo;
+            entries.sort();
+            let mut bytes = Vec::new();
+            gix::objs::Tree { entries }.write_to(&mut bytes).unwrap();
+            Ok(self.put(gix::objs::Kind::Tree, bytes))
+        }
+        fn dispatch(&self, _: &str, _: Vec<Entry>) -> Result<(String, String), String> {
+            Err("no runs here".into())
+        }
+        fn origins_of(&self, oid: &str) -> Vec<Origin> {
+            self.known.get(oid).cloned().unwrap_or_default()
+        }
+        fn evaluated(
+            &self,
+            origins: &[Origin],
+            value: (String, String),
+        ) -> Result<(String, String), String> {
+            self.seen.borrow_mut().push(origins.to_vec());
+            Ok(value)
+        }
+    }
+
+    #[test]
+    fn a_node_carries_its_path_and_every_origin_it_was_mounted_with() {
+        let mut host = Memory::default();
+        let expr = host.put(
+            gix::objs::Kind::Blob,
+            b"curry --base:docker=img@sha256:00 --x=1\n".to_vec(),
+        );
+        let tool = host.tree(vec![(".caos-expr", false, expr)]);
+        let mounted = host.tree(vec![("tool", true, tool)]);
+        let root = host.tree(vec![("sub", true, mounted)]);
+        let upstream = Origin {
+            root: "upstream".into(),
+            path: "std".into(),
+        };
+        host.known.insert(mounted.to_string(), vec![upstream]);
+
+        eval_path(&host, &root.to_string(), "sub/tool").unwrap();
+        assert_eq!(
+            host.seen.borrow().as_slice(),
+            &[vec![
+                Origin {
+                    root: root.to_string(),
+                    path: "sub/tool".into()
+                },
+                Origin {
+                    root: "upstream".into(),
+                    path: "std/tool".into()
+                },
+            ]]
+        );
     }
 }
