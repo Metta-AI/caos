@@ -176,6 +176,13 @@ fn finish(state_ref: &str) -> Result<(), String> {
 
 fn publish(state_ref: &str, head: Option<Oid>, new_state: Oid) -> Result<(), String> {
     let mut store = promisor_store()?;
+    // This container is not start's, so the scratch repo holds nothing: bring in
+    // the parent commit and the new state's root tree, one object each, so the
+    // push can traverse the new commit without reading the state's closure.
+    if let Some(head) = &head {
+        fetch_one(head)?;
+    }
+    fetch_one(&new_state)?;
     let tree = store
         .write_tree(&[TreeEntry {
             name: STATE_ENTRY.to_string(),
