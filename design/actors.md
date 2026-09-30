@@ -64,14 +64,13 @@ one per attempt are both correct, because messages are idempotent.
 
 ```
 state/      the actor's state: an ordinary tree, opaque to caos
-.actor/     reserved for actor bookkeeping; empty today
 ```
 
-The branch tree is `{state, .actor}`. The wrapper hands the inner only the
-`state/` subtree, so the inner never sees bookkeeping. Every update is **one
-commit whose parent is the observed head**, a linear chain. Reserving `.actor/`
-now keeps room for later features (claims, counters) without changing the
-layout.
+The branch tree is `{state}`. The wrapper hands the inner only the `state/`
+subtree, so everything else in the tree is the wrapper's. Nothing else is used
+today and nothing is reserved; a later feature (claims, counters) can add a
+sibling of `state/` without changing the inner's view. Every update is **one
+commit whose parent is the observed head**, a linear chain.
 
 ### The inner actor
 
