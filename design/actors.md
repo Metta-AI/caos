@@ -194,9 +194,26 @@ conversation ref that started it. For `spawn_agent` it checkpoints the child
 conversation's head onto the parent. It has the start/finish structure the
 actor wrapper wants (start emits `run-request-then`, finish updates a ref), and
 `refs.rs` has the exact-ref fetch and lease-push logic for conversation refs.
-The actor wrapper should reuse or factor out that code rather than duplicate
-it. I have read only its header and its use of `CAOS_SERVER_URL`, so how cleanly
-it separates from conversation semantics is unverified.
+The conversation semantics live in `refs.rs`, but the Git plumbing it uses is
+generic and sits in the `conversation-protocol` crate (`git-cli` feature), which
+the actor wrapper can depend on directly:
+
+- `GitStore::scratch(name, remote)` makes a bare scratch repo whose `origin` is
+  the server. `read_ref` is a cheap `ls-remote`. `push(&[RefUpdate])` pushes
+  with `--force-with-lease=<ref>:<expected>` (and `--atomic` for several refs).
+  `GitStore` also implements `ObjectStore` (`read_tree`, `write_tree`,
+  `write_commit`, ...), so it can write the commit.
+- `cas_append` in `refs.rs` is the right ambiguous-push rule, already tested
+  with a fake store: after a failed push, re-read the ref; if the candidate is an
+  ancestor of the observed head the push succeeded; if the head is unchanged the
+  failure is real; otherwise it was a lost race.
+
+**One thing not to reuse as is:** `GitStore::fetch_ref` fetches with no depth
+and no filter into a scratch repo that is cleared for every job. For a
+conversation ref that is cheap by design (its trees hold gitlinks). For an actor
+it would download the whole history and the whole state closure on every
+request. The wrapper must use `read_ref` plus a depth-1, `tree:0` fetch of the
+head commit instead.
 
 **`TreeBuilder`** (`conversation_protocol::v3::tree`) builds trees by oid with
 no checkout: `put_oid(path, mode, oid)`, `delete(path)`, `build(store)`.
