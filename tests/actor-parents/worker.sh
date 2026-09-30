@@ -59,7 +59,7 @@ variant() {
   noshallowfile)
     git fetch -q --no-tags --no-write-fetch-head --depth=1 --filter=tree:0 origin "$head"
     rm -f shallow ;;
-  rawparent) : ;; # parent never fetched at all
+  rawparent|orphan) : ;; # parent never fetched at all
   esac
   local tree commit parentline="parent $head
 "
