@@ -93,4 +93,9 @@ VARIANT_HOOK="" variant shallow --depth=1 --filter=tree:0
 #    head came in a promisor pack) rather than present.
 VARIANT_HOOK='rm -f shallow' variant noshallow --depth=1 --filter=tree:0
 
+# 4. As 3, plus a diagnostic: is the depth-1 pack marked as a promisor pack?
+VARIANT_HOOK='note "  packs: $(ls objects/pack | tr "\n" " ")"; note "  fsck-ish: $(git rev-list --missing=allow-promisor --count --all 2>&1 | tr "\n" " ")"; rm -f shallow' variant diag --depth=1 --filter=tree:0
+# 5. As 3, pushed with --no-thin.
+VARIANT_HOOK='rm -f shallow; PUSH_EXTRA=--no-thin' variant nothin --depth=1 --filter=tree:0
+
 fail $'report\n'"$REPORT"
