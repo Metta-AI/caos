@@ -25,7 +25,7 @@
 // do this: it resolves the new commit in a local repository and walks its
 // ancestry to build a pack, which needs every ancestor commit ("a deep
 // checkout"), and a partial clone with a promisor remote does not avoid that
-// (design/actors.md, open question 6; tests/actor-ref proves the direct route).
+// (README.md, open question 6; tests/actor-ref proves the direct route).
 package main
 
 import (
