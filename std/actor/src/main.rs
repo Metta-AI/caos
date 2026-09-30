@@ -84,8 +84,11 @@ fn promisor_store() -> Result<GitStore, String> {
     Ok(store)
 }
 
-/// The `state/` subtree oid of `head`, reading only the commit and its root tree.
-fn state_of(store: &GitStore, head: &Oid) -> Result<Option<Oid>, String> {
+/// Fetch exactly one object from the server through the promisor filter: a
+/// commit arrives alone (depth 1, no trees), a tree arrives without its
+/// children. Everything it references is then "promised", which is what lets a
+/// later push traverse it without downloading the rest.
+fn fetch_one(oid: &Oid) -> Result<(), String> {
     git(&[
         "fetch",
         "--quiet",
@@ -94,8 +97,13 @@ fn state_of(store: &GitStore, head: &Oid) -> Result<Option<Oid>, String> {
         "--depth=1",
         "--filter=tree:0",
         "origin",
-        head.as_str(),
-    ])?;
+        oid.as_str(),
+    ])
+}
+
+/// The `state/` subtree oid of `head`, reading only the commit and its root tree.
+fn state_of(store: &GitStore, head: &Oid) -> Result<Option<Oid>, String> {
+    fetch_one(head)?;
     let commit = store.read_commit(head).map_err(String::from)?;
     let root = store.read_tree(&commit.tree).map_err(String::from)?;
     Ok(root
