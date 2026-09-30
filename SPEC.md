@@ -19,6 +19,15 @@ images is what makes currying (below) a uniform operation.
 
 Also note in calling that rebinding existing args is an error #todo
 
+## Submitting work
+
+A client puts what a request needs into caos git, then makes one call: run
+this request (a base and args) against this tree. An arg is a literal, an
+object, a locator, or a path in the tree. The server does the rest: every
+evaluation, forming the ArgTree, and running it. A client never walks a tree
+itself — a walk costs a round trip per node, and evaluation is where the server
+grants secrets.
+
 # Forming an ArgTree
 
 The simplest ArgTree is one that only specifies an image
@@ -472,17 +481,25 @@ reader:@=imports/caos/std/llm-step conversation=<id>
   conversation's tree, and only in that conversation. The agent can edit that
   code, so this exposes the secret to the agent.
 
-Matching happens during evaluation, where the server knows the root tree `T`
-it evaluates from and the path `P` within it. Evaluation is a function of `T`
-and `P` (a parent `.caos-expr` can reshape everything below it, so nothing less
-than the whole root identifies the result):
+Matching happens where evaluation applies a node's `.caos-expr`. Every node
+has an origin `(T, P)`: a root tree and the node's path in it. A walk's start
+tree is its own origin at `P = ""`, descending by name extends `P`, and a
+`:@@=` result's origin is `(C^{tree}, dir)` — so what a consumer mounts keeps
+the identity it had upstream. A node's value is a function of its origin (a
+parent `.caos-expr` can reshape everything below it, so nothing less than the
+whole root identifies it). An origin is the server's bookkeeping during the
+walk, never written into a tree: an ungranted node evaluates exactly as it
+would with no secrets, and a granted one differs only by `secret-hash`. Only
+the eval memo sees it, keyed by origin when a request carries keys; the runs a
+walk dispatches stay memoized by ArgTree.
 - `reader:@@=` matches when `P` is `dir=` and `T` is `C^{tree}` for a commit `C`
   in its range. The allowed set is `git log --first-parent --format=%T`,
   computed once per pushed tree, and needs no evaluation. A root that differs
   from every commit in the range, anywhere, matches nothing; modified code is
   what `reader:@=` is for.
-- `reader:@=` matches when the evaluation is of `path` in conversation `id`'s
-  tree, for a request of that conversation.
+- `reader:@=` matches when the origin is `path` in the tree of conversation
+  `id`'s current head, for a request of that conversation (named out of band,
+  like the keys).
 
 This check runs on every evaluation, including one that is a memo hit.
 
