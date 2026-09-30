@@ -242,7 +242,7 @@ The wrapper is a new std tool, `std/actor`, laid out like `run-and-update-ref`
 - Server-side ordering, leases or ref policy. The server stays transport.
 - Built-in dedupe, reply caching or exactly-once delivery.
 - External effects. The inner must be pure; effectful actors are an optional
-  later pattern (a write-ahead claim commit under `.actor/`).
+  later pattern (a write-ahead claim commit in a sibling of `state/`).
 - Strong isolation between actors.
 
 ## Deferred: daemons
