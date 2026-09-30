@@ -1,3 +1,0 @@
-# SPIKE for design/actors.md open question 6 (see worker.sh). Pure git, in the
-# worker-test image.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh
