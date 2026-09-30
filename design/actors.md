@@ -241,9 +241,12 @@ wrapper can use it to build `{state: <oid>}` the same way.
 
 ## Build plan
 
-The wrapper is a new std tool, `std/actor`, laid out like `run-and-update-ref`
-(`rustc` factory, `git-runner` as `--output-runner`). It depends on
-`worker-common` and the shared ref code from item 4 above.
+The wrapper is a new std tool, `std/actor`: a single Go program run by `std/go`
+(Go is the language for new workers), with start and finish as two positions of
+one program like `std/run-and-update-ref`. It shells out to the `caos` CLI and,
+for the head read, to `git`. The sections above describe the first design, a
+Rust wrapper that pushed from a scratch repository; the shipped wrapper replaced
+that with the direct receive-pack command described under open question 6.
 
 0. **Spike (verify before building).** An integration test against the test
    stack, using real `git`:
