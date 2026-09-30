@@ -61,11 +61,15 @@ variant() {
     rm -f shallow ;;
   rawparent) : ;; # parent never fetched at all
   esac
-  local tree commit
+  local tree commit parentline="parent $head
+"
+  # An orphan names the previous head in its message instead of as a parent:
+  # the lease still compares against $head, but git ancestry is not involved.
+  if [ "$name" = orphan ]; then parentline=""; fi
   tree=$(printf '040000 tree %s\tstate\n' "$newstate" | git mktree --missing 2>&1) \
     || { say "[$name] mktree: $tree"; return; }
-  commit=$(printf 'tree %s\nparent %s\nauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\n\nactor state\n' \
-    "$tree" "$head" | git hash-object -t commit -w --stdin --literally 2>&1) \
+  commit=$(printf 'tree %s\n%sauthor a <a@a> 0 +0000\ncommitter a <a@a> 0 +0000\n\nactor state\n\nPrevious: %s\n' \
+    "$tree" "$parentline" "$head" | git hash-object -t commit -w --stdin --literally 2>&1) \
     || { say "[$name] hash-object: $commit"; return; }
   local out
   if out=$(git push --force-with-lease="$ref:$head" origin "$commit:$ref" 2>&1); then
