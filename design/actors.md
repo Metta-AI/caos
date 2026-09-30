@@ -83,7 +83,7 @@ The inner is an ordinary caos worker with **any image**, including a
 
 | | |
 |---|---|
-| in | `state`: the tree oid of the `state/` subtree (empty for a new actor), read lazily with `caos get /cas/args/state/<path>`; plus the message args |
+| in | `/cas/args` with two entries, read lazily with `caos get`: `state`, the tree oid of the `state/` subtree (empty for a new actor), and `message` |
 | out | `/cas/out`: a tree `{state, reply}`. `state` is the new state tree (staged with `caos put`); `reply` is a blob or tree |
 
 Two choices here differ from a first instinct:
