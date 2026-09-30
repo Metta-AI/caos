@@ -216,8 +216,9 @@ The wrapper is a new std tool, `std/actor`, laid out like `run-and-update-ref`
 
 0. **Spike (verify before building).**
    - Build a root tree and a commit from oids alone, with no checkout
-     (`worker-common` has `write_commit` and `write_commit_as`; I have not
-     confirmed they take a tree oid).
+     (`TreeBuilder` builds the tree; `worker-common` has `write_commit` and
+     `write_commit_as`, and I have not confirmed they take a tree oid or that
+     `TreeBuilder` can write to the store a wrapper has).
    - Confirm the shallow-fetch-then-push path works for a commit built that way.
    - Confirm a start/finish pair can carry the observed head through the
      callback.
