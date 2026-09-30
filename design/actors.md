@@ -336,9 +336,19 @@ detection.
      parents to mark them uninteresting and does not tolerate a missing one.
      With the `shallow` file kept, the server refuses the push instead
      (`shallow pushes are not accepted`). Only the full-history fetch
-     pushes. Still untried: bypass `git push` by building the pack from an
-     explicit object list (`git pack-objects`, no revision walk) and speaking
-     receive-pack directly;
+     pushes;
+   - **bypass `git push` and speak receive-pack directly. Tried; it works**
+     (`tests/actor-ref`). A push is a command `<old> <new> <ref>` plus a pack,
+     and the pack may be empty when the server already has the new object. A
+     commit made with `caos put-commit` is already on the server, so finish
+     POSTs one pkt-line command and an empty pack to
+     `$CAOS_SERVER_URL/git-receive-pack`: no scratch repository, no promisor
+     setup, no fetch of the parent or of any history. The server does the
+     compare-and-swap: a stale `<old>` is answered `ng <ref>` and the ref does
+     not move, and the right `<old>` is accepted. The result is an ordinary
+     branch that git can fetch. This resolves the history cost of this
+     question for the write path, and needs no server change. `std/actor`
+     should use it;
    - squash periodically (question 2), which bounds the chain;
    - add a small server-side push-by-oid endpoint, which breaks "no server
      change".
