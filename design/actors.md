@@ -183,12 +183,22 @@ anything else, and only `/runner/*` checks a token. A wrapper needs only
 
 ### 4. Existing machinery to reuse
 
-`run-and-update-ref` already has the start/finish structure (start emits
-`run-request-then`, finish updates a ref) and `refs.rs` has the exact-ref fetch
-and lease-push logic for conversation refs. The actor wrapper should reuse or
-factor out that code rather than duplicate it. I have read only its header and
-its use of `CAOS_SERVER_URL`, so how cleanly it separates from conversation
-semantics is unverified.
+**`std/run-and-update-ref`** is the async worker behind `llm-step`'s
+`run_async` and `spawn_agent` tools (bound in `std/llm-step/.caos-expr`, tested
+in `tests/run-and-update-ref`). For `run_async` it runs an already-built
+request and appends the task's terminal status, with the result oid, to the
+conversation ref that started it. For `spawn_agent` it checkpoints the child
+conversation's head onto the parent. It has the start/finish structure the
+actor wrapper wants (start emits `run-request-then`, finish updates a ref), and
+`refs.rs` has the exact-ref fetch and lease-push logic for conversation refs.
+The actor wrapper should reuse or factor out that code rather than duplicate
+it. I have read only its header and its use of `CAOS_SERVER_URL`, so how cleanly
+it separates from conversation semantics is unverified.
+
+**`TreeBuilder`** (`conversation_protocol::v3::tree`) builds trees by oid with
+no checkout: `put_oid(path, mode, oid)`, `delete(path)`, `build(store)`.
+`llm-step` uses it to seed a child conversation from the parent's tree. The
+wrapper can use it to build `{state: <oid>}` the same way.
 
 ### Caveats
 
