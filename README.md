@@ -3,6 +3,52 @@
 Caos is a Content-Addressable Operating System. It's functional programming with git as the values and docker as the
 functions, cached by redis
 
+# How to use
+
+- In the instructions below, `$FOO` can be used literally if you have set an env var. `<FOO>` needs to be expanded by you when entering the text
+- `CAOS_SERVER` is a secret ticket that grants access to your caos server. If you work at softmax, get it with:
+  ```
+    AWS_PROFILE=softmax aws secretsmanager get-secret-value \
+      --region us-east-1 --secret-id caos/prod-iroh-ticket \
+      --query SecretString --output text
+  ```
+- `CAOS_SECRETS_DIR` is the directory on your computer where you keep caos secrets
+- On your computer, make some secrets:
+  - `mkdir $CAOS_SECRETS_DIR` and then cd there
+  - `nix run github:Metta-AI/caos#caos-cli -- secrets-push --dir=$CAOS_SECRETS_DIR`
+  - Github:
+    - If you need to make a github token
+        - Go to https://github.com/settings/personal-access-tokens
+        - Make a new fine-grained token
+        - Give it access to content, PRs
+        - Set to read+write
+    - Put this into `$CAOS_SECRETS_DIR/github-token`, using your real github token as the value:
+      ```
+      value=<token>
+      reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/llm-step
+      ```
+  - If you have a softmax token, do the same as above but:
+    - Name the file `softmax-token`
+    - Set the reader to `reader:@@=git+https://github.com/Metta-AI/caos-softmax?ref=refs/heads/main&dir=tools/gota`
+  - `nix run github:Metta-AI/caos#caos-cli -- secrets-push --dir=. --server=$CAOS_SERVER`. This prints your `SECRET_READERS_KEY`
+- Go go https://claude.ai/code. Click New
+- At the bottom, click Default > Cloud > Add Cloud env... and fill in the form:
+  - Name: Caos
+  - Network: Full
+  - Setup script:
+    ```
+      echo last modified on 2026-10-01T1455PT
+      B=https://raw.githubusercontent.com/Metta-AI/caos/main
+      curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+      go run /tmp/caos-bootstrap.go --base="$B" \
+        --server=<CAOS_SERVER> --secret-readers=<SECRET_READERS_KEY>
+    ```
+- From the repo picker (next to the env picker), choose `metta-ai/caos-session`
+- Type a prompt
+  - `Use caos to import metta-ai/caos into caos/main`
+  - `Use caos' RunTool to run caos-std/caos-build on caos/main`
+  - `Use caos' RunTool to run caos-std/caos-test on caos/main`
+
 # Why?
 
 ## Security
@@ -385,13 +431,16 @@ the object machinery through a one-way dependency. Their difference is the
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
   - `tui` — interactive conversations, with a bundled harness independent of
-    target repositories. It starts without code; `caos tui --import imports/repo/base`
+    target repositories. **Probably broken at the moment:** it predates the
+    server-held secret store, and its first-run key prompt is reduced to a
+    check (rust/crates/caos-cli/TUI.md).
+    It starts without code; `caos tui --import imports/repo/base`
     imports the launching checkout's clean HEAD at that conversation path.
     Add a source and revision to select another repository or commit; Git URLs
     require a full commit hash. Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
-    remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
-    one PR, and `/checkout <gitlink> [directory]` exports code for local editing;
+    remote repository commits, and `/checkout <gitlink> [directory]` exports code
+    for local editing; the agent opens PRs itself;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form. A conversation NAMES the two
@@ -399,73 +448,52 @@ the object machinery through a one-way dependency. Their difference is the
     `--llm-call:@=std/llm-call` here, `--llm-step:@=caos-std/llm-step` in a repo
     that mounted caos, or `:@@=<git ref>` in one that only pinned it. There is
     no default and no path this client goes looking in;
-  - `secrets [--check]` — tend the `.caos-secrets` store: fill a
-    missing `entropy=`, warn on a weak one (`--check` reports only and exits
-    non-zero, for CI). Offline — no server (design/secrets.md). A committed
-    entry taking its value from the environment is left alone (below).
+  - `secrets-init --dir=<d>` / `secrets-push --dir=<d> [--server=<url>]` —
+    your secret store (SPEC.md, "Secrets"). Runs anywhere, no caos tree needed.
 
-Conversations read their model credential from that local store rather than
-putting it in a curried worker. The easiest setup is `caos tui`: when the store
-has no `anthropic-api-key`, it prompts for the key (pasted, or the path to a
-file holding it), then writes the entry below with fresh entropy and the
-ignore rule (rust/crates/caos-cli/TUI.md). The TUI reuses the launching
-checkout's existing store; otherwise it uses `~/.local/share/caos/secrets`
-(or `$XDG_DATA_HOME/caos/secrets`). Its internal harness checkout keeps this
-store ignored and separate from attached code. Set `--server <url>` to choose
-a server outside a checkout (default: `http://localhost:9090`).
-The same setup by hand for checkout-based line clients is:
+Secrets live in a directory you choose — it is the only copy you keep, so put
+it somewhere you back up — and the server holds a copy you replace with each
+push. `caos-cli secrets-init --dir=<d>` creates the directory and a key pair,
+and prints the SecretReaderKey: the key a client presents to use the secrets
+(run it again to print the key of a directory that has one). A checkout
+presents it once you run `git config caos.secret-readers <key>` there; a cloud
+session is given it on its setup line (integrations/claude-code/cloud). Each
+file in the directory is one secret:
 
 ```text
-# .gitignore
-.caos-secrets/
-
-# .caos-secrets/anthropic-api-key
-name=anthropic-api-key
-value:@=.anthropic-api-key-value
-reader=std/llm-step
-reader=std/llm-call
+# <d>/anthropic-api-key
+value=<the key>
+reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
+reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-call
 ```
 
-The two `reader=` lines are the paths the conversation's `--llm-step:@=` and
-`--llm-call:@=` args name, since a reader is the expression it grants to — so
-they move together, and a repo that mounted caos writes `caos-std/…` in both
-places. `caos tui` derives them from the args it was given.
-
-Run `caos-cli secrets` once to add the random `entropy=` used for cache
-isolation. The value file must hold the key verbatim — no trailing newline,
-since the value goes into the `x-api-key` header untouched. The file and value
-path stay local; only the entropy-derived identity enters an ArgTree, while the
-value is carried out of band for the run.
-
-### A secrets file that can be committed
-
-`value:env=<VAR>` and `entropy:env=<VAR>` take both halves from the process
-environment, so the file itself carries no secret and belongs in git — which is
-what lets a shared client repo ship the *declaration* (the name and the
-readers) while each user supplies their own bytes:
+A reader names the image a secret is granted to: a path in a repository, at a
+commit (`rev=<sha>`) or a branch (`ref=`), back to an optional `since=<sha>`;
+or `reader:@=<path> conversation=<id>` for a path in one conversation. A copy
+of a granted tree — a `DEEP-DEPS` mount, a repository that pins caos — is
+granted too, so a client repo mounting caos' std needs nothing more. Then:
 
 ```text
-# .caos-secrets/github-token — committed; both values come from the environment
-name=github-token
-value:env=GITHUB_TOKEN
-entropy:env=CAOS_GITHUB_TOKEN_ENTROPY
-reader=caos-std/llm-step
+caos-cli secrets-push --dir=<d> --server=http://localhost:9090
 ```
 
-The pairing is a rule, not a convention: `value:env=` beside a literal
-`entropy=` is **refused at parse time**. Entropy is a bearer capability for the
-cache — knowing it reconstructs the key of any run that used it — so a
-committed literal would put every clone of the repo on one `secret-hash` and
-let one user's cached results answer another's. `caos secrets` will not invent
-one either; it says to add `entropy:env=` instead.
+Neither needs caos installed, or a caos tree to run in. With nix:
 
-An `:env=` variable that is unset or blank **drops that secret** from the store,
-with one line on stderr, rather than failing the turn. A template can therefore
-declare a token most of its users never set: public work keeps running, and a
-worker that genuinely needed the credential fails on the missing
-`/secret/<name>`, which is the contract anyway. Unlike the other two forms, an
-`:env=` value is trimmed — a variable set by a shell far more often carries a
-stray newline than a token that ends in one.
+```bash
+nix run github:Metta-AI/caos#caos-cli -- secrets-init --dir=<d>
+nix run github:Metta-AI/caos#caos-cli -- \
+  secrets-push --dir=<d> --server=caos://<ticket>
+```
+
+`--server` takes a ticket as well as a URL.
+
+`secrets-push` adds a random `entropy=` to any secret without one (it is the
+secret's cache-isolation identity; rotate it with the value when a result
+depends on which account the value belongs to). `value:@=<file>` reads the
+value from a file instead. The value file must hold the key verbatim — no
+trailing newline, since the value goes into the `x-api-key` header untouched.
+Values never enter an ArgTree: the server injects them at `/secret/<name>`.
+A grant, or a secret, pushed later takes effect on the next request.
 
 `caos-cli` must run inside a git working tree with the server as its `caos`
 remote — the remote's URL is also where compute is triggered and results are

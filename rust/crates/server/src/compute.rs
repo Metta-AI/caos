@@ -93,7 +93,7 @@ struct WorkRequest<'a> {
     /// The secrets the run carries as ephemeral context (design/secrets.md):
     /// matched + injected at every dispatch, threaded into promise sub-runs.
     /// NOT part of the ArgTree or the cache key.
-    secrets: &'a [crate::secrets::Grant],
+    secrets: &'a crate::secrets::Context,
 }
 
 /// `GET /resolve-image?image=<hex hash | docker://ref>` — the reference a
@@ -148,15 +148,12 @@ pub(crate) fn resolve_image_endpoint(config: &Config, query: &str) -> Result<Vec
 /// The walk is [`resolve_promise`]'s `eval` step ([`ServerEvalHost`]); its
 /// sub-builds already ride `/run`'s single-flight and memo, so concurrent
 /// callers are correct and cheap on repeat even before the result cache below
-/// skips the re-walk. Secret marking is a no-op through eval (it happens when
-/// the step RUNS, not when it resolves — measured: a marked and an unmarked
-/// resolve of `std/llm-step` produce the identical oid), so the object is
-/// byte-identical to a client `eval-path`. Scoped by the caller's secrets
-/// anyway, like `/run`, against the day that stops holding.
+/// skips the re-walk. A request carrying SecretReaderKeys skips that cache:
+/// evaluation is where grants are decided and recorded (SPEC, "Secrets").
 pub(crate) fn eval_endpoint(
     config: &Config,
     query: &str,
-    secrets_header: &str,
+    secrets: &crate::secrets::Context,
     token: Option<&str>,
 ) -> Result<Vec<u8>, HttpError> {
     let by_hash = query_param(query, "root:hash");
@@ -175,7 +172,7 @@ pub(crate) fn eval_endpoint(
             let path = path.ok_or_else(|| {
                 HttpError::new(400, "root:hash=<oid> needs &path=<p> to evaluate within it")
             })?;
-            eval_in_tree(config, &root, &path, secrets_header)
+            eval_in_tree(config, &root, &path, secrets)
         }
         (None, Some(locator)) => {
             // A locator IS a path: `dir=` says which. Taking `&path=` as well
@@ -191,38 +188,75 @@ pub(crate) fn eval_endpoint(
             let root = crate::locator::resolve_root(config, &git_ref, token)
                 .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
             let dir = git_ref.dir.as_deref().unwrap_or("");
-            eval_in_tree(config, &root.to_string(), dir, secrets_header).map_err(|e| {
+            let result = eval_in_tree(config, &root.to_string(), dir, secrets).map_err(|e| {
                 HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message()))
-            })
+            })?;
+            if let Some((_, hash)) = std::str::from_utf8(&result)
+                .ok()
+                .and_then(|r| r.split_once(' '))
+            {
+                crate::secrets::record_mount(
+                    config,
+                    hash.trim(),
+                    caos_eval::Origin {
+                        root: root.to_string(),
+                        path: dir.to_string(),
+                    },
+                );
+            }
+            Ok(result)
         }
     }
 }
 
-/// [`eval_endpoint`]'s body once the root is an object this store holds: the
-/// `{in, eval}` continuation, memoized on (tree, path, secret scope). Both root
-/// types land here, so a locator's descent and a direct one over the same
+/// [`eval_endpoint`]'s body once the root is an object this store holds. Both
+/// root types land here, so a locator's descent and a direct one over the same
 /// fetched root are ONE memo entry rather than two.
 fn eval_in_tree(
     config: &Config,
     root: &str,
     path: &str,
-    secrets_header: &str,
+    secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
+    evaluate(config, root, path, secrets).map(String::into_bytes)
+}
+
+/// Walk `root` down to `path`, returning `"<kind> <hash>"`, memoized on the
+/// tree, the path, and whatever a grant could depend on
+/// ([`crate::secrets::Context::walk_key`]). A cached result needs nothing
+/// replayed: the walk's grant records are kept in redis too.
+fn evaluate(
+    config: &Config,
+    root: &str,
+    path: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    // Content-addressed by storing it, so the redis key is fixed-length.
+    let identity = match secrets.walk_key() {
+        None => format!("eval\u{0}{root}\u{0}{path}"),
+        Some(scope) => format!("eval\u{0}{root}\u{0}{path}\u{0}{scope}"),
+    };
+    let id = store_git_blob(config, identity.as_bytes()).map_err(|e| HttpError::new(500, e))?;
+    let key = result_key(config, &id.to_string());
+    if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
+        return Ok(result);
+    }
+    let result = walk(config, root, path, secrets)?;
+    let _ = cache_set(&config.redis_addr, &key, &result);
+    Ok(result)
+}
+
+/// Walk `root` down to `path`, returning `"<kind> <hash>"`.
+fn walk(
+    config: &Config,
+    root: &str,
+    path: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let root_oid = gix::ObjectId::from_hex(root.as_bytes())
         .map_err(|_| HttpError::new(400, format!("root:hash={root:?} is not an object id")))?;
-    let secrets = crate::secrets::parse_header(secrets_header);
-
-    // The memo identity: the input tree, the path, and the secret scope.
-    // Content-addressed by storing it, so the redis key is fixed-length.
-    let identity = format!("eval\u{0}{root}\u{0}{path}\u{0}{secrets_header}");
-    let id = store_git_blob(config, identity.as_bytes()).map_err(|e| HttpError::new(500, e))?;
-    let key = result_key(config, &id.to_string());
-    if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
-        return Ok(result.into_bytes());
-    }
-
     // The `{in, eval}` continuation `resolve_promise` walks: `in` is the tree,
     // `eval` a blob naming the path within it.
     let eval_blob = store_git_blob(config, path.as_bytes()).map_err(|e| HttpError::new(500, e))?;
@@ -248,9 +282,157 @@ fn eval_in_tree(
     // here (no `then`, so no pool inheritance reads it), so the continuation
     // names itself.
     let cont = cont.to_string();
-    let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], &secrets)?;
-    let _ = cache_set(&config.redis_addr, &key, &result);
-    Ok(result.into_bytes())
+    let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], secrets)?;
+    Ok(result)
+}
+
+/// A locator's object: its `rev`'s tree, descended to `dir=` by evaluation.
+fn evaluate_locator(
+    config: &Config,
+    locator: &str,
+    token: Option<&str>,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
+    let root = crate::locator::resolve_root(config, &git_ref, token)
+        .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+    let dir = git_ref.dir.as_deref().unwrap_or("");
+    let result = evaluate(config, &root.to_string(), dir, secrets)
+        .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
+    if let Some((_, hash)) = result.split_once(' ') {
+        crate::secrets::record_mount(
+            config,
+            hash,
+            caos_eval::Origin {
+                root: root.to_string(),
+                path: dir.to_string(),
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// `POST /submit` — form a request (SPEC, "Submitting work") and return
+/// `tree <ArgTree>` and a `granted <name>…` line: the secrets a run of it
+/// would be given. The body is JSON:
+///
+/// - `bundle`: a tree the client pushed, holding `args` (the call's entries,
+///   ready) and, when `base` is a path, `root` (the tree it is a path in);
+/// - `base`: `{"type": "path"|"locator"|"hash"|"docker", "value": …}`;
+/// - `locators` (optional): `{name: locator}`, args evaluated here;
+/// - `salt` (optional).
+///
+/// Everything that needs evaluating is evaluated here, so the client's whole
+/// part is one push and this call.
+pub(crate) fn submit(
+    config: &Config,
+    body: &[u8],
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    let bad = |message: String| HttpError::new(400, message);
+    let json: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| bad(format!("body is not JSON: {e}")))?;
+    let text = |value: &serde_json::Value, what: &str| {
+        value
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| bad(format!("{what} must be a string")))
+    };
+    let bundle = text(&json["bundle"], "bundle")?;
+    let entry = |name: &str| -> Result<Option<gix::objs::tree::Entry>, HttpError> {
+        Ok(fetch_tree(config, &bundle)
+            .map_err(|e| bad(format!("bundle {bundle}: {e}")))?
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| named_entry(&e.name, e.mode, e.oid)))
+    };
+    let kind_hash = |result: String| -> Result<(String, String), HttpError> {
+        result
+            .split_once(' ')
+            .map(|(k, h)| (k.to_string(), h.to_string()))
+            .ok_or_else(|| HttpError::new(500, format!("malformed result {result:?}")))
+    };
+
+    let base_value = text(&json["base"]["value"], "base.value")?;
+    let image = match json["base"]["type"].as_str() {
+        Some("path") => {
+            let root = entry("root")?.ok_or_else(|| bad("a path base needs bundle/root".into()))?;
+            kind_hash(evaluate(
+                config,
+                &root.oid.to_string(),
+                &base_value,
+                secrets,
+            )?)?
+            .1
+        }
+        Some("locator") => kind_hash(evaluate_locator(config, &base_value, token, secrets)?)?.1,
+        Some("hash") => base_value,
+        Some("docker") => format!("docker://{base_value}"),
+        other => return Err(bad(format!("unknown base type {other:?}"))),
+    };
+
+    let mut call = match entry("args")? {
+        Some(args) => fetch_tree(config, &args.oid.to_string())
+            .map_err(|e| bad(format!("bundle args: {e}")))?
+            .into_iter()
+            .map(|e| named_entry(&e.name, e.mode, e.oid))
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(locators) = json["locators"].as_object() {
+        for (name, locator) in locators {
+            let locator = text(locator, "a locator")?;
+            let (kind, hash) = kind_hash(evaluate_locator(config, &locator, token, secrets)?)?;
+            let oid = gix::ObjectId::from_hex(hash.as_bytes())
+                .map_err(|_| HttpError::new(500, format!("{hash:?} is not an object id")))?;
+            call.push(named_entry(name, caos_eval::mode_of_kind(&kind), oid));
+        }
+    }
+    // A base may itself be a formed request, carried forward with more args.
+    let (image, call) = match flat_arg_tree(config, &image)? {
+        Some((inner, bound)) => (inner, merge_entries(bound, call)),
+        None => (image, call),
+    };
+    let salt = json["salt"].as_str().unwrap_or("");
+    let arg_tree = form_arg_tree(config, &image, call, salt)?;
+    let granted = crate::secrets::granted_names(config, secrets, &args_entries(config, &arg_tree)?);
+    Ok(format!("tree {arg_tree}\ngranted {}\n", granted.join(" ")).into_bytes())
+}
+
+/// A formed ArgTree's `base` and its other entries; `None` for anything else.
+/// A git-docker image carries a `base` of its own, and `config.json`, which no
+/// arg can be named.
+fn flat_arg_tree(
+    config: &Config,
+    hash: &str,
+) -> Result<Option<(String, Vec<gix::objs::tree::Entry>)>, HttpError> {
+    if !(hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Ok(None);
+    }
+    let Ok(entries) = fetch_tree(config, hash) else {
+        return Ok(None);
+    };
+    if entries
+        .iter()
+        .any(|e| e.name == CURRY_MARKER || e.name == "config.json")
+    {
+        return Ok(None);
+    }
+    let Some(base) = entries.iter().find(|e| e.name == "base") else {
+        return Ok(None);
+    };
+    let base = if base.mode.is_tree() {
+        base.oid.to_string()
+    } else {
+        blob_string(config, &base.oid.to_string())?
+    };
+    let bound = entries
+        .into_iter()
+        .filter(|e| e.name != "base")
+        .map(|e| named_entry(&e.name, e.mode, e.oid))
+        .collect();
+    Ok(Some((base, bound)))
 }
 
 /// `GET /run?req=<argTreeHash>` — run the ArgTree `<argTreeHash>` (which carries
@@ -269,12 +451,9 @@ fn eval_in_tree(
 pub(crate) fn run(
     config: &Config,
     query: &str,
-    secrets_header: &str,
+    secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
     let arg_tree = parse_arg_tree(query)?;
-    // The carried secrets store (design/secrets.md): parsed from the request
-    // header, held for this run and threaded through every sub-run's dispatch.
-    let secrets = crate::secrets::parse_header(secrets_header);
     // An HTTP run is by definition top-level: the run stack (cycle detection)
     // exists only inside the server, threaded through promise sub-runs.
     let result = run_work_request(
@@ -282,7 +461,7 @@ pub(crate) fn run(
         &WorkRequest {
             arg_tree: &arg_tree,
             stack: &[],
-            secrets: &secrets,
+            secrets,
         },
     );
     // Top-level publication is part of `run_work_request`: a flight owner pins
@@ -497,12 +676,12 @@ fn run_dispatch_inner(
         let seeded = arg_entries
             .get(caos_world::REQUIRED_POOL_ARG)
             .is_some_and(|oid| *oid == crate::runner::pool_oid(caos_world::SEEDED_POOL));
-        // Find the secrets this job's identity is entitled to (design/secrets.md):
-        // carried readers whose partial arg tree is a subset of ours. They ride
+        // Find the secrets this job's identity is entitled to (SPEC, "Secrets"):
+        // those of every image evaluation granted that ours contains. They ride
         // out of band in the job payload — never in the ArgTree, so never in the
         // cache key — and the container runner drops them at `/secret/<name>`.
         // Read from `arg_entries` before dispatch takes ownership of it.
-        let granted = crate::secrets::grant(secrets, &arg_entries);
+        let granted = crate::secrets::grant(config, secrets, &arg_entries);
         crate::runner::dispatch(
             arg_tree,
             arg_entries,
@@ -562,7 +741,7 @@ fn start_sub_run(
     config: &Config,
     arg_tree: &str,
     stack: &[String],
-    secrets: &[crate::secrets::Grant],
+    secrets: &crate::secrets::Context,
 ) -> Result<(), HttpError> {
     let (image, _) = read_arg_tree(config, arg_tree)?;
     if image.is_empty() {
@@ -572,7 +751,7 @@ fn start_sub_run(
     let config = config.clone();
     let arg_tree = arg_tree.to_string();
     let stack = stack.to_vec();
-    let secrets = secrets.to_vec();
+    let secrets = secrets.clone();
     std::thread::spawn(move || {
         let result = run_work_request(
             &config,
@@ -972,13 +1151,13 @@ fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
 /// — which blocks THIS request thread (never a worker slot), exactly as
 /// [`resolve_promise`]'s own `run` step does. This is what lets a worker request
 /// evaluation server-side, via an `eval` continuation, and get the byte-identical
-/// object a client `eval-path` would build. Marking is a no-op: server-side
-/// secret marking through eval is deferred (tools use no secrets).
+/// object a client `eval-path` would build, marked where a node's origin
+/// matches a grant ([`crate::secrets::evaluated`]).
 struct ServerEvalHost<'a> {
     config: &'a Config,
     salt: &'a str,
     stack: &'a [String],
-    secrets: &'a [crate::secrets::Grant],
+    secrets: &'a crate::secrets::Context,
     /// The promising ArgTree whose continuation this walk is, and the path it
     /// was asked to evaluate — together the name under which each dispatch is
     /// recorded as that node's child.
@@ -1052,11 +1231,29 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         let dir = git_ref.dir.as_deref().unwrap_or("");
         let (kind, hash) = caos_eval::eval_path(self, &root.to_string(), dir)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;
+        crate::secrets::record_mount(
+            self.config,
+            &hash,
+            caos_eval::Origin {
+                root: root.to_string(),
+                path: dir.to_string(),
+            },
+        );
         Ok((
             caos_eval::mode_of_kind(&kind),
             gix::ObjectId::from_hex(hash.as_bytes())
                 .map_err(|_| format!("git ref {value:?}: {hash:?} is not an object id"))?,
         ))
+    }
+    fn origins_of(&self, oid: &str) -> Vec<caos_eval::Origin> {
+        crate::secrets::origins_of(self.config, oid)
+    }
+    fn evaluated(
+        &self,
+        origins: &[caos_eval::Origin],
+        value: (String, String),
+    ) -> Result<(String, String), String> {
+        crate::secrets::evaluated(self.config, self, self.secrets, origins, value)
     }
     fn dispatch(
         &self,
@@ -1135,7 +1332,7 @@ fn resolve_promise(
     cont: &str,
     salt: &str,
     stack: &[String],
-    secrets: &[crate::secrets::Grant],
+    secrets: &crate::secrets::Context,
 ) -> Result<(String, bool), HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -1338,6 +1535,7 @@ fn resolve_promise(
             eval_path: path,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         };
+        crate::secrets::index_root(config, secrets, &input.oid.to_string());
         let evaluated = caos_eval::eval_path(&host, &input.oid.to_string(), path)
             .map(|(kind, hash)| format!("{kind} {hash}"))
             .map_err(|e| {
@@ -1571,8 +1769,28 @@ fn run_image(
     call_args: Vec<gix::objs::tree::Entry>,
     salt: &str,
     stack: &[String],
-    secrets: &[crate::secrets::Grant],
+    secrets: &crate::secrets::Context,
     record: impl FnOnce(&str),
+) -> Result<String, HttpError> {
+    let arg_tree = form_arg_tree(config, image_ref, call_args, salt)?;
+    record(&arg_tree);
+    run_work_request(
+        config,
+        &WorkRequest {
+            arg_tree: &arg_tree,
+            stack,
+            secrets,
+        },
+    )
+}
+
+/// The ArgTree `image_ref` with `call_args` makes: its bound args, the call's,
+/// its `base`, and the salt.
+fn form_arg_tree(
+    config: &Config,
+    image_ref: &str,
+    call_args: Vec<gix::objs::tree::Entry>,
+    salt: &str,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::EntryKind;
 
@@ -1606,13 +1824,47 @@ fn run_image(
         );
         args = merge_entries(args, vec![salt_entry]);
     }
-    // Cache-isolation tag (design/secrets.md): fold in `secret-hash` when this
-    // sub-run is granted a secret — matched against the base entries, so two
-    // callers with different secrets don't collide in the cache. Matched before
-    // the entry is added (readers never pin it, so there's no self-reference),
-    // and byte-identical to what the client folds into an equivalent top-level
-    // ArgTree, so a computation shares one cache entry however it's reached.
-    let base: std::collections::BTreeMap<String, String> = args
+    // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
+    Ok(store_git_tree(config, args).map_err(store_err)?.to_string())
+}
+
+/// `image_ref` as one curry node with the arg `name` released.
+pub(crate) fn unbind(config: &Config, image_ref: &str, name: &str) -> Result<String, HttpError> {
+    use gix::objs::tree::EntryKind;
+    let store_err = |e: String| HttpError::new(500, format!("unbinding {name}: {e}"));
+    let (image, bound) = unwrap_curry(config, image_ref)?;
+    let args: Vec<_> = bound
+        .into_iter()
+        .filter(|e| e.filename != name.as_bytes())
+        .collect();
+    let node = vec![
+        named_entry(
+            "base",
+            EntryKind::Blob.into(),
+            store_git_blob(config, image.as_bytes()).map_err(store_err)?,
+        ),
+        named_entry(
+            "args",
+            EntryKind::Tree.into(),
+            store_git_tree(config, args).map_err(store_err)?,
+        ),
+        named_entry(
+            CURRY_MARKER,
+            EntryKind::Blob.into(),
+            store_git_blob(config, b"1").map_err(store_err)?,
+        ),
+    ];
+    Ok(store_git_tree(config, node).map_err(store_err)?.to_string())
+}
+
+/// The entries `run_image` puts in every ArgTree formed from `image_ref`,
+/// before any call args or salt: its bound args and its `base`.
+pub(crate) fn image_entries(
+    config: &Config,
+    image_ref: &str,
+) -> Result<std::collections::BTreeMap<String, String>, HttpError> {
+    let (image, bound) = unwrap_curry(config, image_ref)?;
+    let mut entries: std::collections::BTreeMap<String, String> = bound
         .iter()
         .map(|e| {
             (
@@ -1621,25 +1873,19 @@ fn run_image(
             )
         })
         .collect();
-    if let Some(hash) = crate::secrets::secret_hash(secrets, &base) {
-        let entry = named_entry(
-            caos_world::SECRET_HASH_ARG,
-            EntryKind::Blob.into(),
-            store_git_blob(config, hash.as_bytes()).map_err(store_err)?,
-        );
-        args = merge_entries(args, vec![entry]);
-    }
-    // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
-    let arg_tree = store_git_tree(config, args).map_err(store_err)?.to_string();
-    record(&arg_tree);
-    run_work_request(
-        config,
-        &WorkRequest {
-            arg_tree: &arg_tree,
-            stack,
-            secrets,
-        },
-    )
+    let base = if image.len() == 40 && image.bytes().all(|b| b.is_ascii_hexdigit()) {
+        image
+    } else {
+        gix::objs::compute_hash(
+            gix::hash::Kind::Sha1,
+            gix::objs::Kind::Blob,
+            image.as_bytes(),
+        )
+        .map_err(|e| HttpError::new(500, format!("hashing {image:?}: {e}")))?
+        .to_string()
+    };
+    entries.insert("base".to_string(), base);
+    Ok(entries)
 }
 
 /// Peel any curry layers off `image_ref`, returning the underlying plain image
@@ -2490,6 +2736,37 @@ pub(crate) fn list_append(addr: &str, key: &str, value: &str) -> Result<(), Stri
         .write_all(&resp_command(&["RPUSH", key, value]))
         .map_err(|e| format!("write: {e}"))?;
     read_integer_reply(&mut BufReader::new(stream)).map(|_| ())
+}
+
+/// `RPUSH key value` for every pair, over one connection: one write, then
+/// every reply. Indexing a tree appends thousands, and a connection each would
+/// cost more than the walk.
+pub(crate) fn list_append_many(addr: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut stream = redis_connect(addr)?;
+    let mut buf = Vec::new();
+    for (key, value) in pairs {
+        buf.extend_from_slice(&resp_command(&["RPUSH", key, value]));
+    }
+    stream.write_all(&buf).map_err(|e| format!("write: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    for _ in pairs {
+        read_integer_reply(&mut reader)?;
+    }
+    Ok(())
+}
+
+/// `GET key`, in the result cache's namespace-free keyspace — for facts about
+/// content that hold for every build.
+pub(crate) fn fact_get(addr: &str, key: &str) -> Result<Option<String>, String> {
+    cache_get(addr, key)
+}
+
+/// `SET key value`, the counterpart of [`fact_get`].
+pub(crate) fn fact_set(addr: &str, key: &str, value: &str) -> Result<(), String> {
+    cache_set(addr, key, value)
 }
 
 /// `LRANGE key 0 -1` — the whole list, in insertion order.

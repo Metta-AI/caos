@@ -600,6 +600,7 @@ fn diagnostics() -> String {
     }
     // The remote the client dials -- present means the setup phase added it.
     d.push_str(&format!("caos remote: {}\n", caos_remote()));
+    d.push_str(&format!("{}\n", crate::secret_store::reader_summary()));
     // Whether git can reach a `caos://` remote, which is a DIFFERENT question
     // from whether this client can: the client speaks the transport itself,
     // while git execs `git-remote-caos` by name for every push and fetch. A

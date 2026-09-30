@@ -84,6 +84,7 @@ func curlTo(url, dest string) error {
 type args struct {
 	base       string
 	server     string
+	readers    string
 	devCommit  string
 	devTree    string
 	enableBash bool
@@ -99,6 +100,10 @@ func parseArgs(argv []string) args {
 		switch key {
 		case "--base":
 			a.base = strings.TrimRight(value, "/")
+		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"), kept
+		// in the checkout's git config beside the `caos` remote `--server` adds.
+		case "--secret-readers":
+			a.readers = value
 		case "--server":
 			a.server = value
 		// A COMMIT, not a second server: the install package comes from the
@@ -628,8 +633,8 @@ func main() {
 		fatal("no checkout with a flake.lock was found under /home/user.\n" +
 			"  A caos session starts from a CLIENT repo: flake.nix + flake.lock\n" +
 			"  pinning a 'caos' input by revision, a root .caos-expr mounting that\n" +
-			"  input's std, the AGENTS.md the agent is given, and .caos-secrets\n" +
-			"  declaring what it may use. Point this environment at one, or fork\n" +
+			"  input's std, and the AGENTS.md the agent is given.\n" +
+			"  Point this environment at one, or fork\n" +
 			"  Metta-AI/caos-session.")
 	}
 	p, err := readLock(filepath.Join(repoDir, "flake.lock"), "caos")
@@ -778,6 +783,11 @@ func main() {
 	if err := probe.Run(); err != nil {
 		if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
 			say("could not add the caos remote; the session will have no server")
+		}
+	}
+	if a.readers != "" {
+		if _, err := run(repoDir, "git", "config", "caos.secret-readers", a.readers); err != nil {
+			say("could not record --secret-readers; the session will present no secrets")
 		}
 	}
 

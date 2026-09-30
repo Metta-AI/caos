@@ -7,9 +7,14 @@
 // its setup and re-runs it only when the setup text changes
 // (design/cloud-setup.md).
 //
-// THE DEV CHECK, which is the one thing that has to be per-session for that
-// reason. Setup refuses a `--dev-commit` the server is not serving, but a cached
-// setup is not asked again, so a stack republished since is caught only here.
+// THE STALENESS CHECK, which is the one thing that has to be per-session for
+// that reason: is the installed caos the one a fresh setup would install NOW?
+// Too late to install that one instead -- Claude Code has already started on
+// the files setup left. Out of dev mode the answer is the checkout's pin, which
+// the environment fetches before every session while the install stays where
+// setup left it. In dev mode it is the commit the server serves: setup refuses
+// a `--dev-commit` the server is not serving, but a cached setup is not asked
+// again, so a stack republished since is caught only here.
 //
 // THE REGISTRY WARM, which fills the cache `mcp serve` reads. It could run in
 // setup -- nothing stops it reaching the server from there -- but it is the step
@@ -22,6 +27,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,10 +36,11 @@ import (
 	"time"
 )
 
-const shareDir = "/usr/local/share/caos"
+// `--share-dir` moves it, for tests/cloud-setup, as it does for bootstrap.go.
+var shareDir = "/usr/local/share/caos"
 
 // The `caos` wrapper refuses every call while this exists (install.go).
-const staleMarker = shareDir + "/stale-dev"
+func staleMarker() string { return filepath.Join(shareDir, "stale-install") }
 
 // Long enough for the observed resolve (~110s in a cloud session, which talks to
 // the server and may run the step to list its tools), so a cap short enough to be
@@ -71,6 +78,11 @@ func git(args ...string) (string, error) {
 }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if value, ok := strings.CutPrefix(arg, "--share-dir="); ok {
+			shareDir = strings.TrimRight(value, "/")
+		}
+	}
 	// The repo is named, not assumed from cwd: a hook's working directory is not
 	// contractually the project, and a wrong one here does not error -- it
 	// silently adds the remote to some other repository, and the failure shows up
@@ -87,13 +99,19 @@ func main() {
 	}
 
 	// A marker describes one session's check, so it never outlives it.
-	os.Remove(staleMarker)
+	os.Remove(staleMarker())
 	setup := stamp("setup-stamp")
 	dev := stamp("dev-stamp")
 	for _, key := range []string{"built", "base", "pin", "client"} {
 		if value, ok := setup[key]; ok {
 			log("env %s=%s", key, value)
 		}
+	}
+	// Dev mode installs the dev commit whatever the checkout pins, so there the
+	// pin says nothing about staleness. No warm after a failure: every call it
+	// would make is refused.
+	if dev["rev"] == "" && pinMoved(setup["pin"]) {
+		return
 	}
 
 	// REPORTED, NOT REPAIRED. The setup phase adds this from `--server` before
@@ -187,11 +205,7 @@ func probeDev() devProbe {
 }
 
 // A mismatch FAILS THE SESSION: it is the state in which everything else
-// looks right and the tree under test is not the one running. A SessionStart
-// hook cannot refuse a session, so it writes `staleMarker`, which the `caos`
-// wrapper (install.go) turns into exit 2 on every call -- blocking each prompt
-// and each caos tool call with this text. Also on STDOUT, the one stream a
-// session keeps from this hook.
+// looks right and the tree under test is not the one running.
 //
 // A probe that failed only goes to stderr -- the warm reports an unreachable
 // server on its own, and a dev check that cannot be made is not a mismatch.
@@ -210,8 +224,83 @@ func reportDev(installed string, p devProbe) {
 		"on the old commit. Every caos call in this session is refused. Put the\n"+
 		"--dev-commit=<sha> that the latest `caosd up --iroh` printed on the\n"+
 		"environment's setup line, then start a new session.\n", short(installed), short(p.sha))
-	if err := os.WriteFile(staleMarker, []byte(msg), 0o644); err != nil {
-		log("could not write %s, so this session is NOT blocked: %v", staleMarker, err)
+	fail(msg)
+}
+
+// Whether the checkout now pins a different caos than the one setup installed,
+// failing the session if so. A cached setup cannot notice: the environment
+// fetches the repo before every session but re-runs setup only when the setup
+// TEXT changes, so moving the pin moves the checkout and leaves the install
+// behind -- a session that runs the old tools with nothing saying so.
+func pinMoved(installed string) bool {
+	if installed == "" {
+		log("the setup stamp names no pin, so the install cannot be checked against the checkout")
+		return false
+	}
+	top, err := git("rev-parse", "--show-toplevel")
+	if err != nil {
+		log("could not find the checkout's top level: %v", err)
+		return false
+	}
+	// A lock that no longer reads is a checkout a fresh setup would refuse, which
+	// is as stale as one that moved.
+	now, err := lockedCaos(filepath.Join(top, "flake.lock"))
+	if err != nil {
+		now = "nothing readable (" + err.Error() + ")"
+	}
+	if now == installed {
+		log("pin check: the checkout still pins %s", installed)
+		return false
+	}
+	fail(fmt.Sprintf("caos: STALE INSTALL -- this session runs caos\n  %s\nbut the checkout now pins\n  %s\n"+
+		"The environment's setup is cached from an earlier session and\n"+
+		"re-runs only when its setup text changes, so it is still on the old pin.\n"+
+		"Every caos call in this session is refused. Change the environment's setup\n"+
+		"line (the date on its first line will do), then start a new session.\n", installed, now))
+	return true
+}
+
+// The `caos` input as bootstrap.go stamps it, `owner/repo@rev`, by readLock's
+// node walk: the input name maps to a node KEY, and only that node's `locked`
+// section is authoritative.
+func lockedCaos(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var lock struct {
+		Root  string `json:"root"`
+		Nodes map[string]struct {
+			Inputs map[string]json.RawMessage `json:"inputs"`
+			Locked struct {
+				Owner string `json:"owner"`
+				Repo  string `json:"repo"`
+				Rev   string `json:"rev"`
+			} `json:"locked"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return "", err
+	}
+	root := lock.Root
+	if root == "" {
+		root = "root"
+	}
+	var key string
+	if err := json.Unmarshal(lock.Nodes[root].Inputs["caos"], &key); err != nil || key == "" {
+		return "", fmt.Errorf("no caos input")
+	}
+	locked := lock.Nodes[key].Locked
+	return locked.Owner + "/" + locked.Repo + "@" + locked.Rev, nil
+}
+
+// A SessionStart hook cannot refuse a session, so this writes the marker the
+// `caos` wrapper (install.go) turns into exit 2 on every call -- blocking each
+// prompt and each caos tool call with this text. Also on STDOUT, the one
+// stream a session keeps from this hook.
+func fail(msg string) {
+	if err := os.WriteFile(staleMarker(), []byte(msg), 0o644); err != nil {
+		log("could not write %s, so this session is NOT blocked: %v", staleMarker(), err)
 	}
 	fmt.Print(msg)
 }

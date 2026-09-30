@@ -75,16 +75,21 @@ not claimed here; what changed is that it is no longer on this path at all.
 
 The client repo is also the **version knob**. Stage 1 reads its `flake.lock`
 before installing anything, so the client binary, the tools and the tree the
-session evaluates all come from the commit the repo pins. It is read once per
-session rather than twice: the setup phase runs every session, so a repo that has
-re-pinned is picked up there, and a second reader in the hook could only ever be
-the stale one of the two.
+session evaluates all come from the commit the repo pins. **But a re-pin does not
+re-run setup.** An environment caches its setup and re-runs it only when the
+setup text changes, while it fetches the repo before every session — so moving
+the pin moves the checkout and leaves the install behind. The session hook reads
+the lock again and compares it with the `pin=` setup stamped; on a mismatch it
+prints `STALE INSTALL` naming both and blocks every call the way a stale dev
+install is blocked (below). Change the setup line (its first-line date will do)
+and start a new session. The hook cannot install the new pin itself: Claude Code
+has already started on the old files by the time it runs.
 
 With caos reachable at a path in the checkout (`caos-std/`, from the repo's
 root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
 rather than a locator pinned to the client's own build. The same path makes
-`reader=caos-std/llm-step` resolvable in a **committed** `.caos-secrets` entry,
-which is how a shared repo can declare a GitHub token without holding one.
+`caos-std/llm-step` the node a `reader:@@=` grant on caos's `std/llm-step` matches
+(SPEC.md, "Secrets").
 
 Claude Code's own configuration is still user-level in the container, so one
 environment serves every repo. Three routes were possible; only one works:
@@ -127,7 +132,6 @@ environment at your fork. It is four things, and nothing else:
 flake.nix / flake.lock   a `caos` input pinned by revision — the version knob
 .caos-expr               one line, mounting that input's std/ at --output-path
 AGENTS.md (+ CLAUDE.md)  what the agent is told at the start of every session
-.caos-secrets/           secret DECLARATIONS — names and readers, no values
 .gitignore               the mount point, which must not exist as a real directory
 ```
 
@@ -143,7 +147,8 @@ scripts* — everything else is read back out of it):
 ```
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
-go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
+go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
+  --secret-readers=<key>
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, and a single stdlib-only file
@@ -174,26 +179,14 @@ that server, which runs containers and holds every secret. The status tool
 redacts it rather than printing it for a model to quote, and the stamps stage 1
 writes carry the revision but never the ticket.
 
-**For private repositories**, two more, both named by the client repo's
-committed `.caos-secrets/github-token` rather than by anything here:
+**Secrets** — the model key, a GitHub token for private repositories — live
+in your own secret store on the server (SPEC.md, "Secrets"), pushed from your
+machine with `caos-cli secrets-push`. The setup line names it:
 
-- `GITHUB_TOKEN` — a PAT with access to the repos you want to import or publish.
-- `CAOS_GITHUB_TOKEN_ENTROPY` — 16+ random characters, yours alone. This is
-  what keeps your cached results unreadable by anyone else holding the same
-  client repo; it is a bearer capability for the cache, which is why it comes
-  from the environment and never from the committed file.
+- `--secret-readers=<key>` — the SecretReaderKey `caos-cli secrets-init`
+  printed. It is a credential: whoever holds it can run with your secrets.
 
-Leave both unset for public work: the secret is simply absent from the store
-(one line on stderr), and imports of public repositories need no credential.
-
-One thing to know before setting only one of them: **the container already has
-a `GITHUB_TOKEN`**, put there by the harness for its own clone. Measured — a
-session with neither variable set warned about the ENTROPY, and that warning is
-only reached once the value has resolved. So setting just
-`CAOS_GITHUB_TOKEN_ENTROPY` promotes the harness's token into a caos secret,
-which may be what you want or may not. Requiring both is what keeps that a
-decision: an ambient token with no entropy would otherwise have run with no
-cache isolation at all.
+A secret, or a grant, pushed later needs no change here.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
 client), `api.anthropic.com`, and iroh's relays are reachable from a SESSION;

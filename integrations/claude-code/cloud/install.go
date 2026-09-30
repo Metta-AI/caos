@@ -137,12 +137,12 @@ func installClient(a args) {
 	// dash on Debian and Ubuntu, where it is `exec: -a: not found` on every call.
 	//
 	// THE STALE MARKER FAILS EVERY CALL. The session hook writes it when this
-	// install is a dev commit the server no longer serves (session.go), and a
+	// install is not what a fresh setup would install now (session.go), and a
 	// SessionStart hook cannot stop a session on its own -- but every prompt and
 	// every caos tool call runs `caos mcp hook` through this file, and exit 2 is
 	// what makes Claude Code block the prompt or the call and show the reason.
 	// Removed here because it describes one session, never an install.
-	stale := filepath.Join(a.prefix, "share/caos/stale-dev")
+	stale := filepath.Join(a.prefix, "share/caos/stale-install")
 	os.Remove(stale)
 	wrapper := "#!/bin/bash\n" +
 		"if [ -e " + stale + " ]; then cat " + stale + " >&2; exit 2; fi\n" +
@@ -229,7 +229,7 @@ func marshal(value any) []byte {
 // A caos-client repo MOUNTS caos' std into its evaluated tree, so the step is an
 // ordinary path and the client resolves it by descent -- the same walk that
 // reaches `DEEP-DEPS/<x>` inside caos itself. This is also what makes
-// `reader=<std>/llm-step` resolvable in a committed `.caos-secrets` entry.
+// a `reader:@@=` grant on caos's `std/llm-step` match it (SPEC.md, "Secrets").
 //
 // The locator form pins the step to another repo's tree by full sha, for a
 // checkout with no std of its own.

@@ -89,14 +89,17 @@ case "$(subjects "$(ref_of "cc/$a")")" in
 esac
 
 echo "== resume needs the head, and says so ==" >&2
+# EXIT 2 exactly: it is the only status with which Claude Code blocks the prompt
+# and shows the reason. Any other failure lets the prompt through with no
+# conversation behind it and the reason dropped.
 old_head=$head_a   # the branch has moved past it now
-if prompt "resume-stale-$stamp" "/resume-caos-conversation $old_head" >/tmp/stale.out 2>/tmp/stale.err; then
-  fail "resumed from a commit that is no longer the head"
-fi
+rc=0
+prompt "resume-stale-$stamp" "/resume-caos-conversation $old_head" >/tmp/stale.out 2>/tmp/stale.err || rc=$?
+[ "$rc" = 2 ] || fail "a resume from a stale head exited $rc, not 2: $(cat /tmp/stale.err)"
 grep -q "not the head" /tmp/stale.err || fail "the refusal does not say why: $(cat /tmp/stale.err)"
-if prompt "resume-bad-$stamp" "/resume-caos-conversation main" >/dev/null 2>/tmp/bad.err; then
-  fail "accepted a branch name where a commit hash belongs"
-fi
+rc=0
+prompt "resume-bad-$stamp" "/resume-caos-conversation main" >/dev/null 2>/tmp/bad.err || rc=$?
+[ "$rc" = 2 ] || fail "a resume naming a branch exited $rc, not 2: $(cat /tmp/bad.err)"
 grep -q "40-character" /tmp/bad.err || fail "the refusal does not say what is wanted: $(cat /tmp/bad.err)"
 
 echo "== a head left open is used as it is ==" >&2

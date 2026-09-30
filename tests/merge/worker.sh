@@ -20,7 +20,7 @@
 # same oids. The message carries `--test-salt` so a salted run genuinely
 # recomputes rather than replaying the merge it did last time.
 #
-# FOUR STAGES: no run can be waited on, so each assertion is the `then` of the
+# FIVE STAGES: no run can be waited on, so each assertion is the `then` of the
 # merge it is about.
 set -euo pipefail
 
@@ -69,9 +69,11 @@ mint() { # <cas-name> <tree-oid> <message> [parent...]
 #
 # Everything the old test asked git is a line in the commit's raw bytes, or in
 # the tree they name.
-merge_run() { # <ours-cas-path> <theirs-cas-path> -> a request hash
+merge_run() { # <ours-cas-path> <theirs-cas-path> [merge-base-cas-path] -> a request hash
+  local base=()
+  if [ -n "${3:-}" ]; then base=(--merge-base:@="$3"); fi
   caos prepare-request --base:hash="$(caos hash /cas/args/merge)" \
-    --ours:@="$1" --theirs:@="$2"
+    --ours:@="$1" --theirs:@="$2" "${base[@]}"
 }
 result_commit() {
   caos get /cas/args/result >/dev/null
@@ -218,6 +220,36 @@ $out"
   if [[ "$out" == *"conflict"* ]]; then fail "clean merge's out mentions conflicts:
 $out"; fi
   echo "  ok: clean merge is a pure two-parent commit, no .caos/conflicts" >&2
+
+  echo "== an explicit base: replay a layer onto a force-pushed upstream ==" >&2
+  # A layer A on base H, and a new upstream H2 that is a fresh root: H is not
+  # in its history, so git finds no merge base of its own. With merge-base=H the
+  # merge applies only A's change on top of H2.
+  build_sides
+  A_T=$(mktree layer-t "f.txt=line1
+line2
+line3" "keep.txt=keep" "layer.txt=layer")
+  A=$(mint layer "$A_T" layer "$BASE")
+  H2_T=$(mktree h2-t "f.txt=line1
+REWRITTEN
+line3" "keep.txt=keep")
+  H2=$(mint h2 "$H2_T" "force-pushed upstream")
+  caos run-request-then "$(merge_run /cas/h2 /cas/layer /cas/base)" \
+    --then:hash="$(next rebased --ours="$H2" --theirs="$A")"
+  ;;
+
+rebased)
+  caos get /cas/args/ours; caos get /cas/args/theirs
+  m=$(result_commit)
+  parents=$(printf '%s\n' "$m" | grep '^parent ' | cut -d' ' -f2)
+  [ "$parents" = "$(cat /cas/args/ours)
+$(cat /cas/args/theirs)" ] || fail "M's parents are not [H2, A]: $parents"
+  t=$(merged_tree "$m")
+  [ ! -e "$t/.caos" ] || fail "the replay conflicted: $(result_out)"
+  [ "$(cat "$t/f.txt")" = "$(printf 'line1\nREWRITTEN\nline3')" ] \
+    || fail "the replay did not keep the new upstream's f.txt"
+  [ "$(cat "$t/layer.txt")" = "layer" ] || fail "the replay dropped the layer's change"
+  echo "  ok: with merge-base=H, only the layer's change lands on H2" >&2
 
   printf 'merge: ALL PASS\n' > /tmp/report
   cat /tmp/report >&2

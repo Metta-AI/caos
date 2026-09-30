@@ -1,26 +1,11 @@
-//! `.caos-expr` evaluation, client side (design/caos-expr.md).
+//! `.caos-expr` evaluation, from the client (design/caos-expr.md).
 //!
 //! A `.caos-expr` file makes the directory it sits in *evaluable*: instead of
 //! being taken verbatim, the directory's contents are computed by running the
-//! expression the file holds. The WALK itself lives in the shared `caos-eval`
-//! crate, generic over a `caos_eval::EvalHost` so it runs identically here
-//! (blocking at top level — a client holds no worker slot) and in the server
-//! (blocking a request thread to resolve an `eval` continuation). One walk, two
-//! backends: that is what makes a worker's server-side `eval-path-then` return
-//! the byte-identical object a client `eval-path` would build.
-//!
-//! This module is the CLIENT backend — [`ClientEvalHost`], which dispatches a
-//! `run` through `request_compute`, marks curries with the caller's secret store
-//! (design/secrets.md), and fetches `:@@=` locators — plus the CLI and
-//! resolution entry points that used to hold the walk.
-//!
-//! **`:@@=` is client-only, and not because of a sandbox.** A locator carries a
-//! mandatory commit sha, so it is perfectly deterministic; the point is that the
-//! ArgTree IS the cache key, so a locator must become an oid *before* the
-//! request is formed — otherwise the URL sits inside the key and two consumers
-//! pinning the same rev through different URLs (a fork, a mirror, ssh vs https)
-//! key identical content differently. `caos_eval::EvalHost::eval_remote`
-//! therefore refuses by default, and only this host overrides it.
+//! expression the file holds. The WALK lives in the shared `caos-eval` crate,
+//! and the client never runs it: it pushes the tree and asks the server
+//! (SPEC, "Submitting work"). A walk from here would cost a round trip per
+//! node, and evaluation is where the server grants secrets.
 //!
 //! The grammar, the here-string form, the `$CAOS_EXPR` binding and the
 //! worker-vs-data rule are documented on `caos_eval` itself.
@@ -28,14 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use caos_eval::MemoKind;
-use gix::objs::tree::Entry;
-
-use super::{
-    assemble_arg_tree, build_secret_store, eval_remote_arg, fetch_tree_entries, mark_arg_tree,
-    post_object, post_tree, request_compute, secret_store_header, store_key, ClientSecret,
-    Transport,
-};
+use super::{percent_encode, request_compute_url, Secrets, Transport};
 
 /// The shared walk's kind/mode helper, re-exported so the rest of the client
 /// keeps naming it through `eval::` — the same function the server uses.
@@ -85,98 +63,20 @@ impl<V: Clone> Memo<V> {
     }
 }
 
-/// The walk's memos, one per [`MemoKind`], scoped by the caller's secret store:
-/// `<store>\0<content key>` → `(kind, oid)`.
-///
-/// The SCOPE is this host's contribution and the reason the memo lives here
-/// rather than in `caos-eval`: a store's readers change what a `curry`
-/// evaluates to (`mark_curry`), and the client is the only host that has one.
-/// `CAOS_SALT` is not in the key because [`crate::run_salt`] reads the
-/// environment, which is fixed for the process — two different salts never meet
-/// in one memo. The server keeps no memo here at all: its salt and stack vary
-/// per request, so it opts out (the trait default) until it has a key that says
-/// so.
-static NODE_MEMO: Memo<(String, String)> = Memo::new();
-static PATH_MEMO: Memo<(String, String)> = Memo::new();
-
-fn memo_for(kind: MemoKind) -> &'static Memo<(String, String)> {
-    match kind {
-        MemoKind::Node => &NODE_MEMO,
-        MemoKind::Path => &PATH_MEMO,
-    }
-}
-
-/// The CLIENT `caos_eval::EvalHost`: CAS over a `Transport`, a `run` dispatched
-/// by `request_compute` (blocking, at top level), curries marked with the
-/// caller's secret store (a no-op without secrets, so the common path is
-/// byte-identical to the server's), and `:@@=` locators fetched — the one
-/// capability no other host has.
-struct ClientEvalHost<'a> {
-    t: &'a dyn Transport,
-    store: &'a [ClientSecret],
-}
-
-impl caos_eval::EvalHost for ClientEvalHost<'_> {
-    fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
-        self.t.get_object(oid)
-    }
-    fn post_object(&self, kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
-        post_object(self.t, kind, bytes)
-    }
-    fn fetch_tree_entries(&self, tree: &str) -> Result<Option<Vec<Entry>>, String> {
-        fetch_tree_entries(self.t, tree)
-    }
-    fn post_tree(&self, entries: Vec<Entry>) -> Result<gix::ObjectId, String> {
-        post_tree(self.t, entries)
-    }
-    fn dispatch(&self, image: &str, entries: Vec<Entry>) -> Result<(String, String), String> {
-        // A `run` marks via `assemble_arg_tree` and must carry the store to the
-        // server (to inject and pass the double-check), exactly like `caos-cli
-        // run`.
-        let arg_tree = assemble_arg_tree(self.t, image, entries, self.store)?;
-        let server = self.t.server_url()?;
-        request_compute(&server, &arg_tree, &secret_store_header(self.store))
-    }
-    fn mark_curry(&self, oid: &str) -> Result<String, String> {
-        mark_arg_tree(self.t, self.store, oid)
-    }
-    fn eval_remote(
-        &self,
-        value: &str,
-    ) -> Result<(gix::objs::tree::EntryMode, gix::ObjectId), String> {
-        // `dir=` descends through EVALUATION (see `eval_remote_arg`), so a
-        // pinned consumer reaches `dir=std/<x>` exactly as caos reaches its own
-        // entries. It carries its own memo, on the locator.
-        eval_remote_arg(self.t, value, self.store)
-    }
-    fn memo_get(&self, kind: MemoKind, key: &str) -> Option<(String, String)> {
-        memo_for(kind).get(&self.memo_key(key))
-    }
-    fn memo_put(&self, kind: MemoKind, key: &str, value: &(String, String)) {
-        memo_for(kind).put(self.memo_key(key), value.clone());
-    }
-}
-
-impl ClientEvalHost<'_> {
-    /// The walk's content key, scoped by the caller's store — see [`NODE_MEMO`].
-    fn memo_key(&self, key: &str) -> String {
-        format!("{}\0{key}", store_key(self.store))
-    }
-}
-
-/// Walk `start_tree` from its root down to `path`, evaluating every `.caos-expr`
-/// encountered (each in the tree its parent produced) and returning the final
-/// object's `(kind, oid)` — the client entry to `caos_eval::eval_path`. `store`
-/// is the caller's secret store, threaded into the host for `run` dispatch and
-/// curry marking.
+/// The object `path` evaluates to under `start_tree`, as `(kind, oid)`:
+/// `start_tree` is pushed and the server walks it.
 pub(crate) fn eval_path(
     t: &dyn Transport,
     start_tree: &str,
     path: &str,
-    store: &[ClientSecret],
+    secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    let host = ClientEvalHost { t, store };
-    caos_eval::eval_path(&host, start_tree, path)
+    t.ensure_pushed(start_tree)?;
+    request_compute_url(
+        &t.server_url()?,
+        &format!("/eval?root:hash={start_tree}&path={}", percent_encode(path)),
+        secrets,
+    )
 }
 
 /// `eval-path [--tree=<oid>] <path>` — evaluate the `.caos-expr` files from the
@@ -199,12 +99,38 @@ pub fn cli_eval_path(t: &dyn Transport, tree: Option<&str>, path: &str) -> Resul
             oid.to_string()
         }
     };
-    // The caller's secret store, resolved once — so eval-path marks the `curry`
-    // arg trees it returns, giving their callers per-user isolation, and carries
-    // the store to any `run` it dispatches (design/secrets.md). A `:@=` target is
-    // NOT marked; see `caos_eval`'s `eval_expr_path`.
-    let store = build_secret_store(t)?;
-    let (kind, hash) = eval_path(t, &start, path, &store)?;
+    let (kind, hash) = eval_path(t, &start, path, &Secrets::current())?;
     println!("{kind} {hash}");
     Ok(())
+}
+
+/// The walk run in-process over a test transport, which has no server.
+#[cfg(test)]
+pub(crate) fn eval_path_locally(
+    t: &dyn Transport,
+    start_tree: &str,
+    path: &str,
+) -> Result<(String, String), String> {
+    use gix::objs::tree::Entry;
+
+    struct Local<'a>(&'a dyn Transport);
+    impl caos_eval::EvalHost for Local<'_> {
+        fn get_object(&self, oid: &str) -> Result<(String, Vec<u8>), String> {
+            self.0.get_object(oid)
+        }
+        fn post_object(&self, kind: &str, bytes: &[u8]) -> Result<gix::ObjectId, String> {
+            super::post_object(self.0, kind, bytes)
+        }
+        fn fetch_tree_entries(&self, tree: &str) -> Result<Option<Vec<Entry>>, String> {
+            super::fetch_tree_entries(self.0, tree)
+        }
+        fn post_tree(&self, entries: Vec<Entry>) -> Result<gix::ObjectId, String> {
+            super::post_tree(self.0, entries)
+        }
+        fn dispatch(&self, image: &str, entries: Vec<Entry>) -> Result<(String, String), String> {
+            let arg_tree = super::assemble_arg_tree(self.0, image, entries)?;
+            super::request_compute(&self.0.server_url()?, &arg_tree, &Secrets::default())
+        }
+    }
+    caos_eval::eval_path(&Local(t), start_tree, path)
 }

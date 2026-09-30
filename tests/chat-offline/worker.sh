@@ -88,55 +88,56 @@ opts=(--model test-model --base-url "http://$stub_host:$port"
       --llm-step:@=DEEP-DEPS/llm-step)
 
 echo "== request preparation fails before admission ==" >&2
+STORE=/tmp/chat-offline-secrets
 if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.err; then
   fail "chat succeeded without its model secret"
 fi
 grep -q "anthropic-api-key" key.err || fail "missing-key error is unclear"
-grep -qF '.caos-secrets/anthropic-api-key' key.err \
-  || fail "missing-key error does not name the setup file"
-grep -qF -- '--llm-step:@=' key.err \
-  || fail "missing-key error does not explain the llm-step grant"
-grep -qF -- '--llm-call:@=' key.err \
-  || fail "missing-key error does not explain the title grant"
-grep -qF "$CAOS_CLI secrets" key.err \
-  || fail "missing-key error does not explain entropy setup"
+grep -qF "$CAOS_CLI secrets-init" key.err \
+  || fail "missing-key error does not explain creating a store"
+grep -qF "$CAOS_CLI secrets-push" key.err \
+  || fail "missing-key error does not explain pushing it"
 if remote_tip "$queued_ref" >/dev/null; then
   fail "request-preparation failure partially admitted a conversation"
 fi
 [ ! -e stub/request-1.json ] || fail "missing-key failure reached the LLM"
 
-mkdir -p .caos-secrets
-printf '.caos-secrets/\n' >> .git/info/exclude
+# Readers grant by locator: this repo's commit, and the step's path in it. The
+# chat below evaluates the step from the clean worktree, which is that tree.
+git push -q caos "HEAD:refs/heads/${test_id}-chat-offline" || fail "pushing the fixture commit"
+key=$("$CAOS_CLI" secrets-init --dir="$STORE") || fail "secrets-init failed"
+git config caos.secret-readers "$key"
+step_at="git+http://caos.invalid/chat-offline?rev=$(git rev-parse HEAD)&dir=DEEP-DEPS/llm-step"
+push() { "$CAOS_CLI" secrets-push --dir="$STORE" --server="$CAOS_SERVER_URL" >/dev/null; }
 echo "== stale and mismatched model readers fail before admission ==" >&2
-for reader in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
+for dir in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
   printf '%s\n' \
-    'name=anthropic-api-key' \
     'value=test-key' \
     'entropy=0123456789abcdef0123456789abcdef' \
-    "reader=$reader" > .caos-secrets/anthropic-api-key
+    "reader:@@=${step_at%dir=*}dir=$dir" > "$STORE/anthropic-api-key"
   # Another credential still marks the selected worker. Its hash must not
   # disguise the missing grant for the model key.
   printf '%s\n' \
-    'name=unrelated-key' \
     'value=unrelated-value' \
     'entropy=abcdef0123456789abcdef0123456789' \
-    'reader=DEEP-DEPS/llm-step' > .caos-secrets/unrelated-key
+    "reader:@@=$step_at" > "$STORE/unrelated-key"
+  push || fail "secrets-push failed"
   if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>reader.err; then
-    fail "chat admitted a model key with reader=$reader"
+    fail "chat admitted a model key granted to $dir"
   fi
-  grep -qF 'not granted to this worker' reader.err || fail "reader error is unclear"
-  grep -qF 'reader=DEEP-DEPS/llm-step' reader.err || fail "reader error omits the selected image"
+  grep -qF 'is not granted to this conversation' reader.err || fail "reader error is unclear"
+  grep -qF 'reader:@=DEEP-DEPS/llm-step' reader.err || fail "reader error omits the selected image"
   if remote_tip "$queued_ref" >/dev/null; then
     fail "reader failure partially admitted a conversation"
   fi
   [ ! -e stub/request-1.json ] || fail "reader failure reached the LLM"
 done
-rm .caos-secrets/unrelated-key
+rm "$STORE/unrelated-key"
 printf '%s\n' \
-  'name=anthropic-api-key' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  'reader=DEEP-DEPS/llm-step' > .caos-secrets/anthropic-api-key
+  "reader:@@=$step_at" > "$STORE/anthropic-api-key"
+push || fail "secrets-push failed"
 
 echo "== a conversation-shaped base is refused ==" >&2
 fake_output=$($TOOL root --repo "$PWD" --id "${test_id}-fake-base" --title fake)
@@ -230,8 +231,8 @@ done < talk.parents
 
 # THE BASE IS THE CONVERSATION'S OWN CONTENT, at the root -- not a source tree
 # at `code/dirty`, which is what this asserted before. A session starts from a
-# caos CLIENT repo (SPEC, "Agent/harness integration"): a pin, an `AGENTS.md`,
-# `.caos-secrets` declarations. That is conversation content, so it lands where
+# caos CLIENT repo (SPEC, "Agent/harness integration"): a pin and an `AGENTS.md`.
+# That is conversation content, so it lands where
 # the agent's file tools land, and `--base` seeds it directly.
 #
 # Read the same way `.caos/title` is read above, which is the point: there is
@@ -246,6 +247,12 @@ fi
 admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
 admission=$($TOOL request --repo "$PWD" --head "$admitted")
 request=$(jq -r .id <<<"$admission")
+# The server formed this ArgTree, so it is read from there: the one tree
+# object, not the image closure a fetch would bring with it.
+curl -fsS "$CAOS_SERVER_URL/object/$request" \
+  | { IFS= read -r -d '' _header; cat; } \
+  | git hash-object -w -t tree --stdin >/dev/null \
+  || fail "reading the request's ArgTree from the server"
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \
   || fail "conversation request is not isolated by its model secret"

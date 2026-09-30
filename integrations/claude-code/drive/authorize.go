@@ -205,8 +205,8 @@ func authorize(days int, scopes []string) error {
 		fmt.Fprintf(os.Stderr, "\nNOTE: %s is not a lifetime a secret can hold. The ceiling above is\n"+
 			"what this server allows on these scopes.\n", life.Round(time.Minute))
 	}
-	fmt.Fprintf(os.Stderr, "\nput this in .caos-secrets/%s as `value=`, keeping its\n"+
-		"reader= and entropy= lines:\n\n", secretName)
+	fmt.Fprintf(os.Stderr, "\nput this in your secret store's %s as `value=`, keeping its\n"+
+		"reader and entropy lines, then run `caos-cli secrets-push`:\n\n", secretName)
 	fmt.Println(tok.AccessToken)
 	return nil
 }

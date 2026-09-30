@@ -27,6 +27,7 @@ fn main() -> ExitCode {
     caos::install_ticket_transport(Box::new(IrohTransport {
         client: std::sync::OnceLock::new(),
     }));
+    caos::set_secret_readers(caos_cli::secret_store::reader_keys());
     let args: Vec<String> = std::env::args().collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -124,16 +125,10 @@ fn run(args: &[String]) -> Result<(), String> {
             [flag, arg_tree] if flag == "--all" => caos::cli_status(&transport()?, arg_tree, true),
             _ => Err(usage(args)),
         },
-        // `secrets [--check]` — tend the local `.caos-secrets` store: fill a
-        // missing `entropy=` with fresh entropy and warn on a weak one, so
-        // cache isolation is safe by default (design/secrets.md). `--check`
-        // only reports (writes nothing) and exits non-zero on any issue — a CI
-        // gate. Offline: no server, no transport.
-        Some("secrets") => match &args[2..] {
-            [] => caos::cli_secrets(false),
-            [flag] if flag == "--check" => caos::cli_secrets(true),
-            _ => Err(usage(args)),
-        },
+        // `secrets-init --dir=<d>` / `secrets-push --dir=<d> [--server=<url>]` — the
+        // server-held store (SPEC.md, "Secrets"). No caos tree needed.
+        Some("secrets-init") => caos_cli::secret_store::cli_secrets_init(&args[2..]),
+        Some("secrets-push") => caos_cli::secret_store::cli_secrets_push(&args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -203,7 +198,8 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \
          {prog} status [--all] <arg tree hash>\n  \
-         {prog} secrets [--check]"
+         {prog} secrets-init --dir=<d>\n  \
+         {prog} secrets-push --dir=<d> [--server=<url>]"
     )
 }
 

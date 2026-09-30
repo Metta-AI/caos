@@ -257,16 +257,16 @@ fn dispatch_call(
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
-    let store = caos::build_secret_store(t)?;
-    let configuration = tools_configuration(t, options, id, &store)?;
+    let secrets = caos::Secrets::current().for_conversation(id);
+    let configuration = tools_configuration(t, options, id, &secrets)?;
     let kvs = vec![
         format!("--head:commit={request_head}"),
         format!("--run={request}"),
         format!("--tools-only={call}"),
     ];
-    let dispatch = caos::prepare_client_request_with_store(t, &configuration, &kvs, &store)?;
+    let dispatch = caos::prepare_client_request_with_secrets(t, &configuration, &kvs, &secrets)?;
     let server = t.server_url()?;
-    caos::compute_client_request_with_store(&server, &dispatch, &store).map(drop)
+    caos::compute_client_request_with_secrets(&server, &dispatch, &secrets).map(drop)
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -279,7 +279,7 @@ fn tools_configuration(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
-    store: &[caos::ClientSecret],
+    secrets: &caos::Secrets,
 ) -> Result<String, String> {
     // REACHABLE FIRST, IN FRONT OF EVERYTHING BELOW. Resolving the step and
     // preparing a request both talk to the caos server, and in a cloud session
@@ -301,7 +301,7 @@ fn tools_configuration(
     // merge tools resolve against the conversation's own Git store, so a ref
     // snapshot passed from here would be a second, staler source of truth.
     let config = vec![format!("--conversation={id}")];
-    let base = step_image(t, options, store)?;
+    let base = step_image(t, options, secrets)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
 
@@ -315,7 +315,7 @@ fn tools_configuration(
 fn step_image(
     t: &GitTransport,
     options: &TurnOptions,
-    store: &[caos::ClientSecret],
+    secrets: &caos::Secrets,
 ) -> Result<String, String> {
     let tree = match &options.base {
         Some(base) => Some(
@@ -333,7 +333,7 @@ fn step_image(
         t,
         options.llm_step.as_deref(),
         LLM_STEP_ARG,
-        store,
+        secrets,
         tree.as_deref(),
     )
 }
@@ -347,8 +347,13 @@ fn step_image(
 /// `UserPromptSubmit` hook blocks the turn until it returns. Each attempt is
 /// `ensure_server_reachable`'s own 5s round trip, so `HOOK_REACH_ATTEMPTS`
 /// probes plus the interstitial sleeps is the ceiling -- ~35s, which outlasts
-/// tunnel bringup and stays well under Claude Code's hook timeout. The common
-/// case returns on the first probe.
+/// tunnel bringup. The common case returns on the first probe.
+///
+/// THE HOOK'S OWN TIMEOUT IS SET, in `shared/settings.json`, because Claude
+/// Code's 60s default is not enough over iroh: this wait plus a resume's fetch,
+/// settle and push plus `record_prompt`'s pushes exceeded it in a cloud
+/// session, and a killed hook lets the prompt through with no conversation and
+/// no reason given.
 const HOOK_REACH_ATTEMPTS: u32 = 6;
 const HOOK_REACH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -439,9 +444,9 @@ pub(crate) fn discovery_timing() -> Option<String> {
 /// the tui.
 fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
     let total = std::time::Instant::now();
-    let store = caos::build_secret_store(t)?;
+    let secrets = caos::Secrets::current();
     let mark = std::time::Instant::now();
-    let base = step_image(t, options, &store)?;
+    let base = step_image(t, options, &secrets)?;
     let resolve_step = mark.elapsed();
     // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
     // A repository's own tools are reached by PATH (`tool_help` to describe one,
@@ -458,7 +463,7 @@ fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, S
     // is empty, and `registry` never enumerated tree tools.
     let kvs = vec!["--list-tools=1".to_string()];
     let mark = std::time::Instant::now();
-    let (_, result) = caos::run_client_request_with_store(t, &base, &kvs, &store)?;
+    let (_, result) = caos::run_client_request_with_secrets(t, &base, &kvs, &secrets)?;
     let run_list = mark.elapsed();
     let objects = open_store(t)?;
     let result = oid(&result, "tool registry")?;
@@ -605,6 +610,20 @@ fn debug_log_hook(
 /// The user's prompt, and the only event allowed to create the conversation:
 /// the first prompt of a session establishes its base and fallback title
 /// exactly as the TUI's first message does.
+/// EXIT 2, the one status with which Claude Code blocks a prompt and shows the
+/// hook's stderr. Any other failure lets the prompt through and drops the
+/// reason, and for a failed fork or resume that is a session running on with
+/// no conversation behind it: the model, following the command's text, calls a
+/// tool that answers `no conversation ... to record into`, and the actual
+/// refusal (not the head, not on this server) is never seen by anyone.
+fn refuse_prompt(error: &str) -> ! {
+    eprintln!(
+        "caos: this session is NOT attached to that conversation: {error}\n\
+         Nothing was recorded; fix the command and send it again."
+    );
+    std::process::exit(2)
+}
+
 fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
@@ -613,20 +632,30 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     // `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
     // decide WHICH conversation this session records into, so they run before it
     // is looked up. Both are no-ops once the session has its conversation.
-    let note = match resume::parse_command(prompt)? {
-        Some(command) => {
-            // Both talk to the server before anything below would have proven it
-            // reachable.
-            wait_server_reachable(t)?;
-            resume::begin(t, string_field(payload, "session_id")?, &command)?
+    let command = || -> Result<Option<String>, String> {
+        match resume::parse_command(prompt)? {
+            Some(command) => {
+                // Both talk to the server before anything below would have
+                // proven it reachable.
+                wait_server_reachable(t)?;
+                resume::begin(t, string_field(payload, "session_id")?, &command)
+            }
+            None => Ok(None),
         }
-        None => None,
+    };
+    let note = match command() {
+        Ok(note) => note,
+        Err(error) => refuse_prompt(&error),
     };
     let id = recorded_conversation(t, payload)?;
+    let readers = crate::secret_store::reader_summary();
     if record_prompt(t, options, &id, prompt)? {
-        announce(&format!("caos conversation ref {}", conversation_ref(&id)?))?;
+        announce(&format!(
+            "caos conversation ref {}; {readers}",
+            conversation_ref(&id)?
+        ))?;
     } else if let Some(note) = note {
-        announce(&note)?;
+        announce(&format!("{note}; {readers}"))?;
     }
     Ok(())
 }
@@ -654,7 +683,7 @@ fn record_prompt(
     let username = resolve_username(t, None)?;
     let signature = signature(&username)?;
     let refname = conversation_ref(id)?;
-    let secrets = caos::build_secret_store(t)?;
+    let secrets = caos::Secrets::current().for_conversation(id);
     let phase = std::time::Instant::now();
     let configuration = tools_configuration(t, options, id, &secrets)?;
     cc_timing("tools_configuration", phase.elapsed());
@@ -756,7 +785,7 @@ fn record_prompt(
         // the record says it was.
         let phase = std::time::Instant::now();
         let request = oid(
-            &caos::prepare_client_request_with_store(
+            &caos::prepare_client_request_with_secrets(
                 t,
                 &configuration,
                 &[format!("--head:commit={message}")],

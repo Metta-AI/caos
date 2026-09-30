@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Runs cwd'd into a client repo with $CAOS_CLI set, INSIDE the dev stack.
 #
-# Exercises secret injection with the store carried as ephemeral run context
-# (design/secrets.md): the client reads its own git-ignored `.caos-secrets`,
-# resolves each reader with eval-path, and sends the result to the server,
-# which subset-matches and injects at `/secret/<name>`. Covers: a granted vs a
-# denied secret, the output-leak assertion, log masking, and a grant naming a
-# repo-local tool by path.
+# Exercises the server-held secret store (SPEC.md, "Secrets"): a directory
+# pushed with `secrets-push`, readers that grant by locator, and injection at
+# `/secret/<name>`. Covers: a granted vs a denied secret, the output-leak
+# assertion, log masking, a grant naming a repo-local tool, a sub-run, and a
+# copy of a granted tool.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -122,27 +121,34 @@ cat > embedder/.caos-expr <<'EOF'
 curry --base:@=bash --worker1:@=run.sh --pusher:@=mytool
 EOF
 
-echo '.caos-secrets/' > .gitignore
 commit "secrets fixtures"
 test_run_id="$(date +%s%N)-$$-$RANDOM"
 git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
   || fail "pushing source_tree to caos"
 
-# --- the store (git-ignored, per-user, NOT committed) ------------------------
-mkdir -p .caos-secrets
-# Pin readers' resolution to this committed tree (excludes .caos-secrets itself).
-git rev-parse "HEAD^{tree}" > .caos-secrets/.tree
-cat > .caos-secrets/token <<'EOF'
+# --- the store (outside the repo, never committed) ---------------------------
+# Readers grant by LOCATOR: this commit, and a path in it. The client ingests
+# the committed tree, so what it evaluates has exactly that origin. The URL is
+# never fetched — the server already holds the commit — so any well-formed one
+# names it.
+STORE=/tmp/secrets-test-store
+key=$("$CAOS_CLI" secrets-init --dir="$STORE") || fail "secrets-init failed"
+git config caos.secret-readers "$key"
+head=$(git rev-parse HEAD)
+at() { echo "git+http://caos.invalid/secrets-test?rev=$head&dir=$1"; }
+push() { "$CAOS_CLI" secrets-push --dir="$STORE" --server="$CAOS_SERVER_URL" >/dev/null; }
+cat > "$STORE/token" <<EOF2
 value=SEKRET-abc-123
 entropy=7f3a9c2e1b8d4f60a5e7c9d1b3f5a7e9
-reader=DEEP-DEPS/bash
-EOF
-cat > .caos-secrets/deploytok <<'EOF'
+reader:@@=$(at DEEP-DEPS/bash)
+EOF2
+cat > "$STORE/deploytok" <<EOF2
 value=DEPLOY-xyz-789
 entropy=aa11bb22cc33dd44ee55ff6677889900
-reader=mytool
-reader=subtool
-EOF
+reader:@@=git+caos://this-server?ref=refs/heads/${test_run_id}-secrets-test&dir=mytool
+reader:@@=$(at subtool)
+EOF2
+push || fail "secrets-push failed"
 
 echo "== a granted secret is injected; a non-matching one is not ==" >&2
 out=$("$CAOS_CLI" run got --base:@=DEEP-DEPS/bash --worker1:@=check.sh) || fail "run failed: $out"
@@ -175,34 +181,36 @@ tool=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed: $tool"
 out=$("$CAOS_CLI" run tgot --base:hash="${tool##* }") || fail "run mytool failed: $out"
 verdict=$(cat tgot/verdict)
 [ "$verdict" = "deploytok-ok" ] \
-  || fail "current-tree grant verdict: $verdict (expected 'deploytok-ok')"
+  || fail "grant verdict: $verdict (expected 'deploytok-ok')"
 echo "  ok: a reader naming a repo path grants the secret" >&2
 
-echo "== a reader naming a path the tree lacks is ignored, not fatal ==" >&2
-# A store is loaded by every client on every turn, so a stale reader (a tool
-# that moved directories) must not take the client down: it grants nothing, so
-# it is dropped with a warning while the rest of the store still resolves.
-cat > .caos-secrets/stale <<'EOF'
-value=STALE-nobody-can-read-this
-entropy=00112233445566778899aabbccddeeff
-reader=gone-tools/test
-EOF
-out=$("$CAOS_CLI" run stillgot --base:@=DEEP-DEPS/bash --worker1:@=check.sh 2>stale.err) \
-  || fail "a stale reader broke the store: $(cat stale.err)"
-verdict=$(cat stillgot/verdict)
-[ "$verdict" = "token-ok deploy-absent" ] \
-  || fail "verdict with a stale reader: $verdict (expected 'token-ok deploy-absent')"
-grep -q 'gone-tools/test' stale.err \
-  || fail "the dropped reader should be reported: $(cat stale.err)"
-# A reader that is malformed rather than absent stays loud.
-printf 'value=x\nentropy=00112233445566778899aabbccddeeff\nreader=mytool extra-arg\n' \
-  > .caos-secrets/badreader
-if "$CAOS_CLI" run nope --base:@=DEEP-DEPS/bash --worker1:@=check.sh >/dev/null 2>bad.err; then
-  fail "a malformed reader should still fail the load"
-fi
-grep -q 'single path' bad.err || fail "expected the malformed-reader error: $(cat bad.err)"
-rm -f .caos-secrets/badreader .caos-secrets/stale
-echo "  ok: an absent reader is dropped with a warning; a malformed one fails" >&2
+echo "== a changed tool outside the range grants nothing ==" >&2
+# mytool is granted by BRANCH. One commit later on another branch, with mytool
+# edited: a tree the range never held. (An UNCHANGED mytool there would still
+# be granted — it is the same tree, so the same program, as the one the range
+# covers.)
+echo '# changed after the grant' >> mytool/run.sh && commit "after the grant"
+later=$(git rev-parse HEAD)
+git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-later" || fail "pushing the later commit"
+out=$("$CAOS_CLI" run later --base:@=mytool) || fail "run at the later commit failed: $out"
+[ "$(cat later/verdict)" = "deploytok-missing" ] \
+  || fail "a changed tool off the granted branch was granted: $(cat later/verdict)"
+echo "  ok: a changed tool off the granted branch is not covered" >&2
+
+echo "== moving the granted branch moves the grant, with no new push ==" >&2
+git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" || fail "moving the granted branch"
+out=$("$CAOS_CLI" run moved --base:@=mytool) || fail "run on the moved branch failed: $out"
+[ "$(cat moved/verdict)" = "deploytok-ok" ] \
+  || fail "the moved branch did not carry the grant: $(cat moved/verdict)"
+git reset -q --hard "$head"
+echo "  ok: the grant follows the branch" >&2
+
+echo "== a malformed reader is refused by secrets-push ==" >&2
+printf 'value=x\nreader:@@=%s until=never\n' "$(at mytool)" > "$STORE/badreader"
+if push 2>bad.err; then fail "a malformed reader should fail the push"; fi
+grep -q 'until=never' bad.err || fail "expected the malformed-reader error: $(cat bad.err)"
+rm -f "$STORE/badreader"
+echo "  ok: a malformed reader fails the push" >&2
 
 echo "== sub-run preserves the server-held secret store ==" >&2
 # The launcher is an ordinary bash worker and cannot read deploytok. Its child
@@ -238,38 +246,28 @@ done
   || fail "sub-run result was wrong: $(cat sub-run-result)"
 echo "  ok: a child received its reader-matched secret through server context" >&2
 
-echo "== eval-path folds secret-hash, so a worker's callers become per-user ==" >&2
-# mytool matches the deploytok reader, so eval-path marks its returned arg tree.
-# With the secret removed it matches nothing, so the result differs — which is
-# exactly what makes anything embedding mytool per-user.
+echo "== a granted tool is marked, and so is anything embedding it ==" >&2
+# mytool matches the deploytok reader, so evaluating it marks it with
+# secret-hash. embedder/mytool is a byte-identical COPY, so it carries mytool's
+# origin and is marked too — which is what makes its embedder per-user.
 withsecret=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed"
 emb_with=$("$CAOS_CLI" eval-path embedder) || fail "eval-path embedder failed"
-rm .caos-secrets/deploytok
+rm "$STORE/deploytok"
+push || fail "re-pushing without deploytok failed"
 without=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool (no secret) failed"
 emb_without=$("$CAOS_CLI" eval-path embedder) || fail "eval-path embedder (no secret) failed"
 [ "$withsecret" != "$without" ] \
   || fail "eval-path mytool should depend on the secret store (got '$withsecret' both times)"
-echo "  ok: mytool's eval result differs with vs without its granted secret" >&2
-
-echo "== caller-propagation: embedding a granted worker isolates the EMBEDDER ==" >&2
-# The embedder reads no secret; it only binds mytool via `--pusher:@=mytool`.
-# Its result must still differ, or a caller of a secret-granted worker would
-# share one cache entry across users (design/secrets.md, caller-propagation).
 [ "$emb_with" != "$emb_without" ] \
   || fail "eval-path embedder should depend on the store (got '$emb_with' both times)"
-echo "  ok: the embedder is per-user via its :@= worker, reading no secret itself" >&2
+echo "  ok: mytool and its embedder differ with vs without the grant" >&2
 
-echo "== caos-cli secrets fills missing entropy and --check gates weak ones ==" >&2
-mkdir -p /tmp/sectool/.caos-secrets
-cd /tmp/sectool
-printf 'value=abc\nreader=DEEP-DEPS/bash\n' > .caos-secrets/needs-entropy
-"$CAOS_CLI" secrets || fail "secrets fill failed"
-grep -q '^entropy=' .caos-secrets/needs-entropy || fail "entropy was not filled in"
-# A present-but-weak entropy is never overwritten, and --check must gate on it.
-printf 'value=abc\nentropy=short\nreader=DEEP-DEPS/bash\n' > .caos-secrets/weak
-if "$CAOS_CLI" secrets --check 2>/dev/null; then
-  fail "--check should exit non-zero on weak entropy"
-fi
-echo "  ok: entropy autofilled; --check gates weak entropy" >&2
+echo "== secrets-push fills missing entropy and refuses a weak one ==" >&2
+printf 'value=abc\nreader:@@=%s\n' "$(at DEEP-DEPS/bash)" > "$STORE/needs-entropy"
+push || fail "push with a missing entropy failed"
+grep -q '^entropy=' "$STORE/needs-entropy" || fail "entropy was not filled in"
+printf 'value=abc\nentropy=short\n' > "$STORE/weak"
+if push 2>/dev/null; then fail "a weak entropy should fail the push"; fi
+echo "  ok: entropy autofilled; a weak one is refused" >&2
 
 echo "secrets: ALL PASS" >&2

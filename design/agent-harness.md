@@ -297,11 +297,12 @@ commit). Hand-rolled retry on 429/5xx honoring `retry-after`. Top-level
 `cache_control: {"type": "ephemeral"}` on every request — each step replays
 an identical prefix, so steps after the first read the prompt cache.
 
-Secrets: the client reads its git-ignored `.caos-secrets` store when preparing
-and dispatching a turn. `llm-step` reads `anthropic-api-key` from
-`/secret/anthropic-api-key`; the value never enters its args or CAS. Reader
-expressions and `secret-hash` give the request its per-secret cache identity,
-and the server carries the store to entitled tool sub-runs.
+Secrets: a turn's requests present the user's SecretReaderKeys and the
+conversation (SPEC.md, "Secrets"). `llm-step` reads `anthropic-api-key` from
+`/secret/anthropic-api-key`; the value never enters its args or CAS. The server
+grants it where evaluation reaches a granted image, marks that image with
+`secret-hash` for its per-secret cache identity, and injects it into tool
+sub-runs built from granted images.
 
 ## Progress
 
@@ -389,17 +390,10 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   and freezes redraws for native terminal text selection. `/checkout <gitlink>
   [directory]` checks out the named code commit as a detached HEAD in a clean
   local checkout. `Ctrl+H` opens the keyboard and slash-command reference.
-  `/pr <gitlink> <base-remote-branch> [remote-URL]` previews one PR; Enter
-  confirms. The URL is explicit or inferred from matching import provenance.
-  Publication pushes the exact code commit, using the gitlink path as the branch
-  name, then opens or reuses its PR through `gh`. The agent tests the code before
-  this client operation. Source and base must share history. If the latest base is not an ancestor,
-  Enter instead imports the base and sends an integration request to the agent;
-  the user runs `/pr` again afterward to review publication. Changed content, remote drift, conflict markers,
-  unrelated histories, and reserved `.caos` state stop publication. Merely
-  opening, running, switching, or publishing conversations never mutates the
-  checkout. `/publish-branch` pushes the same full-history branch without PR
-  creation, while `/load` imports a `remote/caos/<conversation>` branch or
+  The agent publishes PRs itself (agent-github.md, "PRs"); the client has no
+  publish command. Merely opening, running, switching, or publishing
+  conversations never mutates the checkout. `/load` imports a
+  `remote/caos/<conversation>` branch or
   GitHub PR back into the canonical server-side conversation. Imports preserve
   the ID and event spine, allow only first-parent advancement, and reject
   divergent ID collisions. Progress remains one completed API round at a time,

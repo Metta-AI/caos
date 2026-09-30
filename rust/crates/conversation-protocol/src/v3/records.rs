@@ -1188,7 +1188,7 @@ impl ChildRecord {
 
 impl Descriptor {
     fn validate(&self) -> Result<(), String> {
-        if !matches!(self.policy.as_str(), "squash" | "preserve") {
+        if !matches!(self.policy.as_str(), "squash" | "preserve" | "force") {
             return Err(format!("invalid descriptor policy {:?}", self.policy));
         }
         Ok(())

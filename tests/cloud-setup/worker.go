@@ -219,11 +219,11 @@ func main() {
 		w.True(stamp("/tmp/prefix/share/caos/build")["commit"] == pinRev,
 			"the build record does not name the commit that was installed")
 
-		// The session hook marks a dev install the server no longer serves, and
+		// The session hook marks an install a fresh setup would not make now, and
 		// the wrapper is what turns that into a failure: exit 2 is the code that
 		// makes Claude Code block a prompt or a tool call and show the reason.
-		const staleMsg = "caos: STALE DEV INSTALL -- test\n"
-		write("/tmp/prefix/share/caos/stale-dev", staleMsg, 0o644)
+		const staleMsg = "caos: STALE INSTALL -- test\n"
+		write("/tmp/prefix/share/caos/stale-install", staleMsg, 0o644)
 		refused := exec.Command("/tmp/prefix/bin/caos", "mcp", "hook")
 		var refusedErr strings.Builder
 		refused.Stderr = &refusedErr
@@ -232,7 +232,7 @@ func main() {
 			"a stale-marked client did not exit 2, so Claude Code would not block on it: %v", err)
 		w.True(refusedErr.String() == staleMsg,
 			"a stale-marked client did not say why: %q", refusedErr.String())
-		w.Must(os.Remove("/tmp/prefix/share/caos/stale-dev"))
+		w.Must(os.Remove("/tmp/prefix/share/caos/stale-install"))
 		w.True(strings.Contains(output("/tmp/prefix/bin/caos"), "usage:"),
 			"the client does not run again once the stale marker is gone")
 
@@ -249,6 +249,11 @@ func main() {
 			"the shared asset's ${CAOS_BIN} placeholder survived into the config: %s", prompt)
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
 			"nothing runs the session hook")
+		// Claude Code's 60s default kills a resume over iroh, and a killed prompt
+		// hook lets the prompt through with no conversation and no reason.
+		promptHook := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+		timeout, _ := promptHook["timeout"].(float64)
+		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
 		// The slash commands that start a session from a recorded conversation.
 		// The marker line is what the prompt hook keys on if it is handed the
@@ -286,12 +291,14 @@ func main() {
 		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
+		readers := strings.Repeat("ab", 32)
 		devTree := fixtureDevTree("/tmp/dev-tree", assets)
 		head := git(repo, "rev-parse", "HEAD")
 		bootstrap := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base,
 			"--server="+ticket,
 			"--dev-commit="+devRev,
+			"--secret-readers="+readers,
 			"--dev-tree="+devTree,
 			"--prefix=/tmp/prefix1",
 			"--share-dir=/tmp/share",
@@ -304,6 +311,8 @@ func main() {
 		w.True(git(repo, "status", "--porcelain") == "",
 			"stage 1 left the checkout dirty, which Claude Code's stop hook reports:\n%s",
 			git(repo, "status", "--porcelain"))
+		w.True(git(repo, "config", "--get", "caos.secret-readers") == readers,
+			"--secret-readers is not in the checkout's git config, where the client reads it")
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
@@ -390,6 +399,38 @@ func main() {
 		devPrompt := hookCommand(readJSON("/tmp/home1/.claude/settings.json"), "UserPromptSubmit")
 		w.True(strings.Contains(devPrompt, "--base="+seedCommit),
 			"the session would seed from HEAD rather than from the dev commit: %s", devPrompt)
+
+		// -------------------------------------------------------------------
+		w.Step("the session hook fails a cached install the checkout's pin has left")
+		// -------------------------------------------------------------------
+		// A cached setup is not re-run when the repo moves its pin, so the hook
+		// is the only thing that can notice. No std_path in these stamps: the
+		// hook then stops before the warm, which would need a server.
+		pinRepo := fixtureRepo("/tmp/pin-repo")
+		hook := func(shareDir, pin, devRev string) (string, bool) {
+			write(filepath.Join(shareDir, "setup-stamp"), "pin="+pin+"\n", 0o644)
+			if devRev != "" {
+				write(filepath.Join(shareDir, "dev-stamp"), "rev="+devRev+"\n", 0o644)
+			}
+			cmd := exec.Command("go", "run", filepath.Join(cloud, "session.go"), "--share-dir="+shareDir)
+			cmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+pinRepo)
+			cmd.Dir = "/tmp"
+			out, err := cmd.Output()
+			w.True(err == nil, "the session hook failed outright: %v", err)
+			_, statErr := os.Stat(filepath.Join(shareDir, "stale-install"))
+			return string(out), statErr == nil
+		}
+		hookOut, marked := hook("/tmp/share-current", "Metta-AI/caos@"+pinRev, "")
+		w.True(!marked, "the hook marked an install that matches the checkout's pin stale:\n%s", hookOut)
+		const otherRev = "dddddddddddddddddddddddddddddddddddddddd"
+		hookOut, marked = hook("/tmp/share-moved", "Metta-AI/caos@"+otherRev, "")
+		w.True(marked, "the hook let an install from an older pin through:\n%s", hookOut)
+		w.True(strings.Contains(hookOut, "STALE INSTALL") && strings.Contains(hookOut, pinRev) &&
+			strings.Contains(hookOut, otherRev),
+			"the hook's stdout does not name both pins, so nobody can act on it:\n%s", hookOut)
+		// Dev mode installs the dev commit whatever the checkout pins.
+		hookOut, marked = hook("/tmp/share-dev", "Metta-AI/caos@"+otherRev, devRev)
+		w.True(!marked, "the hook failed a dev install over the checkout's pin:\n%s", hookOut)
 
 		w.Report(fmt.Sprintf("cloud-setup: stage 2 installed and configured; stage 1 repointed a\n"+
 			"checkout at %s and seeded %s\n", devRev[:12], seedCommit[:12]))

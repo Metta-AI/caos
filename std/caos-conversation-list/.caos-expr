@@ -1,0 +1,29 @@
+# The `caos-conversation-list` tool (SPEC, "Tools"): the std/go worker image
+# with this directory's script curried onto it, plus the `help` the agent
+# registers it by. The sibling of caos-conversation, which reads ONE conversation
+# by the hash of its tip: this finds the hashes. Like it, it touches no source
+# tree, so it needs no `@in`.
+#
+# The docs are a HERE-STRING, so they live in the `.caos-expr` — which is
+# STRIPPED from the tree the expression is evaluated against. Editing them
+# re-keys this tool's arg tree and nothing else: no build sees these bytes.
+HELP=<<END
+List the conversations recorded on this caos server — for example Claude Code sessions
+that `caos mcp hook` recorded — NEWEST FIRST, one per line: the UTC time of the last
+message, the conversation id, the hash of its current tip commit, its title, and who has
+it (`user:active` or `user:archived`). `limit=N` is therefore the N most recent. Pass a
+tip hash to `caos-conversation` to read one.
+
+Conversations live as git refs on the server: `refs/caos/v3/conversations/<hex id>/head`
+is the tip, and `refs/caos/v3/users/<hex user>/conversations/{active,archived}/<hex id>`
+records who has it. This reads those refs; nothing is cloned. A Claude Code session's id
+is `cc/<session-id>`.
+
+THE TIME is the committer time of the tip commit: refs carry none, so every tip is read
+to sort, which costs one fetch per conversation. A conversation whose tip cannot be read
+is listed last with the reason. Use `filter` (a substring of the id or title) to narrow it.
+@param [filter] Keep only conversations whose id or title contains this text (case-insensitive).
+@param [limit] Print at most this many conversations (default 50; 0 for all).
+@param [titles] Set to 0 to skip reading each tip's title, which costs one fetch per conversation (default 1).
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP

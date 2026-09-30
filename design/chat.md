@@ -262,23 +262,10 @@ binds a `help`, each repository documents its own, and `tool_help` is the
 authoritative description of what one takes (SPEC, "CaosTools"). The tool list
 is therefore the same whatever source trees a conversation gains.
 
-### Preparing a stack
+### Stacks
 
-Once the first change is ready, the agent copies it and edits the copy:
-
-```sh
-cp -a feature/01-change feature/02-tests
-```
-
-Now `01-change` remains the first review boundary while `02-tests` advances.
-Each gitlink names a commit snapshot that may include several editing commits.
-The user describes the desired work and PR structure; the agent organizes these
-copies itself.
-
-Sibling gitlinks sort by filename. By convention, the first is the starting
-base and each later entry is a review boundary. Number prefixes make the order
-clear; names such as `dirty` have no special behavior. Folder order neither
-merges Git histories nor chooses a remote PR base.
+A sequence of PRs lives here as sibling gitlinks, one per layer: see
+[stacks.md](stacks.md).
 
 ## Subagents and merging their work
 
@@ -296,24 +283,14 @@ only the child's conversation; the parent's files and references stay unchanged.
 After the child finishes, `harvest_agent` compares its final content with its
 starting content and applies that difference to the parent. It can restrict the
 application to selected paths. The child's transcript and protocol metadata are
-not copied into the parent.
+not copied into the parent. Harvest applies changes at their existing paths and
+creates no stack layers; the parent decides the stack's shape
+([stacks.md](stacks.md)).
 
 Harvesting preserves unrelated parent edits and reconciles concurrent source-tree
 changes. The operation is atomic: if reconciliation conflicts, CAOS retains the
 proposal for resolution without partially installing it. The parent then
 inspects the result, resolves conflicts, and runs checks.
-
-For two independent changes intended as a PR stack, the parent can:
-
-1. Give two children bounded tasks against the same starting source.
-2. Harvest the first child's change into `feature/01-change` and check it.
-3. Preserve that snapshot by copying it to `feature/02-tests`.
-4. Apply the second child's source commit to `feature/02-tests` using a merge,
-   then check the combined result.
-
-Harvest applies changes at their existing paths; it does not choose PR
-boundaries or redirect changes into a differently named snapshot. The parent
-owns that organization unless it delegates it explicitly.
 
 ### Resolving source-tree conflicts
 
@@ -358,68 +335,14 @@ and gitlink path. A later `/checkout feature/01-change` can reuse it.
 checkout, submits them back to that source, and continues the conversation with
 the user's message. The source path is explicit in both commands.
 
-Browser selection does not choose checkout or publication targets, and does not
-change the agent's execution context.
+Browser selection does not choose checkout targets, and does not change the
+agent's execution context.
 
-## Publishing with `/pr`
+## Publishing
 
-The user enters:
-
-```text
-/pr feature/01-change main
-```
-
-The client:
-
-1. Reads the commit referenced by `feature/01-change`. That path also supplies
-   the proposed remote branch name.
-2. Determines the destination repository from an explicit optional URL or
-   unambiguous import provenance matching the oldest sibling's commit.
-3. Fetches the requested base branch, here `main`, and checks the source commit.
-4. Shows the source path and hash, repository, branch, and base for review.
-5. On Enter, rechecks the selected snapshot and remote state, pushes the exact
-   source commit with its history, and opens or updates the PR using the client's
-   Git and GitHub credentials. Escape cancels.
-6. Records the confirmed push as a `CAOS` message. Successful PR creation or
-   update adds another message with the PR URL, branch, and base.
-
-The full syntax is `/pr <conversation/gitlink> <base-remote-branch> [remote-URL]`.
-The base branch is explicit. The optional remote is a repository URL, not a
-local remote name such as `origin`. Missing or ambiguous provenance requires
-that URL. The preview shows destination metadata, not a full PR diff.
-
-For a stack, publish each boundary in order:
-
-```text
-/pr feature/01-change main
-/pr feature/02-tests feature/01-change
-```
-
-The preceding branch must exist remotely before it can serve as the next base.
-Publication does not squash source history or change the conversation's gitlinks.
-`/publish-branch <conversation/gitlink> [remote-URL]` provides the same preview
-and branch push without a PR or base-branch requirement.
-
-### When the PR base needs integrating
-
-The source and remote base must share Git history. If the source does not contain
-the fetched base tip, the preview offers a different action:
-
-1. On Enter, import that exact base commit under `imports/pr-base-<commit>/base`.
-2. Send a message asking the agent to merge or rebase it into the named source
-   and run checks.
-3. After integration, the user runs `/pr` again to review the result.
-
-That confirmation imports and sends the message; it publishes nothing. A failed
-import sends no message. The handoff preserves the user's draft and stays in the
-original conversation.
-
-Before integrating, the agent checks the full proposed PR scope. Merging upstream
-retains inherited branch changes; moving only a small requested edit onto a new
-base requires deciding which changes to carry over.
-
-Publication rejects changed snapshots, remote drift, unrelated histories,
-conflict markers, and any remaining source-tree `.caos` entry. It never cleans
-files or rewrites the reviewed commit at push time. Interrupted pushes are
-checked against the destination before retrying, and failed PR operations do
-not record a successful PR.
+The agent publishes; the client has no publish command. The agent pushes a
+source tree's commit with `publish_source`, which the server sends from its own
+store, and opens or updates the PR with `caos-std/github`. Neither checks
+anything out, on the client or anywhere else. A stack is squashed first, one
+commit per layer ([stacks.md](stacks.md), "Publishing"). See
+[agent-github.md](agent-github.md#prs) for both tools.

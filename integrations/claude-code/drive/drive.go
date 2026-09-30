@@ -267,8 +267,8 @@ func readCreds() (creds, error) {
 			c.token, from = tok, "~/.claude/.credentials.json"
 		} else if inWorker() {
 			return creds{}, fmt.Errorf("no token at %s/%s, and $CLAUDE_CODE_OAUTH_TOKEN is unset.\n"+
-				"  The secret is granted only to a job whose ArgTree is a superset of one of\n"+
-				"  its readers, so check `reader=` in .caos-secrets/%s.", secretsDir, secretName, secretName)
+				"  The secret is granted only to an image a reader matches, so check the\n"+
+				"  readers of %s in your secret store.", secretsDir, secretName, secretName)
 		} else {
 			return creds{}, fmt.Errorf("no token: %v.\n"+
 				"  Set $CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token` mints a long-lived one),\n"+

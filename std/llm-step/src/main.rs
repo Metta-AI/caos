@@ -1463,13 +1463,27 @@ fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepa
         Ok(theirs) => theirs,
         Err(block) => return Ok(Prepared::Result(block)),
     };
+    // `merge-base` is checked like any `{commit}` parameter: a hash that names
+    // nothing, or names something other than a commit, is the model's mistake.
+    let base = match call["input"]["merge-base"].as_str().map(str::trim) {
+        None | Some("") => None,
+        Some(base) => match tools::resolve_object(base, "commit", None) {
+            Ok(bound) => Some(bound.ready()?),
+            Err(why) => {
+                let id = call["id"].as_str().unwrap_or("");
+                let error = format!("merge's `merge-base`: {why}");
+                return Ok(Prepared::Result(error_block(id, &error)));
+            }
+        },
+    };
     let theirs_path = fresh("theirs");
     caos(["get-hash", &theirs, &theirs_path])?;
+    let mut args = vec![("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))];
+    if let Some(base) = &base {
+        args.push(("merge-base", base.arg()));
+    }
     let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
-    let curried = caos_curry(
-        Arg::Hash(image),
-        &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
-    )?;
+    let curried = caos_curry(Arg::Hash(image), &args)?;
     // NO `in`. merge never read one, and `ours` already determines the tree,
     // so binding it only made the key bigger. Its help declares no `@in`.
     let _ = ws;
@@ -1639,6 +1653,9 @@ fn launch_resolved_tool(
         if let Some(refs) = cfg.merge_refs.as_deref() {
             args.push(("refs", Arg::Lit(refs)));
         }
+    }
+    if tool.call {
+        args.push(("call", Arg::Lit(&call.id)));
     }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
@@ -3121,9 +3138,14 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // Everything below implements no entry and has no path, so declaring it here
     // is the only way to reach it at all.
     let mut registry = tools::declarations();
-    registry.push(with_source_tree(tools::tree_tool_declaration(
-        &tools::builtin_tool("publish_source", publish_source::HELP),
+    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
+        "publish_source",
+        publish_source::HELP,
     )));
+    // Help types are what a curried arg can carry, which has no boolean; this
+    // built-in reads its input as JSON, so it can take a real one.
+    publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
+    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
