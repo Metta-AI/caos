@@ -98,6 +98,14 @@ func main() {
 		w.Must(os.RemoveAll(dir))
 		w.Must(os.MkdirAll(dir, 0o755))
 		w.Must(os.WriteFile(filepath.Join(dir, "main.go"), w.Check(os.ReadFile("/cas/args/kv")), 0o644))
-		w.Do(execCmd("/tmp/run", "go", "run", "./kvcmd"))
+		w.Must(execCmd("/tmp/run", "go", "run", "./kvcmd"))
 	})
+}
+
+// execCmd runs a command with this worker's stdio, in dir ("" for the current one).
+func execCmd(dir, name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
 }
