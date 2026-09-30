@@ -126,8 +126,8 @@ while the inner runs, and it needs `git` (selected through `git-runner` in its
 **Finish**, given R's result `{state, reply}` and the observed head:
 
 1. If `state` equals the input state, return `reply`. Nothing to publish.
-2. Otherwise build the root tree `{state: <new state oid>, .actor: <carried>}`
-   by oid, with no checkout, and a commit on the observed head.
+2. Otherwise build the root tree `{state: <new state oid>}` by oid, with no
+   checkout, and a commit on the observed head.
 3. Store the commit through the object API, then fetch just that commit into a
    throwaway scratch repository (origin `CAOS_SERVER_URL`).
 4. Push with `git push --force-with-lease=<ref>:<observed> <commit>:<ref>`.
