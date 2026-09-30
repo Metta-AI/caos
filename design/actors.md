@@ -52,7 +52,7 @@ An actor request is a call to the `actor` wrapper tool with these args:
 
 | arg | meaning |
 |---|---|
-| `actor` | the branch: `refs/heads/actors/<name>` |
+| `state-ref` | the branch holding the actor's state: `refs/heads/actors/<name>` |
 | `inner` | the inner actor: any caos worker request template, in any image |
 | `nonce` | any value that makes this ArgTree unique, so the outer request is never answered from the cache |
 | `message` | the message: a blob or a tree, opaque to the wrapper and passed to the inner unchanged |
