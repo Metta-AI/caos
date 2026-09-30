@@ -88,17 +88,15 @@ fn promisor_store() -> Result<GitStore, String> {
 /// commit arrives alone (depth 1, no trees), a tree arrives without its
 /// children. Everything it references is then "promised", which is what lets a
 /// later push traverse it without downloading the rest.
-fn fetch_one(oid: &Oid) -> Result<(), String> {
-    git(&[
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--no-write-fetch-head",
-        "--depth=1",
-        "--filter=tree:0",
-        "origin",
-        oid.as_str(),
-    ])
+fn fetch_one(oid: &Oid, shallow: bool) -> Result<(), String> {
+    let mut args = vec!["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"];
+    // A shallow repository cannot push (the server refuses shallow pushes), so
+    // only start, which merely reads, may cut the history off.
+    if shallow {
+        args.push("--depth=1");
+    }
+    args.extend(["--filter=tree:0", "origin", oid.as_str()]);
+    git(&args)
 }
 
 /// The `state/` subtree oid of `head`, reading only the commit and its root tree.
