@@ -1,0 +1,5 @@
+# What this test reaches for (format `<path> <name>`).
+../../std/bash bash
+../../std/actor actor
+# A worker test that needs git, to read the actor's branch on the server.
+../../dev/worker-test worker-test
