@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Reference inner actor (design/actors.md): a key-value store in plain bash, run
-# in std/bash, which is not a runner image. A pure function of
-# (state tree, message) -> {state, reply}. Messages are idempotent:
+# Reference inner actor (design/actors.md): a key-value store in plain bash. A
+# pure function of (state tree, message) -> {state, reply}. Messages are
+# idempotent:
 #   put <key> <value>   set key (applying twice is the same as once)
 #   get <key>           reply with the value, state unchanged
+#   getcheck <key>      like get, and fail if any OTHER entry's content was
+#                       materialized: the inner sees the state lazily
 set -euo pipefail
 
 caos get /cas/args/message
@@ -28,13 +30,22 @@ put)
   printf '%s\n' "$value" > "/tmp/out/state/$key"
   printf 'ok\n' > /tmp/out/reply
   ;;
-get)
+get|getcheck)
   ln -s /cas/args/state /tmp/out/state
   if [ -e "/cas/args/state/$key" ]; then
     caos get "/cas/args/state/$key"
     cp "/cas/args/state/$key" /tmp/out/reply
   else
     : > /tmp/out/reply
+  fi
+  if [ "$op" = getcheck ]; then
+    for entry in /cas/args/state/*; do
+      name=$(basename "$entry")
+      if [ "$name" != "$key" ] && [ -s "$entry" ]; then
+        echo "kv: $name was materialized by a read of $key" >&2
+        exit 1
+      fi
+    done
   fi
   ;;
 *) echo "kv: unknown op: $op" >&2; exit 1 ;;
