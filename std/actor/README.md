@@ -14,7 +14,7 @@ moves the branch with a direct receive-pack command and an empty pack instead
 of `git push`, so it fetches no history (see the question). Daemons are deliberately set aside; see
 [Deferred: daemons](#deferred-daemons).
 
-Builds on [client-owned conversation refs](client-owned-conversation-refs.md)
+Builds on [client-owned conversation refs](../../design/client-owned-conversation-refs.md)
 (the Git protocol workers already use for conversation heads) and follows the
 start/finish shape of `std/run-and-update-ref`.
 
