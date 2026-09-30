@@ -326,13 +326,19 @@ detection.
    never shrinks. Start is unaffected (it reads the head at depth 1). This is
    the same problem as question 2 seen from the write path, and it is the
    reason that question matters now rather than later. Options to investigate:
-   - make the parent promised rather than present: write the commit against a
-     parent the scratch repo has never seen, if git will push it with the
-     parent in a promisor pack (not tried);
-   - drop the `shallow` file after a depth-1 fetch, so the repository is
-     treated as complete while the grandparents stay absent. Pack-objects
-     walks parents to mark them uninteresting, so this may fail or lazily
-     fetch the whole chain anyway (not tried);
+   - make the parent promised rather than present, by dropping the `shallow`
+     file after a depth-1 `tree:0` fetch so the head is the only commit held
+     and its parent is absent but listed by a `.promisor` pack. **Tried; it
+     does not work with `git push`** (40-commit branch, empty scratch repo):
+     the push fails with `Could not read <parent>` / `could not parse commit
+     <parent>`, with or without `--no-thin`. The depth-1 pack is marked
+     promisor, but the pack-objects that `send-pack` starts walks the head's
+     parents to mark them uninteresting and does not tolerate a missing one.
+     With the `shallow` file kept, the server refuses the push instead
+     (`shallow pushes are not accepted`). Only the full-history fetch
+     pushes. Still untried: bypass `git push` by building the pack from an
+     explicit object list (`git pack-objects`, no revision walk) and speaking
+     receive-pack directly;
    - squash periodically (question 2), which bounds the chain;
    - add a small server-side push-by-oid endpoint, which breaks "no server
      change".
