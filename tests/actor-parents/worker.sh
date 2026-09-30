@@ -78,7 +78,7 @@ variant() { # <name> <fetch args...>; then optionally VARIANT_HOOK runs before t
   fi
   if [ -n "${VARIANT_HOOK:-}" ]; then eval "$VARIANT_HOOK"; fi
   c=$(child "$head") || { note "$name: could not write the child commit"; return; }
-  if out=$(git push --force-with-lease="$ref:$head" origin "$c:$ref" 2>&1); then
+  if out=$(git push ${PUSH_EXTRA:-} --force-with-lease="$ref:$head" origin "$c:$ref" 2>&1); then
     note "$name: PUSH OK; commits held locally: $(local_commits) of $N"
   else
     note "$name: PUSH FAILED ($(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)); commits held locally: $(local_commits) of $N"
