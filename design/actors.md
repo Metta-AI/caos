@@ -8,8 +8,10 @@ re-apply (which is also the crash-after-push retry), a read making no commit,
 the inner's lazy view of the state, and the inner's cache hit. Two caveats: a
 real crash between push and reply is not injected (a re-applied message is the
 same observable), and laziness is checked from inside the inner, not by
-counting server object reads. Open question 6 (history fetched on every write)
-is unresolved. Daemons are deliberately set aside; see
+counting server object reads. Both are Go programs on `std/go`. Open question 6
+(history fetched on every write) is resolved for the write path: the wrapper
+moves the branch with a direct receive-pack command and an empty pack instead
+of `git push`, so it fetches no history (see the question). Daemons are deliberately set aside; see
 [Deferred: daemons](#deferred-daemons).
 
 Builds on [client-owned conversation refs](client-owned-conversation-refs.md)
