@@ -178,9 +178,9 @@ fn publish(state_ref: &str, head: Option<Oid>, new_state: Oid) -> Result<(), Str
     // the parent commit and the new state's root tree, one object each, so the
     // push can traverse the new commit without reading the state's closure.
     if let Some(head) = &head {
-        fetch_one(head)?;
+        fetch_one(head, false)?;
     }
-    fetch_one(&new_state)?;
+    fetch_one(&new_state, false)?;
     let tree = store
         .write_tree(&[TreeEntry {
             name: STATE_ENTRY.to_string(),
