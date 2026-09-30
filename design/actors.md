@@ -55,7 +55,11 @@ An actor request is a call to the `actor` wrapper tool with these args:
 | `actor` | the branch: `refs/heads/actors/<name>` |
 | `inner` | the inner actor: any caos worker request template, in any image |
 | `nonce` | any value that makes this ArgTree unique, so the outer request is never answered from the cache |
-| message args | whatever the inner expects; passed through to it unchanged |
+| `message` | the message: a blob or a tree, opaque to the wrapper and passed to the inner unchanged |
+
+`message` is one entry so that a message field can never collide with `state`
+or with the wrapper's own args, and so the inner's input and output are
+symmetric (`{state, message}` in, `{state, reply}` out).
 
 The nonce is only a cache-buster. Reusing it across retries or minting a new
 one per attempt are both correct, because messages are idempotent.
