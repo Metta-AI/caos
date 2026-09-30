@@ -23,7 +23,7 @@ Today a job that needs a daemon starts it as a child of its own container
 ## Model
 
 An **actor** is a worker with a durable name and its state in a Git branch.
-Cloudflare Durable Objects are the closest analogue. Four rules define it:
+Cloudflare Durable Objects are the closest analog. Four rules define it:
 
 1. **No Start message.** The container comes alive on the first request and
    exits after an idle period. So every request names the actor, and the
