@@ -84,6 +84,7 @@ variant() {
 variant full
 variant noshallowfile
 variant rawparent
+variant orphan
 echo "---- spike report ----" >&2
 cat "$report" >&2
 exit 1
