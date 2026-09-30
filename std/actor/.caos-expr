@@ -1,0 +1,5 @@
+# Build the actor wrapper from its Rust project (design/actors.md). One binary,
+# two positions like run-and-update-ref: start reads the branch head and tail-calls
+# the inner request; finish publishes the new state with a leased push. It selects
+# git-runner because both positions use ordinary Git.
+run --base:@=DEEP-DEPS/rustc --src:@=. --dep0:@=DEEP-DEPS/conversation-protocol --dep1:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
