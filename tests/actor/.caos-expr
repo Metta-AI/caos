@@ -1,5 +1,5 @@
-# tests/actor, as an ENTRY: a worker test (dev/worker-test has git, which is how
-# it reads the actor's branch on the server) driving std/actor with a reference
-# key-value inner that runs in std/bash. `probe` is an impure inner and `mapper`
-# a concurrent writer, both for the race and concurrency cases.
-curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --actor:@=DEEP-DEPS/actor --kv:@=kv.sh --probe:@=probe.sh --mapper:@=mapper.sh
+# tests/actor, as an ENTRY: a std/go worker test (std/go has git, which is how it
+# reads the actor's branch on the server) driving std/actor with a reference
+# key-value inner. `probe` is an impure inner and `mapper` a concurrent writer,
+# both for the race and concurrency cases. Every program runs on std/go.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --actor:@=DEEP-DEPS/actor --kv:@=kv.go --probe:@=probe.go --mapper:@=mapper.go
