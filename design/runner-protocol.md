@@ -7,7 +7,7 @@ backends outright: `dispatch_docker`/`dispatch_serve`/`dispatch_fly`, the
 are all deleted, and the dev stack gains `caos runnerd` as a required daemon.
 Builds on the runner-pool decomposition (`runner-pool-and-cloud-builds.md`):
 that doc removes the per-worker *image*; this one removes the per-job
-*container start*.
+*container start*. See also [actors](actors.md) for state that outlives a job.
 
 ---
 
