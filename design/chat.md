@@ -397,6 +397,9 @@ For a stack, publish each boundary in order:
 
 The preceding branch must exist remotely before it can serve as the next base.
 Publication does not squash source history or change the conversation's gitlinks.
+An agent publishing a stack itself instead collapses it to one commit per layer
+and pushes those with a leased rewrite (design/agent-github.md, "Publishing a
+stack"); the layers' gitlinks still keep their full merge history.
 `/publish-branch <conversation/gitlink> [remote-URL]` provides the same preview
 and branch push without a PR or base-branch requirement.
 
