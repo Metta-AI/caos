@@ -22,20 +22,21 @@ For example, one conversation tree might contain:
 memories/project.md            an ordinary conversation file
 imports/repo/base              gitlink -> ST_0
 imports/repo/base.source.json  optional repository provenance
-feature/00-base                gitlink -> ST_0
-feature/01-change              gitlink -> ST_4
-feature/02-tests               gitlink -> ST_8
+feature/00-change              gitlink -> ST_4
+feature/00.base                text -> ST_0
+feature/01-tests               gitlink -> ST_8
+feature/01.base                text -> ST_4
 ```
 
 If the agent calls `write` or `edit` on
-`feature/01-change/README.md` and changes its contents, saving the tool result
+`feature/00-change/README.md` and changes its contents, saving the tool result
 automatically creates a new source-tree commit. Its tree contains the edited
 files and its parent is the previously referenced commit, here `ST_4`. The
-harness then records a conversation commit whose `feature/01-change` gitlink
+harness then records a conversation commit whose `feature/00-change` gitlink
 points to that new commit. The agent does not separately commit or update the
 gitlink; bash edits use the same save path.
 
-Other references, including `00-base` and `02-tests`, stay unchanged.
+Other references, including the recorded base and `01-tests`, stay unchanged.
 An unchanged source tree keeps its existing commit. Many conversation commits
 can therefore reference the same `ST`: messages and tool activity need not
 change code.
@@ -49,14 +50,14 @@ history is reachable.
 flowchart TB
     subgraph caos["CAOS Git"]
         C["C: conversation snapshot"]
-        C -.->|"feature/00-base"| ST0["ST_0"]
-        C -.->|"feature/01-change"| ST4["ST_4"]
-        C -.->|"feature/02-tests"| ST8["ST_8"]
+        C -.->|"feature/00.base (text)"| ST0["ST_0"]
+        C -.->|"feature/00-change"| ST4["ST_4"]
+        C -.->|"feature/01-tests"| ST8["ST_8"]
         ST8 -->|"ancestor; intermediate commits omitted"| ST4
         ST4 -->|"ancestor; intermediate commits omitted"| ST0
     end
     subgraph remote["Destination Git"]
-        P["P: refs/heads/feature/02-tests"] --> Published["ST_8 and its reachable history"]
+        P["P: refs/heads/feature/01-tests"] --> Published["ST_8 and its reachable history"]
     end
     ST8 -.->|publish the same commits| Published
 ```
@@ -214,7 +215,7 @@ unchanged under `imports/`, separate from feature work.
 ## Ordinary agent work
 
 Every command starts from the conversation root. File tools and grep use paths
-such as `memories/project.md` or `feature/01-change/README.md`; grep can descend
+such as `memories/project.md` or `feature/00-change/README.md`; grep can descend
 through gitlinks. Bash can choose a relative `cwd` for one call, but its declared
 `paths` are always conversation-relative. Declared directories include their
 descendants; undeclared content stays lazy until requested.
@@ -223,18 +224,18 @@ To start work, the agent uses ordinary operations:
 
 ```sh
 mkdir -p feature
-cp -a imports/repo/base feature/00-base
-cp -a imports/repo/base feature/01-change
+cp -a imports/repo/base feature/00-change
+printf '%s\n' <imported-commit-id> > feature/00.base
 ```
 
-The copies initially reference the same `ST_0`. Suppose the agent then writes
-`feature/01-change/MYFILE.txt`:
+The gitlink initially references `ST_0`; `00.base` records that same id. Suppose the agent then writes
+`feature/00-change/MYFILE.txt`:
 
 1. The harness exposes the requested source-tree files as a writable directory.
 2. The tool writes the file.
 3. Saving the result creates `ST_1` with the edited tree and `ST_0` as parent.
-4. The conversation update changes `feature/01-change` to point to `ST_1`.
-   `imports/repo/base` and `feature/00-base` keep their original references.
+4. The conversation update changes `feature/00-change` to point to `ST_1`.
+   `imports/repo/base` and `feature/00.base` keep their original references.
 
 Writing `memories/project.md` changes the conversation tree directly and creates
 no source-tree commit. One tool call can edit ordinary files and several source
@@ -252,7 +253,7 @@ link that CAS object into the conversation tree; the next tool call exposes it
 as a directory.
 
 Repository tools are called with `run_tool` at a conversation-relative path,
-such as `feature/01-change/caos-tools/test`, and described by `tool_help` at
+such as `feature/00-change/caos-tools/test`, and described by `tool_help` at
 that same path. The harness resolves the tool from the captured snapshot. Its
 input is the outermost source tree containing that path; a tool outside source
 trees receives the conversation tree.
@@ -264,21 +265,22 @@ is therefore the same whatever source trees a conversation gains.
 
 ### Preparing a stack
 
-Once the first change is ready, the agent copies it and edits the copy:
+Use numbered layer gitlinks with a matching `<number>.base` file for each.
+The base records where that layer started, even after its predecessor is rewritten.
+Names such as `work` have no special behavior.
 
-```sh
-cp -a feature/01-change feature/02-tests
-```
+Start with `feature/00-work` copied from the imported commit and that commit's
+id in `feature/00.base`. Tool calls can create many editing commits. A replay
+plan picks their net change as one commit, supplies its message, and records a
+named layer. Another branch instruction can start the next work at that tip.
 
-Now `01-change` remains the first review boundary while `02-tests` advances.
-Each gitlink names a commit snapshot that may include several editing commits.
-The user describes the desired work and PR structure; the agent organizes these
-copies itself.
+When a lower layer changes, replay each later layer's selected change onto its
+new predecessor. Plans can also split, combine, rename, or omit layers. Source
+history and remote PR bases are separate: folder order does not choose a
+GitHub base branch.
 
-Sibling gitlinks sort by filename. By convention, the first is the starting
-base and each later entry is a review boundary. Number prefixes make the order
-clear; names such as `dirty` have no special behavior. Folder order neither
-merges Git histories nor chooses a remote PR base.
+See [agent stacks and replay](agent-rebase.md) for the layout, tools, plans,
+and conflict resolution.
 
 ## Subagents and merging their work
 
@@ -306,9 +308,9 @@ inspects the result, resolves conflicts, and runs checks.
 For two independent changes intended as a PR stack, the parent can:
 
 1. Give two children bounded tasks against the same starting source.
-2. Harvest the first child's change into `feature/01-change` and check it.
-3. Preserve that snapshot by copying it to `feature/02-tests`.
-4. Apply the second child's source commit to `feature/02-tests` using a merge,
+2. Harvest the first child's change into `feature/00-change` and check it.
+3. Prepare the first layer with a replay plan, then start `feature/01-tests` at its tip with a matching `01.base`.
+4. Apply the second child's source commit to `feature/01-tests` using a merge,
    then check the combined result.
 
 Harvest applies changes at their existing paths; it does not choose PR
@@ -345,7 +347,7 @@ head. Its comparisons are between named snapshots, not against a remote PR base.
 To work in a host checkout, the user enters:
 
 ```text
-/checkout feature/01-change /absolute/path/to/checkout
+/checkout feature/00-change /absolute/path/to/checkout
 ```
 
 This is a TUI command. It imports the needed objects into the local checkout and
@@ -353,8 +355,8 @@ checks out the named source commit with detached HEAD. The destination must be
 a clean Git checkout or an empty/new directory.
 
 The client remembers that destination locally, keyed by server, conversation,
-and gitlink path. A later `/checkout feature/01-change` can reuse it.
-`/update-tree feature/01-change <message>` commits edits in that path's remembered
+and gitlink path. A later `/checkout feature/00-change` can reuse it.
+`/update-tree feature/00-change <message>` commits edits in that path's remembered
 checkout, submits them back to that source, and continues the conversation with
 the user's message. The source path is explicit in both commands.
 
@@ -366,12 +368,12 @@ change the agent's execution context.
 The user enters:
 
 ```text
-/pr feature/01-change main
+/pr feature/00-change main
 ```
 
 The client:
 
-1. Reads the commit referenced by `feature/01-change`. That path also supplies
+1. Reads the commit referenced by `feature/00-change`. That path also supplies
    the proposed remote branch name.
 2. Determines the destination repository from an explicit optional URL or
    unambiguous import provenance matching the oldest sibling's commit.
@@ -391,8 +393,8 @@ that URL. The preview shows destination metadata, not a full PR diff.
 For a stack, publish each boundary in order:
 
 ```text
-/pr feature/01-change main
-/pr feature/02-tests feature/01-change
+/pr feature/00-change main
+/pr feature/01-tests feature/00-change
 ```
 
 The preceding branch must exist remotely before it can serve as the next base.
