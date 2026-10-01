@@ -485,7 +485,10 @@ Matching happens where evaluation applies a node's `.caos-expr`. Every node
 has an origin `(T, P)`: a root tree and the node's path in it. A walk's start
 tree is its own origin at `P = ""`, descending by name extends `P`, and a
 `:@@=` result's origin is `(C^{tree}, dir)` — so what a consumer mounts keeps
-the identity it had upstream. A node's value is a function of its origin (a
+the identity it had upstream. Every subtree of a `:@@=` result, or of a value
+a `.caos-expr` produced, is recorded at its path below that origin; equal oids
+are equal content, so a copy (a `DEEP-DEPS/<name>` mount is one) carries the
+origins of what it was copied from. A node's value is a function of its origin (a
 parent `.caos-expr` can reshape everything below it, so nothing less than the
 whole root identifies it). An origin is the server's bookkeeping during the
 walk, never written into a tree: an ungranted node evaluates exactly as it

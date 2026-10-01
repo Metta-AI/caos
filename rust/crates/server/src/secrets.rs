@@ -58,12 +58,74 @@ impl Context {
     }
 }
 
-/// Every `(root, path)` a `:@@=` result has been reached at, by result oid.
-/// Facts about content, so shared by every run.
+/// Every `(root, path)` a tree has been reached at, by tree oid: a `:@@=`
+/// result, and every subtree of a value a `.caos-expr` produced. Equal oids
+/// are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one — carries
+/// the origin of what it was copied from. Facts about content, so shared by
+/// every run.
 static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
 
 /// Bounds [`KNOWN_ORIGINS`]; forgetting only means a later grant misses.
-const KNOWN_ORIGINS_CAP: usize = 100_000;
+const KNOWN_ORIGINS_CAP: usize = 1_000_000;
+
+/// The values whose subtrees are already in [`KNOWN_ORIGINS`], with the
+/// origins they were indexed under.
+static INDEXED: Mutex<Option<HashSet<(String, Vec<Origin>)>>> = Mutex::new(None);
+
+/// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
+/// `(T, P)` of `tree` itself.
+fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
+    {
+        let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
+        let indexed = guard.get_or_insert_with(HashSet::new);
+        if indexed.len() >= KNOWN_ORIGINS_CAP {
+            indexed.clear();
+        }
+        if !indexed.insert((tree.to_string(), origins.to_vec())) {
+            return Ok(());
+        }
+    }
+    let repo = config.repo.to_thread_local();
+    let root = gix::ObjectId::from_hex(tree.as_bytes()).map_err(|e| format!("{tree}: {e}"))?;
+    if repo
+        .find_header(root)
+        .map_err(|e| format!("{tree}: {e}"))?
+        .kind()
+        != gix::object::Kind::Tree
+    {
+        return Ok(());
+    }
+    let mut pending = vec![(root, String::new())];
+    while let Some((oid, rel)) = pending.pop() {
+        let object = repo.find_object(oid).map_err(|e| format!("{oid}: {e}"))?;
+        let decoded = object.try_into_tree().map_err(|e| format!("{oid}: {e}"))?;
+        for entry in decoded.decode().map_err(|e| format!("{oid}: {e}"))?.entries {
+            if !entry.mode.is_tree() {
+                continue;
+            }
+            let path = if rel.is_empty() {
+                entry.filename.to_string()
+            } else {
+                format!("{rel}/{}", entry.filename)
+            };
+            for origin in origins {
+                record_origin(
+                    &entry.oid.to_string(),
+                    Origin {
+                        root: origin.root.clone(),
+                        path: if origin.path.is_empty() {
+                            path.clone()
+                        } else {
+                            format!("{}/{path}", origin.path)
+                        },
+                    },
+                );
+            }
+            pending.push((entry.oid.to_owned(), path));
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn record_origin(oid: &str, origin: Origin) {
     let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
@@ -74,6 +136,14 @@ pub(crate) fn record_origin(oid: &str, origin: Origin) {
     let origins = map.entry(oid.to_string()).or_default();
     if !origins.contains(&origin) {
         origins.push(origin);
+    }
+}
+
+/// What a `:@@=` resolution produced, at its locator's `(rev^{tree}, dir)`.
+pub(crate) fn record_mount(config: &Config, oid: &str, origin: Origin) {
+    record_origin(oid, origin.clone());
+    if let Err(e) = index_subtrees(config, oid, &[origin]) {
+        eprintln!("secrets: cannot index {oid}: {e}");
     }
 }
 
@@ -100,6 +170,9 @@ pub(crate) fn evaluated(
 ) -> Result<(String, String), String> {
     if context.is_empty() {
         return Ok(value);
+    }
+    if value.0 == "tree" {
+        index_subtrees(config, &value.1, origins)?;
     }
     let granted: Vec<&Stored> = context
         .stored

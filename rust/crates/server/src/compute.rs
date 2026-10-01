@@ -195,7 +195,8 @@ pub(crate) fn eval_endpoint(
                 .ok()
                 .and_then(|r| r.split_once(' '))
             {
-                crate::secrets::record_origin(
+                crate::secrets::record_mount(
+                    config,
                     hash.trim(),
                     caos_eval::Origin {
                         root: root.to_string(),
@@ -292,7 +293,8 @@ fn evaluate_locator(
     let result = evaluate(config, &root.to_string(), dir, secrets)
         .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
     if let Some((_, hash)) = result.split_once(' ') {
-        crate::secrets::record_origin(
+        crate::secrets::record_mount(
+            config,
             hash,
             caos_eval::Origin {
                 root: root.to_string(),
@@ -1222,7 +1224,8 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         let dir = git_ref.dir.as_deref().unwrap_or("");
         let (kind, hash) = caos_eval::eval_path(self, &root.to_string(), dir)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;
-        crate::secrets::record_origin(
+        crate::secrets::record_mount(
+            self.config,
             &hash,
             caos_eval::Origin {
                 root: root.to_string(),
