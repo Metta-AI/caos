@@ -125,7 +125,7 @@ fn run(args: &[String]) -> Result<(), String> {
             [flag, arg_tree] if flag == "--all" => caos::cli_status(&transport()?, arg_tree, true),
             _ => Err(usage(args)),
         },
-        // `secrets-init` / `secrets-push [--dir=<d>] [--server=<url>]` — the
+        // `secrets-init --dir=<d>` / `secrets-push --dir=<d> [--server=<url>]` — the
         // server-held store (SPEC.md, "Secrets"). No caos tree needed.
         Some("secrets-init") => caos_cli::secret_store::cli_secrets_init(&args[2..]),
         Some("secrets-push") => caos_cli::secret_store::cli_secrets_push(&args[2..]),
@@ -198,8 +198,8 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \
          {prog} status [--all] <arg tree hash>\n  \
-         {prog} secrets-init [--dir=<d>]\n  \
-         {prog} secrets-push [--dir=<d>] [--server=<url>]"
+         {prog} secrets-init --dir=<d>\n  \
+         {prog} secrets-push --dir=<d> [--server=<url>]"
     )
 }
 

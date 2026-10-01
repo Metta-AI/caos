@@ -42,12 +42,12 @@ conversation state.
 Supply the token through your secret store (SPEC.md, "Secrets"):
 
 ```text
-# ~/.config/caos/secrets/github-token
+# <your secrets directory>/github-token
 value:@=values/github-token
 reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
 ```
 
-`caos-cli secrets-push` adds its entropy and sends it to the server.
+`caos-cli secrets-push --dir=<d>` adds its entropy and sends it to the server.
 The agent uses `/secret/github-token` for GitHub ref lookup and passes
 `--github-token-file=/secret/github-token` to `import-git`. The command
 forwards it in the sensitive `X-Caos-Git-Token` header; the server does not look

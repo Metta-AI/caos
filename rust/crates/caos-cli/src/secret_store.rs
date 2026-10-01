@@ -14,8 +14,8 @@ const WRITER_KEY_FILE: &str = ".secret-writer-key";
 /// Below this an entropy is guessable out of its `secret-hash`.
 const MIN_ENTROPY_LEN: usize = 16;
 
-/// `secrets-init [--dir=<d>]`: create the directory and its key pair, and
-/// print the SecretReaderKey.
+/// `secrets-init --dir=<d>`: create the directory and its key pair, and print
+/// the SecretReaderKey. A directory that has one already just prints it.
 pub fn cli_secrets_init(args: &[String]) -> Result<(), String> {
     let (dir, server) = parse_flags(args)?;
     if server.is_some() {
@@ -25,7 +25,7 @@ pub fn cli_secrets_init(args: &[String]) -> Result<(), String> {
     if key_path.exists() {
         let key = read_writer_key(&dir)?;
         println!("{}", hex(&key.verifying_key().to_bytes()));
-        return Err(format!("{} already exists", key_path.display()));
+        return Ok(());
     }
     create_private_dir(&dir)?;
     let seed: [u8; 32] = random_bytes()?;
@@ -37,7 +37,7 @@ pub fn cli_secrets_init(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `secrets-push [--dir=<d>] [--server=<url>]`: replace the server's tree for
+/// `secrets-push --dir=<d> [--server=<url>]`: replace the server's tree for
 /// this key with the directory's secrets.
 pub fn cli_secrets_push(args: &[String]) -> Result<(), String> {
     let (dir, server) = parse_flags(args)?;
@@ -110,49 +110,27 @@ fn parse_flags(args: &[String]) -> Result<(PathBuf, Option<String>), String> {
             return Err(format!("unknown argument {arg:?}"));
         }
     }
-    let dir = match dir {
-        Some(dir) => dir,
-        None => default_dir()?,
-    };
+    // No default: the directory is the only copy of your secrets, so it goes
+    // where you will find it and back it up.
+    let dir = dir.ok_or("--dir=<d> is required: the directory that holds your secrets")?;
     Ok((dir, server))
 }
 
-/// The SecretReaderKeys this process presents, space-separated in the first
-/// of: the checkout's `caos.secret-readers` (a cloud session's setup line puts
-/// them there); the default directory's own key.
+/// The SecretReaderKeys this process presents: the checkout's
+/// `caos.secret-readers`, space-separated. A cloud session's setup line puts
+/// them there; elsewhere, `git config caos.secret-readers <key>`.
 pub fn reader_keys() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("git")
+    let Ok(out) = std::process::Command::new("git")
         .args(["config", "--get", "caos.secret-readers"])
         .stderr(std::process::Stdio::null())
         .output()
-    {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .map(str::to_string)
-                .collect();
-        }
-    }
-    default_dir()
-        .and_then(|dir| read_writer_key(&dir))
-        .map(|key| vec![hex(&key.verifying_key().to_bytes())])
-        .unwrap_or_default()
-}
-
-/// `$CAOS_SECRETS_DIR`, else `$XDG_CONFIG_HOME/caos/secrets`, else
-/// `~/.config/caos/secrets`.
-fn default_dir() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("CAOS_SECRETS_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    let config = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(config) => PathBuf::from(config),
-        None => PathBuf::from(
-            std::env::var_os("HOME").ok_or("neither --dir, $CAOS_SECRETS_DIR nor $HOME is set")?,
-        )
-        .join(".config"),
+    else {
+        return Vec::new();
     };
-    Ok(config.join("caos").join("secrets"))
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
 }
 
 fn read_writer_key(dir: &Path) -> Result<SigningKey, String> {

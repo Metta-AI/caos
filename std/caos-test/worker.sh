@@ -133,8 +133,9 @@ git push -q http://127.0.0.1 "HEAD:refs/heads/caos-test/$(git rev-parse HEAD)" \
 # dev/worker-test is granted so a test's own ArgTree carries the key's
 # `secret-hash`: llm-step's admission protocol names the exact request hash in
 # advance, and a worker can only form that request if it can bind the entry.
-export CAOS_SECRETS_DIR=/tmp/caos-test-secrets
-"$CLI" secrets-init >/dev/null || fail "creating the test store"
+STORE=/tmp/caos-test-secrets
+key=$("$CLI" secrets-init --dir="$STORE") || fail "creating the test store"
+git config caos.secret-readers "$key"
 at="git+http://caos.invalid/caos-test?rev=$(git rev-parse HEAD)&dir"
 {
   printf 'name=anthropic-api-key\n'
@@ -143,8 +144,8 @@ at="git+http://caos.invalid/caos-test?rev=$(git rev-parse HEAD)&dir"
   printf 'reader:@@=%s=std/llm-call\n' "$at"
   printf 'reader:@@=%s=std/llm-step\n' "$at"
   printf 'reader:@@=%s=dev/worker-test\n' "$at"
-} > "$CAOS_SECRETS_DIR/llm-mock"
-"$CLI" secrets-push --server=http://127.0.0.1 >/dev/null || fail "pushing the test store"
+} > "$STORE/llm-mock"
+"$CLI" secrets-push --dir="$STORE" --server=http://127.0.0.1 >/dev/null || fail "pushing the test store"
 echo "==> granting llm-call, llm-step and dev/worker-test a mock key" >&2
 
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected

@@ -2675,11 +2675,13 @@ fn invoked_as() -> String {
 pub fn model_secret_manual_setup() -> String {
     let cli = invoked_as();
     format!(
-        "run `{cli} secrets-init` once, then create `{MODEL_API_SECRET}` in the directory it \
-         names with:\n\nvalue=<your key>\nreader:@@=<caos locator>&dir=std/{LLM_STEP_ARG}\n\
-         reader:@@=<caos locator>&dir=std/{LLM_CALL_ARG}\n\nand run `{cli} secrets-push`. The \
-         locator is the one your repository pins caos with (`git+https://…?rev=<sha>`). See \
-         SPEC.md, \"Secrets\"."
+        "run `{cli} secrets-init --dir=<d>` once, choosing a directory you back up, \
+         and `git config caos.secret-readers <the key it prints>` in this checkout. Then \
+         create `<d>/{MODEL_API_SECRET}` with:\n\nvalue=<your key>\n\
+         reader:@@=<caos locator>&dir=std/{LLM_STEP_ARG}\n\
+         reader:@@=<caos locator>&dir=std/{LLM_CALL_ARG}\n\nand run `{cli} secrets-push \
+         --dir=<d>`. The locator names caos' repository with `rev=<sha>` or `ref=<branch>`. \
+         See SPEC.md, \"Secrets\"."
     )
 }
 

@@ -402,18 +402,20 @@ the object machinery through a one-way dependency. Their difference is the
     `--llm-call:@=std/llm-call` here, `--llm-step:@=caos-std/llm-step` in a repo
     that mounted caos, or `:@@=<git ref>` in one that only pinned it. There is
     no default and no path this client goes looking in;
-  - `secrets-init` / `secrets-push [--dir=<d>] [--server=<url>]` — your
-    secret store (SPEC.md, "Secrets"). Runs anywhere, no caos tree needed.
+  - `secrets-init --dir=<d>` / `secrets-push --dir=<d> [--server=<url>]` —
+    your secret store (SPEC.md, "Secrets"). Runs anywhere, no caos tree needed.
 
-Secrets live in a directory on your machine — `~/.config/caos/secrets` by
-default, or `$CAOS_SECRETS_DIR` — and the server holds a copy you replace with
-each push. `caos-cli secrets-init` creates the directory and a key pair, and
-prints the SecretReaderKey: the key a client presents to use the secrets. A
-client on this machine presents it by itself; a cloud session is given it on
-its setup line (integrations/claude-code/cloud). Each file is one secret:
+Secrets live in a directory you choose — it is the only copy you keep, so put
+it somewhere you back up — and the server holds a copy you replace with each
+push. `caos-cli secrets-init --dir=<d>` creates the directory and a key pair,
+and prints the SecretReaderKey: the key a client presents to use the secrets
+(run it again to print the key of a directory that has one). A checkout
+presents it once you run `git config caos.secret-readers <key>` there; a cloud
+session is given it on its setup line (integrations/claude-code/cloud). Each
+file in the directory is one secret:
 
 ```text
-# ~/.config/caos/secrets/anthropic-api-key
+# <d>/anthropic-api-key
 value=<the key>
 reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
 reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-call
@@ -426,19 +428,18 @@ of a granted tree — a `DEEP-DEPS` mount, a repository that pins caos — is
 granted too, so a client repo mounting caos' std needs nothing more. Then:
 
 ```text
-caos-cli secrets-push --server=http://localhost:9090
+caos-cli secrets-push --dir=<d> --server=http://localhost:9090
 ```
 
 Neither needs caos installed, or a caos tree to run in. With nix:
 
 ```bash
-nix run github:Metta-AI/caos#caos-cli -- secrets-init
+nix run github:Metta-AI/caos#caos-cli -- secrets-init --dir=<d>
 nix run github:Metta-AI/caos#caos-cli -- \
-  secrets-push --server=caos://<ticket>
+  secrets-push --dir=<d> --server=caos://<ticket>
 ```
 
-`--server` takes a ticket as well as a URL, and `--dir=<d>` names a directory
-other than the default.
+`--server` takes a ticket as well as a URL.
 
 `secrets-push` adds a random `entropy=` to any secret without one (it is the
 secret's cache-isolation identity; rotate it with the value when a result

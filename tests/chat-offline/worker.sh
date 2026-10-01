@@ -88,7 +88,7 @@ opts=(--model test-model --base-url "http://$stub_host:$port"
       --llm-step:@=DEEP-DEPS/llm-step)
 
 echo "== request preparation fails before admission ==" >&2
-export CAOS_SECRETS_DIR=/tmp/chat-offline-secrets
+STORE=/tmp/chat-offline-secrets
 if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>key.err; then
   fail "chat succeeded without its model secret"
 fi
@@ -105,21 +105,22 @@ fi
 # Readers grant by locator: this repo's commit, and the step's path in it. The
 # chat below evaluates the step from the clean worktree, which is that tree.
 git push -q caos "HEAD:refs/heads/${test_id}-chat-offline" || fail "pushing the fixture commit"
-"$CAOS_CLI" secrets-init >/dev/null || fail "secrets-init failed"
+key=$("$CAOS_CLI" secrets-init --dir="$STORE") || fail "secrets-init failed"
+git config caos.secret-readers "$key"
 step_at="git+http://caos.invalid/chat-offline?rev=$(git rev-parse HEAD)&dir=DEEP-DEPS/llm-step"
-push() { "$CAOS_CLI" secrets-push --server="$CAOS_SERVER_URL" >/dev/null; }
+push() { "$CAOS_CLI" secrets-push --dir="$STORE" --server="$CAOS_SERVER_URL" >/dev/null; }
 echo "== stale and mismatched model readers fail before admission ==" >&2
 for dir in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
   printf '%s\n' \
     'value=test-key' \
     'entropy=0123456789abcdef0123456789abcdef' \
-    "reader:@@=${step_at%dir=*}dir=$dir" > "$CAOS_SECRETS_DIR/anthropic-api-key"
+    "reader:@@=${step_at%dir=*}dir=$dir" > "$STORE/anthropic-api-key"
   # Another credential still marks the selected worker. Its hash must not
   # disguise the missing grant for the model key.
   printf '%s\n' \
     'value=unrelated-value' \
     'entropy=abcdef0123456789abcdef0123456789' \
-    "reader:@@=$step_at" > "$CAOS_SECRETS_DIR/unrelated-key"
+    "reader:@@=$step_at" > "$STORE/unrelated-key"
   push || fail "secrets-push failed"
   if "$CAOS_CLI" chat "$queued_conv" -m "hello" --base "$base" "${opts[@]}" 2>reader.err; then
     fail "chat admitted a model key granted to $dir"
@@ -131,11 +132,11 @@ for dir in std/removed-llm-step DEEP-DEPS/llm-test-tool; do
   fi
   [ ! -e stub/request-1.json ] || fail "reader failure reached the LLM"
 done
-rm "$CAOS_SECRETS_DIR/unrelated-key"
+rm "$STORE/unrelated-key"
 printf '%s\n' \
   'value=test-key' \
   'entropy=0123456789abcdef0123456789abcdef' \
-  "reader:@@=$step_at" > "$CAOS_SECRETS_DIR/anthropic-api-key"
+  "reader:@@=$step_at" > "$STORE/anthropic-api-key"
 push || fail "secrets-push failed"
 
 echo "== a conversation-shaped base is refused ==" >&2

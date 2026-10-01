@@ -131,17 +131,18 @@ git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
 # the committed tree, so what it evaluates has exactly that origin. The URL is
 # never fetched — the server already holds the commit — so any well-formed one
 # names it.
-export CAOS_SECRETS_DIR=/tmp/secrets-test-store
-"$CAOS_CLI" secrets-init >/dev/null || fail "secrets-init failed"
+STORE=/tmp/secrets-test-store
+key=$("$CAOS_CLI" secrets-init --dir="$STORE") || fail "secrets-init failed"
+git config caos.secret-readers "$key"
 head=$(git rev-parse HEAD)
 at() { echo "git+http://caos.invalid/secrets-test?rev=$head&dir=$1"; }
-push() { "$CAOS_CLI" secrets-push --server="$CAOS_SERVER_URL" >/dev/null; }
-cat > "$CAOS_SECRETS_DIR/token" <<EOF2
+push() { "$CAOS_CLI" secrets-push --dir="$STORE" --server="$CAOS_SERVER_URL" >/dev/null; }
+cat > "$STORE/token" <<EOF2
 value=SEKRET-abc-123
 entropy=7f3a9c2e1b8d4f60a5e7c9d1b3f5a7e9
 reader:@@=$(at DEEP-DEPS/bash)
 EOF2
-cat > "$CAOS_SECRETS_DIR/deploytok" <<EOF2
+cat > "$STORE/deploytok" <<EOF2
 value=DEPLOY-xyz-789
 entropy=aa11bb22cc33dd44ee55ff6677889900
 reader:@@=git+caos://this-server?ref=refs/heads/${test_run_id}-secrets-test&dir=mytool
@@ -205,10 +206,10 @@ git reset -q --hard "$head"
 echo "  ok: the grant follows the branch" >&2
 
 echo "== a malformed reader is refused by secrets-push ==" >&2
-printf 'value=x\nreader:@@=%s until=never\n' "$(at mytool)" > "$CAOS_SECRETS_DIR/badreader"
+printf 'value=x\nreader:@@=%s until=never\n' "$(at mytool)" > "$STORE/badreader"
 if push 2>bad.err; then fail "a malformed reader should fail the push"; fi
 grep -q 'until=never' bad.err || fail "expected the malformed-reader error: $(cat bad.err)"
-rm -f "$CAOS_SECRETS_DIR/badreader"
+rm -f "$STORE/badreader"
 echo "  ok: a malformed reader fails the push" >&2
 
 echo "== sub-run preserves the server-held secret store ==" >&2
@@ -251,7 +252,7 @@ echo "== a granted tool is marked, and so is anything embedding it ==" >&2
 # origin and is marked too — which is what makes its embedder per-user.
 withsecret=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool failed"
 emb_with=$("$CAOS_CLI" eval-path embedder) || fail "eval-path embedder failed"
-rm "$CAOS_SECRETS_DIR/deploytok"
+rm "$STORE/deploytok"
 push || fail "re-pushing without deploytok failed"
 without=$("$CAOS_CLI" eval-path mytool) || fail "eval-path mytool (no secret) failed"
 emb_without=$("$CAOS_CLI" eval-path embedder) || fail "eval-path embedder (no secret) failed"
@@ -262,10 +263,10 @@ emb_without=$("$CAOS_CLI" eval-path embedder) || fail "eval-path embedder (no se
 echo "  ok: mytool and its embedder differ with vs without the grant" >&2
 
 echo "== secrets-push fills missing entropy and refuses a weak one ==" >&2
-printf 'value=abc\nreader:@@=%s\n' "$(at DEEP-DEPS/bash)" > "$CAOS_SECRETS_DIR/needs-entropy"
+printf 'value=abc\nreader:@@=%s\n' "$(at DEEP-DEPS/bash)" > "$STORE/needs-entropy"
 push || fail "push with a missing entropy failed"
-grep -q '^entropy=' "$CAOS_SECRETS_DIR/needs-entropy" || fail "entropy was not filled in"
-printf 'value=abc\nentropy=short\n' > "$CAOS_SECRETS_DIR/weak"
+grep -q '^entropy=' "$STORE/needs-entropy" || fail "entropy was not filled in"
+printf 'value=abc\nentropy=short\n' > "$STORE/weak"
 if push 2>/dev/null; then fail "a weak entropy should fail the push"; fi
 echo "  ok: entropy autofilled; a weak one is refused" >&2
 

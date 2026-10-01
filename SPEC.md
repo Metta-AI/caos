@@ -455,7 +455,10 @@ Some tools need secrets: the github-push tool needs an auth token, and there wil
   main one (no alternates, no fetch endpoint, unreachable from a worker), with
   reflogs off and pruned after every push, so a replaced value is gone.
 - `caos-cli secrets-push` needs no caos tree: `nix run <caos>#caos-cli -- secrets-push
-  --server=…`. It never takes a value in argv.
+  --dir=<d> --server=…`. It never takes a value in argv, and names its directory
+  every time: there is no default, so the only copy is never somewhere a user
+  did not choose.
+- A checkout presents the keys in its `caos.secret-readers` git config.
 
 Each file in the directory is one secret, as a repeated-key file:
 ```
