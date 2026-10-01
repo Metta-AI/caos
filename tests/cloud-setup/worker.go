@@ -249,6 +249,11 @@ func main() {
 			"the shared asset's ${CAOS_BIN} placeholder survived into the config: %s", prompt)
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
 			"nothing runs the session hook")
+		// Claude Code's 60s default kills a resume over iroh, and a killed prompt
+		// hook lets the prompt through with no conversation and no reason.
+		promptHook := settings["hooks"].(map[string]any)["UserPromptSubmit"].([]any)[0].(map[string]any)["hooks"].([]any)[0].(map[string]any)
+		timeout, _ := promptHook["timeout"].(float64)
+		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
 		// The slash commands that start a session from a recorded conversation.
 		// The marker line is what the prompt hook keys on if it is handed the

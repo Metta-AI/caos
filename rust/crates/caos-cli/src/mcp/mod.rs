@@ -347,8 +347,13 @@ fn step_image(
 /// `UserPromptSubmit` hook blocks the turn until it returns. Each attempt is
 /// `ensure_server_reachable`'s own 5s round trip, so `HOOK_REACH_ATTEMPTS`
 /// probes plus the interstitial sleeps is the ceiling -- ~35s, which outlasts
-/// tunnel bringup and stays well under Claude Code's hook timeout. The common
-/// case returns on the first probe.
+/// tunnel bringup. The common case returns on the first probe.
+///
+/// THE HOOK'S OWN TIMEOUT IS SET, in `shared/settings.json`, because Claude
+/// Code's 60s default is not enough over iroh: this wait plus a resume's fetch,
+/// settle and push plus `record_prompt`'s pushes exceeded it in a cloud
+/// session, and a killed hook lets the prompt through with no conversation and
+/// no reason given.
 const HOOK_REACH_ATTEMPTS: u32 = 6;
 const HOOK_REACH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -605,6 +610,20 @@ fn debug_log_hook(
 /// The user's prompt, and the only event allowed to create the conversation:
 /// the first prompt of a session establishes its base and fallback title
 /// exactly as the TUI's first message does.
+/// EXIT 2, the one status with which Claude Code blocks a prompt and shows the
+/// hook's stderr. Any other failure lets the prompt through and drops the
+/// reason, and for a failed fork or resume that is a session running on with
+/// no conversation behind it: the model, following the command's text, calls a
+/// tool that answers `no conversation ... to record into`, and the actual
+/// refusal (not the head, not on this server) is never seen by anyone.
+fn refuse_prompt(error: &str) -> ! {
+    eprintln!(
+        "caos: this session is NOT attached to that conversation: {error}\n\
+         Nothing was recorded; fix the command and send it again."
+    );
+    std::process::exit(2)
+}
+
 fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
@@ -613,14 +632,20 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     // `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
     // decide WHICH conversation this session records into, so they run before it
     // is looked up. Both are no-ops once the session has its conversation.
-    let note = match resume::parse_command(prompt)? {
-        Some(command) => {
-            // Both talk to the server before anything below would have proven it
-            // reachable.
-            wait_server_reachable(t)?;
-            resume::begin(t, string_field(payload, "session_id")?, &command)?
+    let command = || -> Result<Option<String>, String> {
+        match resume::parse_command(prompt)? {
+            Some(command) => {
+                // Both talk to the server before anything below would have
+                // proven it reachable.
+                wait_server_reachable(t)?;
+                resume::begin(t, string_field(payload, "session_id")?, &command)
+            }
+            None => Ok(None),
         }
-        None => None,
+    };
+    let note = match command() {
+        Ok(note) => note,
+        Err(error) => refuse_prompt(&error),
     };
     let id = recorded_conversation(t, payload)?;
     if record_prompt(t, options, &id, prompt)? {
