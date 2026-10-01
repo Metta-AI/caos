@@ -521,7 +521,7 @@ fn wipe_dir_contents(dir: &str) {
 fn usage(args: &[String]) -> String {
     let prog = prog_name(args);
     format!(
-        "usage:\n  {prog} import-git <https-url> <commit> [--github-token-file=<path>]\n  {prog} push-git <https-url> <commit> <branch> --expected=<hash|absent> [--github-token-file=<path>]\n  {prog} resolve <hash> <relative-path> <cas-path>\n  {prog} kind <cas-path>\n  {prog} get-hash <hash> <path>\n  \
+        "usage:\n  {prog} import-git <https-url> <commit> [--github-token-file=<path>]\n  {prog} push-git <https-url> <commit> <branch> --expected=<hash|absent> [--rewrite] [--github-token-file=<path>]\n  {prog} resolve <hash> <relative-path> <cas-path>\n  {prog} kind <cas-path>\n  {prog} get-hash <hash> <path>\n  \
          {prog} get [-r | --recursive[=<depth>]] <path>\n  \
          {prog} put <src-path> <cas-path>\n  \
          {prog} put-commit <src-file> <cas-path>\n  \
