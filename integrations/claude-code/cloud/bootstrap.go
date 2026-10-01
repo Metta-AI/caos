@@ -84,6 +84,7 @@ func curlTo(url, dest string) error {
 type args struct {
 	base       string
 	server     string
+	readers    string
 	devCommit  string
 	devTree    string
 	enableBash bool
@@ -99,6 +100,10 @@ func parseArgs(argv []string) args {
 		switch key {
 		case "--base":
 			a.base = strings.TrimRight(value, "/")
+		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"), kept
+		// in the checkout's git config beside the `caos` remote `--server` adds.
+		case "--secret-readers":
+			a.readers = value
 		case "--server":
 			a.server = value
 		// A COMMIT, not a second server: the install package comes from the
@@ -778,6 +783,11 @@ func main() {
 	if err := probe.Run(); err != nil {
 		if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
 			say("could not add the caos remote; the session will have no server")
+		}
+	}
+	if a.readers != "" {
+		if _, err := run(repoDir, "git", "config", "caos.secret-readers", a.readers); err != nil {
+			say("could not record --secret-readers; the session will present no secrets")
 		}
 	}
 

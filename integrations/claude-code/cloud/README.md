@@ -142,7 +142,8 @@ scripts* — everything else is read back out of it):
 ```
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
-go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
+go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
+  --secret-readers=<key>
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, and a single stdlib-only file
@@ -175,10 +176,10 @@ writes carry the revision but never the ticket.
 
 **Secrets** — the model key, a GitHub token for private repositories — live
 in your own secret store on the server (SPEC.md, "Secrets"), pushed from your
-machine with `caos-cli secrets-push`. The environment holds one variable:
+machine with `caos-cli secrets-push`. The setup line names it:
 
-- `CAOS_SECRET_READERS` — the SecretReaderKey `caos-cli secrets-init` printed.
-  It is a credential: whoever holds it can run with your secrets.
+- `--secret-readers=<key>` — the SecretReaderKey `caos-cli secrets-init`
+  printed. It is a credential: whoever holds it can run with your secrets.
 
 A secret, or a grant, pushed later needs no change here.
 

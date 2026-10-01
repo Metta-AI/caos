@@ -117,11 +117,23 @@ fn parse_flags(args: &[String]) -> Result<(PathBuf, Option<String>), String> {
     Ok((dir, server))
 }
 
-/// The SecretReaderKeys this machine presents: `$CAOS_SECRET_READERS`
-/// (space-separated) when set, else the default directory's own.
+/// The SecretReaderKeys this process presents, space-separated in the first
+/// of: `$CAOS_SECRET_READERS`; the checkout's `caos.secret-readers` (a cloud
+/// session's setup line puts them there); the default directory's own key.
 pub fn reader_keys() -> Vec<String> {
+    let split =
+        |keys: &str| -> Vec<String> { keys.split_whitespace().map(str::to_string).collect() };
     if let Ok(keys) = std::env::var("CAOS_SECRET_READERS") {
-        return keys.split_whitespace().map(str::to_string).collect();
+        return split(&keys);
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["config", "--get", "caos.secret-readers"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if out.status.success() {
+            return split(&String::from_utf8_lossy(&out.stdout));
+        }
     }
     default_dir()
         .and_then(|dir| read_writer_key(&dir))
