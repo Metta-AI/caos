@@ -310,8 +310,7 @@ fn evaluate_locator(
 /// would be given. The body is JSON:
 ///
 /// - `bundle`: a tree the client pushed, holding `args` (the call's entries,
-///   ready), `root` when `base` is a path (the tree it is a path in), and
-///   `image` when it is a hash (so the push carries it; it is not read);
+///   ready) and, when `base` is a path, `root` (the tree it is a path in);
 /// - `base`: `{"type": "path"|"locator"|"hash"|"docker", "value": …}`;
 /// - `locators` (optional): `{name: locator}`, args evaluated here;
 /// - `salt` (optional).
