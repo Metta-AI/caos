@@ -70,7 +70,8 @@ const KNOWN_ORIGINS_CAP: usize = 1_000_000;
 
 /// The values whose subtrees are already in [`KNOWN_ORIGINS`], with the
 /// origins they were indexed under.
-static INDEXED: Mutex<Option<HashSet<(String, Vec<Origin>)>>> = Mutex::new(None);
+type Indexed = HashSet<(String, Vec<Origin>)>;
+static INDEXED: Mutex<Option<Indexed>> = Mutex::new(None);
 
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
