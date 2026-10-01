@@ -1528,6 +1528,7 @@ fn resolve_promise(
             eval_path: path,
             dispatches: std::sync::atomic::AtomicUsize::new(0),
         };
+        crate::secrets::index_root(config, secrets, &input.oid.to_string());
         let evaluated = caos_eval::eval_path(&host, &input.oid.to_string(), path)
             .map(|(kind, hash)| format!("{kind} {hash}"))
             .map_err(|e| {

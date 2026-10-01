@@ -58,11 +58,11 @@ impl Context {
     }
 }
 
-/// Every `(root, path)` a tree has been reached at, by tree oid: a `:@@=`
-/// result, and every subtree of a value a `.caos-expr` produced. Equal oids
-/// are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one — carries
-/// the origin of what it was copied from. Facts about content, so shared by
-/// every run.
+/// Every `(root, path)` a tree has been reached at, by tree oid: a start tree,
+/// a `:@@=` result, a value a `.caos-expr` produced, and every subtree of each.
+/// Equal oids are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one —
+/// carries the origin of what it was copied from. Facts about content, so
+/// shared by every run.
 static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
 
 /// Bounds [`KNOWN_ORIGINS`]; forgetting only means a later grant misses.
@@ -137,6 +137,20 @@ pub(crate) fn record_origin(oid: &str, origin: Origin) {
     let origins = map.entry(oid.to_string()).or_default();
     if !origins.contains(&origin) {
         origins.push(origin);
+    }
+}
+
+/// A walk's start tree, which is its own origin: every subtree is at its path.
+pub(crate) fn index_root(config: &Config, context: &Context, tree: &str) {
+    if context.is_empty() {
+        return;
+    }
+    let origin = Origin {
+        root: tree.to_string(),
+        path: String::new(),
+    };
+    if let Err(e) = index_subtrees(config, tree, &[origin]) {
+        eprintln!("secrets: cannot index {tree}: {e}");
     }
 }
 

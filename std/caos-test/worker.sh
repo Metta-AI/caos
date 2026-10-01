@@ -114,79 +114,37 @@ if [ -e /cas/args/max-parallel ]; then
   args+=("--max-parallel=$(cat /cas/args/max-parallel)")
 fi
 
-# A SECRET STORE DOES NOT CROSS A STACK. It is built by the client from its own
-# `.caos-secrets` and shipped in a header, and the server grants a secret to any
-# job whose ArgTree is a superset of a declared reader's — all within ONE call
-# stack. tests/chat-online's real-API turn runs two stacks down, on the dev
-# stack, so the value has to be re-registered there.
-#
-# That is what this does, and it is the one place in the tree where a secret is
-# written to disk: it arrives here at /secret/anthropic-api-key because the
-# caller's store names `std/caos-test` as a reader, and it is written back as
-# a store for the dev stack naming `tests/chat-online` as its reader. The value
-# never enters an ArgTree or the CAS.
-#
-# AFTER `stack-up`, deliberately. stack-up git-inits this source tree with
-# `add -Af` — the tree is the truth — so a `.caos-secrets` written before it
-# would be COMMITTED and then ingested by `--in:@=.`. Written afterwards it is
-# untracked, and `:@=` ingests only tracked paths.
-#
-# Absent, nothing is written and chat-online self-skips, which is what happens
-# whenever the caller has no key or has not granted this tool.
-if [ -e /secret/anthropic-api-key ]; then
-  mkdir -p .caos-secrets
-  {
-    printf 'name=anthropic-api-key\n'
-    printf 'value=%s\n' "$(cat /secret/anthropic-api-key)"
-    printf 'entropy=0123456789abcdef0123456789abcdef\n'
-    printf 'reader=tests/chat-online\n'
-  } > .caos-secrets/anthropic-api-key
-  chmod 600 .caos-secrets/anthropic-api-key
-  echo "==> granting tests/chat-online the anthropic key on the dev stack" >&2
-fi
+# THE TREE THE SUITE RUNS IS A COMMIT THE DEV STACK HOLDS, so a secret can be
+# granted to a path in it by locator (SPEC, "Secrets"). Committed at a fixed
+# date, like stack-up's, so an unchanged tree is an unchanged commit.
+GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
+  git -c user.name=caos -c user.email=dev@caos commit -q --allow-empty -m "tested client" \
+  || fail "committing the tested client"
+git push -q http://127.0.0.1 HEAD:refs/heads/caos-test-workspace \
+  || fail "pushing the workspace commit to the dev stack"
 
-# A MOCK KEY FOR std/llm-call, unconditionally — and it is not a secret: the
-# value is a constant, and the only thing that ever sees it is a stub HTTP
-# server the test starts in its own container.
+# A MOCK KEY FOR std/llm-call, std/llm-step and dev/worker-test — not a secret:
+# the value is a constant, and the only thing that ever sees it is a stub HTTP
+# server a test starts in its own container. Granted here, the suite's own run
+# carries it, so a worker test forms an llm-call request directly and the key
+# arrives at /secret. Tests reach these through DEEP-DEPS copies, which carry
+# the origin of the node they copy.
 #
-# WHY IT IS INJECTED HERE. A secret store is built by a CLIENT from its own
-# `.caos-secrets`, so a test that needs one used to have to BE a client — which
-# is the only reason tests/llm-call staged a repo and drove caos-cli, to test a
-# worker. Written here instead, the suite's own run carries it, and the server
-# grants it to any job whose ArgTree is a superset of the reader's. So the test
-# forms an llm-call request directly and the key arrives at /secret.
-#
-# A SECOND FILE, not a second `reader=` line on the one above. Both grants use
-# the name `anthropic-api-key` (llm-call reads exactly that path) but must carry
-# DIFFERENT VALUES: adding `reader=std/llm-call` to chat-online's file would POST
-# the caller's real key to a stub, which then writes it to a request-N.json the
-# test greps. The store is a list, matched per-reader and deduped by name, so two
-# entries sharing a name are fine as long as no job matches both — and none can:
-# a tests/chat-online job does not run the llm-call image.
-#
-# The entropy differs from chat-online's for the same reason it exists at all:
-# it is the cache-isolation tag, and two values under one name must not share a
-# cache key.
-mkdir -p .caos-secrets
+# dev/worker-test is granted so a test's own ArgTree carries the key's
+# `secret-hash`: llm-step's admission protocol names the exact request hash in
+# advance, and a worker can only form that request if it can bind the entry.
+export CAOS_SECRETS_DIR=/tmp/caos-test-secrets
+"$CLI" secrets-init >/dev/null || fail "creating the test store"
+at="git+http://caos.invalid/caos-test?rev=$(git rev-parse HEAD)&dir"
 {
   printf 'name=anthropic-api-key\n'
   printf 'value=mock-key-for-the-llm-call-stub\n'
   printf 'entropy=fedcba9876543210fedcba9876543210\n'
-  printf 'reader=std/llm-call\n'
-  printf 'reader=std/llm-step\n'
-  # AND THE TEST IMAGE ITSELF, which is what lets a worker test form a request
-  # that can be granted anything. `caos prepare-request` in a worker folds NO
-  # `secret-hash` (it has no store), and the server fail-closes without it — so
-  # a request a test forms is refused, and one the server folds the entry into
-  # has a hash the test cannot predict. Since all three readers here share one
-  # name and one entropy, they imply the SAME digest: a test running in
-  # dev/worker-test carries that entry in its own ArgTree and can bind it onto
-  # the request it forms, which then matches what llm-step is dispatched as.
-  # That is why llm-step's admission protocol — which requires naming the exact
-  # request hash in advance — works from a worker at all.
-  printf 'reader=dev/worker-test\n'
-} > .caos-secrets/llm-mock
-chmod 600 .caos-secrets/llm-mock
+  printf 'reader:@@=%s=std/llm-call\n' "$at"
+  printf 'reader:@@=%s=std/llm-step\n' "$at"
+  printf 'reader:@@=%s=dev/worker-test\n' "$at"
+} > "$CAOS_SECRETS_DIR/llm-mock"
+"$CLI" secrets-push --server=http://127.0.0.1 >/dev/null || fail "pushing the test store"
 echo "==> granting llm-call, llm-step and dev/worker-test a mock key" >&2
 
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected
