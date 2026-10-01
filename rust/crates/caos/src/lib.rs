@@ -4322,12 +4322,45 @@ fn curry_object(
 }
 
 /// Bind host-side scalar/commit arguments to an existing ArgTree.
+///
+/// LAYERED, not flattened: the new node's base is `arg_tree` itself. A base
+/// the server evaluated is on the server and only partly here, so a flattened
+/// node — which copies its bound args — could not be pushed. Unwrapping peels
+/// layers, so the request formed from either is the same.
 pub fn curry_client_object(
     t: &dyn Transport,
     arg_tree: &str,
     kvs: &[String],
 ) -> Result<gix::ObjectId, String> {
-    curry_object(t, arg_tree, None, &[], kvs)
+    let new = build_arg_entries(t, None, kvs)?;
+    let (_, bound) = unwrap_curry(t, arg_tree)?;
+    if let Some(e) = new
+        .iter()
+        .find(|e| bound.iter().any(|b| b.filename == e.filename))
+    {
+        return Err(format!(
+            "curry: arg {:?} is already bound in {arg_tree}; rename one of them",
+            String::from_utf8_lossy(&e.filename)
+        ));
+    }
+    let entries = vec![
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: b"base".to_vec().into(),
+            oid: post_object(t, "blob", arg_tree.as_bytes())?,
+        },
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Tree.into(),
+            filename: b"args".to_vec().into(),
+            oid: post_tree(t, new)?,
+        },
+        gix::objs::tree::Entry {
+            mode: gix::objs::tree::EntryKind::Blob.into(),
+            filename: CURRY_MARKER.as_bytes().to_vec().into(),
+            oid: post_object(t, "blob", b"1")?,
+        },
+    ];
+    post_tree(t, entries)
 }
 
 /// The body of [`curry_object`] once the new args are resolved into `new`
