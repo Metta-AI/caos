@@ -25,7 +25,7 @@ go run integrations/claude-code/drive/authorize.go
 ```
 
 Approve in the browser, paste back the code, and put what it prints in
-`.caos-secrets/claude-oauth-token` as `value=`, keeping `reader=` and
+`claude-oauth-token` in your secret store as `value=`, keeping its readers and
 `entropy=`. **30 days is the server's ceiling on the scopes this needs**, so it
 is a monthly chore; `authorize.go` explains why the shorter and longer-lived
 alternatives do not work.

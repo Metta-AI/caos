@@ -42,6 +42,8 @@ pub fn mismatch(server: &str, client: &str) -> String {
     )
 }
 
+pub mod secrets;
+
 /// The reserved ArgTree entry carrying a run's secret-cache-isolation tag
 /// (design/secrets.md). Present only when the run is granted ≥1 secret.
 pub const SECRET_HASH_ARG: &str = "secret-hash";

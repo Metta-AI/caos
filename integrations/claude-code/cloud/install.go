@@ -229,7 +229,7 @@ func marshal(value any) []byte {
 // A caos-client repo MOUNTS caos' std into its evaluated tree, so the step is an
 // ordinary path and the client resolves it by descent -- the same walk that
 // reaches `DEEP-DEPS/<x>` inside caos itself. This is also what makes
-// `reader=<std>/llm-step` resolvable in a committed `.caos-secrets` entry.
+// a `reader:@@=` grant on caos's `std/llm-step` match it (SPEC.md, "Secrets").
 //
 // The locator form pins the step to another repo's tree by full sha, for a
 // checkout with no std of its own.

@@ -59,13 +59,7 @@ pub(super) fn prepare(args: &mut Args) -> Result<PathBuf, String> {
     let data = data_dir()?;
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let data = data.canonicalize().map_err(|e| e.to_string())?;
-    // Reuse the launching checkout's existing store without copying credentials.
-    let secrets = checkout
-        .as_ref()
-        .map(|repo| repo.join(caos::SECRETS_DIR))
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(|| data.join("secrets"));
-    let client = create_client(&source, &data, &server, &secrets, checkout.as_deref())?;
+    let client = create_client(&source, &data, &server, checkout.as_deref())?;
     if let Some(file) = &mut args.turn.system_file {
         *file = cwd.join(&*file).to_string_lossy().into_owned();
     }
@@ -248,15 +242,13 @@ fn create_client(
     source: &Path,
     data: &Path,
     server: &str,
-    secrets: &Path,
     checkout: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
     let harness = create_harness(source, data)?;
     let clients = data.join("clients");
     fs::create_dir_all(&clients).map_err(|e| e.to_string())?;
     // Structured policy avoids ambiguous keys when paths contain newlines.
-    let policy = hash_key(data, &serde_json::json!([server, secrets, checkout]))?;
+    let policy = hash_key(data, &serde_json::json!([server, checkout]))?;
     let artifact = harness
         .file_name()
         .ok_or("harness has no name")?
@@ -303,15 +295,6 @@ fn create_client(
             &["config", "caos.checkout", &checkout.to_string_lossy()],
         )?;
     }
-    fs::write(staging.0.join(".git/info/exclude"), "/.caos-secrets\n")
-        .map_err(|e| e.to_string())?;
-    if !secrets.exists() {
-        fs::create_dir_all(secrets).map_err(|e| e.to_string())?;
-        fs::set_permissions(secrets, fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-    }
-    std::os::unix::fs::symlink(secrets, staging.0.join(caos::SECRETS_DIR))
-        .map_err(|e| e.to_string())?;
     match fs::rename(&staging.0, &destination) {
         Ok(()) => Ok(destination),
         Err(_) if destination.exists() => Ok(destination),
@@ -545,20 +528,17 @@ mod tests {
         fs::create_dir_all(source.join(".caos-secrets")).unwrap();
         fs::write(source.join(".caos-secrets/never-copy"), "fixture only").unwrap();
         let data = root.join("data");
-        let secrets = data.join("secrets");
-        let first = create_client(&source, &data, "http://localhost:9090", &secrets, None).unwrap();
+        let first = create_client(&source, &data, "http://localhost:9090", None).unwrap();
         assert_eq!(
-            create_client(&source, &data, "http://localhost:9090", &secrets, None).unwrap(),
+            create_client(&source, &data, "http://localhost:9090", None).unwrap(),
             first
         );
         assert!(!git(&first, &["ls-files"])
             .unwrap()
             .contains(".caos-secrets"));
-        assert!(!secrets.join("never-copy").exists());
-        assert!(first.join(caos::SECRETS_DIR).is_dir());
+        assert!(!first.join(".caos-secrets").exists());
         assert_eq!(git(&first, &["status", "--porcelain"]).unwrap(), "");
-        let second =
-            create_client(&source, &data, "http://localhost:9091", &secrets, None).unwrap();
+        let second = create_client(&source, &data, "http://localhost:9091", None).unwrap();
         assert_ne!(first, second);
         assert_eq!(fs::read_dir(data.join("harnesses")).unwrap().count(), 1);
         assert!(!fs::read_dir(data.join("harnesses"))
@@ -567,10 +547,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .path()
-            .join(caos::SECRETS_DIR)
+            .join(".caos-secrets")
             .exists());
         fs::write(source.join("DEPS"), "changed\n").unwrap();
-        let third = create_client(&source, &data, "http://localhost:9090", &secrets, None).unwrap();
+        let third = create_client(&source, &data, "http://localhost:9090", None).unwrap();
         assert_ne!(first, third);
         assert_eq!(
             fs::read_to_string(first.join("DEPS")).unwrap(),

@@ -50,12 +50,14 @@
 
 mod compute;
 mod git;
+mod grant_history;
 mod import;
 mod locator;
 mod push;
 mod remote_git;
 mod repair;
 mod runner;
+mod secret_store;
 mod secrets;
 mod status;
 mod storage;
@@ -119,6 +121,8 @@ struct Config {
     /// Filesystem path to the git object database, passed to `git http-backend`
     /// as `GIT_PROJECT_ROOT` for the smart-HTTP transport (see [`mod git`]).
     git_dir: String,
+    /// `secrets.git`, which nothing else in this server links to.
+    secrets_git: String,
     /// The git object database, served directly (storage is now in-process).
     /// Thread-safe: each request thread takes a local handle via `to_thread_local`.
     repo: gix::ThreadSafeRepository,
@@ -323,6 +327,12 @@ fn main() {
         std::process::exit(1);
     });
 
+    let secrets_git = env_or("CAOS_SECRETS_GIT_DIR", &secret_store::default_dir(&git_dir));
+    secret_store::init(&secrets_git).unwrap_or_else(|error| {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    });
+
     // Shared read-only across handler threads (one per request, see below).
     let config = Arc::new(Config {
         registry_push_url: env_or("CAOS_REGISTRY_PUSH_URL", DEFAULT_REGISTRY_PUSH_URL),
@@ -330,6 +340,7 @@ fn main() {
         redis_addr: env_or("CAOS_REDIS_ADDR", DEFAULT_REDIS_ADDR),
         cache_namespace: env_or("CAOS_CACHE_NAMESPACE", ""),
         git_dir,
+        secrets_git,
         repo,
     });
 
@@ -679,6 +690,39 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     }
 }
 
+/// The secrets a request's SecretReaderKeys hold, for its conversation.
+/// Headers, never the ArgTree: a key is a credential.
+fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context, HttpError> {
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    secrets::Context::admit(
+        config,
+        &header(caos_world::secrets::READERS_HEADER).unwrap_or_default(),
+        header(caos_world::secrets::CONVERSATION_HEADER).as_deref(),
+    )
+}
+
+/// A private repository's token for a `:@@=` fetch — the header
+/// `POST /git/import` takes, for the same reason: it is the caller's, scoped
+/// to one URL, and never looked up from the calling job's secrets.
+fn git_token(request: &Request) -> Result<Option<String>, HttpError> {
+    let tokens: Vec<_> = request
+        .headers()
+        .iter()
+        .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
+        .map(|h| h.value.as_str().to_owned())
+        .collect();
+    if tokens.len() > 1 {
+        return Err(HttpError::new(400, "duplicate Git token header"));
+    }
+    Ok(tokens.into_iter().next())
+}
+
 /// Match the request to a handler and produce the response body. Serves the
 /// storage endpoints (`/object*`), compute (`/run`, `/sub-run`), and the runner
 /// protocol (`/runner/poll`, `/runner/result`).
@@ -691,48 +735,24 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
 
     match request.method() {
         Method::Get if path == "/run" => {
-            // The carried secrets store rides in a header (design/secrets.md),
-            // out of band from the content-addressed ArgTree.
-            let secrets_header = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv(secrets::HEADER))
-                .map(|h| h.value.as_str().to_string())
-                .unwrap_or_default();
-            compute::run(config, &query, &secrets_header)
+            let secrets = secret_context(config, request)?;
+            compute::run(config, &query, &secrets)
         }
         Method::Get if path.starts_with("/status/") => {
             status::serve(config, path.trim_start_matches("/status/"), &query)
         }
         Method::Get if path == "/resolve-image" => compute::resolve_image_endpoint(config, &query),
         Method::Get if path == "/eval" => {
-            // Secrets ride the same out-of-band header as `/run`, since an eval
-            // may mark a `curry` with the caller's identity (design/secrets.md).
-            let secrets_header = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv(secrets::HEADER))
-                .map(|h| h.value.as_str().to_string())
-                .unwrap_or_default();
-            // The same sensitive header `POST /git/import` takes, for the same
-            // reason: a private repository's token is the caller's, scoped to
-            // one URL, and never looked up from the calling job's secrets. Only
-            // a `root:@@=` root can use it; the others need no credential.
-            let tokens: Vec<_> = request
-                .headers()
-                .iter()
-                .filter(|h| h.field.equiv(git_locator::import::TOKEN_HEADER))
-                .map(|h| h.value.as_str().to_owned())
-                .collect();
-            if tokens.len() > 1 {
-                return Err(HttpError::new(400, "duplicate Git token header"));
-            }
-            compute::eval_endpoint(
-                config,
-                &query,
-                &secrets_header,
-                tokens.first().map(String::as_str),
-            )
+            let secrets = secret_context(config, request)?;
+            let token = git_token(request)?;
+            compute::eval_endpoint(config, &query, &secrets, token.as_deref())
+        }
+        Method::Post if path == "/submit" => {
+            let secrets = secret_context(config, request)?;
+            let token = git_token(request)?;
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body)?;
+            compute::submit(config, &body, &secrets, token.as_deref())
         }
         Method::Get => match path.strip_prefix("/object/") {
             Some(hash) if !hash.is_empty() => storage::get_object(config, hash),
@@ -749,6 +769,7 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
         }
         Method::Post if path == "/git/import" => import::endpoint(config, request),
         Method::Post if path == "/git/push" => push::endpoint(config, request),
+        Method::Post if path == "/secrets/push" => secret_store::push_endpoint(config, request),
         Method::Post if path == "/sub-run" => {
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;

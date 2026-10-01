@@ -286,12 +286,14 @@ func main() {
 		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
+		readers := strings.Repeat("ab", 32)
 		devTree := fixtureDevTree("/tmp/dev-tree", assets)
 		head := git(repo, "rev-parse", "HEAD")
 		bootstrap := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base,
 			"--server="+ticket,
 			"--dev-commit="+devRev,
+			"--secret-readers="+readers,
 			"--dev-tree="+devTree,
 			"--prefix=/tmp/prefix1",
 			"--share-dir=/tmp/share",
@@ -304,6 +306,8 @@ func main() {
 		w.True(git(repo, "status", "--porcelain") == "",
 			"stage 1 left the checkout dirty, which Claude Code's stop hook reports:\n%s",
 			git(repo, "status", "--porcelain"))
+		w.True(git(repo, "config", "--get", "caos.secret-readers") == readers,
+			"--secret-readers is not in the checkout's git config, where the client reads it")
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])

@@ -297,11 +297,12 @@ commit). Hand-rolled retry on 429/5xx honoring `retry-after`. Top-level
 `cache_control: {"type": "ephemeral"}` on every request — each step replays
 an identical prefix, so steps after the first read the prompt cache.
 
-Secrets: the client reads its git-ignored `.caos-secrets` store when preparing
-and dispatching a turn. `llm-step` reads `anthropic-api-key` from
-`/secret/anthropic-api-key`; the value never enters its args or CAS. Reader
-expressions and `secret-hash` give the request its per-secret cache identity,
-and the server carries the store to entitled tool sub-runs.
+Secrets: a turn's requests present the user's SecretReaderKeys and the
+conversation (SPEC.md, "Secrets"). `llm-step` reads `anthropic-api-key` from
+`/secret/anthropic-api-key`; the value never enters its args or CAS. The server
+grants it where evaluation reaches a granted image, marks that image with
+`secret-hash` for its per-secret cache identity, and injects it into tool
+sub-runs built from granted images.
 
 ## Progress
 
