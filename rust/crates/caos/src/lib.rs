@@ -256,8 +256,8 @@ pub struct Secrets {
 
 static SECRET_READERS: OnceLock<Vec<String>> = OnceLock::new();
 
-/// The SecretReaderKeys this process presents. A host binary sets them once,
-/// early; `CAOS_SECRET_READERS` (space-separated) is read when it did not.
+/// The SecretReaderKeys this process presents, set once and early by a host
+/// binary. None when it did not: a worker's secrets come from the job it is.
 pub fn set_secret_readers(keys: Vec<String>) {
     let _ = SECRET_READERS.set(keys);
 }
@@ -265,16 +265,8 @@ pub fn set_secret_readers(keys: Vec<String>) {
 impl Secrets {
     /// This process's SecretReaderKeys, for no particular conversation.
     pub fn current() -> Secrets {
-        let readers = match SECRET_READERS.get() {
-            Some(keys) => keys.clone(),
-            None => std::env::var("CAOS_SECRET_READERS")
-                .unwrap_or_default()
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
-        };
         Secrets {
-            readers,
+            readers: SECRET_READERS.get().cloned().unwrap_or_default(),
             conversation: None,
         }
     }
