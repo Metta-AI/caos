@@ -203,7 +203,7 @@ pub(crate) fn evaluated(
     if granted.is_empty() {
         return Ok(value);
     }
-    let names: Vec<String> = granted.iter().map(|s| s.name.clone()).collect();
+    let mut names: Vec<String> = granted.iter().map(|s| s.name.clone()).collect();
     if value.0 != "tree" {
         eprintln!(
             "secrets: {names:?} match a node that evaluates to a {}, which cannot carry a grant",
@@ -211,8 +211,22 @@ pub(crate) fn evaluated(
         );
         return Ok(value);
     }
-    let pairs: Vec<(&str, &str)> = granted
+    // A value built on a granted image already carries that image's mark —
+    // one `secret-hash` per ArgTree, so it is replaced by the union.
+    let mut image = value.1.clone();
+    let existing =
+        crate::compute::image_entries(config, &image).map_err(|e| e.message().to_string())?;
+    if existing.contains_key(caos_world::SECRET_HASH_ARG) {
+        names.extend(recorded_names(context, &existing));
+        names.sort();
+        names.dedup();
+        image = crate::compute::unbind(config, &image, caos_world::SECRET_HASH_ARG)
+            .map_err(|e| e.message().to_string())?;
+    }
+    let pairs: Vec<(&str, &str)> = context
+        .stored
         .iter()
+        .filter(|s| names.contains(&s.name))
         .map(|s| (s.name.as_str(), s.entropy.as_str()))
         .collect();
     let digest = blob_oid(&caos_world::secret_hash_material(&pairs));
@@ -221,7 +235,7 @@ pub(crate) fn evaluated(
         filename: caos_world::SECRET_HASH_ARG.into(),
         oid: host.post_object("blob", digest.as_bytes())?,
     };
-    let marked = caos_eval::curry(host, &value.1, vec![entry])?.to_string();
+    let marked = caos_eval::curry(host, &image, vec![entry])?.to_string();
     let entries =
         crate::compute::image_entries(config, &marked).map_err(|e| e.message().to_string())?;
     let mut guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -256,6 +270,19 @@ pub(crate) fn grant(
 }
 
 /// The names [`grant`] would inject, sorted.
+/// The names recorded for exactly the image whose entries are `entries`.
+fn recorded_names(context: &Context, entries: &BTreeMap<String, String>) -> Vec<String> {
+    let guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|r| r.get(&context.scope))
+        .into_iter()
+        .flatten()
+        .filter(|(recorded, _)| recorded == entries)
+        .flat_map(|(_, names)| names.iter().cloned())
+        .collect()
+}
+
 pub(crate) fn granted_names(
     context: &Context,
     arg_entries: &BTreeMap<String, String>,

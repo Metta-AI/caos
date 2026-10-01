@@ -310,7 +310,8 @@ fn evaluate_locator(
 /// would be given. The body is JSON:
 ///
 /// - `bundle`: a tree the client pushed, holding `args` (the call's entries,
-///   ready) and, when `base` is a path, `root` (the tree it is a path in);
+///   ready), `root` when `base` is a path (the tree it is a path in), and
+///   `image` when it is a hash (so the push carries it; it is not read);
 /// - `base`: `{"type": "path"|"locator"|"hash"|"docker", "value": …}`;
 /// - `locators` (optional): `{name: locator}`, args evaluated here;
 /// - `salt` (optional).
@@ -1819,6 +1820,35 @@ fn form_arg_tree(
     }
     // The ArgTree IS the request — its hash is the cache key, nothing wraps it.
     Ok(store_git_tree(config, args).map_err(store_err)?.to_string())
+}
+
+/// `image_ref` as one curry node with the arg `name` released.
+pub(crate) fn unbind(config: &Config, image_ref: &str, name: &str) -> Result<String, HttpError> {
+    use gix::objs::tree::EntryKind;
+    let store_err = |e: String| HttpError::new(500, format!("unbinding {name}: {e}"));
+    let (image, bound) = unwrap_curry(config, image_ref)?;
+    let args: Vec<_> = bound
+        .into_iter()
+        .filter(|e| e.filename != name.as_bytes())
+        .collect();
+    let node = vec![
+        named_entry(
+            "base",
+            EntryKind::Blob.into(),
+            store_git_blob(config, image.as_bytes()).map_err(store_err)?,
+        ),
+        named_entry(
+            "args",
+            EntryKind::Tree.into(),
+            store_git_tree(config, args).map_err(store_err)?,
+        ),
+        named_entry(
+            CURRY_MARKER,
+            EntryKind::Blob.into(),
+            store_git_blob(config, b"1").map_err(store_err)?,
+        ),
+    ];
+    Ok(store_git_tree(config, node).map_err(store_err)?.to_string())
 }
 
 /// The entries `run_image` puts in every ArgTree formed from `image_ref`,

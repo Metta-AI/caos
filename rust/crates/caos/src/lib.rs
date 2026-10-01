@@ -3376,7 +3376,17 @@ fn submit_request(
     let base_json = match base {
         Base::Ref(image) => match image.strip_prefix(DOCKER_SCHEME) {
             Some(docker) => serde_json::json!({"type": "docker", "value": docker}),
-            None => serde_json::json!({"type": "hash", "value": image}),
+            None => {
+                // In the bundle so the push carries it: a base curried here
+                // exists nowhere else.
+                let (kind, _) = t.get_object(image)?;
+                bundle.push(Entry {
+                    mode: eval::mode_of_kind(&kind),
+                    filename: "image".into(),
+                    oid: parse_oid(image)?,
+                });
+                serde_json::json!({"type": "hash", "value": image})
+            }
         },
         Base::Path { root, path } => {
             bundle.push(Entry {
