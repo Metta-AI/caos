@@ -120,7 +120,7 @@ fi
 GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
   git -c user.name=caos -c user.email=dev@caos commit -q --allow-empty -m "tested client" \
   || fail "committing the tested client"
-git push -q http://127.0.0.1 HEAD:refs/heads/caos-test-workspace \
+git push -q http://127.0.0.1 "HEAD:refs/heads/caos-test/$(git rev-parse HEAD)" \
   || fail "pushing the workspace commit to the dev stack"
 
 # A MOCK KEY FOR std/llm-call, std/llm-step and dev/worker-test — not a secret:
