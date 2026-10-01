@@ -628,8 +628,8 @@ func main() {
 		fatal("no checkout with a flake.lock was found under /home/user.\n" +
 			"  A caos session starts from a CLIENT repo: flake.nix + flake.lock\n" +
 			"  pinning a 'caos' input by revision, a root .caos-expr mounting that\n" +
-			"  input's std, the AGENTS.md the agent is given, and .caos-secrets\n" +
-			"  declaring what it may use. Point this environment at one, or fork\n" +
+			"  input's std, and the AGENTS.md the agent is given.\n" +
+			"  Point this environment at one, or fork\n" +
 			"  Metta-AI/caos-session.")
 	}
 	p, err := readLock(filepath.Join(repoDir, "flake.lock"), "caos")
