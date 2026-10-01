@@ -429,6 +429,17 @@ granted too, so a client repo mounting caos' std needs nothing more. Then:
 caos-cli secrets-push --server=http://localhost:9090
 ```
 
+Neither needs caos installed, or a caos tree to run in. With nix:
+
+```bash
+nix run github:Metta-AI/caos#caos-cli -- secrets-init
+nix run github:Metta-AI/caos#caos-cli -- \
+  secrets-push --server=caos://<ticket>
+```
+
+`--server` takes a ticket as well as a URL, and `--dir=<d>` names a directory
+other than the default.
+
 `secrets-push` adds a random `entropy=` to any secret without one (it is the
 secret's cache-isolation identity; rotate it with the value when a result
 depends on which account the value belongs to). `value:@=<file>` reads the
