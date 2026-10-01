@@ -429,9 +429,8 @@ on any of it, and each is written down because the reason is easy to lose.
 
 # Secrets
 
-**Status:** designed, not built. The code implements the previous design: a
-`.caos-secrets` directory in the client tree, readers resolved by the client,
-the whole store sent with every request in `X-Caos-Secrets`.
+**Status:** built. The tui (rust/crates/caos-cli/TUI.md) predates it and is
+probably broken.
 
 ## Problem
 

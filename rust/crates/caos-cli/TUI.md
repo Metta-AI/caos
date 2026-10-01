@@ -77,24 +77,22 @@ The TUI checks the configured server before entering the alternate screen. If
 it cannot connect within five seconds, it exits with the server URL and asks
 you to check the running service and the `caos` git remote.
 
-The Anthropic API key is checked next, still at the shell prompt. When the
-git-ignored `.caos-secrets` store has no `anthropic-api-key` secret, the TUI
-asks for one — paste the key, or enter the path to a file that holds it — and
-writes the canonical secret entry, trimmed, with fresh cache-isolation entropy
-already included (what `caos secrets` would add). Its `reader=` lines are the
-paths `--llm-step`/`--llm-call` named, so the grant matches the run; an arg
-with no reader spelling (`:@@=`, `:docker=`) is reported instead of silently
-left ungranted. It ensures git ignores
-`.caos-secrets/` (adding the rule to `.git/info/exclude` when nothing else
-covers it), re-loads the store through the normal loader, and continues
-straight into the UI — no relaunch. A pasted key is erased from the screen the
-moment it is submitted. A store that exists but fails to load is reported as
-the error it is rather than prompting, so an existing broken configuration is
-never overwritten.
+**The TUI is probably broken at the moment.** It predates the server-held
+secret store (SPEC.md, "Secrets") and has not been brought up since. What
+changed under it:
 
-Before submitting a chat turn, the client checks that the selected worker
-will receive the key. Missing or mismatched readers produce a local error
-naming the required `reader=` setting. Correct the entry and resend the message.
+- The first-run key prompt is gone. It wrote a `.caos-secrets` entry, and that
+  store no longer exists; the TUI now only checks that a SecretReaderKey is
+  present and otherwise exits naming `caos-cli secrets-init` and
+  `secrets-push`. The model key is set up as the README describes.
+- Run in caos itself, `--llm-step:@=std/llm-step` evaluates the working tree,
+  which no `reader:@@=` grant covers once it differs from a commit in the
+  grant's range. A grant on a branch you commit to covers committed work;
+  uncommitted work needs `reader:@=std/llm-step conversation=<id>`.
+
+Before submitting a chat turn, the client asks the server which secrets the
+request would be given, and refuses to send a turn whose `llm-step` would not
+receive the model key, naming the reader to add.
 
 Below, `$W` stands for the two required image args
 (`--llm-step:@=std/llm-step --llm-call:@=std/llm-call`). The last two run no

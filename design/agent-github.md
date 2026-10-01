@@ -39,16 +39,15 @@ A completion marker for the same URL and H skips fetch and verification.
 The endpoint handles object availability; callers handle ref resolution and
 conversation state.
 
-Supply the token through the existing secret store:
+Supply the token through your secret store (SPEC.md, "Secrets"):
 
 ```text
-# .caos-secrets/github-token
-name=github-token
-value:@=.github-token-value
-reader=std/llm-step
+# ~/.config/caos/secrets/github-token
+value:@=values/github-token
+reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
 ```
 
-Keep the value file ignored and run `caos secrets` to initialize its entropy.
+`caos-cli secrets-push` adds its entropy and sends it to the server.
 The agent uses `/secret/github-token` for GitHub ref lookup and passes
 `--github-token-file=/secret/github-token` to `import-git`. The command
 forwards it in the sensitive `X-Caos-Git-Token` header; the server does not look
