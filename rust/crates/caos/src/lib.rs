@@ -18,6 +18,7 @@
 //! per-path, thread-safe mapping from CAS paths back to hashes, and what lets
 //! `get` expand a placeholder later.
 
+pub mod git_objects;
 pub mod gitlinks;
 pub mod import_git;
 pub mod push_git;

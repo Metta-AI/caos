@@ -1,0 +1,11 @@
+HELP=<<END
+Create a Git commit from stored objects and explicit metadata.
+Returns the new commit ID. Does not update conversation files or gitlinks.
+Signatures use Name <email> <unix-seconds> <+/-HHMM>.
+@param tree Tree ID
+@param parents Space-separated parent commit IDs; empty for a root commit
+@param author Author signature including timestamp and timezone
+@param committer Committer signature including timestamp and timezone
+@param message Literal commit message
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
