@@ -246,6 +246,12 @@ fi
 admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
 admission=$($TOOL request --repo "$PWD" --head "$admitted")
 request=$(jq -r .id <<<"$admission")
+# The server formed this ArgTree, so it is read from there: the one tree
+# object, not the image closure a fetch would bring with it.
+curl -fsS "$CAOS_SERVER_URL/object/$request" \
+  | { IFS= read -r -d '' _header; cat; } \
+  | git hash-object -w -t tree --stdin >/dev/null \
+  || fail "reading the request's ArgTree from the server"
 request_args=$(git ls-tree --name-only "$request")
 grep -qx 'secret-hash' <<<"$request_args" \
   || fail "conversation request is not isolated by its model secret"
