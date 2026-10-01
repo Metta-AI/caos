@@ -75,10 +75,15 @@ not claimed here; what changed is that it is no longer on this path at all.
 
 The client repo is also the **version knob**. Stage 1 reads its `flake.lock`
 before installing anything, so the client binary, the tools and the tree the
-session evaluates all come from the commit the repo pins. It is read once per
-session rather than twice: the setup phase runs every session, so a repo that has
-re-pinned is picked up there, and a second reader in the hook could only ever be
-the stale one of the two.
+session evaluates all come from the commit the repo pins. **But a re-pin does not
+re-run setup.** An environment caches its setup and re-runs it only when the
+setup text changes, while it fetches the repo before every session — so moving
+the pin moves the checkout and leaves the install behind. The session hook reads
+the lock again and compares it with the `pin=` setup stamped; on a mismatch it
+prints `STALE INSTALL` naming both and blocks every call the way a stale dev
+install is blocked (below). Change the setup line (its first-line date will do)
+and start a new session. The hook cannot install the new pin itself: Claude Code
+has already started on the old files by the time it runs.
 
 With caos reachable at a path in the checkout (`caos-std/`, from the repo's
 root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
