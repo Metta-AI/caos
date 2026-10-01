@@ -8,6 +8,11 @@
 //! is a superset of a recorded image. The record is what proves the image came
 //! from this server's evaluation: `secret-hash` alone is visible to anyone who
 //! has seen a granted run.
+//!
+//! Origins and records are kept in redis as well as here, so a restart forgets
+//! neither and a cached walk needs nothing replayed. Both are facts — about
+//! content, and about a scope that names every input to the grant — so no
+//! build's answer differs and they are not namespaced.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -15,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use caos_eval::{EvalHost, Origin};
 use caos_world::secrets::Reader;
 
+use crate::compute::{fact_get, fact_set, list_append_many, list_read};
 use crate::secret_store::Stored;
 use crate::{Config, HttpError};
 
@@ -22,10 +28,17 @@ use crate::{Config, HttpError};
 #[derive(Clone, Default)]
 pub(crate) struct Context {
     stored: Arc<Vec<Stored>>,
-    /// The resolved trees and the conversation: what every record is keyed by,
-    /// so a push or another conversation sees none of this run's grants.
+    /// Each `reader:@@=` locator as matched: a `ref=` resolved to the commit
+    /// it named at admission, so one run sees one answer. `None` when it could
+    /// not be resolved, which grants nothing.
+    pins: Arc<HashMap<String, Option<String>>>,
+    /// Every input a grant depends on — the stores' trees, the conversation,
+    /// the pinned commits — so a push, a moved branch or another conversation
+    /// sees none of this run's records.
     scope: String,
     conversation: Option<String>,
+    /// The conversation's head tree, when a `reader:@=` grant names it.
+    head: Option<String>,
 }
 
 impl Context {
@@ -42,49 +55,162 @@ impl Context {
         let (stored, trees) =
             crate::secret_store::load(config, &keys).map_err(|e| HttpError::new(400, e))?;
         let conversation = conversation.filter(|c| !c.is_empty()).map(str::to_string);
+        let mut pins = HashMap::new();
+        let mut head = None;
+        for reader in stored.iter().flat_map(|s| &s.readers) {
+            match reader {
+                Reader::Locator { locator, .. } if !pins.contains_key(locator) => {
+                    let pinned = crate::grant_history::pin(config, locator).map_err(|e| {
+                        eprintln!("secrets: {locator}: {e}; it grants nothing");
+                    });
+                    pins.insert(locator.clone(), pinned.ok());
+                }
+                Reader::Conversation {
+                    conversation: id, ..
+                } if Some(id) == conversation.as_ref() && head.is_none() => {
+                    head = conversation_head(config, id).unwrap_or_else(|e| {
+                        eprintln!("secrets: conversation {id}: {e}");
+                        None
+                    });
+                }
+                _ => {}
+            }
+        }
+        let mut pinned: Vec<&str> = pins.values().flatten().map(String::as_str).collect();
+        pinned.sort();
         Ok(Context {
             scope: format!(
-                "{}|{}",
+                "{}|{}|{}",
                 trees.join(","),
-                conversation.as_deref().unwrap_or("")
+                conversation.as_deref().unwrap_or(""),
+                pinned.join(",")
             ),
             stored: Arc::new(stored),
+            pins: Arc::new(pins),
             conversation,
+            head,
         })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.stored.is_empty()
     }
+
+    /// What a walk's result depends on besides its tree and path: `None` with
+    /// no secrets, since then it depends on nothing more.
+    pub(crate) fn walk_key(&self) -> Option<String> {
+        (!self.is_empty()).then(|| format!("{}|{}", self.scope, self.head.as_deref().unwrap_or("")))
+    }
 }
+
+// ---- origins ----------------------------------------------------------------
 
 /// Every `(root, path)` a tree has been reached at, by tree oid: a start tree,
 /// a `:@@=` result, a value a `.caos-expr` produced, and every subtree of each.
 /// Equal oids are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one —
-/// carries the origin of what it was copied from. Facts about content, so
-/// shared by every run.
+/// carries the origin of what it was copied from. In front of redis, and an
+/// entry here is everything redis holds for that oid.
 static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
 
-/// Bounds [`KNOWN_ORIGINS`]; forgetting only means a later grant misses.
-const KNOWN_ORIGINS_CAP: usize = 1_000_000;
+/// Bounds the in-memory maps; forgetting only means a later redis read.
+const MEMORY_CAP: usize = 1_000_000;
 
-/// The values whose subtrees are already in [`KNOWN_ORIGINS`], with the
-/// origins they were indexed under.
-type Indexed = HashSet<(String, Vec<Origin>)>;
-static INDEXED: Mutex<Option<Indexed>> = Mutex::new(None);
+fn origins_key(oid: &str) -> String {
+    format!("caos:secrets:origins:{oid}")
+}
+
+fn encode_origin(origin: &Origin) -> String {
+    format!("{}\t{}", origin.root, origin.path)
+}
+
+fn decode_origin(text: &str) -> Option<Origin> {
+    let (root, path) = text.split_once('\t')?;
+    Some(Origin {
+        root: root.to_string(),
+        path: path.to_string(),
+    })
+}
+
+/// The known origins of `oid`, from memory or else redis.
+pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
+    if let Some(hit) = KNOWN_ORIGINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(oid).cloned())
+    {
+        return hit;
+    }
+    let loaded: Vec<Origin> = list_read(&config.redis_addr, &origins_key(oid))
+        .unwrap_or_else(|e| {
+            eprintln!("secrets: reading the origins of {oid}: {e}");
+            Vec::new()
+        })
+        .iter()
+        .filter_map(|text| decode_origin(text))
+        .collect();
+    let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= MEMORY_CAP {
+        map.clear();
+    }
+    let entry = map.entry(oid.to_string()).or_default();
+    for origin in loaded {
+        if !entry.contains(&origin) {
+            entry.push(origin);
+        }
+    }
+    entry.clone()
+}
+
+/// Record each `(oid, origin)`, in redis and in memory where memory already
+/// holds that oid. An oid it does not hold is left for [`origins_of`] to load
+/// whole, so a repeat in redis costs nothing but a duplicate line.
+fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
+    let mut new = Vec::new();
+    {
+        let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        for (oid, origin) in facts {
+            if let Some(known) = map.get_mut(&oid) {
+                if known.contains(&origin) {
+                    continue;
+                }
+                known.push(origin.clone());
+            }
+            new.push((origins_key(&oid), encode_origin(&origin)));
+        }
+    }
+    if let Err(e) = list_append_many(&config.redis_addr, &new) {
+        eprintln!("secrets: recording {} origin(s): {e}", new.len());
+    }
+}
+
+/// The values whose subtrees are recorded, with the origins they were recorded
+/// under. In front of a redis marker per entry.
+static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
+    let mut marker = format!("caos:secrets:indexed:{tree}");
+    for origin in origins {
+        marker.push('\n');
+        marker.push_str(&encode_origin(origin));
+    }
+    let marker = format!("caos:secrets:indexed:{}", blob_oid(marker.as_bytes()));
     {
         let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
         let indexed = guard.get_or_insert_with(HashSet::new);
-        if indexed.len() >= KNOWN_ORIGINS_CAP {
+        if indexed.len() >= MEMORY_CAP {
             indexed.clear();
         }
-        if !indexed.insert((tree.to_string(), origins.to_vec())) {
+        if !indexed.insert(marker.clone()) {
             return Ok(());
         }
+    }
+    if matches!(fact_get(&config.redis_addr, &marker), Ok(Some(_))) {
+        return Ok(());
     }
     let repo = config.repo.to_thread_local();
     let root = gix::ObjectId::from_hex(tree.as_bytes()).map_err(|e| format!("{tree}: {e}"))?;
@@ -96,6 +222,7 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
     {
         return Ok(());
     }
+    let mut facts = Vec::new();
     let mut pending = vec![(root, String::new())];
     while let Some((oid, rel)) = pending.pop() {
         let object = repo.find_object(oid).map_err(|e| format!("{oid}: {e}"))?;
@@ -110,8 +237,8 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
                 format!("{rel}/{}", entry.filename)
             };
             for origin in origins {
-                record_origin(
-                    &entry.oid.to_string(),
+                facts.push((
+                    entry.oid.to_string(),
                     Origin {
                         root: origin.root.clone(),
                         path: if origin.path.is_empty() {
@@ -120,24 +247,16 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
                             format!("{}/{path}", origin.path)
                         },
                     },
-                );
+                ));
             }
             pending.push((entry.oid.to_owned(), path));
         }
     }
+    record_origins(config, facts);
+    if let Err(e) = fact_set(&config.redis_addr, &marker, "1") {
+        eprintln!("secrets: marking {tree} indexed: {e}");
+    }
     Ok(())
-}
-
-pub(crate) fn record_origin(oid: &str, origin: Origin) {
-    let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(HashMap::new);
-    if map.len() >= KNOWN_ORIGINS_CAP {
-        map.clear();
-    }
-    let origins = map.entry(oid.to_string()).or_default();
-    if !origins.contains(&origin) {
-        origins.push(origin);
-    }
 }
 
 /// A walk's start tree, which is its own origin: every subtree is at its path.
@@ -156,23 +275,67 @@ pub(crate) fn index_root(config: &Config, context: &Context, tree: &str) {
 
 /// What a `:@@=` resolution produced, at its locator's `(rev^{tree}, dir)`.
 pub(crate) fn record_mount(config: &Config, oid: &str, origin: Origin) {
-    record_origin(oid, origin.clone());
+    record_origins(config, vec![(oid.to_string(), origin.clone())]);
     if let Err(e) = index_subtrees(config, oid, &[origin]) {
         eprintln!("secrets: cannot index {oid}: {e}");
     }
 }
 
-pub(crate) fn origins_of(oid: &str) -> Vec<Origin> {
-    let guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .and_then(|map| map.get(oid).cloned())
-        .unwrap_or_default()
+// ---- records ----------------------------------------------------------------
+
+/// A granted image's entries and the names granted, by scope. In front of a
+/// redis list per scope; a scope present here holds everything redis does.
+type Record = (BTreeMap<String, String>, Vec<String>);
+static RECORDS: Mutex<Option<HashMap<String, Vec<Record>>>> = Mutex::new(None);
+
+fn records_key(scope: &str) -> String {
+    format!("caos:secrets:records:{}", blob_oid(scope.as_bytes()))
 }
 
-/// A granted image's entries and the names granted, by scope.
-type Records = HashMap<String, Vec<(BTreeMap<String, String>, Vec<String>)>>;
-static RECORDS: Mutex<Option<Records>> = Mutex::new(None);
+/// The records of `scope`, loading them from redis the first time.
+fn records(config: &Config, scope: &str) -> Vec<Record> {
+    if let Some(hit) = RECORDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|r| r.get(scope).cloned())
+    {
+        return hit;
+    }
+    let loaded: Vec<Record> = list_read(&config.redis_addr, &records_key(scope))
+        .unwrap_or_else(|e| {
+            eprintln!("secrets: reading the records of a scope: {e}");
+            Vec::new()
+        })
+        .iter()
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect();
+    let mut guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= MEMORY_CAP {
+        map.clear();
+    }
+    map.entry(scope.to_string()).or_insert(loaded).clone()
+}
+
+fn record_grant(config: &Config, scope: &str, record: Record) {
+    if records(config, scope).iter().any(|(e, _)| *e == record.0) {
+        return;
+    }
+    let text = serde_json::to_string(&record).expect("a record serializes");
+    RECORDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry(scope.to_string())
+        .or_default()
+        .push(record);
+    if let Err(e) = list_append_many(&config.redis_addr, &[(records_key(scope), text)]) {
+        eprintln!("secrets: recording a grant: {e}");
+    }
+}
+
+// ---- granting ---------------------------------------------------------------
 
 /// [`EvalHost::evaluated`] for the server: mark and record `value` when one of
 /// the node's origins matches a reader of the run's secrets.
@@ -217,7 +380,12 @@ pub(crate) fn evaluated(
     let existing =
         crate::compute::image_entries(config, &image).map_err(|e| e.message().to_string())?;
     if existing.contains_key(caos_world::SECRET_HASH_ARG) {
-        names.extend(recorded_names(context, &existing));
+        names.extend(
+            records(config, &context.scope)
+                .into_iter()
+                .filter(|(recorded, _)| *recorded == existing)
+                .flat_map(|(_, names)| names),
+        );
         names.sort();
         names.dedup();
         image = crate::compute::unbind(config, &image, caos_world::SECRET_HASH_ARG)
@@ -238,14 +406,7 @@ pub(crate) fn evaluated(
     let marked = caos_eval::curry(host, &image, vec![entry])?.to_string();
     let entries =
         crate::compute::image_entries(config, &marked).map_err(|e| e.message().to_string())?;
-    let mut guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
-    let records = guard
-        .get_or_insert_with(HashMap::new)
-        .entry(context.scope.clone())
-        .or_default();
-    if !records.iter().any(|(e, _)| *e == entries) {
-        records.push((entries, names.clone()));
-    }
+    record_grant(config, &context.scope, (entries, names.clone()));
     eprintln!("secrets: granted {names:?} to {marked}");
     Ok(("tree".to_string(), marked))
 }
@@ -253,10 +414,11 @@ pub(crate) fn evaluated(
 /// The secrets a job may read: those of every image evaluation granted in this
 /// run's scope whose entries the job's ArgTree contains. Returns (name, value).
 pub(crate) fn grant(
+    config: &Config,
     context: &Context,
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
-    let names = granted_names(context, arg_entries);
+    let names = granted_names(config, context, arg_entries);
     let out: Vec<(String, String)> = context
         .stored
         .iter()
@@ -270,34 +432,18 @@ pub(crate) fn grant(
 }
 
 /// The names [`grant`] would inject, sorted.
-/// The names recorded for exactly the image whose entries are `entries`.
-fn recorded_names(context: &Context, entries: &BTreeMap<String, String>) -> Vec<String> {
-    let guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .and_then(|r| r.get(&context.scope))
-        .into_iter()
-        .flatten()
-        .filter(|(recorded, _)| recorded == entries)
-        .flat_map(|(_, names)| names.iter().cloned())
-        .collect()
-}
-
 pub(crate) fn granted_names(
+    config: &Config,
     context: &Context,
     arg_entries: &BTreeMap<String, String>,
 ) -> Vec<String> {
     if context.is_empty() {
         return Vec::new();
     }
-    let guard = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(records) = guard.as_ref().and_then(|r| r.get(&context.scope)) else {
-        return Vec::new();
-    };
     let mut names = HashSet::new();
-    for (entries, granted) in records {
+    for (entries, granted) in records(config, &context.scope) {
         if entries.iter().all(|(k, v)| arg_entries.get(k) == Some(v)) {
-            names.extend(granted.iter().cloned());
+            names.extend(granted);
         }
     }
     let mut names: Vec<String> = names.into_iter().collect();
@@ -307,14 +453,18 @@ pub(crate) fn granted_names(
 
 fn matches(config: &Config, context: &Context, reader: &Reader, origin: &Origin) -> bool {
     let outcome = match reader {
-        Reader::Locator { locator, since } => {
-            match_locator(config, locator, since.as_deref(), origin)
-        }
+        Reader::Locator { locator, since } => match context.pins.get(locator) {
+            Some(Some(pinned)) => match_locator(config, pinned, since.as_deref(), origin),
+            _ => Ok(false),
+        },
         Reader::Conversation { path, conversation } => {
             if context.conversation.as_deref() != Some(conversation.as_str()) {
                 return false;
             }
-            match_conversation(config, conversation, path, origin)
+            match &context.head {
+                Some(head) => match_conversation(config, head, path, origin),
+                None => Ok(false),
+            }
         }
     };
     outcome.unwrap_or_else(|e| {
@@ -342,12 +492,28 @@ fn match_locator(
     Ok(crate::grant_history::allowed_roots(config, &git_ref, since)?.contains(&origin.root))
 }
 
+/// The tree of the conversation's head commit, or `None` with no head yet.
+fn conversation_head(config: &Config, conversation: &str) -> Result<Option<String>, String> {
+    let repo = config.repo.to_thread_local();
+    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    let Ok(mut reference) = repo.find_reference(refname.as_str()) else {
+        return Ok(None);
+    };
+    let tree = reference
+        .peel_to_commit()
+        .map_err(|e| format!("{refname}: {e}"))?
+        .tree_id()
+        .map_err(|e| format!("{refname}: {e}"))?
+        .to_string();
+    Ok(Some(tree))
+}
+
 /// `path` in the conversation's head tree, evaluated the way the conversation
 /// evaluates it: from the root of whichever tree along the path the walk
 /// started at, a source tree's gitlink included.
 fn match_conversation(
     config: &Config,
-    conversation: &str,
+    head: &str,
     path: &str,
     origin: &Origin,
 ) -> Result<bool, String> {
@@ -358,16 +524,7 @@ fn match_conversation(
     }
     let prefix = &parts[..parts.len() - rest.len()];
     let repo = config.repo.to_thread_local();
-    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
-    let Ok(mut reference) = repo.find_reference(refname.as_str()) else {
-        return Ok(false);
-    };
-    let mut tree = reference
-        .peel_to_commit()
-        .map_err(|e| format!("{refname}: {e}"))?
-        .tree_id()
-        .map_err(|e| format!("{refname}: {e}"))?
-        .detach();
+    let mut tree = gix::ObjectId::from_hex(head.as_bytes()).map_err(|e| format!("{head}: {e}"))?;
     for name in prefix {
         let object = repo.find_object(tree).map_err(|e| format!("{tree}: {e}"))?;
         let Ok(decoded) = object.try_into_tree() else {

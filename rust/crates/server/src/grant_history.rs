@@ -56,6 +56,78 @@ pub(crate) fn allowed_roots(
     Ok(roots)
 }
 
+/// A grant's locator with any `ref=` replaced by the commit the branch names
+/// now. `git+caos://` is this server, so its refs are read here; any other URL
+/// is asked with `ls-remote`, remembered for [`REF_TTL`].
+pub(crate) fn pin(config: &Config, locator: &str) -> Result<String, String> {
+    let (url, query) = locator.split_once('?').unwrap_or((locator, ""));
+    let mut name = None;
+    let mut rest = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("ref", value)) => name = Some(value),
+            _ => rest.push(pair.to_string()),
+        }
+    }
+    let Some(name) = name else {
+        return Ok(locator.to_string());
+    };
+    let rev = resolve_branch(config, url, name)?;
+    rest.push(format!("rev={rev}"));
+    Ok(format!("{url}?{}", rest.join("&")))
+}
+
+/// How long a remote branch's answer is trusted.
+const REF_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type Resolved = HashMap<(String, String), (std::time::Instant, String)>;
+static BRANCHES: Mutex<Option<Resolved>> = Mutex::new(None);
+
+fn resolve_branch(config: &Config, url: &str, name: &str) -> Result<String, String> {
+    if url.starts_with("git+caos://") {
+        let out = git(
+            Path::new(&config.git_dir),
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{name}^{{commit}}"),
+            ],
+        )
+        .map_err(|_| format!("{name} names no commit on this server"))?;
+        return Ok(out.trim().to_string());
+    }
+    let key = (url.to_string(), name.to_string());
+    if let Some((at, rev)) = BRANCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key).cloned())
+    {
+        if at.elapsed() < REF_TTL {
+            return Ok(rev);
+        }
+    }
+    let fetch_url = url.strip_prefix("git+").unwrap_or(url);
+    let fetch_url = match fetch_url.strip_prefix("github:") {
+        Some(repo) => format!("https://github.com/{repo}"),
+        None => fetch_url.to_string(),
+    };
+    let out = git(Path::new(&config.git_dir), &["ls-remote", &fetch_url, name])?;
+    let rev = out
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or_else(|| format!("{fetch_url} has no {name}"))?
+        .to_string();
+    BRANCHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (std::time::Instant::now(), rev.clone()));
+    Ok(rev)
+}
+
 fn first_parent_trees(
     dir: &str,
     rev: &str,

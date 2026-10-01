@@ -209,9 +209,8 @@ pub(crate) fn eval_endpoint(
     }
 }
 
-/// [`eval_endpoint`]'s body once the root is an object this store holds: the
-/// `{in, eval}` continuation, memoized on (tree, path, secret scope). Both root
-/// types land here, so a locator's descent and a direct one over the same
+/// [`eval_endpoint`]'s body once the root is an object this store holds. Both
+/// root types land here, so a locator's descent and a direct one over the same
 /// fetched root are ONE memo entry rather than two.
 fn eval_in_tree(
     config: &Config,
@@ -219,28 +218,36 @@ fn eval_in_tree(
     path: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    // The memo identity: the input tree and the path. Content-addressed by
-    // storing it, so the redis key is fixed-length. Not with secrets: a grant
-    // is decided, and recorded, by walking (SPEC, "Secrets").
-    let identity = format!("eval\u{0}{root}\u{0}{path}");
+    evaluate(config, root, path, secrets).map(String::into_bytes)
+}
+
+/// Walk `root` down to `path`, returning `"<kind> <hash>"`, memoized on the
+/// tree, the path, and whatever a grant could depend on
+/// ([`crate::secrets::Context::walk_key`]). A cached result needs nothing
+/// replayed: the walk's grant records are kept in redis too.
+fn evaluate(
+    config: &Config,
+    root: &str,
+    path: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    // Content-addressed by storing it, so the redis key is fixed-length.
+    let identity = match secrets.walk_key() {
+        None => format!("eval\u{0}{root}\u{0}{path}"),
+        Some(scope) => format!("eval\u{0}{root}\u{0}{path}\u{0}{scope}"),
+    };
     let id = store_git_blob(config, identity.as_bytes()).map_err(|e| HttpError::new(500, e))?;
-    let key = secrets
-        .is_empty()
-        .then(|| result_key(config, &id.to_string()));
-    if let Some(key) = &key {
-        if let Ok(Some(result)) = cache_get(&config.redis_addr, key) {
-            return Ok(result.into_bytes());
-        }
+    let key = result_key(config, &id.to_string());
+    if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
+        return Ok(result);
     }
-    let result = evaluate(config, root, path, secrets)?;
-    if let Some(key) = &key {
-        let _ = cache_set(&config.redis_addr, key, &result);
-    }
-    Ok(result.into_bytes())
+    let result = walk(config, root, path, secrets)?;
+    let _ = cache_set(&config.redis_addr, &key, &result);
+    Ok(result)
 }
 
 /// Walk `root` down to `path`, returning `"<kind> <hash>"`.
-fn evaluate(
+fn walk(
     config: &Config,
     root: &str,
     path: &str,
@@ -389,7 +396,7 @@ pub(crate) fn submit(
     };
     let salt = json["salt"].as_str().unwrap_or("");
     let arg_tree = form_arg_tree(config, &image, call, salt)?;
-    let granted = crate::secrets::granted_names(secrets, &args_entries(config, &arg_tree)?);
+    let granted = crate::secrets::granted_names(config, secrets, &args_entries(config, &arg_tree)?);
     Ok(format!("tree {arg_tree}\ngranted {}\n", granted.join(" ")).into_bytes())
 }
 
@@ -674,7 +681,7 @@ fn run_dispatch_inner(
         // out of band in the job payload — never in the ArgTree, so never in the
         // cache key — and the container runner drops them at `/secret/<name>`.
         // Read from `arg_entries` before dispatch takes ownership of it.
-        let granted = crate::secrets::grant(secrets, &arg_entries);
+        let granted = crate::secrets::grant(config, secrets, &arg_entries);
         crate::runner::dispatch(
             arg_tree,
             arg_entries,
@@ -1239,7 +1246,7 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         ))
     }
     fn origins_of(&self, oid: &str) -> Vec<caos_eval::Origin> {
-        crate::secrets::origins_of(oid)
+        crate::secrets::origins_of(self.config, oid)
     }
     fn evaluated(
         &self,
@@ -2729,6 +2736,37 @@ pub(crate) fn list_append(addr: &str, key: &str, value: &str) -> Result<(), Stri
         .write_all(&resp_command(&["RPUSH", key, value]))
         .map_err(|e| format!("write: {e}"))?;
     read_integer_reply(&mut BufReader::new(stream)).map(|_| ())
+}
+
+/// `RPUSH key value` for every pair, over one connection: one write, then
+/// every reply. Indexing a tree appends thousands, and a connection each would
+/// cost more than the walk.
+pub(crate) fn list_append_many(addr: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut stream = redis_connect(addr)?;
+    let mut buf = Vec::new();
+    for (key, value) in pairs {
+        buf.extend_from_slice(&resp_command(&["RPUSH", key, value]));
+    }
+    stream.write_all(&buf).map_err(|e| format!("write: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    for _ in pairs {
+        read_integer_reply(&mut reader)?;
+    }
+    Ok(())
+}
+
+/// `GET key`, in the result cache's namespace-free keyspace — for facts about
+/// content that hold for every build.
+pub(crate) fn fact_get(addr: &str, key: &str) -> Result<Option<String>, String> {
+    cache_get(addr, key)
+}
+
+/// `SET key value`, the counterpart of [`fact_get`].
+pub(crate) fn fact_set(addr: &str, key: &str, value: &str) -> Result<(), String> {
+    cache_set(addr, key, value)
 }
 
 /// `LRANGE key 0 -1` — the whole list, in insertion order.

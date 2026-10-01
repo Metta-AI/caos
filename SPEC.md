@@ -476,7 +476,10 @@ reader:@=imports/caos/std/llm-step conversation=<id>
   locator's `rev` and in each of its first-parent ancestors, back to and
   including `since` (or to the root without `since`). First-parent, so a branch forked
   before `since` and merged after it does not bring back the code `since`
-  excluded. The range is content; the URL only says where to fetch it.
+  excluded. The range is content; the URL only says where to fetch it. A
+  `ref=` in place of `rev=` names a branch, resolved when a request is admitted
+  (`git+caos://` is this server's own; any other URL is asked), so the range
+  moves with it — and trusts whoever can move that branch.
 - **`reader:@=<path> conversation=<id>`** grants whatever is at `path` in that
   conversation's tree, and only in that conversation. The agent can edit that
   code, so this exposes the secret to the agent.
@@ -493,9 +496,10 @@ of its origin (a parent `.caos-expr` can reshape everything below it, so nothing
 less than the whole root identifies it). An origin is the server's bookkeeping
 during the
 walk, never written into a tree: an ungranted node evaluates exactly as it
-would with no secrets, and a granted one differs only by `secret-hash`. Only
-the eval memo sees it, keyed by origin when a request carries keys; the runs a
-walk dispatches stay memoized by ArgTree.
+would with no secrets, and a granted one differs only by `secret-hash`. Origins
+and grant records are kept, so a walk is memoized on its tree, its path and
+what a grant depends on (the stores, the conversation and its head, the
+resolved branches).
 - `reader:@@=` matches when `P` is `dir=` and `T` is `C^{tree}` for a commit `C`
   in its range. The allowed set is `git log --first-parent --format=%T`,
   computed once per pushed tree, and needs no evaluation. A root that differs
