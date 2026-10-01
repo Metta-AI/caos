@@ -170,3 +170,68 @@ fn code_paths_are_content_and_renaming_preserves_code_history() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn tool_completion_roundtrips_directory_replacement_and_deletion() {
+    let mut store = MemoryStore::new();
+    let mut cursor = fixtures::golden(&mut store);
+    let (parent, record) = loop {
+        let info = store.read_commit(&cursor).unwrap();
+        let (kind, events) = events::decode(&info.message).unwrap();
+        if kind == Kind::ToolComplete {
+            if let Some(record) = events.into_iter().find_map(|event| match event {
+                Event::Tool(record) if !record.files.is_empty() => Some(record),
+                _ => None,
+            }) {
+                break (info.parents[0].clone(), record);
+            }
+        }
+        cursor = info.parents[0].clone();
+    };
+    let sig = client_signature("Test", "test@example.com", 1);
+    let mut original = TreeBuilder::from(None);
+    original.put("old", Mode::Blob, b"old contents".to_vec());
+    let original = original.build(&mut store).unwrap();
+    let setup = Transition::FilesApply {
+        files: vec![("feature".into(), Some((Mode::Tree, original.encode_line())))],
+    };
+    let applied = apply(&mut store, Some(&parent), &setup).unwrap();
+    let before = mint(&mut store, &parent, &applied, setup.kind(), &sig).unwrap();
+    let mut replacement = TreeBuilder::from(None);
+    replacement.put("new", Mode::Blob, b"new contents".to_vec());
+    let replacement = replacement.build(&mut store).unwrap();
+    for value in [Some((Mode::Tree, replacement.encode_line())), None] {
+        let transition = Transition::ToolComplete {
+            record: CallRecord {
+                files: vec!["feature".into()],
+                files_outcome: Some(FilesOutcome {
+                    applied: vec!["feature".into()],
+                    conflicted: Vec::new(),
+                }),
+                ..record.clone()
+            },
+            payloads: vec![("observation".into(), b"changed".to_vec())],
+            files: vec![("feature".into(), value.clone())],
+        };
+        let applied = apply(&mut store, Some(&before), &transition).unwrap();
+        let after = mint(&mut store, &before, &applied, transition.kind(), &sig).unwrap();
+        validate_spine(&store, &after, &mut HashSet::new()).unwrap();
+        let tree = store.read_commit(&after).unwrap().tree;
+        assert_eq!(
+            Snapshot::new(&store, tree.clone())
+                .entry("feature")
+                .unwrap()
+                .map(|entry| entry.oid),
+            value.as_ref().map(|_| replacement.clone())
+        );
+        let mut tampered = TreeBuilder::from(Some(tree));
+        tampered.put("unrecorded", Mode::Blob, b"outside the scope".to_vec());
+        let mut info = store.read_commit(&after).unwrap();
+        info.tree = tampered.build(&mut store).unwrap();
+        let tampered = store.write_commit(&info).unwrap();
+        assert!(validate_commit(&store, &tampered)
+            .unwrap_err()
+            .reason
+            .contains("unrecorded"));
+    }
+}
