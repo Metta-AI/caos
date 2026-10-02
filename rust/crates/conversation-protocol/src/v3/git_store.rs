@@ -398,6 +398,21 @@ impl GitStore {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// A ref in THIS repository, never the remote's: the counterpart of
+    /// [`GitStore::read_ref`] for state that is the checkout's own.
+    pub fn read_local(&self, refname: &str) -> Result<Option<Oid>, String> {
+        self.read_local_ref(refname)
+    }
+
+    /// Point a ref in this repository at `oid`. Only `refs/caos/` is written.
+    pub fn write_local(&self, refname: &str, oid: &Oid) -> Result<(), String> {
+        self.update_local_refs(&[RefUpdate {
+            refname: refname.to_string(),
+            expected: None,
+            new: Some(oid.clone()),
+        }])
+    }
+
     pub fn git_version(&self) -> Result<String, String> {
         let output = self.output(&["version"])?;
         if !output.status.success() {

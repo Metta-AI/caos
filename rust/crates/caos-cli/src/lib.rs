@@ -313,14 +313,63 @@ fn open_store(t: &GitTransport) -> Result<GitStore, String> {
 
 static VALIDATED_SPINES: OnceLock<Mutex<HashSet<Oid>>> = OnceLock::new();
 
-fn validate_cached(store: &GitStore, head: &Oid) -> Result<(), String> {
+/// Where this checkout records the newest head of conversation `id` it has
+/// validated. A local ref, never pushed: it certifies what THIS repository
+/// checked, which is worth nothing to anyone else.
+fn validated_ref(id: &str) -> Result<String, String> {
+    refs::validate_conversation_id(id)?;
+    Ok(format!("{VALIDATED_PREFIX}{}", refs::key_of(id)))
+}
+
+const VALIDATED_PREFIX: &str = "refs/caos/validated/";
+
+/// Validate `head`'s spine, walking only as far as something already checked.
+///
+/// "Already checked" has to outlive the process. Each Claude Code hook is a
+/// new `caos` process, and a full walk costs a diff and a transition check per
+/// commit back to the root -- so with only the in-memory set, every prompt and
+/// every Stop pays for the whole history, and a long session's prompt hook
+/// outlives the 30s it is allowed. A killed prompt hook opens no request, and
+/// every tool call of that turn is refused. So the newest validated head is
+/// also kept as a local ref, and the walk stops there.
+///
+/// The conversation is read off `head` BEFORE it is validated, and that is
+/// safe: the id only picks which ref seeds the walk, and a seed short-circuits
+/// only on reaching that exact commit, so a head whose spine does not contain
+/// it is validated in full.
+///
+/// Answers how many commits it had to check.
+fn validate_cached(store: &GitStore, head: &Oid) -> Result<usize, String> {
     let cache = VALIDATED_SPINES.get_or_init(|| Mutex::new(HashSet::new()));
     let mut known = cache
         .lock()
         .map_err(|_| "conversation validation cache is poisoned".to_string())?;
-    validate_spine(store, head, &mut known)
-        .map(drop)
-        .map_err(String::from)
+    let refname = Conversation::open(store, head)
+        .and_then(|view| view.identity())
+        .ok()
+        .map(|identity| validated_ref(&identity.id))
+        .transpose()?;
+    if let Some(refname) = &refname {
+        if let Some(checked) = store.read_local(refname)? {
+            known.insert(checked);
+        }
+    }
+    let mark = Instant::now();
+    let walked = validate_spine(store, head, &mut known).map_err(String::from)?;
+    if !walked.is_empty() {
+        caos::timing::record(
+            "validate-spine",
+            &format!(
+                "{} commit(s) in {:.1}s",
+                walked.len(),
+                mark.elapsed().as_secs_f64()
+            ),
+        );
+    }
+    if let Some(refname) = &refname {
+        store.write_local(refname, head)?;
+    }
+    Ok(walked.len())
 }
 
 fn already_validated(head: &Oid) -> Result<bool, String> {
@@ -344,7 +393,7 @@ fn fetch_validated_head(
     if local.as_ref() != Some(&head) || !already_validated(&head)? {
         // Fetch the observed commit without racing other readers to rewrite the
         // local ref. The remote ref may also advance while this fetch runs.
-        store.fetch_object(&head)?;
+        store.ensure_local(&head)?;
         validate_cached(store, &head)?;
     }
     let _ = update_local_cache(t, &refname, head.as_str());
@@ -3582,6 +3631,51 @@ mod tests {
             drop(store);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn a_new_process_validates_only_what_was_appended_since() {
+        let (root, transport, base) = fixture("validated-ref");
+        let options = options(&transport);
+        create_conversation(&transport, &options, "long", "New conversation").unwrap();
+        let forget = || VALIDATED_SPINES.get().unwrap().lock().unwrap().clear();
+        let head = |t: &GitTransport| {
+            oid(&conversation_head(t, "long").unwrap().unwrap(), "head").unwrap()
+        };
+        submit_message_inner_with(
+            &transport,
+            &options,
+            "long",
+            "plan first",
+            false,
+            None,
+            None,
+            |_, _, _, _| Ok(base.clone()),
+        )
+        .unwrap();
+        interrupt_request(&transport, "long").unwrap();
+        let store = open_store(&transport).unwrap();
+        let first = head(&transport);
+        validate_cached(&store, &first).unwrap();
+        forget();
+        assert_eq!(validate_cached(&store, &first).unwrap(), 0);
+
+        fixture_reference(&transport, "long", "code", Some(&base)).unwrap();
+        let next = head(&transport);
+        let appended = validate_spine(&store, &next, &mut HashSet::from([first.clone()]))
+            .unwrap()
+            .len();
+        let whole = validate_spine(&store, &next, &mut HashSet::new())
+            .unwrap()
+            .len();
+        assert!(appended < whole);
+        forget();
+        assert_eq!(validate_cached(&store, &next).unwrap(), appended);
+        assert_eq!(
+            store.read_local(&validated_ref("long").unwrap()).unwrap(),
+            Some(next)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
