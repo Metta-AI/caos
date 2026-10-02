@@ -41,8 +41,10 @@ cannot wait like that.
 
 ## Principles
 
-1. **No Start message.** A message is an ordinary job. If nothing is resident
-   for its instance, the job's worker brings the daemon up.
+1. **No start mechanism.** The server and runner have no concept of starting a
+   daemon. A message is an ordinary job. If nothing is resident for its
+   instance, the job's worker brings the daemon up. A daemon may still define a
+   `start` op of its own (Part 2 does), but to caos it is just another message.
 2. **Wake on message, stop on idle.** The server's existing eviction rule is
    the idle stop; the next message is the wake.
 3. **The runner is the only poller and the only poster.** Registration logic
