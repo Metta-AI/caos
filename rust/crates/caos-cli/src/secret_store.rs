@@ -103,7 +103,7 @@ fn parse_flags(args: &[String]) -> Result<(PathBuf, Option<String>), String> {
     let mut server = None;
     for arg in args {
         if let Some(d) = arg.strip_prefix("--dir=") {
-            dir = Some(PathBuf::from(d));
+            dir = Some(expand_home(d)?);
         } else if let Some(s) = arg.strip_prefix("--server=") {
             server = Some(s.to_string());
         } else {
@@ -114,6 +114,17 @@ fn parse_flags(args: &[String]) -> Result<(PathBuf, Option<String>), String> {
     // where you will find it and back it up.
     let dir = dir.ok_or("--dir=<d> is required: the directory that holds your secrets")?;
     Ok((dir, server))
+}
+
+/// `d` with a leading `~` expanded: a shell leaves the one in `--dir=~/…`
+/// alone, since it is not at the start of a word.
+fn expand_home(d: &str) -> Result<PathBuf, String> {
+    let rest = match d.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => rest.trim_start_matches('/'),
+        _ => return Ok(PathBuf::from(d)),
+    };
+    let home = std::env::var_os("HOME").ok_or("--dir starts with ~, and $HOME is not set")?;
+    Ok(PathBuf::from(home).join(rest))
 }
 
 /// The SecretReaderKeys this process presents: the checkout's
@@ -317,6 +328,15 @@ mod tests {
         assert!(written.contains("entropy="), "{written}");
         // Stable: the second load reads the entropy it wrote.
         assert_eq!(tree_oid(&secrets), tree_oid(&load_dir(dir.path()).unwrap()));
+    }
+
+    #[test]
+    fn a_leading_tilde_is_home() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(expand_home("~/x/y").unwrap(), home.join("x/y"));
+        assert_eq!(expand_home("~").unwrap(), home);
+        assert_eq!(expand_home("/a/~b").unwrap(), PathBuf::from("/a/~b"));
+        assert_eq!(expand_home("~other/x").unwrap(), PathBuf::from("~other/x"));
     }
 
     #[test]

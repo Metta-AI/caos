@@ -3,6 +3,52 @@
 Caos is a Content-Addressable Operating System. It's functional programming with git as the values and docker as the
 functions, cached by redis
 
+# How to use
+
+- In the instructions below, `$FOO` can be used literally if you have set an env var. `<FOO>` needs to be expanded by you when entering the text
+- `CAOS_SERVER` is a secret ticket that grants access to your caos server. If you work at softmax, get it with:
+  ```
+    AWS_PROFILE=softmax aws secretsmanager get-secret-value \
+      --region us-east-1 --secret-id caos/prod-iroh-ticket \
+      --query SecretString --output text
+  ```
+- `CAOS_SECRETS_DIR` is the directory on your computer where you keep caos secrets
+- On your computer, make some secrets:
+  - `mkdir $CAOS_SECRETS_DIR` and then cd there
+  - `nix run github:Metta-AI/caos#caos-cli -- secrets-push --dir=$CAOS_SECRETS_DIR`
+  - Github:
+    - If you need to make a github token
+        - Go to https://github.com/settings/personal-access-tokens
+        - Make a new fine-grained token
+        - Give it access to content, PRs
+        - Set to read+write
+    - Put this into `$CAOS_SECRETS_DIR/github-token`, using your real github token as the value:
+      ```
+      value=<token>
+      reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/llm-step
+      ```
+  - If you have a softmax token, do the same as above but:
+    - Name the file `softmax-token`
+    - Set the reader to `reader:@@=git+https://github.com/Metta-AI/caos-softmax?ref=refs/heads/main&dir=tools/gota`
+  - `nix run github:Metta-AI/caos#caos-cli -- secrets-push --dir=. --server=$CAOS_SERVER`. This prints your `SECRET_READERS_KEY`
+- Go go https://claude.ai/code. Click New
+- At the bottom, click Default > Cloud > Add Cloud env... and fill in the form:
+  - Name: Caos
+  - Network: Full
+  - Setup script:
+    ```
+      echo last modified on 2026-10-01T1455PT
+      B=https://raw.githubusercontent.com/Metta-AI/caos/main
+      curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+      go run /tmp/caos-bootstrap.go --base="$B" \
+        --server=<CAOS_SERVER> --secret-readers=<SECRET_READERS_KEY>
+    ```
+- From the repo picker (next to the env picker), choose `metta-ai/caos-session`
+- Type a prompt
+  - `Use caos to import metta-ai/caos into caos/main`
+  - `Use caos' RunTool to run caos-std/caos-build on caos/main`
+  - `Use caos' RunTool to run caos-std/caos-test on caos/main`
+
 # Why?
 
 ## Security

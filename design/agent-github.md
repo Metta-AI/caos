@@ -77,64 +77,7 @@ remove `/pr`, `/publish-branch`, and their UI.
 
 ### Stacks
 
-Keep each stack boundary as a source gitlink:
-
-```text
-imports/repo/base   -> H
-feature/01-core     -> A   parent H
-feature/02-tests    -> B   parent A
-```
-
-Start each layer by copying the preceding snapshot with `cp -a`, then editing
-the copy. Git ancestry records the dependency. If A changes, merge its new
-commit into B and test; the layers keep that full merge history.
-
-#### Publishing a stack
-
-Reviewers see one commit per layer, so the stack is collapsed every time it is
-pushed, the first publish and each update alike. The layers themselves are
-never rewritten: bringing a stack onto a moved base (what "rebase" means here)
-is importing the base, merging it into the bottom layer and each layer into the
-one above, and testing. Then:
-
-1. Run `caos-std/collapse-stack` with `stack=feature`, `onto=H` (the base
-   branch's tip that layer 1 last merged) and one `<entry> <message>` line per
-   layer, bottom first. For each layer it mints
-   `C_i = commit(tree(layer i tip), parent C_{i-1} or H, message_i)`, with the
-   author and committer of layer i's tip, and prints `<layer> <C_i>`. It refuses,
-   naming both, a layer that does not contain the one below it (or H): merge
-   first. Identical input mints identical commits, so republishing an unchanged
-   stack pushes nothing new.
-2. Link each `C_i` into the conversation (`caos get-hash C_i /cas/c; rm -rf
-   publish/<layer>; ln -s /cas/c publish/<layer>`), since `publish_source`
-   publishes a gitlink. A linked commit is a directory, so replacing one on an
-   update needs `rm -rf`, not `rm -f`.
-3. `publish_source` each, bottom to top, with `rewrite=true`. A collapsed
-   commit does not descend from the one it replaces, so this is the one case for
-   a rewrite; the push stays leased on the exact remote head `publish_source`
-   observes, so a change someone else pushed is never overwritten.
-4. The first PR targets `main`; each later one targets the branch below it.
-
-```text
-feature/01-core  -> A'  (merge history)   C1 = tree(A'), parent H    -> feature/01-core
-feature/02-tests -> B'  (merge history)   C2 = tree(B'), parent C1   -> feature/02-tests
-```
-
-Link the existing PR URLs in order with
-[`gh stack link`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands#gh-stack-link):
-
-```sh
-GH_REPO=owner/repo gh stack link --base main \
-  https://github.com/owner/repo/pull/123 \
-  https://github.com/owner/repo/pull/124
-```
-
-This needs no local stack branches. Commands such as `push`, `submit`, and
-`rebase` do require local branches and stack metadata. Supporting them would
-mean reconstructing that local repository from gitlinks and returning any
-rewritten commits to CAOS. Use CAOS's copy, edit, and merge operations initially,
-and `link` to publish the relationship. `modify` additionally requires linear
-history, so it cannot restructure stacks containing merge commits.
+See [stacks.md](stacks.md).
 
 ### Merges
 

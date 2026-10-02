@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/collapse-stack — a WORKER test: no client, no repo.
 #
-# Drives std/collapse-stack directly over the stack shape design/agent-github.md
+# Drives std/collapse-stack directly over the stack shape design/stacks.md
 # describes: a base B, layer 1 on B, layer 2 copied from layer 1, then layer 1
 # changes and is MERGED UP into layer 2, so layer 2's tip is a merge commit.
 # Collapsing must give one single-parent commit per layer, B <- C1 <- C2, each
