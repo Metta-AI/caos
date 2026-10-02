@@ -10,6 +10,8 @@ pub fn diagnostic(code: &str) -> Option<&'static str> {
         "lease-rejected" => "The remote head does not match the pinned lease. Inspect it before importing and integrating changes.",
         "hook-declined" => "The remote rejected the push: a receive hook declined it. Check repository rules and branch protection.",
         "remote-rejected" => "The remote rejected this branch update. Check repository rules and write access.",
+        "credential-missing" => "The remote asked for credentials and this publication carries none, so nothing was pushed. Grant a GitHub token to the step that publishes (SPEC.md, \"Secrets\").",
+        "credential-rejected" => "The remote refused this publication's credential, so nothing was pushed: the token is invalid or cannot write to this repository.",
         "invalid-request" => "The server rejected the publication request before pushing.",
         _ => return None,
     })

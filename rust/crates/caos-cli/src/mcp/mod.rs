@@ -648,10 +648,14 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
         Err(error) => refuse_prompt(&error),
     };
     let id = recorded_conversation(t, payload)?;
+    let readers = crate::secret_store::reader_summary();
     if record_prompt(t, options, &id, prompt)? {
-        announce(&format!("caos conversation ref {}", conversation_ref(&id)?))?;
+        announce(&format!(
+            "caos conversation ref {}; {readers}",
+            conversation_ref(&id)?
+        ))?;
     } else if let Some(note) = note {
-        announce(&note)?;
+        announce(&format!("{note}; {readers}"))?;
     }
     Ok(())
 }

@@ -144,6 +144,26 @@ pub fn reader_keys() -> Vec<String> {
         .collect()
 }
 
+/// One line naming the keys [`reader_keys`] presents, for a transcript. A
+/// session presenting no key is granted nothing, and from inside a cloud
+/// session that was invisible: its pushes failed as "uncertain" for a day
+/// while the store and grant were correct. Only a prefix is shown, because a
+/// SecretReaderKey is a credential and this text is quoted into a model's
+/// context; it is enough to compare with what `secrets-init` prints.
+pub fn reader_summary() -> String {
+    let keys = reader_keys();
+    if keys.is_empty() {
+        return "secret readers: none -- caos.secret-readers is unset in this \
+                checkout, so no secret can be granted"
+            .to_string();
+    }
+    let shown: Vec<String> = keys
+        .iter()
+        .map(|k| format!("{}…", &k[..k.len().min(8)]))
+        .collect();
+    format!("secret readers: {}", shown.join(" "))
+}
+
 fn read_writer_key(dir: &Path) -> Result<SigningKey, String> {
     let path = dir.join(WRITER_KEY_FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| {

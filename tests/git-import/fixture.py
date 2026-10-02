@@ -647,7 +647,11 @@ def main():
             conversation = source_commit(empty, genesis)
             assert push(conversation, branch="conversation")["status"] == "complete"
             assert push(first[0], branch="code-after-conversation")["status"] == "complete"
-            assert push(first[0], branch="private-test", dest=private, credential="wrong-token")["status"] == "uncertain"
+            # Authentication fails before git sends an update, so it is certain.
+            refused = push(first[0], branch="private-test", dest=private, credential="wrong-token")
+            assert refused["status"] == "conflict" and refused["code"] == "credential-rejected", refused
+            unauthenticated = push(first[0], branch="private-test", dest=private)
+            assert unauthenticated["status"] == "conflict" and unauthenticated["code"] == "credential-missing", unauthenticated
             assert push(first[0], branch="private-test", dest=private, credential=token)["status"] == "complete"
             if cli:
                 receipt = json.loads(run(cli, "push-git", destination, second[0], "cli", "--expected=absent", env=cli_env))

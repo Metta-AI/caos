@@ -125,18 +125,27 @@ pub(crate) fn endpoint(
         input.expected.as_deref().unwrap_or("")
     );
     let refspec = format!("{}:{refname}", input.commit);
-    let output = run(&[
-        "-c",
-        "push.followTags=false",
-        "push",
-        "--porcelain",
-        "--no-verify",
-        "--recurse-submodules=no",
-        &lease,
-        "--",
-        &input.destination,
-        &refspec,
-    ]);
+    // stderr is captured only to be CLASSIFIED (`credential_failure`) and is
+    // never returned: it is remote-controlled and can quote credentials.
+    let output = git_locator::import::git(&input.destination, token).and_then(|mut command| {
+        command
+            .args(["--git-dir", &config.git_dir])
+            .args([
+                "-c",
+                "push.followTags=false",
+                "push",
+                "--porcelain",
+                "--no-verify",
+                "--recurse-submodules=no",
+                &lease,
+                "--",
+                &input.destination,
+                &refspec,
+            ])
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|_| "could not start Git publication".to_string())
+    });
     match output {
         Ok(output) if output.status.success() => receipt(
             PublicationStatus::Complete,
@@ -161,6 +170,13 @@ pub(crate) fn endpoint(
                     } else {
                         "push-rejected"
                     },
+                    Some(code),
+                )
+            } else if let Some(code) = credential_failure(&output.stderr) {
+                receipt(
+                    PublicationStatus::Conflict,
+                    None,
+                    "push-rejected",
                     Some(code),
                 )
             } else {
@@ -251,7 +267,8 @@ fn ignored_files(
 }
 
 // Only a per-ref porcelain rejection proves the receiver refused this update.
-// Missing status (including authentication/transport failures) remains uncertain.
+// Missing status remains uncertain, except a failure to authenticate
+// (`credential_failure`), which happens before anything is sent.
 fn rejection(stdout: &[u8], refname: &str) -> Option<&'static str> {
     String::from_utf8_lossy(stdout).lines().find_map(|line| {
         let mut fields = line.split('\t');
@@ -281,9 +298,40 @@ fn rejection(stdout: &[u8], refname: &str) -> Option<&'static str> {
     })
 }
 
+// Git authenticates while DISCOVERING refs, before it sends any update, so a
+// failure there proves nothing was pushed. Reported as "uncertain", a session
+// with no GitHub token was told its push "may still have an in-flight update"
+// and went looking for a race. Only these fixed phrases are matched; a
+// transport failure part-way through a push stays uncertain.
+fn credential_failure(stderr: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(stderr);
+    if text.contains("could not read Username") {
+        Some("credential-missing")
+    } else if text.contains("Authentication failed for")
+        || text.contains("The requested URL returned error: 403")
+    {
+        Some("credential-rejected")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_authentication_failures_are_certain() {
+        let missing =
+            b"fatal: could not read Username for 'https://github.com': terminal prompts disabled\n";
+        assert_eq!(credential_failure(missing), Some("credential-missing"));
+        let rejected = b"remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/o/r.git/'\n";
+        assert_eq!(credential_failure(rejected), Some("credential-rejected"));
+        let forbidden = b"remote: Permission to o/r.git denied to u.\nfatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 403\n";
+        assert_eq!(credential_failure(forbidden), Some("credential-rejected"));
+        let transport = b"send-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\n";
+        assert_eq!(credential_failure(transport), None);
+    }
     #[test]
     fn expected_is_required_but_may_be_null() {
         let mut value =
