@@ -287,7 +287,9 @@ reusing its interpreter (`design/test-stack-image.md`):
 
 ## Messages
 
-Every message carries `instance` (the pin), `op`, and a `nonce`.
+Every message carries `instance` (the pin) and `op`. Every op except `start`
+also carries a `nonce`, so it always reaches the daemon. `start` carries an
+`epoch` instead (Part 1, Caching).
 
 | op | does | reply |
 |---|---|---|
