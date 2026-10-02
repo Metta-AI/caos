@@ -155,10 +155,12 @@ attributed to the current job for a failure report.
   *not running* and exit without starting anything; only ops that are meant to
   wake do so. A later server change could add an *exclusive pin* so that a job
   carrying a pinned arg only matches pinned polls.
-- Two starts racing for one instance can create two daemons, one per container.
-  Nothing in this design prevents it. A daemon that needs uniqueness has to
-  check on start against something outside the container, for example an actor
-  branch holding the instance's address (Part 2 does not do this in v1).
+- **Duplicate starts.** The server dedupes on the ArgTree hash: identical
+  concurrent requests share one run (single-flight), and a later identical
+  request is answered from the cache. So two starts with identical args never
+  make two daemons. Two daemons need two *different* ArgTrees, which happens
+  when callers put a random nonce in `start` to defeat the cache. `start`
+  therefore carries an agreed `epoch` instead (see Caching, below).
 
 ## Stopping
 
