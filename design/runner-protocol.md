@@ -1,9 +1,12 @@
 # Runner protocol — sequential jobs on warm workers
 
-**Status:** design agreed, not yet implemented. Replaces the existing
-backends outright: `dispatch_docker`/`dispatch_serve`/`dispatch_fly`, the
-`Backend` enum, the worker-slot semaphore, `caos entrypoint`, and `caos serve`
-are all deleted, and the dev stack gains `caos runnerd` as a required daemon.
+**Status:** implemented (`server/src/runner.rs`, `crates/runnerd`, and `runner`
+in `crates/caos/src/bin/caos.rs`). It replaced the existing backends outright:
+`dispatch_docker`/`dispatch_serve`/`dispatch_fly`, the `Backend` enum, the
+worker-slot semaphore, `caos entrypoint`, and `caos serve` are deleted, and the
+dev stack runs `caos runnerd` as a required daemon. Resident worker daemons
+(below) are still deferred. What a runner does, step by step, is in SPEC.md,
+"Runners: how a worker's container lives".
 Builds on the runner-pool decomposition (`runner-pool-and-cloud-builds.md`):
 that doc removes the per-worker *image*; this one removes the per-job
 *container start*.
