@@ -67,6 +67,106 @@ Add more about the contract with the worker #todo
 - /cas/out
 - run-then, map-then
 
+## Runners: how a worker's container lives
+
+A worker is run by `caos runner`, not by the server and not by the worker itself.
+(Protocol: design/runner-protocol.md. Code: `rust/crates/caos/src/bin/caos.rs`,
+`rust/crates/runnerd`, `rust/crates/server/src/runner.rs`.)
+
+### The first process
+
+- Capacity is minted by `caos-runnerd`, the host agent. Each of its slots
+  long-polls the server with no required args, so it matches any job. On a job it
+  runs `docker run … --entrypoint /bin/caos <image> runner --job=<json>` and
+  waits for the container to exit, then removes it
+- The entrypoint is forced. Any image that carries `/bin/caos` and a `/worker` is
+  a compute image, whatever entrypoint or command the image configures
+- PID 1 is therefore `caos runner`, running as root (`/bin/caos` is setuid). It
+  stays root so that it can set up and tear down the root-owned `/cas`.
+  `/worker` is only ever its child. A slot does not poll again until its
+  container exits, so a slot is one container's worth of capacity
+
+### One job
+
+`caos runner` takes a job through these steps. The worker takes part in only the
+third.
+
+1. unpack the ArgTree the job names, and set up `/cas` (root-owned) with the
+   args materialized lazily at `/cas/args`
+2. write the secrets granted to this job to `/secret/<name>`, wiping any left by
+   an earlier job
+3. run `/worker` as the unprivileged worker user (`CAOS_WORKER_UID` and
+   `CAOS_WORKER_GID`, default 1000), relaying its output to the container log.
+   The worker writes `/cas/out` through `caos`
+4. remove the secrets, then read the kind and hash recorded at `/cas/out`
+5. POST the outcome to `/runner/result`: `ok` with `"<type> <hash>"`, or an error
+   with the tail of the log. The first post per nonce wins; a later one is
+   answered 410 and dropped
+6. tear down `/cas`, then reset the container (below)
+
+**The runner posts the result. The worker never does.** The worker's only
+output is `/cas/out`. If the container exits nonzero, runnerd posts a failure
+result itself, as a backstop; if the runner had already posted, that post is a
+harmless 410.
+
+### After the first job: stay registered, or exit
+
+After each job the runner polls `POST /runner/poll` with
+`required: {base: <the image's oid>}` and `lineage: [{}]`. The oid is learned once,
+from the first job's materialized args. The poll hangs for its TTL
+(`CAOS_RUNNER_TTL_MS`, read from the container's environment, default 2000 ms;
+the server clamps it to between 10 ms and 300 s). The reply decides:
+
+- a `job` → run it, from step 1. This is the warm-worker case: no container
+  start between jobs
+- anything else (`idle` when the TTL passed, or `exit` when the server evicts
+  the runner so that a slot can serve a job the runner cannot) → the runner
+  returns and the container exits 0. It does not distinguish the two
+
+The runner also exits, without registering again, when:
+
+- posting the result fails (nonzero exit)
+- it never learned the image's oid, because setup failed before `/cas/args`
+  existed. There is nothing to advertise
+- the poll itself fails (nonzero exit)
+
+A job whose `/worker` failed does NOT end the runner. Its failure is posted and
+the runner registers for more work like any other.
+
+### What this does not do
+
+- **Nothing in a worker's control decides this.** A worker cannot ask its
+  container to stay or to leave. The inputs are the TTL in the image's
+  environment and the server's reply
+- **No worker process stays resident.** Every job starts a fresh `/worker`. What
+  a warm runner saves is the container start, not the process start
+- **No worker registers itself.** A worker is never a poller. The pollers are
+  `caos-runnerd` (the generic pool), `caos runner` (one image, one container)
+  and `core-seeder-runner`, which is a separate long-lived poller with its own
+  required args and not a compute image
+- **A job cannot leave a process behind.** After every job `reset_after_job`
+  SIGKILLs every process owned by the worker uid, except the runner, and empties
+  `/tmp`, `/var/tmp` and `/dev/shm`. The container is reused, so these are the
+  only things that separate one job from the next
+- **Required args match by oid, and only `base` is advertised.** A poll matches a
+  job iff every required entry equals the job's top-level arg of that name. The
+  most required keys wins, and ties go to the most recently parked poll. Today a
+  runner polls on its image alone, so any job for that image can reach any warm
+  container for it
+
+### Image-declared settings
+
+An image declares, in its own environment, what runnerd and the runner may do
+for it. A caller cannot ask for these, because they are read from the image
+config and not from the job:
+
+- `CAOS_WORKER_UID`, `CAOS_WORKER_GID`: the user `/worker` runs as, and the uid
+  that is reaped between jobs
+- `CAOS_RUNNER_TTL_MS`: how long the runner lingers for more work
+- `CAOS_GRANT_ENGINE_SOCKET=1`: the container gets the engine socket, if the
+  pool offers one (`CAOS_RUNNER_SOCKET`)
+- `CAOS_GRANT_VOLUMES`: mountpoints backed by persistent named volumes
+
 # Principles of reliability
 
 Caos is reliable because:
