@@ -1,0 +1,5 @@
+# collapse-stack's worker image (format `<path> <name>`): the opt-in Git
+# runtime, because an ancestry check over an imported history is a graph walk
+# that `git merge-base` does from one filtered fetch, and that a per-commit
+# `caos get-hash` walk would pay a round trip for every ancestor.
+../git-runner git-runner

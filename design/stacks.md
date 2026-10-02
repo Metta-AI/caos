@@ -68,25 +68,40 @@ The parent owns the stack's shape.
 
 ## Publishing
 
-**Bottom to top, each layer to its own branch.** The first PR targets the base
-branch; each later one targets the branch below it, which must already exist
-remotely.
+**Reviewers see one commit per layer**, so the agent collapses the stack every
+time it publishes, the first publish and each update alike. The layers keep
+their merge history; collapsing only mints commits beside them.
 
-- **Agent:** `publish_source` per layer (design/agent-publish.md). A
-  fast-forward only, leased on the remote head observed when the call
-  starts, so a change someone else pushed is never overwritten.
-- **User:** `/pr <layer> <base-branch>` in the TUI, in the same order
-  (chat.md, "Publishing with `/pr`"). When the source does not contain the
-  base's tip, the preview offers to import it and ask the agent to merge it
-  up instead of publishing.
+```text
+feature/01-core  -> A'  (merge history)   C1 = tree(A'), parent H    -> feature/01-core
+feature/02-tests -> B'  (merge history)   C2 = tree(B'), parent C1   -> feature/02-tests
+```
 
-  ```text
-  /pr feature/01-core main
-  /pr feature/02-tests feature/01-core
-  ```
+1. **Collapse.** `caos-std/collapse-stack` with `stack=feature`, `onto=H` (the
+   base tip the bottom layer last merged) and one `<entry> <message>` line per
+   layer, bottom first. It mints
+   `C_i = commit(tree(layer i tip), parent C_{i-1} or H, message_i)` with the
+   author and committer of layer i's tip, and prints `<layer> <C_i>`. It
+   refuses, naming both, a layer that does not contain the one below it (or
+   H): merge first. Identical input mints identical commits, so republishing
+   an unchanged stack pushes nothing new.
+2. **Link.** `publish_source` publishes a gitlink, so each `C_i` goes into the
+   conversation: `caos get-hash C_i /cas/c; rm -rf publish/<layer>; ln -s
+   /cas/c publish/<layer>`. A linked commit is a directory, hence `rm -rf`.
+3. **Push, bottom to top,** with `publish_source(rewrite=true)`
+   (design/agent-publish.md). A collapsed commit does not descend from the one
+   it replaces, so this is the one case for a rewrite. **The push stays leased
+   on the exact remote head observed when the call starts**: a rewrite can
+   replace history the agent has seen, never a change someone else pushed.
 
-Either way **the published branch is the layer's own history**, merges
-included. Publication changes no gitlink.
+The first PR targets the base branch; each later one targets the branch below
+it, which must already exist remotely.
+
+**The TUI's `/pr` does not collapse.** `/pr <layer> <base-branch>`, in the same
+order, pushes the layer's own history, merges included (chat.md, "Publishing
+with `/pr`"); when the source does not contain the base's tip, its preview
+offers to import it and ask the agent to merge it up instead. It is slated for
+removal once agent publication covers it (agent-github.md, "PRs").
 
 ## Not built
 

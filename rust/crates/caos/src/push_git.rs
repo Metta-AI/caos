@@ -3,6 +3,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut positional = Vec::new();
     let mut token_file = None;
     let mut expected = None;
+    let mut rewrite = false;
     for arg in args {
         if let Some(value) = arg.strip_prefix("--github-token-file=") {
             if token_file.replace(value).is_some() {
@@ -12,6 +13,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             if expected.replace(value).is_some() {
                 return Err("duplicate expected head".into());
             }
+        } else if arg == "--rewrite" {
+            if rewrite {
+                return Err("duplicate rewrite flag".into());
+            }
+            rewrite = true;
         } else if arg.starts_with('-') {
             return Err("unknown push-git option".into());
         } else {
@@ -31,7 +37,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         _ => return Err("push-git requires --expected=<full hash|absent>".into()),
     };
     let commit = commit.to_ascii_lowercase();
-    let body = serde_json::json!({"destination":destination,"commit":commit,"branch":branch,"expected":expected}).to_string();
+    let body = serde_json::json!({"destination":destination,"commit":commit,"branch":branch,"expected":expected,"rewrite":rewrite}).to_string();
     // Everything that can fail locally happens before dispatch. Once a request
     // may have been sent, always return a receipt, even for an unreadable response.
     let (server, headers) = crate::import_git::prepare(destination, token_file)?;

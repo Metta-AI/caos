@@ -1,0 +1,23 @@
+# The `collapse-stack` tool (design/stacks.md, "Publishing"): the
+# std/git-runner image with this directory's script curried onto it, plus the
+# `help` it is described by. It returns VALUES — new commit hashes — and changes
+# no tree, so it is not a `@writer`; the agent links the commits it prints.
+HELP=<<END
+Collapse a stack of source layers into one commit per layer, for publishing each
+layer as a branch with a linear history. The layers keep their own merge history;
+this only mints new commits beside them.
+
+For each layer in order, C = commit(tree = the layer tip's tree, parent = the
+previous C, or `onto` for the first layer, message = that layer's message), with
+the author and committer copied from the layer tip. The same input always mints
+the same commits. Refused, naming both, unless each layer's tip already contains
+the one below it (or `onto`, for the first): merge a changed lower layer up first.
+
+Prints one line per layer, `<layer name> <commit>`. To publish, link each commit
+into the conversation (`caos get-hash <commit> /cas/c; ln -s /cas/c <path>`) and
+publish_source them bottom to top with rewrite=true.
+@param {tree} stack Conversation path of the directory holding the layer gitlinks, e.g. `feature`.
+@param {commit} onto Full hash of the commit the first layer is published onto: the base branch's tip that layer 1 last merged.
+@param {array} layers One entry per layer, bottom first: `<entry name in stack> <commit message>`, e.g. `01-core Add the parser core`.
+END
+curry --base:@=DEEP-DEPS/git-runner --worker1:@=worker.sh --help=$HELP
