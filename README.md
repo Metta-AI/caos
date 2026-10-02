@@ -717,7 +717,7 @@ passes (see `design/runner-protocol.md`). Per job:
    results go back to the caller as-is; a `promise` (a `caos map-then`
    continuation) is resolved by the server once posted;
 5. **tear down** — delete `/cas`, then long-poll `/runner/poll` for another job
-   for this image (`required: {image: <oid>}`). An `idle` or `exit` reply ends
+   for this image (`required: {base: <oid>}`). An `idle` or `exit` reply ends
    the container; a job goes back to step 1 — that's the warm-worker win: no
    container start between jobs.
 
