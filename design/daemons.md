@@ -299,8 +299,9 @@ also carries a `nonce`, so it always reaches the daemon. `start` carries an
 | `harvest` | export selected inner refs to the outer server | the refs written |
 | `stop` | stop the stack; leave the loop | `stopped` |
 
-Reads never wake a stack (see Spillover above). `start` is idempotent: if the
-stack is already up it replies with the current ticket.
+Reads never wake a stack (see Spillover above). `start` is idempotent per
+epoch: the server runs one and answers repeats with the same result, which has
+the same ticket. If `status` says *not running*, bump the epoch and start again.
 
 ## Identity and tickets
 
