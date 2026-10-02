@@ -40,9 +40,6 @@ while IFS= read -r line || [ -n "$line" ]; do
   if [ "$message" = "$line" ] || [ -z "$message" ]; then
     refuse "layer line \"$line\" has no commit message; write \`<entry> <message>\`"
   fi
-  if [ "$name" = . ] || [ "$name" = .. ] || [[ "$name" == */* ]]; then
-    refuse "\"$name\" is not an entry name; name a layer directly inside stack"
-  fi
   if [ -n "${seen[$name]+x}" ]; then
     refuse "layer $name is listed twice"
   fi

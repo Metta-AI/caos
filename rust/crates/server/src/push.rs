@@ -353,7 +353,11 @@ mod tests {
             .unwrap()
             .expected
             .is_some());
-        assert!(!serde_json::from_value::<Input>(value.clone()).unwrap().rewrite);
+        assert!(
+            !serde_json::from_value::<Input>(value.clone())
+                .unwrap()
+                .rewrite
+        );
         value["rewrite"] = json!(true);
         assert!(serde_json::from_value::<Input>(value).unwrap().rewrite);
     }
