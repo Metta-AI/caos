@@ -91,8 +91,11 @@ commit into B and test; the layers keep that full merge history.
 
 #### Publishing a stack
 
-Reviewers see one commit per layer, so the stack is collapsed before it is
-pushed. The layers themselves are never rewritten:
+Reviewers see one commit per layer, so the stack is collapsed every time it is
+pushed, the first publish and each update alike. The layers themselves are
+never rewritten: bringing a stack onto a moved base (what "rebase" means here)
+is importing the base, merging it into the bottom layer and each layer into the
+one above, and testing. Then:
 
 1. Run `caos-std/collapse-stack` with `stack=feature`, `onto=H` (the base
    branch's tip that layer 1 last merged) and one `<entry> <message>` line per
@@ -102,8 +105,10 @@ pushed. The layers themselves are never rewritten:
    naming both, a layer that does not contain the one below it (or H): merge
    first. Identical input mints identical commits, so republishing an unchanged
    stack pushes nothing new.
-2. Link each `C_i` into the conversation (`caos get-hash C_i /cas/c; ln -s
-   /cas/c publish/<layer>`), since `publish_source` publishes a gitlink.
+2. Link each `C_i` into the conversation (`caos get-hash C_i /cas/c; rm -rf
+   publish/<layer>; ln -s /cas/c publish/<layer>`), since `publish_source`
+   publishes a gitlink. A linked commit is a directory, so replacing one on an
+   update needs `rm -rf`, not `rm -f`.
 3. `publish_source` each, bottom to top, with `rewrite=true`. A collapsed
    commit does not descend from the one it replaces, so this is the one case for
    a rewrite; the push stays leased on the exact remote head `publish_source`
