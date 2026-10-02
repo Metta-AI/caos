@@ -12,7 +12,7 @@
 # and genuinely recomputes; the server's salt does not reach a sub-run's key
 # (CLAUDE.md), so this payload is what does.
 #
-# FOUR STAGES: no run can be waited on, so each assertion is the `then` of the
+# THREE STAGES: no run can be waited on, so each assertion is the `then` of the
 # run it is about.
 set -euo pipefail
 
@@ -38,14 +38,15 @@ mktree() { # <cas-name> <path=content>... -> its oid
   caos hash "/cas/$dst"
 }
 
-# A DISTINCT time per commit, so "the author is the layer tip's" is a real check.
+# A DISTINCT time per commit, and a committer time distinct from the author's,
+# so "the author and committer are the layer tip's" is a real check.
 mint() { # <cas-name> <tree-oid> <time> <message> [parent...]
   local dst=$1 tree=$2 ts=$3 msg=$4; shift 4
   local p
   { printf 'tree %s\n' "$tree"
     for p in "$@"; do printf 'parent %s\n' "$p"; done
     printf 'author dev <dev@caos> %s +0000\n' "$ts"
-    printf 'committer dev <dev@caos> %s +0000\n' "$ts"
+    printf 'committer dev <dev@caos> %s +0000\n' "$((ts + 50))"
     printf '\n%s (%s)\n' "$msg" "$SALT"
   } > /tmp/commit
   caos put-commit /tmp/commit "/cas/$dst" || fail "minting $dst"
@@ -77,19 +78,14 @@ build() {
   mkstack unmerged 01-core=l1b 02-tests=l2a
 }
 
-LAYERS='01-core Add the core
-02-tests Test the core'
+LAYERS="01-core Add the core ($SALT)
+02-tests Test the core ($SALT)"
 collapse() { # <stack-cas-name> [extra arg...] -> a request hash
   local stack=$1; shift
   caos prepare-request --base:hash="$(caos hash /cas/args/collapse)" \
     --stack:@="/cas/$stack" --onto:@=/cas/b --layers="$LAYERS" "$@"
 }
 result() { caos get /cas/args/result >/dev/null; cat /cas/args/result; }
-field() { printf '%s\n' "$1" | { grep "^$2 " || true; } | cut -d' ' -f2- ; }
-raw_commit() { # <oid> -> its raw bytes
-  caos get-hash "$1" "/cas/raw-$1" || fail "fetching commit $1"
-  cat "/cas/raw-$1"
-}
 
 case "$stage" in
 
@@ -101,42 +97,19 @@ start)
 
 collapsed)
   build
-  out=$(result)
-  [ "$(printf '%s\n' "$out" | wc -l)" = 2 ] || fail "expected two lines:
-$out"
-  C1=$(field "$out" 01-core)
-  C2=$(field "$out" 02-tests)
-  [ -n "$C1" ] && [ -n "$C2" ] || fail "missing a layer in:
-$out"
-  c1=$(raw_commit "$C1")
-  c2=$(raw_commit "$C2")
-  l1b=$(raw_commit "$L1B")
-  l2b=$(raw_commit "$L2B")
-  [ "$(field "$c1" tree)" = "$L1B_T" ] || fail "C1's tree is not layer 1's"
-  [ "$(field "$c2" tree)" = "$L2B_T" ] || fail "C2's tree is not layer 2's"
-  [ "$(field "$c1" parent)" = "$B" ] || fail "C1's parents are not [base]: $(field "$c1" parent)"
-  [ "$(field "$c2" parent)" = "$C1" ] || fail "C2's parents are not [C1]: $(field "$c2" parent)"
-  [ "$(field "$c1" author)" = "$(field "$l1b" author)" ] || fail "C1's author is not layer 1's tip's"
-  [ "$(field "$c2" committer)" = "$(field "$l2b" committer)" ] || fail "C2's committer is not layer 2's tip's"
-  [[ "$c1" == *$'\n\nAdd the core'* ]] || fail "C1's message is not layer 1's:
-$c1"
-  echo "  ok: base <- C1 <- C2, each with its layer tip's tree and author" >&2
-
-  echo "== a second, uncached run mints the same commits ==" >&2
-  # `again` is an arg the tool never reads: it only makes this a new ArgTree,
-  # so the run recomputes rather than replaying the first one's result.
-  caos run-request-then "$(collapse merged --again=1)" \
-    --then:hash="$(next again --first="$out")"
-  ;;
-
-again)
-  build
-  caos get /cas/args/first
-  [ "$(result)" = "$(cat /cas/args/first)" ] || fail "a re-run minted different commits:
-$(result)
-vs
-$(cat /cas/args/first)"
-  echo "  ok: identical input, identical commits" >&2
+  # The commits the tool must mint, minted here: each layer tip's tree on the
+  # one below, with that tip's author and committer (every tip has its own
+  # time) and the layer's message. Equal oids check all of it at once, and
+  # since nothing else goes in, that the same input mints the same commits.
+  C1=$(mint c1 "$L1B_T" 1700000300 "Add the core" "$B")
+  C2=$(mint c2 "$L2B_T" 1700000400 "Test the core" "$C1")
+  want="01-core $C1
+02-tests $C2"
+  [ "$(result)" = "$want" ] || fail "expected:
+$want
+got:
+$(result)"
+  echo "  ok: base <- C1 <- C2, each with its layer tip's tree, author and committer" >&2
 
   echo "== a layer that has not merged the one below is refused ==" >&2
   caos run-request-then "$(collapse unmerged)" --then:hash="$(next refused)"
