@@ -192,7 +192,7 @@ runner process calls them in-process (setup `/cas`, fork `/worker`
 unprivileged, read `/cas/out`, teardown, `reset_after_job`) — two processes,
 no middle layer. Doing the materialization itself means the runner has the
 args tree's top-level name→oid listing in hand as a side effect — that's where
-its next poll's `required: {image: <oid>}` comes from (`fetch_and_materialize`
+its next poll's `required: {base: <oid>}` comes from (`fetch_and_materialize`
 already fetches the tree and stamps each child's oid; no extra round trip, no
 protocol field).
 
