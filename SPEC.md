@@ -404,6 +404,37 @@ is the same reason the `help` lives in the expression.
   error there takes the agent's turn down with it
 - Unexpected failures die, per the reliability principles above
 
+## Known problem: a tool call costs O(conversation length)
+
+**Every tool call re-validates the conversation's whole history.** A call runs
+`llm-step` in a fresh worker container, and `State::from_store`
+(`std/llm-step/src/progress.rs`) opens a scratch repository, fetches the
+conversation and calls `validate_spine` with an empty `known_valid` — a diff
+and a transition check per commit, back to the root. Nothing survives the
+container, so no call benefits from the one before it.
+
+Measured on CaosLocal1 (2026-10-01, 200 sequential `ls` calls, 446 commits):
+the call itself went from 5.8s to 13s, linearly, while the model's time
+between calls stayed at 1–2.5s. Fetching that history into an empty repository
+takes 0.09s (~300 KiB); one full `validate_spine` of it takes 2.3s in a local
+release build. Validation is the term that grows.
+
+`caos mcp`'s hooks had the same defect, as fresh processes with an in-memory
+cache; there the prompt hook outgrew its timeout and was killed, so no request
+opened and every tool call of the turn was refused. They now keep the newest
+validated head as the local ref `refs/caos/validated/<id>` and walk only to it
+(`validate_cached`, `caos-cli`). A worker has no local state to keep it in.
+
+The fix needs an anchor the worker can trust without walking:
+
+- **The client names it (preferred).** `caos mcp serve` has just validated the
+  head when it declares the call, so it binds that commit into the per-call
+  request and `llm-step` seeds `known_valid` with it. That request is already
+  unique per call, so nothing memoizes worse, and trust does not move: whoever
+  forms the request can already write the conversation ref.
+- **The server validates every conversation push**, and workers trust its
+  refs. Cleaner, and a change to the server's write path.
+
 ## Not built
 
 Everything here was considered and deliberately deferred. Nothing above depends
