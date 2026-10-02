@@ -190,6 +190,13 @@ A caller cannot set any of these.
 - A message's result is cached by its ArgTree like any other job. A pure query
   can be answered from the cache without reaching the daemon. An op with
   effects carries a `nonce` arg, which is the existing answer to memoization.
+- `start` is the exception: it carries a generation number, `epoch`, that its
+  callers agree on, instead of a random nonce. Identical starts then dedupe
+  (single-flight while the start runs, cached afterwards), so each epoch has
+  exactly one daemon, however many callers race. The cost is that the cached
+  reply outlives the daemon: after an eviction or a crash, a repeat of the same
+  `start` is a cache hit and runs nothing. A caller learns that from `status`
+  (*not running*) and bumps the epoch to start again.
 - A resident worker's result must still depend only on its ArgTree and the
   instance's *declared* state. Hidden in-memory state breaks cache
   correctness silently. That is the daemon author's responsibility, and the
