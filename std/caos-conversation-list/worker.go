@@ -104,6 +104,9 @@ func title(n int, tip string) (string, string) {
 		return "", "tip is not a commit"
 	}
 	head, _, _ := bytes.Cut(raw, []byte("\n\n"))
+	if os.Getenv("PROBE") != "" || optArg("debug", "") != "" {
+		say("DEBUG %s:\n%s\n", tip, head)
+	}
 	tree := ""
 	for _, line := range strings.Split(string(head), "\n") {
 		if v, ok := strings.CutPrefix(line, "tree "); ok {
