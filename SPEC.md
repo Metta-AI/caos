@@ -411,9 +411,9 @@ takes 0.09s (~300 KiB); one full `validate_spine` of it takes 2.3s in a local
 release build. Validation is the term that grows.
 
 `caos mcp`'s hooks had the same defect, as fresh processes with an in-memory
-cache; there it killed the prompt hook at its 30s limit, so no request opened
-and every tool call of the turn was refused. They now keep the newest validated
-head as the local ref `refs/caos/validated/<id>` and walk only to it
+cache; there the prompt hook outgrew its timeout and was killed, so no request
+opened and every tool call of the turn was refused. They now keep the newest
+validated head as the local ref `refs/caos/validated/<id>` and walk only to it
 (`validate_cached`, `caos-cli`). A worker has no local state to keep it in.
 
 The fix needs an anchor the worker can trust without walking:

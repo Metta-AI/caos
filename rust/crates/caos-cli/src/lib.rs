@@ -329,7 +329,7 @@ const VALIDATED_PREFIX: &str = "refs/caos/validated/";
 /// new `caos` process, and a full walk costs a diff and a transition check per
 /// commit back to the root -- so with only the in-memory set, every prompt and
 /// every Stop pays for the whole history, and a long session's prompt hook
-/// outlives the 30s it is allowed. A killed prompt hook opens no request, and
+/// outlives its hook timeout. A killed prompt hook opens no request, and
 /// every tool call of that turn is refused. So the newest validated head is
 /// also kept as a local ref, and the walk stops there.
 ///
