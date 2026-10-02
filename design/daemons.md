@@ -155,8 +155,10 @@ attributed to the current job for a failure report.
   *not running* and exit without starting anything; only ops that are meant to
   wake do so. A later server change could add an *exclusive pin* so that a job
   carrying a pinned arg only matches pinned polls.
-- Two starts racing for one instance can create two daemons. A daemon whose
-  identity can be checked (Part 2 uses an actor record) must check on start.
+- Two starts racing for one instance can create two daemons, one per container.
+  Nothing in this design prevents it. A daemon that needs uniqueness has to
+  check on start against something outside the container, for example an actor
+  branch holding the instance's address (Part 2 does not do this in v1).
 
 ## Stopping
 
