@@ -234,9 +234,6 @@ func list() {
 	if filter != "" {
 		say("%d match %q", len(shown), filter)
 	}
-	if wantTitles && filter != "" && limit == 0 {
-		// nothing to add: everything was read
-	}
 	say("")
 	cut := 0
 	if limit > 0 && len(shown) > limit {
