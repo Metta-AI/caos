@@ -6,7 +6,12 @@ functions, cached by redis
 # How to use
 
 - In the instructions below, `$FOO` can be used literally if you have set an env var. `<FOO>` needs to be expanded by you when entering the text
-- `CAOS_SERVER` is a secret ticket that grants access to your caos server
+- `CAOS_SERVER` is a secret ticket that grants access to your caos server. If you work at softmax, get it with:
+  ```
+    AWS_PROFILE=softmax aws secretsmanager get-secret-value \
+      --region us-east-1 --secret-id caos/prod-iroh-ticket \
+      --query SecretString --output text
+  ```
 - `CAOS_SECRETS_DIR` is the directory on your computer where you keep caos secrets
 - On your computer, make some secrets:
   - `mkdir $CAOS_SECRETS_DIR` and then cd there
