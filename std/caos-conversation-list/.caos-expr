@@ -19,9 +19,9 @@ is the tip, and `refs/caos/v3/users/<hex user>/conversations/{active,archived}/<
 records who has it. This reads those refs; nothing is cloned. A Claude Code session's id
 is `cc/<session-id>`.
 
-NO ORDER BY TIME. Commit timestamps are fixed and refs carry none, so the list is sorted
-by id and says nothing about which conversation is recent. Use `filter` (a substring of
-the id or title) to narrow it.
+THE TIME is the committer time of the tip commit: refs carry none, so every tip is read
+to sort, which costs one fetch per conversation. A conversation whose tip cannot be read
+is listed last with the reason. Use `filter` (a substring of the id or title) to narrow it.
 @param [filter] Keep only conversations whose id or title contains this text (case-insensitive).
 @param [limit] Print at most this many conversations (default 50; 0 for all).
 @param [titles] Set to 0 to skip reading each tip's title, which costs one fetch per conversation (default 1).
