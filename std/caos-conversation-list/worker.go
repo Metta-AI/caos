@@ -1,8 +1,8 @@
 // The `caos-conversation-list` tool's worker. Its DOCS live in the sibling
 // `.caos-expr` here-string, not in this header (SPEC, "Tools").
 //
-// It lists the conversations recorded on the server it runs against, so a
-// caller has a tip hash to give `caos-conversation`.
+// It lists the conversations recorded on the server it runs against, newest
+// first, so a caller has a tip hash to give `caos-conversation`.
 //
 // WHERE A CONVERSATION LIVES (v3/refs.rs): in two kinds of git ref on the server,
 // with every id hex-encoded into its ref path:
@@ -14,10 +14,17 @@
 // asks git, which std/go carries for exactly that, at $CAOS_SERVER_URL, the same
 // remote every worker already pushes to.
 //
+// WHEN: a ref carries no time, but the tip COMMIT does. Its committer time is
+// when the last event was recorded, which is the last message. (std/caos-conversation's
+// recording-gaps.md says commit timestamps are all identical; on this server they
+// are not, and that note is the stale one.) So listing newest-first means reading
+// every tip commit, one `caos get-hash` each, BEFORE the limit is applied.
+//
 // A tip's title is `.caos/title` in its tree, read the way caos-conversation
 // reads it. It is best-effort: a conversation whose tip cannot be read is still
 // listed, with a note, because a listing that drops what it cannot describe is
-// how a conversation goes missing without a trace.
+// how a conversation goes missing without a trace. Such a conversation has no
+// time and sorts last.
 //
 // EVERY OUTCOME IS THE VALUE, as in caos-conversation: a server that cannot be
 // reached comes back as text, never as a job error.
@@ -31,6 +38,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"caos/w"
 
@@ -70,6 +78,11 @@ type conversation struct {
 	id      string
 	tip     string
 	members []string
+
+	tree  string
+	when  int64 // committer time of the tip, 0 when it could not be read
+	title string
+	note  string // why there is no time or title, when there is none
 }
 
 // refs returns ref name -> hash for every ref under the given patterns, or the
@@ -92,44 +105,64 @@ func refs(server string, patterns ...string) (map[string]string, string) {
 	return found, ""
 }
 
-// title reads `.caos/title` from the tip's tree. The second result says why
-// there is none, when there is none.
-func title(n int, tip string) (string, string) {
+// readTip fills in the tip's tree and time from its commit.
+func (c *conversation) readTip(n int) {
 	dest := fmt.Sprintf("/cas/c%d", n)
-	if errText, code := w.Try(script.Exec("caos get-hash " + tip + " " + dest)); code != 0 {
-		return "", "tip not fetchable: " + firstLine(errText)
+	if errText, code := w.Try(script.Exec("caos get-hash " + c.tip + " " + dest)); code != 0 {
+		c.note = "tip not fetchable: " + firstLine(errText)
+		return
 	}
 	raw, err := os.ReadFile(dest)
 	if err != nil || !bytes.HasPrefix(raw, []byte("tree ")) {
-		return "", "tip is not a commit"
+		c.note = "tip is not a commit"
+		return
 	}
 	head, _, _ := bytes.Cut(raw, []byte("\n\n"))
-	if optArg("titles", "1") == "2" {
-		say("DEBUG %s:\n%s\n", tip, head)
-	}
-	tree := ""
 	for _, line := range strings.Split(string(head), "\n") {
 		if v, ok := strings.CutPrefix(line, "tree "); ok {
-			tree = v
+			c.tree = v
+		}
+		// `committer Name <email> <unix> <tz>`: the time is the second-to-last field.
+		if v, ok := strings.CutPrefix(line, "committer "); ok {
+			fields := strings.Fields(v)
+			if len(fields) >= 2 {
+				if t, err := strconv.ParseInt(fields[len(fields)-2], 10, 64); err == nil {
+					c.when = t
+				}
+			}
 		}
 	}
+	if c.when == 0 {
+		c.note = "tip has no readable time"
+	}
+}
+
+// readTitle reads `.caos/title` from the tip's tree.
+func (c *conversation) readTitle(n int) {
+	if c.tree == "" {
+		return
+	}
 	root := fmt.Sprintf("/cas/t%d", n)
-	if errText, code := w.Try(script.Exec("caos get-hash " + tree + " " + root)); code != 0 {
-		return "", "tree not fetchable: " + firstLine(errText)
+	if errText, code := w.Try(script.Exec("caos get-hash " + c.tree + " " + root)); code != 0 {
+		c.note = "tree not fetchable: " + firstLine(errText)
+		return
 	}
 	for _, p := range []string{root + "/.caos", root + "/.caos/title"} {
 		if _, err := os.Stat(p); err != nil {
-			return "", "no title recorded"
+			c.note = "no title recorded"
+			return
 		}
 		if _, code := w.Try(script.Exec("caos get " + p)); code != 0 {
-			return "", "title not fetchable"
+			c.note = "title not fetchable"
+			return
 		}
 	}
 	b, err := os.ReadFile(root + "/.caos/title")
 	if err != nil {
-		return "", "title not readable"
+		c.note = "title not readable"
+		return
 	}
-	return strings.TrimSpace(string(b)), ""
+	c.title = strings.TrimSpace(string(b))
 }
 
 func firstLine(s string) string {
@@ -203,37 +236,39 @@ func list() {
 		}
 	}
 
+	// Newest first. The id breaks ties, and orders the conversations whose tip
+	// could not be read (time 0) among themselves, at the end.
 	all := make([]*conversation, 0, len(byID))
 	for _, c := range byID {
 		sort.Strings(c.members)
 		all = append(all, c)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+	for i, c := range all {
+		c.readTip(i)
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].when > all[j].when })
 
-	titles := map[string]string{}
-	whys := map[string]string{}
+	// With a filter the title is part of what is matched, so every title is
+	// read; without one, only the conversations that will be printed.
 	if wantTitles {
-		// Titles are read for the conversations that will be printed, not for
-		// all of them, but the filter may be on the title, so with one set the
-		// whole list is read.
 		reading := all
 		if filter == "" && limit > 0 && len(reading) > limit {
 			reading = reading[:limit]
 		}
 		for i, c := range reading {
-			titles[c.id], whys[c.id] = title(i, c.tip)
+			c.readTitle(i)
 		}
 	}
 
 	var shown []*conversation
 	for _, c := range all {
-		hay := strings.ToLower(c.id + "\n" + titles[c.id])
-		if filter == "" || strings.Contains(hay, filter) {
+		if filter == "" || strings.Contains(strings.ToLower(c.id+"\n"+c.title), filter) {
 			shown = append(shown, c)
 		}
 	}
 
-	say("%d conversations on %s", len(all), server)
+	say("%d conversations on %s, newest first", len(all), server)
 	if filter != "" {
 		say("%d match %q", len(shown), filter)
 	}
@@ -244,11 +279,15 @@ func list() {
 		shown = shown[:limit]
 	}
 	for _, c := range shown {
-		line := c.id + "  " + c.tip
-		if t := titles[c.id]; t != "" {
-			line += "  " + strconv.Quote(t)
-		} else if why := whys[c.id]; why != "" {
-			line += "  (" + why + ")"
+		when := "(no time)"
+		if c.when != 0 {
+			when = time.Unix(c.when, 0).UTC().Format("2006-01-02T15:04:05Z")
+		}
+		line := when + "  " + c.id + "  " + c.tip
+		if c.title != "" {
+			line += "  " + strconv.Quote(c.title)
+		} else if c.note != "" {
+			line += "  (" + c.note + ")"
 		}
 		if len(c.members) > 0 {
 			line += "  [" + strings.Join(c.members, ", ") + "]"
@@ -257,7 +296,7 @@ func list() {
 	}
 	if cut > 0 {
 		say("")
-		say("… %d more; pass limit=0 for all, or filter=<text> to narrow", cut)
+		say("… %d older; pass limit=0 for all, or filter=<text> to narrow", cut)
 	}
 	if len(skipped) > 0 {
 		say("")
