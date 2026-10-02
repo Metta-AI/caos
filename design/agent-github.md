@@ -77,34 +77,7 @@ remove `/pr`, `/publish-branch`, and their UI.
 
 ### Stacks
 
-Keep each stack boundary as a source gitlink:
-
-```text
-imports/repo/base   -> H
-feature/01-core     -> A   parent H
-feature/02-tests    -> B   parent A
-```
-
-Start each layer by copying the preceding snapshot with `cp -a`, then editing
-the copy. Git ancestry records the dependency. Push A and B to corresponding
-remote branches; the first PR targets `main`, the second targets the first
-branch. If A changes, merge its new commit into B, test, and push.
-
-Link the existing PR URLs in order with
-[`gh stack link`](https://docs.github.com/en/pull-requests/reference/stacked-prs-cli-commands#gh-stack-link):
-
-```sh
-GH_REPO=owner/repo gh stack link --base main \
-  https://github.com/owner/repo/pull/123 \
-  https://github.com/owner/repo/pull/124
-```
-
-This needs no local stack branches. Commands such as `push`, `submit`, and
-`rebase` do require local branches and stack metadata. Supporting them would
-mean reconstructing that local repository from gitlinks and returning any
-rewritten commits to CAOS. Use CAOS's copy, edit, and merge operations initially,
-and `link` to publish the relationship. `modify` additionally requires linear
-history, so it cannot restructure stacks containing merge commits.
+See [stacks.md](stacks.md).
 
 ### Merges
 

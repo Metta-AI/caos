@@ -966,8 +966,8 @@ revision (and made the history tools' hashes readable the same way).
 The [conversation publication flow](design/chat.md) publishes one named gitlink
 with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
 branch name. The base is explicit; an omitted URL comes from unambiguous import
-provenance. Directory ordering guides review, not publication. Publish earlier
-PRs first, then name their remote branches as later PR bases.
+provenance. A stack is published bottom to top, each layer based on the branch
+below ([Stacks](design/stacks.md)).
 
 The client previews the exact source commit and destination before confirmation.
 If the source does not contain the fetched base tip, it offers to import that
