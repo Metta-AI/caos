@@ -384,8 +384,9 @@ dies with the container. `harvest` copies it out.
 |---|---|
 | relay unreachable or not set | `start` replies with an error; no ticket is published |
 | engine socket not offered by the pool | the inner stack cannot start containers; `status` shows it |
-| second `start` for a live instance | returns the current ticket |
-| `start` races and lands in two containers | not prevented in v1 (needs an actor record or an exclusive pin); callers start each instance once |
+| second `start`, same epoch | deduped by the server: one run, same reply and ticket |
+| `start` with a different epoch while the first stack is up | a different request, so a second stack starts. Callers agree on the epoch |
+| repeat `start` after eviction, same epoch | a cache hit; nothing runs. `status` says *not running*; bump the epoch |
 | stack crashes | the daemon exits, the runner exits, the slot is freed; `status` says *not running* |
 | eviction or cap | SIGTERM, final `harvest`, then killed |
 
