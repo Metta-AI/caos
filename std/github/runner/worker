@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stage the compiled worker in the GitHub CLI image.
+set -euo pipefail
+
+bin=/cas/args/worker1
+caos get "$bin"
+if [ ! -f "$bin" ]; then
+  echo "github-runner: the worker1 arg is not a regular file" >&2
+  exit 1
+fi
+
+run_dir=$(mktemp -d /tmp/caos-github-runner.XXXXXX)
+cp "$bin" "$run_dir/worker"
+chmod 755 "$run_dir/worker"
+exec "$run_dir/worker"

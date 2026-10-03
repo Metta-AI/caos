@@ -22,3 +22,7 @@ concurrent updates, code-history preservation and publication guards. It needs n
 The llm-import entry exercises agent-driven importing in an empty conversation,
 including provenance, readable history, occupied destinations, and invalid
 sources. Pinning and replay are also covered by llm-step's unit tests.
+
+The github entry exercises the packaged CLI, secret grants and invocation
+replay using the version command. It requires
+no GitHub account and makes no external writes.
