@@ -7,3 +7,14 @@
 /target
 # Everything cargo compiles lives under rust/, so its target dir does too.
 /rust/target
+# A std tool run through cargo OUTSIDE a worker: the crate's path deps get
+# hand-linked beside Cargo.toml (worker-common, llm-client, conversation-protocol,
+# or DEEP-DEPS/<name>), and cargo writes target/ and a Cargo.lock next to them.
+# Inside a worker, rustc splices those deps itself and skips DEEP-DEPS/; the
+# `:@=` ingest ships only git-tracked paths. None of it belongs in the tree.
+/std/*/DEEP-DEPS/
+/std/*/target/
+/std/*/Cargo.lock
+/std/*/worker-common
+/std/*/llm-client
+/std/*/conversation-protocol
