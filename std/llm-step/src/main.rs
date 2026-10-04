@@ -1459,17 +1459,35 @@ fn prepare_compute(
 
 
 fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepared, String> {
+    let id = call["id"].as_str().unwrap_or("");
     let theirs = match resolve_theirs(cfg, call) {
         Ok(theirs) => theirs,
         Err(block) => return Ok(Prepared::Result(block)),
     };
+    let base = match merge_base_input(call) {
+        Ok(base) => base,
+        Err(error) => return Ok(Prepared::Result(error_block(id, &error))),
+    };
     let theirs_path = fresh("theirs");
+    let base_path = fresh("merge-base");
     caos(["get-hash", &theirs, &theirs_path])?;
+    let mut args = vec![("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))];
+    // `merge-base` is the model's to name, so a hash that names nothing, or names
+    // something other than a commit, is answered as its mistake.
+    if let Some(base) = &base {
+        if caos(["get-hash", base, &base_path]).is_err() {
+            let error = format!("merge's `merge-base` {base} names no object; is it imported?");
+            return Ok(Prepared::Result(error_block(id, &error)));
+        }
+        let kind = worker_common::cas_kind(&base_path)?;
+        if kind != "commit" {
+            let error = format!("merge's `merge-base` {base} is a {kind}, not a commit");
+            return Ok(Prepared::Result(error_block(id, &error)));
+        }
+        args.push(("merge-base", Arg::Path(&base_path)));
+    }
     let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
-    let curried = caos_curry(
-        Arg::Hash(image),
-        &[("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))],
-    )?;
+    let curried = caos_curry(Arg::Hash(image), &args)?;
     // NO `in`. merge never read one, and `ours` already determines the tree,
     // so binding it only made the key bigger. Its help declares no `@in`.
     let _ = ws;
@@ -3209,6 +3227,27 @@ fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
     lookup_theirs(cfg.merge_refs.as_deref(), theirs).map_err(|error| error_block(id, &error))
 }
 
+/// merge's optional `merge-base`: absent, or a full commit hash. Unlike `theirs`
+/// it takes no ref names, because the commit it names is an old tip that no
+/// ref snapshot holds.
+fn merge_base_input(call: &Value) -> Result<Option<String>, String> {
+    let base = match &call["input"]["merge-base"] {
+        Value::Null => return Ok(None),
+        Value::String(base) => base.trim(),
+        _ => return Err("merge's `merge-base` must be a string: a full commit hash".to_string()),
+    };
+    if base.is_empty() {
+        return Ok(None);
+    }
+    if matches!(base.len(), 40 | 64) && base.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(base.to_string()))
+    } else {
+        Err(format!(
+            "merge's `merge-base` must be a full commit hash, not {base:?}"
+        ))
+    }
+}
+
 fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, String> {
     let theirs = theirs
         .ok_or_else(|| "merge needs a string `theirs` (a ref name or a commit hash)".to_string())?;
@@ -4416,6 +4455,17 @@ mod tests {
         assert_eq!(lookup_theirs(Some(&refs), Some("origin/main")).unwrap(), b);
         let error = lookup_theirs(Some(&refs), Some("missing")).unwrap_err();
         assert!(error.contains("main") && error.contains("origin/main"));
+    }
+
+    #[test]
+    fn merge_base_is_absent_or_a_full_commit_hash() {
+        let input = |base: Value| json!({"input": {"theirs": "x", "merge-base": base}});
+        assert_eq!(merge_base_input(&json!({"input": {}})).unwrap(), None);
+        assert_eq!(merge_base_input(&input(json!(""))).unwrap(), None);
+        let hash = "a".repeat(40);
+        assert_eq!(merge_base_input(&input(json!(hash))).unwrap(), Some(hash));
+        assert!(merge_base_input(&input(json!("main"))).is_err());
+        assert!(merge_base_input(&input(json!(7))).is_err());
     }
     struct ImportStore {
         objects: MemoryStore,
