@@ -929,7 +929,10 @@ fn resolve_object(value: &str, want: &str, conversation: Option<&str>) -> Result
 /// The tool_result block for a tree tool's result — a VALUE whose shape the
 /// tool chose, rendered by `caos-cli run-tool`'s conventions: a tree with a
 /// `report` shows the report (a FAILED banner renders `is_error`); a plain
-/// blob shows its text; any other tree shows its top-level listing.
+/// blob shows its text; any other tree shows its HASH and its top-level
+/// listing. The hash is what makes a tree-valued result usable at all: the
+/// model links a returned tree into the conversation with `caos get-hash`
+/// (collapse-stack, design/stacks.md), and names alone give it nothing to link.
 pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
     caos(["get", result])?;
     let p = Path::new(result);
@@ -948,7 +951,8 @@ pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
                 .filter_map(|e| e.file_name().to_str().map(str::to_string))
                 .collect();
             names.sort();
-            (format!("result tree: {}", names.join(" ")), false)
+            let oid = worker_common::cas_hash(result)?;
+            (format!("result tree {oid}: {}", names.join(" ")), false)
         }
     } else {
         let bytes = fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?;

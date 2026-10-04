@@ -180,26 +180,37 @@ This takes three steps:
      mystack-messages/02-tests      Test the feature\n\n<body>
      ```
 
-   The layers are the message files, in filename order, so `00-base` (which
-   has none) is not published.
+   The layers are the message files, in filename order (byte order,
+   `LC_ALL=C`), so `00-base` (which has none) is not published.
 
    For each layer it mints
    `C_i = commit(tree(layer i), parent C_{i-1} or onto, message_i)`, with the
    author and committer of the layer's tip, and returns them as one tree of
-   gitlinks, `T = {01-feature: C1, 02-tests: C2}`. It refuses a layer that does not contain the one below it (or `onto`): merge
-   first. The same input mints the same commits, so republishing an unchanged
-   stack pushes nothing new.
+   gitlinks, `T = {01-feature: C1, 02-tests: C2}`, which the agent sees as
+   `result tree <T>: 01-feature 02-tests`. The same input mints the same
+   commits, so republishing an unchanged stack pushes nothing new.
 
-   **TODO:** the tool still takes `layers` (one `<entry> <message>` line per
-   layer, which cannot hold a multi-line message) and prints `<layer> <C_i>`
-   lines instead of returning `T`.
+   It refuses, as a `FAILED` report rather than an error, a layer that does
+   not contain the one below it (or `onto`): merge first. It also refuses a
+   message file naming no stack entry, or an entry that is not a gitlink, an
+   empty message file or a subfolder, and a folder with no message files.
 
 2. **Link** `T` into the conversation with the shell, since `publish_source`
-   takes a gitlink:
+   takes a gitlink. The call declares `paths: ["publish/mystack"]`: on a
+   republish the old link is there, and the shell can only remove what it
+   has materialized (undeclared, `rm -rf` is refused with `Permission
+   denied`). On the first publish the path does not exist yet, and declaring
+   it costs nothing; on a republish it checks out the old collapsed layers
+   only for `rm -rf` to delete them.
 
    ```sh
-   caos get-hash <T> /cas/s; rm -rf publish/mystack; ln -s /cas/s publish/mystack
+   caos get-hash <T> /cas/s; rm -rf publish/mystack; mkdir -p publish; ln -s /cas/s publish/mystack
    ```
+
+   Each child, `publish/mystack/01-feature`, is then a gitlink in the
+   conversation tree at `C1`, which is what `publish_source` takes as a
+   `source_tree`. `tests/chat-collapse-publish` runs steps 1 and 2 and calls
+   `publish_source` on a child; the push itself is not tested.
 
 3. **Push**, bottom to top, with `publish_source`:
 

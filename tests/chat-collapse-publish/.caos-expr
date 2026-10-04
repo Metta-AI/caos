@@ -1,0 +1,11 @@
+# tests/chat-collapse-publish, as an ENTRY: evaluating this directory yields the
+# test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST, like tests/chat-tools-mixed: the subject is the publishing
+# recipe design/stacks.md gives an agent — collapse-stack, then one shell line
+# linking its tree, then publish_source on a child of that link — run through
+# llm-step's real tool loop with a scripted model.
+#
+# dev/worker-test, not std/bash: the conversation REF is the completion signal,
+# and refs on the server are the one thing caos gives a worker no verb for.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash-tool:@=DEEP-DEPS/bash-tool --collapse:@=DEEP-DEPS/collapse-stack --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh
