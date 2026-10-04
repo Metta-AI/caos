@@ -3139,9 +3139,14 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // Everything below implements no entry and has no path, so declaring it here
     // is the only way to reach it at all.
     let mut registry = tools::declarations();
-    registry.push(with_source_tree(tools::tree_tool_declaration(
-        &tools::builtin_tool("publish_source", publish_source::HELP),
+    let mut publish = with_source_tree(tools::tree_tool_declaration(&tools::builtin_tool(
+        "publish_source",
+        publish_source::HELP,
     )));
+    // Help types are what a curried arg can carry, which has no boolean; this
+    // built-in reads its input as JSON, so it can take a real one.
+    publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
+    registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());

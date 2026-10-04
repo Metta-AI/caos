@@ -485,8 +485,8 @@ def main():
             # Pushes use a separate empty remote: object transfer comes from
             # the server, including code ancestry, without a worker checkout.
             destination = f"https://localhost:{remote_port}/published.git"
-            def push(commit, branch="topic", old=None, dest=destination, **kwargs):
-                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old},
+            def push(commit, branch="topic", old=None, dest=destination, force=False, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "force":force},
                             endpoint="/git/push", **kwargs)
             def remote_head(branch):
                 return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
@@ -501,6 +501,19 @@ def main():
             assert push(second[0], old=first[0])["kind"] == "ref-converged"
             assert push(third[0], old=first[0])["status"] == "conflict"
             assert json.loads(push(first[0], old=second[0], expected=422))["code"] == "not-fast-forward"
+            assert remote_head("topic") == second[0]
+            # A forced push may move the branch backwards, but only from the exact
+            # head it names: a stale lease is still a conflict.
+            assert push(first[0], old=second[0], force=True)["status"] == "complete"
+            assert remote_head("topic") == first[0]
+            assert push(third[0], old=second[0], force=True)["status"] == "conflict"
+            assert remote_head("topic") == first[0]
+            assert push(second[0], old=first[0])["status"] == "complete"
+            if cli:
+                rewritten = json.loads(run(cli, "push-git", destination, first[0], "topic",
+                    "--expected=" + second[0], "--force", env=cli_env))
+                assert rewritten["status"] == "complete", rewritten
+                assert push(second[0], old=first[0])["status"] == "complete"
             assert remote_head("topic") == second[0]
             assert json.loads(push("e" * 40, branch="missing", expected=422))["code"] == "missing-commit"
             unimported = advance()
