@@ -3,9 +3,12 @@
 # here-string, not in this header (SPEC, "CaosTools").
 #
 # Args, materialized under /cas/args:
-#   stack   a tree whose entries include the layer gitlinks
-#   onto    the commit the first layer is published onto
-#   layers  `<entry> <message>` lines, bottom first
+#   stack     a tree whose entries include the layer gitlinks
+#   onto      the commit the first layer is published onto
+#   messages  a tree of message files, one per layer, named after its entry
+#
+# Returns a tree of gitlinks, `{<entry>: <collapsed commit>}`, which the agent
+# links into the conversation as a whole.
 #
 # A refusal is a VALUE, a `report` tree with a FAILED banner, never a job
 # error: the caller is an agent that has to read it and merge.
@@ -24,38 +27,36 @@ refuse() {
 }
 
 caos get /cas/args/stack
-caos get /cas/args/layers
+caos get /cas/args/messages
 onto=$(caos hash /cas/args/onto)
 
+# The layers ARE the message files, in byte order: a glob sorts by the
+# collation, so pin it rather than let a locale reorder `01-x` and `01_x`.
+export LC_ALL=C
 names=()
-messages=()
 tips=()
-declare -A seen=()
-while IFS= read -r line || [ -n "$line" ]; do
-  if [ -z "$line" ]; then
-    continue
+shopt -s nullglob
+for file in /cas/args/messages/*; do
+  name=${file##*/}
+  if [ "$(caos kind "$file")" != blob ]; then
+    refuse "messages/$name is not a file; each layer's message is one file named after its stack entry"
   fi
-  name=${line%% *}
-  message=${line#* }
-  if [ "$message" = "$line" ] || [ -z "$message" ]; then
-    refuse "layer line \"$line\" has no commit message; write \`<entry> <message>\`"
+  caos get "$file"
+  if [ ! -s "$file" ]; then
+    refuse "messages/$name is empty; write layer $name's commit message into it"
   fi
-  if [ -n "${seen[$name]+x}" ]; then
-    refuse "layer $name is listed twice"
-  fi
-  seen[$name]=1
   if [ ! -e "/cas/args/stack/$name" ]; then
-    refuse "stack has no entry $name"
+    refuse "stack has no entry $name, which messages/$name names"
   fi
   if [ "$(caos kind "/cas/args/stack/$name")" != commit ]; then
     refuse "stack entry $name is not a source gitlink"
   fi
   names+=("$name")
-  messages+=("$message")
   tips+=("$(caos hash "/cas/args/stack/$name")")
-done < /cas/args/layers
+done
+shopt -u nullglob
 if [ "${#names[@]}" = 0 ]; then
-  refuse "no layers given"
+  refuse "messages has no files; write one per layer to publish, named after its stack entry"
 fi
 
 # The commit GRAPH only (--filter=tree:0), as std/merge fetches it: ancestry
@@ -91,7 +92,8 @@ done
 # from the clock: that is what makes a re-run mint the same commits, so a
 # republished stack whose layers did not move pushes nothing new.
 out=/tmp/collapse-out
-: > "$out"
+rm -rf "$out"
+mkdir -p "$out"
 parent=$onto
 for i in "${!names[@]}"; do
   raw=$(git -C "$repo" cat-file commit "${tips[$i]}")
@@ -106,12 +108,19 @@ for i in "${!names[@]}"; do
       "committer "*) committer=$header ;;
     esac
   done <<< "$raw"
+  message="/cas/args/messages/${names[$i]}"
   {
     printf 'tree %s\n' "$tree"
     printf 'parent %s\n' "$parent"
-    printf '%s\n%s\n\n%s\n' "$author" "$committer" "${messages[$i]}"
+    printf '%s\n%s\n\n' "$author" "$committer"
+    # The message file's bytes as written, so a body keeps its blank lines; a
+    # missing final newline is the one thing supplied.
+    cat "$message"
+    if [ -n "$(tail -c 1 "$message")" ]; then
+      printf '\n'
+    fi
   } > /tmp/collapse-commit
   parent=$(caos put-commit /tmp/collapse-commit "/cas/c$i")
-  printf '%s %s\n' "${names[$i]}" "$parent" >> "$out"
+  ln -s "/cas/c$i" "$out/${names[$i]}"
 done
 caos put "$out" /cas/out
