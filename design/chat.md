@@ -262,23 +262,10 @@ binds a `help`, each repository documents its own, and `tool_help` is the
 authoritative description of what one takes (SPEC, "CaosTools"). The tool list
 is therefore the same whatever source trees a conversation gains.
 
-### Preparing a stack
+### Stacks
 
-Once the first change is ready, the agent copies it and edits the copy:
-
-```sh
-cp -a feature/01-change feature/02-tests
-```
-
-Now `01-change` remains the first review boundary while `02-tests` advances.
-Each gitlink names a commit snapshot that may include several editing commits.
-The user describes the desired work and PR structure; the agent organizes these
-copies itself.
-
-Sibling gitlinks sort by filename. By convention, the first is the starting
-base and each later entry is a review boundary. Number prefixes make the order
-clear; names such as `dirty` have no special behavior. Folder order neither
-merges Git histories nor chooses a remote PR base.
+A sequence of PRs lives here as sibling gitlinks, one per layer: see
+[stacks.md](stacks.md).
 
 ## Subagents and merging their work
 
@@ -296,24 +283,14 @@ only the child's conversation; the parent's files and references stay unchanged.
 After the child finishes, `harvest_agent` compares its final content with its
 starting content and applies that difference to the parent. It can restrict the
 application to selected paths. The child's transcript and protocol metadata are
-not copied into the parent.
+not copied into the parent. Harvest applies changes at their existing paths and
+creates no stack layers; the parent decides the stack's shape
+([stacks.md](stacks.md)).
 
 Harvesting preserves unrelated parent edits and reconciles concurrent source-tree
 changes. The operation is atomic: if reconciliation conflicts, CAOS retains the
 proposal for resolution without partially installing it. The parent then
 inspects the result, resolves conflicts, and runs checks.
-
-For two independent changes intended as a PR stack, the parent can:
-
-1. Give two children bounded tasks against the same starting source.
-2. Harvest the first child's change into `feature/01-change` and check it.
-3. Preserve that snapshot by copying it to `feature/02-tests`.
-4. Apply the second child's source commit to `feature/02-tests` using a merge,
-   then check the combined result.
-
-Harvest applies changes at their existing paths; it does not choose PR
-boundaries or redirect changes into a differently named snapshot. The parent
-owns that organization unless it delegates it explicitly.
 
 ### Resolving source-tree conflicts
 
@@ -388,15 +365,9 @@ The base branch is explicit. The optional remote is a repository URL, not a
 local remote name such as `origin`. Missing or ambiguous provenance requires
 that URL. The preview shows destination metadata, not a full PR diff.
 
-For a stack, publish each boundary in order:
-
-```text
-/pr feature/01-change main
-/pr feature/02-tests feature/01-change
-```
-
-The preceding branch must exist remotely before it can serve as the next base.
-Publication does not squash source history or change the conversation's gitlinks.
+`/pr` does not squash source history or change the conversation's gitlinks.
+An agent publishing a stack squashes each layer to one commit instead, and
+that replaces `/pr` ([stacks.md](stacks.md), "Publishing").
 `/publish-branch <conversation/gitlink> [remote-URL]` provides the same preview
 and branch push without a PR or base-branch requirement.
 
