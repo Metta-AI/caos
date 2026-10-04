@@ -1,0 +1,40 @@
+# The `squash-stack` tool (design/stacks.md, "Publishing"): the std/go worker
+# image with this directory's program curried onto it, plus the `help` it is
+# described by. A writer run on the conversation: `@in` hands it the
+# conversation tree, and it proposes that tree with the plan's `into` replaced.
+HELP=<<END
+Squash a stack to one commit per layer, for publishing each layer as a branch
+with a linear history, as a plan file says. The layers keep their own merge
+history; this only mints new commits beside them.
+
+The plan is one key=value per line:
+
+  onto=mystack/00-base
+  into=publish/mystack
+  layer=01-feature
+  commit=mystack/01-feature
+  message=Add the feature
+  message=
+  message=Why, in a body.
+  layer=02-tests
+  commit=mystack/02-tests
+  message=Test the feature
+
+onto and into come once, before the first layer=. onto and each commit are a
+conversation path to a gitlink or a full commit hash. Each layer= starts a block
+that becomes <into>/<layer>, with one commit= and its message= lines, which in
+order are that layer's commit message.
+
+For each layer in order, C = commit(tree = the commit's tree, parent = the
+previous C, or onto for the first layer, message = its message lines), with the
+author and committer copied from the commit. The same plan always mints the same
+commits. They are written to into as one folder of gitlinks, replacing what a
+previous run wrote there. Refused, naming both, unless each layer's commit
+contains the one before it (or onto): merge a changed lower layer up first.
+
+Then publish_source each <into>/<layer>, bottom to top, with rewrite=true.
+@param plan Conversation path of the plan file, e.g. `mystack.plan`.
+@writer
+@in
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP

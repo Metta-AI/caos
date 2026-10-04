@@ -1,0 +1,9 @@
+# What this test reaches for (format `<path> <name>`).
+../../std/llm-step llm-step
+../../std/bash-tool bash-tool
+../../std/squash-stack squash-stack
+../../std/llm-stub llm-stub
+../../std/llm-test llm-test
+../../std/llm-test-tool llm-test-tool
+# The image this test runs in: a dependency, not a harness.
+../../dev/worker-test worker-test
