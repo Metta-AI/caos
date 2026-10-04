@@ -932,7 +932,7 @@ fn resolve_object(value: &str, want: &str, conversation: Option<&str>) -> Result
 /// blob shows its text; any other tree shows its HASH and its top-level
 /// listing. The hash is what makes a tree-valued result usable at all: the
 /// model links a returned tree into the conversation with `caos get-hash`
-/// (collapse-stack, design/stacks.md), and names alone give it nothing to link.
+/// (squash-layers, design/stacks.md), and names alone give it nothing to link.
 pub fn tree_tool_result_block(id: &str, result: &str) -> Result<Value, String> {
     caos(["get", result])?;
     let p = Path::new(result);

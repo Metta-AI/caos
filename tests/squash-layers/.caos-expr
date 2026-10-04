@@ -1,0 +1,6 @@
+# tests/squash-layers, as an ENTRY: evaluating this directory yields the test's
+# ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST, like tests/merge: std/squash-layers is the subject, and the
+# fixture commits are minted with `caos put-commit`, so no client is needed.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --squash:@=DEEP-DEPS/squash-layers

@@ -1,10 +1,10 @@
 #!/bin/bash
-# tests/collapse-stack — a WORKER test: no client, no repo.
+# tests/squash-layers — a WORKER test: no client, no repo.
 #
-# Drives std/collapse-stack directly over the stack shape design/stacks.md
+# Drives std/squash-layers directly over the stack shape design/stacks.md
 # describes: a base B at 00-base, layer 1 on B, layer 2 copied from layer 1,
 # then layer 1 changes and is MERGED UP into layer 2, so layer 2's tip is a
-# merge commit; a third layer sits on layer 2. Collapsing must give one
+# merge commit; a third layer sits on layer 2. Squashing must give one
 # single-parent commit per layer that has a message file, B <- C1 <- C2 <- C3,
 # each carrying its layer tip's tree, author and committer and its file's
 # message byte for byte, returned as ONE TREE of gitlinks — and must refuse,
@@ -24,7 +24,7 @@ stage=start
 if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
   --worker1:@=/cas/args/worker1 --stage="$s" --test-salt:@=/cas/args/test-salt \
-  --collapse:@=/cas/args/collapse "$@"; }
+  --squash:@=/cas/args/squash "$@"; }
 
 caos get /cas/args/test-salt || fail "reading --test-salt"
 SALT=$(cat /cas/args/test-salt)
@@ -131,8 +131,8 @@ build() {
   mkmessages msgs-none
 }
 
-collapse() { # <stack-cas-name> <messages-cas-name> [onto-cas-name] -> a request hash
-  caos prepare-request --base:hash="$(caos hash /cas/args/collapse)" \
+squash() { # <stack-cas-name> <messages-cas-name> [onto-cas-name] -> a request hash
+  caos prepare-request --base:hash="$(caos hash /cas/args/squash)" \
     --stack:@="/cas/$1" --messages:@="/cas/$2" --onto:@="/cas/${3:-b}"
 }
 
@@ -154,24 +154,24 @@ launch_refusal() { # <case index>
   local spec=${REFUSALS[$1]%%|*} stack msgs onto
   read -r stack msgs onto <<< "$spec"
   echo "== refusal $1: stack=$stack messages=$msgs onto=$onto ==" >&2
-  caos run-request-then "$(collapse "$stack" "$msgs" "$onto")" \
+  caos run-request-then "$(squash "$stack" "$msgs" "$onto")" \
     --then:hash="$(next "refused-$1")"
 }
 
 case "$stage" in
 
 start)
-  echo "== collapse a stack whose layer 2 merged a revised layer 1 ==" >&2
-  caos run-request-then "$(collapse merged msgs)" --then:hash="$(next collapsed)"
+  echo "== squash a stack whose layer 2 merged a revised layer 1 ==" >&2
+  caos run-request-then "$(squash merged msgs)" --then:hash="$(next squashed)"
   ;;
 
-collapsed)
+squashed)
   caos get /cas/args/result >/dev/null
   [ "$(caos kind /cas/args/result)" = tree ] \
     || fail "the result is not a tree: $(cat /cas/args/result)"
   if [ -e /cas/args/result/report ]; then
     caos get /cas/args/result/report >/dev/null
-    fail "the collapse was refused: $(cat /cas/args/result/report)"
+    fail "the squash was refused: $(cat /cas/args/result/report)"
   fi
   # 00-base has no message file, so it is not published; nothing else rides
   # along. LC_ALL=C so this listing is the byte order the tool promises.
@@ -219,7 +219,7 @@ refused-*)
   if [ "$((i + 1))" -lt "${#REFUSALS[@]}" ]; then
     launch_refusal "$((i + 1))"
   else
-    printf 'collapse-stack: ALL PASS\n' > /tmp/report
+    printf 'squash-layers: ALL PASS\n' > /tmp/report
     cat /tmp/report >&2
     caos put /tmp/report /cas/out
   fi

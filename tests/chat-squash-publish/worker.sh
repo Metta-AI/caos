@@ -1,10 +1,10 @@
 #!/bin/bash
 # shellcheck disable=SC1091,SC2034,SC2154
-# tests/chat-collapse-publish — design/stacks.md's "Publishing", run the way an
+# tests/chat-squash-publish — design/stacks.md's "Publishing", run the way an
 # agent runs it, through llm-step's real tool loop with a scripted model:
 #
 #   turn 1  build a stack with the shell, write one message file per layer,
-#           run_tool collapse-stack. The model must be SHOWN the result tree's
+#           run_tool squash-layers. The model must be SHOWN the result tree's
 #           hash, because the next step needs it and nothing else carries it.
 #   turn 2  the one-line link the doc gives, twice (the second time over the
 #           link the first made, which is every republish, and which fails
@@ -39,13 +39,13 @@ echo "base" > /tmp/ws/base.txt
 ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 mkdir -p /tmp/stub
 start_stub /tmp/stub
-new_llm_conversation collapse-publish "$STUB_PORT" "$ws"
+new_llm_conversation squash-publish "$STUB_PORT" "$ws"
 
 # The tools, staged as chat-tools-mixed stages its shell: a directory whose
 # .caos-expr names the image by hash. An agent reaches the same images at
-# caos-std/bash-tool and caos-std/collapse-stack.
+# caos-std/bash-tool and caos-std/squash-layers.
 sh_expr="curry --base:hash=$(caos hash /cas/args/bash-tool)"
-collapse_expr="curry --base:hash=$(caos hash /cas/args/collapse)"
+squash_expr="curry --base:hash=$(caos hash /cas/args/squash)"
 
 # Response bodies are JSON; jq builds them so the messages' newlines and quotes
 # are escaped by something that knows how.
@@ -76,17 +76,17 @@ One body line.
 "
 
 respond 1 "[$(write_call tu_sh tools/sh/.caos-expr "$sh_expr"),
-  $(write_call tu_cx tools/collapse/.caos-expr "$collapse_expr"),
+  $(write_call tu_cx tools/squash/.caos-expr "$squash_expr"),
   $(sh_call tu_l1 'mkdir -p mystack && cp -a main mystack/00-base && cp -a main mystack/01-feature && echo feature > mystack/01-feature/feature.txt' '["main"]')]"
 respond 2 "[$(sh_call tu_l2 'cp -a mystack/01-feature mystack/02-tests && echo tests > mystack/02-tests/tests.txt' '["mystack"]'),
   $(write_call tu_m1 mystack-messages/01-feature "$M1"),
   $(write_call tu_m2 mystack-messages/02-tests "$M2")]"
 respond 3 "[$(jq -c -n --arg onto "$base" \
-  '{type: "tool_use", id: "tu_collapse", name: "run_tool",
-    input: {path: "tools/collapse", arguments: {stack: "mystack", onto: $onto, messages: "mystack-messages"}}}')]"
-respond 4 "[$(text "collapsed")]"
+  '{type: "tool_use", id: "tu_squash", name: "run_tool",
+    input: {path: "tools/squash", arguments: {stack: "mystack", onto: $onto, messages: "mystack-messages"}}}')]"
+respond 4 "[$(text "squashed")]"
 
-dispatch_turn "build a two-layer stack and collapse it"
+dispatch_turn "build a two-layer stack and squash it"
 wait_turn >/dev/null || fail "turn 1 never reached a terminal head"
 
 # What the model saw for each call, as text, by tool_use id.
@@ -101,25 +101,25 @@ for call in "2 tu_l1" "3 tu_l2" "3 tu_m1" "3 tu_m2"; do
   out=$(seen $call)
   case $out in ERROR:*) fail "turn 1 call ${call#* } failed: $out" ;; esac
 done
-collapsed=$(seen 4 tu_collapse)
-note "collapse-stack, as the model saw it: $collapsed"
-case $collapsed in
+squashed=$(seen 4 tu_squash)
+note "squash-layers, as the model saw it: $squashed"
+case $squashed in
   "result tree "*": 01-feature 02-tests") ;;
-  *) fail "collapse-stack's result did not render as its hash and two layers: $collapsed" ;;
+  *) fail "the squash-layers result did not render as its hash and two layers: $squashed" ;;
 esac
-T=${collapsed#result tree }
+T=${squashed#result tree }
 T=${T%%:*}
-assert_oid "$T" "the collapsed tree"
+assert_oid "$T" "the squashed tree"
 
 # The commits inside T, and what they must be: each layer's tree on the one
 # below, with the message file's bytes.
-caos get-hash "$T" /cas/t >/dev/null || fail "fetching the collapsed tree $T"
+caos get-hash "$T" /cas/t >/dev/null || fail "fetching the squashed tree $T"
 C1=$(caos hash /cas/t/01-feature)
 C2=$(caos hash /cas/t/02-tests)
 [ "$(caos kind /cas/t/01-feature)" = commit ] || fail "T/01-feature is not a gitlink"
 L1=$(source_tree_commit "$head" mystack/01-feature)
 L2=$(source_tree_commit "$head" mystack/02-tests)
-fetch_code "$C2" "fetching the collapsed commits"
+fetch_code "$C2" "fetching the squashed commits"
 fetch_code "$L2" "fetching the layers"
 [ "$(git rev-parse "$C1^{tree}")" = "$(git rev-parse "$L1^{tree}")" ] || fail "C1 is not layer 1's tree"
 [ "$(git rev-parse "$C2^{tree}")" = "$(git rev-parse "$L2^{tree}")" ] || fail "C2 is not layer 2's tree"
@@ -133,7 +133,7 @@ note "ok: T = {01-feature: $C1, 02-tests: $C2}, each a layer tree on the one bel
 
 stage "the link line, twice, then publish_source on a child of it"
 link="caos get-hash $T /cas/s; rm -rf publish/mystack; mkdir -p publish; ln -s /cas/s publish/mystack"
-REPO=https://caos-collapse-publish.invalid/repo.git
+REPO=https://caos-squash-publish.invalid/repo.git
 publish() { # <id> <source_tree>
   jq -c -n --arg id "$1" --arg s "$2" --arg r "$REPO" \
     '{type: "tool_use", id: $id, name: "publish_source",
@@ -177,5 +177,5 @@ esac
 note "ok: publish_source took the linked layer and stopped only at the remote"
 
 stage "done"
-printf 'chat-collapse-publish: ALL PASS\n' >> /tmp/narration
+printf 'chat-squash-publish: ALL PASS\n' >> /tmp/narration
 caos put /tmp/narration /cas/out

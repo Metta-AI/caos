@@ -1,11 +1,11 @@
-# The `collapse-stack` tool (design/stacks.md, "Publishing"): the
+# The `squash-layers` tool (design/stacks.md, "Publishing"): the
 # std/git-runner image with this directory's script curried onto it, plus the
 # `help` it is described by. It returns a VALUE — a tree of new commits — and
 # changes no tree, so it is not a `@writer`; the agent links the tree it returns.
 HELP=<<END
-Collapse a stack of source layers into one commit per layer, for publishing each
-layer as a branch with a linear history. The layers keep their own merge history;
-this only mints new commits beside them.
+Squash each layer of a stack into one commit, for publishing each layer as a
+branch with a linear history. The layers keep their own merge history; this only
+mints new commits beside them.
 
 The layers are the files in `messages`, in byte order (LC_ALL=C): one per layer to
 publish, named after its entry in `stack`, holding that layer's full commit

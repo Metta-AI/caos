@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The `collapse-stack` tool's worker. Its DOCS live in the sibling `.caos-expr`
+# The `squash-layers` tool's worker. Its DOCS live in the sibling `.caos-expr`
 # here-string, not in this header (SPEC, "CaosTools").
 #
 # Args, materialized under /cas/args:
@@ -7,7 +7,7 @@
 #   onto      the commit the first layer is published onto
 #   messages  a tree of message files, one per layer, named after its entry
 #
-# Returns a tree of gitlinks, `{<entry>: <collapsed commit>}`, which the agent
+# Returns a tree of gitlinks, `{<entry>: <squashed commit>}`, which the agent
 # links into the conversation as a whole.
 #
 # A refusal is a VALUE, a `report` tree with a FAILED banner, never a job
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 refuse() {
-  local r=/tmp/collapse-refused
+  local r=/tmp/squash-refused
   rm -rf "$r"
   mkdir -p "$r"
   printf 'FAILED: %s\n' "$1" > "$r/report"
@@ -62,7 +62,7 @@ fi
 # The commit GRAPH only (--filter=tree:0), as std/merge fetches it: ancestry
 # and the tip commits' own headers are all this reads, and a layer's tree is
 # reused by oid rather than fetched.
-repo=/tmp/collapse-repo
+repo=/tmp/squash-repo
 rm -rf "$repo"
 mkdir -p "$repo"
 git -C "$repo" init -q
@@ -81,7 +81,7 @@ for i in "${!names[@]}"; do
   if [ "$code" = 1 ]; then
     refuse "layer ${names[$i]} (${tips[$i]}) does not contain $below ($below_tip). Merge $below into ${names[$i]} first."
   elif [ "$code" != 0 ]; then
-    echo "collapse-stack: git merge-base failed (exit $code)" >&2
+    echo "squash-layers: git merge-base failed (exit $code)" >&2
     exit 1
   fi
   below="layer ${names[$i]}"
@@ -91,7 +91,7 @@ done
 # Author and committer are copied verbatim from the layer tip, never taken
 # from the clock: that is what makes a re-run mint the same commits, so a
 # republished stack whose layers did not move pushes nothing new.
-out=/tmp/collapse-out
+out=/tmp/squash-out
 rm -rf "$out"
 mkdir -p "$out"
 parent=$onto
@@ -119,8 +119,8 @@ for i in "${!names[@]}"; do
     if [ -n "$(tail -c 1 "$message")" ]; then
       printf '\n'
     fi
-  } > /tmp/collapse-commit
-  parent=$(caos put-commit /tmp/collapse-commit "/cas/c$i")
+  } > /tmp/squash-commit
+  parent=$(caos put-commit /tmp/squash-commit "/cas/c$i")
   ln -s "/cas/c$i" "$out/${names[$i]}"
 done
 caos put "$out" /cas/out

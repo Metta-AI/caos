@@ -157,7 +157,7 @@ mystack/03-tests    -> B2  parents B, A2
 
 ## Publishing
 
-The git history from the working stack will have lots of commits, for agent turns, merges, etc. So the publishing process collapses each layer's changes into a single commit, forming a clean new temp stack.
+The git history from the working stack will have lots of commits, for agent turns, merges, etc. So the publishing process squashes each layer's changes into a single commit, forming a clean new temp stack.
 
 ```text
 mystack/01-feature  -> A'  (merge history)   C1 = tree(A'), parent H    -> publish/mystack/01-feature
@@ -166,8 +166,8 @@ mystack/02-tests    -> B'  (merge history)   C2 = tree(B'), parent C1   -> publi
 
 This takes three steps:
 
-1. **Collapse** with `caos-std/collapse-stack`, called as
-   `run_tool(path="caos-std/collapse-stack", arguments={...})`:
+1. **Squash** with `caos-std/squash-layers`, called as
+   `run_tool(path="caos-std/squash-layers", arguments={...})`:
 
    - `stack`: conversation path of the folder holding the layers, e.g. `mystack`.
    - `onto`: full commit hash the first layer goes on: `00-base`'s, `H`.
@@ -200,7 +200,7 @@ This takes three steps:
    republish the old link is there, and the shell can only remove what it
    has materialized (undeclared, `rm -rf` is refused with `Permission
    denied`). On the first publish the path does not exist yet, and declaring
-   it costs nothing; on a republish it checks out the old collapsed layers
+   it costs nothing; on a republish it checks out the old squashed layers
    only for `rm -rf` to delete them.
 
    ```sh
@@ -209,7 +209,7 @@ This takes three steps:
 
    Each child, `publish/mystack/01-feature`, is then a gitlink in the
    conversation tree at `C1`, which is what `publish_source` takes as a
-   `source_tree`. `tests/chat-collapse-publish` runs steps 1 and 2 and calls
+   `source_tree`. `tests/chat-squash-publish` runs steps 1 and 2 and calls
    `publish_source` on a child; the push itself is not tested.
 
 3. **Push**, bottom to top, with `publish_source`:
@@ -220,7 +220,7 @@ This takes three steps:
    - `rewrite` (optional): `true` to allow a non-fast-forward update.
 
    It pushes exactly that commit to the branch, and creates no PR. Updates are
-   fast-forward only unless `rewrite=true`; a collapsed commit does not descend
+   fast-forward only unless `rewrite=true`; a squashed commit does not descend
    from the one it replaces, so updating a stack always needs it. Even then the
    push is leased on the remote head observed when the call starts: it can
    replace history the agent has seen, never a change someone else pushed
@@ -229,7 +229,7 @@ This takes three steps:
 This publishes branches, not PRs. **TODO:** open and update a PR per layer,
 each based on the branch below (the first on the base branch), and then remove
 the TUI's `/pr` (chat.md, "Publishing with `/pr`"), which pushes a layer's
-uncollapsed history.
+unsquashed history.
 
 ## Not built
 
