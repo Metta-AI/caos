@@ -35,6 +35,7 @@ from `.caos/conflicts`. Saving the resolution removes the empty ledger and its
 .caos directory if empty. Bash changes are committed automatically, just like
 inline edits. Then run relevant checks.
 @param theirs Full imported commit hash. A ref name works only if the harness explicitly supplied a ref snapshot.
+@param {commit} [merge-base] Full commit hash to use as the merge base instead of the one git finds. Only for replaying a change onto a history that does not contain its old base, such as a stack layer rebuilt on a force-pushed upstream: merge-base is then the old tip of the layer below.
 @writer
 END
 IMAGE=run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
