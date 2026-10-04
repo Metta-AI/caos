@@ -283,7 +283,9 @@ only the child's conversation; the parent's files and references stay unchanged.
 After the child finishes, `harvest_agent` compares its final content with its
 starting content and applies that difference to the parent. It can restrict the
 application to selected paths. The child's transcript and protocol metadata are
-not copied into the parent.
+not copied into the parent. Harvest applies changes at their existing paths and
+creates no stack layers; the parent decides the stack's shape
+([stacks.md](stacks.md)).
 
 Harvesting preserves unrelated parent edits and reconciles concurrent source-tree
 changes. The operation is atomic: if reconciliation conflicts, CAOS retains the

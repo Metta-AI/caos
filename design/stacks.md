@@ -1,92 +1,224 @@
 # Stacks
 
-A stack is a sequence of PRs, each based on the one below. In caos it lives in
-one conversation as **sibling gitlinks, one per layer**; Git ancestry between
-them is the whole dependency. There are no local branches and no stack
-metadata.
+A stack is an ordered sequence of refs, or layers, that share git ancestry.
+
+In caos they are represented by a folder containing sibling gitlinks, each of which
+corresponds to one layer of the stack.
+
 
 ```text
-imports/repo/main   -> H            the base, as imported
-feature/00-base     -> H
-feature/01-core     -> A   parent H
-feature/02-tests    -> B   parent A
+mystack/00-base     -> H
+mystack/01-feature  -> A   parent H
+mystack/02-tests    -> B   parent A
 ```
 
 ## Layers
 
-- **A layer is a review boundary, not an editing step.** Each gitlink names a
-  commit that may sit on many edits and merges; the name says where a PR's
-  diff ends.
-- **Order is by filename.** By convention the first sibling is the starting
-  base (`00-base`) and each later one a boundary; number prefixes make the
-  order plain. Folder order merges nothing and chooses no PR base — ancestry
-  does.
-- **Build a layer by copying the one below** and editing the copy:
+- Their order is inferred by their names
 
+- They are understood to descend directly from each other, in that order. If they don't, merges from parents (lower-numbered layers) into children (higher-numbered) may be necessary.
+
+- Agents can start a new stack doing something like the following:
   ```sh
-  cp -a imports/repo/main feature/01-core
-  cp -a feature/01-core feature/02-tests
+  cp -a imports/repo/main mystack/00-base  # assuming this is a gitlink file
+  cp -a mystack/00-base mystack/01-feature
   ```
 
-  `cp -a` keeps the directory's commit (an extended attribute), so the copy
-  is the same gitlink until edited, and its first edit is a child of the
-  layer below. A copy that drops the attribute is plain files and loses the
-  boundary.
+  And subsequent edits to the source tree `mystack/01-feature` will be reflected
 
-## Keeping a stack current
+  in updates to its git history (and the git hash kept in that file)
 
-**Layers are only ever merged into, never rewritten.** Both kinds of change
-flow upward the same way:
+## Examples of common operations on stacks
 
-- **A lower layer changed:** merge it into the layer above, then that into
-  the next, and test the top.
-- **The base moved** — what "rebase" means here: import the new tip at a
-  fresh path (an import never advances an existing one), merge it into the
-  bottom layer, then merge up as above.
+Every operation below is made of three things: editing a layer, merging a
+lower layer into a higher one, and `cp -a` / `mv` / `rm -rf` on the gitlinks
+themselves. 
 
-Merging is `std/merge` with the other side's full commit hash. A conflict
-still advances the layer, with markers in the files and a `.caos/conflicts`
-ledger listing every unresolved path; resolve each and delete its rows
-(chat.md, "Resolving source-tree conflicts").
+The `merge` std tool works like so: `merge(source_tree=Y, theirs=X)`, where
+`Y` is the gitlink being merged into and `X` is a full commit hash. It always mints a merge commit
+with parents `Y` and `X`. A conflict still moves along the gitlinik and introduces a a `.caos/conflicts` file listing items that need to be resolved. See chat.md's "Resolving source-tree conflicts" for info on how these are handled.
 
-So a layer's history is a **merge history**: every upstream change it
-absorbed is a parent edge, and nothing a reviewer or a subagent saw is ever
-replaced.
+All examples below assume we're starting with:
 
-## Delegating layers
+```text
+mystack/00-base     -> H
+mystack/01-feature  -> A   parent H
+mystack/02-tests    -> B   parent A
+```
 
-Two independent changes intended as a stack can be built by subagents:
+### Changing a lower layer
 
-1. Give two children bounded tasks against the same starting source.
-2. Harvest the first child's change into `feature/01-core` and check it.
-3. `cp -a feature/01-core feature/02-tests`.
-4. Merge the second child's source commit into `feature/02-tests` and check
-   the combined result.
+Edit `mystack/01-feature`, progressing it to A2, then merge each layer into the one above it.
 
-Harvest applies changes at their existing paths; it chooses no boundaries.
-The parent owns the stack's shape.
+```text
+merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+```
+
+`std/merge/worker` will choose `A` as the base for the merge (it looks for the highest common ancestor). After resolving conflicts, the result will look like:
+
+```text
+mystack/01-feature  -> A2  parent A
+mystack/02-tests    -> B2  parents B, A2
+```
+
+
+### Updating the base
+
+Import the new upstream tip `H2` at a fresh path, put it at `00-base`, and merge
+up:
+
+```sh
+rm -rf mystack/00-base
+cp -a imports/repo/main-H2 mystack/00-base
+```
+
+```text
+merge(source_tree="mystack/01-feature", theirs="<full commit hash of mystack/00-base>")
+... # potentially resolve conflicts
+merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+```
+
+Resulting in:
+```text
+mystack/00-base     -> H2
+mystack/01-feature  -> A2  parents A, H2
+mystack/02-tests    -> B2  parents B, A2
+```
+
+If `H2` descends from `H` (as it should unless the imported ref has been force-pushed over in the intervening time), then here, too, there are no rewrites: `mystack/01-feature` still descends from `H` because `H2` does.
+
+If it was force-pushed, rebuild each layer bottom-up instead: copy the rebuilt
+layer below, then merge in this layer's old tip with `base` set to the old tip
+of the layer below it. **TODO:** `merge` has no `base` parameter yet
+(`git merge-tree --merge-base`).
+
+```text
+rm -rf mystack/01-feature; cp -a mystack/00-base mystack/01-feature
+merge(source_tree="mystack/01-feature", theirs="<A>", base="<H>")
+rm -rf mystack/02-tests; cp -a mystack/01-feature mystack/02-tests
+merge(source_tree="mystack/02-tests", theirs="<B>", base="<A>")
+```
+
+### Drop the contents of a layer
+
+Just a special case of editing.
+
+Replace `01-feature`'s files with `00-base`'s, then merge up and delete the gitlink
+
+```sh
+find mystack/01-feature -mindepth 1 -delete
+cp -R --preserve=mode mystack/00-base/. mystack/01-feature/
+```
+
+```text
+merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+
+mystack/01-feature  -> A2  parent A          tree(A2) = tree(H)
+mystack/02-tests    -> B2  parents B, A2     H + tests only
+```
+
+```sh
+rm -rf mystack/01-feature
+```
+
+The merge base is `A`, so `A → A2` removes the feature from `02-tests` too.
+
+We dont need to relabel mystack/02-tests to mystack/01-tests; gaps are fine.
+
+
+### Combining two layers
+
+Delete the lower one; the upper one already contains it:
+
+```sh
+rm -rf mystack/01-feature
+```
+
+### Splitting a layer in two
+
+Suppose `01-feature` holds changes X and Y. Make a new layer for X from the layer below,
+and keep the original as the layer for Y:
+
+```sh
+mv mystack/02-tests   mystack/03-tests
+mv mystack/01-feature mystack/02-y
+cp -a mystack/00-base mystack/01-x
+# then re-make X in mystack/01-x
+```
+
+```text
+merge(source_tree="mystack/02-y", theirs="<full commit hash of mystack/01-x>")
+merge(source_tree="mystack/03-tests", theirs="<full commit hash of mystack/02-y>")
+
+mystack/01-x        -> X1  parent H
+mystack/02-y        -> A2  parents A, X1
+mystack/03-tests    -> B2  parents B, A2
+```
 
 ## Publishing
 
-**Bottom to top, each layer to its own branch.** The first PR targets the base
-branch; each later one targets the branch below it, which must already exist
-remotely.
+The git history from the working stack will have lots of commits, for agent turns, merges, etc. So the publishing process collapses each layer's changes into a single commit, forming a clean new temp stack.
 
-- **Agent:** `publish_source` per layer (design/agent-publish.md). A
-  fast-forward only, leased on the remote head observed when the call
-  starts, so a change someone else pushed is never overwritten.
-- **User:** `/pr <layer> <base-branch>` in the TUI, in the same order
-  (chat.md, "Publishing with `/pr`"). When the source does not contain the
-  base's tip, the preview offers to import it and ask the agent to merge it
-  up instead of publishing.
+```text
+mystack/01-feature  -> A'  (merge history)   C1 = tree(A'), parent H    -> publish/mystack/01-feature
+mystack/02-tests    -> B'  (merge history)   C2 = tree(B'), parent C1   -> publish/mystack/02-tests
+```
 
-  ```text
-  /pr feature/01-core main
-  /pr feature/02-tests feature/01-core
-  ```
+This takes three steps:
 
-Either way **the published branch is the layer's own history**, merges
-included. Publication changes no gitlink.
+1. **Collapse** with `caos-std/collapse-stack`, called as
+   `run_tool(path="caos-std/collapse-stack", arguments={...})`:
+
+   - `stack`: conversation path of the folder holding the layers, e.g. `mystack`.
+   - `onto`: full commit hash the first layer goes on: `00-base`'s, `H`.
+   - `messages`: conversation path of a folder holding one file per layer to
+     publish, named after its entry. Each file is that layer's full commit
+     message, used verbatim:
+
+     ```text
+     mystack-messages/01-feature    Add the feature\n\n<body>
+     mystack-messages/02-tests      Test the feature\n\n<body>
+     ```
+
+   The layers are the message files, in filename order, so `00-base` (which
+   has none) is not published.
+
+   For each layer it mints
+   `C_i = commit(tree(layer i), parent C_{i-1} or onto, message_i)`, with the
+   author and committer of the layer's tip, and returns them as one tree of
+   gitlinks, `T = {01-feature: C1, 02-tests: C2}`. It refuses a layer that does not contain the one below it (or `onto`): merge
+   first. The same input mints the same commits, so republishing an unchanged
+   stack pushes nothing new.
+
+   **TODO:** the tool still takes `layers` (one `<entry> <message>` line per
+   layer, which cannot hold a multi-line message) and prints `<layer> <C_i>`
+   lines instead of returning `T`.
+
+2. **Link** `T` into the conversation with the shell, since `publish_source`
+   takes a gitlink:
+
+   ```sh
+   caos get-hash <T> /cas/s; rm -rf publish/mystack; ln -s /cas/s publish/mystack
+   ```
+
+3. **Push**, bottom to top, with `publish_source`:
+
+   - `source_tree`: the gitlink to publish, e.g. `publish/mystack/01-feature`.
+   - `repository`: HTTPS repository URL, without credentials.
+   - `branch`: destination branch, without `refs/heads/`.
+   - `rewrite` (optional): `true` to allow a non-fast-forward update.
+
+   It pushes exactly that commit to the branch, and creates no PR. Updates are
+   fast-forward only unless `rewrite=true`; a collapsed commit does not descend
+   from the one it replaces, so updating a stack always needs it. Even then the
+   push is leased on the remote head observed when the call starts: it can
+   replace history the agent has seen, never a change someone else pushed
+   (design/agent-publish.md).
+
+This publishes branches, not PRs. **TODO:** open and update a PR per layer,
+each based on the branch below (the first on the base branch), and then remove
+the TUI's `/pr` (chat.md, "Publishing with `/pr`"), which pushes a layer's
+uncollapsed history.
 
 ## Not built
 
@@ -96,3 +228,4 @@ included. Publication changes no gitlink.
   metadata, which would mean reconstructing a repository from gitlinks and
   returning rewritten commits to caos. `modify` needs linear history, so it
   cannot restructure a stack with merge commits.
+
