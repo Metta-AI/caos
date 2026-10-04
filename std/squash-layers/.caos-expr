@@ -1,0 +1,30 @@
+# The `squash-layers` tool (design/stacks.md, "Publishing"): the std/go worker
+# image with this directory's program curried onto it, plus the `help` it is
+# described by. A writer run on the conversation: `@in` hands it the
+# conversation tree, and it proposes that tree with `into` replaced.
+HELP=<<END
+Squash each layer of a stack into one commit, for publishing each layer as a
+branch with a linear history, and write them to `into` as one folder of
+gitlinks, {<entry>: <commit>}, replacing what a previous run wrote there. The
+layers keep their own merge history; this only mints new commits beside them.
+
+The layers are the files in `messages`, in byte order: one per layer to publish,
+named after its entry in `stack`, holding that layer's full commit message
+(subject, blank line, body), used verbatim. An entry with no message file, such
+as 00-base, is not published.
+
+For each layer in order, C = commit(tree = the layer tip's tree, parent = the
+previous C, or `onto` for the first layer, message = that layer's file), with the
+author and committer copied from the layer tip. The same input always mints the
+same commits. Refused, naming both, unless each layer's tip already contains the
+one below it (or `onto`, for the first): merge a changed lower layer up first.
+
+Then publish_source each <into>/<entry>, bottom to top, with rewrite=true.
+@param {tree} stack Conversation path of the folder holding the layer gitlinks, e.g. `feature`.
+@param {commit} onto Full hash of the commit the first layer is published onto: the base branch's tip that layer 1 last merged.
+@param {tree} messages Conversation path of a folder holding one commit-message file per layer to publish, named after its stack entry, e.g. `feature-messages` holding `01-core` and `02-tests`.
+@param into Conversation path to write the squashed stack to, e.g. `publish/feature`: a new path, or one a previous run wrote. Not inside a source tree.
+@writer
+@in
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP

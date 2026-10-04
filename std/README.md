@@ -18,6 +18,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-test` | Build the caos test stack from the tree and run the whole suite — unit tests and every `tests/<name>`. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `merge` | Three-way merge another commit into the current source tree. |
+| `squash-layers` | Squash each layer of a stack to one commit, each layer's tree on the commit below, and write them to a folder of gitlinks for publishing. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says

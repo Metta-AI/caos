@@ -14,6 +14,10 @@ struct Input {
     // No default: omission is different from an explicit create-only lease.
     #[serde(deserialize_with = "expected")]
     expected: Option<String>,
+    // Permits a non-fast-forward update. The exact lease on `expected` is what
+    // still prevents overwriting a head the caller has not seen.
+    #[serde(default)]
+    rewrite: bool,
 }
 
 fn expected<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -100,14 +104,16 @@ pub(crate) fn endpoint(
         if capture(&["cat-file", "-t", old]).unwrap_or_default().trim() != "commit" {
             return Err(reject("missing-expected"));
         }
-        match run(&["merge-base", "--is-ancestor", old, &input.commit])
-            .map_err(invalid)?
-            .status
-            .code()
-        {
-            Some(0) => {}
-            Some(1) => return Err(reject("not-fast-forward")),
-            _ => return Err(reject("validation-failed")),
+        if !input.rewrite {
+            match run(&["merge-base", "--is-ancestor", old, &input.commit])
+                .map_err(invalid)?
+                .status
+                .code()
+            {
+                Some(0) => {}
+                Some(1) => return Err(reject("not-fast-forward")),
+                _ => return Err(reject("validation-failed")),
+            }
         }
     }
     if ignored_files(
@@ -343,9 +349,16 @@ mod tests {
             .expected
             .is_none());
         value["expected"] = json!("b".repeat(40));
-        assert!(serde_json::from_value::<Input>(value)
+        assert!(serde_json::from_value::<Input>(value.clone())
             .unwrap()
             .expected
             .is_some());
+        assert!(
+            !serde_json::from_value::<Input>(value.clone())
+                .unwrap()
+                .rewrite
+        );
+        value["rewrite"] = json!(true);
+        assert!(serde_json::from_value::<Input>(value).unwrap().rewrite);
     }
 }
