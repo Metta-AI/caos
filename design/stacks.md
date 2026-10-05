@@ -208,7 +208,7 @@ This takes three steps:
    replace history the agent has seen, never a change someone else pushed
    (design/agent-publish.md).
 
-3. **Open a PR per layer and link them** with the `github` tool, each PR based
-   on the branch below it and the first on the trunk. See
+3. **Open a PR per layer and link them** with `std/github`, each PR based on
+   the branch below it and the first on the trunk. See
    [agent-github.md](agent-github.md#prs-for-a-stack), "PRs for a stack".
 

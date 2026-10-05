@@ -1,0 +1,3 @@
+# This tool's worker image: the program runs on std/go, whose image carries the
+# CA bundle an HTTPS client needs (format `<path> <name>`).
+../go go
