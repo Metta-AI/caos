@@ -26,16 +26,18 @@ key.
 
 ## Namespaces
 
-A namespace is a group of refs that share one list of writers. Its name, the
-`<id>` below, is not chosen: it's the hash of the commit that created it.
+A namespace is a group of refs that share one list of writers:
 
 ```text
 refs/caos/w/<id>/writers      the namespace's writers list
 refs/caos/w/<id>/<anything>   the refs it governs
 ```
 
-`writers` is one specific ref. Each commit on it has a tree with a single file,
-`.caos/writers`, and the latest commit is the current list:
+Governed refs can point at anything, like any other ref on a caos server (a
+source branch shouldn't have to carry the list). `writers` is the exception: it
+always points at a commit, and each change to the list is a new commit on top
+of the last. Each commit's tree holds a single file, `.caos/writers`, and the
+latest commit is the current list:
 
 ```text
 # <ed25519 pubkey, hex>  <label, display only>
@@ -43,12 +45,12 @@ refs/caos/w/<id>/<anything>   the refs it governs
 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60  nishad
 ```
 
-A `.caos/writers` file anywhere else means nothing. Governed refs can point at
-anything (a source branch shouldn't have to carry the file).
+A `.caos/writers` file anywhere else means nothing.
 
-To create a namespace, make a root commit whose `.caos/writers` lists yourself,
-and push it to `refs/caos/w/<that commit's hash>/writers`. Because the id is
-the hash of the initial list, nobody can claim a namespace ahead of you or
+`<id>` is not chosen: it's the hash of the first commit on `writers`, the one
+holding the initial list. So to create a namespace, make that root commit,
+listing yourself, and push it to `refs/caos/w/<its hash>/writers`. Because the
+id is the hash of the initial list, nobody can claim a namespace ahead of you or
 create one you aren't in. The first commit is deterministic (author and
 committer `caos <caos>` at time 0, message `caos namespace\n\n<label>`), so the
 same writers and label always name the same namespace; `caos-cli namespace new
