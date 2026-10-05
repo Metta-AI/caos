@@ -357,10 +357,13 @@ def main():
             # A normal push publishes complete commits; malformed additional
             # objects and shallow histories are rejected in Git's quarantine.
             pushed = advance(posted_child[0])
-            run("git", "--git-dir", str(origin), "push", base, pushed[0] + ":refs/caos/test/closure")
+            # A content-named ref: the server's ref-writers hook refuses any
+            # other name without a writer's proof (design/ref-writers.md).
+            closure_ref = "refs/caos/req/" + pushed[0]
+            run("git", "--git-dir", str(origin), "push", base, pushed[0] + ":" + closure_ref)
             visible(pushed[0])
             assert run("git", "--git-dir", str(odb), "config", "receive.fsckObjects") == "true"
-            run("git", "--git-dir", str(origin), "push", base, ":refs/caos/test/closure")
+            run("git", "--git-dir", str(origin), "push", base, ":" + closure_ref)
             # A pack's surplus, unreferenced commits must also have parents.
             malformed = child_bytes.replace(posted_parent[0].encode(), ("2" * 40).encode())
             malformed_oid = run("git", "--git-dir", str(origin), "hash-object", "-t", "commit", "-w", "--stdin", input=malformed)
@@ -687,7 +690,7 @@ def main():
             for index in range(40):
                 packed = advance()
                 run("git", "--git-dir", str(origin), "push", "-q", base,
-                    packed[0] + f":refs/heads/pack-growth-{index}")
+                    packed[0] + ":refs/caos/req/" + packed[0])
                 for oid in packed:
                     object_request(oid)
             assert len(list((odb / "objects/pack").glob("*.pack"))) > 32

@@ -123,6 +123,14 @@ GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
 git push -q http://127.0.0.1 "HEAD:refs/heads/caos-test/$(git rev-parse HEAD)" \
   || fail "pushing the workspace commit to the dev stack"
 
+# THE SUITE'S WRITER (design/ref-writers.md): the dev stack enforces who may
+# write a ref, so the client driving the suite signs as a writer, and the suite
+# hands that on (`--writes=*`) to the tests and the steps they run. A fresh key
+# per run: it is in no ArgTree, so it moves no cache key.
+writer=$("$CLI" ref-writer-key new 2>/dev/null) || fail "creating the suite's ref writer key"
+git config caos.ref-writer-key "$writer"
+args+=("--writes=*")
+
 # A MOCK KEY FOR std/llm-call, std/llm-step, dev/worker-test and std/go — not a secret:
 # the value is a constant, and the only thing that ever sees it is a stub HTTP
 # server a test starts in its own container. Granted here, the suite's own run

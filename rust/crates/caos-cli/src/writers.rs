@@ -1,11 +1,13 @@
 //! The client's side of ref writers (design/ref-writers.md): the writer key it
-//! signs with, and the commands that manage keys, namespaces and their writers.
+//! signs with, the commands that manage keys, namespaces and their writers, and
+//! the namespaces its conversations live in.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use caos::GitTransport;
 use conversation_protocol::v3::writers::{self, Writer, WriterKey};
-use conversation_protocol::v3::{GitStore, Oid, RefUpdate};
+use conversation_protocol::v3::{refs, GitStore, Oid, RefUpdate};
 
 /// The checkout's git config entry holding this client's private writer key.
 pub const KEY_CONFIG: &str = "caos.ref-writer-key";
@@ -14,6 +16,8 @@ static KEY: OnceLock<Option<WriterKey>> = OnceLock::new();
 
 /// This process's writer key: `caos.ref-writer-key`, read once.
 pub fn key() -> Result<Option<&'static WriterKey>, String> {
+    #[cfg(test)]
+    set_key(WriterKey::from_seed([7; 32]));
     if KEY.get().is_none() {
         let configured = std::process::Command::new("git")
             .args(["config", "--get", KEY_CONFIG])
@@ -28,6 +32,12 @@ pub fn key() -> Result<Option<&'static WriterKey>, String> {
         let _ = KEY.set(key);
     }
     Ok(KEY.get().and_then(Option::as_ref))
+}
+
+/// Use `key` instead of the checkout's config, for a process that is handed
+/// one (tests). Only the first call takes effect.
+pub fn set_key(key: WriterKey) {
+    let _ = KEY.set(Some(key));
 }
 
 pub fn require_key() -> Result<&'static WriterKey, String> {
@@ -133,15 +143,20 @@ pub fn cli_namespace(t: &GitTransport, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `writers list|add|remove <namespace> [<key> [<label>]]`.
+/// `writers list|add|remove <namespace|conversation> [<key> [<label>]]`.
 pub fn cli_writers(t: &GitTransport, args: &[String]) -> Result<(), String> {
-    let usage = || "usage: writers list|add|remove <namespace> [<key> [<label>]]".to_string();
+    let usage =
+        || "usage: writers list|add|remove <namespace|conversation> [<key> [<label>]]".to_string();
     let (command, target, rest) = match args {
         [command, target, rest @ ..] => (command.as_str(), target.as_str(), rest),
         _ => return Err(usage()),
     };
-    writers::validate_namespace(target)?;
-    let namespace = target.to_string();
+    let namespace = if writers::is_namespace(target) {
+        target.to_string()
+    } else {
+        let id = resolve(t, target)?;
+        namespace_of(t, &id)?
+    };
     match (command, rest) {
         ("list", []) => {
             for writer in list(t, &namespace)?.1 {
@@ -232,4 +247,117 @@ pub fn cli_ref_push(t: &GitTransport, args: &[String]) -> Result<(), String> {
         expected: current,
         new: Some(commit),
     }])
+}
+
+// ---- conversations --------------------------------------------------------------
+
+/// The namespace holding this writer's conversation memberships.
+pub fn personal_namespace() -> Result<String, String> {
+    Ok(refs::personal_namespace(&require_key()?.public()))
+}
+
+/// The namespace a new conversation `id` of this writer's is created in.
+pub fn own_namespace(id: &str) -> Result<String, String> {
+    refs::conversation_namespace(&require_key()?.public(), id)
+}
+
+static NAMESPACES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn known() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    NAMESPACES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remember that conversation `id` lives in `namespace`, e.g. a child found
+/// through its parent.
+pub fn remember(id: &str, namespace: &str) {
+    known().insert(id.to_string(), namespace.to_string());
+}
+
+/// Which conversation a user means: an address `<namespace>/<id>`, or a bare
+/// id resolved by [`namespace_of`]. Returns the id, its namespace remembered.
+pub fn resolve(t: &GitTransport, name: &str) -> Result<String, String> {
+    if let Ok((namespace, id)) = refs::parse_address(name) {
+        remember(&id, &namespace);
+        return Ok(id);
+    }
+    namespace_of(t, name)?;
+    Ok(name.to_string())
+}
+
+/// The namespace conversation `id` lives in. This writer's own comes first;
+/// otherwise the one namespace holding a conversation of that id. A new id is
+/// this writer's.
+pub fn namespace_of(t: &GitTransport, id: &str) -> Result<String, String> {
+    if let Some(namespace) = known().get(id) {
+        return Ok(namespace.clone());
+    }
+    let mine = key()?
+        .map(|key| refs::conversation_namespace(&key.public(), id))
+        .transpose()?;
+    let pattern = refs::head_ref_pattern(id)?;
+    let listing = t.git_capture(&["ls-remote", "--refs", caos::CAOS_REMOTE, &pattern], None)?;
+    let mut found: Vec<String> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(_, refname)| refs::parse_head_ref(refname).ok())
+        .filter(|(_, found)| found == id)
+        .map(|(namespace, _)| namespace)
+        .collect();
+    found.sort();
+    found.dedup();
+    let namespace = match (mine, found.as_slice()) {
+        (Some(mine), found) if found.contains(&mine) => mine,
+        (_, [only]) => only.clone(),
+        (Some(mine), []) => mine,
+        (None, []) => return Err(missing_key()),
+        (_, many) => {
+            return Err(format!(
+                "conversation {id:?} exists in several namespaces; name one by its address: {}",
+                many.iter()
+                    .map(|ns| refs::address(ns, id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    };
+    remember(id, &namespace);
+    Ok(namespace)
+}
+
+/// The head ref of conversation `id`.
+pub fn head_ref(t: &GitTransport, id: &str) -> Result<String, String> {
+    refs::head_ref(&namespace_of(t, id)?, id)
+}
+
+/// The address of conversation `id`, `<namespace>/<id>`.
+pub fn address(t: &GitTransport, id: &str) -> Result<String, String> {
+    Ok(refs::address(&namespace_of(t, id)?, id))
+}
+
+/// Create conversation `id`'s `namespace` on its own, ahead of its first head
+/// (a namespace with nothing in it yet is harmless).
+pub fn ensure_namespace(store: &mut GitStore, namespace: &str, id: &str) -> Result<(), String> {
+    let updates = create_namespace_update(store, namespace, &conversation_label(id))?;
+    store.push(&updates)
+}
+
+/// The label a conversation's namespace was created with; see
+/// [`refs::conversation_namespace`].
+pub fn conversation_label(id: &str) -> String {
+    format!("conversation {}", refs::key_of(id))
+}
+
+pub const PERSONAL_LABEL: &str = "personal";
+
+/// `conversation-ref <id|address>`: the conversation's head ref.
+pub fn cli_conversation_ref(t: &GitTransport, args: &[String]) -> Result<(), String> {
+    let [name] = args else {
+        return Err("usage: conversation-ref <id|namespace/id>".to_string());
+    };
+    let id = resolve(t, name)?;
+    println!("{}", head_ref(t, &id)?);
+    Ok(())
 }

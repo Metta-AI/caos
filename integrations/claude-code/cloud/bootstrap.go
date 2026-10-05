@@ -85,6 +85,7 @@ type args struct {
 	base       string
 	server     string
 	readers    string
+	writerKey  string
 	devCommit  string
 	devTree    string
 	enableBash bool
@@ -104,6 +105,11 @@ func parseArgs(argv []string) args {
 		// in the checkout's git config beside the `caos` remote `--server` adds.
 		case "--secret-readers":
 			a.readers = value
+		// The private ref writer key this session's conversations are written
+		// with (design/ref-writers.md), kept beside the readers. A credential,
+		// like them: set once for the environment, never echoed.
+		case "--ref-writer-key":
+			a.writerKey = value
 		case "--server":
 			a.server = value
 		// A COMMIT, not a second server: the install package comes from the
@@ -788,6 +794,11 @@ func main() {
 	if a.readers != "" {
 		if _, err := run(repoDir, "git", "config", "caos.secret-readers", a.readers); err != nil {
 			say("could not record --secret-readers; the session will present no secrets")
+		}
+	}
+	if a.writerKey != "" {
+		if _, err := run(repoDir, "git", "config", "caos.ref-writer-key", a.writerKey); err != nil {
+			say("could not record --ref-writer-key; the session can write no conversation")
 		}
 	}
 

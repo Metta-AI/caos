@@ -104,7 +104,7 @@ fi
 
 # Readers grant by locator: this repo's commit, and the step's path in it. The
 # chat below evaluates the step from the clean worktree, which is that tree.
-git push -q caos "HEAD:refs/heads/${test_id}-chat-offline" || fail "pushing the fixture commit"
+git push -q caos "HEAD:refs/caos/req/$(git rev-parse HEAD)" || fail "pushing the fixture commit"
 key=$("$CAOS_CLI" secrets-init --dir="$STORE") || fail "secrets-init failed"
 git config caos.secret-readers "$key"
 step_at="git+http://caos.invalid/chat-offline?rev=$(git rev-parse HEAD)&dir=DEEP-DEPS/llm-step"
@@ -213,7 +213,7 @@ git ls-remote --refs caos "$conversation_prefix/*" > conversation.refs
   || fail "conversation does not have exactly one canonical ref"
 conversation_key=$(printf '%s' "$conv" | od -An -v -tx1 | tr -d '[:space:]')
 git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/active/$conversation_key" > membership.refs
+  "refs/caos/w/*/memberships/active/*/$conversation_key" > membership.refs
 [ "$(wc -l < membership.refs)" -eq 1 ] \
   || fail "conversation does not have exactly one active creator membership"
 [ "$($TOOL read --repo "$PWD" --head "$tip" --path .caos/title)" = "fresh start" ] \

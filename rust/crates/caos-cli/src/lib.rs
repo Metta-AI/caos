@@ -388,7 +388,7 @@ fn fetch_validated_head(
     store: &GitStore,
     id: &str,
 ) -> Result<Option<(String, Oid)>, String> {
-    let refname = refs::head_ref(id)?;
+    let refname = writers::head_ref(t, id)?;
     let Some(head) = store.read_ref(&refname)? else {
         return Ok(None);
     };
@@ -520,7 +520,7 @@ fn append_system_notice(
     append_transition(
         t,
         id,
-        &refs::head_ref(id)?,
+        &writers::head_ref(t, id)?,
         "recording client action",
         |store, head| {
             let view = Conversation::open(store, head)?;
@@ -726,29 +726,15 @@ pub fn create_conversation(
     title: &str,
 ) -> Result<String, String> {
     let user = resolve_username(t, options.username.as_deref())?;
-    let refname = refs::head_ref(id)?;
+    let namespace = writers::own_namespace(id)?;
+    writers::remember(id, &namespace);
+    let refname = refs::head_ref(&namespace, id)?;
     let mut store = open_store(t)?;
     if store.read_ref(&refname)?.is_some() {
         return Err(format!("conversation {id:?} already exists"));
     }
     let head = mint_conversation_root(t, &mut store, options, id, title, &signature(&user)?)?;
-    let updates = [
-        RefUpdate {
-            refname: refname.clone(),
-            expected: None,
-            new: Some(head.clone()),
-        },
-        RefUpdate {
-            refname: refs::active_membership_ref(&user, id)?,
-            expected: None,
-            new: Some(head.clone()),
-        },
-        RefUpdate {
-            refname: refs::archived_membership_ref(&user, id)?,
-            expected: None,
-            new: None,
-        },
-    ];
+    let updates = creation_updates(&mut store, &namespace, id, &head)?;
     if let Err(error) = store.push(&updates) {
         let Some(remote) = store.fetch_ref(&refname)? else {
             return Err(error);
@@ -757,10 +743,52 @@ pub fn create_conversation(
         if !spine_contains(&store, remote.clone(), &head)? {
             return Err(error);
         }
-        repair_creation_membership(&store, &user, id, &remote)?;
+        repair_creation_membership(&mut store, &namespace, id, &remote)?;
     }
     update_local_cache(t, &refname, head.as_str())?;
     Ok(head.to_string())
+}
+
+/// Everything a conversation's first push writes, atomically: its namespace
+/// (when new), its head, and this writer's active membership.
+fn creation_updates(
+    store: &mut GitStore,
+    namespace: &str,
+    id: &str,
+    head: &Oid,
+) -> Result<Vec<RefUpdate>, String> {
+    let mut updates =
+        writers::create_namespace_update(store, namespace, &writers::conversation_label(id))?;
+    updates.push(RefUpdate {
+        refname: refs::head_ref(namespace, id)?,
+        expected: None,
+        new: Some(head.clone()),
+    });
+    updates.extend(membership_updates(store, namespace, id, head)?);
+    Ok(updates)
+}
+
+/// Make conversation `id` active in this writer's personal namespace, creating
+/// that namespace if it is new.
+fn membership_updates(
+    store: &mut GitStore,
+    namespace: &str,
+    id: &str,
+    head: &Oid,
+) -> Result<Vec<RefUpdate>, String> {
+    let personal = writers::personal_namespace()?;
+    let mut updates = writers::create_namespace_update(store, &personal, writers::PERSONAL_LABEL)?;
+    updates.push(RefUpdate {
+        refname: refs::active_membership_ref(&personal, namespace, id)?,
+        expected: None,
+        new: Some(head.clone()),
+    });
+    updates.push(RefUpdate {
+        refname: refs::archived_membership_ref(&personal, namespace, id)?,
+        expected: None,
+        new: None,
+    });
+    Ok(updates)
 }
 
 struct PreparedRequest {
@@ -774,7 +802,8 @@ fn prepare_queued_request_detail(
     id: &str,
     queued_head: &str,
 ) -> Result<PreparedRequest, String> {
-    let secrets = conversation_secrets(id)?;
+    let secrets = conversation_secrets(t, id)?;
+    let namespace = writers::namespace_of(t, id)?;
     let configuration = resolve_llm(t, options, id, queued_head, &secrets)?;
     let (request, granted) = caos::prepare_client_request_granted(
         t,
@@ -786,7 +815,7 @@ fn prepare_queued_request_detail(
         let reader = options
             .llm_step
             .as_deref()
-            .map(|image| image_arg_reader(image, id))
+            .map(|image| image_arg_reader(image, &refs::address(&namespace, id)))
             .unwrap_or_else(|| "a reader for the selected --llm-step image".to_string());
         return Err(format!(
             "{MODEL_API_SECRET} is not granted to this conversation's {LLM_STEP_ARG}. \
@@ -968,7 +997,8 @@ where
     let username = resolve_username(t, options.username.as_deref())?;
     let message_id = caos::fresh_entropy()?;
     let signature = signature(&username)?;
-    let refname = refs::head_ref(id)?;
+    let namespace = writers::namespace_of(t, id)?;
+    let refname = refs::head_ref(&namespace, id)?;
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
@@ -1010,25 +1040,7 @@ where
 
         match observed {
             None => {
-                let active = refs::active_membership_ref(&username, id)?;
-                let archived = refs::archived_membership_ref(&username, id)?;
-                let updates = [
-                    RefUpdate {
-                        refname: refname.clone(),
-                        expected: None,
-                        new: Some(outcome.head.clone()),
-                    },
-                    RefUpdate {
-                        refname: active.clone(),
-                        expected: None,
-                        new: Some(outcome.head.clone()),
-                    },
-                    RefUpdate {
-                        refname: archived,
-                        expected: None,
-                        new: None,
-                    },
-                ];
+                let updates = creation_updates(&mut store, &namespace, id, &outcome.head)?;
                 match store.push(&updates) {
                     Ok(()) => {
                         return finish_submission(t, &refname, Some(outcome.head.clone()), outcome)
@@ -1040,7 +1052,7 @@ where
                         store.fetch_ref(&refname)?;
                         validate_cached(&store, &remote_head)?;
                         if spine_contains(&store, remote_head.clone(), &outcome.head)? {
-                            repair_creation_membership(&store, &username, id, &remote_head)?;
+                            repair_creation_membership(&mut store, &namespace, id, &remote_head)?;
                             return finish_submission(t, &refname, Some(remote_head), outcome);
                         }
                         return Err(format!(
@@ -1237,27 +1249,20 @@ where
 }
 
 fn repair_creation_membership(
-    store: &GitStore,
-    user: &str,
+    store: &mut GitStore,
+    namespace: &str,
     id: &str,
     head: &Oid,
 ) -> Result<(), String> {
-    let active = refs::active_membership_ref(user, id)?;
-    let archived = refs::archived_membership_ref(user, id)?;
+    let personal = writers::personal_namespace()?;
+    let active = refs::active_membership_ref(&personal, namespace, id)?;
+    let archived = refs::archived_membership_ref(&personal, namespace, id)?;
     match (store.read_ref(&active)?, store.read_ref(&archived)?) {
         (Some(_), None) => Ok(()),
-        (None, None) => store.push(&[
-            RefUpdate {
-                refname: active,
-                expected: None,
-                new: Some(head.clone()),
-            },
-            RefUpdate {
-                refname: archived,
-                expected: None,
-                new: None,
-            },
-        ]),
+        (None, None) => {
+            let updates = membership_updates(store, namespace, id, head)?;
+            store.push(&updates)
+        }
         (_, Some(_)) => Err(format!(
             "conversation {id:?} was created but its creator membership is archived"
         )),
@@ -1265,7 +1270,7 @@ fn repair_creation_membership(
 }
 
 pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
-    let refname = refs::head_ref(id)?;
+    let refname = writers::head_ref(t, id)?;
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
         let Some(request) = view.active_turn()? else {
@@ -1287,13 +1292,13 @@ pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
     })
 }
 
-pub fn conversation_ref(id: &str) -> Result<String, String> {
-    refs::head_ref(id)
+pub fn conversation_ref(t: &GitTransport, id: &str) -> Result<String, String> {
+    writers::head_ref(t, id)
 }
 
 pub fn conversation_head(t: &GitTransport, id: &str) -> Result<Option<String>, String> {
     let store = open_store(t)?;
-    let refname = refs::head_ref(id)?;
+    let refname = writers::head_ref(t, id)?;
     Ok(store.read_ref(&refname)?.map(|head| head.to_string()))
 }
 
@@ -1658,54 +1663,46 @@ fn failure_reason(snapshot: &ConversationSnapshot) -> String {
     })
 }
 
-pub fn invite_user_to_conversation(
+/// Add the writer with public `key` to conversation `id`'s namespace, so they
+/// can open and continue it (design/ref-writers.md).
+pub fn invite_writer(
     t: &GitTransport,
-    user: &str,
     id: &str,
+    key: &str,
+    label: &str,
 ) -> Result<InviteOutcome, String> {
-    let mut store = open_store(t)?;
-    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
-        return Err(format!(
-            "cannot invite to conversation {id:?} before its first turn"
-        ));
-    };
-    invite_at(&mut store, user, id, &head)
+    let namespace = writers::namespace_of(t, id)?;
+    if writers::add(t, &namespace, key, label)? {
+        Ok(InviteOutcome::Created)
+    } else {
+        Ok(InviteOutcome::AlreadyActive)
+    }
 }
 
-fn invite_at(
-    store: &mut GitStore,
-    user: &str,
-    id: &str,
-    head: &Oid,
-) -> Result<InviteOutcome, String> {
-    let active = refs::active_membership_ref(user, id)?;
-    let archived = refs::archived_membership_ref(user, id)?;
+/// Keep conversation `id` active in this writer's sidebar.
+pub fn publish_user_conversation(t: &GitTransport, id: &str) -> Result<(), String> {
+    let mut store = open_store(t)?;
+    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+        return Err(format!("no conversation {id:?}"));
+    };
+    let namespace = writers::namespace_of(t, id)?;
+    let active = membership_ref(UserConversationStatus::Active, &namespace, id)?;
+    let archived = membership_ref(UserConversationStatus::Archived, &namespace, id)?;
     for _ in 0..MAX_APPEND_ATTEMPTS {
         match (store.read_ref(&active)?, store.read_ref(&archived)?) {
             (Some(_), Some(_)) => {
                 return Err(format!("conversation {id:?} is both active and archived"))
             }
-            (Some(_), None) => return Ok(InviteOutcome::AlreadyActive),
-            (None, Some(_)) => return Ok(InviteOutcome::Archived),
+            (Some(_), None) => return Ok(()),
+            (None, Some(_)) => return unarchive_user_conversation(t, id),
             (None, None) => {}
         }
-        let updates = [
-            RefUpdate {
-                refname: active.clone(),
-                expected: None,
-                new: Some(head.clone()),
-            },
-            RefUpdate {
-                refname: archived.clone(),
-                expected: None,
-                new: None,
-            },
-        ];
+        let updates = membership_updates(&mut store, &namespace, id, &head)?;
         match store.push(&updates) {
-            Ok(()) => return Ok(InviteOutcome::Created),
+            Ok(()) => return Ok(()),
             Err(error) => {
                 if store.read_ref(&active)?.is_none() && store.read_ref(&archived)?.is_none() {
-                    return Err(format!("inviting {user:?} to conversation {id:?}: {error}"));
+                    return Err(format!("listing conversation {id:?}: {error}"));
                 }
             }
         }
@@ -1713,23 +1710,20 @@ fn invite_at(
     Err(format!("conversation {id:?} membership kept changing"))
 }
 
-pub fn publish_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
-    match invite_user_to_conversation(t, user, id)? {
-        InviteOutcome::Archived => unarchive_user_conversation(t, user, id),
-        InviteOutcome::Created | InviteOutcome::AlreadyActive => Ok(()),
-    }
-}
-
-fn membership_ref(user: &str, status: UserConversationStatus, id: &str) -> Result<String, String> {
+fn membership_ref(
+    status: UserConversationStatus,
+    namespace: &str,
+    id: &str,
+) -> Result<String, String> {
+    let personal = writers::personal_namespace()?;
     match status {
-        UserConversationStatus::Active => refs::active_membership_ref(user, id),
-        UserConversationStatus::Archived => refs::archived_membership_ref(user, id),
+        UserConversationStatus::Active => refs::active_membership_ref(&personal, namespace, id),
+        UserConversationStatus::Archived => refs::archived_membership_ref(&personal, namespace, id),
     }
 }
 
 fn move_user_conversation(
     t: &GitTransport,
-    user: &str,
     id: &str,
     from: UserConversationStatus,
     to: UserConversationStatus,
@@ -1738,8 +1732,9 @@ fn move_user_conversation(
     let Some((_, observed_head)) = fetch_validated_head(t, &store, id)? else {
         return Err(format!("no conversation {id:?}"));
     };
-    let from_ref = membership_ref(user, from, id)?;
-    let to_ref = membership_ref(user, to, id)?;
+    let namespace = writers::namespace_of(t, id)?;
+    let from_ref = membership_ref(from, &namespace, id)?;
+    let to_ref = membership_ref(to, &namespace, id)?;
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let from_value = store.read_ref(&from_ref)?;
         let to_value = store.read_ref(&to_ref)?;
@@ -1778,20 +1773,18 @@ fn move_user_conversation(
     Err(format!("conversation {id:?} membership kept changing"))
 }
 
-pub fn archive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+pub fn archive_user_conversation(t: &GitTransport, id: &str) -> Result<(), String> {
     move_user_conversation(
         t,
-        user,
         id,
         UserConversationStatus::Active,
         UserConversationStatus::Archived,
     )
 }
 
-pub fn unarchive_user_conversation(t: &GitTransport, user: &str, id: &str) -> Result<(), String> {
+pub fn unarchive_user_conversation(t: &GitTransport, id: &str) -> Result<(), String> {
     move_user_conversation(
         t,
-        user,
         id,
         UserConversationStatus::Archived,
         UserConversationStatus::Active,
@@ -1819,17 +1812,14 @@ fn remote_refs(
         .collect())
 }
 
+/// This writer's conversations with membership `status`, newest first, each
+/// root followed by its children.
 pub fn list_user_conversations(
     t: &GitTransport,
-    user: &str,
     status: UserConversationStatus,
 ) -> Result<Vec<UserConversationSummary>, String> {
-    refs::validate_user_id(user)?;
-    let sample = membership_ref(user, status, "sample")?;
-    let prefix = sample
-        .strip_suffix(&refs::key_of("sample"))
-        .expect("membership ref ends in its conversation key");
-    let memberships = remote_refs(t, [format!("{prefix}*")])?;
+    let personal = writers::personal_namespace()?;
+    let memberships = remote_refs(t, [format!("{}*", refs::memberships_prefix(&personal)?)])?;
     let wanted = match status {
         UserConversationStatus::Active => conversation_protocol::v3::Membership::Active,
         UserConversationStatus::Archived => conversation_protocol::v3::Membership::Archived,
@@ -1837,12 +1827,13 @@ pub fn list_user_conversations(
     let mut ids = Vec::new();
     for refname in memberships.keys() {
         let parsed = refs::parse_membership_ref(refname);
-        let Ok((found_user, found_status, id)) = parsed else {
+        let Ok((found_personal, found_status, namespace, id)) = parsed else {
             warn_skipped_conversation(refname, &parsed.expect_err("checked error"));
             continue;
         };
-        if found_user == user && found_status == wanted {
-            ids.push(id);
+        if found_personal == personal && found_status == wanted {
+            writers::remember(&id, &namespace);
+            ids.push((namespace, id));
         }
     }
     ids.sort();
@@ -1856,24 +1847,26 @@ pub fn list_user_conversations(
     fetch_changed_heads(t, &heads, &local_heads);
     let store = open_store(t)?;
     let mut summaries = Vec::new();
-    for id in ids {
+    for (_, id) in ids {
         match summary_for_advertised_id(&store, &heads, &id) {
             Ok(summary) => summaries.push(summary),
             Err(error) => warn_skipped_conversation(&id, &error),
         }
     }
 
+    // A child's head sits in its parent's namespace.
     let mut child_ids = Vec::new();
     let mut roots = Vec::new();
     for summary in summaries {
         let head = oid(&summary.head, "conversation head")?;
         let children = Conversation::open(&store, &head)?.children()?;
-        child_ids.extend(
-            children
-                .iter()
-                .map(|child| child.id.clone())
-                .filter(|id| !heads.contains_key(id)),
-        );
+        let namespace = writers::namespace_of(t, &summary.id)?;
+        for child in &children {
+            writers::remember(&child.id, &namespace);
+            if !heads.contains_key(&child.id) {
+                child_ids.push((namespace.clone(), child.id.clone()));
+            }
+        }
         roots.push((summary, children));
     }
     child_ids.sort();
@@ -1884,16 +1877,17 @@ pub fn list_user_conversations(
     group_child_conversations(&store, &heads, roots)
 }
 
+/// The advertised heads of `(namespace, id)` conversations, by id.
 fn advertised_heads_for_ids(
     t: &GitTransport,
-    ids: &[String],
+    ids: &[(String, String)],
 ) -> Result<HashMap<String, (String, Oid)>, String> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
     let patterns = ids
         .iter()
-        .map(|id| refs::head_ref(id))
+        .map(|(namespace, id)| refs::head_ref(namespace, id))
         .collect::<Result<Vec<_>, _>>()?;
     remote_refs(t, patterns).map(|advertised| advertised_conversation_heads(&advertised))
 }
@@ -1903,7 +1897,7 @@ fn advertised_conversation_heads(
 ) -> HashMap<String, (String, Oid)> {
     let mut heads = HashMap::new();
     for (refname, value) in advertised {
-        let Ok(id) = refs::parse_head_ref(refname) else {
+        let Ok((_, id)) = refs::parse_head_ref(refname) else {
             continue;
         };
         match oid(value, "advertised conversation head") {
@@ -1921,7 +1915,7 @@ fn local_conversation_heads(t: &GitTransport) -> Result<HashMap<String, Oid>, St
         &[
             "for-each-ref",
             "--format=%(objectname) %(refname)",
-            refs::CONVERSATIONS_PREFIX,
+            conversation_protocol::v3::writers::NAMESPACE_PREFIX,
         ],
         None,
     )?;
@@ -1930,6 +1924,9 @@ fn local_conversation_heads(t: &GitTransport) -> Result<HashMap<String, Oid>, St
         let (value, refname) = line
             .split_once(' ')
             .ok_or_else(|| format!("git for-each-ref returned a malformed line {line:?}"))?;
+        if refs::parse_head_ref(refname).is_err() {
+            continue;
+        }
         local.insert(refname.to_string(), oid(value, "local conversation ref")?);
     }
     Ok(local)
@@ -2091,7 +2088,9 @@ fn pick_conversation(
     requested: Option<&str>,
     new: bool,
 ) -> Result<(String, bool), String> {
-    if let Some(id) = requested {
+    if let Some(requested) = requested {
+        let id = writers::resolve(t, requested)?;
+        let id = id.as_str();
         let exists = conversation_head(t, id)?.is_some();
         if new && exists {
             return Err(format!(
@@ -2100,14 +2099,15 @@ fn pick_conversation(
         }
         return Ok((id.to_string(), !exists));
     }
-    let refs = remote_refs(
-        t,
-        [format!(
-            "{}*{}",
-            refs::CONVERSATIONS_PREFIX,
-            refs::HEAD_SUFFIX
-        )],
-    )?;
+    // This writer's own conversations: those in the namespace its key derives
+    // for their id.
+    let key = writers::require_key()?.public();
+    let mut refs = remote_refs(t, [refs::ALL_HEADS_PATTERN.to_string()])?;
+    refs.retain(|refname, _| {
+        refs::parse_head_ref(refname).is_ok_and(|(namespace, id)| {
+            refs::conversation_namespace(&key, &id).is_ok_and(|mine| mine == namespace)
+        })
+    });
     let heads = advertised_conversation_heads(&refs);
     let local_heads = local_conversation_heads(t)?;
     fetch_changed_heads(t, &heads, &local_heads);
@@ -2157,26 +2157,10 @@ pub fn fork_conversation(
         title: title.clone(),
     };
     let candidate = mint_transition(&mut store, &from, &transition, &signature(user)?)?;
-    let head_ref = refs::head_ref(id)?;
-    let active = refs::active_membership_ref(user, id)?;
-    let archived = refs::archived_membership_ref(user, id)?;
-    let updates = [
-        RefUpdate {
-            refname: head_ref.clone(),
-            expected: None,
-            new: Some(candidate.clone()),
-        },
-        RefUpdate {
-            refname: active,
-            expected: None,
-            new: Some(candidate.clone()),
-        },
-        RefUpdate {
-            refname: archived,
-            expected: None,
-            new: None,
-        },
-    ];
+    let namespace = writers::own_namespace(id)?;
+    writers::remember(id, &namespace);
+    let head_ref = refs::head_ref(&namespace, id)?;
+    let updates = creation_updates(&mut store, &namespace, id, &candidate)?;
     match store.push(&updates) {
         Ok(()) => {
             let _ = update_local_cache(t, &head_ref, candidate.as_str());
@@ -2196,7 +2180,7 @@ pub fn fork_conversation(
                     })
                 && conversation.title()? == title
             {
-                repair_creation_membership(&store, user, id, &observed)?;
+                repair_creation_membership(&mut store, &namespace, id, &observed)?;
                 Ok(observed.to_string())
             } else {
                 Err(format!(
@@ -2209,7 +2193,7 @@ pub fn fork_conversation(
 
 pub fn set_conversation_title(t: &GitTransport, id: &str, title: &str) -> Result<(), String> {
     let title = validate_conversation_title(title)?.to_string();
-    let refname = refs::head_ref(id)?;
+    let refname = writers::head_ref(t, id)?;
     append_transition(t, id, &refname, "setting its title", |store, head| {
         if Conversation::open(store, head)?.title()? == title {
             return Ok(Step::Done(head.to_string()));
@@ -2229,7 +2213,7 @@ pub fn compare_and_set_conversation_title(
 ) -> Result<bool, String> {
     let expected = validate_conversation_title(expected)?.to_string();
     let title = validate_conversation_title(title)?.to_string();
-    let refname = refs::head_ref(id)?;
+    let refname = writers::head_ref(t, id)?;
     let mut matched = true;
     append_transition(t, id, &refname, "setting its title", |store, head| {
         let current = Conversation::open(store, head)?.title()?;
@@ -2703,7 +2687,17 @@ fn resolve_llm(
         }
     };
     let _ = oid(queued_head, "queued conversation")?;
-    let mut config = vec![format!("--system={system}"), format!("--conversation={id}")];
+    // The step names its conversation by address, and asks to write that
+    // conversation's namespace (design/ref-writers.md).
+    let namespace = writers::namespace_of(t, id)?;
+    let mut config = vec![
+        format!("--system={system}"),
+        format!("--conversation={}", refs::address(&namespace, id)),
+        format!(
+            "--{}={namespace}",
+            conversation_protocol::v3::writers::WRITES_ARG
+        ),
+    ];
     config.push(format!(
         "--model={}",
         options.model.as_deref().unwrap_or(DEFAULT_MODEL)
@@ -2757,9 +2751,12 @@ pub fn model_secret_missing() -> Result<bool, String> {
     Ok(Secrets::current().is_empty())
 }
 
-fn conversation_secrets(id: &str) -> Result<Secrets, String> {
+/// The secrets a request for conversation `id` presents, naming the
+/// conversation by its address so a grant to it cannot match a conversation of
+/// the same id in another namespace.
+fn conversation_secrets(t: &GitTransport, id: &str) -> Result<Secrets, String> {
     ensure_conversation_secret()?;
-    Ok(Secrets::current().for_conversation(id))
+    Ok(Secrets::current().for_conversation(&writers::address(t, id)?))
 }
 
 pub fn ensure_conversation_secret() -> Result<(), String> {
@@ -2781,7 +2778,7 @@ fn request_is_active(status: TurnStatus) -> bool {
 
 pub fn resume_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
     oid(request, "request")?;
-    let secrets = conversation_secrets(id)?;
+    let secrets = conversation_secrets(t, id)?;
     let server = t.server_url()?;
     compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
 }
@@ -2824,7 +2821,7 @@ pub fn run_chat_turn(
     if let Some(request) = request {
         emit(TurnEvent::PhaseStarted(TurnPhase::Model));
         emit(TurnEvent::Status("waiting for agent".to_string()));
-        let secrets = conversation_secrets(id)?;
+        let secrets = conversation_secrets(t, id)?;
         let server = t.server_url()?;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -3429,7 +3426,7 @@ mod tests {
         if let Some(commit) = &commit {
             ensure_code_commit(t, &mut open_store(t)?, commit)?;
         }
-        append_transition(t, id, &refs::head_ref(id)?, "fixture edit", |_, _| {
+        append_transition(t, id, &writers::head_ref(t, id)?, "fixture edit", |_, _| {
             Ok(Step::Mint(Transition::reference(
                 name.into(),
                 commit.clone(),
@@ -3563,10 +3560,11 @@ mod tests {
     }
 
     #[test]
-    fn conversation_refs_are_v3() {
+    fn a_new_conversation_lives_in_its_writers_namespace() {
+        let namespace = writers::own_namespace("talk-1").unwrap();
         assert_eq!(
-            conversation_ref("talk-1").unwrap(),
-            "refs/caos/v3/conversations/74616c6b2d31/head"
+            refs::head_ref(&namespace, "talk-1").unwrap(),
+            format!("refs/caos/w/{namespace}/conversations/74616c6b2d31/head")
         );
     }
 
@@ -3984,7 +3982,7 @@ mod tests {
         append_transition(
             &transport,
             "attached",
-            &refs::head_ref("attached").unwrap(),
+            &writers::head_ref(&transport, "attached").unwrap(),
             "fixture metadata",
             |_, _| {
                 Ok(Step::Mint(Transition::FilesApply {
@@ -4103,7 +4101,7 @@ mod tests {
             append_transition(
                 &transport,
                 "stack",
-                &refs::head_ref("stack").unwrap(),
+                &writers::head_ref(&transport, "stack").unwrap(),
                 "import provenance",
                 |_, _| {
                     Ok(Step::Mint(Transition::FilesApply {
@@ -4786,7 +4784,7 @@ mod tests {
             Some(base.clone())
         );
         // A background reader may hold this cache ref while another follower fetches.
-        let refname = conversation_ref("talk-1").unwrap();
+        let refname = conversation_ref(&transport, "talk-1").unwrap();
         git(transport.work_dir(), &["update-ref", "-d", &refname]);
         let ref_lock = transport
             .work_dir()
@@ -4818,8 +4816,11 @@ mod tests {
             assert_ne!(commit.parents[0].as_str(), base);
             cursor = commit.parents[0].clone();
         }
-        let conversation_ref_prefix =
-            format!("{}{}/*", refs::CONVERSATIONS_PREFIX, refs::key_of("talk-1"));
+        let conversation_ref_prefix = format!(
+            "refs/caos/w/{}/conversations/{}/*",
+            writers::own_namespace("talk-1").unwrap(),
+            refs::key_of("talk-1")
+        );
         assert_eq!(
             git(
                 transport.work_dir(),
@@ -4829,12 +4830,17 @@ mod tests {
             .count(),
             1
         );
+        let namespace = writers::own_namespace("talk-1").unwrap();
         assert!(store
-            .read_ref(&refs::active_membership_ref("Alice", "talk-1").unwrap())
+            .read_ref(
+                &membership_ref(UserConversationStatus::Active, &namespace, "talk-1").unwrap()
+            )
             .unwrap()
             .is_some());
         assert!(store
-            .read_ref(&refs::archived_membership_ref("Alice", "talk-1").unwrap())
+            .read_ref(
+                &membership_ref(UserConversationStatus::Archived, &namespace, "talk-1").unwrap()
+            )
             .unwrap()
             .is_none());
 
@@ -4917,7 +4923,7 @@ mod tests {
         fixture_reference(&transport, "talk-1", "other", Some(&other)).unwrap();
         fixture_reference(&transport, "talk-1", "other", None).unwrap();
         let summaries =
-            list_user_conversations(&transport, "Alice", UserConversationStatus::Active).unwrap();
+            list_user_conversations(&transport, UserConversationStatus::Active).unwrap();
         assert_eq!(summaries[0].title, "hello");
         std::fs::remove_dir_all(root).unwrap();
     }
