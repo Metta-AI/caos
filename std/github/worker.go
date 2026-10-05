@@ -7,7 +7,7 @@
 //	method  GET, POST, PATCH, PUT or DELETE
 //	path    the API path, with any query string
 //	body    optional JSON request body
-//	at      any value of the caller's; it only keys the result
+//	call    the tool call's id (`@call`); it only keys the result
 //
 // The github-token secret, when granted, is at /secret/github-token.
 //
@@ -80,7 +80,7 @@ func request(token string) *http.Request {
 	w.True(strings.HasPrefix(path, "/") && !strings.ContainsFunc(path, func(r rune) bool {
 		return r <= ' ' || r == 0x7f
 	}), "github: path must be an API path such as /repos/owner/repo/pulls, not %q", raw)
-	required("at")
+	required("call")
 	var body io.Reader
 	if text, ok := arg("body"); ok && strings.TrimSpace(text) != "" {
 		w.True(method != "GET", "github: a GET takes no body; put its parameters in the query string")

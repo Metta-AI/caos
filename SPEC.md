@@ -210,7 +210,7 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Three bare tags are flags:
+Four bare tags are flags:
 - `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
   than returning a value. Absent means READ-ONLY, which is the default because
   it is the safe reading of a tool that forgot to say
@@ -222,6 +222,11 @@ Three bare tags are flags:
   changed, or what `main` points at. Off by default because `wc` changes on
   every accepted edit while the tree often does not, so binding it would make
   every call a miss for a commit the tool never reads
+- `@call` — bind the tool call's id as `call`. Results are kept by their
+  arguments, so without it two calls with the same arguments share one result;
+  a tool that talks to an outside service needs each call to be its own run.
+  The id is unique to the call and the same when a call is recovered, so a
+  retry still gets the stored result
 
 The tags live in the help rather than as their own args so that `tool_help` can
 report it WITHOUT EVALUATING: "will this change my tree?" is the second most

@@ -1654,6 +1654,9 @@ fn launch_resolved_tool(
             args.push(("refs", Arg::Lit(refs)));
         }
     }
+    if tool.call {
+        args.push(("call", Arg::Lit(&call.id)));
+    }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
         let task_text = prepare_request(Arg::Hash(&curried), &input)?;
