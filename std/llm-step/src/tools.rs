@@ -1973,9 +1973,7 @@ mod tests {
         let m = refused(move_entry(&call("main/a", "/main/./a"), "ws"));
         assert!(m.contains("same path"), "{m}");
 
-        // A move into itself would delete the only copy; a sibling that merely
-        // shares a prefix of the name is not "into itself" and gets past the
-        // guard (it then fails on the missing /cas, which is not a User error).
+        // A move into itself would delete the only copy.
         let m = refused(move_entry(&call("main/dir", "main/dir/inner"), "ws"));
         assert!(m.contains("into itself"), "{m}");
         let m = refused(move_entry(&call("main/dir", "main/dir/a/b/c"), "ws"));
