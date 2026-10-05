@@ -72,6 +72,17 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
 
+const COPY_HELP: &str = "Copy a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash — it needs no `paths` declaration.
+@param from Conversation path to copy, such as imports/repo/base.
+@param to Conversation path of the copy, such as feature/01-change.";
+
+const MOVE_HELP: &str = "Move or rename a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. A source tree stays a source tree, with its history. Prefer this over mv via bash — it needs no `paths` declaration.
+@param from Conversation path to move, such as feature/01-change.
+@param to New conversation path, such as feature/02-change.";
+
+const REMOVE_HELP: &str = "Remove a file or directory, and everything under it, from the conversation. Removing a source tree removes the whole tree from the conversation. Prefer this over rm via bash — it needs no `paths` declaration.
+@param file-path Conversation path to remove, such as feature/01-change/old.txt.";
+
 const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
 @param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
