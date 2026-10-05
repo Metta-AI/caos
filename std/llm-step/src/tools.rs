@@ -1946,6 +1946,90 @@ mod tests {
         assert!(read["input_schema"].get("required").is_none());
     }
 
+    /// The message of a refusal the model is meant to read. These guards run
+    /// before anything touches /cas, so `ws` is never looked at.
+    fn refused(result: Result<(String, String), Fail>) -> String {
+        match result {
+            Err(User(message)) => message,
+            Err(Infra(message)) => panic!("expected a user error, got infra: {message}"),
+            Ok((text, _)) => panic!("expected a refusal, got: {text}"),
+        }
+    }
+
+    #[test]
+    fn copy_and_move_refuse_what_cannot_work_before_touching_the_tree() {
+        let call = |from: &str, to: &str| json!({"input": {"from": from, "to": to}});
+
+        // The protocol directory is refused as a destination of a copy and as
+        // either end of a move; `execute_inline` only sees `file-path`.
+        let m = refused(copy(&call("main/a", ".caos/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+        let m = refused(move_entry(&call("main/a", ".caos/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+        let m = refused(move_entry(&call(".caos/a", "main/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+
+        // A move onto itself, however the path is spelled, would delete it.
+        let m = refused(move_entry(&call("main/a", "/main/./a"), "ws"));
+        assert!(m.contains("same path"), "{m}");
+
+        // A move into itself would delete the only copy; a sibling that merely
+        // shares a prefix of the name is not "into itself" and gets past the
+        // guard (it then fails on the missing /cas, which is not a User error).
+        let m = refused(move_entry(&call("main/dir", "main/dir/inner"), "ws"));
+        assert!(m.contains("into itself"), "{m}");
+        let m = refused(move_entry(&call("main/dir", "main/dir/a/b/c"), "ws"));
+        assert!(m.contains("into itself"), "{m}");
+
+        // Missing and malformed arguments are the model's mistake, named.
+        assert!(refused(copy(&json!({"input": {"to": "main/a"}}), "ws")).contains("`from`"));
+        assert!(refused(copy(&json!({"input": {"from": "main/a"}}), "ws")).contains("`to`"));
+        assert!(refused(move_entry(&call("main/a", ".."), "ws")).contains(".."));
+        assert!(refused(copy(&call("main/../a", "main/b"), "ws")).contains(".."));
+        assert!(refused(copy(&call("", "main/b"), "ws")).contains("names no path"));
+    }
+
+    #[test]
+    fn remove_refuses_the_protocol_directory_and_bad_paths() {
+        let call = |p: &str| json!({"input": {"file-path": p}});
+        for p in [".caos", ".caos/x", "/.caos/conflicts"] {
+            let m = refused(remove(&call(p), "ws"));
+            assert!(m.contains(".caos is protocol metadata"), "{p}: {m}");
+        }
+        // Only the ROOT `.caos` is protocol: a source tree may have its own.
+        assert!(!matches!(
+            remove(&call("main/.caos"), "ws"),
+            Err(User(m)) if m.contains("protocol metadata")
+        ));
+        assert!(refused(remove(&json!({"input": {}}), "ws")).contains("`file-path`"));
+        assert!(refused(remove(&call("."), "ws")).contains("names no path"));
+        assert!(refused(remove(&call("main/../.."), "ws")).contains(".."));
+    }
+
+    #[test]
+    fn the_direct_tools_are_declared_with_the_arguments_the_worker_reads() {
+        let find = |name: &str| {
+            declarations()
+                .into_iter()
+                .find(|d| d["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not declared"))
+        };
+        for (name, required) in [
+            ("copy", json!(["from", "to"])),
+            ("move", json!(["from", "to"])),
+            ("remove", json!(["file-path"])),
+        ] {
+            let d = find(name);
+            assert_eq!(d["input_schema"]["required"], required, "{name}");
+            let props = d["input_schema"]["properties"].as_object().unwrap();
+            // No `paths` and no commit message: the commit comes from the tool
+            // name, as for write and edit.
+            assert!(!props.contains_key("paths"), "{name}");
+            assert!(!props.contains_key("message"), "{name}");
+            assert!(props.keys().all(|k| required.as_array().unwrap().contains(&json!(k))));
+        }
+    }
+
     #[test]
     fn a_dot_path_is_the_root_rather_than_a_parse_failure() {
         // `.` is EVERY `ls` of a root hash, because `normalize_inline_call`
