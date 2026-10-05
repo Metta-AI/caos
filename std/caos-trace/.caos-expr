@@ -17,4 +17,4 @@ stack's records are readable from the host's tools.
 @param [perf] Any value: also print every out-trace object found in the tree.
 @param [top] How many of the slowest nodes to list (default 25).
 END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
