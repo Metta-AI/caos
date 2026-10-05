@@ -123,16 +123,17 @@ GIT_AUTHOR_DATE="@0 +0000" GIT_COMMITTER_DATE="@0 +0000" \
 git push -q http://127.0.0.1 "HEAD:refs/heads/caos-test/$(git rev-parse HEAD)" \
   || fail "pushing the workspace commit to the dev stack"
 
-# A MOCK KEY FOR std/llm-call, std/llm-step and dev/worker-test — not a secret:
+# A MOCK KEY FOR std/llm-call, std/llm-step, dev/worker-test and std/go — not a secret:
 # the value is a constant, and the only thing that ever sees it is a stub HTTP
 # server a test starts in its own container. Granted here, the suite's own run
 # carries it, so a worker test forms an llm-call request directly and the key
 # arrives at /secret. Tests reach these through DEEP-DEPS copies, which carry
 # the origin of the node they copy.
 #
-# dev/worker-test is granted so a test's own ArgTree carries the key's
-# `secret-hash`: llm-step's admission protocol names the exact request hash in
-# advance, and a worker can only form that request if it can bind the entry.
+# dev/worker-test and std/go are granted so a test's own ArgTree carries the
+# key's `secret-hash`: llm-step's admission protocol names the exact request
+# hash in advance, and a worker can only form that request if it can bind the
+# entry. std/go is the image the Go worker tests run on.
 STORE=/tmp/caos-test-secrets
 key=$("$CLI" secrets-init --dir="$STORE") || fail "creating the test store"
 git config caos.secret-readers "$key"
@@ -144,9 +145,10 @@ at="git+http://caos.invalid/caos-test?rev=$(git rev-parse HEAD)&dir"
   printf 'reader:@@=%s=std/llm-call\n' "$at"
   printf 'reader:@@=%s=std/llm-step\n' "$at"
   printf 'reader:@@=%s=dev/worker-test\n' "$at"
+  printf 'reader:@@=%s=std/go\n' "$at"
 } > "$STORE/llm-mock"
 "$CLI" secrets-push --dir="$STORE" --server=http://127.0.0.1 >/dev/null || fail "pushing the test store"
-echo "==> granting llm-call, llm-step and dev/worker-test a mock key" >&2
+echo "==> granting llm-call, llm-step, dev/worker-test and std/go a mock key" >&2
 
 # THE REPORT IS A VALUE, red or green. SPEC is explicit that a tool's expected
 # failures are results the model can read, and a failing suite is the single
