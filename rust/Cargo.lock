@@ -457,6 +457,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "conversation-protocol"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "flate2",
  "git-locator",
  "serde",
