@@ -213,14 +213,22 @@ func read() {
 	}
 	say("")
 
-	say("---- tree (requested/started/ended ms) ----")
+	say("---- tree to depth %d (name  requested/started/ended ms) ----", depth)
+	hidden := 0
 	for _, f := range all {
+		if f.depth > depth {
+			hidden++
+			continue
+		}
 		mark := ""
 		if f.Reused {
 			mark = " [reused]"
 		}
 		say("%s%s  %s/%s/%s%s", strings.Repeat("  ", f.depth), f.Name,
 			ms(f.Requested), ms(f.Started), ms(f.Ended), mark)
+	}
+	if hidden > 0 {
+		say("(%d deeper nodes not shown; raise `depth` to see them)", hidden)
 	}
 	say("")
 
