@@ -18,7 +18,7 @@ full output or its inner-stack logs. Nothing is handed in from the host: the
 stack under test is compiled from these sources, inside workers. This tool is
 specific to the caos codebase; run in any other tree it reports cleanly that
 there is nothing for it to test. The report ends with the suite's trace hash; pass
-it to `caos-trace` for per-node timings.
+it to `read-trace` for per-node timings.
 @param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys each test and the requests a client test makes, but nothing above them.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
 @in

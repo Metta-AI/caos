@@ -1,4 +1,4 @@
-# The `caos-trace` tool (SPEC, "Tracing"): the std/go worker image with this
+# The `read-trace` tool (SPEC, "Tracing"): the std/go worker image with this
 # directory's program curried onto it, plus the `help` an agent registers it by.
 # Like `caos-test-result` it reads by hash and touches no source tree.
 #

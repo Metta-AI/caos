@@ -1,4 +1,4 @@
-// The `caos-trace` tool's worker. Its DOCS live in the sibling `.caos-expr`
+// The `read-trace` tool's worker. Its DOCS live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "Tools").
 //
 // It reads a run's trace by the hash of its ArgTree. The trace is NOT a git
