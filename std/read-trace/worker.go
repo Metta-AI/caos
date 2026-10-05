@@ -140,7 +140,12 @@ func read() {
 	if err != nil || top < 0 {
 		top = 25
 	}
+	depth, err := strconv.Atoi(optArg("depth", "3"))
+	if err != nil || depth < 0 {
+		depth = 3
+	}
 	perf := optArg("perf", "") != ""
+	wantJSON := optArg("json", "") != ""
 
 	body, problem := fetchStatus(hash)
 	if problem != "" {
