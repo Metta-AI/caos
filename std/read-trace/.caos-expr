@@ -15,6 +15,8 @@ trace outlives its run and both stacks write to the one redis, so the dev
 stack's records are readable from the host's tools.
 @param hash The ArgTree hash from the `caos-test` report's "full trace" line (40 hex characters).
 @param [perf] Any value: also print every out-trace object found in the tree.
+@param [depth] How many levels of the tree to list (default 3; a big run has thousands of nodes).
+@param [json] Any value: also print the complete raw JSON from the server (can be very long).
 @param [top] How many of the slowest nodes to list (default 25).
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
