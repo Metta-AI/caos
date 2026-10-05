@@ -13,8 +13,7 @@
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `sub-run`, `trace-child`, `status`, `prepare-request`,
-//! `curry`, and `runner`.
+//! `run-then`, `run-request-then`, `sub-run`, `prepare-request`, `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
@@ -124,14 +123,6 @@ fn run(args: &[String]) -> Result<(), String> {
         // result (or caught error) to a callback image.
         Some("run-request-then") => match &args[2..] {
             [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
-            _ => Err(usage(args)),
-        },
-        // `status [--all] <arg-tree>` — the server's trace view of an ArgTree
-        // (SPEC.md "Tracing") as JSON: the worker-side `caos-cli status`, which
-        // is how a tool reads a run's trace and perf data.
-        Some("status") => match &args[2..] {
-            [arg_tree] => caos::cli_status(&http()?, arg_tree, false),
-            [flag, arg_tree] if flag == "--all" => caos::cli_status(&http()?, arg_tree, true),
             _ => Err(usage(args)),
         },
         // `trace-child <name> <arg-tree>` — record under this job that it
@@ -542,7 +533,6 @@ fn usage(args: &[String]) -> String {
          {prog} run-request-then <arg-tree-hash|cas-path> [--then:<type>=<image>] [--catch]\n  \
          {prog} sub-run <arg-tree-hash>\n  \
          {prog} trace-child <name> <arg-tree-hash>\n  \
-         {prog} status [--all] <arg-tree-hash>\n  \
          {prog} prepare-request --base:<type>=<image-or-arg tree> [--name=value | --name:@=path ...]\n  \
          {prog} resolve-image <hex hash | docker://<ref>>\n  \
          {prog} curry [--unbind=<name> ...] --base:<type>=<arg tree> [--name=value | --name:@=path ...]\n    \
