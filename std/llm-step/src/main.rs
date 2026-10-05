@@ -79,7 +79,11 @@ struct Config {
     merge_refs: Option<String>,
     model: String,
     base_url: String,
+    /// The conversation's id, as its records name it.
     conversation: String,
+    /// Its address, `<namespace>/<id>`: what `--conversation` names, since an
+    /// id alone does not say whose namespace it is in (design/ref-writers.md).
+    address: String,
 }
 
 fn image_arg(name: &str) -> Result<Option<String>, String> {
@@ -100,6 +104,12 @@ impl Config {
         };
         let tools_only = read_arg_opt("tools-only")?;
         let list_tools = read_arg_opt("list-tools")?.is_some();
+        // A listing describes tools, which no conversation owns.
+        let address = match (read_arg_opt("conversation")?, list_tools) {
+            (Some(address), _) => address,
+            (None, true) => String::new(),
+            (None, false) => return Err("llm-step requires --conversation".to_string()),
+        };
         // Neither of those modes reaches the model, so neither may DEMAND what
         // a model call takes. The key especially: `caos mcp` runs Claude Code's
         // tools for a session whose model is Claude Code's own, and requiring
@@ -125,11 +135,10 @@ impl Config {
                 false => String::new(),
             },
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            // A listing describes tools, which no conversation owns.
-            conversation: match (read_arg_opt("conversation")?, list_tools) {
-                (Some(conversation), _) => conversation,
-                (None, true) => String::new(),
-                (None, false) => return Err("llm-step requires --conversation".to_string()),
+            address: address.clone(),
+            conversation: match address.is_empty() {
+                true => String::new(),
+                false => conversation_protocol::v3::refs::parse_address(&address)?.1,
             },
         })
     }
@@ -143,7 +152,7 @@ fn run() -> Result<(), String> {
     let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
     let request = Oid::parse(&run_text, "conversation request")?;
     let request_head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
-    let mut state = progress::State::open(&cfg.conversation)?;
+    let mut state = progress::State::open(&cfg.address)?;
     timing::phase("state.open");
     let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
         callback(&cfg, &mut state, &request, &request_head)
