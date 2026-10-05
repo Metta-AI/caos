@@ -35,7 +35,15 @@ pub const EVAL_PATH: &str = "eval_path";
 pub fn is_inline(name: &str) -> bool {
     matches!(
         name,
-        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source"
+        "read"
+            | "ls"
+            | "write"
+            | "edit"
+            | "copy"
+            | "move"
+            | "remove"
+            | "import_source"
+            | "publish_source"
     )
 }
 
