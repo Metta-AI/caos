@@ -54,6 +54,7 @@ mod grant_history;
 mod import;
 mod locator;
 mod push;
+mod ref_writers;
 mod remote_git;
 mod repair;
 mod runner;
@@ -152,6 +153,10 @@ fn install_termination_handlers() {
 }
 
 fn main() {
+    // The repository's pre-receive hook is this binary (design/ref-writers.md).
+    if std::env::args().nth(1).as_deref() == Some(ref_writers::HOOK_ARG) {
+        std::process::exit(ref_writers::pre_receive());
+    }
     install_termination_handlers();
 
     let addr = std::env::var("SERVER_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
@@ -201,7 +206,24 @@ fn main() {
         eprintln!("fatal: {error}");
         std::process::exit(1);
     });
-    remove_managed_pre_receive_hook(&git_dir).unwrap_or_else(|error| {
+    // Who may write which ref is checked on every push, by a pre-receive hook
+    // that is this binary (design/ref-writers.md). Its proof travels as a push
+    // option, which receive-pack only accepts once advertised.
+    git(&[
+        "-C",
+        &git_dir,
+        "config",
+        "receive.advertisePushOptions",
+        "true",
+    ]);
+    ensure_git_config_value(
+        &git_dir,
+        ref_writers::UNGUARDED_CONFIG,
+        ref_writers::DEFAULT_UNGUARDED,
+    )
+    .and_then(|()| ref_writers::install_hook(&git_dir, &addr))
+    .and_then(|()| ensure_hooks_path(&git_dir))
+    .unwrap_or_else(|error| {
         eprintln!("fatal: {error}");
         std::process::exit(1);
     });
@@ -574,49 +596,25 @@ fn remove_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), 
     }
 }
 
-const MANAGED_HOOK_MARKERS: [&str; 2] = [
-    "# managed by caos-server: append-only refs",
-    "# managed by caos-server: append-only conversation heads",
-];
-
-// TODO: Remove this one-time migration after every supported repository has
-// been started by a server version that no longer installs the hook.
-/// Remove the pre-receive hook installed by older CAOS servers.
-///
-/// The old hook execs this binary with a validator mode that no longer exists,
-/// so merely ceasing to install it would make every push to an upgraded
-/// repository fail. Its marker is the ownership proof: an unmarked hook and its
-/// configured path belong to the administrator and are left untouched.
-fn remove_managed_pre_receive_hook(git_dir: &str) -> Result<(), String> {
+/// The hook lives at `<git_dir>/hooks`, git's default. Older servers set
+/// `core.hooksPath` to exactly that, which is equivalent; anything else is an
+/// administrator's choice that would bypass the ref-writers hook.
+fn ensure_hooks_path(git_dir: &str) -> Result<(), String> {
     let hooks = std::path::Path::new(git_dir).join("hooks");
-    let hook = hooks.join("pre-receive");
-    let hooks_value = hooks
-        .to_str()
-        .ok_or_else(|| format!("hooks path is not UTF-8: {}", hooks.display()))?;
-    let contents = match std::fs::read(&hook) {
-        Ok(contents) => contents,
-        // A previous cleanup may have removed the hook without clearing the
-        // absolute path our installer wrote. That exact value is redundant
-        // with Git's default `<git-dir>/hooks`, so clearing it cannot disable a
-        // surviving hook in this directory.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return remove_git_config_value(git_dir, "core.hooksPath", hooks_value);
-        }
-        Err(error) => return Err(format!("reading {}: {error}", hook.display())),
-    };
-    let managed = MANAGED_HOOK_MARKERS.iter().any(|marker| {
-        contents
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-    });
-    if !managed {
-        return Ok(());
+    let output = std::process::Command::new("git")
+        .args(["-C", git_dir, "config", "--get", "core.hooksPath"])
+        .output()
+        .map_err(|e| format!("reading core.hooksPath: {e}"))?;
+    let configured = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if configured.is_empty() || configured == "hooks" || std::path::Path::new(&configured) == hooks
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "core.hooksPath is {configured:?}, so the ref-writers hook in {} would never run",
+            hooks.display()
+        ))
     }
-
-    std::fs::remove_file(&hook).map_err(|error| format!("removing {}: {error}", hook.display()))?;
-    // The installer always wrote this absolute value. Remove only that exact
-    // value; preserve relative or alternate administrator-selected hook paths.
-    remove_git_config_value(git_dir, "core.hooksPath", hooks_value)
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -700,11 +698,17 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
             .find(|h| h.field.equiv(name))
             .map(|h| h.value.as_str().to_string())
     };
-    secrets::Context::admit(
+    let writes = ref_writers::admit(
+        header(conversation_protocol::v3::writers::ADMIT_HEADER).as_deref(),
+        &request.method().to_string(),
+        request.url(),
+    )?;
+    Ok(secrets::Context::admit(
         config,
         &header(caos_world::secrets::READERS_HEADER).unwrap_or_default(),
         header(caos_world::secrets::CONVERSATION_HEADER).as_deref(),
-    )
+    )?
+    .with_writes(writes))
 }
 
 /// A private repository's token for a `:@@=` fetch — the header
@@ -774,6 +778,11 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body)?;
             runner::sub_run(&body)
+        }
+        Method::Post if path == ref_writers::TOKEN_PATH => {
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body)?;
+            ref_writers::token_endpoint(&body)
         }
         Method::Post if path == "/trace/child" => {
             let mut body = String::new();
@@ -876,10 +885,7 @@ fn spawn_request_ref_pruner(git_dir: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        configure_ref_advertisements, remove_managed_pre_receive_hook, run_required_git,
-        MANAGED_HOOK_MARKERS,
-    };
+    use super::{configure_ref_advertisements, ensure_hooks_path, run_required_git};
     use std::process::Command;
 
     #[test]
@@ -997,114 +1003,49 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn managed_pre_receive_hooks_are_removed_on_upgrade() {
-        for (index, marker) in MANAGED_HOOK_MARKERS.iter().enumerate() {
-            let dir = std::env::temp_dir().join(format!(
-                "caos-managed-hook-test-{}-{index}",
-                std::process::id()
-            ));
-            std::fs::remove_dir_all(&dir).ok();
-            run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-            let hooks = dir.join("hooks");
-            let hook = hooks.join("pre-receive");
-            std::fs::write(&hook, format!("#!/bin/sh\n{marker}\nexit 1\n")).unwrap();
-            run_required_git(&[
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "core.hooksPath",
-                hooks.to_str().unwrap(),
-            ])
-            .unwrap();
-
-            remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-            assert!(!hook.exists());
-            let configured = Command::new("git")
-                .args([
-                    "-C",
-                    dir.to_str().unwrap(),
-                    "config",
-                    "--get",
-                    "core.hooksPath",
-                ])
-                .output()
-                .unwrap();
-            assert_eq!(configured.status.code(), Some(1));
-            std::fs::remove_dir_all(dir).unwrap();
-        }
+    fn bare(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("caos-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
+        dir
     }
 
     #[test]
-    fn unmanaged_pre_receive_hook_and_path_are_preserved() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-unmanaged-hook-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
-        let hook = hooks.join("pre-receive");
-        let contents = b"#!/bin/sh\necho administrator hook\n";
-        std::fs::write(&hook, contents).unwrap();
-        run_required_git(&[
-            "-C",
-            dir.to_str().unwrap(),
-            "config",
-            "core.hooksPath",
-            hooks.to_str().unwrap(),
-        ])
+    fn the_ref_writers_hook_replaces_an_older_managed_hook() {
+        let dir = bare("managed-hook");
+        let hook = dir.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\n# managed by caos-server: append-only refs\nexit 1\n",
+        )
         .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        assert_eq!(std::fs::read(&hook).unwrap(), contents);
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert!(configured.status.success());
-        assert_eq!(
-            String::from_utf8(configured.stdout).unwrap().trim(),
-            hooks.to_str().unwrap()
-        );
+        crate::ref_writers::install_hook(dir.to_str().unwrap(), "[::]:80").unwrap();
+        let installed = std::fs::read_to_string(&hook).unwrap();
+        assert!(installed.contains("--pre-receive"), "{installed}");
+        assert!(installed.contains("http://127.0.0.1:80"), "{installed}");
+        ensure_hooks_path(dir.to_str().unwrap()).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn stale_managed_hook_path_is_removed_when_the_hook_is_already_absent() {
-        let dir =
-            std::env::temp_dir().join(format!("caos-stale-hook-path-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        run_required_git(&["init", "-q", "--bare", dir.to_str().unwrap()]).unwrap();
-        let hooks = dir.join("hooks");
+    fn an_administrators_hook_or_hook_path_is_refused_not_overwritten() {
+        let dir = bare("unmanaged-hook");
+        let hook = dir.join("hooks").join("pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\necho administrator hook\n").unwrap();
+        assert!(crate::ref_writers::install_hook(dir.to_str().unwrap(), "[::]:80").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&hook).unwrap(),
+            "#!/bin/sh\necho administrator hook\n"
+        );
         run_required_git(&[
             "-C",
             dir.to_str().unwrap(),
             "config",
             "core.hooksPath",
-            hooks.to_str().unwrap(),
+            "/elsewhere",
         ])
         .unwrap();
-
-        remove_managed_pre_receive_hook(dir.to_str().unwrap()).unwrap();
-
-        let configured = Command::new("git")
-            .args([
-                "-C",
-                dir.to_str().unwrap(),
-                "config",
-                "--get",
-                "core.hooksPath",
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(configured.status.code(), Some(1));
+        assert!(ensure_hooks_path(dir.to_str().unwrap()).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
