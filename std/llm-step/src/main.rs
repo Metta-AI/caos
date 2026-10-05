@@ -236,7 +236,7 @@ fn validate_admission(
 }
 
 fn state_conversation_id(state: &progress::State) -> Result<String, String> {
-    conversation_protocol::v3::refs::parse_head_ref(state.refname())
+    conversation_protocol::v3::refs::parse_head_ref(state.refname()).map(|(_, id)| id)
 }
 
 fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
@@ -2359,7 +2359,7 @@ fn spawn_agent_call(
     let prompt_head = mint_detached(state, &root, &prompt_transition, &signature)?;
     state.push_code(&prompt_head)?;
     let (configuration, child_request) =
-        subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
+        subagents::child_request(state.namespace()?, &child_id, &prompt_head, &cfg.system)?;
 
     let admit = Transition::TurnAdmit {
         record: TurnRecord {
@@ -3580,7 +3580,8 @@ mod tests {
         proposal_builder.put("proposal", Mode::Blob, b"proposal\n".to_vec());
         let proposal_tree = proposal_builder.build(&mut writer_store).unwrap();
         let root = root_with(&mut writer_store, BTreeMap::new()).unwrap();
-        let conversation_ref = conversation_protocol::v3::refs::head_ref(CONVERSATION).unwrap();
+        let conversation_ref =
+            conversation_protocol::v3::refs::head_ref(&"a".repeat(40), CONVERSATION).unwrap();
         writer_store
             .push(&[
                 RefUpdate {
@@ -4037,7 +4038,7 @@ mod tests {
                 record: AsyncRecord {
                     task: task.clone(),
                     status: TaskStatus::Pending,
-                    target_ref: Some("refs/caos/v3/conversations/conversation/head".to_string()),
+                    target_ref: Some("refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/conversations/636f6e766572736174696f6e/head".to_string()),
                     result: None,
                     reason: None,
                 },

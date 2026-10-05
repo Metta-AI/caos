@@ -361,12 +361,12 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         transport.ensure_server_reachable()?;
         if args.list_archived {
             for conversation in
-                list_user_conversations(&transport, &args.user, UserConversationStatus::Archived)?
+                list_user_conversations(&transport, UserConversationStatus::Archived)?
             {
                 println!("{}\t{}", conversation.id, conversation.title);
             }
         } else if let Some(id) = &args.unarchive {
-            unarchive_user_conversation(&transport, &args.user, id)?;
+            unarchive_user_conversation(&transport, id)?;
             println!("unarchived {id}");
         }
         return Ok(());

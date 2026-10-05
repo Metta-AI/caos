@@ -36,9 +36,14 @@ pub struct GitStore {
     remote_tip: RefCell<Option<Oid>>,
     batch: RefCell<Option<BatchReader>>,
     batch_dirty: Cell<bool>,
+    push_auth: Option<PushAuth>,
     #[cfg(test)]
     command_count: Cell<usize>,
 }
+
+/// Proves a push to a governed ref (design/ref-writers.md): the `caos-auth`
+/// push option for the commands being pushed.
+pub type PushAuth = Box<dyn Fn(&[super::writers::Command]) -> String>;
 
 static NEXT_OBJECT_TEMP: AtomicU64 = AtomicU64::new(1);
 
@@ -144,7 +149,20 @@ impl GitStore {
         );
         fs::write(dir.join("config"), config)
             .map_err(|error| format!("writing scratch config: {error}"))?;
-        GitStore::open(&dir, Some("origin"))
+        let mut store = GitStore::open(&dir, Some("origin"))?;
+        // A scratch store is a worker's; a job the server granted writes
+        // pushes with the token it injected, and any other job has none.
+        if let Some(token) = super::writers::injected_token() {
+            let option = super::writers::Auth::Run { token }.option();
+            store.set_push_auth(Box::new(move |_: &[super::writers::Command]| {
+                option.clone()
+            }));
+        }
+        Ok(store)
+    }
+
+    pub fn set_push_auth(&mut self, auth: PushAuth) {
+        self.push_auth = Some(auth);
     }
 
     pub fn open(dir: &Path, remote: Option<&str>) -> Result<GitStore, String> {
@@ -157,6 +175,7 @@ impl GitStore {
             remote_tip: RefCell::new(None),
             batch: RefCell::new(None),
             batch_dirty: Cell::new(false),
+            push_auth: None,
             #[cfg(test)]
             command_count: Cell::new(0),
         };
@@ -303,6 +322,19 @@ impl GitStore {
         let mut arguments = vec!["push".to_string(), "--quiet".to_string()];
         if updates.len() > 1 {
             arguments.push("--atomic".to_string());
+        }
+        if let Some(auth) = &self.push_auth {
+            let commands: Vec<super::writers::Command> = updates
+                .iter()
+                .map(|u| {
+                    super::writers::Command::new(
+                        &u.refname,
+                        u.expected.as_ref().map(Oid::as_str),
+                        u.new.as_ref().map(Oid::as_str),
+                    )
+                })
+                .collect();
+            arguments.push(format!("--push-option={}", auth(&commands)));
         }
         for update in updates {
             let expected = update.expected.as_ref().map(Oid::as_str).unwrap_or("");
@@ -551,7 +583,7 @@ impl GitStore {
         updates
             .iter()
             .find(|update| {
-                update.refname.starts_with("refs/caos/v3/conversations/") && update.new.is_some()
+                super::refs::parse_head_ref(&update.refname).is_ok() && update.new.is_some()
             })
             .and_then(|update| update.new.clone())
             .or_else(|| {
@@ -1348,7 +1380,7 @@ mod tests {
                     new: Some(tree),
                 },
                 RefUpdate {
-                    refname: "refs/caos/v3/conversations/test/head".to_string(),
+                    refname: super::super::refs::head_ref(&"a".repeat(40), "test").unwrap(),
                     expected: None,
                     new: Some(commit.clone()),
                 },

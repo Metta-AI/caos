@@ -20,13 +20,29 @@ start|succeeded|failed)
   ;;
 esac
 
+# EVERY STAGE HOLDS `writes` (design/ref-writers.md): each pushes the
+# conversation with its run token, and hands the namespace on to the Q it runs.
+writes=()
+if [ -e /cas/args/writes ]; then writes=("--writes:@=/cas/args/writes"); fi
 next() {
   local next_stage=$1
   shift
   caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage="$next_stage" --test-salt:@=/cas/args/test-salt \
     --bash:@=/cas/args/bash --updater:@=/cas/args/updater --tool:@=/cas/args/tool \
-    --succeed:@=/cas/args/succeed --fail:@=/cas/args/fail "$@"
+    --succeed:@=/cas/args/succeed --fail:@=/cas/args/fail "${writes[@]}" "$@"
+}
+
+# The writer this test's run token acts for, which the tool derives a
+# conversation's namespace from.
+[ -r /secret/caos-write ] || fail "this job holds no run token: dev/run-test must hand the test --writes"
+LLM_TEST_WRITER=$(curl -sf -X POST --data-binary @/secret/caos-write \
+  "$CAOS_SERVER_URL/ref-writers/token" | jq -r .key) \
+  || fail "asking the server which writer this test's run token is"
+export LLM_TEST_WRITER
+namespace_of_ref() { # <refs/caos/w/<ns>/...>
+  local rest=${1#refs/caos/w/}
+  printf '%s\n' "${rest%%/*}"
 }
 
 : "${CAOS_SERVER_URL:?this test needs CAOS_SERVER_URL from the runner}"
@@ -129,7 +145,8 @@ start)
     --id "$failure_id" --new "$failure_root" >/dev/null || fail "creating failure conversation"
 
   success_task=$(caos prepare-request --base:hash="$UPDATER" \
-    --subreq="$success_request" --target-ref="$success_ref") \
+    --subreq="$success_request" --target-ref="$success_ref" \
+    --writes="$(namespace_of_ref "$success_ref")") \
     || fail "preparing the successful Q"
   assert_oid "$success_task" "successful Q"
   success_pending=$($TOOL async-start --repo /tmp/repo --head "$success_root" \
@@ -161,7 +178,8 @@ succeeded)
   diff -r /tmp/expected /cas/actual >/dev/null || fail "Q changed R's result"
 
   failure_task=$(caos prepare-request --base:hash="$UPDATER" \
-    --subreq="$failure_request" --target-ref="$failure_ref") \
+    --subreq="$failure_request" --target-ref="$failure_ref" \
+    --writes="$(namespace_of_ref "$failure_ref")") \
     || fail "preparing the failing Q"
   assert_oid "$failure_task" "failing Q"
   failure_pending=$($TOOL async-start --repo /tmp/repo --head "$failure_root" \

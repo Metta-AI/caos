@@ -133,6 +133,14 @@ git push -q http://127.0.0.1 "HEAD:refs/heads/caos-test/$(git rev-parse HEAD)" \
 # dev/worker-test is granted so a test's own ArgTree carries the key's
 # `secret-hash`: llm-step's admission protocol names the exact request hash in
 # advance, and a worker can only form that request if it can bind the entry.
+# THE SUITE'S WRITER (design/ref-writers.md): the dev stack enforces who may
+# write a ref, so the client driving the suite signs as a writer, and the suite
+# hands that on (`--writes=*`) to the tests and the steps they run. A fresh key
+# per run: it is in no ArgTree, so it moves no cache key.
+writer=$("$CLI" ref-writer-key new 2>/dev/null) || fail "creating the suite's ref writer key"
+git config caos.ref-writer-key "$writer"
+args+=("--writes=*")
+
 STORE=/tmp/caos-test-secrets
 key=$("$CLI" secrets-init --dir="$STORE") || fail "creating the test store"
 git config caos.secret-readers "$key"

@@ -7,13 +7,10 @@ source /cas/args/common
 
 stage "public inline import in an empty conversation"
 llm_test_setup
-# The unchanged turn helper fetches its configuration before publishing the
-# conversation. Git 2.54 refuses that fetch when every server ref is hidden.
-# Advertise one private fixture ref; the conversation itself still has no code.
-fixture_ref="refs/heads/llm-import-fixture-$(date +%s%N)-$$"
-fixture=$(git -c user.name=test -c user.email=test@example.invalid commit-tree "$(git mktree </dev/null)" -m fixture)
-git push -q caos "$fixture:$fixture_ref"
-trap 'git push -q caos ":$fixture_ref" >/dev/null 2>&1 || true; llm_test_cleanup' EXIT
+# The turn helper fetches its configuration before publishing the
+# conversation, and Git 2.54 refuses that fetch when every server ref is
+# hidden. new_llm_conversation founds the conversation's namespace first, and
+# its writers ref is advertised (design/ref-writers.md).
 mkdir -p /tmp/stub
 cat > /tmp/stub/response-1.json <<'JSON'
 {"content":[{"type":"tool_use","id":"import","name":"import_source","input":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/hello/base"}}],"stop_reason":"tool_use"}

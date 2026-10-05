@@ -69,8 +69,10 @@ pub struct State<S: RefStore = GitStore> {
 }
 
 impl State<GitStore> {
+    /// `conversation` is its address, `<namespace>/<id>` (design/ref-writers.md).
     pub fn open(conversation: &str) -> Result<Self, String> {
-        let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+        let (namespace, id) = conversation_protocol::v3::refs::parse_address(conversation)?;
+        let refname = conversation_protocol::v3::refs::head_ref(&namespace, &id)?;
         let server =
             std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
         let store = GitStore::scratch("llm-step-git", server.trim_end_matches('/'))?;
@@ -166,7 +168,8 @@ impl State<GitStore> {
             transition.kind(),
             &signature,
         )?;
-        let child_ref = conversation_protocol::v3::refs::head_ref(&child.id)?;
+        // A child's head sits in its parent's namespace, under one writers list.
+        let child_ref = conversation_protocol::v3::refs::head_ref(self.namespace()?, &child.id)?;
         let updates = [
             RefUpdate {
                 refname: self.refname.clone(),
@@ -291,6 +294,13 @@ impl<S: RefStore> State<S> {
 
     pub fn refname(&self) -> &str {
         &self.refname
+    }
+
+    /// The ref-writers namespace this conversation lives in.
+    pub fn namespace(&self) -> Result<&str, String> {
+        conversation_protocol::v3::writers::split_ref(&self.refname)
+            .map(|(namespace, _)| namespace)
+            .ok_or_else(|| format!("{} is not in a namespace", self.refname))
     }
 
     pub fn store(&self) -> &S {
@@ -686,7 +696,7 @@ mod tests {
         };
         let mut state = State::from_store(
             store,
-            "refs/caos/v3/conversations/conversation/head".to_string(),
+            "refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/conversations/636f6e766572736174696f6e/head".to_string(),
             root,
         )
         .unwrap();
@@ -724,7 +734,7 @@ mod tests {
             };
             let mut state = State::from_store(
                 store,
-                "refs/caos/v3/conversations/conversation/head".to_string(),
+                "refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/conversations/636f6e766572736174696f6e/head".to_string(),
                 root.clone(),
             )
             .unwrap();

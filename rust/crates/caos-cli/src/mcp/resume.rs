@@ -198,7 +198,7 @@ fn fork(t: &GitTransport, session: &str, user: &str, from: &Oid) -> Result<Optio
     crate::fork_conversation(t, user, &id, &title, settled.as_str())?;
     Ok(Some(format!(
         "caos conversation ref {} forked from {from}",
-        conversation_ref(&id)?
+        conversation_ref(t, &id)?
     )))
 }
 
@@ -215,7 +215,7 @@ fn resume(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>,
     store.ensure_local(from)?;
     validate_cached(&store, from)?;
     let id = Conversation::open(&store, from)?.identity()?.id;
-    let refname = refs::head_ref(&id)?;
+    let refname = crate::writers::head_ref(t, &id)?;
     let head = store
         .read_ref(&refname)?
         .ok_or_else(|| format!("conversation {id:?} has no head on this caos server"))?;
@@ -239,7 +239,7 @@ fn resume(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>,
     remember(t, session, &id)?;
     Ok(Some(format!(
         "caos conversation ref {} resumed at {settled}",
-        conversation_ref(&id)?
+        conversation_ref(t, &id)?
     )))
 }
 

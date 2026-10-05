@@ -51,12 +51,18 @@ pub fn prepare_task(
     run_and_update_ref_image: &str,
 ) -> Result<Oid, String> {
     Oid::parse(subrequest, "async subrequest")?;
-    refs::parse_head_ref(target_ref)?;
+    let (namespace, _) = refs::parse_head_ref(target_ref)?;
+    // The task appends its status to the conversation, so it asks to write
+    // the conversation's namespace; its subrequest asks for nothing.
     let task = prepare_request(
         Arg::Hash(run_and_update_ref_image),
         &[
             ("subreq", Arg::Lit(subrequest)),
             ("target-ref", Arg::Lit(target_ref)),
+            (
+                conversation_protocol::v3::writers::WRITES_ARG,
+                Arg::Lit(&namespace),
+            ),
         ],
     )?;
     Oid::parse(&task, "async task")

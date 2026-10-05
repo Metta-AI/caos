@@ -154,7 +154,9 @@ enum IntegrityDepth {
     SourceTreeClosure,
 }
 
-const V3_PREFIX: &str = "refs/caos/v3/";
+/// Ref-writers namespaces (design/ref-writers.md): conversation heads and
+/// `writers` lists. Rewinding a `writers` list could restore a removed writer.
+const V3_PREFIX: &str = "refs/caos/w/";
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/")
@@ -167,7 +169,7 @@ fn integrity_depth(refname: &str) -> IntegrityDepth {
     }
 }
 
-// A v3 conversation head is never rewound: an older reflog value can name a
+// A namespaced ref (a conversation head, a writers list) is never rewound: an older reflog value can name a
 // state whose write-ahead effects (a landed publication push, half of an atomic
 // spawn) already happened. The loose ref is dropped and the reflog kept for a
 // human to restore from.
@@ -699,12 +701,12 @@ mod tests {
         let head_commit = git_stdin(&dir, &["commit-tree", &tree, "-m", "message.append"], b"");
         let head = plant_ref(
             &dir,
-            "refs/caos/v3/conversations/74616c6b/head",
+            "refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/conversations/74616c6b/head",
             &format!("{head_commit}\n"),
         );
         let membership = plant_ref(
             &dir,
-            "refs/caos/v3/users/616c696365/conversations/active/74616c6b",
+            "refs/caos/w/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/memberships/active/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/74616c6b",
             &format!("{head_commit}\n"),
         );
         let blob_path = dir.join("objects").join(&blob[..2]).join(&blob[2..]);
@@ -723,7 +725,8 @@ mod tests {
         let git_dir = dir.to_string_lossy().into_owned();
         let intact = empty_commit(&dir, "conversation.root");
         let missing = "68173e37cae6a53970ceaf3a7d5ced68d1ce6d6a";
-        let name = "refs/caos/v3/conversations/74616c6b/head";
+        let name =
+            "refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/conversations/74616c6b/head";
         let head = plant_ref(&dir, name, &format!("{missing}\n"));
         let reflog = plant_ref(
             &dir,
