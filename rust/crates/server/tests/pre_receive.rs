@@ -103,13 +103,20 @@ fn only_a_namespaces_writers_can_push_into_it() {
         ])
         .expect("alice creates her namespace");
 
-    // Bob is not a writer.
+    // Bob is not a writer, and nobody may push an ungoverned name.
     bob.fetch_object(&ns).unwrap();
     let refused = bob.push(&[update(&format!("refs/caos/w/{ns}/other"), None, &ns)]);
     let refused = refused.expect_err("bob wrote alice's namespace");
     assert!(
         refused.contains("not one of the namespace's writers"),
         "{refused}"
+    );
+    let ungoverned = alice
+        .push(&[update("refs/heads/main", None, &ns)])
+        .expect_err("an ungoverned ref was accepted");
+    assert!(
+        ungoverned.contains("governed refs live under"),
+        "{ungoverned}"
     );
 
     // Alice adds Bob; now he can write.

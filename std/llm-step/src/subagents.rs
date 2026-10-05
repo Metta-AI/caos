@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use conversation_protocol::v3::{refs, Oid};
+use conversation_protocol::v3::{refs, writers, Oid};
 use serde_json::{json, Value};
 use worker_common::{arg, caos, caos_recurry, own_args_tree, prepare_request, Arg};
 
@@ -81,6 +81,7 @@ pub fn agent_title(prompt: &str) -> String {
 /// request. The child prompt commit is already published before this runs, so
 /// `prepare-request` can resolve the commit-kinded `head` argument.
 pub fn child_request(
+    namespace: &str,
     child: &str,
     prompt_head: &Oid,
     parent_system: &str,
@@ -116,12 +117,15 @@ pub fn child_request(
     // and the server refuses a bare hash that is not a tree or blob), so the
     // prompt commit is materialized at a /cas path first, as the client does.
     let head_path = fresh("subagent-head");
+    // The child keeps this step's `writes` (not dropped above): it lives in
+    // the same namespace, so the same grant covers it.
+    let child = refs::address(namespace, child);
     caos(["get-hash", prompt_head.as_str(), &head_path])?;
     let configuration = caos_recurry(
         Arg::Hash(&own_args_tree()?),
         &unbind,
         &[
-            ("conversation", Arg::Lit(child)),
+            ("conversation", Arg::Lit(&child)),
             ("head", Arg::Path(&head_path)),
             ("subagent", Arg::Lit("true")),
             ("system", Arg::Lit(&child_system)),
@@ -140,14 +144,17 @@ pub fn prepare_relay(
     child: &str,
     run_and_update_ref_image: &str,
 ) -> Result<Oid, String> {
-    refs::parse_head_ref(target_ref)?;
-    refs::head_ref(child)?;
+    let (namespace, _) = refs::parse_head_ref(target_ref)?;
+    refs::validate_conversation_id(child)?;
+    // The relay appends to the parent and reads the child, both in this
+    // namespace, so it asks to write it (design/ref-writers.md).
     let relay = prepare_request(
         Arg::Hash(run_and_update_ref_image),
         &[
             ("subreq", Arg::Lit(subrequest.as_str())),
             ("target-ref", Arg::Lit(target_ref)),
             ("child", Arg::Lit(child)),
+            (writers::WRITES_ARG, Arg::Lit(&namespace)),
         ],
     )?;
     Oid::parse(&relay, "subagent relay")
@@ -162,7 +169,7 @@ pub fn relay_request(relay: &Oid) -> Result<(Oid, String, String), String> {
     let child = arguments.next().unwrap();
     let subrequest = Oid::parse(&subrequest, "subagent request")?;
     refs::parse_head_ref(&target_ref)?;
-    refs::head_ref(&child)?;
+    refs::validate_conversation_id(&child)?;
     Ok((subrequest, target_ref, child))
 }
 

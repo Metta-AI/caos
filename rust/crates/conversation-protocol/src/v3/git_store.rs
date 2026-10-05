@@ -583,7 +583,7 @@ impl GitStore {
         updates
             .iter()
             .find(|update| {
-                update.refname.starts_with("refs/caos/v3/conversations/") && update.new.is_some()
+                super::refs::parse_head_ref(&update.refname).is_ok() && update.new.is_some()
             })
             .and_then(|update| update.new.clone())
             .or_else(|| {
@@ -1380,7 +1380,7 @@ mod tests {
                     new: Some(tree),
                 },
                 RefUpdate {
-                    refname: "refs/caos/v3/conversations/test/head".to_string(),
+                    refname: super::super::refs::head_ref(&"a".repeat(40), "test").unwrap(),
                     expected: None,
                     new: Some(commit.clone()),
                 },

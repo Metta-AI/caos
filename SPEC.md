@@ -505,7 +505,7 @@ value=<secret>
 # or read from a file, relative to this one
 value:@=<file>
 reader:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step since=<sha>
-reader:@=imports/caos/std/llm-step conversation=<id>
+reader:@=imports/caos/std/llm-step conversation=<namespace>/<id>
 ```
 
 ## Readers
@@ -518,9 +518,11 @@ reader:@=imports/caos/std/llm-step conversation=<id>
   `ref=` in place of `rev=` names a branch, resolved when a request is admitted
   (`git+caos://` is this server's own; any other URL is asked), so the range
   moves with it — and trusts whoever can move that branch.
-- **`reader:@=<path> conversation=<id>`** grants whatever is at `path` in that
-  conversation's tree, and only in that conversation. The agent can edit that
-  code, so this exposes the secret to the agent.
+- **`reader:@=<path> conversation=<namespace>/<id>`** grants whatever is at
+  `path` in that conversation's tree, and only in that conversation. It names
+  the conversation by its address ([ref writers](design/ref-writers.md)), so a
+  conversation of the same id in another namespace does not match. The agent can
+  edit that code, so this exposes the secret to the agent.
 
 Matching happens where evaluation applies a node's `.caos-expr`. Every node
 has an origin `(T, P)`: a root tree and the node's path in it. A walk's start
@@ -607,6 +609,17 @@ The server holds every pushed value. We can revisit if this becomes a problem.
 ## Remaining work
 
 - **Binary `value:@=`.** Read but kept UTF-8 (binary/multiline later).
+
+# Ref writers
+
+Who may write which ref: [design/ref-writers.md](design/ref-writers.md). The
+server's pre-receive hook accepts a push only to a content-named ref
+(`refs/caos/req/<h>` pointing at `<h>`), an unguarded one (`refs/caos/dev`), or
+a ref in a namespace `refs/caos/w/<ns>/` whose `writers` list holds the pusher.
+A client proves a write by signing it with its ref writer key
+(`caos.ref-writer-key`); a job, with the run token the server injects at
+`/secret/caos-write` when its `writes` arg asks for namespaces its creator was
+handed.
 
 # Agent/harness integration
 

@@ -9,12 +9,11 @@ use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
     describe_tool_set, fork_conversation, generate_conversation_title, interrupt_request,
-    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
-    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
-    InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
-    TurnOutcome, TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary,
-    DEFAULT_MODEL,
+    invite_writer, list_user_conversations, publish_user_conversation, resume_request,
+    run_chat_turn, set_conversation_title, submit_interjection, unarchive_user_conversation,
+    ConversationLoad, ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary,
+    SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, TurnStatus,
+    UserConversationStatus, UserConversationSummary, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -952,8 +951,8 @@ const COMMANDS: [Command; 11] = [
     },
     Command {
         name: "/invite",
-        usage: "/invite <username>",
-        description: "add to one username's sidebar (case-sensitive; spaces allowed)",
+        usage: "/invite <public key> [label]",
+        description: "let another ref writer key write this conversation (design/ref-writers.md)",
         action: AppAction::Invite,
         takes_argument: true,
     },
@@ -1766,8 +1765,13 @@ impl App {
             args.turn.base = Some(commit);
         }
         let mut conversations =
-            list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
+            list_user_conversations(&transport, UserConversationStatus::Active)?;
         let mut relist = false;
+        // An address (`<namespace>/<id>`) names a conversation in another
+        // writer's namespace, e.g. one this writer was invited to.
+        if let Some(requested) = &args.conversation {
+            args.conversation = Some(caos_cli::writers::resolve(&transport, requested)?);
+        }
         if let Some(requested) = args.conversation.clone() {
             if args.new_conversation
                 && (conversations
@@ -1783,26 +1787,22 @@ impl App {
                 .iter()
                 .all(|conversation| conversation.id != requested)
             {
-                let archived = list_user_conversations(
-                    &transport,
-                    &args.user,
-                    UserConversationStatus::Archived,
-                )?;
+                let archived =
+                    list_user_conversations(&transport, UserConversationStatus::Archived)?;
                 if archived
                     .iter()
                     .any(|conversation| conversation.id == requested)
                 {
-                    unarchive_user_conversation(&transport, &args.user, &requested)?;
+                    unarchive_user_conversation(&transport, &requested)?;
                     relist = true;
                 } else if conversation_snapshot(&transport, &requested)?.is_some() {
-                    invite_user_to_conversation(&transport, &args.user, &requested)?;
+                    publish_user_conversation(&transport, &requested)?;
                     relist = true;
                 }
             }
         }
         if relist {
-            conversations =
-                list_user_conversations(&transport, &args.user, UserConversationStatus::Active)?;
+            conversations = list_user_conversations(&transport, UserConversationStatus::Active)?;
         }
         let choice = choose_conversation(
             args.conversation.as_deref(),
@@ -2432,7 +2432,10 @@ impl App {
                 .show_command_error("this conversation has no remote ref until its first message");
             return;
         };
-        match conversation_ref(&id) {
+        match self
+            .transport()
+            .and_then(|transport| conversation_ref(&transport, &id))
+        {
             Ok(refname) => {
                 let state = self.selected_mut();
                 state.command_error = None;
@@ -2538,27 +2541,29 @@ impl App {
         );
     }
 
-    fn invite_selected(&mut self, user: &str) {
+    fn invite_selected(&mut self, arguments: &str) {
+        let (key, label) = arguments
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(key, label)| (key, label.trim()))
+            .unwrap_or((arguments.trim(), ""));
         if self.selected().virtual_conversation {
             self.selected_mut().push_info(format!(
-                "Send the first message before inviting username {user:?}."
+                "Send the first message before inviting writer {key}."
             ));
             return;
         }
         let id = self.selected().id.clone();
         match self
             .transport()
-            .and_then(|transport| invite_user_to_conversation(&transport, user, &id))
+            .and_then(|transport| invite_writer(&transport, &id, key, label))
         {
             Ok(InviteOutcome::Created) => self.selected_mut().push_info(format!(
-                "Invited username {user:?}. They must select that exact case-sensitive identity."
+                "Writer {key} can now write this conversation; they open it by its address."
             )),
-            Ok(InviteOutcome::AlreadyActive) => self.selected_mut().push_info(format!(
-                "Username {user:?} already has this conversation active."
-            )),
-            Ok(InviteOutcome::Archived) => self.selected_mut().push_info(format!(
-                "Username {user:?} has archived this conversation; their choice was preserved."
-            )),
+            Ok(_) => self
+                .selected_mut()
+                .push_info(format!("Writer {key} already writes this conversation.")),
             Err(error) => self.selected_mut().show_command_error(error),
         }
     }
@@ -2855,13 +2860,11 @@ impl App {
                 )
             })
             .collect();
-        let user = self.user.clone();
         spawn(
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let summaries =
-                    list_user_conversations(transport, &user, UserConversationStatus::Active)?;
+                let summaries = list_user_conversations(transport, UserConversationStatus::Active)?;
                 Ok(summaries
                     .into_iter()
                     .map(|summary| {
@@ -3061,7 +3064,7 @@ impl App {
             format!("completed {}", outcome.short_commit)
         };
         match transport {
-            Ok(transport) => match publish_user_conversation(&transport, &user, &state.id) {
+            Ok(transport) => match publish_user_conversation(&transport, &state.id) {
                 Ok(()) => {
                     if let Some(fallback) = state.automatic_title_fallback.clone() {
                         state.remote_title.get_or_insert_with(|| fallback.clone());
@@ -3770,9 +3773,9 @@ impl App {
             None
         };
         if !self.selected().virtual_conversation {
-            let result = self.transport().and_then(|transport| {
-                archive_user_conversation(&transport, &self.user, &self.selected().id)
-            });
+            let result = self
+                .transport()
+                .and_then(|transport| archive_user_conversation(&transport, &self.selected().id));
             if let Err(error) = result {
                 self.selected_mut()
                     .show_command_error(format!("archiving conversation failed: {error}"));
@@ -4061,6 +4064,9 @@ mod tests {
     /// A throwaway git repo for transport-touching paths, so no test depends
     /// on cwd being a repo — the cargo worker's is not.
     fn throwaway_repo(name: &str) -> PathBuf {
+        caos_cli::writers::set_key(conversation_protocol::v3::writers::WriterKey::from_seed(
+            [7; 32],
+        ));
         let dir = std::env::temp_dir().join(format!(
             "caos-cli-tui-{name}-{}-{}",
             std::process::id(),
@@ -4190,7 +4196,8 @@ mod tests {
         }
         store
             .push(&[RefUpdate {
-                refname: refs::head_ref(id).unwrap(),
+                refname: refs::head_ref(&caos_cli::writers::own_namespace(id).unwrap(), id)
+                    .unwrap(),
                 expected: None,
                 new: Some(head.clone()),
             }])
@@ -4921,7 +4928,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let head = seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
         let transport = GitTransport::discover(&repo).unwrap();
-        publish_user_conversation(&transport, "tester", "new-talk").unwrap();
+        publish_user_conversation(&transport, "new-talk").unwrap();
 
         let mut conversation = ConversationState::new_virtual(
             "new-talk".to_string(),
@@ -4950,8 +4957,7 @@ mod tests {
             app.selected().remote_title.as_deref(),
             Some("Generated title")
         );
-        let listed =
-            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        let listed = list_user_conversations(&transport, UserConversationStatus::Active).unwrap();
         assert_eq!(listed[0].title, "Generated title");
 
         std::fs::remove_dir_all(&repo).unwrap();
@@ -4964,7 +4970,7 @@ mod tests {
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         seed_idle_conversation(&repo, "new-talk", "tester", "fallback prompt");
         let transport = GitTransport::discover(&repo).unwrap();
-        publish_user_conversation(&transport, "tester", "new-talk").unwrap();
+        publish_user_conversation(&transport, "new-talk").unwrap();
 
         let mut conversation = ConversationState::new_virtual(
             "new-talk".to_string(),
@@ -4986,8 +4992,7 @@ mod tests {
         app.finish_title_generation(0, Ok("Generated title".to_string()));
 
         assert_eq!(app.selected().title, "Generated title");
-        let listed =
-            list_user_conversations(&transport, "tester", UserConversationStatus::Active).unwrap();
+        let listed = list_user_conversations(&transport, UserConversationStatus::Active).unwrap();
         assert_eq!(listed[0].title, "Generated title");
 
         std::fs::remove_dir_all(repo).unwrap();
@@ -7142,7 +7147,6 @@ mod tests {
         };
         let id = "unprompted";
         caos_cli::create_conversation(&transport, &options, id, "Imported project").unwrap();
-        publish_user_conversation(&transport, "Bob", id).unwrap();
         let mut conversation = ConversationState::new(
             id.to_string(),
             "Imported project".to_string(),
@@ -7179,19 +7183,12 @@ mod tests {
         assert_eq!(app.conversations.len(), 1);
         assert_eq!(app.selected().id, "other");
         assert!(
-            list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+            list_user_conversations(&transport, UserConversationStatus::Active)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            list_user_conversations(&transport, "Alice", UserConversationStatus::Archived).unwrap()
-                [0]
-            .id,
-            id
-        );
-        assert_eq!(
-            list_user_conversations(&transport, "Bob", UserConversationStatus::Active).unwrap()[0]
-                .id,
+            list_user_conversations(&transport, UserConversationStatus::Archived).unwrap()[0].id,
             id
         );
         assert_eq!(
@@ -7539,12 +7536,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_poll_discovers_invited_conversations_and_names_the_other_user() {
+    fn remote_poll_discovers_listed_conversations_and_names_the_other_user() {
         let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let transport = GitTransport::discover(&repo).unwrap();
         let (_, request) = seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
-        invite_user_to_conversation(&transport, "Bob", "shared").unwrap();
+        publish_user_conversation(&transport, "shared").unwrap();
 
         let (mut app, _) = app_with(vec![state("local")]);
         app.repo_dir = repo.clone();
@@ -7612,7 +7609,7 @@ mod tests {
         app.repo_dir = repo.clone();
         app.show_selected_ref();
 
-        let refname = conversation_ref(id).unwrap();
+        let refname = conversation_ref(&GitTransport::discover(&repo).unwrap(), id).unwrap();
         assert!(app.selected().transcript.is_empty());
         assert_eq!(
             app.selected().reference_notice,
@@ -7715,7 +7712,7 @@ mod tests {
         assert!(app.selected().remote_head.is_none());
         assert!(conversation_head(&transport, &id).unwrap().is_none());
         assert!(
-            list_user_conversations(&transport, "Alice", UserConversationStatus::Active,)
+            list_user_conversations(&transport, UserConversationStatus::Active)
                 .unwrap()
                 .is_empty()
         );
@@ -7729,7 +7726,9 @@ mod tests {
         assert_eq!(app.selected().title, "Named before prompting");
         assert!(conversation_head(&transport, &id).unwrap().is_none());
 
-        app.selected_mut().composer.insert_str("/invite Bob");
+        app.selected_mut()
+            .composer
+            .insert_str(&format!("/invite {}", "b".repeat(64)));
         app.start_turn();
         assert!(app.selected().command_error.is_none());
         assert!(app
@@ -7737,11 +7736,6 @@ mod tests {
             .transcript
             .last()
             .is_some_and(|entry| entry.text.contains("Send the first message")));
-        assert!(
-            list_user_conversations(&transport, "Bob", UserConversationStatus::Active)
-                .unwrap()
-                .is_empty()
-        );
         assert!(conversation_head(&transport, &id).unwrap().is_none());
 
         std::fs::remove_dir_all(repo).unwrap();
@@ -7896,7 +7890,7 @@ mod tests {
             app.selected().remote_title.as_deref(),
             Some("Generated fork title")
         );
-        let summary = list_user_conversations(&transport, "Alice", UserConversationStatus::Active)
+        let summary = list_user_conversations(&transport, UserConversationStatus::Active)
             .unwrap()
             .into_iter()
             .find(|summary| summary.id == fork_id)
@@ -7955,12 +7949,8 @@ mod tests {
         assert!(wait_for_fork(&mut app, &pending_id));
         assert_eq!(app.selected().id, pending_id);
         assert_eq!(app.selected().composer.text, "must not submit");
-        assert!(app
-            .selected()
-            .command_error
-            .as_deref()
-            .unwrap()
-            .contains("exactly one parent required"));
+        let error = app.selected().command_error.clone().unwrap();
+        assert!(error.contains("exactly one parent required"), "{error}");
         assert!(conversation_head(&transport, &pending_id)
             .unwrap()
             .is_none());

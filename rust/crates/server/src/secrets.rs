@@ -507,9 +507,13 @@ fn match_locator(
 }
 
 /// The tree of the conversation's head commit, or `None` with no head yet.
+/// `conversation` is its address, `<namespace>/<id>`: an id alone would match
+/// a conversation of that name in anyone's namespace.
 fn conversation_head(config: &Config, conversation: &str) -> Result<Option<String>, String> {
+    use conversation_protocol::v3::refs;
     let repo = config.repo.to_thread_local();
-    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    let (namespace, id) = refs::parse_address(conversation)?;
+    let refname = refs::head_ref(&namespace, &id)?;
     let Ok(mut reference) = repo.find_reference(refname.as_str()) else {
         return Ok(None);
     };
