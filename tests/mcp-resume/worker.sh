@@ -30,8 +30,7 @@ stop() { # <session> <closing message>
     '{hook_event_name:"Stop",session_id:$s,last_assistant_message:$m}')" >/dev/null
 }
 ref_of() { # <conversation id>
-  printf 'refs/caos/v3/conversations/%s/head' \
-    "$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
+  "$CAOS_CLI" conversation-ref "$1"
 }
 head_of() { git rev-parse --verify -q "$(ref_of "$1")" || true; }
 subjects() { git log --format=%s "$1" | tr '\n' ' '; }

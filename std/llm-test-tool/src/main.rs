@@ -13,22 +13,30 @@ use conversation_protocol::v3::records::{
     AsyncRecord, Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TaskStatus,
     TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
 };
-use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
+use conversation_protocol::v3::{refs, writers};
 use conversation_protocol::v3::{
     validate_spine, GitStore, Kind, Mode, ObjectStore, Oid, RefUpdate, TreeEntry,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ToolCommand {
+    Ref {
+        id: String,
+        namespace: Option<String>,
+    },
+    Namespace {
+        id: String,
+    },
+    Found {
+        repo: PathBuf,
+        id: String,
+    },
     ChildId {
         parent: String,
         request: Oid,
         round: u64,
         tool: String,
-    },
-    Ref {
-        id: String,
     },
     Root {
         repo: PathBuf,
@@ -200,6 +208,14 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             tool: args.required("--tool")?,
         },
         "ref" => ToolCommand::Ref {
+            id: args.required("--id")?,
+            namespace: args.take("--namespace")?,
+        },
+        "namespace" => ToolCommand::Namespace {
+            id: args.required("--id")?,
+        },
+        "found" => ToolCommand::Found {
+            repo: args.repo()?,
             id: args.required("--id")?,
         },
         "root" => {
@@ -471,7 +487,25 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             "child {}",
             conversation_protocol::v3::ids::child_id(&parent, &request, round, &tool)?
         ),
-        ToolCommand::Ref { id } => println!("ref {}", refs::head_ref(&id)?),
+        // A child's head is in its parent's namespace: pass that as
+        // `--namespace`. Otherwise the one this writer derives for `id`.
+        ToolCommand::Ref { id, namespace } => {
+            let namespace = match namespace {
+                Some(namespace) => namespace,
+                None => conversation_namespace(&id)?,
+            };
+            println!("ref {}", refs::head_ref(&namespace, &id)?)
+        }
+        ToolCommand::Namespace { id } => println!("{}", conversation_namespace(&id)?),
+        // Found the conversation's namespace ahead of its first head, so the
+        // server advertises a ref before anything fetches from it.
+        ToolCommand::Found { repo, id } => {
+            let mut store = open(&repo)?;
+            let namespace = conversation_namespace(&id)?;
+            let updates = found_namespace(&mut store, &namespace, &id)?;
+            store.push(&updates)?;
+            println!("{namespace}");
+        }
         ToolCommand::Root {
             repo,
             id,
@@ -636,26 +670,17 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             id,
             new,
         } => {
-            let store = open(&repo)?;
-            let active = refs::active_membership_ref(&user, &id)?;
-            let archived = refs::archived_membership_ref(&user, &id)?;
-            store.push(&[
-                RefUpdate {
-                    refname,
-                    expected: None,
-                    new: Some(new.clone()),
-                },
-                RefUpdate {
-                    refname: active,
-                    expected: None,
-                    new: Some(new.clone()),
-                },
-                RefUpdate {
-                    refname: archived,
-                    expected: None,
-                    new: None,
-                },
-            ])?;
+            let _ = user;
+            let mut store = open(&repo)?;
+            let (namespace, _) = refs::parse_head_ref(&refname)?;
+            let mut updates = found_namespace(&mut store, &namespace, &id)?;
+            updates.push(RefUpdate {
+                refname,
+                expected: None,
+                new: Some(new.clone()),
+            });
+            updates.extend(membership_updates(&mut store, &namespace, &id, &new)?);
+            store.push(&updates)?;
             println!("pushed {new}");
         }
         ToolCommand::Fetch { repo, refname } => {
@@ -1012,7 +1037,8 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
         input.configuration.to_string(),
     )?;
 
-    let refname = refs::head_ref(&input.id)?;
+    let namespace = conversation_namespace(&input.id)?;
+    let refname = refs::head_ref(&namespace, &input.id)?;
     push_plain(
         &input.repo,
         &[
@@ -1020,24 +1046,21 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
             (request.clone(), format!("refs/caos/req/{request}")),
         ],
     )?;
-    let mut updates = vec![RefUpdate {
+    let _ = &input.user;
+    let mut updates = if creating {
+        found_namespace(&mut store, &namespace, &input.id)?
+    } else {
+        Vec::new()
+    };
+    updates.push(RefUpdate {
         refname: refname.clone(),
         expected: (!creating).then_some(prior.clone()),
         new: Some(admitted.clone()),
-    }];
+    });
     if creating {
-        updates.extend([
-            RefUpdate {
-                refname: refs::active_membership_ref(&input.user, &input.id)?,
-                expected: None,
-                new: Some(admitted.clone()),
-            },
-            RefUpdate {
-                refname: refs::archived_membership_ref(&input.user, &input.id)?,
-                expected: None,
-                new: None,
-            },
-        ]);
+        updates.extend(membership_updates(
+            &mut store, &namespace, &input.id, &admitted,
+        )?);
     }
     push_updates(&store, updates, &refname, (!creating).then_some(&prior))?;
 
@@ -1382,8 +1405,91 @@ fn push_updates(
     Ok(())
 }
 
+/// The test's store, pushing with the run token its job was granted
+/// (design/ref-writers.md): the tool writes as the suite's writer.
 fn open(repo: &Path) -> Result<GitStore, ToolError> {
-    GitStore::open(repo, Some("caos")).map_err(ToolError::new)
+    let mut store = GitStore::open(repo, Some("caos")).map_err(ToolError::new)?;
+    if let Some(token) = writers::injected_token() {
+        let option = writers::Auth::Run { token }.option();
+        store.set_push_auth(Box::new(move |_: &[writers::Command]| option.clone()));
+    }
+    Ok(store)
+}
+
+/// The writer this test acts for: the key its run token resolves to, which
+/// the harness reads from the server (`LLM_TEST_WRITER`).
+fn writer() -> Result<String, ToolError> {
+    let key = std::env::var("LLM_TEST_WRITER").map_err(|_| {
+        ToolError::new("LLM_TEST_WRITER is not set (std/llm-test/worker-common.sh)")
+    })?;
+    if !writers::is_key(&key) {
+        return Err(ToolError::new(format!(
+            "LLM_TEST_WRITER {key:?} is not a public key"
+        )));
+    }
+    Ok(key)
+}
+
+fn conversation_namespace(id: &str) -> Result<String, ToolError> {
+    Ok(refs::conversation_namespace(&writer()?, id)?)
+}
+
+/// The update founding `namespace` with this writer alone, unless the server
+/// has it already.
+fn found_namespace(
+    store: &mut GitStore,
+    namespace: &str,
+    id: &str,
+) -> Result<Vec<RefUpdate>, ToolError> {
+    let writers_ref = writers::writers_ref(namespace);
+    if store.read_ref(&writers_ref)?.is_some() {
+        return Ok(Vec::new());
+    }
+    let label = format!("conversation {}", refs::key_of(id));
+    let genesis = writers::genesis_commit(store, &refs::sole_writer(&writer()?), &label)?;
+    if genesis.as_str() != namespace {
+        return Err(ToolError::new(format!(
+            "{namespace} is not this writer's namespace for {id:?}"
+        )));
+    }
+    Ok(vec![RefUpdate {
+        refname: writers_ref,
+        expected: None,
+        new: Some(genesis),
+    }])
+}
+
+/// This writer's active membership of conversation `id`, founding its
+/// personal namespace if need be.
+fn membership_updates(
+    store: &mut GitStore,
+    namespace: &str,
+    id: &str,
+    head: &Oid,
+) -> Result<Vec<RefUpdate>, ToolError> {
+    let key = writer()?;
+    let personal = refs::personal_namespace(&key);
+    let mut updates = Vec::new();
+    let personal_writers = writers::writers_ref(&personal);
+    if store.read_ref(&personal_writers)?.is_none() {
+        let genesis = writers::genesis_commit(store, &refs::sole_writer(&key), "personal")?;
+        updates.push(RefUpdate {
+            refname: personal_writers,
+            expected: None,
+            new: Some(genesis),
+        });
+    }
+    updates.push(RefUpdate {
+        refname: refs::active_membership_ref(&personal, namespace, id)?,
+        expected: None,
+        new: Some(head.clone()),
+    });
+    updates.push(RefUpdate {
+        refname: refs::archived_membership_ref(&personal, namespace, id)?,
+        expected: None,
+        new: None,
+    });
+    Ok(updates)
 }
 
 fn signature() -> conversation_protocol::v3::Signature {

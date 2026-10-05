@@ -256,6 +256,18 @@ pub struct Secrets {
 
 static SECRET_READERS: OnceLock<Vec<String>> = OnceLock::new();
 
+/// Signs a compute request for the writer this process acts for
+/// (design/ref-writers.md): `(method, target)` to a `(header, value)`.
+pub type RequestSigner = Box<dyn Fn(&str, &str) -> (&'static str, String) + Send + Sync>;
+
+static REQUEST_SIGNER: OnceLock<RequestSigner> = OnceLock::new();
+
+/// The writer a host binary acts for, set once and early. None in a worker:
+/// a job writes with the run token its server granted it.
+pub fn set_request_signer(signer: RequestSigner) {
+    let _ = REQUEST_SIGNER.set(signer);
+}
+
 /// The SecretReaderKeys this process presents, set once and early by a host
 /// binary. None when it did not: a worker's secrets come from the job it is.
 pub fn set_secret_readers(keys: Vec<String>) {
@@ -4654,7 +4666,10 @@ fn request_compute_url(
     path: &str,
     secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    let headers = secrets.headers();
+    let mut headers = secrets.headers();
+    if let Some(signer) = REQUEST_SIGNER.get() {
+        headers.push(signer("GET", path));
+    }
     // NO TIMEOUT, deliberately: this is the call that waits for the work. A run
     // takes as long as the worker does.
     let body = server_call(

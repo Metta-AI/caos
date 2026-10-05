@@ -42,7 +42,7 @@ if caos get /cas/args/stage 2>/dev/null; then stage=$(cat /cas/args/stage); fi
 # name. One function so a new one is added in one place rather than three, which
 # is how the old version of this lost `--only` for a while.
 forwarded() {
-  for a in only test-salt max-parallel; do
+  for a in only test-salt max-parallel writes; do
     if [ -e "/cas/args/$a" ]; then printf '%s ' "--$a:@=/cas/args/$a"; fi
   done
 }
@@ -122,8 +122,13 @@ fanout)
     caos get /cas/args/test-salt
     salt=$(cat /cas/args/test-salt)
   fi
+  # `writes` (design/ref-writers.md): a test that pushes refs, or runs a step
+  # that does, is handed what this suite was. Every stage that only passes it
+  # on has to ask for it too.
+  writes=()
+  if [ -e /cas/args/writes ]; then writes=("--writes:@=/cas/args/writes"); fi
   map=$(caos curry --base:@=/cas/args/runner \
-    "--cli:@=/cas/args/cli" "--test-salt=$salt") \
+    "--cli:@=/cas/args/cli" "--test-salt=$salt" "${writes[@]}") \
     || fail "currying the per-test image"
 
   only=""
