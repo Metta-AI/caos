@@ -155,8 +155,6 @@ so it never leaves the conversation pane.
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `/checkout <gitlink> [directory]` | Check out this commit, reusing its local directory when omitted |
 | `Ctrl+O` | Browse conversation files and source-tree diffs |
-| `/pr <gitlink> <base-branch> [remote-URL]` | Preview one PR; Enter confirms |
-| `/publish-branch <gitlink> [remote-URL]` | Preview and push this snapshot without creating a PR |
 | `Ctrl+R` | Reload completed conversation history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
@@ -198,7 +196,7 @@ The browser pins the conversation head when opened. `r` refreshes it. There
 are no shell commands or controls that apply edits.
 
 On a source-tree entry, `o` selects the source for tool descriptions and local
-edit submission. Checkout and publication take explicit paths. Use `/import <path> <source> [revision]` to import
+edit submission. Checkout takes an explicit path. Use `/import <path> <source> [revision]` to import
 an existing commit at an unused path. A local source accepts a hash or ref;
 without one, it imports HEAD and rejects staged, unstaged, or untracked changes,
 including dirty submodules. Ignored files do not prevent importing HEAD. An
@@ -210,22 +208,9 @@ The source index, branches, and files stay unchanged. Each import's
 portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
-`/pr feature/01-change main [remote-URL]` fetches a preview for that exact
-snapshot against the named remote branch. Its full path is the PR branch name.
-The URL is inferred from matching import provenance when unambiguous; otherwise
-supply it explicitly. `origin` is not a portable repository URL. Enter confirms
-pushing and opening or updating the PR; Escape cancels. No picker or destination
-editor is involved. For a stack, publish the first PR, then run e.g.
-`/pr feature/02-next feature/01-change`. The command's base wins regardless of
-sibling ordering. `/publish-branch <gitlink> [remote-URL]` skips PR creation.
-Publication never edits or tests code. Ctrl+P and Ctrl+L have no bindings.
-
-When a PR source does not contain the fetched base tip, the preview offers to
-import that exact base and send an integration request to the agent. Enter
-confirms both; Escape cancels. The request stays in the original conversation
-and preserves drafts. It asks for a merge or rebase and tests, then stops for a
-fresh `/pr` review. This action does not publish. Successful pushes and PR
-creation or updates appear as persistent CAOS messages, including the PR URL.
+There is no publish command. Ask the agent for a PR: it pushes the branch with
+`publish_source` and opens or updates the PR with its `github` tool
+(design/agent-github.md, "PRs"). Ctrl+P and Ctrl+L have no bindings.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
@@ -257,8 +242,8 @@ slash-prefixed prompt is sent normally.
 changing the current draft. Type any words from an action, use Up and Down to
 choose a match, then press Enter to run it. The palette covers conversation,
 file browsing, activity, tool, help, reload, archive, and selection actions.
-Escape closes the palette or slash-command menu while an agent turn or
-publication keeps running. With the menu closed, Escape interrupts that work.
+Escape closes the palette or slash-command menu while an agent turn keeps
+running. With the menu closed, Escape interrupts that work.
 
 Bracketed paste mode keeps pasted newlines inside the prompt instead of
 submitting partial lines. Pastes over 1,000 characters are kept out of the
@@ -321,15 +306,11 @@ that gitlink's remembered checkout and imports their
 closure into the client before submission. These commands never replace the
 internal harness.
 
-Publication preserves source tree history, uses leased branch updates, and
-checks conflict cleanup before preview and again before pushing. Resolve a
-nonempty `.caos/conflicts` ledger by fixing each path and clearing its entries.
-Saving an edited source tree removes an empty ledger and prunes its empty
-`.caos` directory. Any remaining `.caos` entry blocks publication; publishing
-never rewrites the selected commit. It leaves the local
-checkout and index unchanged. Credentials remain in the local secret store;
-the launcher reuses an existing checkout store or its own persistent store under
-the data directory.
+Resolve a nonempty `.caos/conflicts` ledger by fixing each path and clearing
+its entries. Saving an edited source tree removes an empty ledger and prunes
+its empty `.caos` directory. Any remaining `.caos` entry blocks publication.
+Credentials remain in the local secret store; the launcher reuses an existing
+checkout store or its own persistent store under the data directory.
 
 
 Over SSH, clipboard copying uses a terminal escape sequence. “Copy requested”

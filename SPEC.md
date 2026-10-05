@@ -966,24 +966,20 @@ revision (and made the history tools' hashes readable the same way).
   resolution turn (a leftover marker does not compile) — not by a marker
   re-scan, which cannot tell a real marker from a bad resolution.
 - The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
-  remaining marker is PUBLISH (the tui's PR or branch flow) — the moment work
-  actually leaves the conversation.
+  remaining marker is PUBLISH (`publish_source`, which refuses a commit with
+  any `.caos` entry) — the moment work actually leaves the conversation.
 
 ## Publication
 
-The [conversation publication flow](design/chat.md) publishes one named gitlink
-with `/pr <gitlink> <base-remote-branch> [remote-URL]`. Its full path is the PR
-branch name. The base is explicit; an omitted URL comes from unambiguous import
-provenance. A stack is published bottom to top, each layer based on the branch
-below ([Stacks](design/stacks.md)).
+The agent publishes (design/agent-github.md, "PRs"); the client has no publish
+command. `publish_source` pushes one named gitlink's exact commit to an explicit
+repository and branch, sent by the server from its own store, and the `github`
+tool opens or updates the PR. A stack is squashed to one commit per layer and
+published bottom to top, each layer's PR based on the branch below
+([Stacks](design/stacks.md)). No snapshot has a special working or sealed
+state.
 
-The client previews the exact source commit and destination before confirmation.
-If the source does not contain the fetched base tip, it offers to import that
-base and send the agent a merge/rebase and test request. This action publishes
-nothing; run `/pr` again after integration. Successful pushes and PR operations
-are recorded as CAOS transcript entries. No snapshot has a special working or
-sealed state.
-
-Per-mutation commits remain in the published source tree history. Only the
-previewed PR tip is checked for unresolved conflicts and reserved state;
+`publish_source` refuses a commit whose tree has a `.caos` entry. Published
+without squashing, per-mutation commits remain in the branch's history: only the
+published tip is checked for unresolved conflicts and reserved state, and
 intermediate commits may contain conflict markers or fail to build.

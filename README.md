@@ -439,8 +439,8 @@ the object machinery through a one-way dependency. Their difference is the
     Add a source and revision to select another repository or commit; Git URLs
     require a full commit hash. Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
-    remote repository commits. `/pr <gitlink> <base-branch> [remote-URL]` previews
-    one PR, and `/checkout <gitlink> [directory]` exports code for local editing;
+    remote repository commits, and `/checkout <gitlink> [directory]` exports code
+    for local editing; the agent opens PRs itself;
   - `talk` / `chat` — agent conversations over the current protocol
     (`design/chat.md`);
     `caos talk "<prompt>"` is the everyday form. A conversation NAMES the two
