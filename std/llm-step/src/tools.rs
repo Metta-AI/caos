@@ -1504,12 +1504,12 @@ fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
     let is_dir = fs::symlink_metadata(&target)
         .map_err(|e| User(format!("{} cannot be removed: {e}", comps.join("/"))))?
         .is_dir();
-    if is_dir {
+    let removal = if is_dir {
         fs::remove_dir_all(&target)
     } else {
         fs::remove_file(&target)
-    }
-    .map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
+    };
+    removal.map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
     let out = fresh("files-inline");
     caos(["put", path(&work), &out]).map_err(Infra)?;
     Ok(out)
