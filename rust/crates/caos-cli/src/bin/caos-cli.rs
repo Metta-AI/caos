@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         client: std::sync::OnceLock::new(),
     }));
     caos::set_secret_readers(caos_cli::secret_store::reader_keys());
+    caos_cli::writers::install_request_signer();
     let args: Vec<String> = std::env::args().collect();
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -129,6 +130,11 @@ fn run(args: &[String]) -> Result<(), String> {
         // server-held store (SPEC.md, "Secrets"). No caos tree needed.
         Some("secrets-init") => caos_cli::secret_store::cli_secrets_init(&args[2..]),
         Some("secrets-push") => caos_cli::secret_store::cli_secrets_push(&args[2..]),
+        // Ref writers (design/ref-writers.md): who may write which ref.
+        Some("ref-writer-key") => caos_cli::writers::cli_key(&args[2..]),
+        Some("namespace") => caos_cli::writers::cli_namespace(&transport()?, &args[2..]),
+        Some("writers") => caos_cli::writers::cli_writers(&transport()?, &args[2..]),
+        Some("ref-push") => caos_cli::writers::cli_ref_push(&transport()?, &args[2..]),
         _ => Err(usage(args)),
     }
 }
@@ -199,7 +205,11 @@ fn usage(args: &[String]) -> String {
          {prog} get <hash> <path>\n  \
          {prog} status [--all] <arg tree hash>\n  \
          {prog} secrets-init --dir=<d>\n  \
-         {prog} secrets-push --dir=<d> [--server=<url>]"
+         {prog} secrets-push --dir=<d> [--server=<url>]\n  \
+         {prog} ref-writer-key new|show\n  \
+         {prog} namespace new [<label>]\n  \
+         {prog} writers list|add|remove <namespace> [<key> [<label>]]\n  \
+         {prog} ref-push <rev> <ref>"
     )
 }
 
