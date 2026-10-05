@@ -18,6 +18,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
 | `caos-test` | Build the caos test stack from the tree and run the whole suite — unit tests and every `tests/<name>`. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
+| `caos-trace` | Print the trace of a run (`/status/<hash>?all=1`) from the ArgTree hash `caos-test` prints in its "full trace" line: timings per node, the slowest nodes, and with `perf` the workers' out-trace data. |
 | `merge` | Three-way merge another commit into the current source tree. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
