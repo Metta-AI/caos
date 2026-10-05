@@ -15,16 +15,31 @@
 # `{array}` on `paths` is why this could not move sooner: every `@param` was a
 # string, and declaring `paths` as one would have silently narrowed the tool
 # from a list to a single value.
+#
+# WHAT THE HELP IS FOR. A model reads this once, before its first call, and the
+# commonest mistake is leaving a path out of `paths`. That mistake does not say
+# so: the scan in src/main.rs only turns "Permission denied" into a retry hint,
+# while the same missing path makes `cd` say "Not a directory", makes `ls` show
+# a link into /cas, and makes `grep -r` and `find` print nothing at all (they do
+# not follow links). So the help names every one of those symptoms next to the
+# rule, and shows one complete call, rather than leaving the model to infer the
+# rule from a sentence about laziness. Keep the examples in step with
+# std/README.md ("Using bash-tool") and the client repo's AGENTS.md.
 HELP=<<END
-Run sh -c from the conversation root. Ordinary files (including memories and
-skills) and source trees are writable together. Declare paths to read or edit
-existing content; undeclared content stays lazy. Use mkdir, mv, cp -a and rm to
-organize source trees. cp -a preserves their commit identity; editing their
-files creates child commits when the result is stored. Conversation-root .caos
-protocol metadata cannot be changed; a source tree's .caos/conflicts ledger is
-editable.
+Run sh -c over a scratch copy of the CONVERSATION TREE: your files, imports/ and feature/. It is not this machine's disk, and nothing in it is a git checkout.
+
+THE ONE RULE: content is lazy. Put in `paths` every existing file or directory the command reads, edits, copies or moves. A directory brings everything under it, source trees included. Anything not listed is a placeholder, and the command does not always say so. These all mean "add that path to `paths` and run it again": Permission denied; Not a directory or No such file or directory about something you know exists; a link into /cas in ls -l; and no output at all from grep -r, find or ls -R, which skip placeholders. A cd that fails leaves the rest of the command running from the root.
+
+Example (search an import):
+  run_tool(path="caos-std/bash-tool", arguments={"cmd": "grep -rn needle imports/repo/base", "paths": ["imports/repo/base"]})
+Example (copy an import to edit it; mkdir the parent first, and use cp -a so the copy keeps its commit identity):
+  arguments={"cmd": "mkdir -p feature && cp -a imports/repo/base feature/01-change", "paths": ["imports/repo/base"]}
+
+New files and new directories need no `paths`. Whatever the command writes is saved to the conversation; there is no commit step, and editing files in a source tree creates its child commits. Prefer the write, edit and read tools for single files: they need no `paths`.
+
+Not available here: git (use the log, show and diff tools), caos-std/ (it exists only in the evaluated tree: use eval_path, then read or ls with root), and the harness's own shell. The root .caos metadata is read-only; a source tree's .caos/conflicts ledger is editable.
 @param cmd The command to run with sh -c.
-@param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root.
+@param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root. It must itself be in `paths`, or be a directory the command creates.
 @param {array} [paths] Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees.
 @writer
 @in
