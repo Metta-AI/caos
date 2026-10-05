@@ -46,6 +46,7 @@ Supply the token through your secret store (SPEC.md, "Secrets"):
 # <your secrets directory>/github-token
 value:@=values/github-token
 reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
+reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/github
 ```
 
 `caos-cli secrets-push --dir=<d>` adds its entropy and sends it to the server.
@@ -79,10 +80,11 @@ their arguments (`salt` is the interpreter's), so repeating a call returns its
 stored result, and only a run that died mid-flight sends a write twice. GitHub
 refuses a duplicate PR, and a repeated base change is a no-op.
 
-The token is the `github-token` secret, granted by a second `reader:` line
-naming `std/github`. The tool reaches only `api.github.com` and follows no
-redirects, but paths are unrestricted: the token's scope is the boundary, so
-grant a fine-grained token for the repositories the agent works on.
+The token is the same `github-token` secret imports use, not a new one; its
+second `reader:` line, under Importing, grants it to `std/github`. The tool
+reaches only `api.github.com` and follows no redirects, but paths are
+unrestricted: the token's scope is the boundary, so grant a fine-grained token
+for the repositories the agent works on.
 
 ### PRs for a stack
 
