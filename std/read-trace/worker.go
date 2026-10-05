@@ -249,9 +249,8 @@ func perfData(all []flat) {
 	}
 	if len(oids) == 0 {
 		say("---- perf data: none ----")
-		say("out-trace arrives with a worker's result and is on a node only while its")
-		say("fan-out is still running (SPEC, \"Tracing\"; status.rs `Node.out_trace`); the")
-		say("completed view of a finished run may not carry it.")
+		say("No node in this trace has an out-trace: no worker in this run left perf data at")
+		say("/cas/out-trace (most don't; tests/tracing's driver does).")
 		say("")
 		return
 	}
