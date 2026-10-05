@@ -1,0 +1,20 @@
+# The `caos-trace` tool (SPEC, "Tracing"): the std/bash worker image with this
+# directory's script curried onto it, plus the `help` an agent registers it by.
+# Like `caos-test-result` it reads by hash and touches no source tree.
+#
+# The docs are a HERE-STRING, so editing them re-keys this tool and nothing it
+# builds (see std/caos-test/.caos-expr).
+HELP=<<END
+Print the trace of a run from the hash of its ArgTree: the complete tree of what
+happened (`GET /status/<hash>?all=1`) with each node's name, requested / started /
+ended times in ms relative to the root, and whether it was REUSED from an earlier
+run, followed by a table of the slowest nodes. With `perf`, also print the perf
+data workers left at /cas/out-trace. The `caos-test` report prints the hash
+beside "full trace" (the one in its `curl .../status/<hash>?all=1` line); a
+trace outlives its run and both stacks write to the one redis, so the dev
+stack's records are readable from the host's tools.
+@param hash The ArgTree hash from the `caos-test` report's "full trace" line (40 hex characters).
+@param [perf] Any value: also print every out-trace object found in the tree.
+@param [top] How many of the slowest nodes to list (default 25).
+END
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --help=$HELP
