@@ -17,18 +17,19 @@
 # from a list to a single value.
 #
 # WHAT THE HELP IS FOR. A model reads this once, before its first call, and the
-# commonest mistake is leaving a path out of `paths`. That mistake does not say
-# so: the scan in src/main.rs only turns "Permission denied" into a retry hint,
-# while the same missing path makes `cd` say "Not a directory", makes `ls` show
-# a link into /cas, and makes `grep -r` and `find` print nothing at all (they do
-# not follow links). So the help names every one of those symptoms next to the
-# rule, and shows one complete call, rather than leaving the model to infer the
+# commonest mistake is leaving a path out of `paths`. Measured with nothing
+# declared: any command that NAMES an unmaterialized path says "Permission
+# denied" (and src/main.rs adds the retry hint), but `cd` says "Not a
+# directory", and what follows a failed `cd` is silent -- `grep -r .` and
+# `find .` run from the root print nothing, because they do not follow the
+# placeholder links into /cas. So the help names those symptoms next to the
+# rule and shows one complete call, rather than leaving the model to infer the
 # rule from a sentence about laziness. Keep the examples in step with
 # std/README.md ("Using bash-tool") and the client repo's AGENTS.md.
 HELP=<<END
 Run sh -c over a scratch copy of the CONVERSATION TREE: your files, imports/ and feature/. It is not this machine's disk, and nothing in it is a git checkout.
 
-THE ONE RULE: content is lazy. Put in `paths` every existing file or directory the command reads, edits, copies or moves. A directory brings everything under it, source trees included. Anything not listed is a placeholder, and the command does not always say so. These all mean "add that path to `paths` and run it again": Permission denied; Not a directory or No such file or directory about something you know exists; a link into /cas in ls -l; and no output at all from grep -r, find or ls -R, which skip placeholders. A cd that fails leaves the rest of the command running from the root.
+THE ONE RULE: content is lazy. Put in `paths` every existing file or directory the command reads, edits, copies or moves. A directory brings everything under it, source trees included. Anything not listed is a placeholder link into /cas. Naming one in cat, ls, cp, grep, find or rm says Permission denied. cd says Not a directory, and then the rest of the command runs from the root, where grep -r . and find . print nothing at all because they do not follow those links. Every one of these means: add that path to `paths` and run it again. "No matches" from a command that touched a placeholder is not an answer.
 
 Example (search an import):
   run_tool(path="caos-std/bash-tool", arguments={"cmd": "grep -rn needle imports/repo/base", "paths": ["imports/repo/base"]})
@@ -39,7 +40,7 @@ New files and new directories need no `paths`. Whatever the command writes is sa
 
 Not available here: git (use the log, show and diff tools), caos-std/ (it exists only in the evaluated tree: use eval_path, then read or ls with root), and the harness's own shell. The root .caos metadata is read-only; a source tree's .caos/conflicts ledger is editable.
 @param cmd The command to run with sh -c.
-@param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root. It must itself be in `paths`, or be a directory the command creates.
+@param {string} [cwd] Optional conversation-relative working directory; defaults to the conversation root. It must already exist, so if it is existing content it must also be in `paths`.
 @param {array} [paths] Conversation-relative files or directories to materialize, independent of cwd. A directory includes its descendants, including source trees.
 @writer
 @in
