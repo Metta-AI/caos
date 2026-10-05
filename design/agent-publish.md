@@ -93,6 +93,7 @@ today. Ignored scratch files can therefore remain in a source during work;
 the agent must remove them or adjust the rules before publication.
 
 Merge conflicts currently create a tracked .caos/conflicts ledger inside a
-source tree, including conflicts without inline markers. llm-step must resolve
-and clear it before publishing. The generic endpoint does not scan for that
+source tree, including conflicts without inline markers. `publish_source`
+refuses a commit whose tree has any `.caos` entry, so the agent must resolve
+and clear the ledger first. The generic endpoint does not scan for that
 ledger, inline markers, or conversation ancestry.
