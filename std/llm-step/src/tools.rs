@@ -1377,6 +1377,144 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
     ))
 }
 
+/// `.caos` at the conversation root is protocol metadata, for the same reason
+/// `write` and `edit` refuse it (see `execute_inline` in main.rs, which only
+/// sees the one `file-path` argument and so cannot guard `from` and `to`).
+fn reject_protocol(comps: &[String]) -> Result<(), Fail> {
+    if comps.first().is_some_and(|c| c == ".caos") {
+        return Err(User(
+            ".caos is protocol metadata; use conversation commands to change it".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let from = components(call, "from")?;
+    let to = components(call, "to")?;
+    reject_protocol(&to)?;
+    let new_ws = copy_entry(ws, &from, &to)?;
+    Ok((
+        format!("copied {} to {}", from.join("/"), to.join("/")),
+        new_ws,
+    ))
+}
+
+fn move_entry(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let from = components(call, "from")?;
+    let to = components(call, "to")?;
+    reject_protocol(&from)?;
+    reject_protocol(&to)?;
+    if from == to {
+        return Err(User(format!(
+            "`from` and `to` are the same path: {}",
+            from.join("/")
+        )));
+    }
+    // A copy of a directory into itself is a fine thing (it copies what was
+    // there), but a MOVE into itself would delete the only copy.
+    if to.len() > from.len() && to[..from.len()] == from[..] {
+        return Err(User(format!(
+            "cannot move {} into itself ({})",
+            from.join("/"),
+            to.join("/")
+        )));
+    }
+    let copied = copy_entry(ws, &from, &to)?;
+    let new_ws = remove_entry(&copied, &from)?;
+    Ok((
+        format!("moved {} to {}", from.join("/"), to.join("/")),
+        new_ws,
+    ))
+}
+
+fn remove(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let comps = components(call, "file-path")?;
+    reject_protocol(&comps)?;
+    let new_ws = remove_entry(ws, &comps)?;
+    Ok((format!("removed {}", comps.join("/")), new_ws))
+}
+
+/// Put the entry at `from` at `to`, creating missing parent directories, and
+/// refusing an existing `to`.
+///
+/// THE ENTRY IS LINKED, NOT READ. `from` resolves to an object in /cas and the
+/// scratch tree gets a link to it, which `caos put` records by hash -- the same
+/// way `rebuild` carries every untouched sibling. So nothing under `from` is
+/// fetched however large it is, and a source tree (a commit) arrives as the
+/// same commit: there is no "preserve history" switch because there is no
+/// copy of bytes to lose it in. The path TO `to` is materialized as `rebuild`
+/// does, which is what restores a source tree boundary when `to` lies inside
+/// one.
+fn copy_entry(ws: &str, from: &[String], to: &[String]) -> Result<String, Fail> {
+    let source = resolve(None, ws, from)?;
+    match resolve(None, ws, to) {
+        Ok(_) => {
+            return Err(User(format!(
+                "{} already exists; remove it first or choose another destination",
+                to.join("/")
+            )))
+        }
+        Err(Infra(e)) => return Err(Infra(e)),
+        Err(User(_)) => {} // not there: the case this wants
+    }
+    let work = scratch(&fresh_name("inline")).map_err(Infra)?;
+    let relative = to.join("/");
+    worker_common::files::materialize(ws, &work, std::slice::from_ref(&relative)).map_err(Infra)?;
+    let mut ancestor = work.clone();
+    for component in &to[..to.len() - 1] {
+        ancestor.push(component);
+        if ancestor.is_symlink() {
+            return Err(User(
+                "copy/move cannot follow a symlink; use bash to replace it explicitly".into(),
+            ));
+        }
+    }
+    let target = work.join(&relative);
+    fs::create_dir_all(target.parent().unwrap())
+        .map_err(|e| User(format!("cannot create the parents of {relative}: {e}")))?;
+    worker_common::link(&source, target).map_err(Infra)?;
+    let out = fresh("files-inline");
+    caos(["put", path(&work), &out]).map_err(Infra)?;
+    Ok(out)
+}
+
+/// Drop the entry at `comps`, and everything under it, from the tree.
+///
+/// The way TO the entry is materialized and the entry itself is not: asking
+/// for a name that cannot exist beside it makes every directory above it real
+/// (so a source tree boundary is restored by `caos put`) while the entry stays
+/// a link, which is then removed without ever having been fetched.
+fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
+    resolve(None, ws, comps)?; // a path that is not there is the model's mistake, not a no-op
+    let work = scratch(&fresh_name("inline")).map_err(Infra)?;
+    let mut probe: Vec<String> = comps[..comps.len() - 1].to_vec();
+    probe.push(".caos-remove-probe".to_string());
+    worker_common::files::materialize(ws, &work, &[probe.join("/")]).map_err(Infra)?;
+    let mut ancestor = work.clone();
+    for component in &comps[..comps.len() - 1] {
+        ancestor.push(component);
+        if ancestor.is_symlink() {
+            return Err(User(
+                "remove cannot follow a symlink; use bash to replace it explicitly".into(),
+            ));
+        }
+    }
+    let target = work.join(comps.join("/"));
+    let is_dir = fs::symlink_metadata(&target)
+        .map_err(|e| User(format!("{} cannot be removed: {e}", comps.join("/"))))?
+        .is_dir();
+    if is_dir {
+        fs::remove_dir_all(&target)
+    } else {
+        fs::remove_file(&target)
+    }
+    .map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
+    let out = fresh("files-inline");
+    caos(["put", path(&work), &out]).map_err(Infra)?;
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // SourceTree plumbing.
 // ---------------------------------------------------------------------------
