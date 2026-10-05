@@ -2,7 +2,6 @@
 
 mod async_work;
 mod githist;
-mod github;
 mod import_source;
 mod progress;
 mod publish_source;
@@ -1063,10 +1062,6 @@ fn drive_call(
                 import_source::execute(state, &site)?;
                 return Ok(true);
             }
-            if existing.name == github::NAME {
-                github::execute(state, &site)?;
-                return Ok(true);
-            }
             if existing.name == subagents::WAIT_TOOL {
                 dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
             } else {
@@ -1093,10 +1088,6 @@ fn drive_call(
     }
     if call.name == "import_source" {
         import_source::execute(state, &site)?;
-        return Ok(true);
-    }
-    if call.name == github::NAME {
-        github::execute(state, &site)?;
         return Ok(true);
     }
     if call.name == async_work::TOOL_NAME {
@@ -3152,9 +3143,6 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // built-in reads its input as JSON, so it can take a real one.
     publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
     registry.push(publish);
-    let mut github = tools::tree_tool_declaration(&tools::builtin_tool(github::NAME, github::HELP));
-    github["input_schema"]["properties"]["body"]["type"] = json!("object");
-    registry.push(github);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
         registry.push(async_work::declaration());
@@ -4735,255 +4723,6 @@ mod tests {
                 assert!(view.snapshot().exists("imports/base.source.json").unwrap());
                 assert_eq!(record.files.len(), 2);
             }
-        }
-    }
-
-    /// A stand-in for api.github.com: it answers each connection with the next
-    /// of `responses`, reporting the request it read, then stops listening.
-    fn github_stub(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
-        use std::io::{BufRead, BufReader, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = format!("http://{}", listener.local_addr().unwrap());
-        let (seen, requests) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for response in responses {
-                let (stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(&stream);
-                let mut request = String::new();
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    request.push_str(&line);
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                }
-                let length = request
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|n| n.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
-                request.push_str(&String::from_utf8(body).unwrap());
-                seen.send(request).unwrap();
-                (&stream).write_all(response.as_bytes()).unwrap();
-            }
-        });
-        (api, requests)
-    }
-
-    fn http_response(status: &str, headers: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {status}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
-    /// A conversation whose current call is a `github` call with `input`, its
-    /// request, and the call. `race` lands just before this attempt's first push.
-    fn github_site_state(
-        input: &Value,
-        race: Option<Transition>,
-    ) -> (Oid, Call, progress::State<ImportStore>) {
-        let golden = golden_with_first(github::NAME, input.clone()).unwrap();
-        let store = ImportStore {
-            objects: golden.store,
-            head: golden.head.clone(),
-            race,
-            lost_ack: true,
-        };
-        let state = progress::State::from_store(
-            store,
-            "refs/conversations/conversation/head".into(),
-            golden.head,
-        )
-        .unwrap();
-        let call = Call {
-            id: "first".into(),
-            name: github::NAME.into(),
-            input: input.clone(),
-        };
-        (golden.request, call, state)
-    }
-
-    /// The text the model sees for a finished call, and whether it is an error.
-    fn github_result(state: &progress::State<ImportStore>, site: &CallSite<'_>) -> (String, bool) {
-        let view = state.conversation().unwrap();
-        let record = view
-            .tool(site.request, site.round, &site.call.id)
-            .unwrap()
-            .unwrap();
-        assert!(record.is_terminal());
-        let block: Value =
-            serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
-        (
-            block["content"][0]["text"].as_str().unwrap().to_string(),
-            block["is_error"] == true,
-        )
-    }
-
-    #[test]
-    fn a_github_write_is_pinned_then_sent_once() {
-        let input = json!({"method":"POST","path":"/repos/o/r/pulls",
-            "body":{"head":"feature","base":"main","title":"T"}});
-        let (request, call, mut state) = github_site_state(&input, None);
-        let site = CallSite::at(&request, 0, &call, ASSISTANT_ID);
-        let (api, seen) = github_stub(vec![http_response(
-            "201 Created",
-            "content-type: application/json\r\n",
-            r#"{"number":7}"#,
-        )]);
-        // The pin's push lands but its acknowledgement is lost: still ours.
-        github::execute_at(&mut state, &site, &api, Some("t0ken")).unwrap();
-        let sent = seen
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        let (head, body) = sent.split_once("\r\n\r\n").unwrap();
-        assert!(
-            head.starts_with("POST /repos/o/r/pulls HTTP/1.1\r\n"),
-            "{head}"
-        );
-        let head = head.to_ascii_lowercase();
-        assert!(head.contains("\r\nauthorization: bearer t0ken"), "{head}");
-        assert!(
-            head.contains("\r\nx-github-api-version: 2022-11-28"),
-            "{head}"
-        );
-        assert_eq!(serde_json::from_str::<Value>(body).unwrap(), input["body"]);
-        assert_eq!(
-            github_result(&state, &site),
-            ("201 Created\n\n{\"number\":7}".to_string(), false)
-        );
-        let view = state.conversation().unwrap();
-        let pin = format!(
-            "{}/github.json",
-            paths::call_payload_dir(request.as_str(), 0, "first")
-        );
-        let pinned: Value = serde_json::from_slice(&view.payload(&pin).unwrap()).unwrap();
-        assert_eq!(pinned["request"]["method"], "POST");
-        assert_eq!(pinned["request"]["path"], "/repos/o/r/pulls");
-        // Driving the finished call again sends nothing.
-        let head = state.head().clone();
-        github::execute_at(&mut state, &site, &api, Some("t0ken")).unwrap();
-        assert_eq!(*state.head(), head);
-        assert!(seen.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_github_write_another_attempt_pinned_is_never_sent_again() {
-        let input = json!({"method":"PATCH","path":"/repos/o/r/pulls/7","body":{"base":"main"}});
-        // Pinned before this attempt started (an attempt that died after
-        // sending), or by a competing attempt while this one was pinning.
-        for competing in [false, true] {
-            let (request, call, _) = github_site_state(&input, None);
-            let site = CallSite::at(&request, 0, &call, ASSISTANT_ID);
-            let mut record = site.stub(None);
-            record.status = CallStatus::Started;
-            let earlier = Transition::ToolStart {
-                record,
-                payloads: vec![(
-                    "github.json".into(),
-                    canonical_payload_bytes(&json!({"attempt": "earlier"})).unwrap(),
-                )],
-            };
-            let (_, _, mut state) = github_site_state(&input, competing.then(|| earlier.clone()));
-            if !competing {
-                state.append(earlier).unwrap();
-            }
-            let (api, seen) = github_stub(Vec::new());
-            github::execute_at(&mut state, &site, &api, Some("t0ken")).unwrap();
-            assert!(seen.try_recv().is_err());
-            let (text, is_error) = github_result(&state, &site);
-            assert!(is_error);
-            assert!(
-                text.starts_with("Not confirmed: PATCH /repos/o/r/pulls/7: another attempt"),
-                "{text}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_github_read_is_not_pinned_and_follows_no_redirect() {
-        let input = json!({"method":"GET","path":"/repos/o/r/tarball/main"});
-        let (request, call, mut state) = github_site_state(&input, None);
-        let site = CallSite::at(&request, 0, &call, ASSISTANT_ID);
-        // Followed, this would fail to connect and read as a transport error.
-        let (api, seen) = github_stub(vec![http_response(
-            "302 Found",
-            "location: http://127.0.0.1:1/elsewhere\r\n",
-            "",
-        )]);
-        github::execute_at(&mut state, &site, &api, None).unwrap();
-        let sent = seen
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap();
-        assert!(
-            !sent.to_ascii_lowercase().contains("authorization"),
-            "{sent}"
-        );
-        assert_eq!(
-            github_result(&state, &site),
-            (
-                "302 Found\nlocation: http://127.0.0.1:1/elsewhere\n\n".to_string(),
-                true
-            )
-        );
-        let view = state.conversation().unwrap();
-        let pin = format!(
-            "{}/github.json",
-            paths::call_payload_dir(request.as_str(), 0, "first")
-        );
-        assert!(!view.snapshot().exists(&pin).unwrap());
-    }
-
-    #[test]
-    fn publish_source_sees_a_caos_entry_in_the_commit_it_would_push() {
-        let mut store = MemoryStore::new();
-        let blob = store.write_blob(b"x").unwrap();
-        let ledger = store
-            .write_tree(&[conversation_protocol::v3::TreeEntry {
-                name: "conflicts".into(),
-                mode: Mode::Blob,
-                oid: blob.clone(),
-            }])
-            .unwrap();
-        for (name, mode, oid, expected) in [
-            (".caos", Mode::Tree, ledger, true),
-            (".caos-expr", Mode::Blob, blob.clone(), false),
-            ("src", Mode::Tree, store.write_tree(&[]).unwrap(), false),
-        ] {
-            let tree = store
-                .write_tree(&[conversation_protocol::v3::TreeEntry {
-                    name: name.into(),
-                    mode,
-                    oid,
-                }])
-                .unwrap();
-            let signature = conversation_protocol::v3::Signature {
-                name: "t".into(),
-                email: "t@example.com".into(),
-                time: 0,
-                offset: "+0000".into(),
-            };
-            let commit = store
-                .write_commit(&conversation_protocol::v3::CommitInfo {
-                    tree,
-                    parents: Vec::new(),
-                    author: signature.clone(),
-                    committer: signature,
-                    extra_headers: Vec::new(),
-                    message: b"m\n".to_vec(),
-                })
-                .unwrap();
-            assert_eq!(
-                publish_source::has_caos_entry(&store, &commit).unwrap(),
-                expected,
-                "{name}"
-            );
         }
     }
 }

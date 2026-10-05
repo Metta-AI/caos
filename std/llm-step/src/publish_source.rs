@@ -3,7 +3,7 @@ use super::*;
 use conversation_protocol::v3::publication::Outcome;
 use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
-pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. It refuses a commit whose tree has a .caos entry, such as an uncleared .caos/conflicts ledger: resolve the conflicts and clear it first. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR (open one with the github tool) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR (caos-std/github opens one) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
 @param branch Destination branch name (without refs/heads/).
 @param [force] true to allow a non-fast-forward update (a force push), still leased on the observed remote head.";
@@ -79,15 +79,6 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     return site.fail(state, "publish_source requires an existing source gitlink")
                 }
             };
-            if has_caos_entry(state.store(), &head)? {
-                return site.fail(
-                    state,
-                    &format!(
-                        "{} ({head}) has a .caos entry, such as an uncleared .caos/conflicts ledger. Resolve the conflicts it lists and clear it, then publish.",
-                        p.source_tree
-                    ),
-                );
-            }
             let base = view.reference_start(&p.source_tree)?;
             let old = match observe() {
                 Ok(old) => old,
@@ -202,18 +193,6 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         }
     };
     finish(state, site, &pending, Some(outcome))
-}
-
-/// Whether `commit`'s tree has a `.caos` entry: conflict bookkeeping, which a
-/// published branch must not carry. Reads the commit and its root tree, and
-/// nothing else.
-pub(super) fn has_caos_entry(store: &dyn ObjectStore, commit: &Oid) -> Result<bool, String> {
-    let tree = store.read_commit(commit).map_err(String::from)?.tree;
-    Ok(store
-        .read_tree(&tree)
-        .map_err(String::from)?
-        .iter()
-        .any(|entry| entry.name == ".caos"))
 }
 
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {

@@ -145,7 +145,7 @@ describes it and `run_tool` runs it. Registering it as well would be a second wa
 to call one thing, and the two can disagree about which version runs — the
 harness's copy against the tree's. So the registry holds only what implements no
 entry and therefore has no path: the file tools, `grep`, the git readers, the
-subagent and async tools, `import_source`, `publish_source`, `github`, and
+subagent and async tools, `import_source`, `publish_source`, and
 `tool_help`/`run_tool` themselves. `std/README.md` is the index for the rest.
 
 `merge` is the one exception, and the reason is what its target is. Every other
@@ -795,14 +795,6 @@ commit and provenance as an import.json payload in tool.start. Inline starts
 may omit a compute task; ordinary dispatched starts still name their task.
 A resumed call uses the saved hash, and concurrent attempts accept the first
 persisted observation. A new tool call observes the remote again.
-
-The inline `github(method, path, body?)` tool makes one call to
-`api.github.com` with the granted `github-token` and follows no redirects
-(design/agent-github.md, "PRs"). A GET runs, and a retry runs it again. Any
-other method is a write: it records the exact request as a github.json payload
-in tool.start before sending, and only the attempt whose tool.start was
-appended sends it. A call found started without a result is completed as not
-confirmed and is never sent again.
 
 After import, the tool atomically adds the gitlink, sibling .source.json
 provenance and completed tool result. It rejects occupied destinations.
