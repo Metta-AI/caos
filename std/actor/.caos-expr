@@ -1,0 +1,5 @@
+# The actor wrapper (README.md), a std/go worker. One program, two
+# positions like run-and-update-ref: start reads the branch head and tail-calls
+# the inner request; finish publishes the new state by moving the branch with a
+# compare-and-swap. std/go has git, which start uses to read the head.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go
