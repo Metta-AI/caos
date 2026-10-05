@@ -1447,7 +1447,15 @@ fn remove(call: &Value, ws: &str) -> Result<(String, String), Fail> {
 /// does, which is what restores a source tree boundary when `to` lies inside
 /// one.
 fn copy_entry(ws: &str, from: &[String], to: &[String]) -> Result<String, Fail> {
-    let source = resolve(None, ws, from)?;
+    // THE ENTRY ITSELF, NOT WHAT `resolve` MAKES OF IT. Resolving `from` walks
+    // THROUGH a source tree (a commit entry) to its code tree, and a link to
+    // that would copy the files but not the commit: the copy would not be a
+    // source tree, and `log`, `diff` and `publish_source` would not know it.
+    // The child of the parent directory is the entry as stored -- which is
+    // also how `ls` tells a commit from a directory.
+    resolve(None, ws, from)?; // a path that is not there is the model's mistake
+    let parent = resolve(None, ws, &from[..from.len() - 1])?;
+    let source = parent.join(&from[from.len() - 1]);
     match resolve(None, ws, to) {
         Ok(_) => {
             return Err(User(format!(
