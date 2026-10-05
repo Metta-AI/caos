@@ -15,6 +15,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `bash-tool` | Run `sh -c` from the conversation root; ordinary files and source trees are writable, the rest is not. |
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
+| `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
 | `caos-test` | Build the caos test stack from the tree and run the whole suite — unit tests and every `tests/<name>`. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `merge` | Three-way merge another commit into the current source tree. |
