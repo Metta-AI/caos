@@ -652,6 +652,9 @@ fn run_dispatch_inner(
     // Promise sub-runs see this computation as an ancestor.
     let mut child_stack: Vec<String> = stack.to_vec();
     child_stack.push(arg_tree.to_string());
+    // What this job's continuations and children run with: its context, with
+    // only the writes it was granted (set at dispatch below).
+    let child_secrets;
 
     // Run the worker through the runner rendezvous: resolve the image to a
     // docker-pullable ref (always sent — a warm runner that pinned the image
@@ -681,22 +684,37 @@ fn run_dispatch_inner(
         // out of band in the job payload — never in the ArgTree, so never in the
         // cache key — and the container runner drops them at `/secret/<name>`.
         // Read from `arg_entries` before dispatch takes ownership of it.
-        let granted = crate::secrets::grant(config, secrets, &arg_entries);
-        crate::runner::dispatch(
+        let mut granted = crate::secrets::grant(config, secrets, &arg_entries);
+        // A job that asks to write (its `writes` arg) gets a run token for
+        // what it asked and was handed; what it creates is handed only that
+        // (design/ref-writers.md).
+        let (token, child_writes) =
+            crate::ref_writers::grant(config, secrets.writes(), &arg_entries).map_err(fail)?;
+        if let Some(token) = &token {
+            granted.push((
+                conversation_protocol::v3::writers::TOKEN_SECRET.to_string(),
+                token.clone(),
+            ));
+        }
+        child_secrets = secrets.clone().with_writes(child_writes);
+        let result = crate::runner::dispatch(
             arg_tree,
             arg_entries,
             &image_ref,
             seeded,
             granted,
-            |sub_request| start_sub_run(config, sub_request, &child_stack, secrets),
+            |sub_request| start_sub_run(config, sub_request, &child_stack, &child_secrets),
             |note| match note {
                 crate::runner::Note::Started => crate::status::started(config, arg_tree),
                 crate::runner::Note::OutTrace(oid) => {
                     crate::status::out_trace(config, arg_tree, &oid)
                 }
             },
-        )
-        .map_err(fail)?
+        );
+        if let Some(token) = &token {
+            crate::ref_writers::revoke(token);
+        }
+        result.map_err(fail)?
     };
 
     if result_hash(&result).is_empty() {
@@ -709,7 +727,8 @@ fn run_dispatch_inner(
     let (result, caught) = match result.split_once(' ') {
         Some((PROMISE_KIND, cont)) => {
             eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, arg_tree, cont, salt, &child_stack, secrets).map_err(fail)?
+            resolve_promise(config, arg_tree, cont, salt, &child_stack, &child_secrets)
+                .map_err(fail)?
         }
         _ => (result, false),
     };
