@@ -13,7 +13,8 @@
 //! CLI surface plus the privileged runner.
 //!
 //! Subcommands: `get-hash`, `get`, `put`, `put-commit`, `hash`, `forward`, `map-then`,
-//! `run-then`, `run-request-then`, `sub-run`, `prepare-request`, `curry`, and `runner`.
+//! `run-then`, `run-request-then`, `sub-run`, `trace-child`, `status`, `prepare-request`,
+//! `curry`, and `runner`.
 //! (Image import and ref resolution are user-facing only — see `caos-cli`.)
 
 use std::os::unix::fs::PermissionsExt;
