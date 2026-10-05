@@ -34,7 +34,7 @@ refs/caos/w/<id>/<anything>   the refs it governs
 ```text
 # <ed25519 pubkey, hex>  <label, display only>
 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29  malcolm
-9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60  nishu
+9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60  nishad
 ```
 
 A `.caos/writers` file anywhere else means nothing. Governed refs can point at
@@ -153,9 +153,9 @@ the namespace id; today's session-derived name (`cc/<session>`) moves into
 
 Multiplayer:
 
-1. Nishu sends Malcolm their public key (it isn't secret)
+1. Nishad sends Malcolm their public key (it isn't secret)
 2. Malcolm adds it to `writers`, from the tui or a `caos mcp` tool
-3. Nishu resumes the conversation by id from their own tui or cloud session
+3. Nishad resumes the conversation by id from their own tui or cloud session
 
 Each writer's pushes and jobs use their own key, so the log shows who drove
 each turn.
