@@ -19,6 +19,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `merge` | Three-way merge another commit into the current source tree. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
+| `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says

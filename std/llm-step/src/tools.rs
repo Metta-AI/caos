@@ -137,7 +137,7 @@ pub fn grep_declaration() -> Value {
 /// declaring one. Reserving a name for its history costs a tool author a
 /// perfectly good parameter and tells the next reader that something binds it.
 const RESERVED_ARGS: &[&str] = &[
-    "in", "worker1", "base", "salt", "wc", "refs",
+    "in", "worker1", "base", "salt", "wc", "refs", "call",
     // The tool's own ArgTree binds `help` (SPEC, "Tools"), and `caos curry`
     // refuses to rebind — so a tool declaring `@param help` would fail at
     // invocation rather than here, where the model can be told why.
@@ -164,6 +164,9 @@ pub struct TreeTool {
     /// The tool declared `@in`: bind the tree it was run on. See
     /// [`Help::wants_in`] for why absence is the default.
     pub wants_in: bool,
+    /// The tool declared `@call`: bind this tool call's id as `call`. See
+    /// [`Help::call`].
+    pub call: bool,
 }
 
 /// What `@in` offers the model: the tree to run over, defaulting to the one
@@ -199,6 +202,7 @@ impl TreeTool {
             git: help.git,
             writer: help.writer,
             wants_in: help.wants_in,
+            call: help.call,
         }
     }
 
@@ -438,6 +442,12 @@ pub struct Help {
     /// same test record could not hit. `grep` has always done this right by
     /// binding only the scope it searches, which is why a scoped grep is cheap.
     pub wants_in: bool,
+    /// `@call`: bind this tool call's id as `call`, for a tool whose result
+    /// must not be reused by a later call with the same arguments, such as one
+    /// that talks to an outside service. Results are kept by their arguments,
+    /// and the call id is unique to the call yet the same when a call is
+    /// recovered, so a retry gets the stored result and a new call does not.
+    pub call: bool,
 }
 
 /// If `line` opens a javadoc BLOCK TAG, its name without the `@`.
@@ -469,6 +479,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut git = false;
     let mut writer = false;
     let mut wants_in = false;
+    let mut call = false;
     let mut in_tags = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -493,11 +504,14 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         } else if trimmed == "@in" {
             in_tags = true;
             wants_in = true;
+        } else if trimmed == "@call" {
+            in_tags = true;
+            call = true;
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
             eprintln!(
                 "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in)"
+                 (known: @param, @git, @writer, @in, @call)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
@@ -510,6 +524,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         git,
         writer,
         wants_in,
+        call,
     }
 }
 
@@ -1517,6 +1532,23 @@ mod tests {
     }
 
     #[test]
+    fn call_is_opt_in_and_not_a_parameter() {
+        let plain = TreeTool::new("t", parse_help("t", "d\n@param path P."));
+        assert!(!plain.call);
+
+        // The harness binds `call`; the model never sees it.
+        let api = TreeTool::new("github", parse_help("t", "d\n@param path P.\n@call"));
+        assert!(api.call);
+        assert_eq!(api.args.len(), 1);
+        assert_eq!(api.args[0].name, "path");
+
+        // Nor may a tool declare it by hand.
+        let by_hand = parse_help("t", "d\n@param call The id.");
+        assert!(by_hand.args.is_empty());
+        assert!(!by_hand.call);
+    }
+
+    #[test]
     fn a_declared_type_reaches_the_schema_and_the_binding() {
         let h = parse_help(
             "t",
@@ -1793,6 +1825,7 @@ mod tests {
             git: false,
             writer: false,
             wants_in: false,
+            call: false,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -1812,6 +1845,7 @@ mod tests {
             git: false,
             writer: false,
             wants_in: false,
+            call: false,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -1842,6 +1876,7 @@ mod tests {
             git: false,
             writer: false,
             wants_in: false,
+            call: false,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 
