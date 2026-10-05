@@ -1133,6 +1133,9 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "copy" => copy(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "move" => move_entry(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "remove" => remove(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
