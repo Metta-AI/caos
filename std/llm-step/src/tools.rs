@@ -894,7 +894,11 @@ fn is_oid(value: &str) -> bool {
 /// A path cannot name a commit, because `caos resolve` traverses a gitlink to
 /// the tree inside it — so `{commit}` takes an oid, and says so when it does
 /// not get one.
-fn resolve_object(value: &str, want: &str, conversation: Option<&str>) -> Result<Bound, String> {
+pub fn resolve_object(
+    value: &str,
+    want: &str,
+    conversation: Option<&str>,
+) -> Result<Bound, String> {
     let materialized = fresh("arg-object");
     if is_oid(value) {
         caos(["get-hash", value, &materialized])

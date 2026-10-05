@@ -9,6 +9,9 @@
 # execs us as /worker with the args materialized under /cas/args:
 #   ours   (:commit=)  the source tree commit to merge into (the current side)
 #   theirs (:commit=)  the commit to merge in
+#   merge-base (:commit=)  optional: the merge base to use instead of the one
+#                      git finds, e.g. the old tip of the layer below when
+#                      rebuilding a stack on a force-pushed base
 # We three-way merge them and write a single result: a two-parent commit M =
 # (merged tree, parents [ours, theirs]). On conflict the merged tree carries
 # git's inline markers PLUS a reserved .caos/conflicts file — git's own
@@ -21,6 +24,10 @@ set -euo pipefail
 # objects themselves come from the server over git below.
 ours=$(caos hash /cas/args/ours)
 theirs=$(caos hash /cas/args/theirs)
+base=()
+if [ -e /cas/args/merge-base ]; then
+  base=("$(caos hash /cas/args/merge-base)")
+fi
 
 # A throwaway git repo, and the two commit closures fetched from the server's
 # own git transport. `--filter=tree:0` fetches the commit GRAPH ONLY — every
@@ -42,14 +49,14 @@ git -C "$repo" remote add origin "$CAOS_SERVER_URL"
 git -C "$repo" config extensions.partialClone origin
 git -C "$repo" config remote.origin.promisor true
 git -C "$repo" config remote.origin.partialclonefilter tree:0
-git -C "$repo" fetch -q --filter=tree:0 origin "$ours" "$theirs"
+git -C "$repo" fetch -q --filter=tree:0 origin "$ours" "$theirs" "${base[@]}"
 timestamp=$(git -C "$repo" show -s --format=%ct "$ours")
 
 # `merge-tree --write-tree`: writes the merged tree to the odb and prints its
 # oid on line 1; on conflict, exits 1 and prints the unmerged-file notation and
 # informational messages after it. Any other exit is a real failure.
 set +e
-merge_out=$(git -C "$repo" merge-tree --write-tree "$ours" "$theirs")
+merge_out=$(git -C "$repo" merge-tree --write-tree "${base[@]/#/--merge-base=}" "$ours" "$theirs")
 code=$?
 set -e
 if [ "$code" != 0 ] && [ "$code" != 1 ]; then
