@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,6 +208,21 @@ func plan(m1, m2 string) string {
 	return b.String()
 }
 
+// runTokenWriter is the public key this job's run token writes as, which
+// the server says when asked about the token (design/ref-writers.md).
+func runTokenWriter() string {
+	token, err := os.ReadFile("/secret/caos-write")
+	w.True(err == nil, "this job holds no run token: dev/run-test must hand the test --writes")
+	resp := w.Check(http.Post(os.Getenv("CAOS_SERVER_URL")+"/ref-writers/token", "text/plain", bytes.NewReader(token)))
+	defer resp.Body.Close()
+	w.True(resp.StatusCode == 200, "asking the server which writer this test's run token is: %s", resp.Status)
+	var grant struct {
+		Key string `json:"key"`
+	}
+	w.Must(json.NewDecoder(resp.Body).Decode(&grant))
+	return grant.Key
+}
+
 func main() {
 	w.Main(func() {
 		w.Step("a source tree, a stub model, and a conversation")
@@ -228,10 +244,16 @@ func main() {
 
 		port := startStub()
 		conv := fmt.Sprintf("%d-%d-squash-publish", time.Now().UnixNano(), rand.Int())
+		// The conversation's namespace (design/ref-writers.md): the tool founds
+		// it as the writer this test's run token acts for, and the step is
+		// handed it.
+		w.Must(os.Setenv("LLM_TEST_WRITER", runTokenWriter()))
+		ns := run(tool, "found", "--repo", repo, "--id", conv)
 		w.Must(os.WriteFile("/tmp/system.txt", []byte("You are a coding agent."), 0o644))
 		caos("put", "/tmp/system.txt", "/cas/system")
 		llm := caos("curry", "--base:hash="+caos("hash", "/cas/args/llm-step"), "--system:@=/cas/system",
-			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--conversation="+conv)
+			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port),
+			"--conversation="+ns+"/"+conv, "--writes="+ns)
 
 		// The tools, staged the way chat-tools-mixed stages its shell: a folder
 		// whose .caos-expr names the image by hash. An agent reaches the same

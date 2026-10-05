@@ -9,6 +9,11 @@ stage() { echo "== $* ==" >&2; }
 test_id="$(date +%s%N)-$$-$RANDOM"
 empty=$(git -c user.name=t -c user.email=t@caos commit-tree "$(git mktree </dev/null)" -m "ref-writers $test_id")
 
+stage "a ref outside every namespace is refused unless it is content-named"
+if git push -q caos "$empty:refs/heads/ref-writers-$test_id" 2>/dev/null; then
+  fail "the stack accepted an ungoverned branch"
+fi
+
 stage "a content-named ref needs no proof but must point at what it names"
 git push -q caos "$empty:refs/caos/req/$empty" || fail "a content-named ref was refused"
 tree=$(git mktree </dev/null)

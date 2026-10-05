@@ -67,9 +67,11 @@ neither combines its commits into one nor discards their history.
 
 ## Conversation commits
 
-A conversation ref, `refs/caos/v3/conversations/<hex(id)>/head`, identifies its
-current `C` in CAOS Git. A normal update creates a commit parented by the previous
-`C`, then advances the ref only if it still points to the expected head.
+A conversation ref, `refs/caos/w/<ns>/conversations/<hex(id)>/head`, identifies its
+current `C` in CAOS Git. `<ns>` is the ref-writers namespace whose writers may
+move it ([ref writers](ref-writers.md)). A normal update creates a commit
+parented by the previous `C`, then advances the ref only if it still points to
+the expected head.
 
 Each `C`'s tree is a complete snapshot of the conversation filesystem.
 `.caos/transcript` holds its ordered messages; `.caos/title` holds its title.

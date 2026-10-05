@@ -209,7 +209,7 @@ pub fn import_source(
     append_transition(
         t,
         id,
-        &refs::head_ref(id)?,
+        &crate::writers::head_ref(t, id)?,
         "importing content",
         |store, head| {
             let view = Conversation::open(store, head)?;
