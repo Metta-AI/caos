@@ -1,8 +1,7 @@
 # Ref writers
 
-Right now any worker can push any ref: workers are on `caos-net`, and the
-server accepts every `receive-pack`. This proposes a way to control who can
-write a ref. Conversations are the first user (see the end).
+Right now any worker can push any ref. This proposes a way to control who can
+write a ref.
 
 ## Goals
 
@@ -14,13 +13,10 @@ write a ref. Conversations are the first user (see the end).
 
 ## Keys
 
-Each person has an ed25519 **writer key**.
-
-- The private key stays on the client: a file on a laptop, or `CAOS_WRITER_KEY`
-  in a cloud environment's settings. The server never sees it.
-- The public key is shared freely; it's what you give someone so they can add
-  you as a writer.
-- Generate one with `caos-cli writer-key new`.
+Each writer has an ed25519 ref writer key, generated with
+`caos-cli ref-writer-key new`. The private key stays on the writer's device, in
+the checkout's git config as `caos.ref-writer-key`, next to
+`caos.secret-readers`.
 
 ## Namespaces
 
@@ -41,8 +37,10 @@ refs/caos/w/<id>/<anything>   governed refs
 
 - `<id>` is the hash of the first `writers` commit. Since the hash covers the
   initial writers list, nobody can squat a namespace.
-- One `writers` list governs every ref in the namespace, so removing someone
-  removes them everywhere at once.
+- One `writers` list governs every ref in the namespace, e.g. a conversation's
+  head and its subagents' heads. Removing someone removes them from all of
+  them at once, and a job can create new refs in the namespace without first
+  setting up their writers.
 - The list lives in its own ref rather than in each governed ref's tree, so
   that a governed ref can point at anything (a source branch shouldn't have to
   carry a `.caos/writers` file).
@@ -55,7 +53,7 @@ someone in the current list, and must be a fast-forward, so the history of who
 added whom is kept. Removal takes effect on the next push.
 
 Only a writer key can change `writers`; a job's run token (below) can't. Jobs
-write content, people decide who writes.
+write content, writers decide who else writes.
 
 ## Proving a write
 
@@ -128,9 +126,11 @@ Cost is one blob read per namespace touched. Needs
 
 ## Claude cloud
 
-- Set `CAOS_WRITER_KEY` once in the environment settings. Bootstrap reads it
-  from the environment; it never goes in the setup script text (and
-  `--secret-readers` should move out of there too).
+- Add `--ref-writer-key=<key>` to the setup line, next to `--secret-readers`.
+  Bootstrap writes it to the checkout's git config. It's a setup argument
+  rather than an environment variable for the same reason `--server` is: the
+  setup phase can't see the environment's variables
+  (integrations/claude-code/cloud/README.md).
 - `caos mcp` signs its own pushes with it, and sends `X-Caos-Write` on the
   requests it makes. Jobs those requests start get their access from that.
 - Nothing is stored per conversation, so a fresh container is fine.
@@ -151,11 +151,11 @@ the namespace id; today's session-derived name (`cc/<session>`) moves into
 
 Multiplayer:
 
-1. Nishu sends Malcolm their public key
+1. Nishu sends Malcolm their public key (it isn't secret)
 2. Malcolm adds it to `writers`, from the tui or a `caos mcp` tool
 3. Nishu resumes the conversation by id from their own tui or cloud session
 
-Each person's pushes and jobs use their own key, so the log shows who drove
+Each writer's pushes and jobs use their own key, so the log shows who drove
 each turn.
 
 Subagents live in the parent's namespace: `llm-step` puts the namespace in each
