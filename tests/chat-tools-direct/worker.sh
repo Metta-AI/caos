@@ -63,7 +63,7 @@ jq -s -e '
 # observation ID -> required error text ("" = only that it is an error)
 observe() {
   $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-    --round 0 --id "$1" > "/tmp/obs-$1.json"
+    --round 0 --id "tu_$1" > "/tmp/obs-$1.json"
 }
 expect_error() {
   observe "$1"
