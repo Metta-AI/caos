@@ -44,13 +44,13 @@ pub fn is_inline(name: &str) -> bool {
 /// then dashed `@param` tags. They are parsed by the same `parse_help` the tree
 /// tools use, so a built-in and a project tool are described one way — the docs
 /// live with the tool, not inside a hand-written JSON schema.
-const READ_HELP: &str = "Read a file's contents. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`, or a stage oid from `.caos/conflicts`) — to read as of another revision. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
+const READ_HELP: &str = "Read a file's contents. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` — a commit, tree, or blob hash (one printed by `log`/`show`/`diff`/`eval_path`, or a stage oid from `.caos/conflicts`) — to read as of another revision or inside an evaluated result such as caos-std/. With a commit or tree `root`, `file-path` names the file within it; with a blob `root`, omit `file-path` to read the blob directly. Prefer this over `cat` via bash — it is immediate and needs no `paths` declaration. Large files are truncated; use `offset`/`limit` (line-based) to page.
 @param [file-path] Conversation path, such as feature/dirty/README.md; code-relative when source tree is explicit.
 @param [root] Optional commit/tree/blob hash to read from — an older revision, or a bare blob (e.g. a `.caos/conflicts` stage oid). Omit for the current conversation tree.
 @param [offset] 1-based first line to return.
 @param [limit] Number of lines to return.";
 
-const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` (a commit or tree hash) to list it as of another revision, and `path` to descend within that root. Prefer this over `ls` via bash.
+const LS_HELP: &str = "List a directory: one entry per line, directories with a trailing `/`. Paths start in the conversation tree and traverse code references, for example feature/dirty/README.md. With an explicit source tree they are relative to its code tree; pass `root` (a commit or tree hash, such as one `eval_path` printed) to list it as of another revision or inside an evaluated result, and `path` to descend within that root. Prefer this over `ls` via bash.
 @param [path] Directory to list (relative to `root`, or to the conversation root unless source tree is explicit); omit for the root itself.
 @param [root] Optional commit or tree hash to list as of another revision. Omit for the current conversation tree.";
 
@@ -67,7 +67,7 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
 @param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
 
-const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash) to search as of another revision. Prefer this over grep/find via bash.
+const GREP_HELP: &str = "Search the conversation tree, including code references, with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. Scope with `path` (a directory or file) to narrow the search; results are cached per unchanged subtree, so repeated and scoped greps are cheap. Pass `root` (a commit or tree hash, such as one `eval_path` printed) to search as of another revision or inside an evaluated result. Prefer this over grep/find via bash.
 @param pattern The regular expression to search for.
 @param [path] Directory or file to search (relative to `root`, or to the conversation root); omit for everything.
 @param [root] Optional commit or tree hash to search as of another revision. Omit for the current conversation tree.";
@@ -1156,8 +1156,41 @@ fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fa
         None => worker_common::cas_hash(ws).map_err(Infra)?,
     };
     let destination = fresh("resolved");
-    caos(["resolve", &hash, &comps.join("/"), &destination]).map_err(User)?;
+    let relative = comps.join("/");
+    let output = std::process::Command::new("caos")
+        .args(["resolve", &hash, &relative, &destination])
+        .output()
+        .map_err(|e| Infra(format!("launching caos resolve: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(User(resolve_failure(
+            root.is_some(),
+            &relative,
+            stderr.trim_end(),
+        )));
+    }
     Ok(PathBuf::from(destination))
+}
+
+/// What a failed lookup tells the model. A path missing from the conversation
+/// tree is most often one that only EVALUATION produces — `caos-std/` is a
+/// mount in the evaluated tree, never in the recorded one — and the raw
+/// `caos resolve` exit status said none of that, so a model that tried
+/// `read caos-std/README.md` had no way to learn `eval_path` was the answer.
+/// The lookup stays a lookup: it names the tool that evaluates rather than
+/// evaluating, since that can build.
+fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
+    if !rooted && stderr.contains("no such path") {
+        format!(
+            "{relative} is not in the conversation tree. If an expression produces it \
+             (a mount such as caos-std/ exists only in the evaluated tree), call \
+             eval_path with that path or a parent of it, then pass the hash it prints \
+             as `root` with the rest of the path."
+        )
+    } else {
+        let reason = stderr.strip_prefix("caos: ").unwrap_or(stderr);
+        format!("resolving {relative}: {reason}")
+    }
 }
 
 /// An optional hash-valued input (`root`): trimmed, empty treated as absent.
@@ -1417,6 +1450,28 @@ fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_missing_from_the_conversation_names_eval_path() {
+        let m = resolve_failure(
+            false,
+            "caos-std/README.md",
+            "caos: no such path: caos-std/README.md",
+        );
+        assert!(m.starts_with("caos-std/README.md is not in the conversation tree"));
+        assert!(m.contains("eval_path"), "{m}");
+        assert!(m.contains("`root`"), "{m}");
+    }
+
+    #[test]
+    fn other_resolve_failures_carry_the_reason() {
+        // With an explicit root the model already holds a hash, so pointing it
+        // at eval_path would be noise: it gets the plain reason instead.
+        let rooted = resolve_failure(true, "a/b", "caos: no such path: a/b");
+        assert_eq!(rooted, "resolving a/b: no such path: a/b");
+        let broken = resolve_failure(false, "a", "caos: \"a\" traverses a non-directory");
+        assert_eq!(broken, "resolving a: \"a\" traverses a non-directory");
+    }
 
     #[test]
     fn parse_help_splits_description_and_params() {
