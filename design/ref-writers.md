@@ -20,14 +20,16 @@ the checkout's git config as `caos.ref-writer-key`, next to
 
 ## Namespaces
 
-Governed refs live in a namespace:
+A namespace is a group of refs that share one list of writers. Its name, the
+`<id>` below, is not chosen: it's the hash of the commit that created it.
 
 ```text
-refs/caos/w/<id>/writers      who may write anything in this namespace
-refs/caos/w/<id>/<anything>   governed refs
+refs/caos/w/<id>/writers      the namespace's writers list
+refs/caos/w/<id>/<anything>   the refs it governs
 ```
 
-`writers` is a chain of commits whose tree has one file, `.caos/writers`:
+`writers` is one specific ref. Each commit on it has a tree with a single file,
+`.caos/writers`, and the latest commit is the current list:
 
 ```text
 # <ed25519 pubkey, hex>  <label, display only>
@@ -35,18 +37,18 @@ refs/caos/w/<id>/<anything>   governed refs
 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60  nishu
 ```
 
-- `<id>` is the hash of the first `writers` commit. Since the hash covers the
-  initial writers list, nobody can squat a namespace.
-- One `writers` list governs every ref in the namespace, e.g. a conversation's
-  head and its subagents' heads. Removing someone removes them from all of
-  them at once, and a job can create new refs in the namespace without first
-  setting up their writers.
-- The list lives in its own ref rather than in each governed ref's tree, so
-  that a governed ref can point at anything (a source branch shouldn't have to
-  carry a `.caos/writers` file).
+A `.caos/writers` file anywhere else means nothing. Governed refs can point at
+anything (a source branch shouldn't have to carry the file).
 
-To create a namespace, push a root commit listing yourself to
-`refs/caos/w/<its hash>/writers`.
+To create a namespace, make a root commit whose `.caos/writers` lists yourself,
+and push it to `refs/caos/w/<that commit's hash>/writers`. Because the id is
+the hash of the initial list, nobody can claim a namespace ahead of you or
+create one you aren't in.
+
+One list governs every ref in the namespace, e.g. a conversation's head and its
+subagents' heads. Removing someone removes them from all of them at once, and a
+job can create new refs in the namespace without setting up their writers
+first.
 
 To add or remove a writer, push a new commit on `writers`. It must be signed by
 someone in the current list, and must be a fast-forward, so the history of who
