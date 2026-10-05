@@ -1,7 +1,8 @@
 # Importing and PRs
 
 Imports use three layers: the server endpoint, `caos import-git`, and the
-agent's `import_source` tool. PR publication and merge drafts come later.
+agent's `import_source` tool. PRs use `publish_source` and `std/github`.
+Merge drafts come later.
 
 ## Importing
 
@@ -45,6 +46,7 @@ Supply the token through your secret store (SPEC.md, "Secrets"):
 # <your secrets directory>/github-token
 value:@=values/github-token
 reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
+reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/github
 ```
 
 `caos-cli secrets-push --dir=<d>` adds its entropy and sends it to the server.
@@ -60,26 +62,55 @@ Public imports need no token. Importing needs neither `gh` nor another worker.
 
 ## PRs
 
-Add `std/github` with Git, `gh`, and a pinned
-[`gh-stack` extension](https://github.com/github/gh-stack). Give it access to
-the same `github-token` secret, exposed to `gh` as `GH_TOKEN`.
+A PR is a pushed branch plus metadata. `publish_source` pushes the commit from
+the server's store ([agent-publish.md](agent-publish.md)); the std tool
+`std/github` sends everything else (opening a PR, changing its base, linking a
+stack) to the GitHub API. Neither checks anything out, which `gh` would: its
+stack commands work on local branches.
 
-Expose a general `gh` operation accepting arguments, repository, stdin, and
-input/output files. Return exit status, stdout, stderr, and requested files.
-Use a small `git_push` helper to publish a selected source commit and its history,
-requiring the remote branch to match an expected head. The server can later
-perform this transfer directly, as it does imports.
+### `std/github`
 
-Create PRs with explicit repository, head, and base. Inspect existing PRs before
-creating duplicates or replacing human-edited metadata. Conversation data and
-merge bookkeeping stay outside published history. Once agent publication works,
-remove `/pr`, `/publish-branch`, and their UI.
+One run, `run_tool(path="caos-std/github")`, is one API call: `method`, `path`
+under `https://api.github.com`, an optional JSON `body`, and `at`. The result is
+the status line and the body. A run fails only when no response came back, and
+a write may still have arrived; read the state with a GET before resending.
 
-### Stacks
+`at` is any value no earlier call used, such as the time. Runs are memoized by
+their arguments (`salt` is the interpreter's), so repeating a call returns its
+stored result, and only a run that died mid-flight sends a write twice. GitHub
+refuses a duplicate PR, and a repeated base change is a no-op.
 
-See [stacks.md](stacks.md).
+The token is the same `github-token` secret imports use, not a new one; its
+second `reader:` line, under Importing, grants it to `std/github`. The tool
+reaches only `api.github.com` and follows no redirects, but paths are
+unrestricted: the token's scope is the boundary, so grant a fine-grained token
+for the repositories the agent works on.
 
-### Merges
+### PRs for a stack
+
+After squashing and pushing the stack ([stacks.md](stacks.md), "Publishing"),
+for each layer, bottom first:
+
+1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
+2. If none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base` (the trunk,
+   or the branch below) and a `title` and `body` from the layer's `message=`
+   lines. If one, `PATCH` its `base` when it differs, and leave its title and
+   body, which a person may have edited.
+
+Then link them with `POST /repos/{owner}/{repo}/stacks` and
+`{"pull_requests": [<numbers, bottom first>]}`, or `.../stacks/{number}/add` to
+extend a stack. The chained bases already make a reviewable stack without it.
+
+### Removing `/pr`
+
+`/pr`, `/publish-branch` and the client code behind them go: the host's
+`git push` and `gh pr create`, the fetched base and history, the preview, and
+its conflict checks. Nothing replaces the checks: resolving a conflict clears
+its ledger entry and saving removes the emptied ledger, so a ledger left in a
+published commit is an unresolved conflict, like code that does not build. No
+person confirms a GitHub write; the agent makes it, as it already pushes.
+
+## Merges
 
 Clean merges use the existing merge worker. On conflict, preserve the source O
 and keep the attempt beside it in the conversation:
@@ -111,10 +142,5 @@ whole attempt with `cp -a`, harvesting the edited draft, and then finishing.
 Abandoning an attempt leaves the source unchanged. Handle old source-tree
 conflict ledgers before removing their compatibility cleanup.
 
-### Retrying GitHub writes
-
-Use the tool call's durable identity to claim an operation before executing it
-and record its result afterwards. A duplicate attempt must not repeat a started
-write. After a crash or partial success, inspect GitHub before continuing;
-do not automatically retry arbitrary writes. Merge computation remains cached
-by its inputs; draft edits and completion use conditional conversation updates.
+Merge computation remains cached by its inputs; draft edits and completion use
+conditional conversation updates.

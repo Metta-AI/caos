@@ -163,7 +163,7 @@ mystack/01-feature  -> A'  (merge history)   C1 = tree(A'), parent H    -> publi
 mystack/02-tests    -> B'  (merge history)   C2 = tree(B'), parent C1   -> publish/mystack/02-tests
 ```
 
-This takes two steps:
+This takes three steps:
 
 1. **Squash** (optional) with `caos-std/create-squashed-stack`, called as
    `run_tool(path="caos-std/create-squashed-stack", arguments={"plan": "mystack.plan"})`.
@@ -208,17 +208,7 @@ This takes two steps:
    replace history the agent has seen, never a change someone else pushed
    (design/agent-publish.md).
 
-This publishes branches, not PRs. **TODO:** open and update a PR per layer,
-each based on the branch below (the first on the base branch), and then remove
-the TUI's `/pr` (chat.md, "Publishing with `/pr`"), which pushes a layer's
-unsquashed history.
-
-## Not built
-
-- **Linking the PRs as a stack.** `gh stack link --base main <pr-1> <pr-2>`
-  needs no local branches; it waits on `std/github` (agent-github.md, "PRs").
-  `gh stack push`, `submit` and `rebase` need local branches and stack
-  metadata, which would mean reconstructing a repository from gitlinks and
-  returning rewritten commits to caos. `modify` needs linear history, so it
-  cannot restructure a stack with merge commits.
+3. **Open a PR per layer and link them** with `std/github`, each PR based on
+   the branch below it and the first on the trunk. See
+   [agent-github.md](agent-github.md#prs-for-a-stack), "PRs for a stack".
 
