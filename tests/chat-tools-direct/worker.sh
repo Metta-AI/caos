@@ -99,10 +99,9 @@ expect_ok s3 'removed review/dir/sub'
 expect_ok s4 'copied main to scratch'
 expect_ok s5 'removed scratch'
 # `scratch` was removed whole, so it is not at the root any more.
-if grep -qF 'scratch' /tmp/obs-tu_ls.json 2>/dev/null; then fail "removed source tree still listed"; fi
-observe tu_ls
-grep -qF 'review' /tmp/obs-tu_ls.json || fail "copied source tree is not listed"
-if grep -qF 'scratch' /tmp/obs-tu_ls.json; then fail "removed source tree still listed"; fi
+observe ls
+grep -qF 'review' /tmp/obs-ls.json || fail "copied source tree is not listed"
+if grep -qF 'scratch' /tmp/obs-ls.json; then fail "removed source tree still listed"; fi
 
 stage "main after the batch"
 source_tree=$(source_tree_commit "$head")
