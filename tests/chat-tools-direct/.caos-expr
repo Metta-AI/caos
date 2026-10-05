@@ -1,0 +1,10 @@
+# tests/chat-tools-direct, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST of llm-step's INLINE TREE TOOLS `copy`, `move` and `remove`: what
+# the worker does with a queued batch of them, including the cases that go wrong
+# (existing destination, missing source, move into itself, `.caos`) and the ones
+# that cross a source tree boundary (a copy of a whole source tree, a copy into
+# one, removing one). Like tests/chat-tools it mints the human turn itself and
+# reads the turn commit back, because the subject is the worker, not `chat`.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh
