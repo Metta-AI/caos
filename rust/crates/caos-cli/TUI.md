@@ -111,11 +111,12 @@ caos tui --unarchive ID      restore one conversation to the active list
 
 `--username` defaults to `$USER`. If `$USER` is a shared container account such
 as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
-work. Active and archived membership is stored on the
-CAOS server under `refs/caos/v3/users/<user-key>/conversations/{active,archived}/`.
-User and conversation keys are lowercase hex of their UTF-8 IDs, without an
-extra prefix. Usernames are limited to 126 bytes and conversation IDs to 124.
-Only v3 refs populate this sidebar; earlier namespaces remain untouched.
+work. Active and archived membership is stored on the CAOS server in the ref
+writer key's personal namespace, under
+`refs/caos/w/<personal>/memberships/{active,archived}/<ns>/<hex id>`
+(design/ref-writers.md). Conversation IDs are limited to 124 bytes. `/invite
+<public key>` adds another writer to the selected conversation; they open it by
+its address, `<ns>/<id>`. The TUI needs `caos.ref-writer-key` set.
 
 ## Controls
 
