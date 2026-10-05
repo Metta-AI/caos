@@ -37,9 +37,12 @@ added to that repository, and only the resolved oid enters the cache key.
 
 Claude Code's built-in file and shell tools are denied, which removes them from
 the model's context entirely rather than merely refusing their calls. In their
-place the tool server offers **`llm-step`'s tools** — read, ls, grep, bash,
-write, edit, the history tools, the caos build/test tools, `merge`, and
-`tool_help`/`run_tool`, which reach whatever tools the workspace itself defines.
+place the tool server offers **`llm-step`'s tools** — read, ls, grep, write,
+edit, the history tools, `merge`, `import_source`, `publish_source`, and
+`tool_help`/`run_tool`. Shell is not among them by name: it is
+`run_tool(path="caos-std/bash-tool")`, reached by path like every std tool
+that carries its own help (`std/README.md`), and so are the caos build/test
+tools.
 
 The deny list is `Bash, Read, Edit, Write, Glob, Grep, NotebookEdit` — every
 built-in whose job a workspace tool does, so the model works in the RECORDED
