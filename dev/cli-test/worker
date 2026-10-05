@@ -102,6 +102,10 @@ git config user.email test@caos
 git config user.name caos
 git config gc.auto 0
 git remote add caos "$CAOS_SERVER_URL"
+# THE CLIENT'S WRITER (design/ref-writers.md): the stack refuses an unsigned
+# write to a governed ref, so every client test signs as a writer of its own.
+writer=$("$CAOS_CLI" ref-writer-key new 2>/dev/null) || fail "creating a ref writer key"
+git config caos.ref-writer-key "$writer"
 
 # The test's own tree at ./test and its dependencies at ./DEEP-DEPS — the two
 # places every test script has always looked. They have to be IN the repo, not
