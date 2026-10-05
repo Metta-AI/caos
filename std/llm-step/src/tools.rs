@@ -1975,7 +1975,7 @@ mod tests {
 
         // A move into itself would delete the only copy.
         let m = refused(move_entry(&call("main/dir", "main/dir/inner"), "ws"));
-        assert!(m.contains("into itself MUTATION"), "{m}");
+        assert!(m.contains("into itself"), "{m}");
         let m = refused(move_entry(&call("main/dir", "main/dir/a/b/c"), "ws"));
         assert!(m.contains("into itself"), "{m}");
 
