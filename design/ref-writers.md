@@ -7,8 +7,9 @@ write a ref.
 
 - Allow multiple writers to a ref
 - Allow removal of writers
-- Add or remove access to many related refs at once (e.g. a conversation's
-  head and its subagents' heads), rather than one change per ref
+- Add or remove access to many related refs at once, rather than one change per
+  ref. This matters because a single caos agent conversation can spin up many
+  other refs, like ones for its subagents
 - Allow any reader
 - caos jobs with write access can pass it on to the jobs/runs they create
 - Works with caos jobs spun up from a claude cloud session
