@@ -135,6 +135,9 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("namespace") => caos_cli::writers::cli_namespace(&transport()?, &args[2..]),
         Some("writers") => caos_cli::writers::cli_writers(&transport()?, &args[2..]),
         Some("ref-push") => caos_cli::writers::cli_ref_push(&transport()?, &args[2..]),
+        Some("conversation-ref") => {
+            caos_cli::writers::cli_conversation_ref(&transport()?, &args[2..])
+        }
         _ => Err(usage(args)),
     }
 }
@@ -208,8 +211,9 @@ fn usage(args: &[String]) -> String {
          {prog} secrets-push --dir=<d> [--server=<url>]\n  \
          {prog} ref-writer-key new|show\n  \
          {prog} namespace new [<label>]\n  \
-         {prog} writers list|add|remove <namespace> [<key> [<label>]]\n  \
-         {prog} ref-push <rev> <ref>"
+         {prog} writers list|add|remove <namespace|conversation> [<key> [<label>]]\n  \
+         {prog} ref-push <rev> <ref>\n  \
+         {prog} conversation-ref <id|namespace/id>"
     )
 }
 

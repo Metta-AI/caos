@@ -1,6 +1,6 @@
 # Ref writers
 
-**Status:** proposed; the stack on top of this change implements it.
+**Status:** implemented.
 
 Before this, any worker could push any ref. This is how caos decides who can
 write one.

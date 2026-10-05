@@ -58,15 +58,18 @@ func main() {
 			msg = "/cas/args/in"
 		}
 		stateRef, salt := readArg("state-ref"), readArg("test-salt")
+		// The actor's namespace (design/ref-writers.md): this job holds it,
+		// and each request and retry it makes asks for it in turn.
+		ns := readArg("writes")
 		nonce := fmt.Sprintf("%s-%d-%s", caos("hash", msg), attempt, salt)
 
 		inner := caos("curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/kv")
 		request := caos("prepare-request", "--base:@=/cas/args/actor", "--state-ref="+stateRef,
-			"--inner:hash="+inner, "--nonce="+nonce, "--message:@="+msg)
+			"--inner:hash="+inner, "--nonce="+nonce, "--message:@="+msg, "--writes="+ns)
 		callback := caos("curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/worker1",
 			"--actor:@=/cas/args/actor", "--kv:@=/cas/args/kv",
 			"--state-ref="+stateRef, "--test-salt:@=/cas/args/test-salt",
-			"--attempt="+strconv.Itoa(attempt), "--msg:@="+msg)
+			"--attempt="+strconv.Itoa(attempt), "--msg:@="+msg, "--writes="+ns)
 		caos("run-request-then", request, "--then:hash="+callback, "--catch")
 	})
 }

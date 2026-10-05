@@ -148,7 +148,7 @@ scripts* — everything else is read back out of it):
 B=https://raw.githubusercontent.com/Metta-AI/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
-  --secret-readers=<key>
+  --secret-readers=<key> --ref-writer-key=<private key>
 ```
 
 `go1.24.7` is on the box at `/usr/local/go/bin/go`, and a single stdlib-only file
@@ -187,6 +187,19 @@ machine with `caos-cli secrets-push`. The setup line names it:
   printed. It is a credential: whoever holds it can run with your secrets.
 
 A secret, or a grant, pushed later needs no change here.
+
+**Your ref writer key** — what this session writes its conversations as
+(design/ref-writers.md). The server refuses a conversation write that no writer
+of its namespace signed, so a session with none can record nothing:
+
+- `--ref-writer-key=<private key>` — what `caos-cli ref-writer-key new` printed
+  on a machine you control (it prints the public key on stderr; that one you can
+  share). A credential: whoever holds it writes as you. One key per person,
+  reused by every session.
+
+To let someone else continue one of your conversations, add their public key
+with `caos-cli writers add <conversation> <their public key>`; they open it by
+its address, `<namespace>/<id>`.
 
 **Network access**: the environment's normal egress is enough. GitHub (the
 client), `api.anthropic.com`, and iroh's relays are reachable from a SESSION;

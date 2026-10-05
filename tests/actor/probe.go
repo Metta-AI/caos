@@ -5,6 +5,9 @@
 //	               wrapper's leased push (which observed no head) loses the race
 //	--count-ref=C  push one new commit to C per execution, so the number of
 //	               commits on C is the number of times this inner actually ran
+//
+// Both refs live in the test's namespace, which the test hands this inner as
+// `writes=<ns>`; each push carries the run token that grants (design/ref-writers.md).
 package main
 
 import (
@@ -47,6 +50,12 @@ func git(stdin string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// push pushes with this inner's run token as the push option.
+func push(args ...string) {
+	token := strings.TrimSpace(string(w.Check(os.ReadFile("/secret/caos-write"))))
+	git("", append([]string{"push", "-q", "-o", "caos-auth=run:" + token}, args...)...)
+}
+
 func headOf(ref string) string {
 	out := git("", "ls-remote", "--refs", "caos", ref)
 	if out == "" {
@@ -74,7 +83,7 @@ func main() {
 			sub := git(fmt.Sprintf("100644 blob %s\tx\n", blob), "mktree")
 			root := git(fmt.Sprintf("040000 tree %s\tstate\n", sub), "mktree")
 			winner := git("", "commit-tree", root, "-m", "competing writer")
-			git("", "push", "-q", "--force-with-lease="+raceRef+":", "caos", winner+":"+raceRef)
+			push("--force-with-lease="+raceRef+":", "caos", winner+":"+raceRef)
 		}
 
 		if countRef != "" {
@@ -88,7 +97,7 @@ func main() {
 			} else {
 				run = git("", "commit-tree", empty, "-m", msg)
 			}
-			git("", "push", "-q", "--force-with-lease="+countRef+":"+prior, "caos", run+":"+countRef)
+			push("--force-with-lease="+countRef+":"+prior, "caos", run+":"+countRef)
 		}
 
 		// Then behave as kv: build the --kv program as a command inside the

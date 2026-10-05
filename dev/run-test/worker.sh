@@ -77,9 +77,13 @@ eval)
   # reserved base entry — the bash image — not this job's ArgTree, so currying
   # onto it carries none of what the fan-out bound alongside it. Anything a
   # later stage reads has to be re-bound by name.
+  # `writes` rides to the test itself (design/ref-writers.md): the launch
+  # stage hands it on, so it has to hold it.
+  writes=()
+  if [ -e /cas/args/writes ]; then writes=("--writes:@=/cas/args/writes"); fi
   next=$(caos curry --base:@=/cas/args/base --worker1:@=/cas/args/worker1 \
     --stage=launch --cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt \
-    "--start=$(date +%s)") || fail "currying the launch stage"
+    "${writes[@]}" "--start=$(date +%s)") || fail "currying the launch stage"
   caos eval-path-then /cas/args/in --eval=. --then:hash="$next" --catch
   ;;
 
@@ -126,6 +130,7 @@ launch)
   # properties of the RUN rather than of any tree.
   #
   bind=(--cli:@=/cas/args/cli --test-salt:@=/cas/args/test-salt)
+  if [ -e /cas/args/writes ]; then bind+=("--writes:@=/cas/args/writes"); fi
   req=$(caos curry --base:hash="$(caos hash /cas/args/result)" "${bind[@]}") \
     || fail "binding this run's arguments onto the test"
 

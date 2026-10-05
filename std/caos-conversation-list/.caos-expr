@@ -10,19 +10,22 @@
 HELP=<<END
 List the conversations recorded on this caos server — for example Claude Code sessions
 that `caos mcp hook` recorded — NEWEST FIRST, one per line: the UTC time of the last
-message, the conversation id, the hash of its current tip commit, its title, and who has
-it (`user:active` or `user:archived`). `limit=N` is therefore the N most recent. Pass a
-tip hash to `caos-conversation` to read one.
+message, the conversation's address (`<namespace>/<id>`), the hash of its current tip
+commit, its title, and who has it (the start of each writer's personal namespace, then
+`:active` or `:archived`). `limit=N` is therefore the N most recent. Pass a tip hash to
+`caos-conversation` to read one.
 
-Conversations live as git refs on the server: `refs/caos/v3/conversations/<hex id>/head`
-is the tip, and `refs/caos/v3/users/<hex user>/conversations/{active,archived}/<hex id>`
+Conversations live as git refs on the server, in ref-writer namespaces
+(design/ref-writers.md): `refs/caos/w/<namespace>/conversations/<hex id>/head` is the
+tip, and `refs/caos/w/<personal namespace>/memberships/{active,archived}/<namespace>/<hex id>`
 records who has it. This reads those refs; nothing is cloned. A Claude Code session's id
-is `cc/<session-id>`.
+is `cc/<session-id>`. The same id can live in more than one namespace, which is why a
+conversation is listed by its address.
 
 THE TIME is the committer time of the tip commit: refs carry none, so every tip is read
 to sort, which costs one fetch per conversation. A conversation whose tip cannot be read
 is listed last with the reason. Use `filter` (a substring of the id or title) to narrow it.
-@param [filter] Keep only conversations whose id or title contains this text (case-insensitive).
+@param [filter] Keep only conversations whose address or title contains this text (case-insensitive).
 @param [limit] Print at most this many conversations (default 50; 0 for all).
 @param [titles] Set to 0 to skip reading each tip's title, which costs one fetch per conversation (default 1).
 END

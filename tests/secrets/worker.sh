@@ -123,8 +123,11 @@ EOF
 
 commit "secrets fixtures"
 test_run_id="$(date +%s%N)-$$-$RANDOM"
-git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" \
-  || fail "pushing source_tree to caos"
+# The granted BRANCH is a governed ref (design/ref-writers.md): it lives in a
+# namespace this client founds, and moves only by a signed push.
+branch_ns=$("$CAOS_CLI" namespace new "secrets-test $test_run_id") || fail "founding a namespace"
+granted_branch="refs/caos/w/$branch_ns/secrets-test"
+"$CAOS_CLI" ref-push HEAD "$granted_branch" || fail "pushing source_tree to caos"
 
 # --- the store (outside the repo, never committed) ---------------------------
 # Readers grant by LOCATOR: this commit, and a path in it. The client ingests
@@ -145,7 +148,7 @@ EOF2
 cat > "$STORE/deploytok" <<EOF2
 value=DEPLOY-xyz-789
 entropy=aa11bb22cc33dd44ee55ff6677889900
-reader:@@=git+caos://this-server?ref=refs/heads/${test_run_id}-secrets-test&dir=mytool
+reader:@@=git+caos://this-server?ref=$granted_branch&dir=mytool
 reader:@@=$(at subtool)
 EOF2
 push || fail "secrets-push failed"
@@ -191,14 +194,14 @@ echo "== a changed tool outside the range grants nothing ==" >&2
 # covers.)
 echo '# changed after the grant' >> mytool/run.sh && commit "after the grant"
 later=$(git rev-parse HEAD)
-git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-later" || fail "pushing the later commit"
+git push -q caos "HEAD:refs/caos/req/$later" || fail "pushing the later commit"
 out=$("$CAOS_CLI" run later --base:@=mytool) || fail "run at the later commit failed: $out"
 [ "$(cat later/verdict)" = "deploytok-missing" ] \
   || fail "a changed tool off the granted branch was granted: $(cat later/verdict)"
 echo "  ok: a changed tool off the granted branch is not covered" >&2
 
 echo "== moving the granted branch moves the grant, with no new push ==" >&2
-git push -q caos "HEAD:refs/heads/${test_run_id}-secrets-test" || fail "moving the granted branch"
+"$CAOS_CLI" ref-push HEAD "$granted_branch" || fail "moving the granted branch"
 out=$("$CAOS_CLI" run moved --base:@=mytool) || fail "run on the moved branch failed: $out"
 [ "$(cat moved/verdict)" = "deploytok-ok" ] \
   || fail "the moved branch did not carry the grant: $(cat moved/verdict)"

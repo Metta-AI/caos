@@ -141,7 +141,8 @@ pre_spawn=$(git rev-parse "$spawn_commit^1")
 parent_main=$(source_tree_commit "$pre_spawn")
 assert_oid "$(jq -r '.spawn_intent.content' <<<"$child_record")" "child content seed"
 
-child_ref=$($TOOL ref --id "$child") || fail "forming child ref"
+# A child's head sits in its parent's namespace (design/ref-writers.md).
+child_ref=$($TOOL ref --id "$child" --namespace "$conv_namespace") || fail "forming child ref"
 child_ref=${child_ref#ref }
 child_tip_output=$($TOOL fetch --repo /tmp/repo --ref "$child_ref") \
   || fail "child has no canonical ref"
@@ -165,7 +166,7 @@ record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 
 child_key=$(printf '%s' "$child" | od -An -tx1 | tr -d ' \n')
 membership=$(git ls-remote --refs caos \
-  "refs/caos/v3/users/*/conversations/*/$child_key") \
+  "refs/caos/w/*/memberships/*/*/$child_key") \
   || fail "checking child membership refs"
 [ -z "$membership" ] || fail "child unexpectedly has a user membership ref"
 
