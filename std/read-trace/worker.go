@@ -236,6 +236,10 @@ func read() {
 		perfData(all)
 	}
 
+	if !wantJSON {
+		say("(raw JSON omitted; pass `json` to include it)")
+		return
+	}
 	var pretty []byte
 	var anyJSON any
 	if json.Unmarshal(body, &anyJSON) == nil {
