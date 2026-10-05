@@ -125,6 +125,14 @@ fn run(args: &[String]) -> Result<(), String> {
             [request, kvs @ ..] => caos::caos_run_request_then(&http()?, request, kvs),
             _ => Err(usage(args)),
         },
+        // `status [--all] <arg-tree>` — the server's trace view of an ArgTree
+        // (SPEC.md "Tracing") as JSON: the worker-side `caos-cli status`, which
+        // is how a tool reads a run's trace and perf data.
+        Some("status") => match &args[2..] {
+            [arg_tree] => caos::cli_status(&http()?, arg_tree, false),
+            [flag, arg_tree] if flag == "--all" => caos::cli_status(&http()?, arg_tree, true),
+            _ => Err(usage(args)),
+        },
         // `trace-child <name> <arg-tree>` — record under this job that it
         // started work on another stack, so `status` descends into it.
         Some("trace-child") => match (args.get(2), args.get(3), args.get(4)) {
