@@ -12,7 +12,7 @@ path prints its parameters, which is the description this table abbreviates.
 
 | tool | one line |
 |---|---|
-| `bash-tool` | Run `sh -c` from the conversation root; ordinary files and source trees are writable, the rest is not. |
+| `bash-tool` | Run `sh -c` over a scratch copy of the conversation tree; list in `paths` every existing file or directory the command touches, or it sees an empty placeholder ([Using `bash-tool`](#using-bash-tool)). |
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
@@ -25,6 +25,47 @@ path prints its parameters, which is the description this table abbreviates.
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says
 what each one does about that.
+
+### Using `bash-tool`
+
+`bash-tool` runs your command in a scratch directory built from the
+conversation tree. The tree is lazy: a file or directory shows up with its
+contents only if you name it in `paths`. Everything else is a placeholder link
+into `/cas`, which is why a model that has never seen this fails in
+different-looking ways:
+
+| you ran, without the path in `paths` | what you see |
+|---|---|
+| `cat`, `cp`, `rm` on it | `Permission denied`, plus a line saying which `paths` to retry with |
+| `cd` into it | `Not a directory`, and the rest of the command runs from the root |
+| `ls -l` | a link to `/cas/args/in/...` |
+| `grep -r`, `find`, `ls -R` | **nothing**, and exit 1 from grep: they do not follow links, so "no matches" is not an answer |
+
+All four mean the same thing: add the path to `paths` and run it again. A
+directory in `paths` brings everything under it, source trees included, so
+`"paths": ["imports/repo/base"]` is enough for a recursive search of it.
+
+```
+run_tool(path="caos-std/bash-tool",
+         arguments={"cmd": "grep -rn needle imports/repo/base",
+                    "paths": ["imports/repo/base"]})
+
+run_tool(path="caos-std/bash-tool",
+         arguments={"cmd": "mkdir -p feature && cp -a imports/repo/base feature/01-change",
+                    "paths": ["imports/repo/base"]})
+```
+
+- **New files and new directories need no `paths`.** `mkdir -p` the parent of
+  anything you create; `cp` and `mv` will not.
+- **`cp -a` and `mv` for source trees**, never a plain `cp`: they carry the
+  commit identity across.
+- **There is no commit step.** What the command writes is saved, and editing
+  files in a source tree creates its child commits.
+- **For one file, use `read`, `write` and `edit`.** They need no `paths`.
+- **Not in the shell:** `git` is not installed (use `log`, `show` and `diff`
+  on the source tree), and `caos-std/` is not in the conversation tree at all,
+  because it exists only in the evaluated tree (`eval_path`, then `read` or `ls`
+  with `root`). The harness's own shell is switched off.
 
 ## Images and workers
 
