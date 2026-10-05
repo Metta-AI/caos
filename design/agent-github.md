@@ -1,7 +1,8 @@
 # Importing and PRs
 
 Imports use three layers: the server endpoint, `caos import-git`, and the
-agent's `import_source` tool. PR publication and merge drafts come later.
+agent's `import_source` tool. PRs use `publish_source` and the agent's `github`
+tool. Merge drafts come later.
 
 ## Importing
 
@@ -60,26 +61,107 @@ Public imports need no token. Importing needs neither `gh` nor another worker.
 
 ## PRs
 
-Add `std/github` with Git, `gh`, and a pinned
-[`gh-stack` extension](https://github.com/github/gh-stack). Give it access to
-the same `github-token` secret, exposed to `gh` as `GH_TOKEN`.
+A PR reaches GitHub in two halves, and neither checks anything out:
 
-Expose a general `gh` operation accepting arguments, repository, stdin, and
-input/output files. Return exit status, stdout, stderr, and requested files.
-Use a small `git_push` helper to publish a selected source commit and its history,
-requiring the remote branch to match an expected head. The server can later
-perform this transfer directly, as it does imports.
+- **Commits** go with `publish_source` ([agent-publish.md](agent-publish.md)):
+  the server pushes the exact commit from its bare store.
+- **Everything else** is metadata: opening a PR, retargeting its base, linking
+  a stack, commenting. It names branches, PR numbers and text, never file
+  content, so it needs no repository on either side. The agent's `github` tool
+  sends it to the GitHub API.
 
-Create PRs with explicit repository, head, and base. Inspect existing PRs before
-creating duplicates or replacing human-edited metadata. Conversation data and
-merge bookkeeping stay outside published history. Once agent publication works,
-remove `/pr`, `/publish-branch`, and their UI.
+### The `github` tool
 
-### Stacks
+`github(method, path, body?)` runs inline in `std/llm-step`, as
+`import_source` and `publish_source` do.
 
-See [stacks.md](stacks.md).
+| Parameter | Meaning |
+| --- | --- |
+| `method` | `GET`, `POST`, `PATCH`, `PUT` or `DELETE`. |
+| `path` | Path under `https://api.github.com`, with any query string, e.g. `/repos/owner/repo/pulls?head=owner:feature&state=open`. GraphQL is `POST /graphql`. |
+| `body` | Optional JSON request body. |
 
-### Merges
+It returns the HTTP status and the response body, truncated if long; a status
+outside 2xx is an error result. Requests carry the `github-token` secret that
+llm-step is already granted for imports, as `Authorization: Bearer`. Without
+it, only public reads work. The host is fixed: the tool reaches
+`api.github.com` and nothing else, and follows no redirects, so the token never
+goes to another host.
+
+Paths are not restricted, so the token's scope is the boundary: with this tool
+the agent can do anything the token allows, not only import and push. Grant a
+fine-grained token limited to the repositories the agent works on, with the
+permissions it needs (contents and pull requests).
+
+It runs inline rather than as a `std/github` worker running `gh`:
+
+- A worker's result is memoized by its ArgTree. A GitHub call depends on remote
+  state and may write, so its record belongs in the conversation, under the
+  tool call, where `publish_source` keeps its own.
+- The secret's `reader:` names `std/llm-step`. A separate worker would need its
+  own grant in every user's secret file.
+- `gh` adds nothing the API lacks. With PR numbers, `gh stack link` is the
+  stacks endpoint below (gh-stack's `internal/github/github.go`). The other
+  [gh-stack](https://github.com/github/gh-stack) commands (`push`, `submit`,
+  `rebase`) need local branches and stack metadata, which would mean rebuilding
+  a repository from gitlinks and bringing rewritten commits back into caos;
+  `modify` also needs linear history, which a stack with merge commits lacks.
+  `create-squashed-stack` and `publish_source` do that job without either.
+
+### Writes
+
+A `GET` is a read: it runs, and a retry runs it again. Every other method is a
+write, including a GraphQL query, which is a POST.
+
+Before sending a write, the tool pins it in a `tool.start` whose payload is the
+exact request. Only the attempt that appended that pin sends the request. An
+attempt that finds the call already started and unfinished never sends it
+again; this covers a step resumed after a crash and any other writer. It
+completes the call as uncertain, and the agent inspects GitHub before doing
+anything else. A response of any status is a definite outcome. A transport
+failure is uncertain, since the request may have arrived.
+
+### PRs for a stack
+
+Once a stack is squashed and its layers pushed ([stacks.md](stacks.md),
+"Publishing"), each layer gets a PR, bottom first:
+
+1. Find the layer's open PR:
+   `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
+2. If there is none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base`, and
+   a `title` and `body` taken from the layer's `message=` lines in the plan. The
+   first layer's base is the trunk; each later layer's base is the branch below
+   it. If there is one, `PATCH /repos/{owner}/{repo}/pulls/{number}` with
+   `base` when it differs, and leave its title and body alone: a person may have
+   edited them.
+3. Link them: `POST /repos/{owner}/{repo}/stacks` with
+   `{"pull_requests": [<numbers, bottom first>]}`, or
+   `POST /repos/{owner}/{repo}/stacks/{number}/add` to extend an existing
+   stack. Without stacks, the chained bases alone still make a reviewable stack.
+
+Republishing an unchanged stack mints the same commits, so the pushes change
+nothing, each PR is found by its branch, and only a changed base is patched.
+
+### Publication checks
+
+`publish_source` refuses a commit whose tree has a `.caos` entry, such as an
+uncleared `.caos/conflicts` ledger, by looking up the pinned commit's tree.
+`/pr` checked this before pushing, and a squash carries a ledger into its
+commit, so a squashed layer needs the check too.
+
+### Removing `/pr`
+
+With the tool in place, `/pr`, `/publish-branch` and the client code behind
+them go: the host's `git push` and `gh pr create`, the base and history fetched
+into the client, the merge-marker `git grep`, and the preview's offer to import
+the base and ask the agent to integrate it, which `import_source` and `merge`
+already cover (stacks.md, "Updating the base"). Publishing then needs neither
+`gh` nor a local copy of the history on the client.
+
+One behavior changes: no person confirms a GitHub write. The agent makes it,
+as it already makes pushes with `publish_source`.
+
+## Merges
 
 Clean merges use the existing merge worker. On conflict, preserve the source O
 and keep the attempt beside it in the conversation:
@@ -111,10 +193,5 @@ whole attempt with `cp -a`, harvesting the edited draft, and then finishing.
 Abandoning an attempt leaves the source unchanged. Handle old source-tree
 conflict ledgers before removing their compatibility cleanup.
 
-### Retrying GitHub writes
-
-Use the tool call's durable identity to claim an operation before executing it
-and record its result afterwards. A duplicate attempt must not repeat a started
-write. After a crash or partial success, inspect GitHub before continuing;
-do not automatically retry arbitrary writes. Merge computation remains cached
-by its inputs; draft edits and completion use conditional conversation updates.
+Merge computation remains cached by its inputs; draft edits and completion use
+conditional conversation updates.
