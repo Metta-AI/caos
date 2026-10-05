@@ -342,7 +342,7 @@ agent's execution context.
 
 The agent publishes; the client has no publish command. The agent pushes a
 source tree's commit with `publish_source`, which the server sends from its own
-store, and opens or updates the PR with its `github` tool. Neither checks
+store, and opens or updates the PR with `caos-std/github`. Neither checks
 anything out, on the client or anywhere else. A stack is squashed first, one
 commit per layer ([stacks.md](stacks.md), "Publishing"). See
 [agent-github.md](agent-github.md#prs) for both tools.

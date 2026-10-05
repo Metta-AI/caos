@@ -209,7 +209,7 @@ portable repository details live in `<path>.source.json` when available. The
 agent preserves imports and organizes feature work with ordinary file operations.
 
 There is no publish command. Ask the agent for a PR: it pushes the branch with
-`publish_source` and opens or updates the PR with its `github` tool
+`publish_source` and opens or updates the PR with `caos-std/github`
 (design/agent-github.md, "PRs"). Ctrl+P and Ctrl+L have no bindings.
 
 Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
@@ -308,9 +308,9 @@ internal harness.
 
 Resolve a nonempty `.caos/conflicts` ledger by fixing each path and clearing
 its entries. Saving an edited source tree removes an empty ledger and prunes
-its empty `.caos` directory. Any remaining `.caos` entry blocks publication.
-Credentials remain in the local secret store; the launcher reuses an existing
-checkout store or its own persistent store under the data directory.
+its empty `.caos` directory. Credentials remain in the local secret store; the
+launcher reuses an existing checkout store or its own persistent store under
+the data directory.
 
 
 Over SSH, clipboard copying uses a terminal escape sequence. “Copy requested”

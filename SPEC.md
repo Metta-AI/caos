@@ -957,21 +957,22 @@ revision (and made the history tools' hashes readable the same way).
 - Correctness of a resolution is checked by BUILD/TEST at the end of the
   resolution turn (a leftover marker does not compile) — not by a marker
   re-scan, which cannot tell a real marker from a bad resolution.
-- The one place to refuse or loudly warn on a non-empty `.caos/conflicts` or a
-  remaining marker is PUBLISH (`publish_source`, which refuses a commit with
-  any `.caos` entry) — the moment work actually leaves the conversation.
+- Nothing refuses a non-empty `.caos/conflicts` at publish. Resolving a
+  conflict clears its entry and saving removes the emptied ledger, so a ledger
+  in a published commit is a conflict left unresolved: the same mistake as
+  publishing code that does not build (design/agent-github.md, "Removing
+  `/pr`").
 
 ## Publication
 
 The agent publishes (design/agent-github.md, "PRs"); the client has no publish
 command. `publish_source` pushes one named gitlink's exact commit to an explicit
-repository and branch, sent by the server from its own store, and the `github`
-tool opens or updates the PR. A stack is squashed to one commit per layer and
-published bottom to top, each layer's PR based on the branch below
-([Stacks](design/stacks.md)). No snapshot has a special working or sealed
-state.
+repository and branch, sent by the server from its own store, and
+`caos-std/github` opens or updates the PR. A stack is squashed to one commit
+per layer and published bottom to top, each layer's PR based on the branch
+below ([Stacks](design/stacks.md)). No snapshot has a special working or
+sealed state.
 
-`publish_source` refuses a commit whose tree has a `.caos` entry. Published
-without squashing, per-mutation commits remain in the branch's history: only the
-published tip is checked for unresolved conflicts and reserved state, and
-intermediate commits may contain conflict markers or fail to build.
+Published without squashing, per-mutation commits remain in the branch's
+history, and intermediate commits may contain conflict markers or fail to
+build.
