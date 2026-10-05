@@ -1,0 +1,5 @@
+HELP=<<END
+Throwaway: time fetching and walking an rgrep result the way llm-step's grep_result_block does.
+@param req The rgrep request (ArgTree) hash.
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
