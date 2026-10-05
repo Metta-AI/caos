@@ -71,14 +71,15 @@ stack commands work on local branches.
 ### `std/github`
 
 One run, `run_tool(path="caos-std/github")`, is one API call: `method`, `path`
-under `https://api.github.com`, an optional JSON `body`, and `at`. The result is
+under `https://api.github.com`, and an optional JSON `body`. The result is
 the status line and the body. A run fails only when no response came back, and
 a write may still have arrived; read the state with a GET before resending.
 
-`at` is any value no earlier call used, such as the time. Runs are memoized by
-their arguments (`salt` is the interpreter's), so repeating a call returns its
-stored result, and only a run that died mid-flight sends a write twice. GitHub
-refuses a duplicate PR, and a repeated base change is a no-op.
+Runs are memoized by their arguments, and the tool declares `@call`, so the
+harness adds the tool call's id to them (SPEC, "CaosTools"). Each call is then
+its own run, while a recovered call keeps its id and gets its stored result, so
+only a run that died mid-flight sends a write twice. GitHub refuses a duplicate
+PR, and a repeated base change is a no-op.
 
 The token is the same `github-token` secret imports use, not a new one; its
 second `reader:` line, under Importing, grants it to `std/github`. The tool

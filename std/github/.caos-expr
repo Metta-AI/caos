@@ -1,7 +1,8 @@
 # The `github` tool (design/agent-github.md, "PRs"): the std/go worker image with
 # this directory's program curried onto it, plus the `help` it is described by.
-# A reader with no `@in`: its ArgTree is its arguments and nothing else, which
-# is why `at` is required.
+# A reader with no `@in`: its ArgTree is its arguments and nothing else, so
+# `@call` adds the tool call's id to make each call its own run. A caller
+# outside llm-step passes `--call=<any unused value>` itself.
 HELP=<<END
 Call the GitHub API at api.github.com, with the granted github-token: everything
 about a PR except its commits, which publish_source pushes. Find a branch's open
@@ -12,12 +13,9 @@ response of any status is a result; the run fails only when none came back,
 and then a write may still have arrived: read the affected state with a GET
 before sending it again.
 
-A result is kept by its arguments: a call that repeats every argument, at
-included, gets the earlier result without reaching GitHub. Give each new call
-a new at.
 @param method GET, POST, PATCH, PUT or DELETE.
 @param path API path with any query string, such as /repos/owner/repo/pulls?head=owner:branch&state=open. GraphQL is POST /graphql.
 @param [body] JSON request body, such as {"title":"Add the parser","head":"parser","base":"main","body":"Why."}.
-@param at Any value no earlier call used, such as the current time.
+@call
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
