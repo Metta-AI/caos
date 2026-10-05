@@ -5,9 +5,9 @@ checking out source files.
 
 | Layer | Interface |
 | --- | --- |
-| Server | `POST /git/push {destination, commit, branch, expected}` |
-| Worker command | `caos push-git <https-url> <commit> <branch> --expected=<oid\|absent>` |
-| Agent tool | `publish_source(source_tree, repository, branch)` |
+| Server | `POST /git/push {destination, commit, branch, expected, force?}` |
+| Worker command | `caos push-git <https-url> <commit> <branch> --expected=<oid\|absent> [--force]` |
+| Agent tool | `publish_source(source_tree, repository, branch, force?)` |
 
 The request fields are:
 
@@ -17,6 +17,7 @@ The request fields are:
 | `commit` | Full hash H of the code commit to publish, already stored in CAOS. |
 | `branch` | Destination branch in that remote, e.g. `feature/parser`, without `refs/heads/`. |
 | `expected` | Full hash E expected at that same remote branch, or JSON `null` if it must not exist. Required; the CLI spells `null` as `absent`. |
+| `force` | Optional, default `false`. `true` permits a non-fast-forward update; see step 2. |
 
 `refs/heads/feature/parser` is Git's full name for the branch `feature/parser`.
 Ordinary branch pushes can infer this prefix from a local branch. Since CAOS
@@ -34,14 +35,18 @@ The endpoint performs one push:
 
 1. Validate the HTTPS destination, branch and full hashes; require H to be a
    stored commit. Trust the complete history verified at ingestion and startup.
-2. If E is non-null, require E to be a stored ancestor of H. If H contains E,
-   CAOS already has E. A missing E or non-fast-forward is a rejection.
+2. If E is non-null, require E to be stored, and unless `force` is set, an
+   ancestor of H. If H contains E, CAOS already has E. A missing E or a
+   non-fast-forward without `force` is a rejection.
    Reject H if its tree contains paths matched by its own .gitignore rules.
 3. Push H to the destination branch with
    --force-with-lease=refs/heads/<branch>:<E>, disabling tag following.
-   Empty E requires creation. The ancestry check prevents history rewrites;
-   despite the Git flag's name, this API permits only creates and fast-forwards.
-   There is no force-push option. Duplicate requests to the same branch are serialized.
+   Empty E requires creation. Without `force`, the ancestry check prevents
+   history rewrites, so only creates and fast-forwards succeed. With it, the
+   lease alone guards the update: the branch moves only from exactly E, so a
+   forced update can replace history the caller has seen and never a concurrent
+   change. Every other check still applies. Duplicate requests to the same
+   branch are serialized.
 4. Return complete, conflict, or uncertain, with a reason. Known validation and
    per-ref receiver rejections are definite failures. Unconfirmed transport
    failures are uncertain. The CLI preserves these results for llm-step.
