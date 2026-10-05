@@ -60,7 +60,8 @@ jq -s -e '
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "tool records are wrong"; }
 [ ! -f /tmp/stub/request-3.json ] || fail "direct tools cost extra model rounds"
 
-# observation ID -> required error text ("" = only that it is an error)
+# Ids are the call ids without their tu_ prefix. expect_error takes the text the
+# error must contain ("" = only that it is an error); expect_ok the result text.
 observe() {
   $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
     --round 0 --id "tu_$1" > "/tmp/obs-$1.json"
