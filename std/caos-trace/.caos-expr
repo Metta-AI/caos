@@ -1,5 +1,5 @@
-# The `caos-trace` tool (SPEC, "Tracing"): the std/bash worker image with this
-# directory's script curried onto it, plus the `help` an agent registers it by.
+# The `caos-trace` tool (SPEC, "Tracing"): the std/go worker image with this
+# directory's program curried onto it, plus the `help` an agent registers it by.
 # Like `caos-test-result` it reads by hash and touches no source tree.
 #
 # The docs are a HERE-STRING, so editing them re-keys this tool and nothing it
