@@ -1921,7 +1921,7 @@ mod tests {
     fn read_and_ls_are_inline_and_declared() {
         // Routed in-process (no sub-run). A repository tool cannot shadow them:
         // it is named by path, never by name.
-        for t in ["read", "ls", "import_source"] {
+        for t in ["read", "ls", "copy", "move", "remove", "import_source"] {
             assert!(is_inline(t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
