@@ -61,101 +61,52 @@ Public imports need no token. Importing needs neither `gh` nor another worker.
 
 ## PRs
 
-A PR reaches GitHub in two halves, and neither checks anything out:
-
-- **Commits** go with `publish_source` ([agent-publish.md](agent-publish.md)):
-  the server pushes the exact commit from its bare store.
-- **Everything else** is metadata: opening a PR, retargeting its base, linking
-  a stack, commenting. It names branches, PR numbers and text, never file
-  content, so it needs no repository on either side. `std/github` sends it to
-  the GitHub API.
+A PR is a pushed branch plus metadata. `publish_source` pushes the commit from
+the server's store ([agent-publish.md](agent-publish.md)); the std tool
+`std/github` sends everything else (opening a PR, changing its base, linking a
+stack) to the GitHub API. Neither checks anything out, which `gh` would: its
+stack commands work on local branches.
 
 ### `std/github`
 
-A std tool like any other: the agent runs it with
-`run_tool(path="caos-std/github", arguments={...})`, and `tool_help` at that
-path describes it. One run is one API call.
+One run, `run_tool(path="caos-std/github")`, is one API call: `method`, `path`
+under `https://api.github.com`, an optional JSON `body`, and `at`. The result is
+the status line and the body. A run fails only when no response came back, and
+a write may still have arrived; read the state with a GET before resending.
 
-| Argument | Meaning |
-| --- | --- |
-| `method` | `GET`, `POST`, `PATCH`, `PUT` or `DELETE`. |
-| `path` | Path under `https://api.github.com`, with any query string, e.g. `/repos/owner/repo/pulls?head=owner:feature&state=open`. GraphQL is `POST /graphql`. |
-| `body` | Optional JSON request body. |
-| `at` | Any value no earlier call used, such as the current time. |
+`at` is any value no earlier call used, such as the time. Runs are memoized by
+their arguments (`salt` is the interpreter's), so repeating a call returns its
+stored result, and only a run that died mid-flight sends a write twice. GitHub
+refuses a duplicate PR, and a repeated base change is a no-op.
 
-The result is the HTTP status line, then the response body, cut if long. A
-response of any status is a result; the run fails only when none came back.
-The worker reaches `api.github.com` and nothing else, and follows no redirects,
-so the token goes nowhere else.
-
-The token is the `github-token` secret, granted to the tool by a second
-`reader:` line beside llm-step's:
-
-```text
-reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/github
-```
-
-Without it, only public reads work. Paths are not restricted, so the token's
-scope is the boundary: with this tool the agent can do anything the token
-allows, not only import and push. Grant a fine-grained token limited to the
-repositories the agent works on, with contents and pull-request permissions.
-
-It calls the API rather than `gh`, whose stack commands work on local branches
-and would mean materializing a repository for every call. `gh stack link` with
-PR numbers is the stacks endpoint below.
-
-### `at`
-
-A run's result is memoized by its ArgTree, while an API call's answer depends on
-GitHub's state, so each call needs an argument of its own: `at` (`salt` is the
-interpreter's). A call that repeats every argument, `at` included, gets the
-stored result without reaching GitHub; a new `at` asks again.
-
-So a write is not sent twice once its run has a result. A run that dies after
-sending and before storing its result runs again when retried, so a write is
-sent at least once, and possibly twice. GitHub refuses a second open PR with
-the same head and base, and repeating a base change sets the same base. When a
-write's run fails, the request may still have arrived: read the affected state
-with a GET before sending it again.
+The token is the `github-token` secret, granted by a second `reader:` line
+naming `std/github`. The tool reaches only `api.github.com` and follows no
+redirects, but paths are unrestricted: the token's scope is the boundary, so
+grant a fine-grained token for the repositories the agent works on.
 
 ### PRs for a stack
 
-Once a stack is squashed and its layers pushed ([stacks.md](stacks.md),
-"Publishing"), each layer gets a PR, bottom first, each call with a new `at`:
+After squashing and pushing the stack ([stacks.md](stacks.md), "Publishing"),
+for each layer, bottom first:
 
-1. Find the layer's open PR:
-   `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
-2. If there is none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base`, and
-   a `title` and `body` taken from the layer's `message=` lines in the plan. The
-   first layer's base is the trunk; each later layer's base is the branch below
-   it. If there is one, `PATCH /repos/{owner}/{repo}/pulls/{number}` with
-   `base` when it differs, and leave its title and body alone: a person may have
-   edited them.
-3. Link them: `POST /repos/{owner}/{repo}/stacks` with
-   `{"pull_requests": [<numbers, bottom first>]}`, or
-   `POST /repos/{owner}/{repo}/stacks/{number}/add` to extend an existing
-   stack. Without stacks, the chained bases alone still make a reviewable stack.
+1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
+2. If none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base` (the trunk,
+   or the branch below) and a `title` and `body` from the layer's `message=`
+   lines. If one, `PATCH` its `base` when it differs, and leave its title and
+   body, which a person may have edited.
 
-Republishing an unchanged stack mints the same commits, so the pushes change
-nothing, each PR is found by its branch, and only a changed base is patched.
+Then link them with `POST /repos/{owner}/{repo}/stacks` and
+`{"pull_requests": [<numbers, bottom first>]}`, or `.../stacks/{number}/add` to
+extend a stack. The chained bases already make a reviewable stack without it.
 
 ### Removing `/pr`
 
-With `std/github` in place, `/pr`, `/publish-branch` and the client code behind
-them go: the host's `git push` and `gh pr create`, the base and history fetched
-into the client, its conflict checks, and the preview's offer to import the base
-and ask the agent to integrate it, which `import_source` and `merge` already
-cover (stacks.md, "Updating the base"). Publishing then needs neither `gh` nor
-a local copy of the history on the client.
-
-Nothing replaces the conflict checks. Resolving a conflict clears its
-`.caos/conflicts` entry, and saving removes the emptied ledger, so a ledger
-survives only while a conflict is unresolved. Publishing then is the same
-mistake as publishing code that does not build, and nothing at publish time
-looks for either.
-
-One behavior changes: no person confirms a GitHub write. The agent makes it,
-as it already makes pushes with `publish_source`.
+`/pr`, `/publish-branch` and the client code behind them go: the host's
+`git push` and `gh pr create`, the fetched base and history, the preview, and
+its conflict checks. Nothing replaces the checks: resolving a conflict clears
+its ledger entry and saving removes the emptied ledger, so a ledger left in a
+published commit is an unresolved conflict, like code that does not build. No
+person confirms a GitHub write; the agent makes it, as it already pushes.
 
 ## Merges
 
