@@ -32,16 +32,16 @@ what each one does about that.
 conversation tree. The tree is lazy: a file or directory shows up with its
 contents only if you name it in `paths`. Everything else is a placeholder link
 into `/cas`, which is why a model that has never seen this fails in
-different-looking ways:
+different-looking ways (all of this is measured, with nothing in `paths`):
 
-| you ran, without the path in `paths` | what you see |
+| you ran | what you see |
 |---|---|
-| `cat`, `cp`, `rm` on it | `Permission denied`, plus a line saying which `paths` to retry with |
+| `cat`, `cp`, `rm`, `ls`, `grep -r`, `find` on the placeholder's path | `Permission denied`, plus a line saying which `paths` to retry with |
 | `cd` into it | `Not a directory`, and the rest of the command runs from the root |
-| `ls -l` | a link to `/cas/args/in/...` |
-| `grep -r`, `find`, `ls -R` | **nothing**, and exit 1 from grep: they do not follow links, so "no matches" is not an answer |
+| `grep -r .`, `find .`, `ls -R` from the root, or after that failed `cd` | **nothing**, and exit 1 from grep: they do not follow the links, so "no matches" is not an answer |
+| `ls -l` on its parent | a link to `/cas/args/in/...` |
 
-All four mean the same thing: add the path to `paths` and run it again. A
+All of them mean the same thing: add the path to `paths` and run it again. A
 directory in `paths` brings everything under it, source trees included, so
 `"paths": ["imports/repo/base"]` is enough for a recursive search of it.
 
