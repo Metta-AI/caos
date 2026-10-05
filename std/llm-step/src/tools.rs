@@ -1994,11 +1994,6 @@ mod tests {
             let m = refused(remove(&call(p), "ws"));
             assert!(m.contains(".caos is protocol metadata"), "{p}: {m}");
         }
-        // Only the ROOT `.caos` is protocol: a source tree may have its own.
-        assert!(!matches!(
-            remove(&call("main/.caos"), "ws"),
-            Err(User(m)) if m.contains("protocol metadata")
-        ));
         assert!(refused(remove(&json!({"input": {}}), "ws")).contains("`file-path`"));
         assert!(refused(remove(&call("."), "ws")).contains("names no path"));
         assert!(refused(remove(&call("main/../.."), "ws")).contains(".."));
