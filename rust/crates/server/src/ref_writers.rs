@@ -350,10 +350,11 @@ fn check(
             }
             return deny("a content-named ref must point at the object it names");
         }
-        // Conversations still live outside namespaces, so a ref outside one
-        // is let through until they move in (design/ref-writers.md).
         let Some((namespace, rest)) = split_ref(refname) else {
-            continue;
+            return deny(
+                "not a ref this server lets anyone push; governed refs live under \
+                 refs/caos/w/<namespace>/ (design/ref-writers.md)",
+            );
         };
         let pusher = pusher_of().map_err(|e| format!("{refname}: {e}"))?;
         if rest == WRITERS_REF {
@@ -647,7 +648,7 @@ mod tests {
         let dev = RefCommand::new("refs/caos/dev", None, Some(&oid('b')));
         assert!(check(&Fake::default(), &[dev], &[], &none).is_ok());
         let other = RefCommand::new("refs/heads/main", None, Some(&oid('b')));
-        assert!(check(&Fake::default(), &[other], &[], &none).is_ok());
+        assert!(check(&Fake::default(), &[other], &[], &none).is_err());
     }
 
     #[test]

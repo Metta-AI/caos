@@ -216,8 +216,7 @@ git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
 session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
   | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
-key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
-head=$(git rev-parse "refs/caos/v3/conversations/$key/head")
+head=$(git rev-parse "$("$CAOS_CLI" conversation-ref "cc/$session")")
 # Discover the repository mount, so this test does not prescribe startup's
 # source-tree prefix (or require a prefix if startup mounts content directly).
 prefix=$(git ls-tree -r "$head" | awk '$1 == "160000" && !found {print $4; found=1}')
@@ -285,7 +284,7 @@ hook() { # <event JSON>
   printf '%s\n' "$1" | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
-held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
+held_ref=$("$CAOS_CLI" conversation-ref "cc/$held")
 send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg nonce "$held" \
   '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run_tool",arguments:{
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,

@@ -292,6 +292,9 @@ func main() {
 		// -------------------------------------------------------------------
 		repo := fixtureRepo("/tmp/repo")
 		readers := strings.Repeat("ab", 32)
+		// The session writes its conversation as this key: the stack refuses
+		// an unsigned write (design/ref-writers.md).
+		writerKey := strings.Repeat("cd", 32)
 		devTree := fixtureDevTree("/tmp/dev-tree", assets)
 		head := git(repo, "rev-parse", "HEAD")
 		bootstrap := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
@@ -299,6 +302,7 @@ func main() {
 			"--server="+ticket,
 			"--dev-commit="+devRev,
 			"--secret-readers="+readers,
+			"--ref-writer-key="+writerKey,
 			"--dev-tree="+devTree,
 			"--prefix=/tmp/prefix1",
 			"--share-dir=/tmp/share",
@@ -313,6 +317,8 @@ func main() {
 			git(repo, "status", "--porcelain"))
 		w.True(git(repo, "config", "--get", "caos.secret-readers") == readers,
 			"--secret-readers is not in the checkout's git config, where the client reads it")
+		w.True(git(repo, "config", "--get", "caos.ref-writer-key") == writerKey,
+			"--ref-writer-key is not in the checkout's git config, where the client reads it")
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])

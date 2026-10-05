@@ -799,7 +799,9 @@ func conv(o opts) error {
 			"  A session that has not run a turn has no conversation.", id)
 	}
 	name := "cc/" + internal
-	ref := "refs/caos/v3/conversations/" + fmt.Sprintf("%x", name) + "/head"
+	// A conversation lives in its writer's namespace (design/ref-writers.md),
+	// which this does not know, so it matches every namespace.
+	pattern := "refs/caos/w/*/conversations/" + fmt.Sprintf("%x", name) + "/head"
 	server := os.Getenv("CAOS_SERVER_URL")
 	if server == "" {
 		server = "http://localhost:9090"
@@ -807,9 +809,11 @@ func conv(o opts) error {
 	fmt.Println("session:      " + id)
 	fmt.Println("internal id:  " + internal)
 	fmt.Println("conversation: " + name)
-	fmt.Println("ref:          " + ref)
-	ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
+	ls, _ := exec.Command("git", "ls-remote", server, pattern).Output()
 	head := strings.Fields(string(ls))
+	if len(head) >= 2 {
+		fmt.Println("ref:          " + head[1])
+	}
 	if len(head) == 0 {
 		fmt.Println("head:         (not on " + server + " — wrong server, or no turn yet)")
 		return errors.New("conversation head not found on " + server)
@@ -1071,9 +1075,9 @@ later push from that checkout dies for an unrelated-looking reason.
 
 Every conversation, with the names decoded:
 
-  git ls-remote %s 'refs/caos/v3/conversations/*' |
+  git ls-remote %s 'refs/caos/w/*/conversations/*/head' |
     while read -r sha ref; do
-      hex=$(echo "$ref" | cut -d/ -f5)
+      hex=$(echo "$ref" | cut -d/ -f6)
       echo "$sha $(echo "$hex" | fold -w2 | while read -r b; do printf "\x$b"; done)"
     done
 `
