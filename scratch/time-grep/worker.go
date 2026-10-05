@@ -100,6 +100,22 @@ func main() {
 		say("walk (render, sequential `caos get` per dir/file): %v", time.Since(t2))
 		say("  caos get calls: %d, dirs: %d, matching files: %d, match bytes read: %d, files not rendered (over %d): %d",
 			gets, dirs, files, matchBytes, max, overflow)
+		// The alternative: one recursive get, then plain filesystem reads.
+		_ = exec.Command("caos", "get-hash", hash, "/cas/res2").Run()
+		t3 := time.Now()
+		err = exec.Command("caos", "get", "-r", "/cas/res2").Run()
+		say("one `caos get -r` of the whole result: %v (err=%v)", time.Since(t3), err)
+		t4 := time.Now()
+		n, bytes := 0, 0
+		_ = filepath.Walk("/cas/res2", func(p string, fi os.FileInfo, e error) error {
+			if e == nil && !fi.IsDir() {
+				b, _ := os.ReadFile(p)
+				n++
+				bytes += len(b)
+			}
+			return nil
+		})
+		say("then reading %d files (%d bytes) from disk: %v", n, bytes, time.Since(t4))
 		w.Report(out.String())
 	})
 }
