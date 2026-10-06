@@ -8,7 +8,8 @@
 // push, which loses the reply, so the client sends the same message again and
 // it is applied a second time, after whatever else landed in between -- and
 // runs an invariant in each reachable state. It is breadth-first, so a
-// violation it reports is a shortest one.
+// violation it reports is a shortest one. When every state has been judged it
+// also asks whether every client can still finish from every state.
 //
 // Args:
 //
@@ -20,11 +21,16 @@
 //	invariant   optional: an image run on every reachable state, with that state
 //	            at /cas/args/in = {state, terminal, clients/<name>/{acked,
 //	            pending, lost}}. It returns a blob: `ok`, or what is wrong
-//	lost        optional: how many replies to ONE message may be lost (default 1)
+//	lost        optional: how many replies to ONE message may be lost (default 1).
+//	            Only an application that changes the state can lose one: std/actor
+//	            pushes nothing for the others, so their lost reply is the same as
+//	            the request not having run yet
 //	max-states  optional: give up past this many states (default 20000)
 //
 // The result is a tree {report, verdict, stats.json[, trace.json]}. verdict is
-// `ok`, `violation`, `stuck` (a client can never proceed) or `incomplete`.
+// `ok`, `violation`, `stuck` (a state from which the clients can no longer all
+// finish) or `incomplete`. A reply must be one line of text: it is what the
+// client acts on, and the invariant reads it.
 //
 // TRANSITIONS ARE NOT RUN HERE. Each one is the inner request std/actor would
 // form (step.sh), dispatched through map-then, so it is cached like any job:
@@ -106,7 +112,11 @@ type search struct {
 	Pending   []string        `json:"pending"`
 	Judged    int             `json:"judged"`
 	Edges     int             `json:"edges"`
-	index     map[string]int
+	// Bounded is set when --lost suppressed an outcome somewhere. If it never
+	// did, a larger bound adds no transition, and the verdict holds for any
+	// number of lost replies.
+	Bounded bool `json:"bounded"`
+	index   map[string]int
 }
 
 func run(name string, args ...string) string {
@@ -242,6 +252,9 @@ func start() {
 		MaxStates: intArg("max-states", 20000),
 		Steps:     map[string]step{},
 	}
+	// A warm runner reuses /tmp, and a leftover file here would silently become
+	// every check's initial state.
+	w.Must(os.RemoveAll("/tmp/empty"))
 	w.Must(os.MkdirAll("/tmp/empty", 0o755))
 	caos("put", "/tmp/empty", "/cas/empty")
 	init := node{Actor: caos("hash", "/cas/empty"), Parent: -1}
@@ -345,7 +358,10 @@ func stepped(s *search) {
 		caos("get", dir)
 		w.True(exists(dir+"/state") && exists(dir+"/reply"),
 			"the inner's result for %q is not {state, reply}", k)
-		s.Steps[k] = step{State: caos("hash", dir+"/state"), Reply: strings.TrimSpace(read(dir + "/reply"))}
+		w.True(caos("kind", dir+"/reply") == "blob", "the inner's reply for %q is not a blob", k)
+		reply := strings.TrimSpace(read(dir + "/reply"))
+		w.True(!strings.Contains(reply, "\n"), "the inner's reply for %q is more than one line", k)
+		s.Steps[k] = step{State: caos("hash", dir+"/state"), Reply: reply}
 	}
 	s.Pending = nil
 	successors(s)
@@ -358,7 +374,6 @@ func successors(s *search) {
 	var frontier []int
 	for _, id := range s.Frontier {
 		n := s.Nodes[id]
-		moved := false
 		for i, c := range s.Clients {
 			cs := n.Clients[i]
 			if done(&c, cs) {
@@ -373,10 +388,14 @@ func successors(s *search) {
 				heard = cs // not the reply it waits for: it will ask again
 			}
 			outcomes := []cstate{heard}
-			if cs.Lost < s.MaxLost {
-				lost := cs
-				lost.Lost++
-				outcomes = append(outcomes, lost)
+			if r.State != n.Actor {
+				if cs.Lost < s.MaxLost {
+					lost := cs
+					lost.Lost++
+					outcomes = append(outcomes, lost)
+				} else {
+					s.Bounded = true
+				}
 			}
 			for o, next := range outcomes {
 				clients := append([]cstate{}, n.Clients...)
@@ -386,7 +405,6 @@ func successors(s *search) {
 				if k == key(n.Actor, n.Clients) {
 					continue // a reply that changes nothing, e.g. busy
 				}
-				moved = true
 				to, seen := s.index[k]
 				if !seen {
 					to = len(s.Nodes)
@@ -401,18 +419,18 @@ func successors(s *search) {
 				s.Nodes[id].Succ = append(s.Nodes[id].Succ, to)
 			}
 		}
-		if !moved && !terminal(s, n) {
-			var waiting []string
-			for i, c := range s.Clients {
-				if !done(&c, n.Clients[i]) {
-					waiting = append(waiting, fmt.Sprintf("%s waits on %q", c.Name, c.Messages[n.Clients[i].PC].Text))
-				}
-			}
-			finish(s, "stuck", id, "no client can proceed: "+strings.Join(waiting, ", "))
-			return
-		}
 	}
 	if len(frontier) == 0 {
+		if id := stuck(s); id >= 0 {
+			var waiting []string
+			for i, c := range s.Clients {
+				if cs := s.Nodes[id].Clients[i]; !done(&c, cs) {
+					waiting = append(waiting, fmt.Sprintf("%s on %q", c.Name, c.Messages[cs.PC].Text))
+				}
+			}
+			finish(s, "stuck", id, "from here the clients can no longer all finish; waiting: "+strings.Join(waiting, ", "))
+			return
+		}
 		finish(s, "ok", -1, "")
 		return
 	}
@@ -422,6 +440,42 @@ func successors(s *search) {
 	}
 	s.Frontier = frontier
 	advance(s)
+}
+
+// stuck is the shallowest state from which no terminal state can be reached,
+// or -1. That covers a state where nobody can move and a cycle the clients can
+// never leave (two clients each waiting on a reply the other keeps away), which
+// a state-at-a-time check calls fine.
+func stuck(s *search) int {
+	preds := make([][]int, len(s.Nodes))
+	var reach []int
+	ok := make([]bool, len(s.Nodes))
+	for id, n := range s.Nodes {
+		for _, to := range n.Succ {
+			preds[to] = append(preds[to], id)
+		}
+		if terminal(s, n) {
+			ok[id] = true
+			reach = append(reach, id)
+		}
+	}
+	for len(reach) > 0 {
+		id := reach[len(reach)-1]
+		reach = reach[:len(reach)-1]
+		for _, p := range preds[id] {
+			if !ok[p] {
+				ok[p] = true
+				reach = append(reach, p)
+			}
+		}
+	}
+	best := -1
+	for id, n := range s.Nodes { // ids are in breadth-first order
+		if !ok[id] && (best < 0 || n.Depth < s.Nodes[best].Depth) {
+			best = id
+		}
+	}
+	return best
 }
 
 // executions counts the complete executions: paths from the initial state to a
@@ -476,6 +530,7 @@ func finish(s *search, verdict string, at int, detail string) {
 	stats := map[string]any{
 		"complete": verdict == "ok", "states": len(s.Nodes), "transitions": s.Edges,
 		"depth": depth, "inner-runs": len(s.Steps), "invariant-runs": s.Judged,
+		"lost": s.MaxLost, "lost-bound-reached": s.Bounded,
 	}
 	// What only a finished search can say. A stopped one has a frontier it
 	// never expanded, which would count as dead ends.
@@ -500,6 +555,12 @@ func finish(s *search, verdict string, at int, detail string) {
 	switch verdict {
 	case "ok":
 		fmt.Fprintf(&r, "actor-check: OK -- the invariant holds in every one of %d reachable states\n", len(s.Nodes))
+		if s.Bounded {
+			fmt.Fprintf(&r, "  with at most %d lost repl%s per message; more were possible and not explored\n",
+				s.MaxLost, map[bool]string{true: "y", false: "ies"}[s.MaxLost == 1])
+		} else {
+			fmt.Fprintf(&r, "  for any number of lost replies: the bound (--lost=%d) never cut an outcome off\n", s.MaxLost)
+		}
 	case "incomplete":
 		fmt.Fprintf(&r, "actor-check: INCOMPLETE -- %s; nothing past it was checked\n", detail)
 	default:

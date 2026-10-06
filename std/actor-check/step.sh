@@ -8,6 +8,9 @@
 # --message:@=<message>` -- so a transition here and a message delivered to a
 # live actor in the same (state, message) are one ArgTree and one cache entry.
 # Do not bind anything else onto it: an extra arg would split the two.
+#
+# BASH, NOT PART OF worker.go. A transition is one prepare-request and one tail
+# call, and on std/go every invocation would first compile a Go program.
 set -euo pipefail
 caos get /cas/args/in
 request=$(caos prepare-request --base:@=/cas/args/inner \

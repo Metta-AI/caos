@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A lock, as an actor's inner (std/actor/README.md): the claim/release half of
-# the lease actor that README proposes for daemons ("Deferred: daemons"). The
-# state is one file, `holder`, present while the lock is held.
+# the kind of lease actor that README proposes for daemons ("Deferred:
+# daemons"), written the obvious way. The state is one file, `holder`, present
+# while the lock is held.
 #
 #   claim <who>    granted if the lock is free or already <who>'s, else busy
 #   release <who>  give the lock up: ok
@@ -19,7 +20,9 @@
 set -euo pipefail
 caos get /cas/args/message
 caos get /cas/args/release
-read -r op who < /cas/args/message
+# `|| [ -n ... ]`: a message with no trailing newline (a literal --message=)
+# makes read fail at EOF after it has filled both fields.
+read -r op who < /cas/args/message || [ -n "${who:-}" ]
 mode=$(cat /cas/args/release)
 caos get /cas/args/state
 holder=""

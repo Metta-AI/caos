@@ -19,13 +19,20 @@
 //	          REUSED in the server's trace of the live request. Then check the
 //	          lock whose release frees only the holder's
 //	fixed     -> ok, and the exploration matches the independent model exactly:
-//	          every reachable state, every transition, every complete execution
+//	          every reachable state, every transition, every complete execution.
+//	          The loss bound never cut an outcome off, so it holds for any
+//	          number of lost replies. Then the same lock with a client that
+//	          never releases
+//	stuck     -> stuck, one step in: once B holds the lock for good, A can
+//	          never finish
 //
-// THE ORACLE SHARES NOTHING WITH THE CHECKER BUT THE CLIENT FILES. It is the
-// lock and the invariant rewritten in Go, explored depth-first with no
-// deduplication at all -- every execution walked to its end -- so a checker
-// that dropped a state, merged two that differ, or miscounted a path disagrees
-// with it here.
+// THE ORACLE SHARES THE MODEL, NOT THE CODE. It is the lock and the invariant
+// rewritten in Go, and the model's rules (std/actor-check/README.md, "Model")
+// written again, explored depth-first with no deduplication at all -- every
+// execution walked to its end. So a checker that drops a state, merges two that
+// differ, miscounts a path, or runs the scripts wrongly disagrees with it here.
+// What it CANNOT see is the model differing from std/actor, because it is the
+// same model; the live stage is what ties a counterexample to the real wrapper.
 package main
 
 import (
@@ -137,7 +144,7 @@ func loadClients() {
 	for _, e := range w.Check(os.ReadDir("/cas/args/clients")) {
 		var script []omsg
 		for _, line := range strings.Split(read("/cas/args/clients/"+e.Name()), "\n") {
-			if line = strings.TrimSpace(line); line == "" {
+			if line = strings.TrimSpace(line); line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
 			text, expect, _ := strings.Cut(line, " => ")
@@ -212,7 +219,7 @@ func moves(s ostate, release string, maxLost int) (all []move, transitions int) 
 			heard.Clients[i].Acked = append(heard.Clients[i].Acked, m.text+" => "+reply)
 		}
 		outs := []move{{i, false, reply, m.text, heard}}
-		if cs.Lost < maxLost {
+		if cs.Lost < maxLost && holder != s.Holder {
 			lost := clone(s)
 			lost.Holder = holder
 			lost.Clients[i].Lost++
@@ -399,8 +406,11 @@ func main() {
 			check("any", "naive")
 
 		case "naive":
-			verdict, report, _, trace := result()
+			verdict, report, stats, trace := result()
 			w.True(verdict == "violation", "verdict %q, want a violation:\n%s", verdict, report)
+			// A's stale release changes the state with one loss already spent,
+			// so the bound cut an outcome off and must say so.
+			w.True(stats["lost-bound-reached"] == true, "the loss bound was not reached for the any lock:\n%s", report)
 			want := explore("any", 1).firstViolation
 			w.True(want > 0, "the oracle finds no violation for release=any")
 			w.True(len(trace) == want, "a %d-step counterexample; the shortest is %d:\n%s", len(trace), want, report)
@@ -490,8 +500,25 @@ func main() {
 			} {
 				w.True(number(stats, k) == want, "%s: the checker says %s, the oracle %s\n%s", k, number(stats, k), want, report)
 			}
-			w.Report(fmt.Sprintf("actor-check: ALL PASS (%s states, %s executions, %s inner runs)\n",
-				number(stats, "states"), number(stats, "executions"), number(stats, "inner-runs")))
+			w.True(stats["lost-bound-reached"] == false, "the loss bound was reached for the holder lock:\n%s", report)
+			w.Must(os.RemoveAll("/tmp/stuck"))
+			w.Must(os.MkdirAll("/tmp/stuck", 0o755))
+			w.Must(os.WriteFile("/tmp/stuck/A", []byte("claim A => granted\nrelease A\n"), 0o644))
+			w.Must(os.WriteFile("/tmp/stuck/B", []byte("claim B => granted\n"), 0o644))
+			caos("put", "/tmp/stuck", "/cas/stuck-clients")
+			checker := caos("curry", "--unbind=inner", "--unbind=clients", "--base:@=/cas/args/holder",
+				"--inner:hash="+inner("holder"), "--clients:@=/cas/stuck-clients")
+			caos("run-request-then", caos("prepare-request", "--base:hash="+checker),
+				"--then:hash="+next("stuck", fmt.Sprintf("--fixed=%s states, %s executions, %s inner runs",
+					number(stats, "states"), number(stats, "executions"), number(stats, "inner-runs"))))
+
+		case "stuck":
+			verdict, report, _, trace := result()
+			w.True(verdict == "stuck", "verdict %q, want stuck:\n%s", verdict, report)
+			w.True(len(trace) == 1 && trace[0].Client == "B" && trace[0].Reply == "granted",
+				"want the one step after which B holds the lock for good:\n%s", report)
+			w.True(strings.Contains(report, `A on "claim A"`), "the report does not say A waits:\n%s", report)
+			w.Report("actor-check: ALL PASS (" + arg("fixed") + ")\n")
 
 		default:
 			w.True(false, "unknown --stage: %s", stage)
