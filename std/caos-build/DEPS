@@ -1,5 +1,3 @@
-# This tool's worker image: dev/test-stack — a shell and a docker client, and the only
-# std image that ASKS for the engine socket. std/bash cannot serve: the grant is
-# read from the image's own config, so a tool that starts a container needs an
-# image that declares it.
-../../dev/test-stack test-stack
+# The router's image, and the daemon it sends messages to (format `<path> <name>`).
+../bash bash
+../../dev/stack-daemon stack-daemon

@@ -13,7 +13,7 @@ path prints its parameters, which is the description this table abbreviates.
 | tool | one line |
 |---|---|
 | `bash-tool` | Run `sh -c` over a scratch copy of the conversation tree, to compute something over its content. List in `paths` every existing file or directory the command touches, or it sees an empty placeholder ([Using `bash-tool`](#using-bash-tool)). |
-| `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. |
+| `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. A router to the stack daemon's `build` op. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
 | `caos-stack` | Start, inspect, harvest from or stop the tree's caos stack. `start` returns the `caos://` ticket a cloud session reaches it by. One stack per tree, shared with `caos-test`. |

@@ -10,6 +10,7 @@
 #
 # THE OPS (the `op` arg):
 #
+#   build       compile the tree with nix and answer with the log. Starts no stack.
 #   start       bring the stack up if it is not, publish an iroh listener on it,
 #               and answer with the ticket a cloud session reaches it by. Needs
 #               `relay`, a relay of our own (design/iroh-transport.md).
@@ -162,6 +163,47 @@ ensure_iroh() {
 }
 
 # ---- ops --------------------------------------------------------------------
+
+# Compile the tree with nix: what `caos-build` is. It needs nix and the source
+# tree and NOTHING of the stack, so it builds from this message's own copy of the
+# tree and leaves no stack behind: asked of a tree with none, the container answers
+# and exits like any other not-running op. The nix store is the persistent volume
+# either way, so a build after `start` or `run-tests` is a lookup.
+op_build() {
+  caos get -r /cas/args/in || fail "materializing the source tree"
+  cd /cas/args/in
+
+  # `path:`, so nix takes the directory as it stands rather than looking for a git
+  # input in it.
+  local status=0
+  nix build "path:$PWD" > /tmp/build.log 2>&1 || status=$?
+  cd /tmp
+
+  # A tree whose flake builds something else is not a failed build but the wrong
+  # tree: the conversation root of an ordinary session is exactly this case, since
+  # a repo pinning caos has a flake of its own. Nix's own message is the cheapest
+  # reliable test for it.
+  if [ "$status" -ne 0 ] && grep -q "does not provide attribute" /tmp/build.log; then
+    {
+      echo "caos-build compiles the caos source tree with nix, and this tree's flake"
+      echo "builds something else — it has no default package."
+      echo "caos-build is specific to the caos codebase; run it there, or pass the"
+      echo "caos tree's conversation path as \`in\`."
+    } > /tmp/build.log
+    reply /tmp/build.log
+    return 0
+  fi
+
+  # A FAILED BUILD IS A VALUE, not a job error: a build tool is called precisely
+  # when something might not compile. The banner goes LAST because both readers of
+  # a tool result truncate by keeping the tail.
+  if [ "$status" -ne 0 ]; then
+    echo "BUILD FAILED (exit $status)" >> /tmp/build.log
+  else
+    echo "BUILD OK" >> /tmp/build.log
+  fi
+  reply /tmp/build.log
+}
 
 op_start() {
   local relay
@@ -433,6 +475,7 @@ op_stop() {
 
 handle() {
   case "$(arg op)" in
+    build) op_build ;;
     start) op_start ;;
     run-tests) op_run_tests ;;
     status) op_status ;;

@@ -40,7 +40,7 @@ Where the code differs from, or settles, what the sections below say:
 - **Residency only starts at `caos next`.** An image can declare
   `CAOS_RESIDENT=1` and still run ordinary jobs: a worker that exits without ever
   calling `caos next` takes the runner back to warm polling, as on any image.
-  `dev/test-stack` declares it and still runs `caos-build` and the suite's
+  `dev/test-stack` declares it and still runs the suite's
   fan-out. The lifetime cap applies to a keyed life only, and counts from its
   start.
 - **`caos next` exits 10 for "leave"**, 0 for a new job, 1 for an error
@@ -55,10 +55,24 @@ Where the code differs from, or settles, what the sections below say:
   replies when the stack is ready and the listener has published its ticket.
 - **`request-id`** replaced the actor wrapper's `nonce` in the actor code and its
   tests, and is the arg `caos-stack` requires.
-- **The callers.** `std/caos-test` and `std/caos-stack` are routers on std/bash:
-  they hash the tree, use it as both `affinity` and `in`, and tail-call the
-  message at `dev/stack-daemon`. `caos-test` is cached like any job; `caos-stack`
-  needs a fresh `request-id` per call or it answers from the cache.
+- **The callers.** `std/caos-build`, `std/caos-test` and `std/caos-stack` are
+  routers on std/bash: they hash the tree, use it as both `affinity` and `in`, and
+  tail-call the message at `dev/stack-daemon`. `caos-build` (op `build`) and
+  `caos-test` (op `run-tests`) are cached like any job, which is why they are
+  tools of their own; `caos-stack` (start, status, logs, harvest, stop) needs a
+  fresh `request-id` per call or it answers from the cache. `build` starts no
+  stack and leaves none; `run-tests` leaves its stack up, which is what makes the
+  next run fast.
+- **Why `dev/stack-daemon` is a directory of its own.** The script has to stay
+  OUT of `dev/test-stack`: that directory is the image's flake source, so a file in
+  it would rebuild the image whenever the script changed, and the point of one
+  script between the host and the test stack is that editing it needs neither a
+  host rebuild nor an image rebuild.
+- **The contract with the host stack.** Everything that runs is in the tree under
+  test, so changes to the script, `stack-up`, `serve` and the suite need no host
+  rebuild. The one new coupling is residency itself: `caos next`, keyed dispatch
+  and leases are the HOST's `server`, `runnerd` and `caos`, so a change to those
+  needs `nix build && caosd up`. The stack inside still builds them from the tree.
 - **Tests:** `tests/resident` (a resident image under `dev/resident-test`: one
   process for three concurrent messages, serialized, `/cas` content kept; an
   explicit stop; a new container after it; a killed worker fails only its job;

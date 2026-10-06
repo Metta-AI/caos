@@ -1,11 +1,13 @@
-# The `caos-build` tool (SPEC, "Tools"): the dev/test-stack worker image with
-# this directory's script curried onto it, plus the `help` an agent registers
-# it by. It moved out of caos-tools/ into std/ so the agent harness can DEPend on
-# it and register it ALWAYS — the tool comes from the harness's own version, not
-# from whatever tree is being worked on (design/flake-inputs.md, "the tui").
+# The `caos-build` tool (SPEC, "Tools"): a ROUTER that sends `build` to the stack
+# daemon for the tree (dev/stack-daemon), plus the `help` an agent registers it by.
+# It moved out of caos-tools/ into std/ so the agent harness can DEPend on it and
+# register it ALWAYS — the tool comes from the harness's own version, not from
+# whatever tree is being worked on (design/flake-inputs.md, "the tui").
 #
-# dev/test-stack, not std/bash: this tool needs nix and a persistent store, and
-# those are grants only an image can declare in its own config.
+# std/bash, not the daemon's image: the router only forms a request and tail-calls
+# it, so it should not pay for the stack image's start. The build itself needs nix
+# and a persistent store, which are grants only that image declares.
+#
 #
 # The docs are a HERE-STRING, so they live here rather than in the script — and
 # a `.caos-expr` is STRIPPED from the tree it is evaluated against, so editing
@@ -19,4 +21,4 @@ caos codebase; run in any other tree it reports cleanly that there is nothing
 for it to build.
 @in
 END
-curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh --help=$HELP
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/stack-daemon --help=$HELP

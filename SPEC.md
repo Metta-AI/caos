@@ -744,7 +744,7 @@ The build and test tools use `dev/test-stack --tree=<hash> --command=<command>` 
 We use one resident test worker per tree, with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
 
 The stack daemon (`dev/stack-daemon`, on the `dev/test-stack` image) is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's conversations to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
-- `std/caos-build <tree-oid>`: `nix build` in the test-stack image, not resident
+- `std/caos-build <tree-oid>`: sends `build` (a `nix build` of the tree). Starts no stack and leaves none
 - `std/caos-test <tree-oid>`: sends `run-tests` to the tree's daemon. The first call per tree builds and brings the stack up; later calls, with any `--only` or `--test-salt`, skip both
 - `std/caos-stack <tree-oid> --op=<op> --request-id=<fresh>`: sends one of the other ops. `request-id` must be fresh per call or the answer comes from the cache
 
