@@ -1,0 +1,5 @@
+# The lock whose release frees it only for the client holding it, under
+# std/actor-check:
+#   caos-cli run out --base:@=examples/actor-check/release-holder && cat out/report
+LOCK=curry --base:@=DEEP-DEPS/lock --release=holder
+curry --base:@=DEEP-DEPS/actor-check --inner=$LOCK --invariant:@=DEEP-DEPS/mutex --clients:@=DEEP-DEPS/clients

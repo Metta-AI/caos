@@ -1,0 +1,2 @@
+# The mutual-exclusion invariant (mutex.sh), for std/actor-check's --invariant.
+curry --base:@=DEEP-DEPS/bash --worker1:@=mutex.sh

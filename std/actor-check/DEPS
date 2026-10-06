@@ -1,0 +1,4 @@
+# What this entry names (format `<path> <name>`): the checker runs on std/go,
+# and its one-transition mapper (step.sh) on std/bash.
+../go go
+../bash bash

@@ -1,0 +1,9 @@
+# What this test names (format `<path> <name>`). The fixtures live in
+# examples/actor-check so that the same checks can be run by hand by path; a
+# directory under this one would be addressable only through this entry's own
+# curry.
+../../std/go go
+../../examples/actor-check/release-any release-any
+../../examples/actor-check/release-holder release-holder
+../../examples/actor-check/clients clients
+../../std/actor actor

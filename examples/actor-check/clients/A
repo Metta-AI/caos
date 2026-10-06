@@ -1,0 +1,4 @@
+claim A => granted
+release A
+claim A => granted
+release A
