@@ -12,7 +12,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 #[cfg(test)]
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -34,9 +33,7 @@ use conversation_protocol::v3::records::{
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::{
-    reconcile, validate_spine, GitStore, ObjectStore, Oid, RefUpdate, Signature,
-};
+use conversation_protocol::v3::{reconcile, GitStore, ObjectStore, Oid, RefUpdate, Signature};
 
 #[cfg(test)]
 use conversation_protocol::v3::Kind;
@@ -292,76 +289,14 @@ fn open_store(t: &GitTransport) -> Result<GitStore, String> {
     GitStore::open(t.work_dir(), Some(CAOS_REMOTE))
 }
 
-static VALIDATED_SPINES: OnceLock<Mutex<HashSet<Oid>>> = OnceLock::new();
-
-/// Where this checkout records the newest head of conversation `id` it has
-/// validated. A local ref, never pushed: it certifies what THIS repository
-/// checked, which is worth nothing to anyone else.
-fn validated_ref(id: &str) -> Result<String, String> {
-    refs::validate_conversation_id(id)?;
-    Ok(format!("{VALIDATED_PREFIX}{}", refs::key_of(id)))
-}
-
-const VALIDATED_PREFIX: &str = "refs/caos/validated/";
-
-/// Validate `head`'s spine, walking only as far as something already checked.
+/// The conversation's head as the server holds it, with its objects local.
 ///
-/// "Already checked" has to outlive the process. Each Claude Code hook is a
-/// new `caos` process, and a full walk costs a diff and a transition check per
-/// commit back to the root -- so with only the in-memory set, every prompt and
-/// every Stop pays for the whole history, and a long session's prompt hook
-/// outlives its hook timeout. A killed prompt hook opens no request, and
-/// every tool call of that turn is refused. So the newest validated head is
-/// also kept as a local ref, and the walk stops there.
-///
-/// The conversation is read off `head` BEFORE it is validated, and that is
-/// safe: the id only picks which ref seeds the walk, and a seed short-circuits
-/// only on reaching that exact commit, so a head whose spine does not contain
-/// it is validated in full.
-///
-/// Answers how many commits it had to check.
-fn validate_cached(store: &GitStore, head: &Oid) -> Result<usize, String> {
-    let cache = VALIDATED_SPINES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut known = cache
-        .lock()
-        .map_err(|_| "conversation validation cache is poisoned".to_string())?;
-    let refname = Conversation::open(store, head)
-        .and_then(|view| view.identity())
-        .ok()
-        .map(|identity| validated_ref(&identity.id))
-        .transpose()?;
-    if let Some(refname) = &refname {
-        if let Some(checked) = store.read_local(refname)? {
-            known.insert(checked);
-        }
-    }
-    let mark = Instant::now();
-    let walked = validate_spine(store, head, &mut known).map_err(String::from)?;
-    if !walked.is_empty() {
-        caos::timing::record(
-            "validate-spine",
-            &format!(
-                "{} commit(s) in {:.1}s",
-                walked.len(),
-                mark.elapsed().as_secs_f64()
-            ),
-        );
-    }
-    if let Some(refname) = &refname {
-        store.write_local(refname, head)?;
-    }
-    Ok(walked.len())
-}
-
-fn already_validated(head: &Oid) -> Result<bool, String> {
-    VALIDATED_SPINES
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map(|known| known.contains(head))
-        .map_err(|_| "conversation validation cache is poisoned".to_string())
-}
-
-fn fetch_validated_head(
+/// NOT VALIDATED. A conversation's history is written only by caos, and each
+/// writer checks its own transition through `apply` before pushing it. A
+/// writer checks what it adds; what is already there is trusted. Re-checking
+/// the spine on read costs a diff and a transition replay per commit back to
+/// the root, in every fresh process -- and each hook is one.
+fn fetch_head(
     t: &GitTransport,
     store: &GitStore,
     id: &str,
@@ -370,20 +305,8 @@ fn fetch_validated_head(
     let Some(head) = store.read_ref(&refname)? else {
         return Ok(None);
     };
-    let local = local_conversation_heads(t)?.get(&refname).cloned();
-    if local.as_ref() != Some(&head) || !already_validated(&head)? {
-        // Fetch the observed commit without racing other readers to rewrite the
-        // local ref. The remote ref may also advance while this fetch runs.
-        store.ensure_local(&head)?;
-        validate_cached(store, &head)?;
-    }
+    store.ensure_local(&head)?;
     let _ = update_local_cache(t, &refname, head.as_str());
-    let conversation = Conversation::open(store, &head)?;
-    if conversation.identity()?.id != id {
-        return Err(format!(
-            "conversation head {head} identity does not match ref for {id:?}"
-        ));
-    }
     Ok(Some((refname, head)))
 }
 
@@ -437,7 +360,7 @@ fn append_transition(
 ) -> Result<String, String> {
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
-        let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+        let Some((_, head)) = fetch_head(t, &store, id)? else {
             return Err(format!("no conversation {id:?}"));
         };
         let transitions = match step(&mut store, &head)? {
@@ -702,7 +625,6 @@ pub fn create_conversation(
         let Some(remote) = store.fetch_ref(&refname)? else {
             return Err(error);
         };
-        validate_cached(&store, &remote)?;
         if !spine_contains(&store, remote.clone(), &head)? {
             return Err(error);
         }
@@ -921,7 +843,7 @@ where
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
-        let observed = fetch_validated_head(t, &store, id)?.map(|(_, head)| head);
+        let observed = fetch_head(t, &store, id)?.map(|(_, head)| head);
         if policy.require_absent && observed.is_some() {
             return Err(format!(
                 "--new: conversation {id:?} was created by another client; choose another name"
@@ -987,7 +909,6 @@ where
                             return Err(push_error);
                         };
                         store.fetch_ref(&refname)?;
-                        validate_cached(&store, &remote_head)?;
                         if spine_contains(&store, remote_head.clone(), &outcome.head)? {
                             repair_creation_membership(&store, &username, id, &remote_head)?;
                             return finish_submission(t, &refname, Some(remote_head), outcome);
@@ -1251,7 +1172,7 @@ pub fn conversation_snapshot(
     id: &str,
 ) -> Result<Option<ConversationSnapshot>, String> {
     let store = open_store(t)?;
-    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+    let Some((_, head)) = fetch_head(t, &store, id)? else {
         return Ok(None);
     };
     snapshot_at(&store, id, &head).map(Some)
@@ -1534,7 +1455,7 @@ fn publication_summaries(
 
 pub fn conversation_load(t: &GitTransport, id: &str) -> Result<Option<ConversationLoad>, String> {
     let store = open_store(t)?;
-    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+    let Some((_, head)) = fetch_head(t, &store, id)? else {
         return Ok(None);
     };
     load_at(t, &store, id, &head).map(Some)
@@ -1548,7 +1469,6 @@ pub fn conversation_load_at(
     let store = open_store(t)?;
     let head = oid(head, "conversation head")?;
     store.ensure_local(&head)?;
-    validate_cached(&store, &head)?;
     let identity = Conversation::open(&store, &head)?.identity()?;
     if identity.id != id {
         return Err(format!(
@@ -1608,7 +1528,7 @@ pub fn invite_user_to_conversation(
     id: &str,
 ) -> Result<InviteOutcome, String> {
     let mut store = open_store(t)?;
-    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+    let Some((_, head)) = fetch_head(t, &store, id)? else {
         return Err(format!(
             "cannot invite to conversation {id:?} before its first turn"
         ));
@@ -1679,7 +1599,7 @@ fn move_user_conversation(
     to: UserConversationStatus,
 ) -> Result<(), String> {
     let store = open_store(t)?;
-    let Some((_, observed_head)) = fetch_validated_head(t, &store, id)? else {
+    let Some((_, observed_head)) = fetch_head(t, &store, id)? else {
         return Err(format!("no conversation {id:?}"));
     };
     let from_ref = membership_ref(user, from, id)?;
@@ -2084,7 +2004,6 @@ pub fn fork_conversation(
     let from = oid(from, "fork source")?;
     let mut store = open_store(t)?;
     store.ensure_local(&from)?;
-    validate_cached(&store, &from)?;
     let source = Conversation::open(&store, &from)?;
     let source_identity = source.identity()?;
     if source_identity.id == id {
@@ -2130,7 +2049,6 @@ pub fn fork_conversation(
             let Some(observed) = store.fetch_ref(&head_ref)? else {
                 return Err(error);
             };
-            validate_cached(&store, &observed)?;
             let conversation = Conversation::open(&store, &observed)?;
             let identity = conversation.identity()?;
             if identity.id == id
@@ -2588,7 +2506,7 @@ pub fn describe_tool_set(
 ) -> Result<ToolSetDescription, String> {
     let source_commit = {
         let store = open_store(t)?;
-        match fetch_validated_head(t, &store, id)? {
+        match fetch_head(t, &store, id)? {
             Some((_, head)) => {
                 let conversation = Conversation::open(&store, &head)?;
                 let name = select_source_tree(&conversation, options.source_tree.as_deref())?;
@@ -2895,7 +2813,7 @@ fn run_line_turn(
 
 fn transcript_len(t: &GitTransport, id: &str) -> Result<usize, String> {
     let store = open_store(t)?;
-    let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+    let Some((_, head)) = fetch_head(t, &store, id)? else {
         return Ok(0);
     };
     usize::try_from(Conversation::open(&store, &head)?.transcript_len()?)
@@ -2913,6 +2831,7 @@ fn print_replay(replay: &ConversationReplay, output: &mut impl Write) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conversation_protocol::v3::validate_spine;
 
     #[test]
     fn skip_warnings_print_once_per_message() {
@@ -3138,51 +3057,6 @@ mod tests {
             conversation_ref("talk-1").unwrap(),
             "refs/caos/v3/conversations/74616c6b2d31/head"
         );
-    }
-
-    #[test]
-    fn a_new_process_validates_only_what_was_appended_since() {
-        let (root, transport, base) = fixture("validated-ref");
-        let options = options(&transport);
-        create_conversation(&transport, &options, "long", "New conversation").unwrap();
-        let forget = || VALIDATED_SPINES.get().unwrap().lock().unwrap().clear();
-        let head = |t: &GitTransport| {
-            oid(&conversation_head(t, "long").unwrap().unwrap(), "head").unwrap()
-        };
-        submit_message_inner_with(
-            &transport,
-            &options,
-            "long",
-            "plan first",
-            false,
-            None,
-            None,
-            |_, _, _, _| Ok(base.clone()),
-        )
-        .unwrap();
-        interrupt_request(&transport, "long").unwrap();
-        let store = open_store(&transport).unwrap();
-        let first = head(&transport);
-        validate_cached(&store, &first).unwrap();
-        forget();
-        assert_eq!(validate_cached(&store, &first).unwrap(), 0);
-
-        fixture_reference(&transport, "long", "code", Some(&base)).unwrap();
-        let next = head(&transport);
-        let appended = validate_spine(&store, &next, &mut HashSet::from([first.clone()]))
-            .unwrap()
-            .len();
-        let whole = validate_spine(&store, &next, &mut HashSet::new())
-            .unwrap()
-            .len();
-        assert!(appended < whole);
-        forget();
-        assert_eq!(validate_cached(&store, &next).unwrap(), appended);
-        assert_eq!(
-            store.read_local(&validated_ref("long").unwrap()).unwrap(),
-            Some(next)
-        );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3757,9 +3631,7 @@ mod tests {
         assert_eq!(next_request, base);
         assert_eq!(prepared_calls.get(), 0);
         let store = open_store(&transport).unwrap();
-        let (_, active_head) = fetch_validated_head(&transport, &store, "talk-1")
-            .unwrap()
-            .unwrap();
+        let (_, active_head) = fetch_head(&transport, &store, "talk-1").unwrap().unwrap();
         assert_eq!(
             Conversation::open(&store, &active_head)
                 .unwrap()
@@ -3853,7 +3725,7 @@ mod tests {
         )
         .unwrap();
         let store = open_store(&transport).unwrap();
-        let (_, head) = fetch_validated_head(&transport, &store, "proposal-talk")
+        let (_, head) = fetch_head(&transport, &store, "proposal-talk")
             .unwrap()
             .unwrap();
         let conversation = Conversation::open(&store, &head).unwrap();
@@ -3883,7 +3755,7 @@ mod tests {
         assert!(error.contains("source_tree"), "{error}");
         assert!(error.contains("conflicting proposal recorded"));
         let store = open_store(&transport).unwrap();
-        let (_, conflict_head) = fetch_validated_head(&transport, &store, "proposal-talk")
+        let (_, conflict_head) = fetch_head(&transport, &store, "proposal-talk")
             .unwrap()
             .unwrap();
         let conversation = Conversation::open(&store, &conflict_head).unwrap();
@@ -3939,7 +3811,7 @@ mod tests {
         assert_eq!(interjected_request.as_deref(), Some(request.as_str()));
 
         let store = open_store(&transport).unwrap();
-        let (_, direct_head) = fetch_validated_head(&transport, &store, "proposal-talk")
+        let (_, direct_head) = fetch_head(&transport, &store, "proposal-talk")
             .unwrap()
             .unwrap();
         let conversation = Conversation::open(&store, &direct_head).unwrap();
@@ -3970,7 +3842,7 @@ mod tests {
         assert!(error.contains("conflicting proposal recorded"));
 
         let store = open_store(&transport).unwrap();
-        let (_, conflict_head) = fetch_validated_head(&transport, &store, "proposal-talk")
+        let (_, conflict_head) = fetch_head(&transport, &store, "proposal-talk")
             .unwrap()
             .unwrap();
         let conversation = Conversation::open(&store, &conflict_head).unwrap();

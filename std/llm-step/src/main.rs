@@ -332,7 +332,8 @@ fn callback(
         return resume(cfg, state, request, request_head);
     }
 
-    let (block, proposal) = callback_result(state, &record)?;
+    let (mut block, proposal) = callback_result(state, &record)?;
+    append_trace_key(&mut block, &record);
     complete_compute(state, &record, block, proposal)?;
     resume(cfg, state, request, request_head)
 }
@@ -3285,6 +3286,15 @@ fn result_block(id: &str, text: &str, is_error: bool) -> Value {
         block["is_error"] = Value::Bool(true);
     }
     block
+}
+
+/// Tell the model which ArgTree the tool ran as: it is the key of
+/// `GET /status/<hash>?all=1`, so it is how an agent looks at the tool's timing.
+fn append_trace_key(block: &mut Value, record: &CallRecord) {
+    let (Some(task), Some(content)) = (&record.task, block["content"].as_array_mut()) else {
+        return;
+    };
+    content.push(json!({"type":"text","text":format!("trace: {task}")}));
 }
 
 fn error_block(id: &str, text: &str) -> Value {

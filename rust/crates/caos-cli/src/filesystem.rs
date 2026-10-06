@@ -27,8 +27,7 @@ pub struct Preview {
 
 pub fn snapshot(t: &GitTransport, id: &str) -> Result<SnapshotInfo, String> {
     let store = open_store(t)?;
-    let (_, head) =
-        fetch_validated_head(t, &store, id)?.ok_or("conversation has no snapshot yet")?;
+    let (_, head) = fetch_head(t, &store, id)?.ok_or("conversation has no snapshot yet")?;
     let commit = store.read_commit(&head)?;
     Ok(SnapshotInfo {
         head: head.to_string(),
