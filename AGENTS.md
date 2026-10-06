@@ -31,6 +31,11 @@ Every script here runs with it, and two constructs quietly break under it.
   never closes and swallows the REST OF THE FILE; bash then reports an
   unterminated `if` hundreds of lines away, nowhere near the cause. Write
   `X="${VAR:?message}"` — inside double quotes the message is literal.
+- **`cmd | grep -q x` is false under `pipefail` when `cmd` writes more than grep
+  reads.** `grep -q` exits at the first match, `cmd` takes SIGPIPE, and the
+  pipeline reports `cmd`'s 141, so a condition that was true reads as false. The
+  stack daemon's `harvest` exported nothing for that reason, with no error.
+  Capture instead: `[ -n "$(cmd)" ]`.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
   `sed`**, and no awk. `sed 's/^/  /'` in `std/caos-test/worker.sh` passed two
@@ -410,3 +415,26 @@ concurrency.
   re-bind by name whatever it reads. `--salt` has to ride in EVERY stage for
   that reason: bound only at the top, a fresh `--test-salt` re-runs the first
   container and hits the memo for all the rest.
+
+# Resident workers
+
+- **`/etc/hostname` does not tell two worker containers apart.** Workers on a dev
+  stack run `--network=host`, so every container reports the stack container's
+  hostname. A resident-worker test that compared hostnames saw "the same
+  container" for a daemon that had in fact been replaced. The runner is PID 1 of
+  its container, so `/proc/1/stat`'s start time names it (`tests/resident`).
+- **A resident worker's environment is its FIRST job's, for good.** `CAOS_SALT`
+  and `CAOS_JOB_NONCE` in it are stale from the second job on. `caos` reads the
+  per-job files first (`/cas/salt`, `/cas/nonce`), but anything else a daemon
+  hands the salt to — the inner `caos-cli` in `dev/stack-daemon` — has to be
+  given it explicitly, per call, from `/cas/salt`.
+- **A message with effects needs a `request-id`, or it is answered from the
+  cache.** The cache is checked before dispatch, so a repeated `caos-stack
+  status` with the same arguments never reaches the daemon and returns the first
+  reply — and a repeated `start` returns a ticket whose stack may be gone.
+  `caos-stack` makes `request-id` a required param for that reason; `caos-test`
+  does not, because a repeated suite run SHOULD be a hit.
+- **A lapsed lease fails the job in flight, and the owner's own late poll gets a
+  410.** A runner that sees 410 stops; it does not re-poll. If a daemon dies
+  mysteriously after a long quiet stretch, look for `lease lapsed` in the server
+  log before suspecting the daemon.

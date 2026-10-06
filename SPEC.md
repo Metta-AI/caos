@@ -67,6 +67,39 @@ Add more about the contract with the worker #todo
 - /cas/out
 - run-then, map-then
 
+## Resident workers
+
+A worker normally ends with its job. A worker in an image that declares
+`CAOS_RESIDENT=1` may instead call `caos next` when it finishes one: the runner
+posts the result, polls for the next job of the same instance and hands it back
+at `/cas/args`, and the same process handles it. The image declares residency, a
+lifetime cap (`CAOS_RESIDENT_MAX_SECS`) and a grace period between SIGTERM and
+SIGKILL (`CAOS_RESIDENT_GRACE_SECS`); a caller cannot ask for any of them.
+
+An INSTANCE is named by the reserved `affinity` arg. The server gives each
+`(base, affinity)` at most one owner runner and queues every job for the key
+behind it, in arrival order, so one instance is never run twice at once and no
+caller has to guess whether it is busy or gone. The owner renews a lease from a
+thread of its own; if the lease lapses, the job in flight fails (uncached) and
+the queue is re-dispatched. Eviction, the lifetime cap or an exit ends an
+instance, and the next message for it wakes a new one. There is no start
+operation: a message for an instance with no owner runs on any runner, whose
+worker brings the daemon up. See `design/daemons.md` and, for the wire
+protocol, `design/runner-protocol.md`.
+
+Between jobs a resident worker keeps the rest of `/cas`, `/tmp` and its
+processes, and loses `/cas/args`, `/cas/out`, `/cas/out-trace`, `/cas/nonce`,
+`/cas/salt` and `/secret`. Its environment's `CAOS_SALT` and `CAOS_JOB_NONCE` are
+the FIRST job's, so `caos` reads the per-job files first, and a script that needs
+the salt for its own children reads `/cas/salt`. A result must still depend only
+on the ArgTree and the instance's declared state; hidden in-memory state breaks
+the cache silently, and that is the daemon author's responsibility.
+
+`request-id` is the name for an ordinary arg that makes otherwise identical
+requests distinct ArgTrees; it is the caller's answer to memoization, and the
+server gives it no meaning. It is unrelated to the job NONCE, the server's
+rendezvous id for one claimed job, which is not in the ArgTree.
+
 # Principles of reliability
 
 Caos is reliable because:
@@ -719,11 +752,12 @@ The build and test tools use `dev/test-stack --tree=<hash> --command=<command>` 
 - Runs the provided command in the container and exists with the exit code of the command
 - Uses --rm to remove the container after it exits
 
-We use a single short-lived test worker with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
+We use one resident test worker per tree, with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
 
-The build and tools are:
-- `std/caos-build <tree-oid>`: `run-in-test-container  --tree=<treeoid> --command="nix build"`
-- `std/caos-test <tree-oid>`: `run-in-test-container --tree=<treeoid> --command="nix build && .../caosd up && .../caos-cli run dev/run-tests"`
+The stack daemon (`dev/stack-daemon`, on the `dev/test-stack` image) is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's conversations to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
+- `std/caos-build <tree-oid>`: `nix build` in the test-stack image, not resident
+- `std/caos-test <tree-oid>`: sends `run-tests` to the tree's daemon. The first call per tree builds and brings the stack up; later calls, with any `--only` or `--test-salt`, skip both
+- `std/caos-stack <tree-oid> --op=<op> --request-id=<fresh>`: sends one of the other ops. `request-id` must be fresh per call or the answer comes from the cache
 
 Some tests need to remain running/block while their child workers run. (Examples: anything that calls `caos-cli run`, and anything that needs to start a daemon that a worker talks to.) `--max-parallel` on the suite's `map-then` bounds how many tests are in flight (default 8), so the general pool has room for both tests and their children.
 

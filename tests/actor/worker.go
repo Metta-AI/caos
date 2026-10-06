@@ -15,7 +15,7 @@
 //	after-conc  12 concurrent puts (map-then, retried on a lost race) all landed
 //	after-lazy  a read touched one entry and the inner saw the others unmaterialized
 //	after-hit1/after-hit2
-//	            the same read twice with different nonces ran the inner once
+//	            the same read twice with different request-ids ran the inner once
 package main
 
 import (
@@ -113,18 +113,18 @@ func probeInner(opts ...string) string {
 }
 
 // actorRequest is the complete request for one message.
-func actorRequest(message, nonce, inner string) string {
+func actorRequest(message, requestID, inner string) string {
 	w.Must(os.WriteFile("/tmp/msg", []byte(message+"\n"), 0o644))
 	_ = os.Remove("/cas/msg")
 	caos("put", "/tmp/msg", "/cas/msg")
 	return caos("prepare-request", "--base:@=/cas/args/actor", "--state-ref="+stateRef,
-		"--inner:hash="+inner, "--nonce="+nonce+"-"+salt, "--message:@=/cas/msg")
+		"--inner:hash="+inner, "--request-id="+requestID+"-"+salt, "--message:@=/cas/msg")
 }
 
 // call sends message and continues at nextStage. With catch, a failed request
 // reaches the next stage as --error instead of failing the test.
-func call(message, nonce, inner, nextStage string, catch bool, extra ...string) {
-	request := actorRequest(message, nonce, inner)
+func call(message, requestID, inner, nextStage string, catch bool, extra ...string) {
+	request := actorRequest(message, requestID, inner)
 	args := []string{"run-request-then", request, "--then:hash=" + next(nextStage, extra...)}
 	if catch {
 		args = append(args, "--catch")
@@ -206,7 +206,7 @@ func main() {
 			w.True(stateFile(winner, "x") == "0", "the head is not the competing commit")
 			_, has := try("/tmp/repo", "git", "cat-file", "-e", winner+":state/a")
 			w.True(!has, "the lost request published anyway")
-			// The identical request again (same nonce): a cached failure would
+			// The identical request again (same request-id): a cached failure would
 			// replay the failure; instead it re-runs against the new head.
 			call("put a 1", "n5", probeInner("--race-ref="+stateRef), "retried", false, "--winner="+winner)
 
@@ -247,7 +247,7 @@ func main() {
 			w.True(remoteHead(stateRef) == head, "a read changed the head")
 			reply := readArg("result")
 			w.True(reply == "v3", "getcheck replied '%s'", reply)
-			// The same read twice, different nonces: the inner (pure, so
+			// The same read twice, different request-ids: the inner (pure, so
 			// cached) runs once.
 			countRef := fmt.Sprintf("refs/heads/actors-count/%d-%d-%d", time.Now().UnixNano(), os.Getpid(), rand.Intn(32768))
 			call("get c4", "n7", probeInner("--count-ref="+countRef), "after-hit1", false, "--count-ref="+countRef)

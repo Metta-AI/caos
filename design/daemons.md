@@ -1,6 +1,73 @@
 # Daemons — resident workers, supervised by the runner
 
-**Status:** proposal. Nothing here is implemented.
+**Status:** Parts 1 and 2 are implemented; Part 3 is still a sketch. The design
+below is the plan this was built from, and "As built" says where the code differs.
+Not done: converting the actor wrapper (`std/actor`) to a resident worker, which
+the "Actors" paragraph under Keyed dispatch anticipated. Its start and finish are
+two jobs per message, so the mailbox would not serialize a whole message and the
+compare-and-swap would stay; that is worth redesigning, not just rewiring.
+
+## As built
+
+Where the code differs from, or settles, what the sections below say:
+
+- **Where it lives.** The server's owner table and leases are in
+  `rust/crates/server/src/runner.rs`; the runner state machine, `caos next` and
+  its socket are in `rust/crates/caos/src/runner.rs` (the runner moved out of
+  `bin/caos.rs`). `design/runner-protocol.md`, "Resident workers", is the wire
+  protocol.
+- **The ownership has its own id, `tenure`.** It is minted when a keyed job is
+  claimed, rides in that job's payload, and is what a runner presents to renew
+  its lease and to poll. The first claimant is usually runnerd's poll, which is
+  not the container that will own the key, so the owner could not be named by a
+  poll.
+- **A result ends the ownership unless it says `keep`.** That is how "a worker
+  that never calls `caos next` behaves exactly as today" is made true without the
+  server knowing which workers are resident. `caos next` posts with `keep`.
+- **An `idle` poll does not release the key.** The table below said it did; the
+  owner polls again, and a job that arrived in between waited in its queue.
+  Eviction (`exit`), a result without `keep`, an explicit release and a lease
+  lapse end an ownership.
+- **Salt is `/cas/salt`, not `/cas/args/salt`.** The arg is a lazy placeholder,
+  and reading it needs a fetch that the file does not. The runner writes
+  `/cas/salt` and `/cas/nonce` (root-owned, 0600) for a resident image, and
+  `caos` reads them before it reads `CAOS_SALT` / `CAOS_JOB_NONCE`. The
+  environment still carries the FIRST job's values, because scripts read it
+  (`dev/cli-test/worker` re-points `CAOS_SALT`), so it is stale from a daemon's
+  second job on. Only `/bin/caos` reads the files: a client that merely shares a
+  container with a runner, like the test stack's `caos-cli`, would otherwise pick
+  up the outer job's context.
+- **Residency only starts at `caos next`.** An image can declare
+  `CAOS_RESIDENT=1` and still run ordinary jobs: a worker that exits without ever
+  calling `caos next` takes the runner back to warm polling, as on any image.
+  `dev/test-stack` declares it and still runs `caos-build` and the suite's
+  fan-out. The lifetime cap applies to a keyed life only, and counts from its
+  start.
+- **`caos next` exits 10 for "leave"**, 0 for a new job, 1 for an error
+  (including a refusal). `--stream` writes a `job` line first, for the job already
+  running, then one per later job; the worker answers `done` or `error <text>`.
+- **Knobs:** `CAOS_LEASE_SECS` (15), `CAOS_LEASE_START_SECS` (600) on the server;
+  `CAOS_LEASE_RENEW_MS` (5000), `CAOS_RESIDENT_POLL_MS` (10000) and
+  `CAOS_NEXT_SOCKET` on the runner.
+- **`start` does not reply early.** One job at a time per key means `status`
+  would queue behind a `start` still bringing the stack up, so replying with the
+  ticket before the stack is ready would not let anyone ask how far it got. It
+  replies when the stack is ready and the listener has published its ticket.
+- **`request-id`** replaced the actor wrapper's `nonce` in the actor code and its
+  tests, and is the arg `caos-stack` requires.
+- **The callers.** `std/caos-test` and `std/caos-stack` are routers on std/bash:
+  they hash the tree, use it as both `affinity` and `in`, and tail-call the
+  message at `dev/stack-daemon`. `caos-test` is cached like any job; `caos-stack`
+  needs a fresh `request-id` per call or it answers from the cache.
+- **Tests:** `tests/resident` (a resident image under `dev/resident-test`: one
+  process for three concurrent messages, serialized, `/cas` content kept; an
+  explicit stop; a new container after it; a killed worker fails only its job;
+  `caos next` refused off a resident image and off a keyed job) and
+  `tests/stack-daemon` (the ops that must not start a stack). The suite itself is
+  the test of `start` and `run-tests`. Not tested end to end: eviction, the
+  lifetime cap, a lapsed lease, `harvest`'s final run in the grace period and
+  `--stream`; the server half of the first three is unit-tested.
+
 
 Describes what to build on top of the runner as it exists today (SPEC.md,
 "Runners: how a worker's container lives"; if that section is not in this
@@ -62,6 +129,21 @@ cannot wait like that.
    they cannot see each other.
 6. **Opt-in per image**, declared by the image author, because a resident
    worker can break the hermeticity that caching relies on.
+
+## Two things that used to be called a nonce
+
+- The **job nonce** is the server's rendezvous id for one claimed job. A runner
+  receives it with the job and presents it back with the result and with every
+  sub-run, which is what authorizes them. It is not in the ArgTree, so it never
+  reaches a cache key, and nothing a caller writes can name it.
+- A **`request-id`** is an ordinary ArgTree entry that a caller adds so that
+  otherwise identical requests have different ArgTrees, and therefore different
+  cache keys. It is the caller's answer to memoization, and the server gives it
+  no meaning. (The actor wrapper used to call this arg `nonce`.)
+
+This document says "nonce" only for the first. The job nonce is chosen by the
+server and dies with the job; a `request-id` is chosen by the caller and is
+cached with the result.
 
 ## The model
 
@@ -126,8 +208,8 @@ What this gives:
 - exactly one owner per key; no spillover, no duplicate daemons
 - strict arrival order per key, with the server holding the mailbox
 - dead-owner detection for keyed jobs
-- no `--pin`, and no epoch to get exclusion. Nonces and the cache still apply
-  as before
+- no `--pin`, and no epoch to get exclusion. The cache still applies as before,
+  so a message with effects still carries a `request-id`
 
 The same mechanism fits actors (`design/actors.md`). Requests for one actor
 serialize in the server's mailbox instead of racing on a compare-and-swap and
@@ -186,9 +268,9 @@ context moves out of the environment.
   The runner currently re-exports it as `CAOS_SALT` and `caos` reads only the
   environment (`run_salt()`). In a worker, `caos` should read `/cas/args/salt`
   first and fall back to the environment.
-- **Nonce** is the runner's rendezvous id and is not in the ArgTree. The runner
-  writes it to a root-owned `/cas/nonce`, and `caos` reads it there in place of
-  `CAOS_JOB_NONCE`.
+- **The job nonce** is the runner's rendezvous id and is not in the ArgTree. The
+  runner writes it to a root-owned `/cas/nonce`, and `caos` reads it there in
+  place of `CAOS_JOB_NONCE`.
 - **Future work arrives in `/cas/args`**, like the first job's.
 
 **Narrow reset**, run by the runner at `caos next`:
@@ -250,7 +332,7 @@ A caller cannot set any of these.
 - A message's result is cached by its ArgTree like any other job, and identical
   concurrent requests share one run (single-flight). A pure query can be
   answered from the cache without reaching the daemon. An op with effects
-  carries a `nonce` arg, which is the existing answer to memoization. This
+  carries a `request-id` arg, which is the existing answer to memoization. This
   includes `start`, which the daemon makes idempotent.
 - A resident worker's result must still depend only on its ArgTree and the
   instance's *declared* state. Hidden in-memory state breaks cache
@@ -356,8 +438,8 @@ reusing its interpreter (`design/test-stack-image.md`):
 
 ## Messages
 
-Every message carries `affinity` (the instance name), `op`, and a `nonce`, so it
-always reaches the daemon and is never answered from the cache.
+Every message carries `affinity` (the instance name), `op`, and a `request-id`,
+so it always reaches the daemon and is never answered from the cache.
 
 | op | does | reply |
 |---|---|---|

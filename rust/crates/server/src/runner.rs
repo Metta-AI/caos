@@ -16,8 +16,15 @@
 //! deadline: it runs until its result arrives (a forced requeue would race a
 //! fresh worker against the still-running one; dead-worker detection is
 //! future work).
+//!
+//! A job carrying the reserved `affinity` entry is KEYED (design/daemons.md): the
+//! first one claimed makes its runner the key's OWNER, and every other job for
+//! the key queues for that owner and for nobody else, whether the owner is parked
+//! or busy. The owner holds a LEASE that its runner renews from a thread of its
+//! own. A lapse is how a dead owner is noticed: it fails the job in flight and
+//! hands the queue back to the pool.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -62,6 +69,33 @@ fn seeded_grace() -> Duration {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(45)
+    }))
+}
+
+/// How long an owner's lease lasts after its runner last renewed it. The runner
+/// renews every third of this, so three missed renewals are a lapse. Liveness
+/// is the runner's own traffic and is never inferred from a job being slow.
+fn lease_ttl() -> Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("CAOS_LEASE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15)
+    }))
+}
+
+/// The lease a NEW owner starts with: long, because the claiming poll is
+/// usually runnerd's and the container that will renew it has yet to be pulled
+/// and started. A container that dies at start posts its own failure (runnerd's
+/// backstop), so this only has to outlast a cold start.
+fn lease_start_ttl() -> Duration {
+    static SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_secs(*SECS.get_or_init(|| {
+        std::env::var("CAOS_LEASE_START_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600)
     }))
 }
 
@@ -152,6 +186,9 @@ struct ParkedPoll {
     /// a connection the runner is about to abandon.
     matchable_until: Instant,
     reply: mpsc::Sender<PollReply>,
+    /// Set on the poll of a key's OWNER: the tenure it polls on behalf of. Such
+    /// a poll is answered only from that owner's queue.
+    tenure: Option<String>,
 }
 
 /// A dispatched job's lifecycle phase.
@@ -162,6 +199,11 @@ enum Phase {
         /// While set (and in the future), only polls with ≥1 required key match.
         defer_generic_until: Option<Instant>,
     },
+    /// A keyed job waiting in its owner's mailbox. No deadline: the pending
+    /// timeout measures how long NO runner wanted a job, and this one has a
+    /// runner that is alive and merely busy. If the owner goes away the job
+    /// returns to `Pending` with a fresh deadline.
+    Queued,
     /// Handed to a runner; runs until its result arrives. No execution
     /// deadline: a deadline + forced requeue races a fresh worker against the
     /// still-running one (nothing kills the old container), and duplicate
@@ -187,6 +229,24 @@ struct Job {
     phase: Phase,
     enqueued: Instant,
     events: mpsc::Sender<DispatchEvent>,
+    /// `(base, affinity)` for a keyed job (see [`job_key`]).
+    key: Option<String>,
+    /// The tenure whose owner this job was handed to, once it has been.
+    tenure: Option<String>,
+}
+
+/// The runner that owns one key: the only one that is ever handed a job for it.
+struct Owner {
+    key: String,
+    /// The owner is gone if its lease is not renewed by then.
+    lease_until: Instant,
+    /// Keyed jobs waiting for the owner, in arrival order.
+    queue: VecDeque<u64>,
+    /// The job it is running, if any. A job and its owner are never both idle
+    /// while the queue holds work.
+    current: Option<u64>,
+    /// The id of its parked poll, when it is between jobs.
+    parked: Option<u64>,
 }
 
 /// The rendezvous state: parked polls and dispatched jobs, one lock.
@@ -198,6 +258,21 @@ struct State {
     /// Nonce → dispatch id, for result posts.
     by_nonce: HashMap<String, u64>,
     next_id: u64,
+    /// Owners by TENURE: an unguessable id the server mints when it makes a
+    /// runner the owner of a key, and that the runner presents to renew its
+    /// lease and to poll. It names one ownership, not one job, so it survives
+    /// from job to job while the job nonce does not.
+    owners: HashMap<String, Owner>,
+    /// Key → tenure. A key has at most one owner.
+    by_key: HashMap<String, String>,
+}
+
+/// The key of a keyed job: its image and its `affinity`, by oid. `None` for
+/// every job that names no instance.
+fn job_key(arg_entries: &ArgTree) -> Option<String> {
+    let affinity = arg_entries.get(caos_world::AFFINITY_ARG)?;
+    let base = arg_entries.get("base").map(String::as_str).unwrap_or("");
+    Some(format!("{base}/{affinity}"))
 }
 
 fn state() -> &'static Mutex<State> {
@@ -373,6 +448,12 @@ fn payload(job: &Job) -> String {
     if let Some(token) = token() {
         body["token"] = serde_json::Value::String(token);
     }
+    if let Some(tenure) = &job.tenure {
+        // Present on a keyed job only. A runner that sees one renews the lease
+        // on it for as long as it holds it, and a resident worker's `caos next`
+        // polls on it.
+        body["tenure"] = serde_json::Value::String(tenure.clone());
+    }
     if !job.secrets.is_empty() {
         // Out-of-band injection channel: the values reach only this worker, for
         // this job, and are never part of the ArgTree/cache key.
@@ -421,6 +502,7 @@ pub(crate) fn dispatch(
         // contract what it always claimed to be: it waits for an answerer, and if
         // none ever comes it fails loudly on the pending timeout.
         let defer_generic_until = if seeded { Some(deadline) } else { None };
+        let key = job_key(&arg_entries);
         st.jobs.insert(
             id,
             Job {
@@ -435,6 +517,8 @@ pub(crate) fn dispatch(
                 },
                 enqueued: Instant::now(),
                 events: event_tx,
+                key,
+                tenure: None,
             },
         );
         offer_job(&mut st, id);
@@ -466,7 +550,7 @@ pub(crate) fn dispatch(
                 // still-running worker — duplicate 20-core bakes ground this
                 // machine to a halt; dead-worker detection is future work,
                 // likely leases).
-                Some(Phase::Inflight) => Duration::from_secs(3600),
+                Some(Phase::Inflight | Phase::Queued) => Duration::from_secs(3600),
                 // Job already resolved and removed: the outcome is in the channel.
                 None => Duration::ZERO,
             }
@@ -711,6 +795,20 @@ fn requeue(st: &mut State, id: u64, defer_generic: Option<Duration>) {
 /// could serve the job (its exit lets an ancestor poll — the anti-starvation
 /// cascade).
 fn offer_job(st: &mut State, id: u64) {
+    // A keyed job whose key has an owner is the owner's, and goes to nobody
+    // else: not to a warm runner, not to the generic pool, and not into the
+    // eviction cascade below. Whether the owner is parked or busy is its own
+    // business; the queue holds the job until it asks.
+    if let Some(tenure) = st
+        .jobs
+        .get(&id)
+        .and_then(|job| job.key.as_ref())
+        .and_then(|key| st.by_key.get(key))
+        .cloned()
+    {
+        enqueue_for_owner(st, id, &tenure);
+        return;
+    }
     let now = Instant::now();
     let (arg_entries, defer_generic) = {
         let job = &st.jobs[&id];
@@ -748,17 +846,214 @@ fn offer_job(st: &mut State, id: u64) {
         .map(|(i, _)| i);
     if let Some(i) = kick {
         let poll = st.parked.remove(i);
+        // An evicted owner is released. Its queue is empty: a job for its key
+        // is handed to a parked owner at once, so a parked owner never has one.
+        if let Some(tenure) = &poll.tenure {
+            release_owner(st, tenure);
+        }
         let _ = poll.reply.send(PollReply::Exit);
     }
 }
 
-/// Hand job `id` to a poll: mark it inflight and answer the poll.
+/// Hand job `id` to a poll: mark it inflight and answer the poll. If the job is
+/// keyed and its key has no owner yet, the poll's runner becomes the owner in
+/// this same step, under the one lock that every offer takes — so two first
+/// messages cannot both claim, and the second finds an owner and queues.
 fn claim(st: &mut State, id: u64, reply: &mpsc::Sender<PollReply>) {
+    let key = st.jobs.get(&id).and_then(|job| job.key.clone());
+    if let Some(key) = key {
+        if !st.by_key.contains_key(&key) {
+            create_owner(st, id, key);
+        }
+    }
     let job = st.jobs.get_mut(&id).expect("job present under lock");
     job.phase = Phase::Inflight;
     let _ = job.events.send(DispatchEvent::Note(Note::Started));
     let body = payload(job);
     let _ = reply.send(PollReply::Job(body));
+}
+
+/// Make the runner that is taking job `id` the owner of `key`, and pull every
+/// other pending job for the key into its queue. Jobs for the key that arrive
+/// from now on queue through [`offer_job`].
+fn create_owner(st: &mut State, id: u64, key: String) {
+    let tenure = new_nonce(st.next_id);
+    st.next_id += 1;
+    let mut waiting: Vec<(Instant, u64)> = st
+        .jobs
+        .iter()
+        .filter(|(&other, job)| {
+            other != id
+                && job.key.as_deref() == Some(key.as_str())
+                && matches!(job.phase, Phase::Pending { .. })
+        })
+        .map(|(&other, job)| (job.enqueued, other))
+        .collect();
+    waiting.sort();
+    for (_, other) in &waiting {
+        st.jobs
+            .get_mut(other)
+            .expect("job present under lock")
+            .phase = Phase::Queued;
+    }
+    st.owners.insert(
+        tenure.clone(),
+        Owner {
+            key: key.clone(),
+            lease_until: Instant::now() + lease_start_ttl(),
+            queue: waiting.into_iter().map(|(_, other)| other).collect(),
+            current: Some(id),
+            parked: None,
+        },
+    );
+    st.by_key.insert(key, tenure.clone());
+    st.jobs.get_mut(&id).expect("job present under lock").tenure = Some(tenure);
+    spawn_sweeper();
+}
+
+/// Put keyed job `id` in `tenure`'s mailbox, and hand it over now if the owner
+/// is waiting for work.
+fn enqueue_for_owner(st: &mut State, id: u64, tenure: &str) {
+    st.jobs.get_mut(&id).expect("job present under lock").phase = Phase::Queued;
+    st.owners
+        .get_mut(tenure)
+        .expect("owner present under lock")
+        .queue
+        .push_back(id);
+    drain_owner(st, tenure);
+}
+
+/// If `tenure`'s owner is parked and has work waiting, hand it the head of its
+/// queue. A parked poll whose TTL is about to run out is left alone: it answers
+/// `idle` and the owner's next poll takes the job, so the job is never handed to
+/// a connection the runner is abandoning.
+fn drain_owner(st: &mut State, tenure: &str) {
+    let now = Instant::now();
+    let Some(owner) = st.owners.get(tenure) else {
+        return;
+    };
+    let (Some(poll_id), true) = (owner.parked, !owner.queue.is_empty()) else {
+        return;
+    };
+    let Some(position) = st
+        .parked
+        .iter()
+        .position(|p| p.id == poll_id && now < p.matchable_until)
+    else {
+        return;
+    };
+    let poll = st.parked.remove(position);
+    let owner = st.owners.get_mut(tenure).expect("owner present under lock");
+    owner.parked = None;
+    let id = owner.queue.pop_front().expect("queue checked non-empty");
+    owner.current = Some(id);
+    st.jobs.get_mut(&id).expect("job present under lock").tenure = Some(tenure.to_string());
+    claim(st, id, &poll.reply);
+}
+
+/// The owner's job has finished. With `keep` the runner stays the owner and is
+/// about to poll for its queue; otherwise it is done with the key.
+fn settle_owner(st: &mut State, tenure: &str, keep: bool) {
+    if keep {
+        if let Some(owner) = st.owners.get_mut(tenure) {
+            owner.current = None;
+        }
+    } else {
+        release_owner(st, tenure);
+    }
+}
+
+/// End an ownership without failing anything: the key is free, and every job
+/// still queued for it goes back to the pending table (fresh deadline, unowned)
+/// to be offered again. The job in flight, if there is one, is left to post its
+/// own result.
+fn release_owner(st: &mut State, tenure: &str) {
+    let Some(owner) = st.owners.remove(tenure) else {
+        return;
+    };
+    st.by_key.remove(&owner.key);
+    if let Some(poll_id) = owner.parked {
+        st.parked.retain(|p| p.id != poll_id);
+    }
+    // Offered in arrival order, so the first becomes the next owner and the
+    // rest queue behind it.
+    for id in owner.queue {
+        if let Some(job) = st.jobs.get_mut(&id) {
+            job.phase = Phase::Pending {
+                deadline: Instant::now() + pending_timeout(),
+                defer_generic_until: None,
+            };
+            job.tenure = None;
+        }
+        offer_job(st, id);
+    }
+}
+
+/// An owner whose lease lapsed is presumed dead. Its job in flight FAILS — a
+/// failure is never cached, so the caller can retry — and its queue returns to
+/// the pool as for [`release_owner`].
+fn lapse_owner(st: &mut State, tenure: &str) {
+    let Some(current) = st.owners.get(tenure).and_then(|owner| owner.current) else {
+        release_owner(st, tenure);
+        return;
+    };
+    release_owner(st, tenure);
+    if st.jobs.contains_key(&current) {
+        let job = remove_job(st, current);
+        let _ = job
+            .events
+            .send(DispatchEvent::Outcome(Outcome::Failed(format!(
+                "the runner owning this job's instance stopped renewing its lease \
+                 (job {}); the instance is released, so a retry starts a new one",
+                job.arg_tree
+            ))));
+    }
+}
+
+/// Sweep lapsed leases. One thread per process, started with the first owner;
+/// it only ever takes the rendezvous lock, so an owner's death is noticed within
+/// a second of its lease running out.
+fn spawn_sweeper() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let mut st = lock();
+            let now = Instant::now();
+            let lapsed: Vec<String> = st
+                .owners
+                .iter()
+                .filter(|(_, owner)| owner.lease_until < now)
+                .map(|(tenure, _)| tenure.clone())
+                .collect();
+            for tenure in lapsed {
+                eprintln!("caos-server: owner {tenure}'s lease lapsed; releasing its key");
+                lapse_owner(&mut st, &tenure);
+            }
+        });
+    });
+}
+
+/// `POST /runner/lease` — an owner's runner renewing its lease (or, with
+/// `release`, giving the key up). 410 if the tenure is not live, which is how a
+/// runner learns it was presumed dead and must stop.
+pub(crate) fn lease(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, HttpError> {
+    check_auth(authorization)?;
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| HttpError::new(400, format!("invalid lease json: {e}")))?;
+    let tenure = v["tenure"].as_str().unwrap_or_default();
+    let mut st = lock();
+    if v["release"].as_bool() == Some(true) {
+        release_owner(&mut st, tenure);
+        return Ok(b"{}".to_vec());
+    }
+    match st.owners.get_mut(tenure) {
+        Some(owner) => {
+            owner.lease_until = Instant::now() + lease_ttl();
+            Ok(b"{}".to_vec())
+        }
+        None => Err(HttpError::new(410, "unknown or lapsed tenure")),
+    }
 }
 
 /// `POST /runner/poll` — hang until a matching job, eviction, or TTL.
@@ -779,27 +1074,53 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
     // Short polls get a proportional margin; long ones cap out.
     let margin = (ttl / 5).min(MAX_POLL_MARGIN);
 
+    let tenure = v["tenure"].as_str().map(str::to_string);
+
     let (reply_tx, reply_rx) = mpsc::channel();
     let poll_id = {
         let mut st = lock();
-        // A pending job may already be waiting for exactly this runner.
-        if let Some(id) = best_pending(&st, &required) {
-            claim(&mut st, id, &reply_tx);
-            match reply_rx.recv() {
-                Ok(PollReply::Job(payload)) => return reply_job(&payload),
-                _ => return Err(HttpError::new(500, "poll reply lost")),
+        if let Some(tenure) = &tenure {
+            // An owner polls for ITS queue and nothing else: never the pending
+            // table, which holds only jobs nobody owns.
+            let id = st.next_id;
+            st.next_id += 1;
+            let poll = ParkedPoll {
+                id,
+                required,
+                lineage,
+                matchable_until: Instant::now() + ttl - margin,
+                reply: reply_tx,
+                tenure: Some(tenure.clone()),
+            };
+            if !owner_poll(&mut st, tenure, poll)? {
+                // Answered from the queue at once.
+                return match reply_rx.recv() {
+                    Ok(PollReply::Job(payload)) => reply_job(&payload),
+                    _ => Err(HttpError::new(500, "poll reply lost")),
+                };
             }
+            id
+        } else {
+            // A pending job may already be waiting for exactly this runner.
+            if let Some(id) = best_pending(&st, &required) {
+                claim(&mut st, id, &reply_tx);
+                match reply_rx.recv() {
+                    Ok(PollReply::Job(payload)) => return reply_job(&payload),
+                    _ => return Err(HttpError::new(500, "poll reply lost")),
+                }
+            }
+            let id = st.next_id;
+            st.next_id += 1;
+            st.parked.push(ParkedPoll {
+                id,
+                required,
+                lineage,
+                matchable_until: Instant::now() + ttl - margin,
+                reply: reply_tx,
+                tenure: None,
+            });
+            id
         }
-        let id = st.next_id;
-        st.next_id += 1;
-        st.parked.push(ParkedPoll {
-            id,
-            required,
-            lineage,
-            matchable_until: Instant::now() + ttl - margin,
-            reply: reply_tx,
-        });
-        id
     };
 
     match reply_rx.recv_timeout(ttl) {
@@ -810,7 +1131,13 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
             // if we're no longer parked, a reply is (about to be) in the channel.
             let mut st = lock();
             if let Some(i) = st.parked.iter().position(|p| p.id == poll_id) {
-                st.parked.remove(i);
+                let poll = st.parked.remove(i);
+                // An idle owner KEEPS its key: it polls again, and a job that
+                // arrived in between waited in its queue. Only eviction,
+                // a release or a lapse ends an ownership.
+                if let Some(owner) = poll.tenure.as_ref().and_then(|t| st.owners.get_mut(t)) {
+                    owner.parked = None;
+                }
                 Ok(br#"{"idle":true}"#.to_vec())
             } else {
                 drop(st);
@@ -824,6 +1151,33 @@ pub(crate) fn poll(authorization: Option<&str>, body: &str) -> Result<Vec<u8>, H
     }
 }
 
+/// An owner's poll: answer it from the owner's queue now, or park it. Returns
+/// whether it was parked (`false` means the reply is already in its channel).
+///
+/// Polling renews the lease, and a poll for a tenure that is not live is an
+/// error rather than a wait: its owner lapsed or was evicted, the key may
+/// already belong to someone else, and the runner must stop.
+fn owner_poll(st: &mut State, tenure: &str, poll: ParkedPoll) -> Result<bool, HttpError> {
+    let Some(owner) = st.owners.get_mut(tenure) else {
+        return Err(HttpError::new(410, "unknown or lapsed tenure"));
+    };
+    if owner.current.is_some() {
+        // A runner polls only after it has posted its result, and a result
+        // that keeps the tenure clears `current`.
+        return Err(HttpError::new(409, "tenure has a job in flight"));
+    }
+    owner.lease_until = Instant::now() + lease_ttl();
+    if let Some(id) = owner.queue.pop_front() {
+        owner.current = Some(id);
+        st.jobs.get_mut(&id).expect("job present under lock").tenure = Some(tenure.to_string());
+        claim(st, id, &poll.reply);
+        return Ok(false);
+    }
+    owner.parked = Some(poll.id);
+    st.parked.push(poll);
+    Ok(true)
+}
+
 /// The oldest pending job this poll's required set matches (respecting a
 /// requeue's defer-generic window), if any.
 fn best_pending(st: &State, required: &ArgTree) -> Option<u64> {
@@ -835,7 +1189,7 @@ fn best_pending(st: &State, required: &ArgTree) -> Option<u64> {
                 defer_generic_until,
                 ..
             } => !(required.is_empty() && defer_generic_until.is_some_and(|until| until > now)),
-            Phase::Inflight => false,
+            Phase::Inflight | Phase::Queued => false,
         })
         .filter(|(_, job)| matches(required, &job.arg_entries))
         .min_by_key(|(_, job)| job.enqueued)
@@ -891,11 +1245,22 @@ pub(crate) fn result(authorization: Option<&str>, body: &str) -> Result<Vec<u8>,
                 .as_u64()
                 .unwrap_or(DEFAULT_DEFER_GENERIC.as_millis() as u64),
         );
+        // A runner that cannot run a keyed job does not own its key either.
+        if let Some(tenure) = st.jobs.get_mut(&id).and_then(|job| job.tenure.take()) {
+            release_owner(&mut st, &tenure);
+        }
         requeue(&mut st, id, Some(defer));
         return Ok(b"{}".to_vec());
     }
 
     let job = remove_job(&mut st, id);
+    // Whether its runner stays the owner is the runner's word, not a guess: a
+    // resident worker's `caos next` posts with `keep` and then polls for its
+    // queue, and anything else is a runner that is done with the key, so the
+    // key is released and whatever queued behind this job is offered afresh.
+    if let Some(tenure) = &job.tenure {
+        settle_owner(&mut st, tenure, v["keep"].as_bool() == Some(true));
+    }
     drop(st);
     // Sent before the outcome, and on the failing path too: perf data from a
     // run that died is the case you most want it for. The outcome ends the
@@ -1008,5 +1373,267 @@ mod tests {
             ("required-pool".to_string(), oid("c")),
         ]);
         assert!(!matches(&test_pool, &other));
+    }
+
+    // ---- keyed dispatch (design/daemons.md) ----
+
+    fn keyed(instance: &str) -> ArgTree {
+        args(&[("base", "image"), ("affinity", instance)])
+    }
+
+    /// Dispatch-side: a pending keyed job, offered. Returns its id and the
+    /// receiver its outcome would arrive on.
+    fn submit(st: &mut State, entries: ArgTree, tag: &str) -> (u64, mpsc::Receiver<DispatchEvent>) {
+        let (events, rx) = mpsc::channel();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.jobs.insert(
+            id,
+            Job {
+                arg_tree: tag.to_string(),
+                image_ref: "image".to_string(),
+                key: job_key(&entries),
+                arg_entries: entries,
+                secrets: Vec::new(),
+                nonce: format!("nonce-{id}"),
+                phase: Phase::Pending {
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    defer_generic_until: None,
+                },
+                enqueued: Instant::now(),
+                events,
+                tenure: None,
+            },
+        );
+        offer_job(st, id);
+        (id, rx)
+    }
+
+    /// A parked generic poll, the way runnerd's is.
+    fn park_generic(st: &mut State) -> mpsc::Receiver<PollReply> {
+        let (reply, rx) = mpsc::channel();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.parked.push(ParkedPoll {
+            id,
+            required: ArgTree::new(),
+            lineage: Vec::new(),
+            matchable_until: Instant::now() + Duration::from_secs(60),
+            reply,
+            tenure: None,
+        });
+        rx
+    }
+
+    /// An owner's poll, the way `caos next` makes it. `true` if it parked.
+    fn owner_polls(st: &mut State, tenure: &str) -> (bool, mpsc::Receiver<PollReply>) {
+        let (reply, rx) = mpsc::channel();
+        let id = st.next_id;
+        st.next_id += 1;
+        let poll = ParkedPoll {
+            id,
+            required: keyed("a"),
+            lineage: vec![ArgTree::new()],
+            matchable_until: Instant::now() + Duration::from_secs(60),
+            reply,
+            tenure: Some(tenure.to_string()),
+        };
+        let Ok(parked) = owner_poll(st, tenure, poll) else {
+            panic!("the tenure is not live");
+        };
+        (parked, rx)
+    }
+
+    fn answered_job(rx: &mpsc::Receiver<PollReply>) -> serde_json::Value {
+        match rx.try_recv() {
+            Ok(PollReply::Job(payload)) => serde_json::from_str(&payload).expect("payload json"),
+            _ => panic!("the poll was not answered with a job"),
+        }
+    }
+
+    fn tenure_of(st: &State, key: &str) -> String {
+        st.by_key.get(key).cloned().expect("the key has an owner")
+    }
+
+    /// Two first messages for one instance, and two generic runners waiting:
+    /// exactly one runner claims, and the second message queues instead of
+    /// starting a second container.
+    #[test]
+    fn concurrent_first_messages_claim_once() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let second = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        let (j2, _r2) = submit(&mut st, keyed("a"), "two");
+        let answered: Vec<_> = [&first, &second]
+            .iter()
+            .filter_map(|rx| rx.try_recv().ok())
+            .collect();
+        assert_eq!(answered.len(), 1, "exactly one runner was handed a job");
+        assert!(matches!(st.jobs[&j1].phase, Phase::Inflight));
+        assert!(matches!(st.jobs[&j2].phase, Phase::Queued));
+        assert_eq!(st.owners.len(), 1);
+    }
+
+    /// While the owner is busy, a message for its key waits in the owner's queue
+    /// and a generic runner that is parked and idle does NOT get it.
+    #[test]
+    fn a_busy_owner_queues_rather_than_spills() {
+        let mut st = State::default();
+        let owner = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        answered_job(&owner);
+        let spare = park_generic(&mut st);
+        let (j2, _r2) = submit(&mut st, keyed("a"), "two");
+        assert!(matches!(st.jobs[&j2].phase, Phase::Queued));
+        assert!(
+            spare.try_recv().is_err(),
+            "the spare runner was offered a keyed job"
+        );
+        assert_eq!(
+            st.owners[&tenure_of(&st, &job_key(&keyed("a")).unwrap())].queue,
+            [j2]
+        );
+        assert!(matches!(st.jobs[&j1].phase, Phase::Inflight));
+    }
+
+    /// The owner is handed its queue one job at a time, in arrival order, and
+    /// is never answered idle while work waits.
+    #[test]
+    fn the_queue_is_served_in_arrival_order() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        let tenure = answered_job(&first)["tenure"].as_str().unwrap().to_string();
+        let (_j2, _r2) = submit(&mut st, keyed("a"), "two");
+        let (_j3, _r3) = submit(&mut st, keyed("a"), "three");
+
+        // `caos next`: post the result and keep the tenure, then poll.
+        st.jobs.remove(&j1);
+        settle_owner(&mut st, &tenure, true);
+        let (parked, rx) = owner_polls(&mut st, &tenure);
+        assert!(!parked, "work was waiting, so the poll is answered at once");
+        let two = answered_job(&rx);
+        assert_eq!(two["req"], "two");
+        assert_eq!(
+            two["tenure"],
+            tenure.as_str(),
+            "the same ownership, a new job"
+        );
+
+        let (j2, _) = st
+            .jobs
+            .iter()
+            .find(|(_, j)| j.arg_tree == "two")
+            .map(|(i, j)| (*i, j.nonce.clone()))
+            .unwrap();
+        st.jobs.remove(&j2);
+        settle_owner(&mut st, &tenure, true);
+        let (_, rx) = owner_polls(&mut st, &tenure);
+        assert_eq!(answered_job(&rx)["req"], "three");
+    }
+
+    /// A parked owner is handed a message the moment it arrives.
+    #[test]
+    fn a_parked_owner_gets_a_new_message_at_once() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        let tenure = answered_job(&first)["tenure"].as_str().unwrap().to_string();
+        st.jobs.remove(&j1);
+        settle_owner(&mut st, &tenure, true);
+        let (parked, rx) = owner_polls(&mut st, &tenure);
+        assert!(parked);
+        let (_j2, _r2) = submit(&mut st, keyed("a"), "two");
+        assert_eq!(answered_job(&rx)["req"], "two");
+    }
+
+    /// A result that does not keep the tenure ends the ownership, and what
+    /// queued behind it is offered to the pool again, unowned.
+    #[test]
+    fn a_result_without_keep_releases_the_key() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        let tenure = answered_job(&first)["tenure"].as_str().unwrap().to_string();
+        let (j2, _r2) = submit(&mut st, keyed("a"), "two");
+        st.jobs.remove(&j1);
+        settle_owner(&mut st, &tenure, false);
+        assert!(st.owners.is_empty() && st.by_key.is_empty());
+        assert!(
+            matches!(st.jobs[&j2].phase, Phase::Pending { .. }),
+            "unowned again"
+        );
+        // The next generic runner to arrive takes it and owns the key afresh.
+        let later = park_generic(&mut st);
+        offer_job(&mut st, j2);
+        assert_eq!(answered_job(&later)["req"], "two");
+        assert_eq!(st.owners.len(), 1);
+    }
+
+    /// A lapsed lease fails the job in flight (uncacheably, as an outcome the
+    /// caller sees) and re-dispatches the queue.
+    #[test]
+    fn a_lapse_fails_the_job_in_flight_and_frees_the_queue() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let (_j1, r1) = submit(&mut st, keyed("a"), "one");
+        let tenure = answered_job(&first)["tenure"].as_str().unwrap().to_string();
+        let (j2, _r2) = submit(&mut st, keyed("a"), "two");
+        lapse_owner(&mut st, &tenure);
+        let outcome = std::iter::from_fn(|| r1.try_recv().ok())
+            .find_map(|event| match event {
+                DispatchEvent::Outcome(Outcome::Failed(message)) => Some(message),
+                _ => None,
+            })
+            .expect("the in-flight job failed");
+        assert!(outcome.contains("lease"), "{outcome}");
+        assert!(st.owners.is_empty() && st.by_key.is_empty());
+        assert!(matches!(st.jobs[&j2].phase, Phase::Pending { .. }));
+        // The owner's own late poll is refused rather than parked.
+        let (reply, _rx) = mpsc::channel();
+        let poll = ParkedPoll {
+            id: 99,
+            required: keyed("a"),
+            lineage: Vec::new(),
+            matchable_until: Instant::now() + Duration::from_secs(60),
+            reply,
+            tenure: Some(tenure.clone()),
+        };
+        assert!(owner_poll(&mut st, &tenure, poll).is_err());
+    }
+
+    /// Eviction ends a parked owner's ownership, and it is only ever chosen
+    /// while its queue is empty. A job nothing can serve kicks it, as it would
+    /// any warm runner.
+    #[test]
+    fn eviction_releases_a_parked_owner() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let (j1, _r1) = submit(&mut st, keyed("a"), "one");
+        let tenure = answered_job(&first)["tenure"].as_str().unwrap().to_string();
+        st.jobs.remove(&j1);
+        settle_owner(&mut st, &tenure, true);
+        let (parked, rx) = owner_polls(&mut st, &tenure);
+        assert!(parked);
+        // A job for another image: no poll matches, the owner's lineage does.
+        let (_other, _r) = submit(&mut st, args(&[("base", "other")]), "other");
+        assert!(matches!(rx.try_recv(), Ok(PollReply::Exit)));
+        assert!(st.owners.is_empty() && st.by_key.is_empty());
+    }
+
+    /// Two instances are two keys with two owners, never one's queue for the
+    /// other's.
+    #[test]
+    fn keys_are_independent() {
+        let mut st = State::default();
+        let first = park_generic(&mut st);
+        let second = park_generic(&mut st);
+        let (_j1, _r1) = submit(&mut st, keyed("a"), "a1");
+        let (_j2, _r2) = submit(&mut st, keyed("b"), "b1");
+        let a = answered_job(&second);
+        let b = answered_job(&first);
+        assert_ne!(a["tenure"], b["tenure"]);
+        assert_eq!(st.owners.len(), 2);
     }
 }

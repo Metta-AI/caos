@@ -780,7 +780,9 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_string(&mut body)?;
             runner::trace_child(config, &body)
         }
-        Method::Post if path == "/runner/poll" || path == "/runner/result" => {
+        Method::Post
+            if path == "/runner/poll" || path == "/runner/result" || path == "/runner/lease" =>
+        {
             let authorization = request
                 .headers()
                 .iter()
@@ -790,6 +792,8 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_string(&mut body)?;
             if path == "/runner/poll" {
                 runner::poll(authorization.as_deref(), &body)
+            } else if path == "/runner/lease" {
+                runner::lease(authorization.as_deref(), &body)
             } else {
                 runner::result(authorization.as_deref(), &body)
             }

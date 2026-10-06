@@ -65,14 +65,14 @@ An actor request is a call to the `actor` wrapper tool with these args:
 |---|---|
 | `state-ref` | the branch holding the actor's state: `refs/heads/actors/<name>` |
 | `inner` | the inner actor: any caos worker request template, in any image |
-| `nonce` | any value that makes this ArgTree unique, so the outer request is never answered from the cache |
+| `request-id` | any value that makes this ArgTree unique, so the outer request is never answered from the cache |
 | `message` | the message: a blob or a tree, opaque to the wrapper and passed to the inner unchanged |
 
 `message` is one entry so that a message field can never collide with `state`
 or with the wrapper's own args, and so the inner's input and output are
 symmetric (`{state, message}` in, `{state, reply}` out).
 
-The nonce is only a cache-buster. Reusing it across retries or minting a new
+The request-id is only a cache-buster. Reusing it across retries or minting a new
 one per attempt are both correct, because messages are idempotent.
 
 ### Branch layout
@@ -110,7 +110,7 @@ Two choices here differ from a first instinct:
   hit the cache.
 
 Because the inner is a pure function of `(state tree, message)`, **caching it is
-correct**. That is why the nonce goes only on the outer request. A retry after
+correct**. That is why the request-id goes only on the outer request. A retry after
 a lost race reaches a different head and so a different inner request, but a
 retry after an unrelated failure with the head unchanged reuses the cached
 inner result.
@@ -162,7 +162,7 @@ with the inner's run time, and the compare-and-swap makes it safe.
 | inner fails | the request fails; not cached |
 | crash after the push, before the reply is posted | the job fails; a retry re-applies the message, which is idempotent |
 | inner succeeds, finish fails | the inner's result stays cached; a retry on an unchanged head reuses it |
-| duplicate concurrent requests | single-flight coalesces identical outer requests; distinct nonces both run and one loses the race |
+| duplicate concurrent requests | single-flight coalesces identical outer requests; distinct request-ids both run and one loses the race |
 
 ## Research: what the existing code gives us
 

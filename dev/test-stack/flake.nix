@@ -159,6 +159,19 @@ sandbox = false''
               "CAOS_GRANT_SYS_ADMIN=1"
               "CAOS_GRANT_DEVICES=/dev/fuse"
               "CAOS_GRANT_VOLUMES=/mounted-nix /caos-dev /caos-images"
+              # RESIDENT (design/daemons.md): a worker on this image MAY call
+              # `caos next` and stay, which is what dev/stack-daemon does. A worker
+              # that does not behaves as on any image: caos-build and the suite's
+              # own fan-out jobs run here too and are unchanged.
+              #
+              # The lifetime cap is the runner's, not the daemon's: a stack is a
+              # cache of work, and an idle one is evicted as soon as anything else
+              # wants its slot, so the cap is only the backstop for a quiet
+              # machine. The grace period is how long a stack has to harvest its
+              # conversations between SIGTERM and SIGKILL.
+              "CAOS_RESIDENT=1"
+              "CAOS_RESIDENT_MAX_SECS=7200"
+              "CAOS_RESIDENT_GRACE_SECS=60"
             ];
           };
           # /usr/bin/env, because nearly every script in this tree opens with

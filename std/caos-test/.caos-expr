@@ -1,8 +1,12 @@
-# The `caos-test` tool (SPEC, "Tools"): the dev/test-stack worker image with
-# this directory's script curried onto it, plus the `help` an agent registers
-# it by. It moved out of caos-tools/ into std/ so the agent harness can DEPend on
-# it and register it ALWAYS — the tool comes from the harness's own version, not
-# from the tree under test (design/flake-inputs.md, "the tui").
+# The `caos-test` tool (SPEC, "Tools"): a ROUTER. It sends a `run-tests` message
+# to the stack daemon for the tree (dev/stack-daemon), which brings the tree's
+# dev stack up if it is not already and runs the suite on it. It moved out of
+# caos-tools/ into std/ so the agent harness can DEPend on it and register it
+# ALWAYS — the tool comes from the harness's own version, not from the tree under
+# test (design/flake-inputs.md, "the tui").
+#
+# std/bash, not the daemon's image: the router only forms a request and
+# tail-calls it, so it should not pay for the stack image's start.
 #
 # The docs are a HERE-STRING, so they live here rather than in the script — and
 # a `.caos-expr` is STRIPPED from the tree it is evaluated against, so editing
@@ -15,11 +19,13 @@ unchanged test never re-runs. Returns the report: a line per test with its
 time and the hash of its record, the last few lines of every failing test,
 and a pass/fail banner. Pass a record's hash to `caos-test-result` for that test's
 full output or its inner-stack logs. Nothing is handed in from the host: the
-stack under test is compiled from these sources, inside workers. This tool is
-specific to the caos codebase; run in any other tree it reports cleanly that
-there is nothing for it to test.
+stack under test is compiled from these sources, inside workers. The stack stays
+up between calls on the same tree, so the second call skips the build and the
+bring-up; `caos-stack` starts, inspects and stops it. This tool is specific to
+the caos codebase; run in any other tree it reports cleanly that there is
+nothing for it to test.
 @param [test-salt] Re-run every test while leaving the build a cache hit — any fresh value (e.g. $(date --iso=s)) re-keys each test and the requests a client test makes, but nothing above them.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
 @in
 END
-curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh --help=$HELP
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/stack-daemon --help=$HELP

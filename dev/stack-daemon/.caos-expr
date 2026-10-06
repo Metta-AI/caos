@@ -1,0 +1,9 @@
+# The stack daemon (design/daemons.md, Part 2): dev/test-stack's image — nix, a
+# stack userland, the grants a dev stack needs, and CAOS_RESIDENT=1 — with this
+# directory's script curried onto it. A job for it carries `affinity`, the
+# tree under test, so ONE container serves every message for one tree and keeps
+# that tree's dev stack running between them.
+#
+# It is not run by hand. `std/caos-test` and `std/caos-stack` are the callers:
+# each forms the keyed message and tail-calls it.
+curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh

@@ -203,13 +203,52 @@ hand-running a container without a server rendezvous matters for debugging, a
 `--print` flag on runner mode covers it. Loop: run the handed-in job, post result, poll `{image}` with
 TTL ≈ container start cost, until `idle`/`exit` → exit 0.
 
-**Resident worker daemon** (`{image, bin}`) — **deferred**. The container
-runner already serves any `bin` for its image at fork+exec cost; the only
-further win is warm process state, which drags in real questions (who cycles
-the root-owned `/cas` for a live worker; hermeticity becomes the daemon
-author's problem). The protocol needs nothing new for it later: the worker
-posts its own result and polls `{image, bin}` while the caos parent waits on
-child death, per the nesting rule.
+**Resident worker daemon** — implemented; see [Resident workers](#resident-workers)
+below and `design/daemons.md`.
+
+## Resident workers
+
+A worker on an image that declares `CAOS_RESIDENT=1` may call `caos next`
+instead of exiting (`design/daemons.md` has the model and the reasons). The wire
+protocol grew only additions: a job with the reserved `affinity` arg is
+KEYED, and the runner that holds a key's ownership names it on three calls.
+
+- **Ownership.** The server keys a job by `(base, affinity)`. The first keyed job
+  claimed by a poll makes that poll's runner the key's OWNER, in the same step
+  under the same lock, so two first messages cannot both claim. Every later job
+  for the key waits in the owner's queue (phase `Queued`: no pending deadline,
+  since a live owner is merely busy) and is offered to nobody else — not to a warm
+  runner, not to the generic pool, not into the eviction cascade. One job at a
+  time per key, in arrival order.
+- **`tenure`.** The server mints an unguessable id for each ownership and returns
+  it as `tenure` in the payload of every keyed job. It names one ownership, not
+  one job, so it survives from job to job while the nonce does not.
+- **`POST /runner/lease {tenure}`** renews the owner's lease; `{tenure, release:
+  true}` gives the key up. A runner renews every `CAOS_LEASE_RENEW_MS` (5s) from a
+  thread of its own. A lease lasts `CAOS_LEASE_SECS` (15s) after the last renewal
+  — and `CAOS_LEASE_START_SECS` (600s) for a NEW owner, whose container may still
+  be starting. 410 means the tenure is not live. A lapse fails the job in flight
+  (a failure is never cached, so the caller can retry), and the queue goes back to
+  the pending table, unowned.
+- **`POST /runner/result … "keep": true`** says the runner stays the owner and is
+  about to poll for its queue. A result WITHOUT `keep` ends the ownership, and
+  anything queued behind it is offered afresh. `caos next` posts with `keep`;
+  every other result does not, so a worker that never calls `caos next` leaves
+  nothing behind.
+- **`POST /runner/poll … "tenure": <id>`** is the owner's poll. It is answered
+  from the owner's queue only, and renews the lease. `idle` does NOT release the
+  key: the owner polls again, and a job that arrived in between waited. `exit` is
+  eviction and does release it. An owner is parked only while its queue is empty,
+  so eviction never strands a queued job. 410 means the tenure lapsed.
+
+The runner's side is `rust/crates/caos/src/runner.rs`. It keeps the worker
+running across jobs, answers `caos next` over a root-owned unix socket
+(`CAOS_NEXT_SOCKET`, default `/run/caos/next.sock`) that only the setuid `caos`
+can reach, and between jobs does a NARROW reset: `/cas/args`, `/cas/out`,
+`/cas/out-trace`, `/cas/nonce`, `/cas/salt` and `/secret` go; the rest of `/cas`,
+the scratch directories and every process stay. Its output is relayed line by
+line as it is written, masked, with a bounded tail kept to explain a failure.
+`caos next` exits 0 with the next job's args at `/cas/args`, or 10 to say leave.
 
 ## Fly (sequenced last)
 
@@ -225,7 +264,7 @@ verb is specced now so the protocol is stable when it does.
 
 ## Out of scope
 
-- Resident worker daemons (above).
+- Handling more than one job at a time per instance (see [Resident workers](#resident-workers)).
 - Batch object fetch (a tree plus its children's contents in one hop) — a nice
   transport optimization someday; nothing here needs it. A plain `caos get` on
   a tree is already a one-hop "get children" at the names+oids level.
