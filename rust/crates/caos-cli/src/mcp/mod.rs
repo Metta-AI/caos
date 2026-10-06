@@ -257,7 +257,7 @@ fn dispatch_call(
     request_head: &Oid,
     call: &str,
 ) -> Result<(), String> {
-    let secrets = caos::Secrets::current().for_conversation(id);
+    let secrets = caos::Secrets::current().for_conversation(&crate::writers::address(t, id)?);
     let configuration = tools_configuration(t, options, id, &secrets)?;
     let kvs = vec![
         format!("--head:commit={request_head}"),
@@ -300,7 +300,17 @@ fn tools_configuration(
     // A host no longer snapshots merge refs into the turn: main's history and
     // merge tools resolve against the conversation's own Git store, so a ref
     // snapshot passed from here would be a second, staler source of truth.
-    let config = vec![format!("--conversation={id}")];
+    let namespace = crate::writers::namespace_of(t, id)?;
+    let config = vec![
+        format!(
+            "--conversation={}",
+            conversation_protocol::v3::refs::address(&namespace, id)
+        ),
+        format!(
+            "--{}={namespace}",
+            conversation_protocol::v3::writers::WRITES_ARG
+        ),
+    ];
     let base = step_image(t, options, secrets)?;
     crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
 }
@@ -652,7 +662,7 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     if record_prompt(t, options, &id, prompt)? {
         announce(&format!(
             "caos conversation ref {}; {readers}",
-            conversation_ref(&id)?
+            conversation_ref(t, &id)?
         ))?;
     } else if let Some(note) = note {
         announce(&format!("{note}; {readers}"))?;
@@ -682,8 +692,8 @@ fn record_prompt(
 ) -> Result<bool, String> {
     let username = resolve_username(t, None)?;
     let signature = signature(&username)?;
-    let refname = conversation_ref(id)?;
-    let secrets = caos::Secrets::current().for_conversation(id);
+    let refname = conversation_ref(t, id)?;
+    let secrets = caos::Secrets::current().for_conversation(&crate::writers::address(t, id)?);
     let phase = std::time::Instant::now();
     let configuration = tools_configuration(t, options, id, &secrets)?;
     cc_timing("tools_configuration", phase.elapsed());
@@ -824,6 +834,13 @@ fn record_prompt(
             &admission,
         )?;
 
+        if observed.is_none() {
+            crate::writers::ensure_namespace(
+                &mut store,
+                &crate::writers::namespace_of(t, id)?,
+                id,
+            )?;
+        }
         let phase = std::time::Instant::now();
         let pushed = push_cas(&store, &refname, observed.as_ref(), &claimed)?;
         cc_timing("push_cas", phase.elapsed());
@@ -991,7 +1008,7 @@ fn append(
     id: &str,
     mut step: impl FnMut(&mut GitStore, &Oid) -> Result<Option<Oid>, String>,
 ) -> Result<Oid, String> {
-    let refname = conversation_ref(id)?;
+    let refname = conversation_ref(t, id)?;
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
         let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
@@ -1227,12 +1244,13 @@ mod tests {
         for hostile in ["../../etc", "a/../b", "with space", "head", "a.lock"] {
             let payload = json!({ "session_id": hostile });
             let id = conversation_id(&payload).unwrap();
-            let refname = conversation_ref(&id).unwrap();
+            let namespace = crate::writers::own_namespace(&id).unwrap();
+            let refname = refs::head_ref(&namespace, &id).unwrap();
             assert!(
-                refname.starts_with("refs/caos/v3/conversations/"),
+                refname.starts_with(&format!("refs/caos/w/{namespace}/conversations/")),
                 "session id {hostile:?} named {refname}"
             );
-            assert_eq!(refs::parse_head_ref(&refname).unwrap(), id);
+            assert_eq!(refs::parse_head_ref(&refname).unwrap(), (namespace, id));
         }
     }
 

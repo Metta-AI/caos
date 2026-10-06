@@ -72,6 +72,15 @@ llm_test_setup() {
     || fail "reading the llm-step identity"
   assert_oid "$LLM_TEST_SECRET_HASH" "the secret-hash identity"
   assert_oid "$LLM_TEST_LLM_STEP" "the llm-step identity"
+  # THE WRITER THIS TEST ACTS FOR (design/ref-writers.md): the key its run
+  # token resolves to. The suite hands every test `--writes=*`, so the token
+  # covers whatever namespace the tool founds for a conversation under it.
+  [ -r /secret/caos-write ] \
+    || fail "this job holds no run token: dev/run-test must hand the test --writes"
+  LLM_TEST_WRITER=$(curl -sf -X POST --data-binary @/secret/caos-write \
+    "$CAOS_SERVER_URL/ref-writers/token" | jq -r .key) \
+    || fail "asking the server which writer this test's run token is"
+  export LLM_TEST_WRITER
 
   local self ip names
   self=$(cat /etc/hostname) || fail "no /etc/hostname"
@@ -152,9 +161,12 @@ new_llm_conversation() {
   LLM_TEST_NEW_CONVERSATION=1
   printf '%s' "$system" > /tmp/system.txt
   caos put /tmp/system.txt "/cas/system-$suffix" >/dev/null || fail "publishing the system prompt"
+  conv_namespace=$($TOOL found --repo /tmp/repo --id "$conv") \
+    || fail "founding $conv's namespace (design/ref-writers.md)"
   llm=$(caos curry --base:hash="$LLM_TEST_LLM_STEP" \
     --system:@="/cas/system-$suffix" --model=test-model \
-    --base-url="http://$stub_host:$stub_port" --conversation="$conv") \
+    --base-url="http://$stub_host:$stub_port" --conversation="$conv_namespace/$conv" \
+    --writes="$conv_namespace") \
     || fail "$curry_failure"
 }
 
@@ -222,7 +234,7 @@ dump_conversation() {
   echo "--- parent run trace ---" >&2; curl -s "$CAOS_SERVER_URL/status/$parent_request?all=1" 2>/dev/null | head -c 6000 >&2 || true; echo >&2
   $TOOL children --repo /tmp/repo --head "$parent_tip" > /tmp/children.jsonl 2>&2 || true; cat /tmp/children.jsonl >&2 || true; child_id=$(jq -r '.id' /tmp/children.jsonl 2>/dev/null | head -1) || true
   if [ -n "$child_id" ]; then
-    child_ref=$($TOOL ref --id "$child_id") || child_ref=""; child_ref=${child_ref#ref }
+    child_ref=$($TOOL ref --id "$child_id" --namespace "${conv_namespace:-}") || child_ref=""; child_ref=${child_ref#ref }
     child_tip=$($TOOL fetch --repo /tmp/repo --ref "$child_ref" 2>&2) || child_tip=""; child_tip=${child_tip#head }
     echo "child ref $child_ref tip ${child_tip:-absent}" >&2
     if [ -n "$child_tip" ]; then $TOOL request --repo /tmp/repo --head "$child_tip" >&2 || true; $TOOL transcript --repo /tmp/repo --head "$child_tip" >&2 || true; fi

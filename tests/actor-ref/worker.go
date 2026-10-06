@@ -10,12 +10,16 @@
 //  1. creating a ref (old = zeros) at a commit made by `caos put-commit`;
 //  2. updating it with the right <old> to a child commit;
 //  3. a stale <old> is REJECTED and the ref does not move;
-//  4. the result is a normal branch: git can fetch it and see both commits.
+//  4. without the run token the update is REFUSED: the ref lives in a ref-writer
+//     namespace (design/ref-writers.md, "Actors"), and the token rides as a push
+//     option after the command;
+//  5. the result is a normal branch: git can fetch it and see both commits.
 package main
 
 import (
 	"bytes"
 	"crypto/sha1"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,11 +53,20 @@ func emptyPack() []byte {
 }
 
 // setRef asks git-receive-pack to move ref from old to new, sending no
-// objects. It returns the server's status lines.
-func setRef(url, ref, old, new string) string {
+// objects, with token (if any) as a push option. It returns the server's
+// status lines.
+func setRef(url, ref, old, new, token string) string {
+	caps := "report-status agent=caos-spike"
+	if token != "" {
+		caps = "report-status push-options agent=caos-spike"
+	}
 	var body bytes.Buffer
-	body.WriteString(pkt(fmt.Sprintf("%s %s %s\x00 report-status agent=caos-spike\n", old, new, ref)))
+	body.WriteString(pkt(fmt.Sprintf("%s %s %s\x00 %s\n", old, new, ref, caps)))
 	body.WriteString("0000")
+	if token != "" {
+		body.WriteString(pkt("caos-auth=run:" + token))
+		body.WriteString("0000")
+	}
 	body.Write(emptyPack())
 	req := w.Check(http.NewRequest("POST", url+"/git-receive-pack", &body))
 	req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
@@ -84,6 +97,39 @@ func commit(tag, value, parent string) string {
 	return run("caos", "put-commit", file, "/cas/commit-"+tag)
 }
 
+// found makes a namespace whose only writer is the one token acts for, and
+// returns its id: a root commit holding `.caos/writers`, pushed to
+// refs/caos/w/<its hash>/writers (design/ref-writers.md, "Namespaces").
+func found(url, token, label string) string {
+	resp := w.Check(http.Post(url+"/ref-writers/token", "text/plain", strings.NewReader(token)))
+	defer resp.Body.Close()
+	w.True(resp.StatusCode == 200, "the server does not know this test's run token: %s", resp.Status)
+	var grant struct {
+		Key string `json:"key"`
+	}
+	w.Must(json.NewDecoder(resp.Body).Decode(&grant))
+	w.Must(os.RemoveAll("/tmp/ns"))
+	run("git", "init", "-q", "--bare", "/tmp/ns")
+	git := func(stdin string, args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", "/tmp/ns"}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_NAME=caos",
+			"GIT_AUTHOR_EMAIL=caos", "GIT_COMMITTER_NAME=caos", "GIT_COMMITTER_EMAIL=caos")
+		cmd.Stdin = strings.NewReader(stdin)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		w.True(err == nil, "git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return strings.TrimSpace(string(out))
+	}
+	list := "# <ed25519 public key>  <label, display only>\n" + grant.Key + "\n"
+	blob := git(list, "hash-object", "-w", "--stdin")
+	dir := git("100644 blob "+blob+"\twriters\n", "mktree")
+	root := git("040000 tree "+dir+"\t.caos\n", "mktree")
+	id := git("", "commit-tree", root, "-m", "caos namespace", "-m", label)
+	git("", "push", "-q", "-o", "caos-auth=run:"+token, url, id+":refs/caos/w/"+id+"/writers")
+	return id
+}
+
 func remoteHead(url, ref string) string {
 	out := run("git", "ls-remote", "--refs", url, ref)
 	if out == "" {
@@ -98,7 +144,11 @@ func main() {
 		w.True(url != "", "this test needs CAOS_SERVER_URL from the runner")
 		run("caos", "get", "/cas/args/test-salt")
 		salt := strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/test-salt"))))
-		ref := fmt.Sprintf("refs/heads/actors/ref-%s-%d", salt, os.Getpid())
+		// dev/run-test hands every test writes=*, so this job holds a run token
+		// that may found a namespace listing its writer.
+		token := strings.TrimSpace(string(w.Check(os.ReadFile("/secret/caos-write"))))
+		ns := found(url, token, fmt.Sprintf("tests/actor-ref %s %d", salt, os.Getpid()))
+		ref := fmt.Sprintf("refs/caos/w/%s/actors/ref-%s-%d", ns, salt, os.Getpid())
 
 		w.Step("mint two commits with caos put-commit (no push)")
 		c1 := commit("one", "1", "")
@@ -106,19 +156,25 @@ func main() {
 		w.True(remoteHead(url, ref) == "", "fresh ref already exists")
 
 		w.Step("create the ref with an empty pack")
-		resp := setRef(url, ref, zeros, c1)
+		resp := setRef(url, ref, zeros, c1, token)
 		fmt.Fprintf(os.Stderr, "create response: %q\n", resp)
 		w.True(strings.Contains(resp, "ok "+ref), "create was not accepted: %q", resp)
 		w.True(remoteHead(url, ref) == c1, "ref is %q, want %s", remoteHead(url, ref), c1)
 
 		w.Step("a STALE <old> is rejected and the ref does not move")
-		resp = setRef(url, ref, zeros, c2)
+		resp = setRef(url, ref, zeros, c2, token)
 		fmt.Fprintf(os.Stderr, "stale response: %q\n", resp)
 		w.True(strings.Contains(resp, "ng "+ref), "a stale <old> was not rejected: %q", resp)
 		w.True(remoteHead(url, ref) == c1, "the ref moved on a stale update")
 
+		w.Step("without the run token the update is refused")
+		resp = setRef(url, ref, c1, c2, "")
+		fmt.Fprintf(os.Stderr, "tokenless response: %q\n", resp)
+		w.True(strings.Contains(resp, "ng "+ref), "an update without the token was not refused: %q", resp)
+		w.True(remoteHead(url, ref) == c1, "the ref moved without the token")
+
 		w.Step("update with the right <old>")
-		resp = setRef(url, ref, c1, c2)
+		resp = setRef(url, ref, c1, c2, token)
 		fmt.Fprintf(os.Stderr, "update response: %q\n", resp)
 		w.True(strings.Contains(resp, "ok "+ref), "update was not accepted: %q", resp)
 		w.True(remoteHead(url, ref) == c2, "ref is %q, want %s", remoteHead(url, ref), c2)

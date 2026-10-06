@@ -63,7 +63,8 @@ An actor request is a call to the `actor` wrapper tool with these args:
 
 | arg | meaning |
 |---|---|
-| `state-ref` | the branch holding the actor's state: `refs/heads/actors/<name>` |
+| `state-ref` | the branch holding the actor's state: `refs/caos/w/<ns>/actors/<name>`, in a ref-writer namespace ([ref-writers.md](../../design/ref-writers.md), "Actors") |
+| `writes` | `<ns>`: what lets finish move the branch. The server grants finish a run token for it; the wrapper adds no `writes` to the inner's request |
 | `inner` | the inner actor: any caos worker request template, in any image |
 | `nonce` | any value that makes this ArgTree unique, so the outer request is never answered from the cache |
 | `message` | the message: a blob or a tree, opaque to the wrapper and passed to the inner unchanged |
@@ -189,11 +190,13 @@ ArgTree hash with no expiry (Redis is best-effort, and the key is namespaced by
 `cache_namespace`). I did not find the server retrying a failed job by itself,
 so the retry in rule 3 is the **caller's**.
 
-### 3. No credentials needed
+### 3. Credentials
 
-The Git paths are unauthenticated: `handle()` in `main.rs` routes them before
-anything else, and only `/runner/*` checks a token. A wrapper needs only
-`CAOS_SERVER_URL`, which every worker has.
+Reading needs none: the Git paths are open to any reader, and a wrapper needs
+only `CAOS_SERVER_URL`, which every worker has. Moving the branch needs the run
+token the server grants finish when the request carries `writes=<ns>`; finish
+sends it as the push option `caos-auth=run:<token>`
+([ref-writers.md](../../design/ref-writers.md), "Actors").
 
 ### 4. Existing machinery to reuse
 
@@ -233,8 +236,9 @@ wrapper can use it to build `{state: <oid>}` the same way.
 
 ### Caveats
 
-- Anyone who can reach the server can rewrite an actor branch. Conversation refs
-  already accept this; actors inherit it.
+- Only the namespace's writers, and the jobs they hand `writes=<ns>`, can move
+  an actor branch ([ref-writers.md](../../design/ref-writers.md)). Anyone can
+  read it.
 - Git advertises every ref on every push and fetch, so the number of actors is a
   soft scaling limit.
 - GC is deliberately off, so actor history is never reclaimed.
@@ -364,5 +368,6 @@ detection.
    spine in the tree. Does the inner have an easy way to build a new state from
    the old by oid, with no checkout? This is the main usability question for
    authors, and the `state-out` helper in `worker-common` is meant to answer it.
-5. **Authorization.** Do we want per-namespace write control on Git pushes
-   before actors hold anything sensitive?
+5. **Authorization.** Answered by [ref-writers.md](../../design/ref-writers.md):
+   the branch lives in a namespace, and only its writers and the jobs they
+   grant can move it.

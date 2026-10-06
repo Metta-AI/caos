@@ -16,12 +16,18 @@
 //	after-lazy  a read touched one entry and the inner saw the others unmaterialized
 //	after-hit1/after-hit2
 //	            the same read twice with different nonces ran the inner once
+//
+// Every ref lives in a namespace start founds with the run token dev/run-test
+// grants each test (design/ref-writers.md, "Actors"). Each request that moves
+// one, and each stage that makes such requests, carries `writes=<ns>`.
 package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,6 +38,7 @@ import (
 
 var (
 	salt     string
+	ns       string // the namespace every ref here lives in
 	stateRef string
 	url      string
 )
@@ -60,6 +67,46 @@ func run(name string, args ...string) string {
 func caos(args ...string) string { return run("caos", args...) }
 
 func git(args ...string) string { return run("git", append([]string{"-C", "/tmp/repo"}, args...)...) }
+
+// gitStdin runs git in /tmp/repo with stdin.
+func gitStdin(stdin string, args ...string) string {
+	cmd := exec.Command("git", append([]string{"-C", "/tmp/repo"}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Stdin = strings.NewReader(stdin)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	w.True(err == nil, "git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	return strings.TrimSpace(string(out))
+}
+
+// found makes a namespace whose only writer is the one this test's run token
+// acts for, and returns its id: a root commit holding `.caos/writers`, pushed to
+// refs/caos/w/<its hash>/writers (design/ref-writers.md, "Namespaces").
+func found(label string) string {
+	token := strings.TrimSpace(string(w.Check(os.ReadFile("/secret/caos-write"))))
+	resp := w.Check(http.Post(url+"/ref-writers/token", "text/plain", strings.NewReader(token)))
+	defer resp.Body.Close()
+	w.True(resp.StatusCode == 200, "the server does not know this test's run token: %s", resp.Status)
+	var grant struct {
+		Key string `json:"key"`
+	}
+	w.Must(json.NewDecoder(resp.Body).Decode(&grant))
+	list := "# <ed25519 public key>  <label, display only>\n" + grant.Key + "\n"
+	blob := gitStdin(list, "hash-object", "-w", "--stdin")
+	dir := gitStdin("100644 blob "+blob+"\twriters\n", "mktree")
+	root := gitStdin("040000 tree "+dir+"\t.caos\n", "mktree")
+	id := gitStdin("", "commit-tree", root, "-m", "caos namespace", "-m", label)
+	git("push", "-q", "-o", "caos-auth=run:"+token, "caos", id+":refs/caos/w/"+id+"/writers")
+	return id
+}
+
+// namespaceOf is the <ns> of refs/caos/w/<ns>/....
+func namespaceOf(ref string) string {
+	rest, _ := strings.CutPrefix(ref, "refs/caos/w/")
+	id, _, _ := strings.Cut(rest, "/")
+	return id
+}
 
 func exists(path string) bool {
 	_, err := os.Lstat(path)
@@ -98,7 +145,7 @@ func next(stage string, extra ...string) string {
 		"--stage=" + stage, "--test-salt:@=/cas/args/test-salt",
 		"--actor:@=/cas/args/actor", "--kv:@=/cas/args/kv",
 		"--probe:@=/cas/args/probe", "--mapper:@=/cas/args/mapper",
-		"--state-ref=" + stateRef}
+		"--state-ref=" + stateRef, "--writes=" + ns}
 	return caos(append(args, extra...)...)
 }
 
@@ -107,9 +154,10 @@ func kvInner() string {
 }
 
 // probeInner is the impure inner, in this image: --race-ref=R, --count-ref=C.
+// It pushes to both, so it asks to write their namespace.
 func probeInner(opts ...string) string {
 	return caos(append([]string{"curry", "--base:@=/cas/args/base",
-		"--worker1:@=/cas/args/probe", "--kv:@=/cas/args/kv"}, opts...)...)
+		"--worker1:@=/cas/args/probe", "--kv:@=/cas/args/kv", "--writes=" + ns}, opts...)...)
 }
 
 // actorRequest is the complete request for one message.
@@ -118,7 +166,8 @@ func actorRequest(message, nonce, inner string) string {
 	_ = os.Remove("/cas/msg")
 	caos("put", "/tmp/msg", "/cas/msg")
 	return caos("prepare-request", "--base:@=/cas/args/actor", "--state-ref="+stateRef,
-		"--inner:hash="+inner, "--nonce="+nonce+"-"+salt, "--message:@=/cas/msg")
+		"--inner:hash="+inner, "--nonce="+nonce+"-"+salt, "--message:@=/cas/msg",
+		"--writes="+ns)
 }
 
 // call sends message and continues at nextStage. With catch, a failed request
@@ -133,7 +182,7 @@ func call(message, nonce, inner, nextStage string, catch bool, extra ...string) 
 }
 
 func freshRef(tag string) string {
-	return fmt.Sprintf("refs/heads/actors/test-%s-%d-%d-%d", tag, time.Now().UnixNano(), os.Getpid(), rand.Intn(32768))
+	return fmt.Sprintf("refs/caos/w/%s/actors/test-%s-%d-%d-%d", ns, tag, time.Now().UnixNano(), os.Getpid(), rand.Intn(32768))
 }
 
 func main() {
@@ -154,9 +203,11 @@ func main() {
 		git("remote", "add", "caos", url)
 
 		if stage == "start" {
+			ns = found(fmt.Sprintf("tests/actor %s %d", salt, time.Now().UnixNano()))
 			stateRef = freshRef("main")
 		} else {
 			stateRef = readArg("state-ref")
+			ns = namespaceOf(stateRef)
 		}
 
 		switch stage {
@@ -230,7 +281,7 @@ func main() {
 			caos("put", "/tmp/msgs", "/cas/msgs")
 			mapper := caos("curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/mapper",
 				"--actor:@=/cas/args/actor", "--kv:@=/cas/args/kv",
-				"--state-ref="+stateRef, "--test-salt:@=/cas/args/test-salt")
+				"--state-ref="+stateRef, "--test-salt:@=/cas/args/test-salt", "--writes="+ns)
 			caos("map-then", "/cas/msgs", "--map:hash="+mapper, "--then:hash="+next("after-conc"))
 
 		case "after-conc":
@@ -249,7 +300,7 @@ func main() {
 			w.True(reply == "v3", "getcheck replied '%s'", reply)
 			// The same read twice, different nonces: the inner (pure, so
 			// cached) runs once.
-			countRef := fmt.Sprintf("refs/heads/actors-count/%d-%d-%d", time.Now().UnixNano(), os.Getpid(), rand.Intn(32768))
+			countRef := fmt.Sprintf("refs/caos/w/%s/actors-count/%d-%d-%d", ns, time.Now().UnixNano(), os.Getpid(), rand.Intn(32768))
 			call("get c4", "n7", probeInner("--count-ref="+countRef), "after-hit1", false, "--count-ref="+countRef)
 
 		case "after-hit1":

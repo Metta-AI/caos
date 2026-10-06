@@ -17,7 +17,7 @@ pub fn validate_target_ref(refname: &str) -> Result<(), String> {
 }
 
 pub fn validate_child(child: &str) -> Result<(), String> {
-    conversation_refs::head_ref(child).map(|_| ())
+    conversation_refs::validate_conversation_id(child)
 }
 
 pub fn append_status(refname: &str, task: &str, status: &str, result: &str) -> Result<(), String> {
@@ -44,7 +44,9 @@ pub fn append_child_terminal(
     let subrequest = Oid::parse(subrequest, "subrequest")?;
     let relay = Oid::parse(relay, "relay")?;
     let mut store = scratch_store()?;
-    let child_ref = conversation_refs::head_ref(child)?;
+    // The child's head sits in its parent's namespace.
+    let (namespace, _) = conversation_refs::parse_head_ref(refname)?;
+    let child_ref = conversation_refs::head_ref(&namespace, child)?;
     let terminal_head = store
         .fetch_ref(&child_ref)?
         .ok_or_else(|| format!("child conversation ref {child_ref} does not exist"))?;
@@ -360,7 +362,7 @@ mod tests {
     }
 
     fn conversation(with_task: bool) -> (FakeStore, String, Oid) {
-        let refname = conversation_refs::head_ref("conversation").unwrap();
+        let refname = conversation_refs::head_ref(&"a".repeat(40), "conversation").unwrap();
         let task = oid('1');
         let mut objects = MemoryStore::new();
         let genesis = ensure_genesis(&mut objects).unwrap();
@@ -637,7 +639,7 @@ mod tests {
 
     #[test]
     fn target_ref_is_only_a_v3_conversation_head() {
-        let valid = conversation_refs::head_ref("chat-1").unwrap();
+        let valid = conversation_refs::head_ref(&"a".repeat(40), "chat-1").unwrap();
         assert!(validate_target_ref(&valid).is_ok());
         assert!(validate_target_ref("refs/heads/main").is_err());
         assert!(validate_target_ref("refs/caos/v2/conversations/chat-1/head").is_err());

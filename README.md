@@ -469,7 +469,8 @@ reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-c
 
 A reader names the image a secret is granted to: a path in a repository, at a
 commit (`rev=<sha>`) or a branch (`ref=`), back to an optional `since=<sha>`;
-or `reader:@=<path> conversation=<id>` for a path in one conversation. A copy
+or `reader:@=<path> conversation=<namespace>/<id>` for a path in one
+conversation (design/ref-writers.md). A copy
 of a granted tree — a `DEEP-DEPS` mount, a repository that pins caos — is
 granted too, so a client repo mounting caos' std needs nothing more. Then:
 

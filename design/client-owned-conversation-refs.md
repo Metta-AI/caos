@@ -24,6 +24,11 @@ The cleanup moved all three responsibilities out of the server. We explicitly
 accept that a buggy or malicious worker with repository access can rewrite
 conversation refs; the server provides transport, not policy.
 
+**Superseded in part by [ref writers](ref-writers.md):** the server now refuses
+a write to a conversation ref from anyone not in its namespace's writers list.
+That check is generic (it knows namespaces and writers, not conversations), so
+everything else here stands: the server still enforces no conversation rules.
+
 ## Target boundary
 
 The server retains only generic facilities:

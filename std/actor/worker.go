@@ -26,6 +26,13 @@
 // ancestry to build a pack, which needs every ancestor commit ("a deep
 // checkout"), and a partial clone with a promisor remote does not avoid that
 // (README.md, open question 6; tests/actor-ref proves the direct route).
+//
+// WHO MAY MOVE IT (design/ref-writers.md, "Actors"): the branch lives in a
+// ref-writer namespace, `refs/caos/w/<ns>/actors/<name>`. The caller puts
+// `writes=<ns>` on the request; finish is curried onto the request, so the
+// server grants it a run token, which it sends as the push option
+// `caos-auth=run:<token>`. The wrapper adds no `writes` to the inner's
+// request, so a pure inner holds no token.
 package main
 
 import (
@@ -48,6 +55,8 @@ const (
 	noHead     = "none"
 	zeros      = "0000000000000000000000000000000000000000"
 	gitDir     = "/tmp/actor-git"
+	// Where the server puts this job's run token (design/ref-writers.md).
+	tokenPath = "/secret/caos-write"
 )
 
 // run runs a command and returns its trimmed stdout, failing with its stderr.
@@ -73,6 +82,39 @@ func readArg(name string) string {
 	path := "/cas/args/" + name
 	caos("get", path)
 	return strings.TrimSpace(string(w.Check(os.ReadFile(path))))
+}
+
+// isNamespace matches writers.rs `is_namespace`: the hash of a namespace's
+// first writers commit.
+func isNamespace(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// isStateRef accepts `refs/caos/w/<ns>/actors/<name>`.
+func isStateRef(ref string) bool {
+	rest, ok := strings.CutPrefix(ref, "refs/caos/w/")
+	if !ok {
+		return false
+	}
+	ns, name, ok := strings.Cut(rest, "/actors/")
+	return ok && isNamespace(ns) && name != "" && !strings.Contains(name, "..")
+}
+
+// runToken is the token the server granted this job, or "" without one.
+func runToken() string {
+	b, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func serverURL() string {
@@ -128,8 +170,8 @@ func emptyState() string {
 func main() {
 	w.Main(func() {
 		stateRef := readArg("state-ref")
-		w.True(strings.HasPrefix(stateRef, "refs/heads/actors/") && !strings.Contains(stateRef, ".."),
-			"state-ref %q must be under refs/heads/actors/", stateRef)
+		w.True(isStateRef(stateRef),
+			"state-ref %q must be refs/caos/w/<namespace>/actors/<name> (design/ref-writers.md)", stateRef)
 		if exists("/cas/args/result") {
 			finish(stateRef)
 		} else {
@@ -203,7 +245,8 @@ func publish(stateRef, head, newState string) {
 	if old == "" {
 		old = zeros
 	}
-	status, err := setRef(serverURL(), stateRef, old, candidate)
+	token := runToken()
+	status, err := setRef(serverURL(), stateRef, old, candidate, token)
 	if err == nil && status == "" {
 		return
 	}
@@ -212,6 +255,9 @@ func publish(stateRef, head, newState string) {
 	case observed == candidate:
 		return
 	case observed == head:
+		if token == "" {
+			status += " (no run token: the request needs writes=<namespace>, design/ref-writers.md)"
+		}
 		w.True(false, "moving %s: %s %v", stateRef, status, err)
 	default:
 		w.True(false, "lost the race for %s: %s %v", stateRef, status, err)
@@ -230,11 +276,20 @@ func emptyPack() []byte {
 
 // setRef asks git-receive-pack to move ref from old to new, sending no objects.
 // It returns "" when the server accepted the update, else the server's
-// complaint (a stale <old> arrives as `ng <ref> <reason>`).
-func setRef(url, ref, old, new string) (string, error) {
+// complaint (a stale <old> arrives as `ng <ref> <reason>`). A token rides as a
+// push option, which follows the commands and their flush (gitprotocol-pack).
+func setRef(url, ref, old, new, token string) (string, error) {
+	caps := "report-status agent=caos-actor"
+	if token != "" {
+		caps = "report-status push-options agent=caos-actor"
+	}
 	var body bytes.Buffer
-	body.WriteString(pkt(fmt.Sprintf("%s %s %s\x00 report-status agent=caos-actor\n", old, new, ref)))
+	body.WriteString(pkt(fmt.Sprintf("%s %s %s\x00 %s\n", old, new, ref, caps)))
 	body.WriteString("0000")
+	if token != "" {
+		body.WriteString(pkt("caos-auth=run:" + token))
+		body.WriteString("0000")
+	}
 	body.Write(emptyPack())
 	req, err := http.NewRequest("POST", url+"/git-receive-pack", &body)
 	if err != nil {
