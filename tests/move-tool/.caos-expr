@@ -1,0 +1,9 @@
+# tests/move-tool, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST of llm-step's inline `move` tool: what the worker does with a
+# queued batch of move calls, including the refusals, and a move of a whole
+# source tree and of a file between source trees. Like tests/chat-tools it mints
+# the human turn itself and reads the turn commit back, because the subject is
+# the worker, not `chat`.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

@@ -98,7 +98,10 @@ func main() {
 		w.True(url != "", "this test needs CAOS_SERVER_URL from the runner")
 		run("caos", "get", "/cas/args/test-salt")
 		salt := strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/test-salt"))))
-		ref := fmt.Sprintf("refs/heads/actors/ref-%s-%d", salt, os.Getpid())
+		// HASHED, because a salt is free text and a refname is not: the
+		// suggested `--test-salt=$(date --iso=s)` has colons, which git
+		// refuses as a "funny refname".
+		ref := fmt.Sprintf("refs/heads/actors/ref-%x-%d", sha1.Sum([]byte(salt)), os.Getpid())
 
 		w.Step("mint two commits with caos put-commit (no push)")
 		c1 := commit("one", "1", "")

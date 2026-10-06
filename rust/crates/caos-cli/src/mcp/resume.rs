@@ -52,8 +52,8 @@ use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
 
 use crate::{
-    conversation_ref, fetch_validated_head, mint_transition, oid, open_store, push_cas,
-    resolve_username, update_local_cache, validate_cached,
+    conversation_ref, fetch_head, mint_transition, oid, open_store, push_cas, resolve_username,
+    update_local_cache,
 };
 
 pub(super) const RESUME_COMMAND: &str = "resume-caos-conversation";
@@ -186,11 +186,10 @@ pub(super) fn begin(
 fn fork(t: &GitTransport, session: &str, user: &str, from: &Oid) -> Result<Option<String>, String> {
     let id = super::conversation_id_for(session)?;
     let mut store = open_store(t)?;
-    if fetch_validated_head(t, &store, &id)?.is_some() {
+    if fetch_head(t, &store, &id)?.is_some() {
         return Ok(None);
     }
     store.ensure_local(from)?;
-    validate_cached(&store, from)?;
     let settled = settle(&mut store, from)?;
     let title = format!("fork of {}", &from.as_str()[..12]);
     // `settled` is `from` itself when nothing was open, so this is exactly the
@@ -213,7 +212,6 @@ fn resume(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>,
     }
     let mut store = open_store(t)?;
     store.ensure_local(from)?;
-    validate_cached(&store, from)?;
     let id = Conversation::open(&store, from)?.identity()?.id;
     let refname = refs::head_ref(&id)?;
     let head = store

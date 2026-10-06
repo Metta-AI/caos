@@ -1,0 +1,8 @@
+# tests/copy-tool, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST of llm-step's inline `copy` tool: what the worker does with a
+# queued batch of copy calls, including the refusals, and a copy of a whole
+# source tree and into one. Like tests/chat-tools it mints the human turn itself
+# and reads the turn commit back, because the subject is the worker, not `chat`.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

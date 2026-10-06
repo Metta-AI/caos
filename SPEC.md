@@ -442,36 +442,24 @@ is the same reason the `help` lives in the expression.
   error there takes the agent's turn down with it
 - Unexpected failures die, per the reliability principles above
 
-## Known problem: a tool call costs O(conversation length)
+## A conversation's history is trusted
 
-**Every tool call re-validates the conversation's whole history.** A call runs
-`llm-step` in a fresh worker container, and `State::from_store`
-(`std/llm-step/src/progress.rs`) opens a scratch repository, fetches the
-conversation and calls `validate_spine` with an empty `known_valid` — a diff
-and a transition check per commit, back to the root. Nothing survives the
-container, so no call benefits from the one before it.
+**A writer checks what it adds; nobody re-checks what is already there.**
+Everything in a conversation's history was written by caos, and every writer
+mints its transition through `apply`, which checks it against the parent's
+state before it is pushed. So a reader — `caos mcp`'s hooks and tool server,
+the tui, `llm-step`, `run-and-update-ref` — opens the head it fetched and uses
+it. `fetch_head` (`caos-cli`) says so where the head is read.
 
-Measured on CaosLocal1 (2026-10-01, 200 sequential `ls` calls, 446 commits):
-the call itself went from 5.8s to 13s, linearly, while the model's time
-between calls stayed at 1–2.5s. Fetching that history into an empty repository
-takes 0.09s (~300 KiB); one full `validate_spine` of it takes 2.3s in a local
-release build. Validation is the term that grows.
+The reason is cost, and it is not small. `validate_spine` replays every
+transition back to the root, and most readers are fresh processes: each hook is
+one, and each tool call is an `llm-step` container. A 446-commit conversation
+took 2.3s to validate in a local release build, so every tool call and every
+hook grew with the length of the session, until a long session's prompt hook
+outlived its timeout and every tool call of that turn was refused.
 
-`caos mcp`'s hooks had the same defect, as fresh processes with an in-memory
-cache; there the prompt hook outgrew its timeout and was killed, so no request
-opened and every tool call of the turn was refused. They now keep the newest
-validated head as the local ref `refs/caos/validated/<id>` and walk only to it
-(`validate_cached`, `caos-cli`). A worker has no local state to keep it in.
-
-The fix needs an anchor the worker can trust without walking:
-
-- **The client names it (preferred).** `caos mcp serve` has just validated the
-  head when it declares the call, so it binds that commit into the per-call
-  request and `llm-step` seeds `known_valid` with it. That request is already
-  unique per call, so nothing memoizes worse, and trust does not move: whoever
-  forms the request can already write the conversation ref.
-- **The server validates every conversation push**, and workers trust its
-  refs. Cleaner, and a change to the server's write path.
+`validate_spine` remains for checking what is NEW: a child conversation
+`llm-step` has just minted, and tests that check what the client writes.
 
 ## Not built
 
