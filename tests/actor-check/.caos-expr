@@ -1,0 +1,6 @@
+# tests/actor-check: std/actor-check against the lock in examples/actor-check, as
+# an ENTRY (dev/run-test evaluates this directory and runs the ArgTree). The two
+# `release-*` entries are complete checks -- the checker curried with the lock,
+# its invariant and its clients -- so naming them hands the worker requests it
+# only has to salt and run. `clients` is data, for the test's own model.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --any:@=DEEP-DEPS/release-any --holder:@=DEEP-DEPS/release-holder --clients:@=DEEP-DEPS/clients --actor:@=DEEP-DEPS/actor

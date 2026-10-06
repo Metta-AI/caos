@@ -60,7 +60,10 @@ usual remedies are a precondition that the first application makes false and
 nobody else can make true again while the sender waits (release only the lock
 you hold), or a request id remembered with its reply, which this design leaves
 out (Non-goals). It is the delayed-duplicate problem distributed locks meet as
-token-checked release and fencing tokens.
+token-checked release and fencing tokens. `std/actor-check` explores every
+order in which clients' messages and retries can land; it finds the lock's five
+steps (`examples/actor-check`) and checks the holder-only release in every
+reachable state.
 
 Nothing in the server changes. An actor is a std tool plus a convention for the
 inner worker.

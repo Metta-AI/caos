@@ -1,0 +1,2 @@
+# The lock inner (lock.sh). A caller curries --release onto it.
+curry --base:@=DEEP-DEPS/bash --worker1:@=lock.sh
