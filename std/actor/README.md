@@ -47,6 +47,21 @@ closest analog. Four rules define it:
    applying it once. That is the whole duplicate-delivery story: caos does not
    dedupe for the actor and the actor does not dedupe for itself.
 
+**Idempotent is necessary and not sufficient.** A retry is applied to whatever
+the branch holds when it runs, not to the state its first application left, so
+a message must also survive every message another client can land while its
+sender waits: for each such sequence σ, applying m, σ, then m again must leave
+the state, and the reply the sender acts on, as m then σ would. A lock whose
+release frees it whoever holds it is idempotent and fails this. A's release is
+applied and its reply lost; B claims the free lock; A's retry frees B's lock,
+and the next claim makes two holders. So does `tests/actor`'s `put`: retried
+after another client's put to the same key, it rolls that put back. The two
+usual remedies are a precondition that the first application makes false and
+nobody else can make true again while the sender waits (release only the lock
+you hold), or a request id remembered with its reply, which this design leaves
+out (Non-goals). It is the delayed-duplicate problem distributed locks meet as
+token-checked release and fencing tokens.
+
 Nothing in the server changes. An actor is a std tool plus a convention for the
 inner worker.
 
@@ -166,7 +181,7 @@ with the inner's run time, and the compare-and-swap makes it safe.
 |---|---|
 | lost race | finish fails; not cached; caller retries; retry reads the new head |
 | inner fails | the request fails; not cached |
-| crash after the push, before the reply is posted | the job fails; a retry re-applies the message, which is idempotent |
+| crash after the push, before the reply is posted | the job fails; a retry re-applies the message, possibly after other clients' messages, which rule 4 alone does not make safe |
 | inner succeeds, finish fails | the inner's result stays cached; a retry on an unchanged head reuses it |
 | duplicate concurrent requests | single-flight coalesces identical outer requests; distinct nonces both run and one loses the race |
 | another request lands the same state on the same head first | its commit names its own request, so ours is refused and does not match: a lost race, and the caller retries |
