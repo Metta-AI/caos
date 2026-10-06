@@ -38,8 +38,8 @@ refs/caos/protected/<ns>/<anything>   the refs it protects
 
 Protected refs can point at anything. `writers` is special: it always points at
 a commit whose tree has a `.caos/writers` file listing who can write the
-namespace, so its history is the history of write access. `.caos/writers`
-looks like this:
+namespace (and `.caos/agents`, below), so its history is the history of write
+access. `.caos/writers` looks like this:
 
 ```text
 # <ed25519 pubkey, hex>  <label, display only>
@@ -63,7 +63,8 @@ server only accepts it if someone already on the list signed it and it's a
 fast-forward, so the history of who added whom sticks around. Removals apply
 from the next push.
 
-The server also only lets a namespace's writers move its other refs.
+The server also only lets a namespace's writers, and their agents (below), move
+its other refs.
 
 ## Writer signatures
 
@@ -72,58 +73,53 @@ at now (`<old>`) and the hash to move it to (`<new>`). Every push to a
 protected ref signs those updates, in a push option (`git push -o`):
 
 ```text
-caos-auth=sig:<pubkey>:<expiry>:<signature>
+caos-auth=sig:<pubkey>:<signature>
 ```
 
-The signature covers the expiry and each `<old> <new> <ref>`, sorted by ref, so
-it signs the ref moves themselves, not the commits. Pushes already use
-`--force-with-lease`, so a captured signature only replays while the ref is
-back at `<old>`; the ten-minute expiry covers that.
+The signature covers each `<old> <new> <ref>`, sorted by ref. A copy of it only
+works while every ref is back at exactly its `<old>` and the signer can still
+write, and all it can do is make the same moves again.
 
 `caos-cli ref-push <rev> <ref>` pushes one ref, signed.
 
-## Run tokens
+## Agent keys
 
-Jobs never hold keys. A job writes for the writer whose request started it,
-with a run token in place of a signature:
-
-```text
-caos-auth=run:<token>
-```
-
-When the server dispatches a job with write access, it mints a token, records
-`token -> (writer pubkey, namespaces)` and drops it at `/secret/caos-write`; it
-dies with the job's container. The server checks the token's pubkey against
-`writers`, so removing someone also cuts off their running jobs. A worker's
-`GitStore` sends the token on its own.
-
-A job asks for write access with a `writes` arg: namespace ids, or `*` for
-everything its creator got. No `writes`, no token, so e.g. a shell tool never
-gets one.
-
-A top-level request names its writer in a header, signed over the expiry and
-the request's method and target:
+Jobs sign with agent keys. A writer's agent key for a namespace is derived from
+their key:
 
 ```text
-X-Caos-Write: <pubkey> <expiry> <signature>
+seed      = HMAC(<writer key>, "caos agent")
+agent(ns) = HMAC(seed, <ns>)              used as an ed25519 key
 ```
 
-The token covers `writes ∩ available`, where `available` is everything that
-writer can write for a top-level request, and what the creator was granted for
-a continuation or child. So a job can only pass on what it has: an agent step
-holding a namespace can put it in `writes` for the jobs it starts, but a shell
-it starts gets nothing, and neither does anything that shell starts. (The grant
-rides along with `secrets::Context`, which already reaches sub-runs.)
+It's listed in the namespace's `.caos/agents`, under its writer:
 
-A token can't change `writers`: jobs write content, writers decide who writes.
-It can found a new namespace that lists only its own writer.
+```text
+# <agent pubkey>  <writer pubkey>
+51c0a5e9b7d2…  3b6a27bcceb6…
+```
 
-A job that only passes writes on asks for `*`. The suite does: its client signs
-as a fresh writer, and `dev/run-tests`, `dev/run-test` and each test hold
-`writes=*`, so a test can hand its steps the namespaces they write.
+An agent can move the namespace's refs while its writer is in `.caos/writers`,
+but can't change either list. A client adds its writer's agent with one
+`writers` commit the first time it writes a namespace, and only a writer can
+add lines under their own key. (A namespace's first commit lists only its
+founder, since `<ns>` isn't known until it's made.)
 
-A cache hit runs nothing, so it writes nothing. An uncached job without access
-runs without a token, and its push is refused.
+Jobs get agent keys through the secret store (SPEC, "Secrets"). Once, a writer
+adds their seed to their secrets as `caos-agent`, granted to the tools that
+write refs: `llm-step`, `run-and-update-ref` and `std/actor`
+(`caos-cli ref-writer-key seed --dir=<d>` writes it). A request names the
+namespace it writes in a header, beside its reader keys:
+
+```text
+X-Caos-Write: <ns>
+```
+
+When a granted tool runs in that request, or in anything it starts, the server
+injects `agent(<ns>)` at `/secret/caos-agent`, never the seed itself, and adds
+`<ns>` to its `secret-hash`. Nothing a job starts can name another namespace.
+Tools without the grant, like a shell or an actor's inner, get nothing. A
+worker's `GitStore` signs with the injected key on its own.
 
 ## The hook
 
@@ -136,12 +132,13 @@ hook, so it covers smart HTTP and iroh alike. The server's own ref writes
 | --- | --- |
 | content-named: `refs/caos/req/<h>`, `refs/heads/caos-test/<h>` | it points at `<h>`, or is deleted |
 | unprotected (`caos.unprotectedRef`; `refs/caos/dev` by default) | always |
-| `refs/caos/protected/<ns>/writers`, create | `new == <ns>`, `new` has no parents, pusher is in `new`'s list |
-| `refs/caos/protected/<ns>/writers`, update | signer is in `old`'s list, fast-forward |
-| `refs/caos/protected/<ns>/<other>` | signer's (or token's) key is in the current `writers`; a token must cover `<ns>` |
+| `refs/caos/protected/<ns>/writers`, create | `new == <ns>`, `new` has no parents, signer is in `new`'s `.caos/writers` |
+| `refs/caos/protected/<ns>/writers`, update | signer is in `old`'s `.caos/writers`, fast-forward |
+| `refs/caos/protected/<ns>/<other>` | signer is in the current `.caos/writers`, or in `.caos/agents` under a writer who is |
 | anything else | rejected |
 
-One blob read per namespace touched. Needs `receive.advertisePushOptions=true`,
+A `writers` push can only add `.caos/agents` lines under its signer. A few blob
+reads per namespace touched. Needs `receive.advertisePushOptions=true`,
 which the server sets.
 
 To roll this out on a server with writers the table misses,
@@ -154,8 +151,10 @@ let it through.
   bootstrap writes it to git config. It's a setup arg, not an env var, for the
   same reason `--server` is: setup can't see env vars
   (integrations/claude-code/cloud/README.md).
-- `caos mcp` signs its pushes with it and sends `X-Caos-Write` on its requests,
-  which is where the jobs they start get their access.
+- `caos mcp` signs its pushes with it, adds its agent to namespaces it writes,
+  and sends `X-Caos-Write` on its requests. Their jobs get agent keys from the
+  seed you pushed once, through the `--secret-readers` the session already
+  presents.
 - Nothing is stored per conversation, so a fresh container is fine.
 
 ## Conversations
@@ -179,9 +178,8 @@ refs/caos/protected/<ns>/conversations/<hex child id>/head    a subagent
   `--conversation`, the `X-Caos-Conversation` header, and a secret's
   `reader:@=<path> conversation=<address>`. A bare id could match a
   conversation of that name in anyone's namespace.
-- A subagent's head goes in its parent's namespace. `llm-step` keeps its own
-  `writes` on the child's request and puts the namespace on the relay's, so no
-  keys get minted at runtime.
+- A subagent's head goes in its parent's namespace, so its jobs use the same
+  agent key.
 - The sidebar is
   `refs/caos/protected/<personal>/memberships/{active,archived}/<ns>/<hex id>`,
   in a personal namespace from the key (label `personal`).
@@ -192,10 +190,11 @@ Multiplayer:
 1. Nishad sends Malcolm their public key (it's not secret)
 2. Malcolm adds it: `caos-cli writers add <conversation> <key>`, or
    `/invite <key>` in the tui
-3. Nishad opens the conversation by its address from their own tui or session
+3. Nishad opens the conversation by its address from their own tui or session,
+   which adds Nishad's agent to it
 
-Everyone's pushes and jobs use their own key, so the log shows who drove each
-turn.
+Everyone's pushes use their own key and their jobs their own agent, so the log
+shows who drove each turn.
 
 ## Actors
 
@@ -207,18 +206,17 @@ refs/caos/protected/<ns>/actors/<name>
 ```
 
 - Many actors can share a namespace, so one `writers` change covers all of
-  them. An actor a conversation drives can live in that conversation's
-  namespace, where `llm-step` already holds `writes`.
-- The caller puts `writes=<ns>` on the actor request. `finish`, the half of the
-  wrapper that moves the branch, is granted a run token from it. The wrapper
-  adds no `writes` to the inner's request, so a pure inner gets no token.
-- The wrapper moves the branch by POSTing one command to `git-receive-pack`
-  rather than running `git push`, so it sends the token itself: it asks for
-  the `push-options` capability and sends `caos-auth=run:<token>` after the
-  command.
-- The namespace has to exist before the first write (`caos-cli namespace new`,
-  or a job holding `*` founds one listing its writer). The actor itself still
-  needs no start message: its first request finds an empty branch.
+  them. An actor a conversation drives lives in that conversation's namespace.
+- `std/actor` is granted the seed, so `finish`, the half of the wrapper that
+  moves the branch, gets the agent key for the request's namespace. The inner
+  isn't granted, so it gets nothing.
+- `finish` moves the branch by POSTing one command to `git-receive-pack` rather
+  than running `git push`, so it signs the update itself: it asks for the
+  `push-options` capability and sends `caos-auth=sig:…` after the command.
+- A request to an actor names its namespace in `X-Caos-Write`; one a
+  conversation starts already carries the conversation's.
+- An actor still needs no start message: its first request finds an empty
+  branch.
 - Reads don't change: anyone can read an actor's state.
 
 ## Migration
@@ -240,9 +238,6 @@ them.
 - One keypair per ref, shared as an invite. Removing someone means moving
   everyone to a new ref, you can't tell writers apart, and a cloud session
   can't hold a key per conversation.
-- Writers' private keys in the secret store, for jobs to sign with. Hands the
-  server everyone's keys, and grants by image, so there's no way to say "pass
-  this on to my children".
 - The conversation id as the namespace id. Subagents would need namespaces of
   their own, and `cc/<session>` would need a lookup in every hook process.
 - The writers list in the commit message instead of a file. It would save the
@@ -252,18 +247,15 @@ them.
   refs under it. Git can't do both: a ref can't also be a directory of refs
   (`refs/a` and `refs/a/b`), so the list gets a fixed name inside instead.
 - Git's own signed pushes (`git push --signed`). A push certificate signs the
-  same `<old> <new> <ref>` list plus a nonce from the server, which beats an
-  expiry. But every client needs a GPG keyring or `ssh-keygen` (a Claude cloud
-  container has no `ssh-keygen`), the nonce costs a round trip first (the
-  actor's one-POST push can't make one), and jobs can't sign at all, so run
-  tokens would still need a push option.
+  same `<old> <new> <ref>` list plus a nonce from the server, which stops
+  replays. But every client and job needs a GPG keyring or `ssh-keygen` (a
+  Claude cloud container has no `ssh-keygen`), and the nonce costs a round
+  trip first, which the actor's one-POST push can't make.
 
 ## Open questions
 
 - `refs/caos/dev` is unprotected: any job can rewrite what dev-mode bootstrap
   installs. An operator namespace whose id bootstrap is given would fix that.
-- A signature can be replayed on another server with the same namespace until
-  it expires. Putting the server's identity in the signed text would fix that,
-  if it matters.
-- `writes=*` is broad on purpose: a job holding it can write every namespace
-  its writer can.
+- A signature can be replayed on another server with the same namespace,
+  while its refs sit at the same `<old>`s there. Putting the server's identity
+  in the signed text would stop that, if it matters.
