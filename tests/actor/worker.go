@@ -16,6 +16,10 @@
 //	after-lazy  a read touched one entry and the inner saw the others unmaterialized
 //	after-hit1/after-hit2
 //	            the same read twice with different nonces ran the inner once
+//	twinned     a request whose push was refused FAILED, though the commit at
+//	            the head was byte-identical to the one it minted: another
+//	            request's, which a commit identified by (parent, state) alone
+//	            cannot tell from its own
 package main
 
 import (
@@ -264,6 +268,17 @@ func main() {
 			fetch(last)
 			runs := git("rev-list", "--count", last)
 			w.True(runs == "1", "the inner ran %s times; the repeat should hit the cache", runs)
+			// A DIFFERENT request with the same outcome: on a fresh branch, the
+			// impure inner pushes the very commit this request's wrapper will
+			// mint, as a concurrent request that applied the same put to the
+			// same head would. The wrapper's push is refused; finding that
+			// commit at the head must not count as its own push landing.
+			stateRef = freshRef("twin")
+			call("put a 1", "n9", probeInner("--twin-ref="+stateRef), "twinned", true)
+
+		case "twinned":
+			w.True(exists("/cas/args/error"),
+				"a request whose push was refused succeeded because another request's commit was identical")
 			w.Report("actor: ALL PASS\n")
 
 		default:

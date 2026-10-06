@@ -5,7 +5,9 @@
 `tests/actor` covers the build plan's cases: concurrent writers converging, a
 forced lost race that fails uncached and succeeds on retry, an idempotent
 re-apply (which is also the crash-after-push retry), a read making no commit,
-the inner's lazy view of the state, and the inner's cache hit. Two caveats: a
+the inner's lazy view of the state, the inner's cache hit, and a refused push
+that finds another request's identical commit at the head failing as a lost
+race rather than passing as its own. Two caveats: a
 real crash between push and reply is not injected (a re-applied message is the
 same observable), and laziness is checked from inside the inner, not by
 counting server object reads. Both are Go programs on `std/go`. Open question 6
@@ -44,6 +46,21 @@ closest analog. Four rules define it:
 4. **Messages are idempotent.** Applying a message twice has the same effect as
    applying it once. That is the whole duplicate-delivery story: caos does not
    dedupe for the actor and the actor does not dedupe for itself.
+
+**Idempotent is necessary and not sufficient.** A retry is applied to whatever
+the branch holds when it runs, not to the state its first application left, so
+a message must also survive every message another client can land while its
+sender waits: for each such sequence σ, applying m, σ, then m again must leave
+the state, and the reply the sender acts on, as m then σ would. A lock whose
+release frees it whoever holds it is idempotent and fails this: a retried
+release frees the next holder's lock (`std/actor-check` finds it in five steps,
+in `examples/actor-check`). So does `tests/actor`'s `put`: retried after another
+client's put to the same key, it rolls that put back. The two usual remedies are
+a precondition that the first application makes false and nobody else can make
+true again while the sender waits (release only the lock you hold), or a request
+id remembered with its reply, which this design leaves out (Non-goals). It is
+the delayed-duplicate problem distributed locks meet as token-checked release
+and fencing tokens.
 
 Nothing in the server changes. An actor is a std tool plus a convention for the
 inner worker.
@@ -149,7 +166,11 @@ while the inner runs, and it needs `git` (selected through `git-runner` in its
    - lease rejected: **fail the request**; the caller retries;
    - ambiguous: fetch the ref again. Treat "my commit is the head" as success,
      "head changed" as a lost race, and "head unchanged" as an infrastructure
-     failure.
+     failure. "My commit" has to be THIS ATTEMPT's: the commit message names
+     the request, because a commit that is only (parent, state) is minted
+     byte for byte by any other request that applies a different message to
+     the same head with the same outcome, and finding its commit there is a
+     lost race, not our push landing.
 
 The window between start and finish is the race window. It is small compared
 with the inner's run time, and the compare-and-swap makes it safe.
@@ -163,6 +184,7 @@ with the inner's run time, and the compare-and-swap makes it safe.
 | crash after the push, before the reply is posted | the job fails; a retry re-applies the message, which is idempotent |
 | inner succeeds, finish fails | the inner's result stays cached; a retry on an unchanged head reuses it |
 | duplicate concurrent requests | single-flight coalesces identical outer requests; distinct nonces both run and one loses the race |
+| another request lands the same state on the same head first | its commit names its own request, so ours is refused and does not match: a lost race, and the caller retries |
 
 ## Research: what the existing code gives us
 
