@@ -7950,12 +7950,8 @@ mod tests {
         assert!(wait_for_fork(&mut app, &pending_id));
         assert_eq!(app.selected().id, pending_id);
         assert_eq!(app.selected().composer.text, "must not submit");
-        assert!(app
-            .selected()
-            .command_error
-            .as_deref()
-            .unwrap()
-            .contains("exactly one parent required"));
+        let error = app.selected().command_error.as_deref().unwrap();
+        assert!(error.contains("must have exactly one parent"), "{error}");
         assert!(conversation_head(&transport, &pending_id)
             .unwrap()
             .is_none());

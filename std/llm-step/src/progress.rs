@@ -1,6 +1,5 @@
 //! V3 conversation storage and exact-head append/retry.
 
-use std::collections::HashSet;
 use std::fs;
 use std::process::{Command, Stdio};
 
@@ -9,7 +8,7 @@ use conversation_protocol::v3::paths;
 use conversation_protocol::v3::tree::encode_commit_bytes;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    validate_spine, Block, ChildRecord, GitStore, ObjectStore, Oid, RefUpdate, TranscriptEntry,
+    Block, ChildRecord, GitStore, ObjectStore, Oid, RefUpdate, TranscriptEntry,
 };
 use worker_common::{path, scratch};
 
@@ -64,7 +63,6 @@ pub struct State<S: RefStore = GitStore> {
     store: S,
     refname: String,
     head: Oid,
-    known_valid: HashSet<Oid>,
     fresh_after_append: bool,
 }
 
@@ -183,7 +181,6 @@ impl State<GitStore> {
         crate::timing::phase(&format!("push {}", kind.as_str()));
         if pushed.is_ok() {
             self.head = candidate.clone();
-            self.known_valid.insert(candidate.clone());
             self.fresh_after_append = true;
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate.clone(),
@@ -212,7 +209,6 @@ impl State<GitStore> {
         };
         self.head = observed_parent.clone();
         self.fresh_after_append = false;
-        self.validate()?;
         let observed_record = self.conversation()?.child(&child.id)?;
         match (observed_record, observed_child) {
             (Some(record), Some(child_head)) => {
@@ -228,8 +224,6 @@ impl State<GitStore> {
                         child.id
                     ));
                 }
-                validate_spine(&self.store, &child_head, &mut HashSet::new())
-                    .map_err(|error| format!("corrupt subagent spawn {}: {error}", child.id))?;
                 if !parent_chain_contains(&self.store, &child_head, &child.initial_head)? {
                     return Err(format!(
                         "corrupt subagent spawn {}: child ref {child_ref} at {child_head} does not contain initial head {}",
@@ -274,15 +268,12 @@ fn require_server_object(commit: &Oid, object: &Oid) -> Result<(), String> {
 
 impl<S: RefStore> State<S> {
     pub fn from_store(store: S, refname: String, head: Oid) -> Result<Self, String> {
-        let mut state = State {
+        Ok(State {
             store,
             refname,
             head,
-            known_valid: HashSet::new(),
             fresh_after_append: false,
-        };
-        state.validate()?;
-        Ok(state)
+        })
     }
 
     pub fn head(&self) -> &Oid {
@@ -316,7 +307,6 @@ impl<S: RefStore> State<S> {
             .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
         self.head = head.clone();
         self.fresh_after_append = false;
-        self.validate()?;
         Ok(head)
     }
 
@@ -369,7 +359,6 @@ impl<S: RefStore> State<S> {
         }
         let mut candidate = expected.clone();
         let mut ordinal = None;
-        let mut intermediate = Vec::new();
         let mut kinds = Vec::new();
         for transition in transitions {
             let parent = self.store.read_commit(&candidate).map_err(String::from)?;
@@ -385,15 +374,11 @@ impl<S: RefStore> State<S> {
             )?;
             ordinal = ordinal.or(applied.ordinal);
             kinds.push(transition.kind().as_str());
-            intermediate.push(candidate.clone());
         }
         let pushed = self
             .store
             .push_ref_value(&self.refname, Some(expected), Some(&candidate));
         crate::timing::phase(&format!("push {}", kinds.join("+")));
-        if pushed.is_ok() {
-            self.known_valid.extend(intermediate);
-        }
         self.finish_append(expected, candidate, ordinal, pushed)
     }
 
@@ -409,7 +394,6 @@ impl<S: RefStore> State<S> {
     ) -> Result<TryAppend, String> {
         if pushed.is_ok() {
             self.head = candidate.clone();
-            self.known_valid.insert(candidate.clone());
             self.fresh_after_append = true;
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate.clone(),
@@ -431,7 +415,6 @@ impl<S: RefStore> State<S> {
             .ok_or_else(|| format!("conversation ref {} disappeared", self.refname))?;
         self.head = observed.clone();
         self.fresh_after_append = false;
-        self.validate()?;
         if observed == candidate || parent_chain_contains(&self.store, &observed, &candidate)? {
             return Ok(TryAppend::Appended(Appended {
                 commit: candidate,
@@ -444,12 +427,6 @@ impl<S: RefStore> State<S> {
         } else {
             Err(push_error)
         }
-    }
-
-    fn validate(&mut self) -> Result<(), String> {
-        validate_spine(&self.store, &self.head, &mut self.known_valid)
-            .map(|_| ())
-            .map_err(String::from)
     }
 
     fn joined(&self, transition: &Transition) -> Result<Option<Appended>, String> {

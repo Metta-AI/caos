@@ -478,7 +478,7 @@ fn conversation_status(session: Option<&str>) -> String {
         Ok(id) => id,
         Err(error) => return format!("conversation: session {session:?} is unusable: {error}\n"),
     };
-    let head = crate::open_store(&t).and_then(|store| crate::fetch_validated_head(&t, &store, &id));
+    let head = crate::open_store(&t).and_then(|store| crate::fetch_head(&t, &store, &id));
     let head = match head {
         Ok(Some((_, head))) => head.as_str().to_string(),
         Ok(None) => "none yet -- no turn has been recorded".to_string(),

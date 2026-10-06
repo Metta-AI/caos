@@ -1,13 +1,10 @@
 //! Append terminal async records or child checkpoints to a v3 conversation.
 
-use std::collections::HashSet;
-
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::refs as conversation_refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    validate_spine, CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus, TurnOutcome,
-    TurnStatus,
+    CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus, TurnOutcome, TurnStatus,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -48,7 +45,6 @@ pub fn append_child_terminal(
     let terminal_head = store
         .fetch_ref(&child_ref)?
         .ok_or_else(|| format!("child conversation ref {child_ref} does not exist"))?;
-    validate_spine(&store, &terminal_head, &mut HashSet::new()).map_err(String::from)?;
     let status = terminal_facts(&store, &terminal_head, &subrequest)?;
     append_child_terminal_with(
         &mut store,
