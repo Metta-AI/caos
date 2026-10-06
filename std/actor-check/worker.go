@@ -22,7 +22,6 @@
 //	            pending, lost}}. It returns a blob: `ok`, or what is wrong
 //	lost        optional: how many replies to ONE message may be lost (default 1)
 //	max-states  optional: give up past this many states (default 20000)
-//	nonce       optional, opaque: re-runs these stages and nothing below them
 //
 // The result is a tree {report, verdict, stats.json[, trace.json]}. verdict is
 // `ok`, `violation`, `stuck` (a client can never proceed) or `incomplete`.
@@ -195,10 +194,8 @@ func next(stage string, s *search) string {
 	args := []string{"curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/worker1",
 		"--stage=" + stage, "--ctx:@=" + ctx,
 		"--inner:@=/cas/args/inner", "--mapper:hash=" + mapper}
-	for _, opt := range []string{"invariant", "nonce"} {
-		if exists("/cas/args/" + opt) {
-			args = append(args, "--"+opt+":@=/cas/args/"+opt)
-		}
+	if exists("/cas/args/invariant") {
+		args = append(args, "--invariant:@=/cas/args/invariant")
 	}
 	return caos(args...)
 }

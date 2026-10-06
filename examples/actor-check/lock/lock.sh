@@ -4,12 +4,13 @@
 # state is one file, `holder`, present while the lock is held.
 #
 #   claim <who>    granted if the lock is free or already <who>'s, else busy
-#   release <who>  give the lock up
+#   release <who>  give the lock up: ok
 #
 # --release says what a release frees, and is the whole point of this fixture:
 #
 #   any     the lock, whoever holds it
-#   holder  the lock only if <who> holds it
+#   holder  the lock only if <who> holds it, replying not-held when it frees
+#           nothing -- so a stale retry shows in the trace as what it is
 #
 # Under either, applying a message twice in a row is applying it once, which is
 # all std/actor's rule 4 asks. Only `holder` also survives the message being
@@ -45,17 +46,20 @@ claim)
   fi
   ;;
 release)
+  reply=ok
   case "$mode" in
   any) ;;
   holder)
-    if [ "$holder" != "$who" ]; then keep; fi
+    if [ "$holder" != "$who" ]; then
+      keep
+      reply=not-held
+    fi
     ;;
   *)
     echo "lock: unknown --release: $mode" >&2
     exit 1
     ;;
   esac
-  reply=ok
   ;;
 *)
   echo "lock: unknown message: $op $who" >&2

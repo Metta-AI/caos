@@ -86,8 +86,7 @@ cat out/report
 ```
 
 `--max-states` bounds the search (default 20000; past it the verdict is
-`incomplete`). `--nonce` re-runs the checker's own stages and nothing below
-them.
+`incomplete`).
 
 ## Limits
 

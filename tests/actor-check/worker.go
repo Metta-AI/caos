@@ -79,12 +79,26 @@ func next(stage string, extra ...string) string {
 	return caos(append(args, extra...)...)
 }
 
-// check runs one of the two checks (examples/actor-check/release-<release>) and
-// continues at stage with the result. The salt rides in as the checker's nonce,
-// so a new --test-salt re-runs the checker; the transitions below it stay
-// cached, as they should.
+// inner is the lock the release-<release> check curries onto the checker, with
+// this run's salt curried on too (lock.sh ignores it).
+//
+// THE SALT GOES ON THE INNER, NOT ON THE CHECKER. The live stage proves that
+// std/actor runs the checker's own transition requests by finding them REUSED
+// in its trace, and a request an EARLIER run cached is reused just the same: a
+// checker whose transitions had drifted from std/actor's shape passed that
+// check on any warm cache. A salted inner makes every transition of this run a
+// new request, so only this run's checker can have run them first.
+func inner(release string) string {
+	caos("get", "/cas/args/"+release)
+	caos("get", "/cas/args/"+release+"/args")
+	return caos("curry", "--base:@=/cas/args/"+release+"/args/inner", "--test-salt=actor-check-"+salt)
+}
+
+// check runs one of the two checks (examples/actor-check/release-<release>),
+// over this run's inner, and continues at stage with the result.
 func check(release, stage string) {
-	request := caos("prepare-request", "--base:@=/cas/args/"+release, "--nonce=actor-check-"+salt)
+	checker := caos("curry", "--unbind=inner", "--base:@=/cas/args/"+release, "--inner:hash="+inner(release))
+	request := caos("prepare-request", "--base:hash="+checker)
 	caos("run-request-then", request, "--then:hash="+next(stage))
 }
 
@@ -145,7 +159,7 @@ func apply(holder, text, release string) (string, string) {
 		return holder, "busy"
 	case "release":
 		if release == "holder" && holder != who {
-			return holder, "ok"
+			return holder, "not-held"
 		}
 		return "", "ok"
 	}
@@ -315,15 +329,13 @@ func readTrace() []tedge {
 
 // deliver sends step i of the trace to the actor on ref, through std/actor,
 // and continues at live with its reply. The inner is the very one the check
-// ran: the `inner` the release-any entry curried onto the checker.
+// ran.
 func deliver(trace []tedge, i int, ref string) {
-	caos("get", "/cas/args/any")
-	caos("get", "/cas/args/any/args")
 	path := fmt.Sprintf("/tmp/live-%d", i)
 	w.Must(os.WriteFile(path, []byte(trace[i].Message+"\n"), 0o644))
 	caos("put", path, "/cas/live-message")
 	request := caos("prepare-request", "--base:@=/cas/args/actor", "--state-ref="+ref,
-		"--inner:@=/cas/args/any/args/inner", fmt.Sprintf("--nonce=live-%s-%d", salt, i),
+		"--inner:hash="+inner("any"), fmt.Sprintf("--nonce=live-%s-%d", salt, i),
 		"--message:@=/cas/live-message")
 	caos("run-request-then", request, "--then:hash="+next("live", "--trace:@=/cas/args/trace",
 		"--ref="+ref, fmt.Sprintf("--i=%d", i+1), "--req="+request))
