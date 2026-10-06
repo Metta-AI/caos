@@ -5,6 +5,11 @@
 //	               wrapper's leased push (which observed no head) loses the race
 //	--count-ref=C  push one new commit to C per execution, so the number of
 //	               commits on C is the number of times this inner actually ran
+//	--twin-ref=T   if T does not exist yet, push to it the commit a DIFFERENT
+//	               request with the same outcome would make: what `put k v`
+//	               produces from no state, minted exactly as the wrapper mints
+//	               it. The wrapper's own push is then refused for a commit that
+//	               is not its own
 package main
 
 import (
@@ -59,7 +64,7 @@ func main() {
 	w.Main(func() {
 		url := strings.TrimRight(os.Getenv("CAOS_SERVER_URL"), "/")
 		w.True(url != "", "needs CAOS_SERVER_URL from the runner")
-		raceRef, countRef := optArg("race-ref"), optArg("count-ref")
+		raceRef, countRef, twinRef := optArg("race-ref"), optArg("count-ref"), optArg("twin-ref")
 
 		w.Must(os.RemoveAll("/tmp/probe"))
 		w.Must(os.MkdirAll("/tmp/probe", 0o755))
@@ -75,6 +80,18 @@ func main() {
 			root := git(fmt.Sprintf("040000 tree %s\tstate\n", sub), "mktree")
 			winner := git("", "commit-tree", root, "-m", "competing writer")
 			git("", "push", "-q", "--force-with-lease="+raceRef+":", "caos", winner+":"+raceRef)
+		}
+
+		if twinRef != "" && headOf(twinRef) == "" {
+			w.Must(execCmd("", "caos", "get", "/cas/args/message"))
+			fields := strings.Fields(string(w.Check(os.ReadFile("/cas/args/message"))))
+			w.True(len(fields) == 3 && fields[0] == "put", "--twin-ref needs a put message")
+			blob := git(fields[2]+"\n", "hash-object", "-w", "--stdin")
+			sub := git(fmt.Sprintf("100644 blob %s\t%s\n", blob, fields[1]), "mktree")
+			root := git(fmt.Sprintf("040000 tree %s\tstate\n", sub), "mktree")
+			twin := git("tree "+root+"\nauthor actor <actor@caos> 0 +0000\ncommitter actor <actor@caos> 0 +0000\n\nactor state\n",
+				"hash-object", "-t", "commit", "-w", "--stdin")
+			git("", "push", "-q", "--force-with-lease="+twinRef+":", "caos", twin+":"+twinRef)
 		}
 
 		if countRef != "" {
