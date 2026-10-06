@@ -1,0 +1,5 @@
+# The actor model checker (README.md), a std/go worker. It explores every order
+# in which clients' messages can reach an actor, each transition being the inner
+# request std/actor itself would run, and checks an invariant in every state.
+# step.sh is the per-transition mapper, on std/bash.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --bash:@=DEEP-DEPS/bash --step:@=step.sh
