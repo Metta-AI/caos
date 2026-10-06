@@ -307,11 +307,6 @@ impl Secrets {
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
 
-/// The current runner job's short-lived capability. A worker presents it to
-/// `POST /sub-run`; the server accepts it only while that exact job is in
-/// flight, and uses it to recover the job's server-held run context.
-pub const JOB_NONCE_ENV: &str = "CAOS_JOB_NONCE";
-
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
 
@@ -4054,11 +4049,10 @@ fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entr
     })
 }
 
-/// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
-/// else — in a resident worker, whose environment cannot change per job — from the
-/// `/cas/salt` its runner writes; empty if neither. Read at the top of a run (the
-/// CLI); the server threads it into each worker and every promise sub-run — so a
-/// whole run tree shares one.
+/// The cache-busting salt for this run (see [`SALT_ENV`]): in the worker-side `caos`
+/// the job's own `salt` arg, in a client `CAOS_SALT`; empty if neither. Read at the
+/// top of a run (the CLI); the server threads it into each worker and every promise
+/// sub-run — so a whole run tree shares one.
 fn run_salt() -> String {
     runner::job_salt().unwrap_or_default()
 }

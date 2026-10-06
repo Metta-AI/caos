@@ -423,11 +423,11 @@ concurrency.
   hostname. A resident-worker test that compared hostnames saw "the same
   container" for a daemon that had in fact been replaced. The runner is PID 1 of
   its container, so `/proc/1/stat`'s start time names it (`tests/resident`).
-- **A resident worker's environment is its FIRST job's, for good.** `CAOS_SALT`
-  and `CAOS_JOB_NONCE` in it are stale from the second job on. `caos` reads the
-  per-job files first (`/cas/salt`, `/cas/nonce`), but anything else a daemon
-  hands the salt to — the inner `caos-cli` in `dev/stack-daemon` — has to be
-  given it explicitly, per call, from `/cas/salt`.
+- **No worker has `CAOS_SALT` or `CAOS_JOB_NONCE` in its environment.** A daemon
+  outlives its first job, so a copy there would be stale. `caos` reads the nonce
+  from `/cas/nonce` and the salt from `/cas/args/salt`. A script that gives the
+  salt to a client — `dev/cli-test/worker`, the inner `caos-cli` in
+  `dev/stack-daemon` — read that arg and export `CAOS_SALT` themselves.
 - **A message with effects needs a `request-id`, or it is answered from the
   cache.** The cache is checked before dispatch, so a repeated `caos-stack
   status` with the same arguments never reaches the daemon and returns the first

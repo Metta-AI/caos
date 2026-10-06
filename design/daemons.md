@@ -28,15 +28,15 @@ Where the code differs from, or settles, what the sections below say:
   owner polls again, and a job that arrived in between waited in its queue.
   Eviction (`exit`), a result without `keep`, an explicit release and a lease
   lapse end an ownership.
-- **Salt is `/cas/salt`, not `/cas/args/salt`.** The arg is a lazy placeholder,
-  and reading it needs a fetch that the file does not. The runner writes
-  `/cas/salt` and `/cas/nonce` (root-owned, 0600) for a resident image, and
-  `caos` reads them before it reads `CAOS_SALT` / `CAOS_JOB_NONCE`. The
-  environment still carries the FIRST job's values, because scripts read it
-  (`dev/cli-test/worker` re-points `CAOS_SALT`), so it is stale from a daemon's
-  second job on. Only `/bin/caos` reads the files: a client that merely shares a
-  container with a runner, like the test stack's `caos-cli`, would otherwise pick
-  up the outer job's context.
+- **The salt is its arg; the nonce is a file.** A worker's environment carries
+  neither `CAOS_SALT` nor `CAOS_JOB_NONCE` any more: a daemon outlives its first
+  job, so a copy there would be stale. The salt is already in the ArgTree, at
+  `/cas/args/salt`, and the worker-side `caos` fetches it from there; a script that
+  hands it to a client does `caos get /cas/args/salt` (`dev/cli-test/worker`
+  does). The nonce is not in the ArgTree, so the runner writes it to `/cas/nonce`
+  (root-owned, 0600), which only `/bin/caos` reads. A client (`caos-cli`) still
+  takes `CAOS_SALT` from the user and reads nothing under `/cas`, so the test
+  stack's `caos-cli` cannot pick up the outer job's context.
 - **Residency only starts at `caos next`.** An image can declare
   `CAOS_RESIDENT=1` and still run ordinary jobs: a worker that exits without ever
   calling `caos next` takes the runner back to warm polling, as on any image.

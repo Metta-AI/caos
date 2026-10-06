@@ -35,10 +35,10 @@
 #              the client that tree compiled, at CAOS_SERVER_URL=http://127.0.0.1.
 #
 # WHAT CHANGES FROM ONE MESSAGE TO THE NEXT, and so is read afresh each time:
-# /cas/args (the runner replaces it), and the job's salt and nonce — which `caos`
-# reads from files the runner rewrites, not from this process's environment,
-# whose copy is the FIRST message's and stays that. The one place this script
-# passes a salt on is to the inner client, below, and it reads /cas/salt for it.
+# /cas/args (the runner replaces it), including its `salt`, and the job nonce, which
+# `caos` reads from a file the runner rewrites. No worker has either in its
+# environment: a daemon outlives its first job, so a copy there would go stale.
+# The one place this script passes a salt on is to the inner client, below.
 set -euo pipefail
 
 fail() { echo "STACK-DAEMON FAIL: $*" >&2; exit 1; }
@@ -75,9 +75,8 @@ reply_text() { printf '%s\n' "$*" > /tmp/reply; reply /tmp/reply; }
 
 # ---- the stack --------------------------------------------------------------
 
-# This message's salt, for the inner client. See the header: the environment's
-# CAOS_SALT is the first message's.
-salt() { if [ -r /cas/salt ]; then cat /cas/salt; fi; }
+# This message's salt, for the inner client. See the header.
+salt() { opt salt; }
 
 # Bring the dev stack up from the tree under test, once. Everything that stood in
 # std/caos-test/worker.sh above "the suite" is here, unchanged but for being a
@@ -246,7 +245,7 @@ op_run_tests() {
   # `run` below will form, so the hash is known before any work starts.
   #
   # CAOS_SALT IS SET HERE, for the inner client, from this message's file. The
-  # one in this process's environment is the first message's.
+  # (A worker has no CAOS_SALT of its own; see the header.)
   #
   # NO COMMENT INSIDE THE BLOCKS BELOW: a continuation followed by a comment
   # joins INTO the comment and severs the environment prefix.
@@ -372,7 +371,7 @@ op_logs() {
 # harvest can overwrite only its own.
 #
 # The source repo, /caos-dev/git, is SHARED by every dev stack on the host, so a
-# pattern broader than conversations may export a neighbour's refs too. The
+# pattern broader than conversations may export a neighbor's refs too. The
 # default is the conversations, which are named by hash and so are no one else's.
 harvest() { # <refs, one pattern per line>
   local instance patterns pattern dst

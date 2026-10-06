@@ -1221,7 +1221,17 @@ fn prepare_turn_request(
             oid: secret_hash.clone(),
         },
     );
-    if let Ok(salt) = std::env::var("CAOS_SALT") {
+    // The job's salt arg, fetched with the worker-side client: a worker's environment
+    // does not carry it.
+    let salt_path = "/cas/args/salt";
+    if let Some(salt) = Command::new("caos")
+        .args(["get", salt_path])
+        .status()
+        .ok()
+        .filter(|status| status.success())
+        .and_then(|_| fs::read_to_string(salt_path).ok())
+        .map(|salt| salt.trim().to_string())
+    {
         if !salt.is_empty() {
             entries.insert(
                 "salt".to_string(),

@@ -245,7 +245,7 @@ The runner's side is `rust/crates/caos/src/runner.rs`. It keeps the worker
 running across jobs, answers `caos next` over a root-owned unix socket
 (`CAOS_NEXT_SOCKET`, default `/run/caos/next.sock`) that only the setuid `caos`
 can reach, and between jobs does a NARROW reset: `/cas/args`, `/cas/out`,
-`/cas/out-trace`, `/cas/nonce`, `/cas/salt` and `/secret` go; the rest of `/cas`,
+`/cas/out-trace`, `/cas/nonce` and `/secret` go; the rest of `/cas`,
 the scratch directories and every process stay. Its output is relayed line by
 line as it is written, masked, with a bounded tail kept to explain a failure.
 `caos next` exits 0 with the next job's args at `/cas/args`, or 10 to say leave.

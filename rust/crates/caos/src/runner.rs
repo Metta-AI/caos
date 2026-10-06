@@ -290,7 +290,7 @@ impl Runner {
     /// and nothing has said it (see `run`).
     fn life(&mut self, first: RunnerJob) -> Result<(After, Option<String>), String> {
         let mut job = first;
-        let (cas, salt) = match self.prepare(&job, true) {
+        let cas = match self.prepare(&job, true) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.post(&job, &Err(error.clone()), None, false)?;
@@ -307,15 +307,7 @@ impl Runner {
             .tenure
             .clone()
             .map(|tenure| Heartbeat::start(&self.t, tenure, job.token.clone(), self.cfg.renew));
-        // The first job's context is in the environment as it always was, so a
-        // worker that never calls `caos next` is unchanged. It is STALE from a
-        // resident worker's second job on, which is why `caos` reads the files
-        // the runner writes before it reads these (see `job_nonce`).
-        let envs = vec![
-            (crate::SALT_ENV, salt),
-            (crate::JOB_NONCE_ENV, job.nonce.clone()),
-        ];
-        let worker = self.spawn_worker(&envs)?;
+        let worker = self.spawn_worker()?;
         let outcome = self.supervise(&mut job, &cas, &worker, heartbeat.as_ref());
         if let Some(heartbeat) = &heartbeat {
             heartbeat.stop();
@@ -554,18 +546,18 @@ impl Runner {
     }
 
     /// Set up for one job: its ArgTree at `/cas/args`, its secrets at
-    /// `/secret`, and — for a resident worker, whose environment cannot change
-    /// from job to job — the job's nonce and salt as root-owned files `caos`
-    /// reads in place of `CAOS_JOB_NONCE` and `CAOS_SALT`. `fresh` wipes `/cas`
+    /// `/secret`, and the job's nonce and salt as root-owned files `caos` reads
+    /// (no worker has either in its environment: a resident one outlives its first
+    /// job). `fresh` wipes `/cas`
     /// first; a later job of a resident worker keeps what earlier ones fetched,
     /// which is checked against its oid and so still correct.
-    fn prepare(&mut self, job: &RunnerJob, fresh: bool) -> Result<(PathBuf, String), String> {
-        let (arg_tree, salt) = read_arg_tree(&self.t, &job.arg_tree)?;
+    fn prepare(&mut self, job: &RunnerJob, fresh: bool) -> Result<PathBuf, String> {
+        let arg_tree = job.arg_tree.as_str();
         let cas = if fresh {
-            cas_setup(&self.t, Some(&arg_tree))?
+            cas_setup(&self.t, Some(arg_tree))?
         } else {
             let cas = crate::cas_dir();
-            crate::fetch_and_materialize(&self.t, &cas.join("args"), &arg_tree)?;
+            crate::fetch_and_materialize(&self.t, &cas.join("args"), arg_tree)?;
             cas
         };
         if self.image_oid.is_none() {
@@ -587,11 +579,8 @@ impl Runner {
                 }
             }
         }
-        if self.cfg.resident {
-            write_root_file(&cas.join(NONCE_FILE), &job.nonce)?;
-            write_root_file(&cas.join(SALT_FILE), &salt)?;
-        }
-        Ok((cas, salt))
+        write_root_file(&cas.join(NONCE_FILE), &job.nonce)?;
+        Ok(cas)
     }
 
     /// Run `/worker` with `envs` added to its environment. We stay root (to tear
@@ -608,16 +597,13 @@ impl Runner {
     /// Best-effort and transform-blind — a value the worker base64'd or split
     /// slips through; this catches an accidental echo, not a determined
     /// exfiltrator.
-    fn spawn_worker(&self, envs: &[(&'static str, String)]) -> Result<Worker, String> {
+    fn spawn_worker(&self) -> Result<Worker, String> {
         let (uid, gid) = (self.cfg.uid, self.cfg.gid);
         let mut command = Command::new(DEFAULT_WORKER);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (key, value) in envs {
-            command.env(key, value);
-        }
         // SAFETY: the closure runs in the forked child before exec and only makes
         // async-signal-safe syscalls. We drop privileges by hand (rather than
         // `Command::uid`/`gid`) so we can also clear supplementary groups — `groups`
@@ -857,7 +843,6 @@ impl Heartbeat {
 
 /// The root-owned files holding a resident worker's current job context.
 const NONCE_FILE: &str = "nonce";
-const SALT_FILE: &str = "salt";
 
 /// Write `contents` root-owned and readable by root only: it is `caos`, which is
 /// setuid-root, that reads these, never the worker.
@@ -867,18 +852,30 @@ fn write_root_file(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|e| format!("chmod {}: {e}", path.display()))
 }
 
-/// The job nonce of the job a worker is running: the file a resident runner
-/// writes for each job, else the environment, which any runner exports for the
-/// FIRST job. The file wins because the environment of a worker that outlives
-/// its first job is stale; only a resident runner writes one, so a worker that
-/// is not resident reads the environment exactly as before.
+/// The job nonce of the job a worker is running, from the file its runner writes
+/// for every job. Only the worker-side `caos` reads it (see
+/// [`trust_job_context_files`]); anything else is not in a job and has none.
 pub fn job_nonce() -> Option<String> {
-    read_context_file(NONCE_FILE).or_else(|| std::env::var(crate::JOB_NONCE_ENV).ok())
+    read_context_file(NONCE_FILE)
 }
 
-/// The salt of the job a worker is running, by the same rule as [`job_nonce`].
+/// The salt of the job a worker is running. In the worker-side `caos` it is the
+/// job's own `salt` arg, which a runner materializes at `/cas/args/salt` for every
+/// job, so it is right for a resident worker's tenth job as for its first; a
+/// worker's environment is not, because it outlives the first. A client (not
+/// trusted, so it reads nothing under `/cas`) takes `CAOS_SALT` as the user's own
+/// choice of salt.
 pub fn job_salt() -> Option<String> {
-    read_context_file(SALT_FILE).or_else(|| std::env::var(crate::SALT_ENV).ok())
+    if !JOB_CONTEXT_FILES.load(Ordering::Relaxed) {
+        return std::env::var(crate::SALT_ENV).ok();
+    }
+    // The arg is a placeholder tagged with its hash; the value is one fetch away.
+    let hash = crate::read_hash(&crate::cas_dir().join("args").join("salt")).ok()?;
+    let (_, content) = crate::HttpTransport::from_env()
+        .ok()?
+        .get_object(&hash)
+        .ok()?;
+    Some(String::from_utf8_lossy(&content).trim().to_string())
 }
 
 fn read_context_file(name: &str) -> Option<String> {
@@ -890,7 +887,7 @@ fn read_context_file(name: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Whether this process may trust `/cas/nonce` and `/cas/salt`. Only `/bin/caos`,
+/// Whether this process may trust `/cas/nonce` and `/cas/args/salt`. Only `/bin/caos`,
 /// the worker-side binary, turns it on. A client that merely shares a container
 /// with a runner — the test stack's tested `caos-cli`, run by an interpreter whose
 /// `/cas` belongs to the OUTER job — must not pick up the outer job's context.
@@ -1090,29 +1087,6 @@ fn remove_secrets() {
     let _ = std::fs::remove_dir_all(SECRET_DIR);
 }
 
-/// Unpack an ArgTree: its hash (returned back for `/cas/args`) and the salt
-/// (its reserved `salt` entry, empty if absent). `base`/`salt` are entries of
-/// this one tree, per SPEC's ArgTree.
-fn read_arg_tree(t: &dyn Transport, arg_tree: &str) -> Result<(String, String), String> {
-    let (kind, content) = t.get_object(arg_tree)?;
-    if kind != "tree" {
-        return Err(format!("arg tree {arg_tree} is a {kind}, not a tree"));
-    }
-    let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
-        .map_err(|e| format!("malformed arg tree {arg_tree}: {e}"))?;
-    let blob = |oid: gix::ObjectId| -> Result<String, String> {
-        let (_, content) = t.get_object(&oid.to_string())?;
-        Ok(String::from_utf8_lossy(&content).trim().to_string())
-    };
-    let mut salt = String::new();
-    for entry in tree.entries {
-        if entry.filename.to_vec().as_slice() == b"salt" {
-            salt = blob(entry.oid.into())?;
-        }
-    }
-    Ok((arg_tree.to_string(), salt))
-}
-
 /// One follow-up long-poll for more work for our image. `Some(job)` to run it;
 /// `None` on `idle` (our TTL passed) or `exit` (evicted) — either way, quit.
 fn next_job(
@@ -1195,7 +1169,7 @@ fn reset_after_job(cfg: &Config) {
 /// the scratch directories, and every process. That is the point of staying.
 fn narrow_reset() {
     let cas = crate::cas_dir();
-    for name in ["args", "out", "out-trace", NONCE_FILE, SALT_FILE] {
+    for name in ["args", "out", "out-trace", NONCE_FILE] {
         let path = cas.join(name);
         let _ = if path.is_dir() && !path.is_symlink() {
             std::fs::remove_dir_all(&path)

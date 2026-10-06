@@ -88,11 +88,12 @@ worker brings the daemon up. See `design/daemons.md` and, for the wire
 protocol, `design/runner-protocol.md`.
 
 Between jobs a resident worker keeps the rest of `/cas`, `/tmp` and its
-processes, and loses `/cas/args`, `/cas/out`, `/cas/out-trace`, `/cas/nonce`,
-`/cas/salt` and `/secret`. Its environment's `CAOS_SALT` and `CAOS_JOB_NONCE` are
-the FIRST job's, so `caos` reads the per-job files first, and a script that needs
-the salt for its own children reads `/cas/salt`. A result must still depend only
-on the ArgTree and the instance's declared state; hidden in-memory state breaks
+processes, and loses `/cas/args` (and its `salt`), `/cas/out`, `/cas/out-trace`,
+`/cas/nonce` and `/secret`. A worker's environment carries neither `CAOS_SALT` nor
+`CAOS_JOB_NONCE`: `caos` reads the nonce from `/cas/nonce` and the salt from
+`/cas/args/salt`, and a script that needs the salt for a client reads that arg. A
+result must still depend only on the ArgTree and the instance's declared state;
+hidden in-memory state breaks
 the cache silently, and that is the daemon author's responsibility.
 
 `request-id` is the name for an ordinary arg that makes otherwise identical
