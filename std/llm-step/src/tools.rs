@@ -35,7 +35,15 @@ pub const EVAL_PATH: &str = "eval_path";
 pub fn is_inline(name: &str) -> bool {
     matches!(
         name,
-        "read" | "ls" | "write" | "edit" | "import_source" | "publish_source"
+        "read"
+            | "ls"
+            | "write"
+            | "edit"
+            | "copy"
+            | "move"
+            | "remove"
+            | "import_source"
+            | "publish_source"
     )
 }
 
@@ -63,6 +71,17 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param old-string Exact text to replace.
 @param new-string Replacement text.
 @param [replace-all] Replace every occurrence (default false).";
+
+const COPY_HELP: &str = "Copy a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash — it needs no `paths` declaration.
+@param from Conversation path to copy, such as imports/repo/base.
+@param to Conversation path of the copy, such as feature/01-change.";
+
+const MOVE_HELP: &str = "Move or rename a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. A source tree stays a source tree, with its history. Prefer this over mv via bash — it needs no `paths` declaration.
+@param from Conversation path to move, such as feature/01-change.
+@param to New conversation path, such as feature/02-change.";
+
+const REMOVE_HELP: &str = "Remove a file or directory, and everything under it, from the conversation. Removing a source tree removes the whole tree from the conversation. Prefer this over rm via bash — it needs no `paths` declaration.
+@param file-path Conversation path to remove, such as feature/01-change/old.txt.";
 
 const TOOL_HELP_HELP: &str = "Describe the repository tool at a conversation path: what it does and which parameters `run_tool` accepts for it. A tool is a directory carrying a `.caos-expr` that binds a `help`, such as feature/01-change/caos-tools/test. Tools are NOT listed for you; they are documented in each repository's own docs (AGENTS.md, README, and so on), and this tool is the authoritative description of what one takes. Call it before `run_tool` whenever you have not been told a tool's parameters, or the docs might be stale. It evaluates the path, including the target expression, and reads the resulting help. This may build the tool but does not invoke it.
 @param path Conversation-relative directory of the tool, such as feature/01-change/caos-tools/test.";
@@ -94,6 +113,9 @@ pub fn declarations() -> Vec<Value> {
         ("ls", LS_HELP),
         ("write", WRITE_HELP),
         ("edit", EDIT_HELP),
+        ("copy", COPY_HELP),
+        ("move", MOVE_HELP),
+        ("remove", REMOVE_HELP),
         ("import_source", crate::import_source::HELP),
         ("tool_help", TOOL_HELP_HELP),
         (EVAL_PATH, EVAL_PATH_HELP),
@@ -1111,6 +1133,9 @@ pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "edit" => edit(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "copy" => copy(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "move" => move_entry(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
+        "remove" => remove(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         other => Err(User(format!("unknown inline tool {other:?}"))),
     };
     match outcome {
@@ -1350,6 +1375,152 @@ fn edit(call: &Value, ws: &str) -> Result<(String, String), Fail> {
         ),
         new_ws,
     ))
+}
+
+/// `.caos` at the conversation root is protocol metadata, for the same reason
+/// `write` and `edit` refuse it (see `execute_inline` in main.rs, which only
+/// sees the one `file-path` argument and so cannot guard `from` and `to`).
+fn reject_protocol(comps: &[String]) -> Result<(), Fail> {
+    if comps.first().is_some_and(|c| c == ".caos") {
+        return Err(User(
+            ".caos is protocol metadata; use conversation commands to change it".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn copy(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let from = components(call, "from")?;
+    let to = components(call, "to")?;
+    reject_protocol(&to)?;
+    let new_ws = copy_entry(ws, &from, &to)?;
+    Ok((
+        format!("copied {} to {}", from.join("/"), to.join("/")),
+        new_ws,
+    ))
+}
+
+fn move_entry(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let from = components(call, "from")?;
+    let to = components(call, "to")?;
+    reject_protocol(&from)?;
+    reject_protocol(&to)?;
+    if from == to {
+        return Err(User(format!(
+            "`from` and `to` are the same path: {}",
+            from.join("/")
+        )));
+    }
+    // A copy of a directory into itself is a fine thing (it copies what was
+    // there), but a MOVE into itself would delete the only copy.
+    if to.len() > from.len() && to[..from.len()] == from[..] {
+        return Err(User(format!(
+            "cannot move {} into itself ({})",
+            from.join("/"),
+            to.join("/")
+        )));
+    }
+    let copied = copy_entry(ws, &from, &to)?;
+    let new_ws = remove_entry(&copied, &from)?;
+    Ok((
+        format!("moved {} to {}", from.join("/"), to.join("/")),
+        new_ws,
+    ))
+}
+
+fn remove(call: &Value, ws: &str) -> Result<(String, String), Fail> {
+    let comps = components(call, "file-path")?;
+    reject_protocol(&comps)?;
+    let new_ws = remove_entry(ws, &comps)?;
+    Ok((format!("removed {}", comps.join("/")), new_ws))
+}
+
+/// Put the entry at `from` at `to`, creating missing parent directories, and
+/// refusing an existing `to`.
+///
+/// THE ENTRY IS LINKED, NOT READ. `from` resolves to an object in /cas and the
+/// scratch tree gets a link to it, which `caos put` records by hash -- the same
+/// way `rebuild` carries every untouched sibling. So nothing under `from` is
+/// fetched however large it is, and a source tree (a commit) arrives as the
+/// same commit: there is no "preserve history" switch because there is no
+/// copy of bytes to lose it in. The path TO `to` is materialized as `rebuild`
+/// does, which is what restores a source tree boundary when `to` lies inside
+/// one.
+fn copy_entry(ws: &str, from: &[String], to: &[String]) -> Result<String, Fail> {
+    // THE ENTRY ITSELF, NOT WHAT `resolve` MAKES OF IT. Resolving `from` walks
+    // THROUGH a source tree (a commit entry) to its code tree, and a link to
+    // that would copy the files but not the commit: the copy would not be a
+    // source tree, and `log`, `diff` and `publish_source` would not know it.
+    // The child of the parent directory is the entry as stored -- which is
+    // also how `ls` tells a commit from a directory.
+    resolve(None, ws, from)?; // a path that is not there is the model's mistake
+    let parent = resolve(None, ws, &from[..from.len() - 1])?;
+    let source = parent.join(&from[from.len() - 1]);
+    match resolve(None, ws, to) {
+        Ok(_) => {
+            return Err(User(format!(
+                "{} already exists; remove it first or choose another destination",
+                to.join("/")
+            )))
+        }
+        Err(Infra(e)) => return Err(Infra(e)),
+        Err(User(_)) => {} // not there: the case this wants
+    }
+    let work = scratch(&fresh_name("inline")).map_err(Infra)?;
+    let relative = to.join("/");
+    worker_common::files::materialize(ws, &work, std::slice::from_ref(&relative)).map_err(Infra)?;
+    let mut ancestor = work.clone();
+    for component in &to[..to.len() - 1] {
+        ancestor.push(component);
+        if ancestor.is_symlink() {
+            return Err(User(
+                "copy/move cannot follow a symlink; use bash to replace it explicitly".into(),
+            ));
+        }
+    }
+    let target = work.join(&relative);
+    fs::create_dir_all(target.parent().unwrap())
+        .map_err(|e| User(format!("cannot create the parents of {relative}: {e}")))?;
+    worker_common::link(&source, target).map_err(Infra)?;
+    let out = fresh("files-inline");
+    caos(["put", path(&work), &out]).map_err(Infra)?;
+    Ok(out)
+}
+
+/// Drop the entry at `comps`, and everything under it, from the tree.
+///
+/// The way TO the entry is materialized and the entry itself is not: asking
+/// for a name that cannot exist beside it makes every directory above it real
+/// (so a source tree boundary is restored by `caos put`) while the entry stays
+/// a link, which is then removed without ever having been fetched.
+fn remove_entry(ws: &str, comps: &[String]) -> Result<String, Fail> {
+    resolve(None, ws, comps)?; // a path that is not there is the model's mistake, not a no-op
+    let work = scratch(&fresh_name("inline")).map_err(Infra)?;
+    let mut probe: Vec<String> = comps[..comps.len() - 1].to_vec();
+    probe.push(".caos-remove-probe".to_string());
+    worker_common::files::materialize(ws, &work, &[probe.join("/")]).map_err(Infra)?;
+    let mut ancestor = work.clone();
+    for component in &comps[..comps.len() - 1] {
+        ancestor.push(component);
+        if ancestor.is_symlink() {
+            return Err(User(
+                "remove cannot follow a symlink; use bash to replace it explicitly".into(),
+            ));
+        }
+    }
+    let target = work.join(comps.join("/"));
+    let is_dir = fs::symlink_metadata(&target)
+        .map_err(|e| User(format!("{} cannot be removed: {e}", comps.join("/"))))?
+        .is_dir();
+    let removal = if is_dir {
+        fs::remove_dir_all(&target)
+    } else {
+        fs::remove_file(&target)
+    };
+    removal.map_err(|e| Infra(format!("removing {}: {e}", target.display())))?;
+    let out = fresh("files-inline");
+    caos(["put", path(&work), &out]).map_err(Infra)?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,7 +1929,7 @@ mod tests {
     fn read_and_ls_are_inline_and_declared() {
         // Routed in-process (no sub-run). A repository tool cannot shadow them:
         // it is named by path, never by name.
-        for t in ["read", "ls", "import_source"] {
+        for t in ["read", "ls", "copy", "move", "remove", "import_source"] {
             assert!(is_inline(t));
             assert!(declarations().iter().any(|d| d["name"] == t));
         }
@@ -1773,6 +1944,83 @@ mod tests {
             .find(|d| d["name"] == "read")
             .unwrap();
         assert!(read["input_schema"].get("required").is_none());
+    }
+
+    /// The message of a refusal the model is meant to read. These guards run
+    /// before anything touches /cas, so `ws` is never looked at.
+    fn refused(result: Result<(String, String), Fail>) -> String {
+        match result {
+            Err(User(message)) => message,
+            Err(Infra(message)) => panic!("expected a user error, got infra: {message}"),
+            Ok((text, _)) => panic!("expected a refusal, got: {text}"),
+        }
+    }
+
+    #[test]
+    fn copy_and_move_refuse_what_cannot_work_before_touching_the_tree() {
+        let call = |from: &str, to: &str| json!({"input": {"from": from, "to": to}});
+
+        // The protocol directory is refused as a destination of a copy and as
+        // either end of a move; `execute_inline` only sees `file-path`.
+        let m = refused(copy(&call("main/a", ".caos/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+        let m = refused(move_entry(&call("main/a", ".caos/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+        let m = refused(move_entry(&call(".caos/a", "main/a"), "ws"));
+        assert!(m.contains(".caos is protocol metadata"), "{m}");
+
+        // A move onto itself, however the path is spelled, would delete it.
+        let m = refused(move_entry(&call("main/a", "/main/./a"), "ws"));
+        assert!(m.contains("same path"), "{m}");
+
+        // A move into itself would delete the only copy.
+        let m = refused(move_entry(&call("main/dir", "main/dir/inner"), "ws"));
+        assert!(m.contains("into itself"), "{m}");
+        let m = refused(move_entry(&call("main/dir", "main/dir/a/b/c"), "ws"));
+        assert!(m.contains("into itself"), "{m}");
+
+        // Missing and malformed arguments are the model's mistake, named.
+        assert!(refused(copy(&json!({"input": {"to": "main/a"}}), "ws")).contains("`from`"));
+        assert!(refused(copy(&json!({"input": {"from": "main/a"}}), "ws")).contains("`to`"));
+        assert!(refused(move_entry(&call("main/a", ".."), "ws")).contains(".."));
+        assert!(refused(copy(&call("main/../a", "main/b"), "ws")).contains(".."));
+        assert!(refused(copy(&call("", "main/b"), "ws")).contains("names no path"));
+    }
+
+    #[test]
+    fn remove_refuses_the_protocol_directory_and_bad_paths() {
+        let call = |p: &str| json!({"input": {"file-path": p}});
+        for p in [".caos", ".caos/x", "/.caos/conflicts"] {
+            let m = refused(remove(&call(p), "ws"));
+            assert!(m.contains(".caos is protocol metadata"), "{p}: {m}");
+        }
+        assert!(refused(remove(&json!({"input": {}}), "ws")).contains("`file-path`"));
+        assert!(refused(remove(&call("."), "ws")).contains("names no path"));
+        assert!(refused(remove(&call("main/../.."), "ws")).contains(".."));
+    }
+
+    #[test]
+    fn the_direct_tools_are_declared_with_the_arguments_the_worker_reads() {
+        let find = |name: &str| {
+            declarations()
+                .into_iter()
+                .find(|d| d["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is not declared"))
+        };
+        for (name, required) in [
+            ("copy", json!(["from", "to"])),
+            ("move", json!(["from", "to"])),
+            ("remove", json!(["file-path"])),
+        ] {
+            let d = find(name);
+            assert_eq!(d["input_schema"]["required"], required, "{name}");
+            let props = d["input_schema"]["properties"].as_object().unwrap();
+            // No `paths` and no commit message: the commit comes from the tool
+            // name, as for write and edit.
+            assert!(!props.contains_key("paths"), "{name}");
+            assert!(!props.contains_key("message"), "{name}");
+            assert!(props.keys().all(|k| required.as_array().unwrap().contains(&json!(k))));
+        }
     }
 
     #[test]

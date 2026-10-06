@@ -1,0 +1,11 @@
+# tests/llm-step-unit, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A CLIENT TEST, because it needs the SOURCE of llm-step, which a worker test
+# cannot get: `--x:@=DEEP-DEPS/llm-step` is EVALUATED (it carries a .caos-expr)
+# and hands over the built step image. A client test's script sees DEEP-DEPS/
+# as plain files, which is how tests/cargo-self gets the workspace.
+#
+#   --test  this directory itself, staged into the repo as ./test with its
+#           DEEP-DEPS alongside (see tests/cargo-self/.caos-expr).
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
