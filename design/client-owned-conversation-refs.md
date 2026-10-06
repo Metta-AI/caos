@@ -82,8 +82,10 @@ Each worker creates a throwaway local repository and points its `origin` at
   changed, and as an infrastructure failure if the observed head is unchanged.
 
 The server does not enforce first-parent ancestry, source-tree-tree continuity,
-or conversation namespaces. The clients continue to enforce those invariants
-because they consume the protocol.
+or conversation namespaces. The clients enforce those invariants when they
+WRITE: each transition is checked by `apply` before it is pushed. A reader
+trusts the history it fetches and does not re-validate it (SPEC, "A
+conversation's history is trusted").
 
 ## Async result ownership
 

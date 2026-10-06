@@ -47,9 +47,9 @@ use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, eval_base, fetch_validated_head, mint_transition, oid,
-    open_store, push_cas, resolve_username, seed_content, signature, update_local_cache,
-    TurnOptions, LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
+    conversation_ref, default_title, eval_base, fetch_head, mint_transition, oid, open_store,
+    push_cas, resolve_username, seed_content, signature, update_local_cache, TurnOptions,
+    LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
 };
 
 /// Conversation ids for recorded sessions live under one component so they are
@@ -380,7 +380,7 @@ fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
 ///
 /// In a cloud session the hook takes ~10s -- its curry, base push and
 /// conversation push each cross the iroh tunnel -- so this is a short wait.
-/// Probing is cheap: `fetch_validated_head` returns early on an absent ref,
+/// Probing is cheap: `fetch_head` returns early on an absent ref,
 /// with no fetch and no local write. Bounded well past the hook's time; a
 /// conversation that never appears still errors, just after the wait.
 const TOOL_WAIT_ATTEMPTS: u32 = 20;
@@ -389,7 +389,7 @@ const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 fn wait_for_conversation(t: &GitTransport, id: &str) {
     for attempt in 0..TOOL_WAIT_ATTEMPTS {
         if let Ok(store) = open_store(t) {
-            if matches!(fetch_validated_head(t, &store, id), Ok(Some(_))) {
+            if matches!(fetch_head(t, &store, id), Ok(Some(_))) {
                 return;
             }
         }
@@ -413,7 +413,7 @@ fn read_outcome(
     call: &str,
 ) -> Result<ToolOutcome, String> {
     let store = open_store(t)?;
-    let (_, head) = fetch_validated_head(t, &store, id)?
+    let (_, head) = fetch_head(t, &store, id)?
         .ok_or_else(|| format!("conversation {id:?} disappeared while its tool ran"))?;
     let view = Conversation::open(&store, &head)?;
     let tool = view
@@ -690,7 +690,7 @@ fn record_prompt(
 
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
-        let observed = fetch_validated_head(t, &store, id)?.map(|(_, head)| head);
+        let observed = fetch_head(t, &store, id)?.map(|(_, head)| head);
         let mut head = match &observed {
             Some(head) => head.clone(),
             None => root_commit(t, &mut store, id, prompt, options, &signature)?,
@@ -994,7 +994,7 @@ fn append(
     let refname = conversation_ref(id)?;
     for _ in 0..MAX_APPEND_ATTEMPTS {
         let mut store = open_store(t)?;
-        let Some((_, head)) = fetch_validated_head(t, &store, id)? else {
+        let Some((_, head)) = fetch_head(t, &store, id)? else {
             return Err(format!(
                 "no conversation {id:?} to record into; \
                  a session's first recorded event is its user prompt"

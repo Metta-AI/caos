@@ -1,0 +1,14 @@
+# DEPS format and dependency-closure rules are documented in
+# design/caos-expr.md.
+../../std/cargo cargo
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../dev/cli-test cli-test
+# What rustc splices into llm-step when it builds it (std/llm-step/.caos-expr:
+# --dep0, --dep1, --dep2, and worker-common). Here they are copied beside its
+# source, because `cargo test` needs the same layout rustc makes.
+../../std/llm-step llm-step
+../../std/llm-client llm-client
+../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/git-locator git-locator
+../../rust/crates/worker-common worker-common

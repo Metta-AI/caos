@@ -1,0 +1,4 @@
+# This tool's worker image: the program runs on std/go, named by a local
+# deep-deps mount (design/caos-expr.md). std/go carries git, which is the one
+# thing needed here: caos has no verb for listing refs.
+../../std/go go

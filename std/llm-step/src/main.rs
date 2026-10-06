@@ -2230,7 +2230,7 @@ fn execute_inline(
 ) -> Result<(), String> {
     let call = normalize_inline_call(site.call, &target);
     if let Some((_, relative)) = inline_files_path(&call) {
-        if matches!(call.name.as_str(), "write" | "edit")
+        if matches!(call.name.as_str(), "write" | "edit" | "remove")
             && (relative == ".caos" || relative.starts_with(".caos/"))
         {
             return site.fail(

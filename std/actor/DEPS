@@ -1,0 +1,2 @@
+# The image this worker runs on (format `<path> <name>`).
+../go go

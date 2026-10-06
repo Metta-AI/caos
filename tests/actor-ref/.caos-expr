@@ -1,0 +1,3 @@
+# SPIKE for std/actor/README.md open question 6 (see worker.go): a std/go worker
+# that moves a branch by speaking git-receive-pack with an empty pack.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go
