@@ -195,7 +195,15 @@ func publish(stateRef, head, newState string) {
 	if head != "" {
 		text += "parent " + head + "\n"
 	}
-	text += "author actor <actor@caos> 0 +0000\ncommitter actor <actor@caos> 0 +0000\n\nactor state\n"
+	// THE COMMIT NAMES THIS ATTEMPT: our own ArgTree, which carries Q (and so
+	// its message and nonce) and the head it observed. A refused push is ours
+	// only if the head is THIS commit, and without the name a commit is just
+	// (parent, state): a different request that applied a different message
+	// to the same head with the same outcome mints the identical bytes, and its
+	// commit at the head would read as our push landing -- two requests
+	// acknowledged, both against one head (tests/actor, `twinned`).
+	text += "author actor <actor@caos> 0 +0000\ncommitter actor <actor@caos> 0 +0000\n\nactor state\n\n" +
+		"request " + caos("hash", "/cas/args") + "\n"
 	w.Must(os.WriteFile("/tmp/actor-commit", []byte(text), 0o644))
 	candidate := caos("put-commit", "/tmp/actor-commit", "/cas/new-commit")
 
