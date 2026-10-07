@@ -487,7 +487,7 @@ DEFAULT_HARVEST='refs/caos/v3/conversations/*'
 op_harvest() {
   if not_running; then return 0; fi
   local refs
-  refs=$(opt refs)
+  refs=$(opt harvest-refs)
   refs=${refs:-$DEFAULT_HARVEST}
   # Remembered, so the last harvest — during the grace period after a leave — is
   # the same one the caller last asked for.
