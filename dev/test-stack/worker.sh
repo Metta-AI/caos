@@ -501,12 +501,14 @@ harvest() { # <refs, one pattern per line>
   done <<<"$patterns"
 }
 
-# What the stack's repo holds, by namespace: the first four ref components and
-# a count. It is the answer to "harvested=0, but is that because there is
-# nothing, or because it is somewhere else?".
+# What the stack's repo holds, by namespace: the first three ref components
+# (refs/caos/req, refs/caos/v3, ...) and a count. It is the answer to
+# "harvested=0, but is that because there is nothing, or because it is somewhere
+# else?". No `head`: it would close the pipe early and `pipefail` would turn the
+# SIGPIPE into an exit of the daemon. `|| true` for the same reason.
 stack_ref_summary() {
-  git -C /caos-dev/git for-each-ref --format='%(refname)' 2>&1 \
-    | cut -d/ -f1-4 | sort | uniq -c | sort -rn | head -20
+  { git -C /caos-dev/git for-each-ref --format='%(refname)' 2>&1 \
+      | cut -d/ -f1-3 | sort | uniq -c | sort -rn; } || true
 }
 
 DEFAULT_HARVEST='refs/caos/v3/conversations/*'
