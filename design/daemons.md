@@ -61,7 +61,7 @@ Where the code differs from, or settles, what the sections below say:
   program that builds, tests and runs a stack on it. `std/caos-build`,
   `std/caos-test` and `dev/caos-stack` drive that program. (Earlier text in this
   document and in `design/test-stack-image.md` says "test stack" for the image.)
-- **The callers.** `std/caos-build`, `std/caos-test` and `std/caos-stack` are
+- **The callers.** `std/caos-build`, `std/caos-test` and `dev/caos-stack` are
   routers on std/bash: they hash the tree, use it as both `affinity` and `in`, and
   tail-call the message at `dev/test-stack`. `caos-build` (op `build`) and
   `caos-test` (op `run-tests`) are cached like any job, which is why they are
