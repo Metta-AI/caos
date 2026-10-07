@@ -836,10 +836,13 @@ func conv(o opts) error {
 	}
 	head := strings.Fields(string(ls))
 	if len(head) == 0 {
-		fmt.Println("head:         (not on " + shown + " — no turn recorded yet, or the session records elsewhere)")
+		fmt.Println("head:         (not on " + shown + " — no turn recorded yet, or not harvested from the stack)")
 		return errors.New("conversation head not found on " + shown)
 	}
 	fmt.Println("head:         " + head[0])
+	if len(head) > 1 {
+		fmt.Println("found as:     " + head[1])
+	}
 	// A ticket stays out of the transcript: the commands below name it by
 	// placeholder, and the person substitutes it.
 	cmdServer := server
