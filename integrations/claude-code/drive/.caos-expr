@@ -34,9 +34,12 @@
 # READING THE ANSWER: `start` and `send` return at once. The model's reply is
 # not printed anywhere; `info` shows the session's `summary` once its turn has
 # finished (empty while it is still running -- call `info` again with a new
-# `at`). `conv` reads the conversation from $CAOS_SERVER_URL, which is the HOST
-# server, so for a session driven at a `caos-stack` test stack it reports "head
-# not found": the conversation is recorded in the stack, not here.
+# `at`). `conv` asks the server the session records into, which it reads from the
+# `--server=` on the session's environment's setup line (a `caos-stack` test
+# stack's ticket, for a session driven at one). Only when the environment names
+# none does it fall back to this worker's $CAOS_SERVER_URL, the HOST server. A
+# `caos://` ticket is printed truncated, being a credential. It needs
+# git-remote-caos in this worker to ask a ticket, and says so when it is missing.
 #
 # No `@writer` and no `@in`: nothing here advances the conversation tree.
 HELP=<<END
