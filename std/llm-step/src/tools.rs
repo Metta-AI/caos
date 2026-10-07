@@ -1123,6 +1123,43 @@ impl Fail {
     }
 }
 
+/// Arguments the hook or an older client may add to any call; they are plumbing,
+/// not the model's, so they are never a mistake to refuse.
+const PLUMBING_ARGS: &[&str] = &[
+    "source_tree",
+    "caos_session",
+    "caos_prompt_id",
+    "caos_tool_use_id",
+];
+
+/// The refusal for a call to a file tool that carries an argument the tool does
+/// not declare, in the words `run_tool` uses for a repository tool. Without it a
+/// misspelled optional argument (`replace_all`) is silently ignored, and a
+/// misspelled required one (`old_string`) is reported as MISSING, which sends
+/// the model hunting for a value it already gave.
+fn unknown_argument(call: &Value, name: &str) -> Option<String> {
+    let help = match name {
+        "read" => READ_HELP,
+        "ls" => LS_HELP,
+        "write" => WRITE_HELP,
+        "edit" => EDIT_HELP,
+        "copy" => COPY_HELP,
+        "move" => MOVE_HELP,
+        "remove" => REMOVE_HELP,
+        _ => return None,
+    };
+    let tool = builtin_tool(name, help);
+    let declared: Vec<&str> = tool.args.iter().map(|a| a.name.as_str()).collect();
+    let input = call["input"].as_object()?;
+    let key = input
+        .keys()
+        .find(|k| !declared.contains(&k.as_str()) && !PLUMBING_ARGS.contains(&k.as_str()))?;
+    Some(format!(
+        "{name} takes no {key:?} argument (declared: {})",
+        declared.join(", ")
+    ))
+}
+
 /// Execute one inline call against the source tree at CAS path `ws`. Returns the
 /// tool_result block and, for a mutation, the new source tree CAS path.
 pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String> {
