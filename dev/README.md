@@ -62,13 +62,19 @@ under test, not the place the tools run.
 - A session started with a plain greeting only lists its tools; give it a
   task that calls a caos tool if you want to see the stack do work (the
   stack's `logs` with `log=server` then shows `cache miss` / `ran worker`).
-- `drive conv` and `harvest` do not retrieve the conversation. `conv` looks
-  for the session's head on YOUR session's server (the `http://10.x.x.x` in its
-  error), not on the test stack, so it reports "not on ... wrong server, or no
-  turn yet" even after turns completed; it also prints the transcript of an
-  unrelated conversation before failing, which is not the session's. `harvest`
-  returned `harvested=0` with the default `refs/caos/v3/conversations/*` after
-  completed turns; why is still not understood. Use `drive info`'s summary.
+- `drive info` is not broken: like `start`, `send` and `list` it only asks the
+  Claude sessions API. `drive conv` is the odd one out: it runs `git ls-remote`
+  against `$CAOS_SERVER_URL`, i.e. YOUR session's caos server (the
+  `http://10.x.x.x` in its error), so it can never see a conversation recorded
+  on a test stack and reports "not on ... wrong server, or no turn yet".
+  (The failed call's output also began with a transcript of some other
+  conversation; I did not find where that comes from.)
+- `harvest` exists because the stack's git dies with the stack. It pushes
+  `refs/caos/v3/conversations/*` from the stack to YOUR server as
+  `refs/stacks/<instance>/caos/v3/conversations/...`, so even after a
+  harvest `conv` (which looks at the unprefixed ref) would not find it.
+  Here it returned `harvested=0` after completed turns; why is not
+  understood. Until it is, read turns from `drive info`'s summary.
 - The stack can be gone within minutes of `start` (a `stop` ten minutes later
   said `not running`). That is the eviction above, not a failed start.
   `stop` then has nothing to do; carry on with `archive` and `env-delete`.
