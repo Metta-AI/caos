@@ -461,25 +461,52 @@ op_logs() {
 # The source repo, /caos-dev/git, is SHARED by every dev stack on the host, so a
 # pattern broader than conversations may export a neighbor's refs too. The
 # default is the conversations, which are named by hash and so are no one else's.
+#
+# NOTHING HERE MAY EXIT THE DAEMON. This script runs under `set -e`, and the
+# stack is this process's child: `fail` (exit 1) from a push that was refused,
+# or `set -u` on an unset CAOS_SERVER_URL, ended the daemon and the stack with
+# it, in the middle of the op that exists to save the stack's conversations. A
+# problem is recorded in /tmp/harvest.problems and reported in the reply
+# instead. A listing that FAILS is also a problem, not "no refs": an unreadable
+# repo (a `dubious ownership` refusal, say) used to read as a stack with
+# nothing to harvest.
 harvest() { # <refs, one pattern per line>
-  local instance patterns pattern dst
+  local instance patterns pattern dst found out
   instance=$(arg affinity)
   patterns=$1
   : > /tmp/harvested
+  : > /tmp/harvest.problems
+  if [ -z "${CAOS_SERVER_URL:-}" ]; then
+    echo "CAOS_SERVER_URL is not set in the daemon, so there is no outer server to push to" >> /tmp/harvest.problems
+  fi
   while IFS= read -r pattern; do
     if [ -z "$pattern" ]; then continue; fi
     case "$pattern" in
       refs/*) ;;
-      *) fail "harvest pattern $pattern must start with refs/" ;;
+      *) echo "pattern $pattern must start with refs/" >> /tmp/harvest.problems; continue ;;
     esac
     dst=refs/stacks/$instance/${pattern#refs/}
     # A pattern that matches nothing is the normal case early in a session.
-    if [ -n "$(git -C /caos-dev/git for-each-ref --count=1 --format=x "$pattern")" ]; then
-      git -C /caos-dev/git push -q "$CAOS_SERVER_URL" "+$pattern:$dst" \
-        || fail "pushing $pattern to the outer server"
-      echo "$dst" >> /tmp/harvested
+    if ! found=$(git -C /caos-dev/git for-each-ref --count=1 --format=x "$pattern" 2>&1); then
+      echo "listing $pattern in /caos-dev/git failed: $found" >> /tmp/harvest.problems
+      continue
     fi
+    if [ -z "$found" ]; then continue; fi
+    if [ -z "${CAOS_SERVER_URL:-}" ]; then continue; fi
+    if ! out=$(git -C /caos-dev/git push -q "$CAOS_SERVER_URL" "+$pattern:$dst" 2>&1); then
+      echo "pushing $pattern to the outer server failed: $out" >> /tmp/harvest.problems
+      continue
+    fi
+    echo "$dst" >> /tmp/harvested
   done <<<"$patterns"
+}
+
+# What the stack's repo holds, by namespace: the first four ref components and
+# a count. It is the answer to "harvested=0, but is that because there is
+# nothing, or because it is somewhere else?".
+stack_ref_summary() {
+  git -C /caos-dev/git for-each-ref --format='%(refname)' 2>&1 \
+    | cut -d/ -f1-4 | sort | uniq -c | sort -rn | head -20
 }
 
 DEFAULT_HARVEST='refs/caos/v3/conversations/*'
