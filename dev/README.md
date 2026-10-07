@@ -66,31 +66,46 @@ under test, not the place the tools run.
   Claude sessions API. `drive conv` is the odd one out, because it asks a caos
   server. It used to ask YOUR session's server (`$CAOS_SERVER_URL`, the
   `http://10.x.x.x` in its error), which never holds a test stack's
-  conversations. It now asks the server named by `--server=` on the session's
-  environment's setup line, printing a `caos://` ticket truncated, and only
-  falls back to your server when the environment names none. UNTESTED: it
-  needs `git-remote-caos` inside the `drive` worker and says so if that is
-  missing; the stack must also still be up, and it is evicted within minutes.
-  (A failed `conv` call's output once began with a transcript of some other
-  conversation; where that comes from was not found.)
+  conversations. It now reads the server from the `--server=` on the session's
+  environment's setup line (printing a `caos://` ticket truncated, since it is
+  a credential). The `drive` worker has no `git-remote-caos`, so it cannot ask
+  a ticket; it says so and looks instead for the copy `harvest` exported to
+  your server. So the order is: the session records a turn, `harvest`, then
+  `drive conv`, which prints the head and the commands to read it. Run this
+  way against a live stack, it found the conversation.
 - `harvest` exists because the stack's git dies with the stack. It copies
-  `refs/caos/v3/conversations/*` from the STACK's own git (`/caos-dev/git`, the
-  repo its server and its `caos://` listener use) to YOUR server, as
-  `refs/stacks/<instance>/caos/v3/conversations/...`; `conv` looks at the
-  unprefixed ref, so it would not find them there. Three things about it:
-  - Its optional pattern argument is `harvest-refs`. It was called `refs`, a
-    name the tool interpreter reserves, so it was silently dropped from the
-    tool's declared arguments and could never be passed ("takes no refs
-    argument"). The rename is untested against a live stack.
+  conversation refs from the STACK's own git (`/caos-dev/git`, the repo its
+  server and its `caos://` listener use) to YOUR server, as
+  `refs/stacks/<instance>/caos/v3/conversations/<hex>/head`. Things to know:
+  - `/caos-dev/git` is shared by every dev stack on the host, so it holds
+    neighbours' conversations too (about a thousand `refs/caos/v3` refs when
+    this was written). The default exports ALL of them. To export just yours,
+    pass its ref as `harvest-refs`: `drive conv` prints it as `ref:`. One
+    pattern per line.
+  - The default used to be `refs/caos/v3/conversations/*`, which matched
+    nothing: `git for-each-ref` matches patterns with path semantics, where
+    `*` stops at a `/`, and a conversation ref has two components after
+    `conversations/`. That, not eviction and not the wrong server, was the
+    `harvested=0`. The default is now `refs/caos/v3/conversations/*/head`.
+    Proved on a live stack: the literal ref and `...<prefix>*/head` both
+    exported; the old pattern exported nothing from a repo that held the
+    conversation.
+  - The optional pattern argument is `harvest-refs`. It was called `refs`, a
+    name the tool interpreter reserves, so it was silently dropped and could
+    never be passed ("takes no refs argument").
+  - `harvest` no longer ends the stack. A failed push or an unset
+    `CAOS_SERVER_URL` used to `exit 1` the daemon, and a failed listing read
+    as "no refs". Problems are now listed in the reply, with a count of the
+    stack repo's refs by namespace. A stack survived three harvests and was
+    still up 400 s after start.
   - The stack runs one last harvest as it is evicted, but only of the patterns
     its latest `harvest` call asked for. A stack never asked to `harvest` while
     up exports nothing when it goes, so call `harvest` once early.
-  - `harvested=0` after completed turns has not been explained. It is not a
-    matter of the stack reading the wrong server: the source is the stack's
-    own repo by design. Either the conversation refs are not in that repo, or
-    the pattern does not see them. Until that is settled, read turns from
-    `drive info`'s summary.
-- The stack can be gone within minutes of `start` (a `stop` ten minutes later
-  said `not running`). That is the eviction above, not a failed start.
-  `stop` then has nothing to do; carry on with `archive` and `env-delete`.
+- Nothing in the image makes a stack live longer: its `CAOS_RESIDENT_MAX_SECS`
+  is already 7200 and there is no idle timer. The server ends a stack only
+  when a job arrives that nothing parked can take, which evicts a parked owner
+  whose lineage could (daemons.md; `offer_job` in
+  `rust/crates/server/src/runner.rs`), so a busy host drops stacks and an idle
+  one keeps them. If one is gone, `stop` says `not running`; carry on with
+  `archive` and `env-delete`, and `start` again WITH `cloud-env`.
 - Clean up: `drive archive`, `drive env-delete`, then `caos-stack stop`.
