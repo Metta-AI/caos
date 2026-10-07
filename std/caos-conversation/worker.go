@@ -569,7 +569,11 @@ func read() {
 		say("")
 	}
 	say("----")
-	renderEntries(files, width, "")
+	shown := renderEntries(files, width, "", o)
+	if o.from > 0 || o.to >= 0 || o.only != "" {
+		say("(showed %d of %d entries; from=%d to=%d only=%q)", shown, len(files), o.from, o.to, o.only)
+		say("")
+	}
 
 	var bad []string
 	for _, id := range reqOrder {
