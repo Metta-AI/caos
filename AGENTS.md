@@ -22,7 +22,7 @@ Every script here runs with it, and two constructs quietly break under it.
   moment a comment lands between two of those lines: the continuation joins
   INTO the comment and the command runs with none of the environment. It is
   not a parse error, so `bash -n` passes and the damage shows up far away —
-  in `test-stack/worker` it was a stack dying at bring-up with "serve needs
+  in `devbox/worker` it was a stack dying at bring-up with "serve needs
   CAOS_STACK_STATE", 28 clients polling for an address that never appeared,
   and a suite that read as SLOW rather than broken. Put the comment above the
   block.
@@ -211,7 +211,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   in which the suite started no containers. Single-flight anything expensive
   behind a per-key lock and RE-READ the cache after acquiring it. There is one
   server process per stack, so an in-process lock is the whole requirement.
-- **A default is dead if every caller passes the variable.** `test-stack/worker`
+- **A default is dead if every caller passes the variable.** `devbox/worker`
   read `CAOS_TEST_STACK_IDLE_SECS` with a 900s default, and the `docker run`
   three hundred lines away that starts that role always passed the variable,
   defaulting it to 120. The 900 was decoration; every shared stack died two
@@ -242,7 +242,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
 
 # Several dev stacks at once
 
-Several `dev/test-stack` containers run against one host stack, each testing a
+Several `dev/devbox` containers run against one host stack, each testing a
 different tree, and they share three volumes (`/mounted-nix`, `/caos-dev`,
 `/caos-images`) plus the host's redis and registry. The rule that makes that
 work is **share what is keyed by CONTENT, and give everything else a name of
@@ -283,7 +283,7 @@ concurrency.
   the object database (`refs/caos/req|res/` are keyed by hash, and a test that
   writes a mutable ref uniquifies it — `tests/README.md`), the registry, the
   podman store, and redis under its `CAOS_CACHE_NAMESPACE`. The nix store too,
-  with one exception: `dev/test-stack/worker` seeds it with `cp`, which writes
+  with one exception: `dev/devbox/worker` seeds it with `cp`, which writes
   each file in place rather than temp-and-rename, so a concurrent nix can read a
   store path that is half there. That copy takes a flock in the volume.
 - **A concurrency fix is not tested by one stack.** Run two, from two trees that
@@ -427,7 +427,7 @@ concurrency.
   outlives its first job, so a copy there would be stale. `caos` reads the nonce
   from `/cas/nonce` and the salt from `/cas/args/salt`. A script that gives the
   salt to a client — `dev/cli-test/worker`, the inner `caos-cli` in
-  `dev/stack-daemon` — read that arg and export `CAOS_SALT` themselves.
+  `dev/test-stack` — read that arg and export `CAOS_SALT` themselves.
 - **A message with effects needs a `request-id`, or it is answered from the
   cache.** The cache is checked before dispatch, so a repeated `caos-stack
   status` with the same arguments never reaches the daemon and returns the first

@@ -3,7 +3,7 @@
 #
 # The same router as std/caos-test's, with the op and its arguments passed
 # through. See that script for why the tree is both `affinity` and `in`, and
-# dev/stack-daemon/worker.sh for what each op does.
+# dev/test-stack/worker.sh for what each op does.
 set -euo pipefail
 
 caos get /cas/args/in

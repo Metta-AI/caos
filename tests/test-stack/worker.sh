@@ -1,5 +1,5 @@
 #!/bin/bash
-# tests/stack-daemon — a WORKER test of the stack daemon (dev/stack-daemon) for a
+# tests/test-stack — a WORKER test of the stack daemon (dev/test-stack) for a
 # tree that has no stack.
 #
 #   status, logs, harvest, stop   each answer `not running` and start nothing: the
@@ -79,7 +79,7 @@ after-start)
   grep -q "needs a relay" /cas/args/error || fail "wrong refusal: $(cat /cas/args/error)"
   echo "  ok: refused: $(grep -m1 'needs a relay' /cas/args/error)" >&2
 
-  printf 'stack-daemon: ALL PASS\n' > /tmp/report
+  printf 'test-stack: ALL PASS\n' > /tmp/report
   cat /tmp/report >&2
   caos put /tmp/report /cas/out
   ;;

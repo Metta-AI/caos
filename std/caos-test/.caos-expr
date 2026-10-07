@@ -1,5 +1,5 @@
 # The `caos-test` tool (SPEC, "Tools"): a ROUTER. It sends a `run-tests` message
-# to the stack daemon for the tree (dev/stack-daemon), which brings the tree's
+# to the stack daemon for the tree (dev/test-stack), which brings the tree's
 # dev stack up if it is not already and runs the suite on it. It moved out of
 # caos-tools/ into std/ so the agent harness can DEPend on it and register it
 # ALWAYS — the tool comes from the harness's own version, not from the tree under
@@ -28,4 +28,4 @@ nothing for it to test.
 @param [only] Run only these tests — a space-separated list of tests/<name> directories.
 @in
 END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/stack-daemon --help=$HELP
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/test-stack --help=$HELP

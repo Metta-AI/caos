@@ -2,7 +2,7 @@
 # The `caos-build` tool: send `build` to the stack daemon for this tree.
 #
 # A ROUTER, like std/caos-test's: the build itself is the daemon's `build` op
-# (dev/stack-daemon/worker.sh). It is a tool of its own rather than an op of
+# (dev/test-stack/worker.sh). It is a tool of its own rather than an op of
 # `caos-stack` because a build is a pure function of the tree, so it wants the
 # cache — a repeat is a hit — while `caos-stack`'s ops have effects and take a
 # `request-id` to stay out of it.

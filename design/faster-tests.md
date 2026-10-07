@@ -78,7 +78,7 @@ the stall persist. Addresses are the only lever.
 duplicated compiles: the sum of per-test times fell 385s -> 63s.
 
 Neither was visible in the per-test times the suite reports, because
-`run-test.sh` starts its clock AFTER setup. That is why `test-stack/worker` now
+`run-test.sh` starts its clock AFTER setup. That is why `devbox/worker` now
 writes a phase clock into every test's record — the setup half of a test job
 was unmeasurable, and three separate wrong diagnoses came out of inferring it
 from `ps` instead.

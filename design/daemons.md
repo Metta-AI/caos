@@ -40,7 +40,7 @@ Where the code differs from, or settles, what the sections below say:
 - **Residency only starts at `caos next`.** An image can declare
   `CAOS_RESIDENT=1` and still run ordinary jobs: a worker that exits without ever
   calling `caos next` takes the runner back to warm polling, as on any image.
-  `dev/test-stack` declares it and still runs the suite's
+  `dev/devbox` declares it and still runs the suite's
   fan-out. The lifetime cap applies to a keyed life only, and counts from its
   start.
 - **`caos next` exits 10 for "leave"**, 0 for a new job, 1 for an error
@@ -55,16 +55,22 @@ Where the code differs from, or settles, what the sections below say:
   replies when the stack is ready and the listener has published its ticket.
 - **`request-id`** replaced the actor wrapper's `nonce` in the actor code and its
   tests, and is the arg `caos-stack` requires.
+- **Names.** `dev/devbox` is a container image and nothing else: nix, podman, git,
+  the persistent store and cache volumes, and the resident declaration. It is not a
+  stack, and the suite's fan-out jobs run on it too. `dev/test-stack` is the
+  program that builds, tests and runs a stack on it. `std/caos-build`,
+  `std/caos-test` and `std/caos-stack` drive that program. (Earlier text in this
+  document and in `design/test-stack-image.md` says "test stack" for the image.)
 - **The callers.** `std/caos-build`, `std/caos-test` and `std/caos-stack` are
   routers on std/bash: they hash the tree, use it as both `affinity` and `in`, and
-  tail-call the message at `dev/stack-daemon`. `caos-build` (op `build`) and
+  tail-call the message at `dev/test-stack`. `caos-build` (op `build`) and
   `caos-test` (op `run-tests`) are cached like any job, which is why they are
   tools of their own; `caos-stack` (start, status, logs, harvest, stop) needs a
   fresh `request-id` per call or it answers from the cache. `build` starts no
   stack and leaves none; `run-tests` leaves its stack up, which is what makes the
   next run fast.
-- **Why `dev/stack-daemon` is a directory of its own.** The script has to stay
-  OUT of `dev/test-stack`: that directory is the image's flake source, so a file in
+- **Why `dev/test-stack` is a directory of its own.** The script has to stay
+  OUT of `dev/devbox`: that directory is the image's flake source, so a file in
   it would rebuild the image whenever the script changed, and the point of one
   script between the host and the test stack is that editing it needs neither a
   host rebuild nor an image rebuild.
@@ -77,7 +83,7 @@ Where the code differs from, or settles, what the sections below say:
   process for three concurrent messages, serialized, `/cas` content kept; an
   explicit stop; a new container after it; a killed worker fails only its job;
   `caos next` refused off a resident image and off a keyed job) and
-  `tests/stack-daemon` (the ops that must not start a stack). The suite itself is
+  `tests/test-stack` (the ops that must not start a stack). The suite itself is
   the test of `start` and `run-tests`. Not tested end to end: eviction, the
   lifetime cap, a lapsed lease, `harvest`'s final run in the grace period and
   `--stream`; the server half of the first three is unit-tested.
@@ -429,7 +435,7 @@ test, point a Claude cloud session at it, drive traffic, collect the results,
 and stop it. The agent does all of it with caos jobs and `drive`.
 
 ```
-agent ── start/status/logs/harvest/stop ──job──▶ resident `stack-daemon` container (one per instance)
+agent ── start/status/logs/harvest/stop ──job──▶ resident `test-stack` container (one per instance)
                                                     inner stack: server, runnerd, redis, git, iroh listener
 agent ── drive env-create/start/send ──▶ Anthropic API ──▶ cloud session
                                               │  caos://<ticket>
@@ -438,7 +444,7 @@ agent ── drive env-create/start/send ──▶ Anthropic API ──▶ cloud
 
 ## The image
 
-A `stack-daemon` image, built from the root flake alongside `caosImage` and
+A `test-stack` image, built from the root flake alongside `caosImage` and
 reusing its interpreter (`design/test-stack-image.md`):
 
 - the interpreter brings up the inner stack exactly as it does for a test, but
@@ -571,7 +577,7 @@ dies with the container. `harvest` copies it out.
 ## Build order
 
 1. Part 1 steps 1 to 4.
-2. `stack-daemon` image with `start`, `status`, `logs`, `stop`. Test: a second
+2. `test-stack` image with `start`, `status`, `logs`, `stop`. Test: a second
    job reaches the same stack, and a stack started from the outer server answers
    a `caos-cli` call over its ticket.
 3. `harvest` and the SIGTERM grace export.

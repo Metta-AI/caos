@@ -548,7 +548,7 @@
           # Single-user, unsandboxed nix: root in a container with no nixbld
           # group and no privilege to build a sandbox. `stack/bootstrap` runs
           # one `nix build` here, and the same three settings the flake-builder
-          # and dev/test-stack pass for the same situation — as NIX_CONFIG, so a
+          # and dev/devbox pass for the same situation — as NIX_CONFIG, so a
           # plain `nix build` inherits them.
           ''NIX_CONFIG=experimental-features = nix-command flakes
 build-users-group =
@@ -654,7 +654,7 @@ sandbox = false''
           # WHAT A BARE NIX ROOT DOES NOT HAVE, and now needs — because this
           # image both BUILDS (stack/bootstrap's `nix build`) and PUBLISHES
           # (serve's build-builtins) rather than being handed the results.
-          # dev/test-stack's image carries the same lines, and its comment
+          # dev/devbox's image carries the same lines, and its comment
           # records each as a distinct failure before it was a line:
           #
           #   /tmp, /var/tmp   a writable TMPDIR for every derivation nix

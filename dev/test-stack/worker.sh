@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dev/stack-daemon/worker.sh — a caos dev stack as a RESIDENT WORKER
+# dev/test-stack/worker.sh — a caos dev stack as a RESIDENT WORKER
 # (design/daemons.md, Part 2).
 #
 # One container per TREE UNDER TEST. A message is an ordinary job whose reserved
@@ -42,7 +42,7 @@
 # The one place this script passes a salt on is to the inner client, below.
 set -euo pipefail
 
-fail() { echo "STACK-DAEMON FAIL: $*" >&2; exit 1; }
+fail() { echo "TEST-STACK FAIL: $*" >&2; exit 1; }
 
 # PHASE MARKERS, as everywhere in this tree: the container log is the only
 # account of where a minute went.

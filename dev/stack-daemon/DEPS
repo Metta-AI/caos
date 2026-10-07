@@ -1,2 +1,0 @@
-# The image this daemon runs on (format `<path> <name>`).
-../test-stack test-stack

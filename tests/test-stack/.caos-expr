@@ -1,8 +1,8 @@
-# tests/stack-daemon, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# tests/test-stack, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A WORKER TEST of the stack daemon's messages that must NOT bring a stack up
-# (dev/stack-daemon). Bringing one up — `start`, `run-tests` — is what the suite
+# (dev/test-stack). Bringing one up — `start`, `run-tests` — is what the suite
 # itself does every run, through `caos-test`, so it needs no second test; what
 # nothing else covers is the daemon answering for a tree with no stack.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/stack-daemon
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/test-stack

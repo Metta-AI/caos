@@ -15,7 +15,7 @@
   # starts using `jq` needs this flake to carry jq, and there is no version of
   # that where the two are usefully in different directories.
   #
-  # WHAT IT DELIBERATELY DOES NOT CARRY: any grant. `dev/test-stack` declares
+  # WHAT IT DELIBERATELY DOES NOT CARRY: any grant. `dev/devbox` declares
   # persistent volumes and CAP_SYS_ADMIN because it hosts a stack; a test does
   # not, and runnerd honours grants per image — so running tests in that image
   # would hand every one of them write access to the dev stack's own nix store

@@ -1,5 +1,5 @@
 # The `caos-build` tool (SPEC, "Tools"): a ROUTER that sends `build` to the stack
-# daemon for the tree (dev/stack-daemon), plus the `help` an agent registers it by.
+# daemon for the tree (dev/test-stack), plus the `help` an agent registers it by.
 # It moved out of caos-tools/ into std/ so the agent harness can DEPend on it and
 # register it ALWAYS — the tool comes from the harness's own version, not from
 # whatever tree is being worked on (design/flake-inputs.md, "the tui").
@@ -21,4 +21,4 @@ caos codebase; run in any other tree it reports cleanly that there is nothing
 for it to build.
 @in
 END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/stack-daemon --help=$HELP
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/test-stack --help=$HELP

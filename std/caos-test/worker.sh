@@ -3,7 +3,7 @@
 #
 # THE ROUTER. What this tool used to do — build the tree, stand a dev stack up in
 # the container, run the suite on it — is the daemon's `run-tests` op now
-# (dev/stack-daemon/worker.sh, which has the long account of how). This script
+# (dev/test-stack/worker.sh, which has the long account of how). This script
 # only addresses the message: the daemon for a tree is keyed by that tree's oid,
 # so every `caos-test` of one tree, whatever its --only or --test-salt, reaches
 # the one container that already has the tree's stack up.

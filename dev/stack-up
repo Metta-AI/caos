@@ -17,7 +17,7 @@
 #
 #   /nix          a granted volume. Content-addressed, and nix locks per
 #                 derivation, so concurrent dev stacks build against one store.
-#                 The one non-atomic step is dev/test-stack/worker's seeding of
+#                 The one non-atomic step is dev/devbox/worker's seeding of
 #                 it, which takes a lock in the volume for exactly that reason.
 #   /caos-dev/git a granted volume, and the server repo of EVERY dev stack on
 #                 this host. Objects are content-addressed, git is built for
@@ -176,7 +176,7 @@ namespace=${namespace%%-*}
 # netns dependents blocking their parent's removal, and nothing of ours left
 # behind on the host if we die badly.
 #
-# The image ships the storage and cgroup config (dev/test-stack/flake.nix), so
+# The image ships the storage and cgroup config (dev/devbox/flake.nix), so
 # there is nothing to construct here — runnerd just needs to be told which
 # binary and where its store lives. The store is a granted volume so images
 # survive the container; otherwise every run would re-pull std.

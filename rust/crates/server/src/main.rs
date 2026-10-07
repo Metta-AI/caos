@@ -174,7 +174,7 @@ fn main() {
     // the server's own protocol requirements, so it owns them wherever the repo
     // came from — and a repo can arrive from anywhere: a test stack seeds one by
     // `git init --bare` plus a fetch of the deps it was handed
-    // (test-stack/worker), and a plain `init` sets neither. That cost a suite
+    // (devbox/worker), and a plain `init` sets neither. That cost a suite
     // where every push came back `403` from the inner server, which reads as an
     // auth problem and is really a missing config.
     git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
