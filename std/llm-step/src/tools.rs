@@ -1128,7 +1128,52 @@ impl Fail {
 pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String> {
     let id = call["id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("");
-    let outcome = match name {
+    let outcome = match check_declared_args(call, name) {
+        Err(error) => Err(error),
+        Ok(()) => execute_checked(call, ws, name),
+    };
+    match outcome {
+        Ok((text, new_ws)) => Ok((result_block(id, &text, false), new_ws)),
+        Err(User(msg)) => Ok((result_block(id, &msg, true), None)),
+        Err(Infra(e)) => Err(e),
+    }
+}
+
+/// An argument the tool does not declare is the model's mistake, and the
+/// commonest one is a spelling: `old_string` for `old-string`. Left alone it is
+/// ignored, so the call fails on the missing argument instead -- "edit needs a
+/// non-empty `old-string`" -- which reads as though the model had left it out.
+/// Say what was sent and what the tool takes; this is the message a repository
+/// tool gets from `tree_tool_args`.
+fn check_declared_args(call: &Value, name: &str) -> Result<(), Fail> {
+    let Some(input) = call["input"].as_object() else {
+        return Ok(());
+    };
+    let declaration = declarations()
+        .into_iter()
+        .find(|declaration| declaration["name"] == name);
+    let Some(declared) = declaration
+        .as_ref()
+        .and_then(|declaration| declaration.pointer("/input_schema/properties"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    match input.keys().find(|key| !declared.contains_key(*key)) {
+        None => Ok(()),
+        Some(key) => Err(User(format!(
+            "{name} takes no {key:?} argument (declared: {})",
+            declared.keys().cloned().collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+fn execute_checked(
+    call: &Value,
+    ws: &str,
+    name: &str,
+) -> Result<(String, Option<String>), Fail> {
+    match name {
         "read" => read(call, ws).map(|text| (text, None)),
         "ls" => ls(call, ws).map(|text| (text, None)),
         "write" => write(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
