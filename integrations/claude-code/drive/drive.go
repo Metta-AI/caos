@@ -882,6 +882,14 @@ func sessionServer(c creds, id string) (string, string) {
 
 var serverFlagRe = regexp.MustCompile(`--server=(\S+)`)
 
+// hostServer is the server this worker itself runs against.
+func hostServer() string {
+	if s := os.Getenv("CAOS_SERVER_URL"); s != "" {
+		return s
+	}
+	return "http://localhost:9090"
+}
+
 // redactServer is a server URL fit to print. A `caos://` ticket is the
 // capability to drive that server (integrations/claude-code/cloud/README.md),
 // and this output is read by a model, so only its first characters show.
