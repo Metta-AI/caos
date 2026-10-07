@@ -19,7 +19,7 @@ INLINE_CALLS='[
  {"id":"tu_r","input":{"source-tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"},
  {"id":"tu_e","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
  {"id":"tu_x","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
-{"id":"tu_l","input":{"source-tree":"main","path":"files/"},"name":"ls","type":"tool_use"},
+ {"id":"tu_l","input":{"source-tree":"main","path":"files/"},"name":"ls","type":"tool_use"},
  {"id":"tu_u","input":{"source-tree":"main","file-path":"files/new.txt","old_string":"hello","new-string":"x"},"name":"edit","type":"tool_use"},
  {"id":"tu_o","input":{"source_tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"}]'
 mkdir -p /tmp/stub
