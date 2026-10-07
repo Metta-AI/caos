@@ -1182,11 +1182,6 @@ fn execute_checked(
         "move" => move_entry(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         "remove" => remove(call, ws).map(|(text, new_ws)| (text, Some(new_ws))),
         other => Err(User(format!("unknown inline tool {other:?}"))),
-    };
-    match outcome {
-        Ok((text, new_ws)) => Ok((result_block(id, &text, false), new_ws)),
-        Err(User(msg)) => Ok((result_block(id, &msg, true), None)),
-        Err(Infra(e)) => Err(e),
     }
 }
 
