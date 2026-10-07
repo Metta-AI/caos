@@ -13,13 +13,24 @@ tools a model calls are under `std/`.)
 
 ## Driving a cloud session at a test stack
 
-A worked pass from an agent session, with a checkout of caos imported into the
-conversation (`import_source`, then `copy` to `feature/...`):
+A worked pass from an agent session. Import caos's `main` once, UNEDITED, as
+`imports/caos` (`import_source` with `source=https://github.com/Metta-AI/caos`,
+`into=imports/caos/main`). That import is where you RUN the tools from. If you
+are changing caos, `copy` it to `feature/<name>` and edit THAT: it is the tree
+under test, not the place the tools run.
 
-- Reach the tools BY PATH in that checkout: `feature/<name>/dev/caos-stack` and
-  `feature/<name>/integrations/claude-code/drive`, with `run_tool`. (`caos-std/`
+- Reach the tools BY PATH in the import: `imports/caos/main/dev/caos-stack` and
+  `imports/caos/main/integrations/claude-code/drive`, with `run_tool`. (`caos-std/`
   is the std pinned by the client repo, not the tree under test, and no longer
-  holds `caos-stack`.)
+  holds `caos-stack`.) Pass the tree to bring up as `in`: `caos-stack` takes it
+  (`tool_help` lists it), e.g. `in=feature/<name>`. Leave `in` off to test the
+  import itself.
+- Do NOT run the tools from `feature/<name>`. `drive` is granted its token only
+  while its own tree is the one a daemon published (see AGENTS.md, "Resident
+  workers"), and an edited checkout can lose it: a `drive` call there failed
+  with "no token at /secret/claude-oauth-token" after the checkout's `drive`
+  was edited. Whether an edit elsewhere in the tree also breaks it has not been
+  tested. Running from the untouched import avoids the question.
 - `caos-stack` `op=start` needs `relay=http://<ip>/`. Your own session already
   has one: `caos_status` shows `over RELAY relay:http://<ip>/` on its `push:`
   lines. Use `cloud-env=1` to get the environment, and a fresh `request-id` for
