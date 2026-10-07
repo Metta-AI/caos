@@ -24,5 +24,13 @@ recording-gaps.md.
 @param hash The full 40-character hash of the conversation's tip commit.
 @param [call] Print only this tool call (its `toolu_...` id, as this tool prints it), untruncated.
 @param [width] Cut each tool call's arguments and result to this many characters (default 300; 0 for no cut).
+@param [msg_width] Cut each user and assistant message to this many characters (default 0: no cut). `width` does not touch messages, which are most of a long conversation's output.
+@param [from] First transcript entry to print, by the number shown as `[n]` (default 0). With `to`, pages a long conversation.
+@param [to] Last transcript entry to print, inclusive (default: the end).
+@param [only] `user`, `assistant`, or `failed`. `failed` prints the user messages and only the calls that did not complete or returned an error, to find where a session stumbled.
+
+The header lists calls by tool and the entries holding a failed call. A long conversation
+overflows what a caller can read (the excess is saved to a file it usually cannot open), so
+start with `only=failed` or `msg_width=200`, then page with `from` and `to`.
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
