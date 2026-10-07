@@ -4,6 +4,6 @@
 # tree under test, so ONE container serves every message for one tree and keeps
 # that tree's dev stack running between them.
 #
-# It is not run by hand. `std/caos-test` and `std/caos-stack` are the callers:
+# It is not run by hand. `std/caos-test` and `dev/caos-stack` are the callers:
 # each forms the keyed message and tail-calls it.
 curry --base:@=DEEP-DEPS/devbox --worker1:@=worker.sh
