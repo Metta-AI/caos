@@ -39,8 +39,8 @@ under test, not the place the tools run.
   and a `prompt`. `env` is the name `start` printed (`cloud_env=`); `repo` is
   any repository the cloud session can clone (this session's own repo works;
   the stack does not care which). `at` is the epoch seconds now, and must be
-  different on every `drive` call: a repeated value returns the earlier answer. Provisioning takes about
-  two minutes; read the result with `drive info` (its `summary` is the turn's
+  different on every `drive` call: a repeated value returns the earlier
+  answer. Provisioning takes about two minutes; read the result with `drive info` (its `summary` is the turn's
   outcome, empty while the turn runs).
 - Each stack start mints a new ticket and dev commit, and the stack is evicted
   when its slot is wanted, so keep one `status` going between turns; after an
