@@ -807,14 +807,23 @@ func conv(o opts) error {
 	fmt.Println("conversation: " + name)
 	fmt.Println("ref:          " + ref)
 	fmt.Println("server:       " + shown + "   (" + from + ")")
+	lsRef := ref
 	if strings.HasPrefix(server, "caos://") {
 		if _, err := exec.LookPath("git-remote-caos"); err != nil {
-			return errors.New("the session's server is a caos:// ticket, and git-remote-caos is not in this worker, " +
-				"so it cannot be queried from here. Query it from a machine that has the helper, with the ticket " +
-				"from `drive env-show` on the session's environment")
+			// This worker cannot speak a ticket, so it cannot ask the stack. What
+			// it can ask is the HOST server, which holds the copy that
+			// `caos-stack harvest` exports: refs/stacks/<instance>/<the ref>.
+			// `git ls-remote` matches a pattern by its tail, so the ref without
+			// its leading "refs/" finds it whatever the instance.
+			fmt.Println("note:         git-remote-caos is not in this worker, so the stack cannot be asked.")
+			fmt.Println("              Looking instead for the copy `caos-stack harvest` exported to the host server.")
+			server = hostServer()
+			shown = redactServer(server)
+			lsRef = strings.TrimPrefix(ref, "refs/")
+			fmt.Println("server:       " + shown + "   (this worker's $CAOS_SERVER_URL)")
 		}
 	}
-	cmd := exec.Command("git", "ls-remote", server, ref)
+	cmd := exec.Command("git", "ls-remote", server, lsRef)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	ls, err := cmd.Output()
