@@ -435,10 +435,30 @@ fn ensure_resolved(t: Option<&GitTransport>, options: &TurnOptions, registry: &R
 /// result would outlive the session's server: a later serve in the same checkout
 /// would then report the cached tools even against a server that has since gone,
 /// hiding exactly the unreachable-server failure `caos_status` exists to name.
-fn resolve_once(options: &TurnOptions) -> Result<Vec<Value>, String> {
-    let t = GitTransport::from_cwd().map_err(|e| format!("cannot open the caos workspace: {e}"))?;
+fn resolve_once(
+    workspace: Option<&GitTransport>,
+    options: &TurnOptions,
+) -> Result<Vec<Value>, String> {
+    let t = reopen(workspace).map_err(|e| format!("cannot open the caos workspace: {e}"))?;
     t.ensure_server_reachable()?;
     declarations(&t, options)
+}
+
+/// A FRESH transport for the checkout this server was started in.
+///
+/// Fresh, because a transport opened at startup can predate the `caos` remote
+/// that setup adds a moment later (see `run_tool`). But fresh from the SAME
+/// WORKTREE, not from the working directory: this used to call
+/// `GitTransport::from_cwd()`, so a server that found its checkout through
+/// `$CLAUDE_PROJECT_DIR` while standing elsewhere resolved against the cwd and
+/// failed -- or, in a cwd that happened to be some other repository, resolved
+/// that one's tools. Only with no workspace at all (the server could not open
+/// one) is the working directory the best that is left.
+fn reopen(workspace: Option<&GitTransport>) -> Result<GitTransport, String> {
+    match workspace {
+        Some(t) => GitTransport::discover(t.work_dir()),
+        None => GitTransport::from_cwd(),
+    }
 }
 
 /// The `tools/list` result: the resolved tools, plus the `caos_status` stand-in.
