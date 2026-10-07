@@ -258,7 +258,7 @@ func trunc(s string, width int, id string) string {
 	if width == 0 || len(r) <= width {
 		return s
 	}
-	return fmt.Sprintf("%s… [%d more chars; pass call=%s to see all]", string(r[:width]), len(r)-width, id)
+	return fmt.Sprintf("%s… [%d more chars; pass call-id=%s to see all]", string(r[:width]), len(r)-width, id)
 }
 
 func indent(s string) {
