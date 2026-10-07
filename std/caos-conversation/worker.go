@@ -490,6 +490,22 @@ func read() {
 	if err != nil || width < 0 {
 		width = 300
 	}
+	o := opts{width: width, to: -1, only: optArg("only", "")}
+	if o.msgWidth, err = strconv.Atoi(optArg("msg_width", "0")); err != nil || o.msgWidth < 0 {
+		o.msgWidth = 0
+	}
+	if o.from, err = strconv.Atoi(optArg("from", "0")); err != nil || o.from < 0 {
+		o.from = 0
+	}
+	if t, err := strconv.Atoi(optArg("to", "-1")); err == nil && t >= 0 {
+		o.to = t
+	}
+	switch o.only {
+	case "", "user", "assistant", "failed":
+	default:
+		say("only=%q is not one of user, assistant, failed.", o.only)
+		return
+	}
 
 	tree, n, perCommit, answer := walk(hash)
 	if answer != "" {
