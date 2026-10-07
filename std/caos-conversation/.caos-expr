@@ -11,7 +11,7 @@ Read a recorded conversation — for example a Claude Code session that `caos mc
 recorded — given the hash of the commit at its tip (`caos head <hash>`, or the `C` a
 conversation ref points to). Prints it in order: each user message, each assistant
 message, and each tool call with its arguments and result. Arguments and results are
-cut to `width` characters; pass `call` to see one call in full. Use it to review how a
+cut to `width` characters; pass `call-id` to see one call in full. Use it to review how a
 session went and to find what the docs or tools should have said.
 
 WHAT IS NOT IN THE RECORD. The hooks record only the user's prompts, the calls to caos
