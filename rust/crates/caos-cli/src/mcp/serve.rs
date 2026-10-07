@@ -1072,6 +1072,27 @@ mod tests {
         assert!(text.contains("--- caos diag ---"), "{text}");
     }
 
+    /// A resolve re-opens the workspace the server was given, not whatever
+    /// repository the working directory happens to be in. The test runs inside
+    /// the caos checkout, so `from_cwd()` would succeed and name the WRONG one.
+    #[test]
+    fn a_resolve_reopens_the_servers_own_worktree_not_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        let opened = GitTransport::discover(dir.path()).unwrap();
+
+        let reopened = reopen(Some(&opened)).unwrap();
+        assert_eq!(
+            reopened.work_dir().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap(),
+        );
+    }
+
     #[test]
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
