@@ -31,6 +31,15 @@ under test, not the place the tools run.
   "no token at /secret/claude-oauth-token". One did, after `drive` itself was
   edited; whether an edit elsewhere also breaks it has not been tested. The
   untouched import is the blessed copy, so it avoids the question.
+  To TEST an edit to `drive` or `caos-stack` itself, grant that path the
+  token: add `reader:@=feature/<name>/integrations/claude-code/drive
+  conversation=<this conversation's id>` (the id `caos_status` prints) to the
+  secret file holding `claude-oauth-token`, `secrets-push`, and run both tools
+  from `feature/<name>`. This was done and both worked, including
+  `caos-stack` reaching `drive` through its own `DEEP-DEPS` copy. The grant
+  exposes the token to the agent, which can edit that code; remove it after.
+  Run `caos-stack` with `in=imports/caos/main` to keep the stack's identity
+  (the hash of `in`) while using your edited daemon.
 - `caos-stack` `op=start` needs `relay=http://<ip>/`. Your own session already
   has one: `caos_status` shows `over RELAY relay:http://<ip>/` on its `push:`
   lines. Use `cloud-env=1` to get the environment, and a fresh `request-id` for
