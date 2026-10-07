@@ -49,7 +49,7 @@ jq -s -e '
   all(.[]; .status == "complete" and .task == null and .source_tree_name == null)
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "inline tool records are wrong"; }
 [ "$($TOOL parents --repo /tmp/repo --head "$head" | grep -c ' tool.complete$')" -eq 7 ] \
-  || fail "inline calls did not append five tool.complete transitions"
+  || fail "inline calls did not append seven tool.complete transitions"
 $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
   --round 0 --id tu_x > /tmp/failed-edit.json
 grep -qF 'old-string not found' /tmp/failed-edit.json \
