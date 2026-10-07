@@ -399,7 +399,9 @@ op_logs() {
   if [ "$want" -lt 0 ]; then cursor=0; want=$size; fi
   {
     echo "cursor=$((cursor + want))"
-    tail -c +"$((cursor + 1))" "$file" | head -c "$want"
+    # `dd`, not `tail | head`: head closes the pipe at its byte count, tail takes
+    # SIGPIPE, and pipefail turns that into a failed op for any log over the cap.
+    dd if="$file" bs=1 skip="$cursor" count="$want" 2>/dev/null
   } > /tmp/reply
   reply /tmp/reply
 }
