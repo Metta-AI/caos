@@ -47,8 +47,26 @@ under test, not the place the tools run.
   `feature/<name>` while a stack is up makes `stop` and `status` address a
   different stack. `stop` before editing, or keep the tree you started with
   untouched.
-- Not understood yet: `harvest` returned `harvested=0` and `drive conv` found no
-  head on the host server, even after a session had completed turns against the
-  stack. Do not rely on either to retrieve the conversation until that is
-  explained.
+- `drive info` is how you read a turn, and the only way that works today. Poll
+  it with a new `at` each time (a repeated `at` returns the cached answer).
+  Until the session's container finishes setup (about 2 minutes) it shows only
+  the provisioning trace; `worker tools:` appears once Claude Code is up; the
+  `summary:` is empty while a turn runs and filled in when it ends. Expect
+  about 2 minutes for a first turn and about 1 minute for a `send` that makes
+  a couple of caos calls. The summary is the session's own account of what it
+  did (a worked pass: asking it to `write` hello.txt and `read` it back
+  produced `wrote hello.txt (17 bytes) and read it back`).
+- A session started with a plain greeting only lists its tools; give it a
+  task that calls a caos tool if you want to see the stack do work (the
+  stack's `logs` with `log=server` then shows `cache miss` / `ran worker`).
+- `drive conv` and `harvest` do not retrieve the conversation. `conv` looks
+  for the session's head on YOUR session's server (the `http://10.x.x.x` in its
+  error), not on the test stack, so it reports "not on ... wrong server, or no
+  turn yet" even after turns completed; it also prints the transcript of an
+  unrelated conversation before failing, which is not the session's. `harvest`
+  returned `harvested=0` with the default `refs/caos/v3/conversations/*` after
+  completed turns; why is still not understood. Use `drive info`'s summary.
+- The stack can be gone within minutes of `start` (a `stop` ten minutes later
+  said `not running`). That is the eviction above, not a failed start.
+  `stop` then has nothing to do; carry on with `archive` and `env-delete`.
 - Clean up: `drive archive`, `drive env-delete`, then `caos-stack stop`.
