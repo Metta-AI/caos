@@ -22,7 +22,7 @@ Commit timestamps are fixed, so there are no timings. A gap in the story usually
 means an unrecorded step, not a missing one. The known gaps are listed in this tool's
 recording-gaps.md.
 @param hash The full 40-character hash of the conversation's tip commit.
-@param [call] Print only this tool call (its `toolu_...` id, as this tool prints it), untruncated.
+@param [call-id] Print only this tool call (its `toolu_...` id, as this tool prints it), untruncated.
 @param [width] Cut each tool call's arguments and result to this many characters (default 300; 0 for no cut).
 @param [msg-width] Cut each user and assistant message to this many characters (default 0: no cut). `width` does not touch messages, which are most of a long conversation's output.
 @param [from] First transcript entry to print, by the number shown as `[n]` (default 0). With `to`, pages a long conversation.
