@@ -860,10 +860,7 @@ func conv(o opts) error {
 // ever collided, the wrong one. The host's is the fallback for a session whose
 // environment names none.
 func sessionServer(c creds, id string) (string, string) {
-	host := os.Getenv("CAOS_SERVER_URL")
-	if host == "" {
-		host = "http://localhost:9090"
-	}
+	host := hostServer()
 	var raw map[string]any
 	if err := api(c, "GET", "/v1/code/sessions/"+id, nil, &raw); err != nil {
 		return host, "this worker's $CAOS_SERVER_URL; the session could not be read: " + err.Error()
