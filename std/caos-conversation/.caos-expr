@@ -31,6 +31,6 @@ recording-gaps.md.
 
 The header lists calls by tool and the entries holding a failed call. A long conversation
 overflows what a caller can read (the excess is saved to a file it usually cannot open), so
-start with `only=failed` or `msg_width=200`, then page with `from` and `to`.
+start with `only=failed` or `msg-width=200`, then page with `from` and `to`.
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
