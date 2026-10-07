@@ -485,7 +485,9 @@ func read() {
 		say("not a hash: %s\n\nPass the 40-character hash of the commit at the tip of a conversation.", hash)
 		return
 	}
-	want := optArg("call", "")
+	// Not `call`: that name is reserved (llm-step's RESERVED_ARGS), so a
+	// `@param call` is dropped at parse time and the tool never accepts it.
+	want := optArg("call-id", "")
 	width, err := strconv.Atoi(optArg("width", "300"))
 	if err != nil || width < 0 {
 		width = 300
