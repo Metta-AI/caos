@@ -24,8 +24,10 @@
 //! result; the request a prompt admits is claimed here rather than by a worker,
 //! because the turn is already running by the time the hook fires.
 
+mod diag;
 mod resume;
 mod serve;
+mod workspace;
 
 use std::io::Read;
 
@@ -107,7 +109,9 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
         }
     }
     match rest.first().copied() {
-        Some("hook") => hook(&workspace?, &options),
+        Some("hook") => hook(workspace, &options),
+        // Needs no workspace: it exists to describe one that is missing.
+        Some("diag") => diag::cli(&rest[1..]),
         Some("serve") => serve::serve(workspace, options),
         Some("warm") => serve::warm(&workspace?, &options),
         _ => Err(usage()),
@@ -156,7 +160,7 @@ fn run_tool(
     // does not know and fails "no `caos` git remote" while the remote is right
     // there. The resolver thread re-opens per attempt for exactly this reason
     // (see `resolve_in_background`); a call has to as well.
-    let fresh = GitTransport::from_cwd()
+    let fresh = workspace::open(session)
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
     let t = &fresh;
     let id = resume::conversation_for_session(t, session)?;
@@ -511,7 +515,16 @@ fn declared_args(args: &Value) -> Value {
 /// Dispatch one hook payload. An event we do not record is not an error: Claude
 /// Code fires many, and a settings file that routes extra ones here should keep
 /// working rather than failing a turn.
-fn hook(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
+///
+/// THE CHECKOUT COMES FROM THE SESSION'S RECORDED ENTRY (`workspace`), never
+/// from wherever this process happens to stand. The one exception is a
+/// session's first prompt, which has no entry yet and so uses the discovered
+/// `workspace` and records it. Any other event with no entry fails, loudly:
+/// diagnostics first (stderr and the diag journal), then exit 2 for the two
+/// events where that is visible (a prompt is blocked with the reason shown, a
+/// tool call is refused with it shown to the model). Elsewhere a failed hook is
+/// shown only as an error line, and exit 2 on `Stop` would force the session on.
+fn hook(discovered: Result<GitTransport, String>, options: &TurnOptions) -> Result<(), String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -519,16 +532,46 @@ fn hook(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
     let payload: Value =
         serde_json::from_str(&input).map_err(|error| format!("parsing hook payload: {error}"))?;
     let event = string_field(&payload, "hook_event_name")?;
+    if !matches!(
+        event,
+        "UserPromptSubmit" | "PreToolUse" | "Stop" | "StopFailure"
+    ) {
+        return Ok(());
+    }
     // Logged at the START too, so a hook killed mid-run (its process gone before
     // the end line) is distinguishable from one that never fired.
     debug_log_hook("start", event, &payload, None);
     let started = std::time::Instant::now();
+    let session = string_field(&payload, "session_id")?;
+    let first_prompt = event == "UserPromptSubmit" && !workspace::exists(session)?;
+    let opened = if first_prompt {
+        discovered.and_then(|t| workspace::record(session, &t).map(|()| t))
+    } else {
+        workspace::open(session)
+    };
+    let t = match opened {
+        Ok(t) => t,
+        Err(error) => {
+            diag::emit(&diag::Context {
+                event,
+                source: payload.get("source").and_then(Value::as_str),
+                session: Some(session),
+                reason: Some(&error),
+            });
+            if matches!(event, "UserPromptSubmit" | "PreToolUse") {
+                eprintln!(
+                    "caos: this session's workspace is unavailable, so caos did nothing: {error}"
+                );
+                std::process::exit(2);
+            }
+            return Err(error);
+        }
+    };
     let result = match event {
-        "UserPromptSubmit" => on_user_prompt(t, options, &payload),
+        "UserPromptSubmit" => on_user_prompt(&t, options, &payload),
         "PreToolUse" => on_pre_tool_use(&payload),
-        "Stop" => on_stop(t, &payload),
-        "StopFailure" => on_stop_failure(t, &payload),
-        _ => Ok(()),
+        "Stop" => on_stop(&t, &payload),
+        _ => on_stop_failure(&t, &payload),
     };
     debug_log_hook("end", event, &payload, Some((started.elapsed(), &result)));
     result

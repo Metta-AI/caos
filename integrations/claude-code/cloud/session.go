@@ -26,9 +26,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,14 +94,24 @@ func main() {
 			log("cannot enter %s: %v", dir, err)
 		}
 	}
+	payload := readPayload()
 	gitDir, err := git("rev-parse", "--absolute-git-dir")
 	if err != nil {
-		log("%s is not a git repository; nothing to warm", mustGetwd())
+		// A DEGRADED STATE, said where the session can read it. This used to log
+		// "nothing to warm" to stderr -- which a SessionStart hook drops -- and
+		// exit 0, so a session in the wrong directory looked healthy and every
+		// later caos hook failed with nothing to show for it.
+		reason := fmt.Sprintf("%s is not a git repository (CLAUDE_PROJECT_DIR=%q)",
+			mustGetwd(), os.Getenv("CLAUDE_PROJECT_DIR"))
+		log("%s; caos is disabled for this session", reason)
+		runDiag(payload, reason)
+		reportDegraded(reason)
 		return
 	}
 
 	// A marker describes one session's check, so it never outlives it.
 	os.Remove(staleMarker())
+	runDiag(payload, "")
 	setup := stamp("setup-stamp")
 	dev := stamp("dev-stamp")
 	for _, key := range []string{"built", "base", "pin", "client"} {
@@ -178,6 +190,63 @@ func main() {
 		fmt.Printf("caos dev mode: off -- this session runs the caos its repo pins (%s).\n",
 			setup["client"])
 	}
+}
+
+// The SessionStart payload Claude Code writes on stdin. Bounded, because a
+// harness that leaves stdin open must not hold the session at "starting".
+func readPayload() []byte {
+	done := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(os.Stdin)
+		done <- data
+	}()
+	select {
+	case data := <-done:
+		return data
+	case <-time.After(2 * time.Second):
+		return nil
+	}
+}
+
+// `caos mcp diag` records where this process is standing (stderr, which the hook
+// events keep, and ~/.cache/caos/diag.jsonl). Best effort: it explains a
+// failure, so it must not cause one.
+func runDiag(payload []byte, reason string) {
+	args := []string{"mcp", "diag", "--event=SessionStart"}
+	if reason != "" {
+		args = append(args, "--reason="+reason)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "caos", args...)
+	if len(payload) > 0 {
+		// --stdin lets the payload's own event, source and session win.
+		cmd.Args = append(cmd.Args, "--stdin")
+		cmd.Stdin = bytes.NewReader(payload)
+	}
+	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 5 * time.Second
+	if err := cmd.Run(); err != nil {
+		log("could not record diagnostics: %v", err)
+	}
+}
+
+// Tell the user (systemMessage) and the model (additionalContext) that caos is
+// off and why. Exit status stays 0: a SessionStart hook cannot refuse a
+// session, and failing here would only hide this message.
+func reportDegraded(reason string) {
+	text := "caos is DISABLED for this session: " + reason + ". " +
+		"No caos tools will be available except caos_status, and nothing is being " +
+		"recorded. Start the session in the project's checkout, or check " +
+		"CLAUDE_PROJECT_DIR. Diagnostics: ~/.cache/caos/diag.jsonl."
+	out, _ := json.Marshal(map[string]any{
+		"systemMessage": text,
+		"hookSpecificOutput": map[string]any{
+			"hookEventName":     "SessionStart",
+			"additionalContext": text,
+		},
+	})
+	fmt.Println(string(out))
 }
 
 type devProbe struct {
