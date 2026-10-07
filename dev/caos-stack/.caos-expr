@@ -1,0 +1,35 @@
+# The `caos-stack` tool (design/daemons.md, Part 2): a ROUTER, like caos-test.
+# It sends one message to the stack daemon for a tree — start, status, logs,
+# harvest or stop — and returns the daemon's reply.
+#
+# What it is for: a session starts a caos stack built from a tree (no tests),
+# points a Claude cloud session at the ticket it returns, drives traffic, and
+# collects the conversations with `harvest`.
+#
+# `request-id` IS REQUIRED, and it is not decoration. A message with effects must
+# not be answered from the cache, and the cache is keyed on the whole ArgTree: a
+# second `status` with the same arguments would return the first one's text, and
+# a second `start` the first one's ticket after its stack was gone. Pass a fresh
+# value every call. (`caos-test` takes none: a repeated suite run SHOULD be a hit.)
+HELP=<<END
+Start, inspect, harvest from, or stop a caos stack built from a source tree. One
+stack per tree: it is created by the first message for the tree, stays up between
+messages and is evicted when its slot is wanted. `start` brings the stack up if it
+is not, publishes a client for it as refs/caos/dev on the stack, and returns the
+`caos://` ticket and that dev commit, which is what a cloud session needs; with
+`cloud-env` it also makes a NEW cloud environment for them and names it. The others
+never start a stack and report `not running` if there is none. `caos-test` runs the
+suite on the same stack.
+@param op One of: start, status, logs, harvest, stop.
+@param request-id Any fresh value (e.g. $(date +%s%N)). Messages are not cached only if this differs from every earlier call's.
+@param [relay] For `start`: the URL of a relay of your own, on port 80 or 443, that this container and the cloud session can both reach. n0's relays are never used. NOT optional in practice: without it `start` fails with "start needs a relay". If you have no relay of your own, the one your own session already uses works: `caos_status`'s phase journal names it on its `push:` lines (`over RELAY relay:http://<ip>/`); pass `http://<ip>/`.
+@param [advertise] For `start`: space-separated host:port addresses to put in the ticket as direct addresses. Without them every client is relayed.
+@param [cloud-env] For `start`: any value (e.g. 1) to also create a new cloud environment named `z Caos Dev <dev commit>` whose setup installs the published client and points at this stack, using the claude-oauth-token. Start a session on it with the `drive` tool. A stack's ticket and dev commit are new on EVERY start, including a restart after eviction, so an environment made for an earlier start points at a dead stack: `start` with `cloud-env` again and use the new environment.
+@param [bootstrap-base] For `start` with `cloud-env`: the raw GitHub base URL the environment fetches its bootstrap from. Default: Metta-AI/caos main.
+@param [secret-readers] For `start` with `cloud-env`: a secret reader key to put in the setup, to be granted what that key is granted on THIS stack (a test stack holds only a mock key).
+@param [log] For `logs`: which member's log: serve, server, runnerd, publish or iroh. Default serve.
+@param [cursor] For `logs`: the byte offset to read from — the `cursor=` line of the previous reply. Default 0.
+@param [refs] For `harvest`: ref patterns, one per line, to copy from the stack's git to this server under refs/stacks/<tree>/. Default: the stack's conversations.
+@in
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --daemon:@=DEEP-DEPS/test-stack --drive:@=DEEP-DEPS/drive --help=$HELP
