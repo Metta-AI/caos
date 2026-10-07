@@ -19,7 +19,9 @@ INLINE_CALLS='[
  {"id":"tu_r","input":{"source-tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"},
  {"id":"tu_e","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
  {"id":"tu_x","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
- {"id":"tu_l","input":{"source-tree":"main","path":"files/"},"name":"ls","type":"tool_use"}]'
+{"id":"tu_l","input":{"source-tree":"main","path":"files/"},"name":"ls","type":"tool_use"},
+ {"id":"tu_u","input":{"source-tree":"main","file-path":"files/new.txt","old_string":"hello","new-string":"x"},"name":"edit","type":"tool_use"},
+ {"id":"tu_o","input":{"source_tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$INLINE_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
@@ -42,11 +44,11 @@ fetch_code "$source_tree" "fetching the resulting source_tree"
 
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/tools.jsonl
 jq -s -e '
-  length == 5 and
-  (map(.id) | sort) == (["tu_w","tu_r","tu_e","tu_x","tu_l"] | sort) and
+  length == 7 and
+  (map(.id) | sort) == (["tu_w","tu_r","tu_e","tu_x","tu_l","tu_u","tu_o"] | sort) and
   all(.[]; .status == "complete" and .task == null and .source_tree_name == null)
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "inline tool records are wrong"; }
-[ "$($TOOL parents --repo /tmp/repo --head "$head" | grep -c ' tool.complete$')" -eq 5 ] \
+[ "$($TOOL parents --repo /tmp/repo --head "$head" | grep -c ' tool.complete$')" -eq 7 ] \
   || fail "inline calls did not append five tool.complete transitions"
 $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
   --round 0 --id tu_x > /tmp/failed-edit.json
