@@ -27,6 +27,17 @@
 # deliberately reuses an answer for up to a minute. It could not be called
 # `salt`: that is a RESERVED arg name (llm-step's RESERVED_ARGS).
 #
+# A session with no clock (the caos tools have no `date`) can pass any integer
+# it has not used before for `at`; it need not be the real time. Only "different
+# from every earlier call" matters.
+#
+# READING THE ANSWER: `start` and `send` return at once. The model's reply is
+# not printed anywhere; `info` shows the session's `summary` once its turn has
+# finished (empty while it is still running -- call `info` again with a new
+# `at`). `conv` reads the conversation from $CAOS_SERVER_URL, which is the HOST
+# server, so for a session driven at a `caos-stack` test stack it reports "head
+# not found": the conversation is recorded in the stack, not here.
+#
 # No `@writer` and no `@in`: nothing here advances the conversation tree.
 HELP=<<END
 Start and inspect Claude Code cloud sessions. A session runs in a named cloud
