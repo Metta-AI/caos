@@ -1189,7 +1189,7 @@ fn drive_call(
 fn resolve_target(view: &Conversation<'_>, call: &Call) -> Result<Target, String> {
     let requested = call
         .input
-        .get("source_tree")
+        .get("source-tree")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty());
@@ -1239,7 +1239,7 @@ fn source_tree_target(
 ) -> Result<Option<(String, Oid)>, String> {
     let source_trees = view.source_trees()?;
     let name = requested
-        .ok_or("specify the source_tree path for this Git operation")?
+        .ok_or("specify the source-tree path for this Git operation")?
         .to_string();
     let Some(source_tree) = source_trees.get(&name) else {
         return Err(format!(
@@ -2203,7 +2203,7 @@ fn tool_complete_transition(
 fn normalize_inline_call(call: &Call, target: &Target) -> Call {
     let mut normalized = call.clone();
     if let Some(input) = normalized.input.as_object_mut() {
-        input.remove("source_tree");
+        input.remove("source-tree");
     }
     if let Some((key, mut path)) = inline_files_path(call) {
         let explicit_root = matches!(call.name.as_str(), "read" | "ls")
@@ -2271,7 +2271,7 @@ fn materialize_files(state: &mut progress::State) -> Result<String, String> {
 fn call_without_source_tree(call: &Call) -> Value {
     let mut input = call.input.clone();
     if let Some(object) = input.as_object_mut() {
-        object.remove("source_tree");
+        object.remove("source-tree");
     }
     json!({"type":"tool_use", "id":call.id, "name":call.name, "input":input})
 }
@@ -3202,7 +3202,7 @@ fn with_source_tree(mut declaration: Value) -> Value {
         .and_then(Value::as_object_mut)
     {
         properties.insert(
-            "source_tree".to_string(),
+            "source-tree".to_string(),
             json!({
                 "type":"string",
                 "description":"Conversation-relative gitlink path to operate on, e.g. feature/dirty. Required even when only one source tree exists. Paths within this Git operation are relative to that source tree."
@@ -3216,8 +3216,8 @@ fn with_source_tree(mut declaration: Value) -> Value {
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .unwrap();
-    if !required.iter().any(|value| value == "source_tree") {
-        required.push(json!("source_tree"));
+    if !required.iter().any(|value| value == "source-tree") {
+        required.push(json!("source-tree"));
     }
     declaration
 }
@@ -4257,7 +4257,7 @@ mod tests {
             let mut call = Call {
                 id: "call-1".into(),
                 name: name.into(),
-                input: json!({"source_tree":"main", path_arg:"files/config.json"}),
+                input: json!({"source-tree":"main", path_arg:"files/config.json"}),
             };
             assert!(
                 matches!(
@@ -4269,7 +4269,7 @@ mod tests {
             let target = resolve_target(&view, &call).unwrap();
             let normalized = normalize_inline_call(&call, &target);
             assert_eq!(normalized.input[path_arg], "main/files/config.json");
-            assert!(normalized.input.get("source_tree").is_none());
+            assert!(normalized.input.get("source-tree").is_none());
             assert!(matches!(
                 resolve_target(&view, &normalized).unwrap(),
                 Target::Files
@@ -4287,11 +4287,11 @@ mod tests {
                 normalize_inline_call(&call, &target).input[path_arg],
                 if name == "ls" { "main/." } else { "." }
             );
-            call.input["source_tree"] = json!("missing");
+            call.input["source-tree"] = json!("missing");
             assert!(resolve_target(&view, &call)
                 .unwrap_err()
                 .contains("unknown source tree"));
-            call.input.as_object_mut().unwrap().remove("source_tree");
+            call.input.as_object_mut().unwrap().remove("source-tree");
             assert!(
                 matches!(resolve_target(&view, &call).unwrap(), Target::Files),
                 "{name}"
@@ -4551,7 +4551,7 @@ mod tests {
     fn publication_pin_keeps_commit_and_lease_across_source_edits_and_restart() {
         use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
         for rejected in [false, true] {
-            let args = json!({"source_tree":"feature/lower","repository":"https://example.com/repo.git","branch":"topic"});
+            let args = json!({"source-tree":"feature/lower","repository":"https://example.com/repo.git","branch":"topic"});
             let golden = golden_with_first("publish_source", args.clone()).unwrap();
             let call = Call {
                 id: "first".into(),

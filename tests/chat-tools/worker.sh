@@ -16,10 +16,10 @@ ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 
 INLINE_CALLS='[
  {"id":"tu_w","input":{"file-path":"main/files/new.txt","content":"hello world"},"name":"write","type":"tool_use"},
- {"id":"tu_r","input":{"source_tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"},
- {"id":"tu_e","input":{"source_tree":"main","file-path":"files/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
- {"id":"tu_x","input":{"source_tree":"main","file-path":"files/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
- {"id":"tu_l","input":{"source_tree":"main","path":"files/"},"name":"ls","type":"tool_use"}]'
+ {"id":"tu_r","input":{"source-tree":"main","file-path":"files/new.txt"},"name":"read","type":"tool_use"},
+ {"id":"tu_e","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"hello","new-string":"goodbye"},"name":"edit","type":"tool_use"},
+ {"id":"tu_x","input":{"source-tree":"main","file-path":"files/new.txt","old-string":"never there","new-string":"x"},"name":"edit","type":"tool_use"},
+ {"id":"tu_l","input":{"source-tree":"main","path":"files/"},"name":"ls","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$INLINE_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json

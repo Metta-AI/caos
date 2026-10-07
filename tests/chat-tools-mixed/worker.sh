@@ -28,10 +28,10 @@ MIXED_CALLS='[
  {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
  {"id":"tu_create","input":{"arguments":{"cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
  {"id":"tu_mb","input":{"arguments":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
- {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
+ {"id":"tu_me","input":{"source-tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
  {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
- {"id":"tu_mm","input":{"source_tree":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
- {"id":"tu_side","input":{"source_tree":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
+ {"id":"tu_mm","input":{"source-tree":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
+ {"id":"tu_side","input":{"source-tree":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
 mkdir -p /tmp/stub
 printf '{"content":%s,"stop_reason":"tool_use"}' \
   "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json

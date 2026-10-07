@@ -11,6 +11,7 @@ pub(super) const HELP: &str = "Publish the exact selected source commit to an HT
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Parameters {
+    #[serde(rename = "source-tree")]
     source_tree: String,
     repository: String,
     branch: String,

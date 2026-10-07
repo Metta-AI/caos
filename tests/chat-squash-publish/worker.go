@@ -242,7 +242,7 @@ func main() {
 		squash := use("tu_squash", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
 		squash2 := use("tu_squash2", "run_tool", map[string]any{"path": "tools/squash", "arguments": map[string]any{"plan": "mystack.plan"}})
 		publish := func(id, source string) map[string]any {
-			return use(id, "publish_source", map[string]any{"source_tree": source,
+			return use(id, "publish_source", map[string]any{"source-tree": source,
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
 		}
 		respond(1,

@@ -82,7 +82,7 @@ new_llm_conversation tools-only "$STUB_PORT" "$ws" \
 admit_turn "read the greeting, then write a file"
 
 stage "a read the harness declared, run by the step"
-declare_call toolu_read read '{"source_tree":"main","file-path":"greeting.txt"}'
+declare_call toolu_read read '{"source-tree":"main","file-path":"greeting.txt"}'
 read_round=$round
 run_tools_only toolu_read
 $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \

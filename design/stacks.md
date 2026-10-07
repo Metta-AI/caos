@@ -34,7 +34,7 @@ Every operation below is made of three things: editing a layer, merging a
 lower layer into a higher one, and `cp -a` / `mv` / `rm -rf` on the gitlinks
 themselves. 
 
-The `merge` std tool works like so: `merge(source_tree=Y, theirs=X, merge-base=B)`, where
+The `merge` std tool works like so: `merge(source-tree=Y, theirs=X, merge-base=B)`, where
 `Y` is the gitlink being merged into, `X` is a full commit hash, and the optional `B` overrides the merge base. It always mints a merge commit
 with parents `Y` and `X`. A conflict still moves along the gitlink and introduces a `.caos/conflicts` file listing items that need to be resolved. See chat.md's "Resolving source-tree conflicts" for info on how these are handled.
 
@@ -51,7 +51,7 @@ mystack/02-tests    -> B   parent A
 Edit `mystack/01-feature`, progressing it to A2, then merge each layer into the one above it.
 
 ```text
-merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+merge(source-tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
 ```
 
 `std/merge/worker` will choose `A` as the base for the merge (it looks for the highest common ancestor). After resolving conflicts, the result will look like:
@@ -73,9 +73,9 @@ cp -a imports/repo/main-H2 mystack/00-base
 ```
 
 ```text
-merge(source_tree="mystack/01-feature", theirs="<full commit hash of mystack/00-base>")
+merge(source-tree="mystack/01-feature", theirs="<full commit hash of mystack/00-base>")
 ... # potentially resolve conflicts
-merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+merge(source-tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
 ```
 
 Resulting in:
@@ -93,9 +93,9 @@ of the layer below it.
 
 ```text
 rm -rf mystack/01-feature; cp -a mystack/00-base mystack/01-feature
-merge(source_tree="mystack/01-feature", theirs="<A>", merge-base="<H>")
+merge(source-tree="mystack/01-feature", theirs="<A>", merge-base="<H>")
 rm -rf mystack/02-tests; cp -a mystack/01-feature mystack/02-tests
-merge(source_tree="mystack/02-tests", theirs="<B>", merge-base="<A>")
+merge(source-tree="mystack/02-tests", theirs="<B>", merge-base="<A>")
 ```
 
 ### Drop the contents of a layer
@@ -110,7 +110,7 @@ cp -R --preserve=mode mystack/00-base/. mystack/01-feature/
 ```
 
 ```text
-merge(source_tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
+merge(source-tree="mystack/02-tests", theirs="<full commit hash of mystack/01-feature>")
 
 mystack/01-feature  -> A2  parent A          tree(A2) = tree(H)
 mystack/02-tests    -> B2  parents B, A2     H + tests only
@@ -146,8 +146,8 @@ cp -a mystack/00-base mystack/01-x
 ```
 
 ```text
-merge(source_tree="mystack/02-y", theirs="<full commit hash of mystack/01-x>")
-merge(source_tree="mystack/03-tests", theirs="<full commit hash of mystack/02-y>")
+merge(source-tree="mystack/02-y", theirs="<full commit hash of mystack/01-x>")
+merge(source-tree="mystack/03-tests", theirs="<full commit hash of mystack/02-y>")
 
 mystack/01-x        -> X1  parent H
 mystack/02-y        -> A2  parents A, X1
@@ -196,7 +196,7 @@ This takes three steps:
 
 2. **Push**, bottom to top, with `publish_source`:
 
-   - `source_tree`: the gitlink to publish, e.g. `publish/mystack/01-feature`.
+   - `source-tree`: the gitlink to publish, e.g. `publish/mystack/01-feature`.
    - `repository`: HTTPS repository URL, without credentials.
    - `branch`: destination branch, without `refs/heads/`.
    - `force` (optional): `true` to allow a non-fast-forward update.

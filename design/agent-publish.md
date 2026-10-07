@@ -7,7 +7,7 @@ checking out source files.
 | --- | --- |
 | Server | `POST /git/push {destination, commit, branch, expected, force?}` |
 | Worker command | `caos push-git <https-url> <commit> <branch> --expected=<oid\|absent> [--force]` |
-| Agent tool | `publish_source(source_tree, repository, branch, force?)` |
+| Agent tool | `publish_source(source-tree, repository, branch, force?)` |
 
 The request fields are:
 
