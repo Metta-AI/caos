@@ -17,9 +17,7 @@ A worked pass from an agent session. Import caos's `main` once, UNEDITED, as
 `imports/caos/main` (`import_source` with `source=https://github.com/Metta-AI/caos`,
 `into=imports/caos/main`). That import is where you RUN the tools from. If you
 are changing caos, `copy` it to `feature/<name>` and edit THAT: it is the tree
-under test, not the place the tools run. (Until `dev/caos-stack` is on `main`,
-import the branch that has it instead, e.g. `revision=claude/caos-stack-to-dev`
-into `imports/caos/stack-to-dev`, and use that path below.)
+under test, not the place the tools run.
 
 - Reach the tools BY PATH in the import: `imports/caos/main/dev/caos-stack` and
   `imports/caos/main/integrations/claude-code/drive`, with `run_tool`. (`caos-std/`
