@@ -1128,6 +1128,9 @@ impl Fail {
 pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String> {
     let id = call["id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("");
+    if let Some(refusal) = unknown_argument(call, name) {
+        return Ok((result_block(id, &refusal, true), None));
+    }
     let outcome = match name {
         "read" => read(call, ws).map(|text| (text, None)),
         "ls" => ls(call, ws).map(|text| (text, None)),
