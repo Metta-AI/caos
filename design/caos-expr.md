@@ -263,7 +263,7 @@ expression evaluates to** — so seeded keys are provably the keys callers hit.
     cycle).
 - **Harness seed plumbing**: `build.sh`'s `make` stage pushes `refs/caos/seed`
   to the outer server and emits a `seed` build output; `test.sh` stage3 hands
-  each test wrapper that seed; `test-stack/worker` fetches it into the inner
+  each test wrapper that seed; `devbox/worker` fetches it into the inner
   stack (a git fetch, like std) so the inner `core-seeder-runner` has the
   record. Seeded into **every** wrapper (unlike the per-test std subset), since
   any test that builds a flake reaches flake-builder transitively.

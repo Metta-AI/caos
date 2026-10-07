@@ -1,8 +1,9 @@
-# dev/test-stack's image (design/caos-expr.md, Phase 3): this directory is a flake
-# (flake.nix + flake.lock + worker), so its image is the flake-builder applied
-# to the directory itself. It names the builder by a LOCAL deep-deps mount
-# (DEEP-DEPS/flake-builder, declared in DEPS) — the only way it CAN name it,
-# since nothing resolves a builtin by name. Resolving this entry evaluates the
-# expression, which makes the flake→image step explicit rather than leaving it
-# to the server to detect.
-run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
+# The stack daemon (design/daemons.md, Part 2): dev/devbox's image — nix, a
+# stack userland, the grants a dev stack needs, and CAOS_RESIDENT=1 — with this
+# directory's script curried onto it. A job for it carries `affinity`, the
+# tree under test, so ONE container serves every message for one tree and keeps
+# that tree's dev stack running between them.
+#
+# It is not run by hand. `std/caos-test` and `std/caos-stack` are the callers:
+# each forms the keyed message and tail-calls it.
+curry --base:@=DEEP-DEPS/devbox --worker1:@=worker.sh

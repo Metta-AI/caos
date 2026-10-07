@@ -9,4 +9,4 @@
 # The docs live here rather than in the script because a `.caos-expr` is
 # STRIPPED from the tree it is evaluated against, so editing them re-keys this
 # job and nothing it runs.
-curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh
+curry --base:@=DEEP-DEPS/devbox --worker1:@=worker.sh

@@ -174,7 +174,7 @@ fn main() {
     // the server's own protocol requirements, so it owns them wherever the repo
     // came from — and a repo can arrive from anywhere: a test stack seeds one by
     // `git init --bare` plus a fetch of the deps it was handed
-    // (test-stack/worker), and a plain `init` sets neither. That cost a suite
+    // (devbox/worker), and a plain `init` sets neither. That cost a suite
     // where every push came back `403` from the inner server, which reads as an
     // auth problem and is really a missing config.
     git(&["-C", &git_dir, "config", "http.receivepack", "true"]);
@@ -780,7 +780,9 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_string(&mut body)?;
             runner::trace_child(config, &body)
         }
-        Method::Post if path == "/runner/poll" || path == "/runner/result" => {
+        Method::Post
+            if path == "/runner/poll" || path == "/runner/result" || path == "/runner/lease" =>
+        {
             let authorization = request
                 .headers()
                 .iter()
@@ -790,6 +792,8 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             request.as_reader().read_to_string(&mut body)?;
             if path == "/runner/poll" {
                 runner::poll(authorization.as_deref(), &body)
+            } else if path == "/runner/lease" {
+                runner::lease(authorization.as_deref(), &body)
             } else {
                 runner::result(authorization.as_deref(), &body)
             }

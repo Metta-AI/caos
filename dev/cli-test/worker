@@ -30,7 +30,7 @@
 # that where the two usefully live apart. An absent binary here is exit 127 at
 # runtime, not a build error.
 #
-# WHAT IT DELIBERATELY DOES NOT CARRY: any grant. dev/test-stack declares
+# WHAT IT DELIBERATELY DOES NOT CARRY: any grant. dev/devbox declares
 # persistent volumes and CAP_SYS_ADMIN because it hosts a stack; a test does
 # not, and runnerd honours grants per image — so running tests in that image
 # would hand every one of them write access to the dev stack's own nix store
@@ -57,7 +57,7 @@ export CAOS_CLI
 : "${CAOS_SERVER_URL:?dev/cli-test needs CAOS_SERVER_URL from the runner}"
 
 # THE RUN'S SALT, RE-POINTED AT --test-salt. The test below drives a CLIENT, and
-# a client reads its salt from CAOS_SALT — which `caos runner` sets from the
+# a client reads its salt from CAOS_SALT — which this script sets (below) from the
 # job's ArgTree `salt` entry, so what arrives here is the SUITE's salt, empty
 # under a plain `--test-salt`. Without this, `--test-salt` re-runs a client
 # test's SCRIPT against requests it has already made, which answer from the memo.
@@ -85,6 +85,14 @@ export CAOS_CLI
 # pin the inner requests and silently un-cold the run. A test that mints its own
 # salt (tests/tracing, tests/cargo-self) exports over this afterwards, which is
 # what it wants: a novel value per invocation, not per --test-salt.
+# The run's own salt first. A worker's environment does not carry it (a resident one
+# outlives its first job), so it is read from the job's `salt` arg, if there is one.
+outer_salt=""
+if [ -e /cas/args/salt ]; then
+  caos get /cas/args/salt || fail "reading the run's salt"
+  outer_salt=$(cat /cas/args/salt)
+fi
+if [ -n "$outer_salt" ]; then export CAOS_SALT="$outer_salt"; fi
 if [ -e /cas/args/test-salt ]; then
   caos get /cas/args/test-salt || fail "reading --test-salt"
   test_salt=$(cat /cas/args/test-salt)

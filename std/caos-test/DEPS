@@ -1,5 +1,3 @@
-# This tool's worker image: dev/test-stack — nix, a stack userland, and the two grants
-# a dev stack needs (persistent volumes and the engine socket). std/bash cannot
-# serve: a grant is read from the image's own config, so a tool that stands a
-# stack up needs an image that declares it.
+# The router's image, and the daemon it sends messages to (format `<path> <name>`).
+../bash bash
 ../../dev/test-stack test-stack

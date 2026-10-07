@@ -1,0 +1,7 @@
+# tests/resident, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST of resident workers (design/daemons.md). `--resident` is the
+# BUILT image of dev/resident-test, which declares CAOS_RESIDENT=1; `--bash` is
+# a plain std/bash, the image that must refuse `caos next`.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --resident:@=DEEP-DEPS/resident-test --daemon:@=daemon.sh --refuse:@=refuse.sh

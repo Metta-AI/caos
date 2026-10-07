@@ -21,6 +21,7 @@
 pub mod gitlinks;
 pub mod import_git;
 pub mod push_git;
+pub mod runner;
 pub mod timing;
 
 use std::ffi::OsStr;
@@ -305,11 +306,6 @@ impl Secrets {
 /// it to a per-run random value, making their cache entries collision-free across
 /// runs without ever touching Redis.
 pub const SALT_ENV: &str = "CAOS_SALT";
-
-/// The current runner job's short-lived capability. A worker presents it to
-/// `POST /sub-run`; the server accepts it only while that exact job is in
-/// flight, and uses it to recover the job's server-held run context.
-pub const JOB_NONCE_ENV: &str = "CAOS_JOB_NONCE";
 
 /// Image-ref scheme marking an ordinary docker reference (vs. a git-image hash).
 pub const DOCKER_SCHEME: &str = "docker://";
@@ -3765,8 +3761,8 @@ pub fn caos_sub_run(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
         ));
     }
     t.ensure_pushed(arg_tree)?;
-    let nonce = std::env::var(JOB_NONCE_ENV)
-        .map_err(|_| "sub-run is available only inside a running worker".to_string())?;
+    let nonce = runner::job_nonce()
+        .ok_or_else(|| "sub-run is available only inside a running worker".to_string())?;
     request_sub_run(&t.server_url()?, arg_tree, &nonce)?;
     println!("request {arg_tree}");
     Ok(())
@@ -3791,8 +3787,8 @@ pub fn caos_trace_child(t: &dyn Transport, name: &str, arg_tree: &str) -> Result
             "trace-child needs a 40-character ArgTree hash, got {arg_tree:?}"
         ));
     }
-    let nonce = std::env::var(JOB_NONCE_ENV)
-        .map_err(|_| "trace-child is available only inside a running worker".to_string())?;
+    let nonce = runner::job_nonce()
+        .ok_or_else(|| "trace-child is available only inside a running worker".to_string())?;
     let body = serde_json::json!({"req": arg_tree, "nonce": nonce, "name": name}).to_string();
     server_call(
         &t.server_url()?,
@@ -4053,11 +4049,12 @@ fn salt_arg_entry(t: &dyn Transport, salt: &str) -> Result<gix::objs::tree::Entr
     })
 }
 
-/// The cache-busting salt for this run (see [`SALT_ENV`]): read from `CAOS_SALT`,
-/// empty if unset. Read at the top of a run (the CLI); the server threads it
-/// into each worker and every promise sub-run — so a whole run tree shares one.
+/// The cache-busting salt for this run (see [`SALT_ENV`]): in the worker-side `caos`
+/// the job's own `salt` arg, in a client `CAOS_SALT`; empty if neither. Read at the
+/// top of a run (the CLI); the server threads it into each worker and every promise
+/// sub-run — so a whole run tree shares one.
 fn run_salt() -> String {
-    std::env::var(SALT_ENV).unwrap_or_default()
+    runner::job_salt().unwrap_or_default()
 }
 
 /// Resolve a git ref to its tree hash, read from the local

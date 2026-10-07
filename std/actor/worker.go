@@ -2,7 +2,7 @@
 // (state', reply)` request against state kept on a Git branch, and publish the
 // new state with a compare-and-swap.
 //
-// `Q = actor { state-ref, inner, nonce, message }` has two positions:
+// `Q = actor { state-ref, inner, request-id, message }` has two positions:
 //
 //   - start reads the branch head (`git ls-remote`, then a depth-1 `tree:0`
 //     fetch of that one commit), takes the `state/` subtree oid from the head,

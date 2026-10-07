@@ -1,7 +1,7 @@
 // One concurrent writer for tests/actor. Used as a map-then `map`, it is called
 // with --in=<message blob>; it sends that message to the actor and, when the
 // request loses the race for the branch (the wrapper fails it, uncached), sends
-// it again with a new nonce, up to maxAttempts. Its callback is this same
+// it again with a new request-id, up to maxAttempts. Its callback is this same
 // program with --attempt and --msg curried on and --result or --error supplied.
 package main
 
@@ -58,11 +58,11 @@ func main() {
 			msg = "/cas/args/in"
 		}
 		stateRef, salt := readArg("state-ref"), readArg("test-salt")
-		nonce := fmt.Sprintf("%s-%d-%s", caos("hash", msg), attempt, salt)
+		requestID := fmt.Sprintf("%s-%d-%s", caos("hash", msg), attempt, salt)
 
 		inner := caos("curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/kv")
 		request := caos("prepare-request", "--base:@=/cas/args/actor", "--state-ref="+stateRef,
-			"--inner:hash="+inner, "--nonce="+nonce, "--message:@="+msg)
+			"--inner:hash="+inner, "--request-id="+requestID, "--message:@="+msg)
 		callback := caos("curry", "--base:@=/cas/args/base", "--worker1:@=/cas/args/worker1",
 			"--actor:@=/cas/args/actor", "--kv:@=/cas/args/kv",
 			"--state-ref="+stateRef, "--test-salt:@=/cas/args/test-salt",

@@ -99,6 +99,13 @@ pub const REQUIRED_POOL_ARG: &str = "required-pool";
 /// attribute. An exclusion cannot race; a preference can.
 pub const SEEDED_POOL: &str = "seeded";
 
+/// The reserved ArgTree entry that names an INSTANCE (design/daemons.md). A job
+/// with one is keyed by `(base, affinity)`: the server gives that key a single
+/// owner runner and queues every job for it behind that owner, so two jobs for
+/// one instance never run in two containers. A job without it is dispatched as
+/// any other. The entry is an ordinary arg, so it is part of the cache key.
+pub const AFFINITY_ARG: &str = "affinity";
+
 #[cfg(test)]
 mod tests {
     use super::*;

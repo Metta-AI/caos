@@ -270,7 +270,7 @@ cat > slow/.caos-expr <<EXPR
 HELP=<<END
 Sleeps, then answers.
 @param seconds How long to sleep.
-@param nonce Makes each call a new job.
+@param request-id Makes each call a new job.
 END
 curry --base:hash=$bash_image --worker1:@=worker.sh --help=\$HELP
 EXPR
@@ -278,7 +278,7 @@ cat > slow/worker.sh <<'WORKER'
 #!/usr/bin/env bash
 set -euo pipefail
 caos get /cas/args/seconds
-caos get /cas/args/nonce
+caos get /cas/args/request-id
 sleep "$(cat /cas/args/seconds)"
 printf 'slept %s' "$(cat /cas/args/seconds)" > /tmp/out
 caos put /tmp/out /cas/out
@@ -291,10 +291,10 @@ hook() { # <event JSON>
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
 held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
-send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg nonce "$held" \
+send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg request_id "$held" \
   '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run_tool",arguments:{
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,
-    arguments:{seconds:"25",nonce:$nonce}}}}')"
+    arguments:{seconds:"25","request-id":$request_id}}}}')"
 # The Stop must land AFTER the call is declared, as a backgrounded call's does.
 declared=""
 for _ in $(seq 60); do

@@ -890,7 +890,7 @@ evaluate `std/caos-build` (a worker may not block on an evaluation's runs),
 agent's `caos-build` call form — `deepener` and `deepen` expand every test's `DEPS`
 into `DEEP-DEPS/` mounts, `fanout` runs one job per `tests/<name>/cli.sh`,
 and `summarize` assembles the report. A test is a directory `tests/<name>/`
-with a `cli.sh`, which runs inside a test-stack worker, cwd'd into a client
+with a `cli.sh`, which runs inside a devbox worker, cwd'd into a client
 repo with the test tree at `./test` and `$CAOS_CLI` set, driving
 computations through `caos-cli` against a nested caos stack built from
 your edited tree. New tests are picked up automatically. Results — every
@@ -937,3 +937,4 @@ The agent's import_source tool also accepts branch names and defaults to the
 remote's default branch. It saves the resolved hash in conversation progress
 before invoking import-git, then attaches the snapshot and provenance at the
 requested unused path. Use /import for local checkouts.
+

@@ -50,7 +50,7 @@ func main() {
 		// std/go, which like std/bash declares no CAOS_WORKER_UID and so runs
 		// as the default unprivileged uid.
 		//
-		// An image that grants root (std/flake-builder, dev/test-stack, the
+		// An image that grants root (std/flake-builder, dev/devbox, the
 		// host stack) IS the owner, so a placeholder is readable there and
 		// reads as EMPTY — which is how dev/run-test came to describe "reads
 		// as empty" as the general rule. It is not the general rule, and this

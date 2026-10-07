@@ -22,7 +22,7 @@ Every script here runs with it, and two constructs quietly break under it.
   moment a comment lands between two of those lines: the continuation joins
   INTO the comment and the command runs with none of the environment. It is
   not a parse error, so `bash -n` passes and the damage shows up far away —
-  in `test-stack/worker` it was a stack dying at bring-up with "serve needs
+  in `devbox/worker` it was a stack dying at bring-up with "serve needs
   CAOS_STACK_STATE", 28 clients polling for an address that never appeared,
   and a suite that read as SLOW rather than broken. Put the comment above the
   block.
@@ -31,6 +31,11 @@ Every script here runs with it, and two constructs quietly break under it.
   never closes and swallows the REST OF THE FILE; bash then reports an
   unterminated `if` hundreds of lines away, nowhere near the cause. Write
   `X="${VAR:?message}"` — inside double quotes the message is literal.
+- **`cmd | grep -q x` is false under `pipefail` when `cmd` writes more than grep
+  reads.** `grep -q` exits at the first match, `cmd` takes SIGPIPE, and the
+  pipeline reports `cmd`'s 141, so a condition that was true reads as false. The
+  stack daemon's `harvest` exported nothing for that reason, with no error.
+  Capture instead: `[ -n "$(cmd)" ]`.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
   `sed`**, and no awk. `sed 's/^/  /'` in `std/caos-test/worker.sh` passed two
@@ -206,7 +211,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
   in which the suite started no containers. Single-flight anything expensive
   behind a per-key lock and RE-READ the cache after acquiring it. There is one
   server process per stack, so an in-process lock is the whole requirement.
-- **A default is dead if every caller passes the variable.** `test-stack/worker`
+- **A default is dead if every caller passes the variable.** `devbox/worker`
   read `CAOS_TEST_STACK_IDLE_SECS` with a 900s default, and the `docker run`
   three hundred lines away that starts that role always passed the variable,
   defaulting it to 120. The 900 was decoration; every shared stack died two
@@ -237,7 +242,7 @@ are the kind of thing that is invisible until 29 clients arrive at once.
 
 # Several dev stacks at once
 
-Several `dev/test-stack` containers run against one host stack, each testing a
+Several `dev/devbox` containers run against one host stack, each testing a
 different tree, and they share three volumes (`/mounted-nix`, `/caos-dev`,
 `/caos-images`) plus the host's redis and registry. The rule that makes that
 work is **share what is keyed by CONTENT, and give everything else a name of
@@ -278,7 +283,7 @@ concurrency.
   the object database (`refs/caos/req|res/` are keyed by hash, and a test that
   writes a mutable ref uniquifies it — `tests/README.md`), the registry, the
   podman store, and redis under its `CAOS_CACHE_NAMESPACE`. The nix store too,
-  with one exception: `dev/test-stack/worker` seeds it with `cp`, which writes
+  with one exception: `dev/devbox/worker` seeds it with `cp`, which writes
   each file in place rather than temp-and-rename, so a concurrent nix can read a
   store path that is half there. That copy takes a flock in the volume.
 - **A concurrency fix is not tested by one stack.** Run two, from two trees that
@@ -410,3 +415,34 @@ concurrency.
   re-bind by name whatever it reads. `--salt` has to ride in EVERY stage for
   that reason: bound only at the top, a fresh `--test-salt` re-runs the first
   container and hits the memo for all the rest.
+
+# Resident workers
+
+- **`/etc/hostname` does not tell two worker containers apart.** Workers on a dev
+  stack run `--network=host`, so every container reports the stack container's
+  hostname. A resident-worker test that compared hostnames saw "the same
+  container" for a daemon that had in fact been replaced. The runner is PID 1 of
+  its container, so `/proc/1/stat`'s start time names it (`tests/resident`).
+- **No worker has `CAOS_SALT` or `CAOS_JOB_NONCE` in its environment.** A daemon
+  outlives its first job, so a copy there would be stale. `caos` reads the nonce
+  from `/cas/nonce` and the salt from `/cas/args/salt`. A script that gives the
+  salt to a client — `dev/cli-test/worker`, the inner `caos-cli` in
+  `dev/test-stack` — read that arg and export `CAOS_SALT` themselves.
+- **A message with effects needs a `request-id`, or it is answered from the
+  cache.** The cache is checked before dispatch, so a repeated `caos-stack
+  status` with the same arguments never reaches the daemon and returns the first
+  reply — and a repeated `start` returns a ticket whose stack may be gone.
+  `caos-stack` makes `request-id` a required param for that reason; `caos-test`
+  does not, because a repeated suite run SHOULD be a hit.
+- **A lapsed lease fails the job in flight, and the owner's own late poll gets a
+  410.** A runner that sees 410 stops; it does not re-poll. If a daemon dies
+  mysteriously after a long quiet stretch, look for `lease lapsed` in the server
+  log before suspecting the daemon.
+- **`drive`'s token is granted only to a tree `caosd up` has published.** The
+  store's reader for it is `git+caos://local?ref=refs/caos/dev&dir=integrations/claude-code/drive`,
+  and a reader matches only when the walk's ROOT tree is one of the commits on that
+  ref. So `caos-stack --cloud-env` and `dev/remove-dev-envs` work straight after
+  `nix build && caosd up`, and fail with "drive: no token at
+  /secret/claude-oauth-token" once the tree has been edited since — with the same
+  message as a missing secret, and nothing in the server log (no grant is recorded,
+  so nothing says why).

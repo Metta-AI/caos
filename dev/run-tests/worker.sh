@@ -55,7 +55,7 @@ suite)
   # hand each test this job's own bindings (observed once as a map job whose
   # args were `image in worker1`, running as the wrong uid).
   #
-  # `dev/test-stack` is a source directory carrying a `.caos-expr`, not an
+  # `dev/devbox` is a source directory carrying a `.caos-expr`, not an
   # image, and turning one into the other is evaluation — which a worker may not
   # do itself, because `eval_path` on a `run` BLOCKS on the result and a worker
   # must never hold a slot waiting (design/map-then.md). `eval-path-then` is the
@@ -76,7 +76,7 @@ suite)
   ;;
 
 deepen)
-  # `--result` is the test-stack IMAGE. Now evaluate the tree's own root
+  # `--result` is the devbox IMAGE. Now evaluate the tree's own root
   # expression — `run --base:@=std/deep-deps --in:@=.` — which is what turns
   # every directory's `DEPS` into `DEEP-DEPS/<name>` mounts. Same mechanism,
   # second use: the root expression is just another path to evaluate.

@@ -1,6 +1,104 @@
 # Daemons — resident workers, supervised by the runner
 
-**Status:** proposal. Nothing here is implemented.
+**Status:** Parts 1 and 2 are implemented; Part 3 is still a sketch. The design
+below is the plan this was built from, and "As built" says where the code differs.
+Not done: converting the actor wrapper (`std/actor`) to a resident worker, which
+the "Actors" paragraph under Keyed dispatch anticipated. Its start and finish are
+two jobs per message, so the mailbox would not serialize a whole message and the
+compare-and-swap would stay; that is worth redesigning, not just rewiring.
+
+## As built
+
+Where the code differs from, or settles, what the sections below say:
+
+- **Where it lives.** The server's owner table and leases are in
+  `rust/crates/server/src/runner.rs`; the runner state machine, `caos next` and
+  its socket are in `rust/crates/caos/src/runner.rs` (the runner moved out of
+  `bin/caos.rs`). `design/runner-protocol.md`, "Resident workers", is the wire
+  protocol.
+- **The ownership has its own id, `tenure`.** It is minted when a keyed job is
+  claimed, rides in that job's payload, and is what a runner presents to renew
+  its lease and to poll. The first claimant is usually runnerd's poll, which is
+  not the container that will own the key, so the owner could not be named by a
+  poll.
+- **A result ends the ownership unless it says `keep`.** That is how "a worker
+  that never calls `caos next` behaves exactly as today" is made true without the
+  server knowing which workers are resident. `caos next` posts with `keep`.
+- **An `idle` poll does not release the key.** The table below said it did; the
+  owner polls again, and a job that arrived in between waited in its queue.
+  Eviction (`exit`), a result without `keep`, an explicit release and a lease
+  lapse end an ownership.
+- **The salt is its arg; the nonce is a file.** A worker's environment carries
+  neither `CAOS_SALT` nor `CAOS_JOB_NONCE` any more: a daemon outlives its first
+  job, so a copy there would be stale. The salt is already in the ArgTree, at
+  `/cas/args/salt`, and the worker-side `caos` fetches it from there; a script that
+  hands it to a client does `caos get /cas/args/salt` (`dev/cli-test/worker`
+  does). The nonce is not in the ArgTree, so the runner writes it to `/cas/nonce`
+  (root-owned, 0600), which only `/bin/caos` reads. A client (`caos-cli`) still
+  takes `CAOS_SALT` from the user and reads nothing under `/cas`, so the test
+  stack's `caos-cli` cannot pick up the outer job's context.
+- **Residency only starts at `caos next`.** An image can declare
+  `CAOS_RESIDENT=1` and still run ordinary jobs: a worker that exits without ever
+  calling `caos next` takes the runner back to warm polling, as on any image.
+  `dev/devbox` declares it and still runs the suite's
+  fan-out. The lifetime cap applies to a keyed life only, and counts from its
+  start.
+- **`caos next` exits 10 for "leave"**, 0 for a new job, 1 for an error
+  (including a refusal). `--stream` writes a `job` line first, for the job already
+  running, then one per later job; the worker answers `done` or `error <text>`.
+- **Knobs:** `CAOS_LEASE_SECS` (15), `CAOS_LEASE_START_SECS` (600) on the server;
+  `CAOS_LEASE_RENEW_MS` (5000), `CAOS_RESIDENT_POLL_MS` (10000) and
+  `CAOS_NEXT_SOCKET` on the runner.
+- **`start` does not reply early.** One job at a time per key means `status`
+  would queue behind a `start` still bringing the stack up, so replying with the
+  ticket before the stack is ready would not let anyone ask how far it got. It
+  replies when the stack is ready and the listener has published its ticket.
+- **`request-id`** replaced the actor wrapper's `nonce` in the actor code and its
+  tests, and is the arg `caos-stack` requires.
+- **Names.** `dev/devbox` is a container image and nothing else: nix, podman, git,
+  the persistent store and cache volumes, and the resident declaration. It is not a
+  stack, and the suite's fan-out jobs run on it too. `dev/test-stack` is the
+  program that builds, tests and runs a stack on it. `std/caos-build`,
+  `std/caos-test` and `std/caos-stack` drive that program. (Earlier text in this
+  document and in `design/test-stack-image.md` says "test stack" for the image.)
+- **The callers.** `std/caos-build`, `std/caos-test` and `std/caos-stack` are
+  routers on std/bash: they hash the tree, use it as both `affinity` and `in`, and
+  tail-call the message at `dev/test-stack`. `caos-build` (op `build`) and
+  `caos-test` (op `run-tests`) are cached like any job, which is why they are
+  tools of their own; `caos-stack` (start, status, logs, harvest, stop) needs a
+  fresh `request-id` per call or it answers from the cache. `build` starts no
+  stack and leaves none; `run-tests` leaves its stack up, which is what makes the
+  next run fast.
+- **Why `dev/test-stack` is a directory of its own.** The script has to stay
+  OUT of `dev/devbox`: that directory is the image's flake source, so a file in
+  it would rebuild the image whenever the script changed, and the point of one
+  script between the host and the test stack is that editing it needs neither a
+  host rebuild nor an image rebuild.
+- **Driving a cloud session at a stack.** `start` publishes the tree and the
+  stack's own TEST-world client as `refs/caos/dev` on the stack (a host-world client
+  is refused by a test server with "caos world mismatch", and the session stalls in
+  its first hook with nothing in the run log: the hook output is only in the raw
+  session events), and replies with `ticket` and `dev_commit`. `caos-stack` is a Go
+  router; with `cloud-env` its second stage tail-calls `drive env-create` for a NEW
+  environment named `z Caos Dev <commit>` rather than editing one, with the setup
+  `--dev-commit=<commit> --server=<ticket>`. That runs in the router and not in the
+  daemon because the environment takes the `claude-oauth-token`, which only `drive`
+  is granted, and the daemon runs the code under test. A test stack holds only a mock
+  secret key, so tools needing real secrets do not work in such a session.
+- **The contract with the host stack.** Everything that runs is in the tree under
+  test, so changes to the script, `stack-up`, `serve` and the suite need no host
+  rebuild. The one new coupling is residency itself: `caos next`, keyed dispatch
+  and leases are the HOST's `server`, `runnerd` and `caos`, so a change to those
+  needs `nix build && caosd up`. The stack inside still builds them from the tree.
+- **Tests:** `tests/resident` (a resident image under `dev/resident-test`: one
+  process for three concurrent messages, serialized, `/cas` content kept; an
+  explicit stop; a new container after it; a killed worker fails only its job;
+  `caos next` refused off a resident image and off a keyed job) and
+  `tests/test-stack` (the ops that must not start a stack). The suite itself is
+  the test of `start` and `run-tests`. Not tested end to end: eviction, the
+  lifetime cap, a lapsed lease, `harvest`'s final run in the grace period and
+  `--stream`; the server half of the first three is unit-tested.
+
 
 Describes what to build on top of the runner as it exists today (SPEC.md,
 "Runners: how a worker's container lives"; if that section is not in this
@@ -62,6 +160,21 @@ cannot wait like that.
    they cannot see each other.
 6. **Opt-in per image**, declared by the image author, because a resident
    worker can break the hermeticity that caching relies on.
+
+## Two things that used to be called a nonce
+
+- The **job nonce** is the server's rendezvous id for one claimed job. A runner
+  receives it with the job and presents it back with the result and with every
+  sub-run, which is what authorizes them. It is not in the ArgTree, so it never
+  reaches a cache key, and nothing a caller writes can name it.
+- A **`request-id`** is an ordinary ArgTree entry that a caller adds so that
+  otherwise identical requests have different ArgTrees, and therefore different
+  cache keys. It is the caller's answer to memoization, and the server gives it
+  no meaning. (The actor wrapper used to call this arg `nonce`.)
+
+This document says "nonce" only for the first. The job nonce is chosen by the
+server and dies with the job; a `request-id` is chosen by the caller and is
+cached with the result.
 
 ## The model
 
@@ -126,8 +239,8 @@ What this gives:
 - exactly one owner per key; no spillover, no duplicate daemons
 - strict arrival order per key, with the server holding the mailbox
 - dead-owner detection for keyed jobs
-- no `--pin`, and no epoch to get exclusion. Nonces and the cache still apply
-  as before
+- no `--pin`, and no epoch to get exclusion. The cache still applies as before,
+  so a message with effects still carries a `request-id`
 
 The same mechanism fits actors (`design/actors.md`). Requests for one actor
 serialize in the server's mailbox instead of racing on a compare-and-swap and
@@ -186,9 +299,9 @@ context moves out of the environment.
   The runner currently re-exports it as `CAOS_SALT` and `caos` reads only the
   environment (`run_salt()`). In a worker, `caos` should read `/cas/args/salt`
   first and fall back to the environment.
-- **Nonce** is the runner's rendezvous id and is not in the ArgTree. The runner
-  writes it to a root-owned `/cas/nonce`, and `caos` reads it there in place of
-  `CAOS_JOB_NONCE`.
+- **The job nonce** is the runner's rendezvous id and is not in the ArgTree. The
+  runner writes it to a root-owned `/cas/nonce`, and `caos` reads it there in
+  place of `CAOS_JOB_NONCE`.
 - **Future work arrives in `/cas/args`**, like the first job's.
 
 **Narrow reset**, run by the runner at `caos next`:
@@ -250,7 +363,7 @@ A caller cannot set any of these.
 - A message's result is cached by its ArgTree like any other job, and identical
   concurrent requests share one run (single-flight). A pure query can be
   answered from the cache without reaching the daemon. An op with effects
-  carries a `nonce` arg, which is the existing answer to memoization. This
+  carries a `request-id` arg, which is the existing answer to memoization. This
   includes `start`, which the daemon makes idempotent.
 - A resident worker's result must still depend only on its ArgTree and the
   instance's *declared* state. Hidden in-memory state breaks cache
@@ -333,7 +446,7 @@ test, point a Claude cloud session at it, drive traffic, collect the results,
 and stop it. The agent does all of it with caos jobs and `drive`.
 
 ```
-agent ── start/status/logs/harvest/stop ──job──▶ resident `stack-daemon` container (one per instance)
+agent ── start/status/logs/harvest/stop ──job──▶ resident `test-stack` container (one per instance)
                                                     inner stack: server, runnerd, redis, git, iroh listener
 agent ── drive env-create/start/send ──▶ Anthropic API ──▶ cloud session
                                               │  caos://<ticket>
@@ -342,7 +455,7 @@ agent ── drive env-create/start/send ──▶ Anthropic API ──▶ cloud
 
 ## The image
 
-A `stack-daemon` image, built from the root flake alongside `caosImage` and
+A `test-stack` image, built from the root flake alongside `caosImage` and
 reusing its interpreter (`design/test-stack-image.md`):
 
 - the interpreter brings up the inner stack exactly as it does for a test, but
@@ -356,8 +469,8 @@ reusing its interpreter (`design/test-stack-image.md`):
 
 ## Messages
 
-Every message carries `affinity` (the instance name), `op`, and a `nonce`, so it
-always reaches the daemon and is never answered from the cache.
+Every message carries `affinity` (the instance name), `op`, and a `request-id`,
+so it always reaches the daemon and is never answered from the cache.
 
 | op | does | reply |
 |---|---|---|
@@ -475,7 +588,7 @@ dies with the container. `harvest` copies it out.
 ## Build order
 
 1. Part 1 steps 1 to 4.
-2. `stack-daemon` image with `start`, `status`, `logs`, `stop`. Test: a second
+2. `test-stack` image with `start`, `status`, `logs`, `stop`. Test: a second
    job reaches the same stack, and a stack started from the outer server answers
    a `caos-cli` call over its ticket.
 3. `harvest` and the SIGTERM grace export.

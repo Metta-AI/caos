@@ -1,5 +1,5 @@
 {
-  # dev/test-stack (SPEC, "Building and testing caos, including inside caos"): the
+  # dev/devbox (SPEC, "Building and testing caos, including inside caos"): the
   # image a caos build or test runs IN. An ordinary worker image — runnerd
   # starts it, `/worker` runs the curried `worker1` — that happens to carry nix
   # and a stack's userland, and to declare the two grants that make that useful.
@@ -66,7 +66,7 @@
   # worker. The lock is NOT here: it is DEPped from the repo root and placed by
   # the flake-builder, so there is one lock in the tree rather than a copy per
   # flake and a lint to keep the copies honest.
-  description = "caos dev/test-stack — the image a caos build or test runs in: nix, a stack userland, and the grants for both";
+  description = "caos dev/devbox — the container a caos stack is built and run in: nix, a stack userland, and the grants for both";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -83,7 +83,7 @@
           '';
         in
         pkgs.dockerTools.buildLayeredImage {
-          name = "caos-test-stack";
+          name = "caos-devbox";
           tag = "latest";
           # No Entrypoint: runnerd forces `/bin/caos runner`, which execs
           # /worker.
@@ -159,6 +159,19 @@ sandbox = false''
               "CAOS_GRANT_SYS_ADMIN=1"
               "CAOS_GRANT_DEVICES=/dev/fuse"
               "CAOS_GRANT_VOLUMES=/mounted-nix /caos-dev /caos-images"
+              # RESIDENT (design/daemons.md): a worker on this image MAY call
+              # `caos next` and stay, which is what dev/test-stack does. A worker
+              # that does not behaves as on any image: caos-build and the suite's
+              # own fan-out jobs run here too and are unchanged.
+              #
+              # The lifetime cap is the runner's, not the daemon's: a stack is a
+              # cache of work, and an idle one is evicted as soon as anything else
+              # wants its slot, so the cap is only the backstop for a quiet
+              # machine. The grace period is how long a stack has to harvest its
+              # conversations between SIGTERM and SIGKILL.
+              "CAOS_RESIDENT=1"
+              "CAOS_RESIDENT_MAX_SECS=7200"
+              "CAOS_RESIDENT_GRACE_SECS=60"
             ];
           };
           # /usr/bin/env, because nearly every script in this tree opens with

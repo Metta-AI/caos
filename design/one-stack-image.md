@@ -1,7 +1,7 @@
 # caosd is the stack — design note
 
 **Status:** PROPOSED. Supersedes the compose half of the host deploy and the
-hand-written bring-up in `test-stack/worker`. Depends on the image/worker
+hand-written bring-up in `devbox/worker`. Depends on the image/worker
 contract in `flake-images.md`; `test-stack-image.md` is the direct ancestor —
 this note generalises its "the stack is an image" claim from the test path to
 *every* path.
@@ -11,7 +11,7 @@ this note generalises its "the stack is an image" claim from the test path to
 **There are two hand-written bring-ups.** The host's is a compose file plus
 ~180 lines of `caosd` (`load_once`, `check_current`, `compose_up`,
 `compose_up_diagnose`) standing up four containers. The test stack's is
-`test-stack/worker`, which starts redis, the server and runnerd as three
+`devbox/worker`, which starts redis, the server and runnerd as three
 processes in one container. They must agree on every daemon's configuration —
 redis addressing, git dir, runner slots, registry naming, the socket grant —
 and nothing makes them agree. They can drift silently, and when they drift the
@@ -201,7 +201,7 @@ and it reports which name it checked. A check that passes over one name while
 replaces.
 
 **Logging.** `docker logs` on one container interleaves four daemons.
-`test-stack/worker` already writes `/tmp/{redis,server,runnerd}.log`; the host
+`devbox/worker` already writes `/tmp/{redis,server,runnerd}.log`; the host
 placement writes `$CAOS_DATA/logs/` and `caosd logs` tails them.
 
 ## The seed
@@ -306,7 +306,7 @@ that, and it is unchanged by any of this.
   `suite-stage4.sh` folds back into `suite-stage3.sh`
 - `/caos/images` and `/caos/tree` from the stack image: with nothing publishing
   at runtime, the clean tarballs and the tree copy have no reader
-- the second bring-up: `test-stack/worker`'s daemon section becomes
+- the second bring-up: `devbox/worker`'s daemon section becomes
   `caosd serve`
 
 ## What this does not change
@@ -347,8 +347,8 @@ tags. What is unresolved is whether the delta emit belongs in
 
 ## Sequence
 
-1. **`caosd serve`** — extract `test-stack/worker`'s daemon section into it;
-   `test-stack/worker` calls it. No behaviour change, and the suite proves it.
+1. **`caosd serve`** — extract `devbox/worker`'s daemon section into it;
+   `devbox/worker` calls it. No behaviour change, and the suite proves it.
 2. **skopeo conversion** — `build-builtins.sh`'s streamed path off `docker
    build`. Verifiable through the existing `caosd up` path alone.
 3. **`caosd up` runs the image** — compose and both daemon images delete;

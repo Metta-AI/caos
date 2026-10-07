@@ -1,0 +1,4 @@
+# The builder for this flake, and the shared lock (one flake.lock at the repo
+# root pins every flake in the tree).
+../../std/flake-builder flake-builder
+../../flake.lock flake.lock
