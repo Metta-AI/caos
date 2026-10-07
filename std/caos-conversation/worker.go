@@ -307,7 +307,7 @@ func renderCall(b block, width int) {
 
 // renderEntries prints the transcript, or with only set, the one entry and
 // call it names.
-func renderEntries(files []string, width int, only string) {
+func renderEntries(files []string, width int, only string, o opts) (shown int) {
 	for _, f := range files {
 		var e entry
 		w.Must(json.Unmarshal(w.Check(os.ReadFile(f)), &e))
@@ -315,6 +315,14 @@ func renderEntries(files []string, width int, only string) {
 			continue
 		}
 		ord, _, _ := strings.Cut(filepath.Base(f), "-")
+		idx := int(w.Check(strconv.ParseUint(ord, 10, 64)))
+		if only == "" && !o.wants(idx, e) {
+			continue
+		}
+		shown++
+		// With only=failed the assistant's closing text is left out too: the
+		// failing calls are what was asked for.
+		quiet := o.only == "failed" && e.Role != "user"
 		round := ""
 		if e.Round != nil {
 			round = fmt.Sprintf(" (round %d)", *e.Round)
