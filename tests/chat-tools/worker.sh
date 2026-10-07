@@ -56,6 +56,18 @@ grep -qF 'old-string not found' /tmp/failed-edit.json \
   || fail "bad edit observation lacks its error"
 grep -qF '"is_error":true' /tmp/failed-edit.json \
   || fail "bad edit observation is not marked is_error"
+# A misspelt argument is named, not reported as a missing one, and it changes nothing.
+$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
+  --round 0 --id tu_u > /tmp/unknown-arg.json
+grep -qF 'edit takes no \"old_string\" argument (declared: ' /tmp/unknown-arg.json \
+  || { cat /tmp/unknown-arg.json >&2; fail "misspelt argument was not named"; }
+grep -qF '"is_error":true' /tmp/unknown-arg.json \
+  || fail "unknown argument is not marked is_error"
+# The retired `source_tree` spelling is refused the same way.
+$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
+  --round 0 --id tu_o > /tmp/old-source-tree.json
+grep -qF 'read takes no \"source_tree\" argument' /tmp/old-source-tree.json \
+  || { cat /tmp/old-source-tree.json >&2; fail "source_tree was not refused"; }
 
 grep -qF '"hello world"' /tmp/stub/request-2.json || fail "read result not sent"
 grep -qF 'wrote main/files/new.txt (11 bytes)' /tmp/stub/request-2.json \
