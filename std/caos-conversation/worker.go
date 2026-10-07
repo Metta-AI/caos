@@ -491,7 +491,7 @@ func read() {
 		width = 300
 	}
 	o := opts{width: width, to: -1, only: optArg("only", "")}
-	if o.msgWidth, err = strconv.Atoi(optArg("msg_width", "0")); err != nil || o.msgWidth < 0 {
+	if o.msgWidth, err = strconv.Atoi(optArg("msg-width", "0")); err != nil || o.msgWidth < 0 {
 		o.msgWidth = 0
 	}
 	if o.from, err = strconv.Atoi(optArg("from", "0")); err != nil || o.from < 0 {
