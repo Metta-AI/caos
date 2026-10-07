@@ -549,6 +549,13 @@ func read() {
 	}
 	say("tip %s (%d commits walked, %d transcript entries)", hash, n, len(files))
 	say("calls: %s", callSummary())
+	tools, failed := overview(files)
+	if tools != "" {
+		say("by tool: %s", tools)
+	}
+	if failed != "" {
+		say("entries with a failed call: %s", failed)
+	}
 	say("")
 	say("NOT RECORDED: the model's text and reasoning between tool calls, calls to tools")
 	say("that are not caos's (and calls that never reached one), and timings. Gaps in the")
