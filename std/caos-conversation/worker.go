@@ -382,7 +382,7 @@ func cutMsg(s string, width, idx int) string {
 	if width == 0 || len(r) <= width {
 		return s
 	}
-	return fmt.Sprintf("%s… [%d more chars; pass from=%d to=%d msg_width=0 to see all]",
+	return fmt.Sprintf("%s… [%d more chars; pass from=%d to=%d msg-width=0 to see all]",
 		string(r[:width]), len(r)-width, idx, idx)
 }
 
