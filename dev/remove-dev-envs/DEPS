@@ -1,0 +1,6 @@
+# What this reaches for (format `<path> <name>`).
+# go     the Go script worker this runs on
+# drive  how a cloud environment is listed and deleted, reached through its own
+#        image so the secret granted to it is granted wherever it is called from
+../../std/go go
+../../integrations/claude-code/drive drive

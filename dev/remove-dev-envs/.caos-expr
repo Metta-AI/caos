@@ -1,0 +1,16 @@
+# The `remove-dev-envs` tool: delete the cloud environments `caos-stack start
+# --cloud-env` made, which nothing else cleans up. Run it by hand now and then:
+#
+#   caos-cli run-tool dev/remove-dev-envs
+#
+# A std/go worker that drives `drive` (design/daemons.md). It is `dev/` and not
+# `std/` because it is for the people who run dev stacks, not for an agent.
+#
+# Nothing is bound but the images: it takes no arguments and `at`, which every
+# `drive` verb needs, is made by the worker itself.
+HELP=<<END
+Delete every cloud environment whose name starts with "z Caos Dev ", which is what
+`caos-stack start --cloud-env` creates for each stack. Environments with any other
+name are left alone. Returns the names it deleted, or says there were none.
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --drive:@=DEEP-DEPS/drive --help=$HELP
