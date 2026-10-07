@@ -532,6 +532,11 @@ conversation (`import_source`, then `copy` to `feature/...`):
   when its slot is wanted, so keep one `status` going between turns; after an
   eviction `start` again WITH `cloud-env` and start a new session on the new
   environment. An old environment cannot be repointed.
+- Edit the checkout AFTER you are done driving. `drive` is granted its token only
+  while its tree is unedited, so once you edit `feature/<name>` every `drive` call
+  there fails with "no token at /secret/claude-oauth-token" (see AGENTS.md,
+  "Resident workers"). Keep an untouched import (`imports/<repo>/base`) and run
+  `drive` from it: it is the same code, and it still has the grant.
 - Not understood yet: `harvest` returned `harvested=0` and `drive conv` found no
   head on the host server, even after a session had completed turns against the
   stack. Do not rely on either to retrieve the conversation until that is
