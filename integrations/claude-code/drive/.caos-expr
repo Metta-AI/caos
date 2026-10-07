@@ -38,8 +38,10 @@
 # `--server=` on the session's environment's setup line (a `caos-stack` test
 # stack's ticket, for a session driven at one). Only when the environment names
 # none does it fall back to this worker's $CAOS_SERVER_URL, the HOST server. A
-# `caos://` ticket is printed truncated, being a credential. It needs
-# git-remote-caos in this worker to ask a ticket, and says so when it is missing.
+# `caos://` ticket is printed truncated, being a credential. This worker has no
+# git-remote-caos, so it cannot ask a ticket; it says so and looks on the HOST
+# server for the copy `caos-stack harvest` exports (refs/stacks/<instance>/...).
+# So for a test stack: let the session record a turn, `harvest`, then `conv`.
 #
 # No `@writer` and no `@in`: nothing here advances the conversation tree.
 HELP=<<END
