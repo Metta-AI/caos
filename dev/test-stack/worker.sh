@@ -523,6 +523,12 @@ op_harvest() {
   {
     echo "harvested=$(grep -c . /tmp/harvested || true)"
     cat /tmp/harvested
+    if [ -s /tmp/harvest.problems ]; then
+      echo "problems:"
+      sed 's/^/  /' /tmp/harvest.problems
+    fi
+    echo "refs in the stack's repo (count, namespace):"
+    stack_ref_summary | sed 's/^/  /'
   } > /tmp/reply
   reply /tmp/reply
 }
