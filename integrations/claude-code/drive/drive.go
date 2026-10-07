@@ -800,23 +800,90 @@ func conv(o opts) error {
 	}
 	name := "cc/" + internal
 	ref := "refs/caos/v3/conversations/" + fmt.Sprintf("%x", name) + "/head"
-	server := os.Getenv("CAOS_SERVER_URL")
-	if server == "" {
-		server = "http://localhost:9090"
-	}
+	server, from := sessionServer(c, id)
+	shown := redactServer(server)
 	fmt.Println("session:      " + id)
 	fmt.Println("internal id:  " + internal)
 	fmt.Println("conversation: " + name)
 	fmt.Println("ref:          " + ref)
-	ls, _ := exec.Command("git", "ls-remote", server, ref).Output()
+	fmt.Println("server:       " + shown + "   (" + from + ")")
+	if strings.HasPrefix(server, "caos://") {
+		if _, err := exec.LookPath("git-remote-caos"); err != nil {
+			return errors.New("the session's server is a caos:// ticket, and git-remote-caos is not in this worker, " +
+				"so it cannot be queried from here. Query it from a machine that has the helper, with the ticket " +
+				"from `drive env-show` on the session's environment")
+		}
+	}
+	cmd := exec.Command("git", "ls-remote", server, ref)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	ls, err := cmd.Output()
+	if err != nil {
+		// A failed query is not an absent conversation, and git's message can
+		// quote the URL, which for a ticket is a credential.
+		msg := strings.TrimSpace(strings.ReplaceAll(stderr.String(), server, shown))
+		fmt.Println("head:         (could not ask " + shown + ")")
+		return fmt.Errorf("git ls-remote %s: %v: %s", shown, err, msg)
+	}
 	head := strings.Fields(string(ls))
 	if len(head) == 0 {
-		fmt.Println("head:         (not on " + server + " — wrong server, or no turn yet)")
-		return errors.New("conversation head not found on " + server)
+		fmt.Println("head:         (not on " + shown + " — no turn recorded yet, or the session records elsewhere)")
+		return errors.New("conversation head not found on " + shown)
 	}
 	fmt.Println("head:         " + head[0])
-	fmt.Printf(convNote, server, head[0], head[0], server)
+	// A ticket stays out of the transcript: the commands below name it by
+	// placeholder, and the person substitutes it.
+	cmdServer := server
+	if strings.HasPrefix(server, "caos://") {
+		cmdServer = "<ticket>"
+		fmt.Println("\n<ticket> is the caos:// URL after --server= in the setup script that `drive env-show` prints for the session's environment.")
+	}
+	fmt.Printf(convNote, cmdServer, head[0], head[0], cmdServer)
 	return nil
+}
+
+// sessionServer finds the caos server a session records into, and says where
+// it found it. The only place a cloud session is told its server is the
+// `--server=` on its environment's setup line (integrations/claude-code/cloud),
+// so that is read first: this worker's own $CAOS_SERVER_URL is the HOST's
+// server, and a session driven at a `caos-stack` test stack records into the
+// stack, so asking the host for its conversation finds nothing — or, if an id
+// ever collided, the wrong one. The host's is the fallback for a session whose
+// environment names none.
+func sessionServer(c creds, id string) (string, string) {
+	host := os.Getenv("CAOS_SERVER_URL")
+	if host == "" {
+		host = "http://localhost:9090"
+	}
+	var raw map[string]any
+	if err := api(c, "GET", "/v1/code/sessions/"+id, nil, &raw); err != nil {
+		return host, "this worker's $CAOS_SERVER_URL; the session could not be read: " + err.Error()
+	}
+	envID, _ := shape(raw)["environment_id"].(string)
+	if envID == "" {
+		return host, "this worker's $CAOS_SERVER_URL; the session names no environment"
+	}
+	env, err := envGet(c, envID)
+	if err != nil {
+		return host, "this worker's $CAOS_SERVER_URL; " + err.Error()
+	}
+	script, _ := dig(env["config"].(map[string]any), "init_script").(string)
+	if m := serverFlagRe.FindStringSubmatch(script); m != nil {
+		return m[1], "--server= in the setup script of " + envID
+	}
+	return host, "this worker's $CAOS_SERVER_URL; the setup script of " + envID + " names no --server="
+}
+
+var serverFlagRe = regexp.MustCompile(`--server=(\S+)`)
+
+// redactServer is a server URL fit to print. A `caos://` ticket is the
+// capability to drive that server (integrations/claude-code/cloud/README.md),
+// and this output is read by a model, so only its first characters show.
+func redactServer(s string) string {
+	if rest, ok := strings.CutPrefix(s, "caos://"); ok {
+		return "caos://" + trunc(rest, 12) + "…"
+	}
+	return s
 }
 
 // ---------------------------------------------- environment definitions
