@@ -413,7 +413,7 @@ fn ensure_resolved(t: Option<&GitTransport>, options: &TurnOptions, registry: &R
                 }
             }
         }
-        match resolve_once(options) {
+        match resolve_once(t, options) {
             Ok(tools) => {
                 publish(registry, tools);
                 return;
