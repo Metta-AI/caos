@@ -6,6 +6,12 @@
 # A std/go worker that drives `drive` (design/daemons.md). It is `dev/` and not
 # `std/` because it is for the people who run dev stacks, not for an agent.
 #
+# IT NEEDS THE TREE PUBLISHED. `drive` is granted the claude-oauth-token by origin,
+# and the grant matches only a walk whose root tree is one `caosd up` published as
+# refs/caos/dev on this stack. After editing the tree, `nix build && caosd up` first,
+# or `drive` answers "no token at /secret/claude-oauth-token". This is true of every
+# tool that calls `drive`, `caos-stack --cloud-env` included.
+#
 # Nothing is bound but the images: it takes no arguments and `at`, which every
 # `drive` verb needs, is made by the worker itself.
 HELP=<<END
