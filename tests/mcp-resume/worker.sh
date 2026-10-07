@@ -16,6 +16,11 @@
 # terminal, and the call paths are what `llm-step`'s `drain` already does.
 set -euo pipefail
 
+# The recorded-workspace store lives under $HOME/.cache, and the worker's HOME
+# is not writable.
+HOME=$(mktemp -d)
+export HOME
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 hook() { # <event JSON>; prints the hook's stdout
@@ -129,5 +134,35 @@ case "$(subjects "$(ref_of "cc/$b")")" in
   "request.claim request.admit message.append request.terminal "*) ;;
   *) fail "the open request was not closed on the resumed branch: $(subjects "$(ref_of "cc/$b")")" ;;
 esac
+
+echo "== a session's checkout is recorded once, and nothing else is consulted ==" >&2
+# A later hook from a directory that is no repository still lands in the same
+# conversation, because it reads the recorded entry rather than discovering.
+w="resume-w-$stamp"
+prompt "$w" "first prompt, records the checkout" >/dev/null
+head_w=$(head_of "cc/$w")
+[ -n "$head_w" ] || fail "the first prompt recorded no conversation"
+elsewhere=$(mktemp -d)
+(cd "$elsewhere" && env -u CLAUDE_PROJECT_DIR \
+  "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step <<<"$(jq -nc --arg s "$w" \
+    '{hook_event_name:"Stop",session_id:$s,last_assistant_message:"from elsewhere"}')" >/dev/null) \
+  || fail "a hook from another directory failed despite a recorded workspace"
+new_head=$(head_of "cc/$w")
+[ "$new_head" != "$head_w" ] || fail "the hook from another directory recorded nothing"
+git merge-base --is-ancestor "$head_w" "$new_head" || fail "the new head does not descend from the old"
+
+# No entry, wrong directory: the hooks fail, loudly, naming the session.
+x="resume-x-$stamp"
+rc=0
+err=$(cd "$elsewhere" && env -u CLAUDE_PROJECT_DIR \
+  "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step 2>&1 >/dev/null <<<"$(jq -nc --arg s "$x" \
+    '{hook_event_name:"PreToolUse",session_id:$s,tool_name:"mcp__caos__x"}')") || rc=$?
+[ "$rc" = 2 ] || fail "PreToolUse with no recorded workspace exited $rc, not 2"
+case "$err" in *"$x"*) ;; *) fail "the failure did not name the session: $err" ;; esac
+rc=0
+(cd "$elsewhere" && env -u CLAUDE_PROJECT_DIR \
+  "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step >/dev/null 2>&1 <<<"$(jq -nc --arg s "$x" \
+    '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:"hi"}')") || rc=$?
+[ "$rc" = 2 ] || fail "a first prompt outside any repository exited $rc, not 2"
 
 echo "mcp-resume: ALL PASS" >&2

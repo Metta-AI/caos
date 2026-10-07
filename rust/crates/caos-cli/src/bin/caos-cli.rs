@@ -192,7 +192,7 @@ fn usage(args: &[String]) -> String {
          {prog} chat <name> [-m <message>] [--base <revspec>] [--log] [--username <name>] [conversation options]\n    \
          (a conversation names its two workers: --llm-step:@=<path> --llm-call:@=<path>,\n     \
          typed like any image arg — caos-std/<name> in a repo that mounted caos)\n  \
-         {prog} mcp <hook | serve | warm> [--llm-step:@=<path>]\n    \
+         {prog} mcp <hook | serve | warm | diag> [--llm-step:@=<path>]\n    \
          (Claude Code: the hook that records a session, and the MCP tool server it spawns)\n  \
          {prog} run-tool <script | name> [--name=value ...]\n  \
          {prog} eval-path [--tree=<oid>] <path>\n  \

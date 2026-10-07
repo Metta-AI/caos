@@ -51,6 +51,11 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         Err(error) => {
             eprintln!("caos mcp serve: cannot open the caos workspace: {error}");
             eprintln!("caos mcp serve: serving anyway; tools will report this when called");
+            super::diag::emit(&super::diag::Context {
+                event: "serve",
+                reason: Some(&error),
+                ..Default::default()
+            });
             Err(error)
         }
     };
@@ -470,7 +475,7 @@ fn conversation_status(session: Option<&str>) -> String {
              PreToolUse hook that supplies it is not installed\n"
         );
     };
-    let t = match GitTransport::from_cwd() {
+    let t = match super::workspace::open(session) {
         Ok(t) => t,
         Err(error) => return format!("conversation: cannot open the workspace: {error}\n"),
     };
@@ -487,7 +492,7 @@ fn conversation_status(session: Option<&str>) -> String {
     format!("conversation: {id}\nconversation head: {head}\n")
 }
 
-fn status_result(registry: &Registry, conversation: &str) -> Value {
+fn status_result(registry: &Registry, conversation: &str, degraded: Option<&str>) -> Value {
     let text = match registry.lock() {
         Err(_) => "the caos tool registry lock is poisoned; this server is broken".to_string(),
         Ok(found) => match (&found.status, found.tools.is_empty()) {
@@ -498,7 +503,20 @@ fn status_result(registry: &Registry, conversation: &str) -> Value {
                 .to_string(),
         },
     };
-    let text = format!("{text}\n{conversation}{}", diagnostics());
+    // THE REASON LEADS. A degraded server has no tools to describe, and the
+    // reader of this text is usually a model deciding what to tell a person.
+    let lead = match degraded {
+        Some(reason) => format!(
+            "caos is DEGRADED: it has no workspace, so no tool can run.\nreason: {reason}\n\n"
+        ),
+        None => String::new(),
+    };
+    let diag = super::diag::emit(&super::diag::Context {
+        event: STATUS_TOOL,
+        reason: degraded,
+        ..Default::default()
+    });
+    let text = format!("{lead}{text}\n{conversation}{}\n{diag}", diagnostics());
     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }
 
@@ -689,7 +707,7 @@ fn registry_cache_state() -> String {
 ///
 /// It replaces a scrub of `dumbpipe`'s `using secret key <64 hex>` line, which
 /// was the same concern about the same kind of value.
-fn redact_secrets(s: &str) -> String {
+pub(super) fn redact_secrets(s: &str) -> String {
     s.lines()
         .map(|line| match line.find(caos::TICKET_SCHEME) {
             Some(start) => {
@@ -846,6 +864,9 @@ fn handle(
         // a protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
         "tools/call" => Some(match t {
+            Err(error) if params.get("name").and_then(Value::as_str) == Some(STATUS_TOOL) => {
+                reply(id, status_result(registry, "", Some(error)))
+            }
             Err(error) => reply(
                 id,
                 json!({
@@ -913,7 +934,7 @@ fn call(
             .get("arguments")
             .and_then(|args| args.get(SESSION_ARG))
             .and_then(Value::as_str);
-        return Ok(status_result(registry, &conversation_status(session)));
+        return Ok(status_result(registry, &conversation_status(session), None));
     }
     let args = params
         .get("arguments")
@@ -1017,6 +1038,18 @@ mod tests {
             notification
         )
         .is_none());
+    }
+
+    /// With no workspace the status still answers, and its first words are the
+    /// reason rather than the registry's "not resolved yet".
+    #[test]
+    fn a_degraded_status_leads_with_its_reason() {
+        let registry: Registry = Arc::new(Mutex::new(Found::default()));
+        let result = status_result(&registry, "", Some("not a git working tree"));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("caos is DEGRADED"), "{text}");
+        assert!(text.contains("reason: not a git working tree"), "{text}");
+        assert!(text.contains("--- caos diag ---"), "{text}");
     }
 
     #[test]

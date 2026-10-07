@@ -16,6 +16,11 @@
 # registry carries the one tool that explains itself.
 set -euo pipefail
 
+# The recorded-workspace store lives under $HOME/.cache, and the worker's HOME
+# is not writable.
+HOME=$(mktemp -d)
+export HOME
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # One JSON-RPC exchange over the server's stdio, as a coprocess: the protocol
