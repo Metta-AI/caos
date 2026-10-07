@@ -527,7 +527,7 @@ func read() {
 
 	if want != "" {
 		if _, ok := calls[want]; ok {
-			renderEntries(files, 0, want)
+			renderEntries(files, 0, want, opts{})
 			return
 		}
 		say("no call %s in this conversation.\n\nCalls it recorded (ids as the default listing prints them):", want)
