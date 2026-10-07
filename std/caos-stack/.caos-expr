@@ -23,7 +23,6 @@ suite on the same stack.
 @param op One of: start, status, logs, harvest, stop.
 @param request-id Any fresh value (e.g. $(date +%s%N)). Messages are not cached only if this differs from every earlier call's.
 @param [relay] For `start`: the URL of a relay of your own, on port 80 or 443, that this container and the cloud session can both reach. n0's relays are never used. NOT optional in practice: without it `start` fails with "start needs a relay". If you have no relay of your own, the one your own session already uses works: `caos_status`'s phase journal names it on its `push:` lines (`over RELAY relay:http://<ip>/`); pass `http://<ip>/`.
-@param [cloud-env] (see below) A stack's ticket and dev commit are new on EVERY start, including a restart after eviction, so an environment made for an earlier start points at a dead stack: call `start` with `cloud-env` again and use the new `z Caos Dev <commit>` environment.
 @param [advertise] For `start`: space-separated host:port addresses to put in the ticket as direct addresses. Without them every client is relayed.
 @param [cloud-env] For `start`: any value (e.g. 1) to also create a new cloud environment named `z Caos Dev <dev commit>` whose setup installs the published client and points at this stack, using the claude-oauth-token. Start a session on it with the `drive` tool.
 @param [bootstrap-base] For `start` with `cloud-env`: the raw GitHub base URL the environment fetches its bootstrap from. Default: Metta-AI/caos main.
