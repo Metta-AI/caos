@@ -12,7 +12,8 @@
       "Glob",
       "Grep",
       "NotebookEdit",
-      "Monitor"
+      "Monitor",
+      "mcp__claude-code-remote__add_repo"
     ],
     "allow": [
       "mcp__caos"

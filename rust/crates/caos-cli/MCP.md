@@ -56,6 +56,13 @@ alone: the step offers no equivalent, so denying them would remove a capability
 rather than redirect it. **Any new harness tool that can run a command or read a
 path belongs on this list**; the deny list is only as tight as its last audit.
 
+`mcp__claude-code-remote__add_repo` is denied too, though it is not a file tool.
+It adds a repo to the cloud session's sources, and nothing can read the clone it
+asks for (no `Read`, no `Bash`), so it buys nothing. It also costs something: a
+session with a second source was seen restarting in `/home/user`, which is no
+repository, and the tool server then offered only `caos_status`. Import a
+repository into the conversation with `import_source` instead.
+
 Not a copy of them: THE SAME ONES. `tools/list` runs the step with
 `--list-tools` and hands back the registry it answers with, and a call runs the
 step with `--tools-only`, which executes it exactly as it does for a turn the
