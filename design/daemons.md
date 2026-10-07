@@ -59,7 +59,7 @@ Where the code differs from, or settles, what the sections below say:
   the persistent store and cache volumes, and the resident declaration. It is not a
   stack, and the suite's fan-out jobs run on it too. `dev/test-stack` is the
   program that builds, tests and runs a stack on it. `std/caos-build`,
-  `std/caos-test` and `std/caos-stack` drive that program. (Earlier text in this
+  `std/caos-test` and `dev/caos-stack` drive that program. (Earlier text in this
   document and in `design/test-stack-image.md` says "test stack" for the image.)
 - **The callers.** `std/caos-build`, `std/caos-test` and `std/caos-stack` are
   routers on std/bash: they hash the tree, use it as both `affinity` and `in`, and
