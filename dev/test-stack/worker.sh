@@ -540,6 +540,8 @@ final_harvest() {
   if [ ! -e "$UP" ] || [ ! -e "$HARVEST_REFS" ]; then return 0; fi
   phase "final harvest"
   (harvest "$(cat "$HARVEST_REFS")") || echo "final harvest failed" >&2
+  echo "final harvest: $(grep -c . /tmp/harvested || true) refs exported" >&2
+  cat /tmp/harvest.problems >&2 2>/dev/null || true
 }
 
 op_stop() {
