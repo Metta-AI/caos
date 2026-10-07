@@ -26,11 +26,11 @@ under test, not the place the tools run.
   (`tool_help` lists it), e.g. `in=feature/<name>`. Leave `in` off to test the
   import itself.
 - Do NOT run the tools from `feature/<name>`. `drive` is granted its token only
-  while its own tree is the one a daemon published (see AGENTS.md, "Resident
-  workers"), and an edited checkout can lose it: a `drive` call there failed
-  with "no token at /secret/claude-oauth-token" after the checkout's `drive`
-  was edited. Whether an edit elsewhere in the tree also breaks it has not been
-  tested. Running from the untouched import avoids the question.
+  when the root tree it is run from is one `caosd up` published (AGENTS.md,
+  "Resident workers"), so an edited checkout can fail every `drive` call with
+  "no token at /secret/claude-oauth-token". One did, after `drive` itself was
+  edited; whether an edit elsewhere also breaks it has not been tested. The
+  untouched import is the blessed copy, so it avoids the question.
 - `caos-stack` `op=start` needs `relay=http://<ip>/`. Your own session already
   has one: `caos_status` shows `over RELAY relay:http://<ip>/` on its `push:`
   lines. Use `cloud-env=1` to get the environment, and a fresh `request-id` for
