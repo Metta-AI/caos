@@ -63,18 +63,33 @@ under test, not the place the tools run.
   task that calls a caos tool if you want to see the stack do work (the
   stack's `logs` with `log=server` then shows `cache miss` / `ran worker`).
 - `drive info` is not broken: like `start`, `send` and `list` it only asks the
-  Claude sessions API. `drive conv` is the odd one out: it runs `git ls-remote`
-  against `$CAOS_SERVER_URL`, i.e. YOUR session's caos server (the
-  `http://10.x.x.x` in its error), so it can never see a conversation recorded
-  on a test stack and reports "not on ... wrong server, or no turn yet".
-  (The failed call's output also began with a transcript of some other
-  conversation; I did not find where that comes from.)
-- `harvest` exists because the stack's git dies with the stack. It pushes
-  `refs/caos/v3/conversations/*` from the stack to YOUR server as
-  `refs/stacks/<instance>/caos/v3/conversations/...`, so even after a
-  harvest `conv` (which looks at the unprefixed ref) would not find it.
-  Here it returned `harvested=0` after completed turns; why is not
-  understood. Until it is, read turns from `drive info`'s summary.
+  Claude sessions API. `drive conv` is the odd one out, because it asks a caos
+  server. It used to ask YOUR session's server (`$CAOS_SERVER_URL`, the
+  `http://10.x.x.x` in its error), which never holds a test stack's
+  conversations. It now asks the server named by `--server=` on the session's
+  environment's setup line, printing a `caos://` ticket truncated, and only
+  falls back to your server when the environment names none. UNTESTED: it
+  needs `git-remote-caos` inside the `drive` worker and says so if that is
+  missing; the stack must also still be up, and it is evicted within minutes.
+  (A failed `conv` call's output once began with a transcript of some other
+  conversation; where that comes from was not found.)
+- `harvest` exists because the stack's git dies with the stack. It copies
+  `refs/caos/v3/conversations/*` from the STACK's own git (`/caos-dev/git`, the
+  repo its server and its `caos://` listener use) to YOUR server, as
+  `refs/stacks/<instance>/caos/v3/conversations/...`; `conv` looks at the
+  unprefixed ref, so it would not find them there. Three things about it:
+  - Its optional pattern argument is `harvest-refs`. It was called `refs`, a
+    name the tool interpreter reserves, so it was silently dropped from the
+    tool's declared arguments and could never be passed ("takes no refs
+    argument"). The rename is untested against a live stack.
+  - The stack runs one last harvest as it is evicted, but only of the patterns
+    its latest `harvest` call asked for. A stack never asked to `harvest` while
+    up exports nothing when it goes, so call `harvest` once early.
+  - `harvested=0` after completed turns has not been explained. It is not a
+    matter of the stack reading the wrong server: the source is the stack's
+    own repo by design. Either the conversation refs are not in that repo, or
+    the pattern does not see them. Until that is settled, read turns from
+    `drive info`'s summary.
 - The stack can be gone within minutes of `start` (a `stop` ten minutes later
   said `not running`). That is the eviction above, not a failed start.
   `stop` then has nothing to do; carry on with `archive` and `env-delete`.
