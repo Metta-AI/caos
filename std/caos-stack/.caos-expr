@@ -15,16 +15,21 @@ HELP=<<END
 Start, inspect, harvest from, or stop a caos stack built from a source tree. One
 stack per tree: it is created by the first message for the tree, stays up between
 messages and is evicted when its slot is wanted. `start` brings the stack up if it
-is not and returns the `caos://` ticket a cloud session reaches it by; the others
+is not, publishes a client for it as refs/caos/dev on the stack, and returns the
+`caos://` ticket and that dev commit, which is what a cloud session needs; with
+`cloud-env` it also makes a NEW cloud environment for them and names it. The others
 never start a stack and report `not running` if there is none. `caos-test` runs the
 suite on the same stack.
 @param op One of: start, status, logs, harvest, stop.
 @param request-id Any fresh value (e.g. $(date +%s%N)). Messages are not cached only if this differs from every earlier call's.
 @param [relay] For `start`: the URL of a relay of your own, on port 80 or 443, that this container and the cloud session can both reach. n0's relays are never used.
 @param [advertise] For `start`: space-separated host:port addresses to put in the ticket as direct addresses. Without them every client is relayed.
+@param [cloud-env] For `start`: any value (e.g. 1) to also create a new cloud environment named `z Caos Dev <dev commit>` whose setup installs the published client and points at this stack, using the claude-oauth-token. Start a session on it with the `drive` tool.
+@param [bootstrap-base] For `start` with `cloud-env`: the raw GitHub base URL the environment fetches its bootstrap from. Default: Metta-AI/caos main.
+@param [secret-readers] For `start` with `cloud-env`: a secret reader key to put in the setup, to be granted what that key is granted on THIS stack (a test stack holds only a mock key).
 @param [log] For `logs`: which member's log: serve, server, runnerd, publish or iroh. Default serve.
 @param [cursor] For `logs`: the byte offset to read from — the `cursor=` line of the previous reply. Default 0.
 @param [refs] For `harvest`: ref patterns, one per line, to copy from the stack's git to this server under refs/stacks/<tree>/. Default: the stack's conversations.
 @in
 END
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --daemon:@=DEEP-DEPS/test-stack --help=$HELP
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --daemon:@=DEEP-DEPS/test-stack --drive:@=DEEP-DEPS/drive --help=$HELP

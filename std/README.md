@@ -16,7 +16,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. A router to the stack daemon's `build` op. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
-| `caos-stack` | Start, inspect, harvest from or stop the tree's caos stack. `start` returns the `caos://` ticket a cloud session reaches it by. One stack per tree, shared with `caos-test`. |
+| `caos-stack` | Start, inspect, harvest from or stop the tree's caos stack. `start` returns the `caos://` ticket and the dev commit a cloud session needs, and with `cloud-env` makes a new cloud environment for them. One stack per tree, shared with `caos-test`. |
 | `caos-test` | Run the whole suite — unit tests and every `tests/<name>` — on the tree's stack, building and starting it if it is not up. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `merge` | Three-way merge another commit into the current source tree. |

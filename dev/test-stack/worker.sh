@@ -205,6 +205,46 @@ op_build() {
   reply /tmp/build.log
 }
 
+# Publish the tree and a client for it as `refs/caos/dev` on THIS stack's own
+# server, once, and print the commit. It is what a cloud session's setup installs
+# from (`--dev-commit=<sha> --server=<ticket>`), so a session against this stack
+# runs the client built from the tree under test.
+#
+# THE CLIENT IS THE STACK'S OWN, from the inputs the stack was built from: they
+# are the TEST world, which is the only world this stack's server accepts. A
+# client from the host build is refused with "caos world mismatch", and a session
+# whose setup installed one stalls in its first hook (design/test-stack-image.md).
+#
+# Over plain HTTP to the local server: no ticket and no git-remote-caos needed
+# from in here. The commit's parent is the workspace's HEAD, as `caosd up`'s is.
+ensure_dev_commit() {
+  if [ -s /tmp/dev.commit ]; then cat /tmp/dev.commit; return 0; fi
+  local inputs idx tree commit
+  inputs=$(cat /tmp/stack.inputs)
+  idx=/tmp/dev-publish.index
+  rm -f "$idx"
+  (
+    cd "$WS"
+    export GIT_INDEX_FILE=$idx
+    git read-tree --empty
+    git add -A
+    blob=$(git hash-object -w "$inputs/bin/caos-cli")
+    git update-index --add --cacheinfo "100755,$blob,dev-bin/caos"
+    blob=$(git hash-object -w "$inputs/bin/git-remote-caos")
+    git update-index --add --cacheinfo "100755,$blob,dev-bin/git-remote-caos"
+    git write-tree
+  ) > /tmp/dev.tree || fail "snapshotting the tree for refs/caos/dev"
+  tree=$(cat /tmp/dev.tree)
+  commit=$(printf 'test stack dev publish: %s\n' "$(arg affinity)" \
+    | git -C "$WS" -c user.name=caos -c user.email=dev@caos commit-tree "$tree" -p HEAD) \
+    || fail "committing refs/caos/dev"
+  git -C "$WS" push -q --force http://127.0.0.1 "$commit:refs/caos/dev" \
+    || fail "publishing refs/caos/dev to the stack"
+  rm -f "$idx"
+  echo "$commit" > /tmp/dev.commit
+  echo "$commit"
+}
+
 op_start() {
   local relay
   relay=$(opt relay)
@@ -215,8 +255,11 @@ op_start() {
   ensure_stack
   local ticket
   ticket=$(ensure_iroh "$relay" "$(opt advertise)")
+  local dev_commit
+  dev_commit=$(ensure_dev_commit)
   {
     echo "ticket=$ticket"
+    echo "dev_commit=$dev_commit"
     echo "phase=ready"
     echo "instance=$(arg affinity)"
     echo "logs=$HOST_LOGS"
@@ -367,6 +410,7 @@ op_status() {
     fi
     # A member that died is the failure worth being loud about, and the log
     # names are the ones `logs` takes.
+    if [ -s /tmp/dev.commit ]; then echo "dev_commit=$(cat /tmp/dev.commit)"; fi
     echo "logs_available=$(ls "$RUN/logs" | tr '\n' ' ')"
   } > /tmp/reply
   reply /tmp/reply

@@ -74,6 +74,17 @@ Where the code differs from, or settles, what the sections below say:
   it would rebuild the image whenever the script changed, and the point of one
   script between the host and the test stack is that editing it needs neither a
   host rebuild nor an image rebuild.
+- **Driving a cloud session at a stack.** `start` publishes the tree and the
+  stack's own TEST-world client as `refs/caos/dev` on the stack (a host-world client
+  is refused by a test server with "caos world mismatch", and the session stalls in
+  its first hook with nothing in the run log: the hook output is only in the raw
+  session events), and replies with `ticket` and `dev_commit`. `caos-stack` is a Go
+  router; with `cloud-env` its second stage tail-calls `drive env-create` for a NEW
+  environment named `z Caos Dev <commit>` rather than editing one, with the setup
+  `--dev-commit=<commit> --server=<ticket>`. That runs in the router and not in the
+  daemon because the environment takes the `claude-oauth-token`, which only `drive`
+  is granted, and the daemon runs the code under test. A test stack holds only a mock
+  secret key, so tools needing real secrets do not work in such a session.
 - **The contract with the host stack.** Everything that runs is in the tree under
   test, so changes to the script, `stack-up`, `serve` and the suite need no host
   rebuild. The one new coupling is residency itself: `caos next`, keyed dispatch

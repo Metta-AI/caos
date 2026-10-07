@@ -1,3 +1,8 @@
-# The router's image, and the daemon it sends messages to (format `<path> <name>`).
-../bash bash
+# What this reaches for (format `<path> <name>`).
+# go          the Go script worker the router runs on
+# test-stack  the daemon it sends messages to
+# drive       how a cloud environment is made. It is reached through its own image
+#             so that the secret granted to it is granted wherever it is called from.
+../go go
 ../../dev/test-stack test-stack
+../../integrations/claude-code/drive drive
