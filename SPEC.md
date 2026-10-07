@@ -734,16 +734,14 @@ Caos can be built and tested on a host with just what's defined in flake.nix wit
 - `result/bin/caosd up`
 - `result/bin/caos-cli run dev/run-tests` (`dev/run-tests` is a caos expr that depends on /tests and runs them all on the current stack. If you run this on the host, you use the host stack. But the world test might fail. The normal usage inside the test container.)
 
-The build and test tools use `dev/devbox --tree=<hash> --command=<command>` to run the build steps in a worker. The goal is isolation from the host stack, with enough caching to make this fast. devbox is a worker that:
-- Mounts a persistent volume at /mounted-nix, copies anything missing in /mounted/nix/store from /nix/store and then mounts /mounted-nix at /nix
-- Mounts the docker socket (to cache images) and a volume for git (single directory on the host is shared for between all test stacks). It uses the host's redis since we want to share the caches between stacks but can't have multiple redis proccesses using the same files
-- Runs `caos get -r <hash>` to fetch the requested tree #todo still working on this
-- Runs the provided command in the container and exists with the exit code of the command
-- Uses --rm to remove the container after it exits
+The build and test tools (`std/caos-build`, `std/caos-test`, `std/caos-stack`) drive `dev/test-stack`, a worker script that builds, tests and runs a stack from a tree. The goal is isolation from the host stack, with enough caching to make this fast. It runs on the `dev/devbox` image, a container with nix, podman and git that:
+- Mounts a persistent volume at /mounted-nix, copies anything missing in /mounted-nix/store from /nix/store and then mounts /mounted-nix at /nix
+- Mounts volumes for git (a single directory on the host, shared between all test stacks) and for the podman image store (to cache images), and runs its own podman for the stack's workers. It uses the host's redis since we want to share the caches between stacks but can't have multiple redis processes using the same files
+- Declares itself resident (`CAOS_RESIDENT=1`), so a worker on it may stay up between jobs
 
 We use one resident test worker per tree, with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
 
-The stack daemon (`dev/test-stack`, on the `dev/devbox` image) is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's conversations to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
+`dev/test-stack` is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's conversations to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
 - `std/caos-build <tree-oid>`: sends `build` (a `nix build` of the tree). Starts no stack and leaves none
 - `std/caos-test <tree-oid>`: sends `run-tests` to the tree's daemon. The first call per tree builds and brings the stack up; later calls, with any `--only` or `--test-salt`, skip both
 - `std/caos-stack <tree-oid> --op=<op> --request-id=<fresh>`: sends one of the other ops. `request-id` must be fresh per call or the answer comes from the cache
