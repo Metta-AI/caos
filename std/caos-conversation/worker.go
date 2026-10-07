@@ -331,25 +331,121 @@ func renderEntries(files []string, width int, only string, o opts) (shown int) {
 		for _, b := range e.Blocks {
 			switch b.Type {
 			case "text":
-				if only == "" {
-					say("%s", b.Text)
+				if only == "" && !quiet {
+					say("%s", cutMsg(b.Text, o.msgWidth, idx))
 				}
 			case "payload":
-				if only == "" {
+				if only == "" && !quiet {
 					if text, err := os.ReadFile(filepath.Join("/cas/tree", b.Path)); err == nil {
-						say("%s", strings.TrimRight(string(text), "\n"))
+						say("%s", cutMsg(string(text), o.msgWidth, idx))
 					} else {
 						say("[payload block: %s]", b.Path)
 					}
 				}
 			case "tool_use":
-				if only == "" || b.ID == only {
+				if (only == "" && (o.only != "failed" || isFailed(b.ID))) || b.ID == only {
 					renderCall(b, width)
 				}
 			}
 		}
 		say("")
 	}
+	return shown
+}
+
+// opts selects which transcript entries print and how message text is cut.
+// from and to are entry numbers, as printed in `[n]`, both inclusive; to < 0
+// means no upper bound.
+type opts struct {
+	width, msgWidth, from, to int
+	only                      string // "", "user", "assistant" or "failed"
+}
+
+func (o opts) wants(idx int, e entry) bool {
+	if idx < o.from || (o.to >= 0 && idx > o.to) {
+		return false
+	}
+	switch o.only {
+	case "user":
+		return e.Role == "user"
+	case "assistant":
+		return e.Role != "user"
+	case "failed":
+		return e.Role == "user" || hasFailed(e)
+	}
+	return true
+}
+
+// cutMsg cuts message text to width characters, 0 meaning no cut.
+func cutMsg(s string, width, idx int) string {
+	r := []rune(s)
+	if width == 0 || len(r) <= width {
+		return s
+	}
+	return fmt.Sprintf("%s… [%d more chars; pass from=%d to=%d msg_width=0 to see all]",
+		string(r[:width]), len(r)-width, idx, idx)
+}
+
+// isFailed is true for a call that did not complete, or that completed with an
+// error result (a tool's own `[is_error]` still has status complete).
+func isFailed(id string) bool {
+	c, ok := calls[id]
+	if !ok {
+		return false
+	}
+	if c.Status != "complete" {
+		return true
+	}
+	if c.Result == nil {
+		return false
+	}
+	ref := c.Result.Observation + c.Result.Error + c.Result.Reason
+	return ref != "" && strings.HasPrefix(resolve(ref), "[is_error]")
+}
+
+func hasFailed(e entry) bool {
+	for _, b := range e.Blocks {
+		if b.Type == "tool_use" && isFailed(b.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// overview reads every entry once for the header: calls per tool, and the
+// numbers of the entries holding a failed call.
+func overview(files []string) (tools, failed string) {
+	counts := map[string]int{}
+	var bad []string
+	for _, f := range files {
+		var e entry
+		if json.Unmarshal(w.Check(os.ReadFile(f)), &e) != nil {
+			continue
+		}
+		ord, _, _ := strings.Cut(filepath.Base(f), "-")
+		n, _ := strconv.Atoi(ord)
+		hit := false
+		for _, b := range e.Blocks {
+			if b.Type != "tool_use" {
+				continue
+			}
+			counts[b.Name]++
+			hit = hit || isFailed(b.ID)
+		}
+		if hit {
+			bad = append(bad, strconv.Itoa(n))
+		}
+	}
+	names := make([]string, 0, len(counts))
+	for n := range counts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = fmt.Sprintf("%s %d", n, counts[n])
+	}
+	return strings.Join(parts, ", "), strings.Join(bad, ", ")
 }
 
 func hasCall(e entry, id string) bool {
