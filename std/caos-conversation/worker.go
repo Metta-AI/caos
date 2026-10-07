@@ -258,7 +258,7 @@ func trunc(s string, width int, id string) string {
 	if width == 0 || len(r) <= width {
 		return s
 	}
-	return fmt.Sprintf("%s… [%d more chars; pass call=%s to see all]", string(r[:width]), len(r)-width, id)
+	return fmt.Sprintf("%s… [%d more chars; pass call-id=%s to see all]", string(r[:width]), len(r)-width, id)
 }
 
 func indent(s string) {
@@ -307,7 +307,7 @@ func renderCall(b block, width int) {
 
 // renderEntries prints the transcript, or with only set, the one entry and
 // call it names.
-func renderEntries(files []string, width int, only string) {
+func renderEntries(files []string, width int, only string, o opts) (shown int) {
 	for _, f := range files {
 		var e entry
 		w.Must(json.Unmarshal(w.Check(os.ReadFile(f)), &e))
@@ -315,6 +315,14 @@ func renderEntries(files []string, width int, only string) {
 			continue
 		}
 		ord, _, _ := strings.Cut(filepath.Base(f), "-")
+		idx := int(w.Check(strconv.ParseUint(ord, 10, 64)))
+		if only == "" && !o.wants(idx, e) {
+			continue
+		}
+		shown++
+		// With only=failed the assistant's closing text is left out too: the
+		// failing calls are what was asked for.
+		quiet := o.only == "failed" && e.Role != "user"
 		round := ""
 		if e.Round != nil {
 			round = fmt.Sprintf(" (round %d)", *e.Round)
@@ -323,25 +331,121 @@ func renderEntries(files []string, width int, only string) {
 		for _, b := range e.Blocks {
 			switch b.Type {
 			case "text":
-				if only == "" {
-					say("%s", b.Text)
+				if only == "" && !quiet {
+					say("%s", cutMsg(b.Text, o.msgWidth, idx))
 				}
 			case "payload":
-				if only == "" {
+				if only == "" && !quiet {
 					if text, err := os.ReadFile(filepath.Join("/cas/tree", b.Path)); err == nil {
-						say("%s", strings.TrimRight(string(text), "\n"))
+						say("%s", cutMsg(string(text), o.msgWidth, idx))
 					} else {
 						say("[payload block: %s]", b.Path)
 					}
 				}
 			case "tool_use":
-				if only == "" || b.ID == only {
+				if (only == "" && (o.only != "failed" || isFailed(b.ID))) || b.ID == only {
 					renderCall(b, width)
 				}
 			}
 		}
 		say("")
 	}
+	return shown
+}
+
+// opts selects which transcript entries print and how message text is cut.
+// from and to are entry numbers, as printed in `[n]`, both inclusive; to < 0
+// means no upper bound.
+type opts struct {
+	width, msgWidth, from, to int
+	only                      string // "", "user", "assistant" or "failed"
+}
+
+func (o opts) wants(idx int, e entry) bool {
+	if idx < o.from || (o.to >= 0 && idx > o.to) {
+		return false
+	}
+	switch o.only {
+	case "user":
+		return e.Role == "user"
+	case "assistant":
+		return e.Role != "user"
+	case "failed":
+		return e.Role == "user" || hasFailed(e)
+	}
+	return true
+}
+
+// cutMsg cuts message text to width characters, 0 meaning no cut.
+func cutMsg(s string, width, idx int) string {
+	r := []rune(s)
+	if width == 0 || len(r) <= width {
+		return s
+	}
+	return fmt.Sprintf("%s… [%d more chars; pass from=%d to=%d msg-width=0 to see all]",
+		string(r[:width]), len(r)-width, idx, idx)
+}
+
+// isFailed is true for a call that did not complete, or that completed with an
+// error result (a tool's own `[is_error]` still has status complete).
+func isFailed(id string) bool {
+	c, ok := calls[id]
+	if !ok {
+		return false
+	}
+	if c.Status != "complete" {
+		return true
+	}
+	if c.Result == nil {
+		return false
+	}
+	ref := c.Result.Observation + c.Result.Error + c.Result.Reason
+	return ref != "" && strings.HasPrefix(resolve(ref), "[is_error]")
+}
+
+func hasFailed(e entry) bool {
+	for _, b := range e.Blocks {
+		if b.Type == "tool_use" && isFailed(b.ID) {
+			return true
+		}
+	}
+	return false
+}
+
+// overview reads every entry once for the header: calls per tool, and the
+// numbers of the entries holding a failed call.
+func overview(files []string) (tools, failed string) {
+	counts := map[string]int{}
+	var bad []string
+	for _, f := range files {
+		var e entry
+		if json.Unmarshal(w.Check(os.ReadFile(f)), &e) != nil {
+			continue
+		}
+		ord, _, _ := strings.Cut(filepath.Base(f), "-")
+		n, _ := strconv.Atoi(ord)
+		hit := false
+		for _, b := range e.Blocks {
+			if b.Type != "tool_use" {
+				continue
+			}
+			counts[b.Name]++
+			hit = hit || isFailed(b.ID)
+		}
+		if hit {
+			bad = append(bad, strconv.Itoa(n))
+		}
+	}
+	names := make([]string, 0, len(counts))
+	for n := range counts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = fmt.Sprintf("%s %d", n, counts[n])
+	}
+	return strings.Join(parts, ", "), strings.Join(bad, ", ")
 }
 
 func hasCall(e entry, id string) bool {
@@ -381,10 +485,28 @@ func read() {
 		say("not a hash: %s\n\nPass the 40-character hash of the commit at the tip of a conversation.", hash)
 		return
 	}
-	want := optArg("call", "")
+	// Not `call`: that name is reserved (llm-step's RESERVED_ARGS), so a
+	// `@param call` is dropped at parse time and the tool never accepts it.
+	want := optArg("call-id", "")
 	width, err := strconv.Atoi(optArg("width", "300"))
 	if err != nil || width < 0 {
 		width = 300
+	}
+	o := opts{width: width, to: -1, only: optArg("only", "")}
+	if o.msgWidth, err = strconv.Atoi(optArg("msg-width", "0")); err != nil || o.msgWidth < 0 {
+		o.msgWidth = 0
+	}
+	if o.from, err = strconv.Atoi(optArg("from", "0")); err != nil || o.from < 0 {
+		o.from = 0
+	}
+	if t, err := strconv.Atoi(optArg("to", "-1")); err == nil && t >= 0 {
+		o.to = t
+	}
+	switch o.only {
+	case "", "user", "assistant", "failed":
+	default:
+		say("only=%q is not one of user, assistant, failed.", o.only)
+		return
 	}
 
 	tree, n, perCommit, answer := walk(hash)
@@ -407,7 +529,7 @@ func read() {
 
 	if want != "" {
 		if _, ok := calls[want]; ok {
-			renderEntries(files, 0, want)
+			renderEntries(files, 0, want, opts{})
 			return
 		}
 		say("no call %s in this conversation.\n\nCalls it recorded (ids as the default listing prints them):", want)
@@ -429,6 +551,13 @@ func read() {
 	}
 	say("tip %s (%d commits walked, %d transcript entries)", hash, n, len(files))
 	say("calls: %s", callSummary())
+	tools, failed := overview(files)
+	if tools != "" {
+		say("by tool: %s", tools)
+	}
+	if failed != "" {
+		say("entries with a failed call: %s", failed)
+	}
 	say("")
 	say("NOT RECORDED: the model's text and reasoning between tool calls, calls to tools")
 	say("that are not caos's (and calls that never reached one), and timings. Gaps in the")
@@ -442,7 +571,11 @@ func read() {
 		say("")
 	}
 	say("----")
-	renderEntries(files, width, "")
+	shown := renderEntries(files, width, "", o)
+	if o.from > 0 || o.to >= 0 || o.only != "" {
+		say("(showed %d of %d entries; from=%d to=%d only=%q)", shown, len(files), o.from, o.to, o.only)
+		say("")
+	}
 
 	var bad []string
 	for _, id := range reqOrder {

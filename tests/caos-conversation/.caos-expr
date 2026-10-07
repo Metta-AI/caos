@@ -1,0 +1,7 @@
+# tests/caos-conversation, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A CLIENT TEST — it records a conversation with `caos mcp hook`, as Claude Code
+# does, then reads it back through std/caos-conversation's image to pin how a
+# long conversation is paged and cut: from/to, only, msg-width, and the header.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
