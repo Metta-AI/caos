@@ -2037,8 +2037,9 @@ mod tests {
             "input": {"file-path": "a", "old_string": "x", "new-string": "y"}});
         let (block, new_ws) = execute(&call, "ws").unwrap();
         assert!(new_ws.is_none());
-        let text = block["content"].to_string();
-        assert!(text.contains("edit takes no \\\"old_string\\\" argument"), "{text}");
+        assert_eq!(block["is_error"], json!(true));
+        let text = block["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("edit takes no \"old_string\" argument"), "{text}");
         assert!(text.contains("declared: file-path, old-string, new-string, replace-all"), "{text}");
         // Plumbing the hook adds is not the model's mistake.
         let plumbing = json!({"name": "read",
