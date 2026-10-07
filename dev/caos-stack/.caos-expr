@@ -29,7 +29,7 @@ suite on the same stack.
 @param [secret-readers] For `start` with `cloud-env`: a secret reader key to put in the setup, to be granted what that key is granted on THIS stack (a test stack holds only a mock key).
 @param [log] For `logs`: which member's log: serve, server, runnerd, publish or iroh. Default serve.
 @param [cursor] For `logs`: the byte offset to read from — the `cursor=` line of the previous reply. Default 0.
-@param [refs] For `harvest`: ref patterns, one per line, to copy from the stack's git to this server under refs/stacks/<tree>/. Default: the stack's conversations.
+@param [harvest-refs] For `harvest`: ref patterns, one per line, to copy from the stack's git to this server under refs/stacks/<tree>/. Default: the stack's conversations.
 @in
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --daemon:@=DEEP-DEPS/test-stack --drive:@=DEEP-DEPS/drive --help=$HELP
