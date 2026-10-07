@@ -2030,6 +2030,25 @@ mod tests {
     }
 
     #[test]
+    fn a_file_tool_refuses_an_argument_it_does_not_declare() {
+        // `old_string` for `old-string` used to reach `edit`, which said
+        // "needs a non-empty `old-string`" about a value the model had sent.
+        let call = json!({"id": "t", "name": "edit",
+            "input": {"file-path": "a", "old_string": "x", "new-string": "y"}});
+        let (block, new_ws) = execute(&call, "ws").unwrap();
+        assert!(new_ws.is_none());
+        let text = block["content"].to_string();
+        assert!(text.contains("edit takes no \\\"old_string\\\" argument"), "{text}");
+        assert!(text.contains("declared: file-path, old-string, new-string, replace-all"), "{text}");
+        // Plumbing the hook adds is not the model's mistake.
+        let plumbing = json!({"name": "read",
+            "input": {"file-path": "a", "caos_session": "s", "source_tree": "main"}});
+        assert!(unknown_argument(&plumbing, "read").is_none());
+        // A tool that is not a file tool is not this check's business.
+        assert!(unknown_argument(&json!({"input": {"x": 1}}), "import_source").is_none());
+    }
+
+    #[test]
     fn remove_refuses_the_protocol_directory_and_bad_paths() {
         let call = |p: &str| json!({"input": {"file-path": p}});
         for p in [".caos", ".caos/x", "/.caos/conflicts"] {
