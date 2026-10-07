@@ -511,7 +511,14 @@ stack_ref_summary() {
       | cut -d/ -f1-3 | sort | uniq -c | sort -rn; } || true
 }
 
-DEFAULT_HARVEST='refs/caos/v3/conversations/*'
+# `*/head`, not a bare `*`. `git for-each-ref` matches its patterns with
+# path semantics, where `*` stops at a `/`, and a conversation ref is
+# refs/caos/v3/conversations/<hex>/head: two components below `conversations/`.
+# The old default, `refs/caos/v3/conversations/*`, therefore matched nothing in a
+# repo full of conversations, and `harvest` answered `harvested=0` every time
+# (the push refspec's `*` does cross slashes, but the listing guard in
+# harvest() never let a push run).
+DEFAULT_HARVEST='refs/caos/v3/conversations/*/head'
 
 op_harvest() {
   if not_running; then return 0; fi
