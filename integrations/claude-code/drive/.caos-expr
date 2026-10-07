@@ -50,7 +50,8 @@ repo and prompt and returns a session id; `send` takes session and prompt;
 `list` takes nothing and returns recent sessions with their status and
 environment; `info` takes session and returns its environment, its source and
 its provisioning trace, read from outside the container; `conv` takes session
-and locates the caos conversation it records into; `archive` takes session and
+and locates the caos conversation it records into, on the server its environment's
+setup line names; `archive` takes session and
 ends it, freeing its container; `probe` asks a session to dump what it can see
 of its own container, into its transcript rather than into this result, and
 takes either a session or an env and repo to start a fresh one. Environments
