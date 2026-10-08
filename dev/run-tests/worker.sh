@@ -171,7 +171,15 @@ fanout)
   # containers later as the summariser's `/cas/args/children/*: No such file or
   # directory`, a message about neither `--only` nor the names it was given.
   if [ -z "$(ls -A /tmp/sel)" ]; then
-    fail "--only matched no tests:$only(the list is SPACE-separated)"
+    # The two usual causes, named: a `tests/` prefix (the names are the
+    # directories under tests/, so `tests/hello` matches nothing) and a separator
+    # other than a space. List what is there so the retry needs no `ls`.
+    hint=""
+    case "$only" in
+      *" tests/"*) hint=" Names have NO tests/ prefix (only=\"hello\", not \"tests/hello\")." ;;
+    esac
+    avail=$(for d in /cas/args/ws/tests/*/; do basename "$d"; done | tr '\n' ' ')
+    fail "--only matched no tests:$only(the list is SPACE-separated).$hint Available: $avail"
   fi
   caos put /tmp/sel /cas/sel
 

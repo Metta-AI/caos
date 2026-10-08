@@ -26,7 +26,12 @@ functions, cached by redis
       ```
       value=<token>
       reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/llm-step
+      reader:@@=git+caos://local?ref=refs/caos/dev&dir=std/github
       ```
+      The first reader lets `import_source` and `publish_source` use the token;
+      the second lets `caos-std/github` use it. With only the first, those work
+      and `caos-std/github` answers `401` ("No github-token secret is granted to
+      std/github").
   - If you have a softmax token, do the same as above but:
     - Name the file `softmax-token`
     - Set the reader to `reader:@@=git+https://github.com/Metta-AI/caos-softmax?ref=refs/heads/main&dir=tools/gota`

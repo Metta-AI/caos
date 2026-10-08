@@ -1123,11 +1123,51 @@ impl Fail {
     }
 }
 
+/// Arguments the hook or an older client may add to any call; they are plumbing,
+/// not the model's, so they are never a mistake to refuse.
+const PLUMBING_ARGS: &[&str] = &[
+    "source_tree",
+    "caos_session",
+    "caos_prompt_id",
+    "caos_tool_use_id",
+];
+
+/// The refusal for a call to a file tool that carries an argument the tool does
+/// not declare, in the words `run_tool` uses for a repository tool. Without it a
+/// misspelled optional argument (`replace_all`) is silently ignored, and a
+/// misspelled required one (`old_string`) is reported as MISSING, which sends
+/// the model hunting for a value it already gave.
+fn unknown_argument(call: &Value, name: &str) -> Option<String> {
+    let help = match name {
+        "read" => READ_HELP,
+        "ls" => LS_HELP,
+        "write" => WRITE_HELP,
+        "edit" => EDIT_HELP,
+        "copy" => COPY_HELP,
+        "move" => MOVE_HELP,
+        "remove" => REMOVE_HELP,
+        _ => return None,
+    };
+    let tool = builtin_tool(name, help);
+    let declared: Vec<&str> = tool.args.iter().map(|a| a.name.as_str()).collect();
+    let input = call["input"].as_object()?;
+    let key = input
+        .keys()
+        .find(|k| !declared.contains(&k.as_str()) && !PLUMBING_ARGS.contains(&k.as_str()))?;
+    Some(format!(
+        "{name} takes no {key:?} argument (declared: {})",
+        declared.join(", ")
+    ))
+}
+
 /// Execute one inline call against the source tree at CAS path `ws`. Returns the
 /// tool_result block and, for a mutation, the new source tree CAS path.
 pub fn execute(call: &Value, ws: &str) -> Result<(Value, Option<String>), String> {
     let id = call["id"].as_str().unwrap_or("");
     let name = call["name"].as_str().unwrap_or("");
+    if let Some(refusal) = unknown_argument(call, name) {
+        return Ok((result_block(id, &refusal, true), None));
+    }
     let outcome = match name {
         "read" => read(call, ws).map(|text| (text, None)),
         "ls" => ls(call, ws).map(|text| (text, None)),
@@ -1207,10 +1247,12 @@ fn resolve(root: Option<&str>, ws: &str, comps: &[String]) -> Result<PathBuf, Fa
 fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
     if !rooted && stderr.contains("no such path") {
         format!(
-            "{relative} is not in the conversation tree. If an expression produces it \
-             (a mount such as caos-std/ exists only in the evaluated tree), call \
-             eval_path with that path or a parent of it, then pass the hash it prints \
-             as `root` with the rest of the path."
+            "{relative} is not in the conversation tree. Check the path first: `ls` its \
+             parent, and note an import lives where `import_source` put it (e.g. \
+             imports/<repo>/<revision>). Only if an expression produces it (a mount \
+             such as caos-std/ exists only in the evaluated tree) call eval_path with \
+             that path or a parent of it, then pass the hash it prints as `root` with \
+             the rest of the path."
         )
     } else {
         let reason = stderr.strip_prefix("caos: ").unwrap_or(stderr);
@@ -1985,6 +2027,26 @@ mod tests {
         assert!(refused(move_entry(&call("main/a", ".."), "ws")).contains(".."));
         assert!(refused(copy(&call("main/../a", "main/b"), "ws")).contains(".."));
         assert!(refused(copy(&call("", "main/b"), "ws")).contains("names no path"));
+    }
+
+    #[test]
+    fn a_file_tool_refuses_an_argument_it_does_not_declare() {
+        // `old_string` for `old-string` used to reach `edit`, which said
+        // "needs a non-empty `old-string`" about a value the model had sent.
+        let call = json!({"id": "t", "name": "edit",
+            "input": {"file-path": "a", "old_string": "x", "new-string": "y"}});
+        let (block, new_ws) = execute(&call, "ws").unwrap();
+        assert!(new_ws.is_none());
+        assert_eq!(block["is_error"], json!(true));
+        let text = block["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("edit takes no \"old_string\" argument"), "{text}");
+        assert!(text.contains("declared: file-path, old-string, new-string, replace-all"), "{text}");
+        // Plumbing the hook adds is not the model's mistake.
+        let plumbing = json!({"name": "read",
+            "input": {"file-path": "a", "caos_session": "s", "source_tree": "main"}});
+        assert!(unknown_argument(&plumbing, "read").is_none());
+        // A tool that is not a file tool is not this check's business.
+        assert!(unknown_argument(&json!({"input": {"x": 1}}), "import_source").is_none());
     }
 
     #[test]
