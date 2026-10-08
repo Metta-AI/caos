@@ -166,7 +166,7 @@ layer, then merge this layer's old tip in with `merge-base` set to the old tip
 of the previous layer.
 
 ```text
-remove sources/repo/01-feature; copy sources/repo/base -> sources/repo/01-feature
+remove sources/repo/01-feature; copy sources/repo/00-base -> sources/repo/01-feature
 merge(source_tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
 remove sources/repo/02-tests;   copy sources/repo/01-feature -> sources/repo/02-tests
 merge(source_tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
