@@ -203,7 +203,7 @@ Write a plan file, one `key=value` per line. `onto` and `into` come once,
 before the first `layer=`:
 
 ```text
-onto=sources/repo/base
+onto=sources/repo/00-base
 into=publish/repo
 layer=01-feature
 commit=sources/repo/01-feature
