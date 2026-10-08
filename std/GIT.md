@@ -212,8 +212,8 @@ tool sits in).
 ```text
 publish_source(source_tree="publish/mystack/01-feature",
                repository="https://github.com/<owner>/<repo>.git",
-               branch="mystack-01-feature", force="true")
-publish_source(source_tree="publish/mystack/02-tests", ..., branch="mystack-02-tests", force="true")
+               branch="mystack-01-feature", force=true)
+publish_source(source_tree="publish/mystack/02-tests", ..., branch="mystack-02-tests", force=true)
 ```
 
 - A squashed commit does not descend from the one it replaces, so updating a
