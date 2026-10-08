@@ -147,15 +147,15 @@ sources/repo/02-tests    -> B2  parents B, A2
 
 ### Updating the base
 
-Import the new upstream tip at a fresh path, put it at `base`, and merge it
+Import the new upstream tip at a fresh path, put it at `00-base`, and merge it
 into the first layer, then each layer into the one after it:
 
 ```text
-import_source(source=..., revision="main", into="sources/repo/base-2")
-remove(file-path="sources/repo/base")
-move(from="sources/repo/base-2", to="sources/repo/base")
+import_source(source=..., revision="main", into="sources/repo/00-base-2")
+remove(file-path="sources/repo/00-base")
+move(from="sources/repo/00-base-2", to="sources/repo/00-base")
 merge(source_tree="sources/repo/01-feature",
-      theirs="<full hash of sources/repo/base>")
+      theirs="<full hash of sources/repo/00-base>")
 merge(source_tree="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 ```
