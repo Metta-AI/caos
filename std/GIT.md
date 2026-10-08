@@ -46,7 +46,7 @@ sources/<repo>/
   99-dirty          scratch layer: the changes you would not have committed yet
 ```
 
-- **`base`** is imported, never edited. It is the record of where you started
+- **`00-base`** is imported, never edited. It is the record of where you started
   and what later diffs and merges are measured against. It is not a layer: it
   is what the first layer builds on (`onto` in a squash plan).
 - **`NN-<name>`** are the layers, in order. The order comes from the names, and
