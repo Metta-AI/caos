@@ -94,7 +94,7 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
 A stack is an ordered sequence of layers that share git ancestry, so a change
 can be reviewed as several small PRs, each built on the one before it. In caos
 a stack is the `sources/<repo>/` folder: **sibling gitlinks**, one per layer,
-beside `base`.
+beside `00-base`.
 
 ```text
 sources/repo/base         -> H
