@@ -176,7 +176,7 @@ merge(source_tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
 
 - **Combine two layers:** `remove` the earlier one. The later one already
   contains it.
-- **Drop a layer's contents:** replace `01-feature`'s files with `base`'s,
+- **Drop a layer's contents:** replace `01-feature`'s files with `00-base`'s,
   merge it into `02-tests` (the merge base is `A`, so the removal carries
   forward), then `remove` the `01-feature` gitlink. Do not renumber
   `02-tests`; gaps are fine.
