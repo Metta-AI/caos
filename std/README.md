@@ -27,6 +27,13 @@ A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says
 what each one does about that.
 
+### Git advice: [GIT.md](GIT.md)
+
+For anything involving git or GitHub — importing a repo, merging, stacks,
+squashing, `publish_source`, opening and linking PRs with `github` — read
+[`GIT.md`](GIT.md) first. Like this file, it is reached with `eval_path(path="caos-std")`
+and then `read(root=<hash>, file-path="GIT.md")`.
+
 ### Before you reach for the shell
 
 Most of what a shell is used for here is already a tool, and none of these
