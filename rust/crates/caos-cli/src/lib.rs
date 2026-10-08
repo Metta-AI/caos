@@ -7,6 +7,7 @@ pub mod filesystem;
 pub mod host_git;
 pub mod secret_store;
 pub mod source_trees;
+pub mod writers;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
@@ -286,7 +287,9 @@ fn signature(username: &str) -> Result<Signature, String> {
 }
 
 fn open_store(t: &GitTransport) -> Result<GitStore, String> {
-    GitStore::open(t.work_dir(), Some(CAOS_REMOTE))
+    let mut store = GitStore::open(t.work_dir(), Some(CAOS_REMOTE))?;
+    writers::sign_pushes(&mut store)?;
+    Ok(store)
 }
 
 /// The conversation's head as the server holds it, with its objects local.
@@ -2886,6 +2889,8 @@ mod tests {
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, &["init", "--quiet", "--bare"]);
         no_background_maintenance(&remote);
+        // A caos server accepts the push option carrying a ref write's proof.
+        git(&remote, &["config", "receive.advertisePushOptions", "true"]);
         std::fs::create_dir_all(&origin).unwrap();
         git(&origin, &["init", "--quiet", "--bare"]);
         no_background_maintenance(&origin);
