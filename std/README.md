@@ -31,8 +31,7 @@ what each one does about that.
 
 For anything involving git or GitHub — importing a repo, merging, stacks,
 squashing, `publish_source`, opening and linking PRs with `github` — read
-[`GIT.md`](GIT.md) first. Like this file, it is reached with `eval_path(path="caos-std")`
-and then `read(root=<hash>, file-path="GIT.md")`.
+[`GIT.md`](GIT.md) first.
 
 ### Before you reach for the shell
 
