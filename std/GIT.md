@@ -61,7 +61,9 @@ sources/<repo>/
   those.
 
 Importing writes the snapshot's provenance next to it as
-`sources/<repo>/00-base.source.json`. That file is not a layer.
+`sources/<repo>/00-base.source.json`. That file is not a layer. `move` renames
+the gitlink but leaves its provenance file behind under the old name, so move
+the pair together.
 
 ## One change, one layer
 
