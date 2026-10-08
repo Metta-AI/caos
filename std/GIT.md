@@ -84,8 +84,8 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
   observes the remote again, so importing the same branch at a fresh path gives
   you its new tip. Public repositories need no token.
 - The destination path and its `.source.json` sibling must both be unused.
-  To import a newer tip while `base` exists, import it at a fresh path such as
-  `sources/<repo>/base-2` (see "Updating the base").
+  To import a newer tip while `00-base` exists, import it at a fresh path such
+  as `sources/<repo>/00-base-2` (see "Updating the base").
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
 
