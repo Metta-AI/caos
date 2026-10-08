@@ -40,7 +40,7 @@ separate `imports/` directory.
 
 ```text
 sources/<repo>/
-  base              the upstream tip you build on, exactly as imported
+  00-base           the upstream tip you build on, exactly as imported
   01-<layer1>       the first layer of work
   02-<layer2>       the next layer, built on the one before it
   99-dirty          scratch layer: the changes you would not have committed yet
