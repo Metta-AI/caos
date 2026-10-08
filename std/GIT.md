@@ -4,10 +4,6 @@ Everything an agent needs to get code in from GitHub, change it, and get it
 back out as a branch or a stack of PRs. The design rationale lives in
 `design/` (linked at the end); this file is the working guide.
 
-Read it from a session with `eval_path(path="caos-std")` and then
-`read(root=<hash>, file-path="GIT.md")`. `caos-std/` exists only in the
-evaluated tree, so `read` and `ls` cannot see it by plain path.
-
 ## The model in one paragraph
 
 Code is never checked out. A **source tree** is a gitlink in the conversation
