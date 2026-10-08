@@ -97,7 +97,7 @@ a stack is the `sources/<repo>/` folder: **sibling gitlinks**, one per layer,
 beside `00-base`.
 
 ```text
-sources/repo/base         -> H
+sources/repo/00-base      -> H
 sources/repo/01-feature   -> A   parent H
 sources/repo/02-tests     -> B   parent A
 ```
