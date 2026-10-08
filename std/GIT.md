@@ -181,7 +181,7 @@ merge(source_tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
   forward), then `remove` the `01-feature` gitlink. Do not renumber
   `02-tests`; gaps are fine.
 - **Split a layer in two:** `move` `02-tests` to `03-tests` and `01-feature`
-  to `02-y`, `copy` `base` to `01-x`, re-make X in `01-x`, then merge `01-x`
+  to `02-y`, `copy` `00-base` to `01-x`, re-make X in `01-x`, then merge `01-x`
   into `02-y` and `02-y` into `03-tests`.
 
 ### Harvesting from subagents
