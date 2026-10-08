@@ -55,10 +55,10 @@ sources/<repo>/
   history grow. When the work in it is a finished chunk, `move` it to the next
   layer name (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
   then `copy` that layer to a fresh `99-dirty` to carry on.
-- **Make a new layer only where you would normally make a new commit-worthy
-  layer of a stack**: per big chunk of work, a unit a reviewer would want as its
-  own PR. Not per commit and not per edit; the history inside a layer already
-  records those.
+- **Make a new layer only where you would normally start a new layer of a
+  stack**: per big chunk of work, a unit a reviewer would want as its own PR.
+  Not per commit and not per edit; the history inside a layer already records
+  those.
 
 Importing writes the snapshot's provenance next to it as
 `sources/<repo>/base.source.json`. That file is not a layer.
