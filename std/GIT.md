@@ -61,7 +61,7 @@ sources/<repo>/
   those.
 
 Importing writes the snapshot's provenance next to it as
-`sources/<repo>/base.source.json`. That file is not a layer.
+`sources/<repo>/00-base.source.json`. That file is not a layer.
 
 ## One change, one layer
 
