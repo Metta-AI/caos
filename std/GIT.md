@@ -110,7 +110,7 @@ sources/repo/02-tests     -> B   parent A
 
 Every operation on a stack is made of three things: editing a layer, merging an
 earlier layer into a later one, and `copy` / `move` / `remove` on the gitlinks.
-The examples below use the stack above.
+The examples that follow use the stack shown just before them.
 
 ### Merging
 
