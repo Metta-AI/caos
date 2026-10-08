@@ -67,8 +67,8 @@ Importing writes the snapshot's provenance next to it as
 
 ```text
 import_source(source="https://github.com/<owner>/<repo>.git",
-              revision="main", into="sources/<repo>/base")
-copy(from="sources/<repo>/base", to="sources/<repo>/99-dirty")
+              revision="main", into="sources/<repo>/00-base")
+copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
 ... edit sources/<repo>/99-dirty ...
 move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
 publish_source(source_tree="sources/<repo>/01-<name>",
