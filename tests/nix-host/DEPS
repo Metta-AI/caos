@@ -1,0 +1,16 @@
+# What this test reaches for (format `<path> <name>`). Deepening mounts these
+# side by side under DEEP-DEPS, so `flake.nix` sits beside `prod/`, `rust/`,
+# `std/` and `stack/` exactly as they do in the repo — which is what lets the
+# worker take that directory as a FLAKE ROOT and evaluate it.
+#
+# dev/test-stack, not std/bash: this test needs nix AND the host's store. The
+# store arrives as a volume grant (CAOS_GRANT_VOLUMES=/mounted-nix), and a
+# grant is read from the image's own config, so only an image that declares it
+# can have it. std/caos-build depends on test-stack for the same reason.
+../../dev/test-stack test-stack
+../../flake.nix flake.nix
+../../flake.lock flake.lock
+../../prod prod
+../../rust rust
+../../std std
+../../stack stack
