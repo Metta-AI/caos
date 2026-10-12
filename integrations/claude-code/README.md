@@ -18,5 +18,15 @@ cloud/    configure a claude.ai/code cloud environment
             session.go        the SessionStart hook: warm the tool registry
 ```
 
+The deny list also bans the GitHub MCP server's tools (`mcp__github__*`) that
+caos covers with `import_source`, `publish_source` and `caos-std/github` (see
+[`std/GIT.md`](../../std/GIT.md)). Six stay available, because `caos-std/github`
+cannot do what they do or is not shown to: `get_job_logs` (GitHub serves CI logs
+through a redirect `caos-std/github` does not follow), `run_secret_scanning`, and
+the four Copilot tools (`assign_copilot_to_issue`,
+`create_pull_request_with_copilot`, `request_copilot_review`,
+`get_copilot_job_status`). A tool added to the GitHub MCP server later is not
+banned until it is listed.
+
 The rust side — `caos mcp` — is compiled into the client (`rust/crates/caos-cli/`,
 see its `MCP.md`); only this host-side glue lives here.
