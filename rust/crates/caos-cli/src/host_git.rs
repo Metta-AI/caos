@@ -108,6 +108,30 @@ fn capture_required_bytes(program: &str, args: &[&str], cwd: &Path) -> Result<Ve
     require_success(program, command_output(program, args, cwd)?)
 }
 
+/// Like [`capture_required`], but with extra environment variables set on the
+/// child -- for a throwaway index operation (`GIT_INDEX_FILE`), or a commit
+/// that needs an identity git itself doesn't have (`GIT_AUTHOR_*`/
+/// `GIT_COMMITTER_*`, when the ambient one is unset or wrong for the commit
+/// being minted). Used by `session_base::repoint_to_dev`'s throwaway-index
+/// plumbing, the same shape `integrations/claude-code/cloud/bootstrap.go`'s
+/// `seedCommit` uses in Go.
+pub fn capture_required_env(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(cwd);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .map_err(|error| format!("running {program}: {error}"))?;
+    require_success(program, output).map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
 fn command_output(program: &str, args: &[&str], cwd: &Path) -> Result<Output, String> {
     Command::new(program)
         .args(args)

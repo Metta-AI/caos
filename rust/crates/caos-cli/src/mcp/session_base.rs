@@ -49,9 +49,9 @@
 //! own small reader rather than `parse_git_ref`, which refuses anything
 //! carrying a mutable `ref=` by design (`git-locator`'s whole point).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use caos::GitTransport;
+use caos::{GitTransport, Transport};
 
 use crate::host_git;
 
@@ -159,7 +159,8 @@ pub(super) fn resolve_default_base(t: &GitTransport, prompt: &str) -> Result<Str
     let locator = start_from
         .or_else(|| std::env::var(BASE_ENV).ok())
         .unwrap_or_else(|| DEFAULT_SESSION_BASE.to_string());
-    fetch_commit(t, &locator)
+    let fetched = fetch_commit(t, &locator)?;
+    repoint_to_dev(t, &fetched)
 }
 
 /// Fetch `locator`'s commit directly into `t`'s checkout and return its sha.
@@ -222,6 +223,245 @@ fn query_value(locator: &str, key: &str) -> Option<String> {
     })
 }
 
+/// The current tip of `server`'s own `refs/caos/dev`, if it has one -- the
+/// SAME probe `scripts/caos-mcp-launch` and the Hermes `caos-hooks` plugin
+/// use for `--llm-step`, kept in sync by hand across the three. `caosd up`
+/// publishes the live, uncommitted working tree there and seeds the core
+/// against that exact same tree (AGENTS.md's seeded-core notes), so it is
+/// the one locator that always matches what a dev/test stack actually
+/// answers for.
+///
+/// `None`, never an error, for an unreachable server or one with no such
+/// ref -- a real production deploy with nothing published there, the common
+/// case `repoint_to_dev` must fall through on rather than break. Bounded
+/// (`timeout`): a dead address does not refuse a connection, it hangs out a
+/// TCP retransmit (AGENTS.md, "Caches and defaults").
+fn probe_dev_sha(server: &str) -> Option<String> {
+    let output = std::process::Command::new("timeout")
+        .args(["10", "git", "ls-remote", server, "refs/caos/dev"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Repoint every `:@@=<scheme>?rev=<hex>&dir=<path>` locator found in a
+/// `.caos-expr`'s text at `server`/`dev_sha`, keeping each locator's own
+/// `dir=` unchanged. Mirrors `integrations/claude-code/cloud/bootstrap.go`'s
+/// `seedCommit`, whose Go regex is
+/// `:@@=[^ ?]*\?rev=[0-9a-f]*&dir=([^ ]*)` -- reimplemented here as plain
+/// string scanning rather than pulling in a `regex` dependency this crate
+/// has none of (anchoring one into std/cargo's offline vendored registry for
+/// one callsite is not worth it; AGENTS.md, "Before committing").
+///
+/// `None`, not an error, when the text carries no such locator at all --
+/// NOTHING TO REWRITE is a normal outcome (a session-base repo that doesn't
+/// mount caos this way), distinct from a malformed one.
+fn rewrite_locators(expr: &str, server: &str, dev_sha: &str) -> Option<String> {
+    const NEEDLE: &str = ":@@=";
+    let mut out = String::with_capacity(expr.len());
+    let mut rest = expr;
+    let mut rewrote = false;
+    while let Some(at) = rest.find(NEEDLE) {
+        let locator_start = at + NEEDLE.len();
+        out.push_str(&rest[..locator_start]);
+        // `.caos-expr` is a space-separated argument list (design/caos-expr.md),
+        // so a locator token never contains whitespace -- it ends at the next
+        // one, or at end of text for a locator on the file's last line.
+        let token_len = rest[locator_start..]
+            .find(char::is_whitespace)
+            .unwrap_or(rest.len() - locator_start);
+        let token = &rest[locator_start..locator_start + token_len];
+        match token
+            .split_once("?rev=")
+            .and_then(|(_, q)| q.split_once("&dir="))
+        {
+            // Shaped like the thing we rewrite: swap scheme+rev, keep dir.
+            Some((_, dir)) => {
+                out.push_str(&format!("git+{server}?rev={dev_sha}&dir={dir}"));
+                rewrote = true;
+            }
+            // A `path:`/`hash:` locator, or a `?rev=`/`&dir=` ordered some
+            // other way -- left exactly as committed, same as the Go regex
+            // simply not matching it.
+            None => out.push_str(token),
+        }
+        rest = &rest[locator_start + token_len..];
+    }
+    out.push_str(rest);
+    rewrote.then_some(out)
+}
+
+/// Repoint `flake.lock`'s `"caos"` input node at `server`/`dev_sha`,
+/// mirroring `bootstrap.go`'s equivalent: `{type: git, url: server, rev:
+/// dev_sha}`, replacing the `github`-locked original (`narHash`/
+/// `lastModified` don't apply to a `git+` fetch pinned by an explicit rev,
+/// same as `bootstrap.go` drops them).
+///
+/// `Ok(None)` -- not an error -- when the lock has no `"caos"` input at all:
+/// nothing to rewrite, e.g. a session-base repo that doesn't declare one.
+/// Only a genuinely MALFORMED flake.lock (unparseable JSON) is an error: a
+/// tree carrying a `.caos-expr` locator worth rewriting but a lock the
+/// flake-input-loader can't even read would otherwise seed a session the
+/// loader refuses outright anyway, which is a worse failure to discover
+/// than refusing to seed it here first.
+fn rewrite_flake_lock(
+    lock_text: &str,
+    server: &str,
+    dev_sha: &str,
+) -> Result<Option<String>, String> {
+    let mut lock: serde_json::Value =
+        serde_json::from_str(lock_text).map_err(|error| format!("parsing as JSON: {error}"))?;
+    let root_name = lock
+        .get("root")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("root")
+        .to_string();
+    let caos_key = lock
+        .get("nodes")
+        .and_then(|nodes| nodes.get(&root_name))
+        .and_then(|root| root.get("inputs"))
+        .and_then(|inputs| inputs.get("caos"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let Some(caos_key) = caos_key else {
+        return Ok(None);
+    };
+    let Some(node) = lock
+        .get_mut("nodes")
+        .and_then(|nodes| nodes.get_mut(&caos_key))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(None);
+    };
+    node.insert(
+        "locked".to_string(),
+        serde_json::json!({ "type": "git", "url": server, "rev": dev_sha }),
+    );
+    let text =
+        serde_json::to_string_pretty(&lock).map_err(|error| format!("re-encoding: {error}"))?;
+    Ok(Some(format!("{text}\n")))
+}
+
+/// Stage `content` as a blob at `name` in the index named by `env`'s
+/// `GIT_INDEX_FILE` -- `hash-object` needs a real path (no stdin-capable
+/// helper in `host_git`, and piping stdin through `Command` for one caller
+/// is not worth adding), so this writes a temp file first.
+fn stage_blob(dir: &Path, env: &[(&str, &str)], name: &str, content: &str) -> Result<(), String> {
+    let tmp = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("could not stage {name}: {error}"))?;
+    std::fs::write(tmp.path(), content)
+        .map_err(|error| format!("could not write {name}'s rewritten content: {error}"))?;
+    let path = tmp.path().to_string_lossy().to_string();
+    let blob = host_git::capture_required_env("git", &["hash-object", "-w", &path], dir, env)?;
+    host_git::capture_required_env(
+        "git",
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{name}"),
+        ],
+        dir,
+        env,
+    )?;
+    Ok(())
+}
+
+/// Automatic analogue of `integrations/claude-code/cloud/bootstrap.go`'s
+/// `seedCommit`, run on EVERY default-based session rather than behind a
+/// `--dev-commit` flag: when the server this transport talks to
+/// (`t.server_url()`) is publishing its own `refs/caos/dev` (a dev/test
+/// stack -- `probe_dev_sha`), repoint `commit`'s root `.caos-expr` (every
+/// `:@@=...&dir=...` locator in it) and `flake.lock`'s `"caos"` input node
+/// at THAT commit instead of whatever the session-base repo itself has
+/// committed.
+///
+/// THIS IS THE FIX for a session whose default content tree pins caos at
+/// one (possibly stale, possibly uncommitted-relative-to) commit while the
+/// dev stack it is actually talking to answers `--llm-step` and every other
+/// seeded-core lookup for a DIFFERENT one: every `caos-std`-mounted tool in
+/// that tree silently ran the wrong caos, or failed outright on a seeded-
+/// sentinel mismatch identical in shape to the one `--llm-step` itself used
+/// to hit (see `caos-hooks/__init__.py`'s `_dev_sha` and
+/// `scripts/caos-mcp-launch`'s matching comment for that half of the fix).
+///
+/// Returns `commit` UNCHANGED, never erroring on its account, when: the
+/// server has no `refs/caos/dev` (a real, git-less production deploy --
+/// the common case this must not break); the dev commit already matches;
+/// the tree carries no `.caos-expr` at `commit` at all; or it carries one
+/// with no locator worth rewriting. A malformed `flake.lock` found ALONGSIDE
+/// a locator that DOES need rewriting is the one case that errors -- see
+/// `rewrite_flake_lock`'s own doc comment for why.
+fn repoint_to_dev(t: &GitTransport, commit: &str) -> Result<String, String> {
+    let server = t.server_url()?;
+    let Some(dev_sha) = probe_dev_sha(&server) else {
+        return Ok(commit.to_string());
+    };
+    if dev_sha == commit {
+        return Ok(commit.to_string());
+    }
+    let dir = t.work_dir();
+    let expr =
+        match host_git::capture_required("git", &["show", &format!("{commit}:.caos-expr")], dir) {
+            Ok(text) => text,
+            // No `.caos-expr` at this commit at all -- nothing to rewrite.
+            Err(_) => return Ok(commit.to_string()),
+        };
+    let Some(rewritten_expr) = rewrite_locators(&expr, &server, &dev_sha) else {
+        return Ok(commit.to_string());
+    };
+
+    let index = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("could not make a seed index: {error}"))?;
+    let index_path = index.path().to_string_lossy().to_string();
+    let env: [(&str, &str); 5] = [
+        ("GIT_INDEX_FILE", &index_path),
+        // An identity of its own, because `commit-tree` refuses without one
+        // and the ambient git config may have none (same reasoning as
+        // `bootstrap.go`'s `seedCommit`). Whose commit this is carries no
+        // meaning: nothing ever pushes it, and its only reader is the
+        // conversation this hook is seeding.
+        ("GIT_AUTHOR_NAME", "caos dev mode"),
+        ("GIT_AUTHOR_EMAIL", "caos@localhost"),
+        ("GIT_COMMITTER_NAME", "caos dev mode"),
+        ("GIT_COMMITTER_EMAIL", "caos@localhost"),
+    ];
+    host_git::capture_required_env("git", &["read-tree", commit], dir, &env)?;
+    stage_blob(dir, &env, ".caos-expr", &rewritten_expr)?;
+
+    if let Ok(lock_text) =
+        host_git::capture_required("git", &["show", &format!("{commit}:flake.lock")], dir)
+    {
+        match rewrite_flake_lock(&lock_text, &server, &dev_sha) {
+            Ok(Some(new_lock)) => stage_blob(dir, &env, "flake.lock", &new_lock)?,
+            // No "caos" input node -- leave flake.lock exactly as committed.
+            Ok(None) => {}
+            Err(error) => return Err(format!("rewriting flake.lock for the dev stack: {error}")),
+        }
+    }
+
+    let tree = host_git::capture_required_env("git", &["write-tree"], dir, &env)?;
+    host_git::capture_required_env(
+        "git",
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            commit,
+            "-m",
+            "caos dev mode: repointed at the dev stack",
+        ],
+        dir,
+        &env,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +519,242 @@ mod tests {
         let t = GitTransport::discover(dir.path()).unwrap();
         let error = fetch_commit(&t, "github:Metta-AI/caos-session").unwrap_err();
         assert!(error.contains("names no ref= or rev="), "{error}");
+    }
+
+    #[test]
+    fn rewrite_locators_swaps_scheme_and_rev_keeping_dir() {
+        let expr = "run --base:@@=github:Metta-AI/caos?rev=oldsha&dir=std/llm-step --in:@=.";
+        let rewritten =
+            rewrite_locators(expr, "http://127.0.0.1", "newsha").expect("a locator to rewrite");
+        assert_eq!(
+            rewritten,
+            "run --base:@@=git+http://127.0.0.1?rev=newsha&dir=std/llm-step --in:@=."
+        );
+    }
+
+    #[test]
+    fn rewrite_locators_rewrites_every_occurrence() {
+        // caos-session's own `.caos-expr` carries exactly this shape: the
+        // locator twice, once for `--base` and once for `--input-tree`.
+        let expr = "run --base:@@=github:Metta-AI/caos?rev=abc&dir=std/flake-input-loader \
+                    --input-tree:@@=github:Metta-AI/caos?rev=abc&dir=std";
+        let rewritten =
+            rewrite_locators(expr, "http://127.0.0.1", "def").expect("locators to rewrite");
+        assert_eq!(
+            rewritten,
+            "run --base:@@=git+http://127.0.0.1?rev=def&dir=std/flake-input-loader \
+             --input-tree:@@=git+http://127.0.0.1?rev=def&dir=std"
+        );
+    }
+
+    #[test]
+    fn rewrite_locators_leaves_a_non_matching_expr_alone() {
+        assert_eq!(
+            rewrite_locators("run --base:@=std/hello --in:@=.", "s", "d"),
+            None
+        );
+    }
+
+    #[test]
+    fn rewrite_flake_lock_repoints_the_caos_input_node() {
+        let lock = serde_json::json!({
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {"caos": "caos"}},
+                "caos": {
+                    "locked": {
+                        "type": "github", "owner": "Metta-AI", "repo": "caos",
+                        "rev": "oldsha", "narHash": "sha256-xxx",
+                    },
+                    "original": {"type": "github", "owner": "Metta-AI", "repo": "caos", "ref": "main"},
+                },
+            },
+        })
+        .to_string();
+        let rewritten = rewrite_flake_lock(&lock, "http://127.0.0.1", "newsha")
+            .unwrap()
+            .expect("a caos input node to rewrite");
+        let parsed: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(
+            parsed["nodes"]["caos"]["locked"],
+            serde_json::json!({"type": "git", "url": "http://127.0.0.1", "rev": "newsha"})
+        );
+    }
+
+    #[test]
+    fn rewrite_flake_lock_is_ok_none_without_a_caos_input() {
+        let lock =
+            serde_json::json!({"root": "root", "nodes": {"root": {"inputs": {}}}}).to_string();
+        assert_eq!(rewrite_flake_lock(&lock, "s", "d").unwrap(), None);
+    }
+
+    #[test]
+    fn rewrite_flake_lock_errors_on_unparseable_json() {
+        let error = rewrite_flake_lock("not json", "s", "d").unwrap_err();
+        assert!(error.contains("parsing as JSON"), "{error}");
+    }
+
+    #[test]
+    fn probe_dev_sha_reads_a_real_refs_caos_dev_and_none_without_one() {
+        // A bare repo stands in for "the server": `git ls-remote` works
+        // identically over a filesystem path as it does over http, which is
+        // what makes this testable without a running caos server at all.
+        let bare = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet", "--bare"], bare.path()).unwrap();
+        let server = bare.path().to_string_lossy().to_string();
+        assert_eq!(probe_dev_sha(&server), None, "a bare repo with no dev ref");
+
+        let work = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        host_git::capture_required(
+            "git",
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "dev",
+                "--no-gpg-sign",
+            ],
+            work.path(),
+        )
+        .unwrap();
+        let dev_commit =
+            host_git::capture_required("git", &["rev-parse", "HEAD"], work.path()).unwrap();
+        host_git::capture_required(
+            "git",
+            &["push", "--quiet", &server, "HEAD:refs/caos/dev"],
+            work.path(),
+        )
+        .unwrap();
+        assert_eq!(probe_dev_sha(&server), Some(dev_commit));
+    }
+
+    /// End to end: a session-base commit whose `.caos-expr`/`flake.lock` pin
+    /// one caos commit gets repointed at a DIFFERENT one the "server" (a
+    /// bare repo standing in for it, same trick as the test above) is
+    /// publishing on `refs/caos/dev` -- the exact scenario this whole
+    /// function exists for.
+    #[test]
+    fn repoint_to_dev_rewrites_when_the_server_publishes_a_different_commit() {
+        let bare = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet", "--bare"], bare.path()).unwrap();
+        let server = bare.path().to_string_lossy().to_string();
+
+        let work = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        host_git::capture_required("git", &["remote", "add", "caos", &server], work.path())
+            .unwrap();
+        let expr = "run --base:@@=github:Metta-AI/caos?rev=oldsha&dir=std/llm-step --in:@=.";
+        std::fs::write(work.path().join(".caos-expr"), expr).unwrap();
+        let lock = serde_json::json!({
+            "root": "root",
+            "nodes": {
+                "root": {"inputs": {"caos": "caos"}},
+                "caos": {
+                    "locked": {"type": "github", "owner": "Metta-AI", "repo": "caos", "rev": "oldsha"},
+                    "original": {"type": "github", "owner": "Metta-AI", "repo": "caos", "ref": "main"},
+                },
+            },
+        })
+        .to_string();
+        std::fs::write(work.path().join("flake.lock"), &lock).unwrap();
+        host_git::capture_required("git", &["add", "-A"], work.path()).unwrap();
+        host_git::capture_required(
+            "git",
+            &["commit", "-q", "-m", "base", "--no-gpg-sign"],
+            work.path(),
+        )
+        .unwrap();
+        let commit =
+            host_git::capture_required("git", &["rev-parse", "HEAD"], work.path()).unwrap();
+
+        // Publish a DIFFERENT commit as the server's refs/caos/dev.
+        host_git::capture_required(
+            "git",
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "dev",
+                "--no-gpg-sign",
+            ],
+            work.path(),
+        )
+        .unwrap();
+        let dev_commit =
+            host_git::capture_required("git", &["rev-parse", "HEAD"], work.path()).unwrap();
+        host_git::capture_required(
+            "git",
+            &["push", "--quiet", &server, "HEAD:refs/caos/dev"],
+            work.path(),
+        )
+        .unwrap();
+        // Back to the original commit -- repoint_to_dev takes an explicit sha.
+        host_git::capture_required("git", &["checkout", "--quiet", &commit], work.path()).unwrap();
+
+        let t = GitTransport::discover(work.path()).unwrap();
+        let repointed = repoint_to_dev(&t, &commit).unwrap();
+        assert_ne!(repointed, commit, "a new commit must have been minted");
+
+        let new_expr = host_git::capture_required(
+            "git",
+            &["show", &format!("{repointed}:.caos-expr")],
+            work.path(),
+        )
+        .unwrap();
+        assert!(
+            new_expr.contains(&format!("git+{server}?rev={dev_commit}&dir=std/llm-step")),
+            "{new_expr}"
+        );
+        let new_lock = host_git::capture_required(
+            "git",
+            &["show", &format!("{repointed}:flake.lock")],
+            work.path(),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&new_lock).unwrap();
+        assert_eq!(
+            parsed["nodes"]["caos"]["locked"],
+            serde_json::json!({"type": "git", "url": server, "rev": dev_commit})
+        );
+        // The checkout itself (the throwaway index aside) is untouched.
+        assert!(host_git::capture_required(
+            "git",
+            &["show", &format!("{commit}:.caos-expr")],
+            work.path()
+        )
+        .unwrap()
+        .contains("rev=oldsha"));
+    }
+
+    #[test]
+    fn repoint_to_dev_is_a_noop_without_a_dev_ref() {
+        let bare = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet", "--bare"], bare.path()).unwrap();
+        let server = bare.path().to_string_lossy().to_string();
+
+        let work = tempfile::tempdir().unwrap();
+        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        host_git::capture_required("git", &["remote", "add", "caos", &server], work.path())
+            .unwrap();
+        std::fs::write(
+            work.path().join(".caos-expr"),
+            "run --base:@@=github:Metta-AI/caos?rev=oldsha&dir=std/llm-step --in:@=.",
+        )
+        .unwrap();
+        host_git::capture_required("git", &["add", "-A"], work.path()).unwrap();
+        host_git::capture_required(
+            "git",
+            &["commit", "-q", "-m", "base", "--no-gpg-sign"],
+            work.path(),
+        )
+        .unwrap();
+        let commit =
+            host_git::capture_required("git", &["rev-parse", "HEAD"], work.path()).unwrap();
+
+        let t = GitTransport::discover(work.path()).unwrap();
+        assert_eq!(repoint_to_dev(&t, &commit).unwrap(), commit);
     }
 }
