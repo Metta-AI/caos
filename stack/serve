@@ -128,15 +128,18 @@
 #                             iroh relay below -- never through the main
 #                             caos-iroh endpoint's own protocol.
 #   CAOS_STACK_HERMES_OIDC_ISSUER / _CLIENT_ID / _CLIENT_SECRET
-#                             NOT currently wired up -- stack/serve uses a
-#                             fixed username/password (dashboard.basic_auth,
-#                             the `basic` provider) for now, quick to stand
-#                             up. The gateway's `self_hosted` OIDC provider
-#                             (per-user identity from a real IdP: Authentik,
-#                             Keycloak, Okta, Google, ...) is the plan once
-#                             more than one person shares this server and
-#                             needs telling apart -- deliberately deferred,
-#                             not forgotten. Reserved names for that pass.
+#                             NOT currently wired up. Per-user identity now
+#                             runs through the bundled `nous` provider instead
+#                             (OAuth against Nous Portal, not a self-hosted
+#                             IdP) -- `basic` stays on as a login that needs no
+#                             Nous account; `nous` activates once someone runs
+#                             `hermes auth add nous --type oauth` +
+#                             `hermes dashboard register` once by hand inside
+#                             this gateway's HERMES_HOME. `self_hosted` OIDC
+#                             (a real IdP: Authentik, Keycloak, Okta, Google,
+#                             ...) is still an option later if a bare Nous
+#                             account isn't the right identity source -- these
+#                             three env vars are reserved for that, unused.
 #   CAOS_STACK_HERMES_REV     commit sha (already pushed to
 #                             github:Metta-AI/caos) to pin the gateway's
 #                             --llm-step to -- its build product carries no
@@ -570,12 +573,19 @@ HERMESENV
     fi
   } >"$env_file"
 
-  # FIXED USERNAME/PASSWORD FOR NOW -- quick to stand up, fine for a trusted
-  # network. OIDC (self_hosted, dashboard.oauth.self_hosted.*,
-  # CAOS_STACK_HERMES_OIDC_ISSUER/_CLIENT_ID/_CLIENT_SECRET, which this
-  # gateway's plugin already supports) is the real per-user-identity plan for
-  # later, once multiple real users need to be told apart -- deliberately
-  # deferred, not forgotten.
+  # FIXED USERNAME/PASSWORD AS A FALLBACK -- quick to stand up, fine for a
+  # trusted network or as a break-glass login if Nous Portal is unreachable.
+  # `nous` (dashboard.oauth.*, enabled alongside `basic` below) is the real
+  # per-user-identity path now: OAuth against Nous Portal, which itself offers
+  # Google/Microsoft/GitHub/email upstream -- no per-provider dev keys needed
+  # on this gateway's side at all. Activate it once, by hand, with
+  # `hermes auth add nous --type oauth` (device-code login, no loopback port
+  # needed) then `hermes dashboard register` inside this HERMES_HOME; it
+  # writes HERMES_DASHBOARD_OAUTH_CLIENT_ID into $hermes_home/.env, a file
+  # this script never touches, so it survives every future `caosd up`.
+  # `self_hosted` OIDC (per-user identity from your OWN IdP instead of a Nous
+  # account) is still there if that's ever the better fit -- deliberately
+  # unused for now.
   #
   # The gateway's own login credential, generated ONCE and kept OUTSIDE the
   # profile dir: the install above is `--force`d on every boot (so a tree
@@ -621,7 +631,17 @@ HERMESENV
     >"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
   HERMES_HOME="$hermes_home" "$hermes_bin" config set dashboard.basic_auth.password_hash "$hermes_hash" \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
-  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic"]' \
+  # "nous" (the bundled dashboard_auth/nous plugin) rides along unconditionally:
+  # it self-gates on whether dashboard.oauth.client_id/HERMES_DASHBOARD_OAUTH_
+  # CLIENT_ID is actually configured, so listing it here is a no-op until
+  # someone runs `hermes auth add nous --type oauth` + `hermes dashboard
+  # register` once (by hand, interactively -- it's a real OAuth login against
+  # the operator's own Nous account) inside this HERMES_HOME. That registration
+  # writes HERMES_DASHBOARD_OAUTH_CLIENT_ID into $hermes_home/.env itself,
+  # which this script never touches (only profiles/caos/.env is ours to
+  # manage), so it survives every future `caosd up` with no extra wiring here.
+  # `basic` stays listed alongside it as a login that needs no Nous account.
+  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
   echo "caosd serve: hermes gateway on :$HERMES_PORT -- sign in as 'caos', password in $hermes_secret" >&2
