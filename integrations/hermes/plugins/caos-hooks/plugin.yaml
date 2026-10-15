@@ -1,0 +1,15 @@
+name: caos-hooks
+version: 0.1.0
+description: >
+  Replicates Claude Code's PreToolUse/UserPromptSubmit/Stop hooks for the
+  caos MCP server under Hermes: stamps caos_session/caos_tool_use_id/
+  caos_prompt_id onto every caos tool call (PreToolUse's job), and drives
+  `caos mcp hook` to record prompts and final messages into the durable
+  caos conversation log (UserPromptSubmit/Stop's job).
+author: "Metta-AI/caos"
+capabilities:
+  - tools.override
+provides_hooks:
+  - pre_tool_call
+  - pre_llm_call
+  - post_llm_call

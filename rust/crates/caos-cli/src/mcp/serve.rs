@@ -883,30 +883,52 @@ fn handle(
         // A workspace we could not open is the model's problem to report, not
         // a protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
-        "tools/call" => Some(match t {
-            Err(error) if params.get("name").and_then(Value::as_str) == Some(STATUS_TOOL) => {
-                reply(id, status_result(registry, "", Some(error)))
+        //
+        // The server's OWN startup-time workspace (`t`, fixed for this
+        // process's whole life) is a FALLBACK now, not the only source: a
+        // call naming a session with its own recorded workspace --
+        // `session_base.rs`'s scratch checkout, or any other workspace a
+        // session's first prompt pinned -- uses THAT instead, exactly what
+        // `conversation_status` below already does for its own report. This
+        // is what makes different sessions sharing this one long-running
+        // server able to use different checkouts/servers at all: a `t` fixed
+        // at process startup could never do that regardless of anything a
+        // later session recorded.
+        "tools/call" => Some({
+            let session = params
+                .get("arguments")
+                .and_then(|args| args.get(SESSION_ARG))
+                .and_then(Value::as_str);
+            let session_t = session.and_then(|s| super::workspace::open(s).ok());
+            let resolved: Result<&GitTransport, &String> = match &session_t {
+                Some(opened) => Ok(opened),
+                None => t,
+            };
+            match resolved {
+                Err(error) if params.get("name").and_then(Value::as_str) == Some(STATUS_TOOL) => {
+                    reply(id, status_result(registry, "", Some(error)))
+                }
+                Err(error) => reply(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": format!(
+                            "caos has no workspace, so no tool can run: {error}\n\
+                             The tool server is started by Claude Code, so it looks for the \
+                             repository at $CLAUDE_PROJECT_DIR and falls back to its working \
+                             directory. Neither was a git working tree."
+                        ) }],
+                        "isError": true,
+                    }),
+                ),
+                Ok(t) => match call(t, options, registry, &params) {
+                    Ok(result) => reply(id, result),
+                    // A tool that could not run at all is a JSON-RPC error; a tool
+                    // that ran and failed is a result with `isError`, which the
+                    // model sees and can act on. Conflating them hides real
+                    // breakage as advice.
+                    Err(error) => fail(id, -32603, &error),
+                },
             }
-            Err(error) => reply(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": format!(
-                        "caos has no workspace, so no tool can run: {error}\n\
-                         The tool server is started by Claude Code, so it looks for the \
-                         repository at $CLAUDE_PROJECT_DIR and falls back to its working \
-                         directory. Neither was a git working tree."
-                    ) }],
-                    "isError": true,
-                }),
-            ),
-            Ok(t) => match call(t, options, registry, &params) {
-                Ok(result) => reply(id, result),
-                // A tool that could not run at all is a JSON-RPC error; a tool
-                // that ran and failed is a result with `isError`, which the
-                // model sees and can act on. Conflating them hides real
-                // breakage as advice.
-                Err(error) => fail(id, -32603, &error),
-            },
         }),
         "ping" => Some(reply(id, json!({}))),
         other => Some(fail(id, -32601, &format!("unknown method {other:?}"))),

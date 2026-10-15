@@ -152,7 +152,19 @@ fn cc_transport() -> Result<GitTransport, String> {
     let t = match std::env::var("CLAUDE_PROJECT_DIR") {
         Ok(dir) if !dir.is_empty() => GitTransport::discover(&dir)
             .map_err(|error| format!("CLAUDE_PROJECT_DIR={dir}: {error}"))?,
-        _ => GitTransport::from_cwd()?,
+        // A server-wide scratch checkout (session_base.rs) is the fallback
+        // here, not just inside the UserPromptSubmit/PreToolUse hook: this
+        // same function resolves `tools/list`'s own startup transport, which
+        // runs once per MCP connection before any session exists to key a
+        // per-session scratch checkout off of. Without this, a scratch-only
+        // deployment (no real local checkout anywhere) would leave
+        // `tools/list`'s cached-once reply permanently degraded, no matter
+        // how many sessions later connect successfully through their own
+        // per-session checkout.
+        _ => match GitTransport::from_cwd() {
+            Ok(t) => t,
+            Err(error) => caos_cli::default_server_transport().unwrap_or(Err(error))?,
+        },
     };
     // And then STAND there. Finding the repository is not enough on its own:
     // plenty below here resolves a relative path against the process's cwd

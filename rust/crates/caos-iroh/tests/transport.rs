@@ -375,3 +375,117 @@ async fn a_push_that_ends_without_a_pack_is_answered() {
         "receive-pack ended the stream with no report at all"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Relay: the separate, protocol-free endpoint. No Service, no magic string --
+// just a token line, then a splice to one fixed TCP backend.
+// ---------------------------------------------------------------------------
+
+use caos_iroh::{Relay, RelayClient, RELAY_ALPN};
+
+/// A relay listener plus the ticket that reaches it.
+struct RelayFixture {
+    ticket: Ticket,
+    _endpoint: Endpoint,
+}
+
+async fn relay_listener(to: String) -> RelayFixture {
+    let token = hex_encode(&[0x5au8; 32]);
+    let key = SecretKey::from_bytes(&[4u8; 32]);
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(key.clone())
+        .alpns(vec![RELAY_ALPN.to_vec()])
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .expect("bind address")
+        .bind()
+        .await
+        .expect("bind the relay listener");
+    let bound = *endpoint.bound_sockets().first().expect("a bound socket");
+    let relay = Arc::new(Relay {
+        to,
+        token: token.clone(),
+    });
+    let accepting = endpoint.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                let _ = relay.accept(incoming).await;
+            });
+        }
+    });
+    RelayFixture {
+        ticket: Ticket {
+            addr: EndpointAddr::new(key.public()).with_ip_addr(bound),
+            token,
+        },
+        _endpoint: endpoint,
+    }
+}
+
+async fn relay_client_for(ticket: &Ticket) -> RelayClient {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .expect("bind address")
+        .bind()
+        .await
+        .expect("bind the client");
+    RelayClient::connect_on(endpoint, ticket)
+        .await
+        .expect("connect to the relay")
+}
+
+/// The whole point: a stream opened against a relay reaches its backend with
+/// no service name, no magic string -- just the token line, then raw bytes.
+#[tokio::test]
+async fn a_relay_stream_reaches_its_backend_with_no_service_name() {
+    let to = echo_line_server().await;
+    let fixture = relay_listener(to).await;
+    let client = relay_client_for(&fixture.ticket).await;
+
+    let (mut send, mut recv) = client.open().await.expect("open a relay stream");
+    send.write_all(b"ping\n").await.expect("write the request");
+    let mut answer = String::new();
+    recv.read_to_string(&mut answer)
+        .await
+        .expect("read the answer");
+    assert_eq!(answer, "pong\n");
+}
+
+#[tokio::test]
+async fn a_relay_stream_with_a_bad_token_is_refused() {
+    let to = echo_line_server().await;
+    let fixture = relay_listener(to).await;
+    let bad_ticket = Ticket {
+        addr: fixture.ticket.addr.clone(),
+        token: hex_encode(&[0xffu8; 32]),
+    };
+    let client = relay_client_for(&bad_ticket).await;
+
+    let error = client.open().await.expect_err("a bad token is refused");
+    assert!(error.contains("unauthorized"), "{error}");
+}
+
+#[tokio::test]
+async fn a_relay_endpoint_refuses_the_main_serve_alpn() {
+    // Proof the two protocols are genuinely separate endpoints, not one
+    // listener dispatching on content: dialling a relay's address with the
+    // OTHER ALPN must fail the handshake, not be misread as a request line.
+    let to = echo_line_server().await;
+    let fixture = relay_listener(to).await;
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .expect("bind address")
+        .bind()
+        .await
+        .expect("bind the client");
+    let error = endpoint
+        .connect(fixture.ticket.addr.clone(), ALPN)
+        .await
+        .expect_err("the relay does not speak the serve ALPN");
+    let error = format!("{error}");
+    assert!(
+        error.to_lowercase().contains("alpn") || error.to_lowercase().contains("protocol"),
+        "{error}"
+    );
+}

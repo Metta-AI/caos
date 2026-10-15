@@ -27,6 +27,7 @@
 mod diag;
 mod resume;
 mod serve;
+mod session_base;
 mod workspace;
 
 use std::io::Read;
@@ -69,6 +70,15 @@ const TOOL_PREFIX: &str = "mcp__caos__";
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
+
+/// Exposed for `caos-cli.rs`'s own `cc_transport()`: a server-wide scratch
+/// checkout (see `session_base`'s module doc comment) for the callers that
+/// run before any session is known at all -- `tools/list`, `caos mcp warm`,
+/// `caos mcp diag`. `None` when `CAOS_MCP_DEFAULT_SERVER` is not set, so a
+/// caller's existing cwd/`$CLAUDE_PROJECT_DIR`-not-a-repo error is unchanged.
+pub fn default_server_transport() -> Option<Result<GitTransport, String>> {
+    session_base::default_server_scratch()
+}
 
 /// The workspace arrives UNRESOLVED because only `serve` can carry on without
 /// one. A hook that cannot find the repository has nothing to record into and
@@ -545,7 +555,9 @@ fn hook(discovered: Result<GitTransport, String>, options: &TurnOptions) -> Resu
     let session = string_field(&payload, "session_id")?;
     let first_prompt = event == "UserPromptSubmit" && !workspace::exists(session)?;
     let opened = if first_prompt {
-        discovered.and_then(|t| workspace::record(session, &t).map(|()| t))
+        let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
+        session_base::open_for_new_session(session, prompt, discovered)
+            .and_then(|t| workspace::record(session, &t).map(|()| t))
     } else {
         workspace::open(session)
     };
@@ -890,7 +902,13 @@ fn root_commit(
     signature: &Signature,
 ) -> Result<Oid, String> {
     let phase = std::time::Instant::now();
-    let base = oid(&eval_base(t, options)?, "conversation base")?;
+    let base = oid(
+        &match &options.base {
+            Some(_) => eval_base(t, options)?,
+            None => session_base::resolve_default_base(t, prompt)?,
+        },
+        "conversation base",
+    )?;
     cc_timing("eval_base", phase.elapsed());
     let phase = std::time::Instant::now();
     // The client repo's own tree becomes the conversation's content, at the

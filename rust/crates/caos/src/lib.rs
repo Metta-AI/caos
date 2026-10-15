@@ -3229,7 +3229,7 @@ pub use git_locator::{parse_git_ref, GitRef};
 /// inside the server, where each hop is sub-millisecond. The local walk this
 /// replaced was measured at ~54 round trips, which over a cloud session's
 /// tunnel was ~30s.
-fn eval_remote_arg(
+pub fn eval_remote_arg(
     t: &dyn Transport,
     value: &str,
     secrets: &Secrets,

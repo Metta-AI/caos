@@ -1,0 +1,62 @@
+name: caos
+version: 0.1.0
+description: >
+  Wires Hermes to caos: bans the built-in toolsets caos replaces
+  (terminal, file, code_execution) and installs the caos MCP server plus
+  the hook plugin that attributes tool calls to a caos conversation.
+hermes_requires: ">=0.0.0"
+author: "Metta-AI/caos"
+license: MIT
+# Default distribution_owned (config.yaml, mcp.json, skills, cron,
+# distribution.yaml) doesn't include arbitrary directories -- confirmed by a
+# real install dropping bin/ silently. Declare it explicitly.
+distribution_owned:
+  - config.yaml
+  - distribution.yaml
+  - plugins
+  - README.md
+env_requires:
+  - name: CAOS_HERMES_DIST_DIR
+    description: >
+      Path to this distribution's own root (the directory containing
+      scripts/caos-mcp-launch) -- distinct from CAOS_REPO below: a bundled
+      deployment (stack/serve under CAOS_STACK_HERMES=yes) installs from a
+      nix build product (.#caos-stack-inputs's hermes-profile output), not a
+      live caos checkout, so the two are different paths there. For a
+      hand-run Desktop profile they're usually the same checkout's
+      integrations/hermes subdirectory.
+    required: true
+  - name: CAOS_MCP_DEFAULT_SERVER
+    description: >
+      Default caos server URL for a NEW session with no
+      `/caos-session-server <url>` on its first prompt's leading line (e.g.
+      `http://localhost:9090` for a local dev stack, or a `caos://<ticket>`
+      remote). Read once per session, not once per profile -- different
+      sessions under this same profile can still override it per-prompt;
+      this is only what a session gets when it doesn't ask for anything else.
+    required: true
+  - name: CAOS_BIN
+    description: >
+      Optional path to a pre-built caos binary. When set, skips CAOS_REPO
+      and the nix build entirely -- useful for a dev build
+      (rust/target/debug/caos-cli) without waiting on a release build, and
+      the only binary-resolution path a bundled (CAOS_STACK_HERMES) deploy
+      uses at all.
+    required: false
+  - name: CAOS_LLM_STEP_REV
+    description: >
+      Explicit commit sha (already pushed to github:Metta-AI/caos) to pin
+      --llm-step to. Set this to skip CAOS_REPO's git-rev-parse entirely --
+      the only option a bundled deploy has, since its build product carries
+      no .git. A hand-run Desktop profile usually leaves this unset and lets
+      CAOS_REPO's own HEAD supply it.
+    required: false
+  - name: CAOS_REPO
+    description: >
+      Path to a local caos checkout, used ONLY as a fallback: to
+      `nix build $CAOS_REPO#caos-cli` when CAOS_BIN isn't set, and to supply
+      --llm-step's pinned rev via `git -C $CAOS_REPO rev-parse HEAD` when
+      CAOS_LLM_STEP_REV isn't set. Irrelevant (and fine to leave unset) for a
+      bundled deploy, which always sets both CAOS_BIN and CAOS_LLM_STEP_REV
+      directly.
+    required: false

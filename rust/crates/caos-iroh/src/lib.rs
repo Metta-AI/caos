@@ -693,6 +693,142 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// The ALPN a [`Relay`] negotiates — deliberately NOT [`ALPN`]. A relay speaks
+/// no request line and dispatches no service; it is one endpoint wired to one
+/// backend. A client dialling the wrong ALPN by mistake fails the handshake
+/// instead of being misunderstood by a listener built for the other protocol.
+pub const RELAY_ALPN: &[u8] = b"caos-relay/1";
+
+/// A relay endpoint: every accepted stream is spliced straight to one local TCP
+/// backend, after one line proves the token.
+///
+/// DELIBERATELY NOT [`Server`]/[`Service`]: that protocol exists to multiplex
+/// caos, git and (once) hermes onto a single endpoint, and a client that wants
+/// only "the hermes gateway, nothing else" should not have to know that
+/// protocol exists at all — no magic string, no service name, no dispatch.
+/// One endpoint, one backend, one line.
+///
+/// The line is kept, not dropped, for the same reason [`Server`]'s is: a
+/// ticket is a bearer capability, and the token is what makes a compromised
+/// one revocable without reminting the endpoint's whole identity (see the
+/// module doc's Authentication section). Real auth for whatever is reached
+/// through it — login, identity — belongs to that backend, not to this relay.
+pub struct Relay {
+    /// `host:port` every accepted stream is spliced to.
+    pub to: String,
+    /// The token every stream must present, as the one line before the splice.
+    pub token: String,
+}
+
+impl Relay {
+    /// Answer one connection's streams until the peer closes it. Same shape as
+    /// [`Server::accept`] — see it for why each stream is spawned rather than
+    /// answered in sequence.
+    pub async fn accept(self: Arc<Self>, incoming: Incoming) -> Result<(), String> {
+        let connection = incoming
+            .accept()
+            .map_err(|e| format!("accepting: {e}"))?
+            .await
+            .map_err(|e| format!("completing the handshake: {e}"))?;
+        let remote = connection.remote_id().fmt_short();
+        eprintln!("caos-iroh: relay: connected {remote}");
+        loop {
+            let (send, recv) = match connection.accept_bi().await {
+                Ok(pair) => pair,
+                Err(error) => {
+                    eprintln!("caos-iroh: relay: {remote} done: {error}");
+                    return Ok(());
+                }
+            };
+            let relay = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = relay.answer(send, recv).await {
+                    eprintln!("caos-iroh: relay: stream: {error}");
+                }
+            });
+        }
+    }
+
+    /// Read the one-line token, check it, and splice to `self.to`.
+    async fn answer(&self, mut send: SendStream, mut recv: RecvStream) -> Result<(), String> {
+        let presented = read_line(&mut recv).await?;
+        if !tokens_match(&presented, &self.token) {
+            return refuse(send, "unauthorized").await;
+        }
+        let stream = match TcpStream::connect(&self.to).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                return refuse(send, &format!("connecting to {}: {error}", self.to)).await
+            }
+        };
+        send.write_all(b"ok\n")
+            .await
+            .map_err(|e| format!("accepting the stream: {e}"))?;
+        let (read, write) = stream.into_split();
+        splice(send, recv, read, write).await
+    }
+}
+
+/// The client half of [`Relay`]: one QUIC connection, and a stream per request
+/// opened against it. No [`Service`] to name — a relay dispatches nothing.
+pub struct RelayClient {
+    /// Held so the connection stays alive — dropping the endpoint closes it.
+    endpoint: Endpoint,
+    connection: Connection,
+    token: String,
+}
+
+impl RelayClient {
+    /// Dial the ticket's endpoint over [`RELAY_ALPN`].
+    pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
+        let endpoint = client_endpoint_builder(ticket)
+            .bind()
+            .await
+            .map_err(|e| format!("binding an iroh endpoint: {e}"))?;
+        Self::connect_on(endpoint, ticket).await
+    }
+
+    /// Dial on an endpoint the caller already has. See [`Client::connect_on`]
+    /// for why a test or a long-lived client wants this.
+    pub async fn connect_on(endpoint: Endpoint, ticket: &Ticket) -> Result<Self, String> {
+        let connection = endpoint
+            .connect(ticket.addr.clone(), RELAY_ALPN)
+            .await
+            .map_err(|e| format!("connecting to {}: {e}", ticket.addr.id.fmt_short()))?;
+        Ok(Self {
+            endpoint,
+            connection,
+            token: ticket.token.clone(),
+        })
+    }
+
+    /// Open one stream and present the token. Returns once the relay has
+    /// accepted it, so the caller can splice without a second handshake.
+    pub async fn open(&self) -> Result<(SendStream, RecvStream), String> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| format!("opening a stream: {e}"))?;
+        send.write_all(format!("{}\n", self.token).as_bytes())
+            .await
+            .map_err(|e| format!("writing the token: {e}"))?;
+        let reply = read_line(&mut recv).await?;
+        match reply.strip_prefix("err ") {
+            Some(message) => Err(message.to_string()),
+            None if reply == "ok" => Ok((send, recv)),
+            None => Err(format!("unexpected reply from the relay: {reply:?}")),
+        }
+    }
+
+    /// Tell the peer we are done. See [`Client::close`] for why this is
+    /// bounded rather than a full graceful close.
+    pub async fn close(self) {
+        self.connection.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.endpoint.close()).await;
+    }
+}
+
 /// Parse a request line into its service and extra. The magic and token are
 /// checked here too, so a listener has one place to reject a stream.
 pub fn parse_request(line: &str, token: &str) -> Result<(Service, Option<String>), String> {

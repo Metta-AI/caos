@@ -134,4 +134,11 @@ export CAOS_BUILTIN_BINS="$inputs"
 export CAOS_CACHE_NAMESPACE="${CAOS_CACHE_NAMESPACE:-${ns%%-*}}"
 CAOS_BUILTIN_IMAGES="$(echo "$inputs"/images/*)"
 export CAOS_BUILTIN_IMAGES
+# The bundled Hermes gateway's distribution, a sibling build product of
+# bin/ and images/ in the SAME aggregate -- not CAOS_STACK_TREE (this
+# container's tree may not even be a git repo, see the `path:` note above,
+# and the whole point of this output is that serve needs no tree at all to
+# find it). CAOS_STACK_HERMES/_PORT/_REV, if the caller set them, are
+# already in the environment this inherits untouched.
+export CAOS_STACK_HERMES_PROFILE="$inputs/hermes-profile"
 exec bash "$tree/stack/serve"

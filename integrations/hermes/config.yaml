@@ -1,0 +1,89 @@
+# caos's own GitHub-tools philosophy: ban exactly the built-ins caos replaces,
+# leave everything caos has no equivalent for untouched (web, delegation,
+# clarify, todo, memory, browser, computer_use, ...). Mirrors
+# integrations/claude-code/shared/settings.json's `permissions.deny`.
+agent:
+  disabled_toolsets:
+    - terminal
+    - file
+    - code_execution
+
+# Deferred-tool-search bounds -- NOT the same knob as mcp_servers.caos's own
+# connect_timeout/timeout below, and the one that actually governs whether a
+# session's first turn ever sees caos's tools at all. hermes_cli/mcp_startup.py
+# bounds the search by mcp_discovery_timeout (default 1.5s!) on an interactive
+# turn and mcp_single_query_discovery_timeout (default 15s) on --oneshot --
+# neither reads a server's own connect_timeout. caos's MCP server's first
+# connect (resolving --llm-step:@@=github:... against the local caos server)
+# takes ~110-130s, so a session whose first message asks for a caos tool
+# reports "no such tool" well before the connection finishes, with no error at
+# all -- just an empty deferred catalog. A `hermes config set` fix doesn't
+# survive: this key lives in the profile's OWN config.yaml, which `hermes
+# profile install --force` (stack/serve, every `caosd up`) overwrites from
+# this file on every boot. It has to live here to survive that.
+mcp_discovery_timeout: 180
+mcp_single_query_discovery_timeout: 180
+
+plugins:
+  enabled:
+    - caos-hooks
+    # The bundled `basic` dashboard-auth provider (username/password,
+    # plugins/dashboard_auth/basic in the hermes-agent package) -- NOT
+    # enabled by default once plugins.enabled lists anything explicitly (it
+    # is an ALLOWLIST, confirmed directly: a bare `hermes serve` with no
+    # profile picked a provider up for free, the exact same config under
+    # `--profile caos --isolated` refused to bind non-loopback with "no auth
+    # providers are registered" until one was listed here, with its own
+    # config already correctly set either way). Vestigial for the profile's
+    # OWN config.yaml -- `--profile <name> serve` is the buggy path neither
+    # this repo nor stack/serve actually uses, and stack/serve sets this
+    # SAME key directly on the MACHINE-level config.yaml instead, which is
+    # what the bare `hermes serve` it runs actually reads. Listed here
+    # anyway so a profile installed and run by hand (outside stack/serve,
+    # for debugging) matches what production does.
+    #
+    # FIXED USERNAME/PASSWORD FOR NOW, quick to stand up -- `self_hosted`
+    # OIDC (per-user identity from a real IdP) is the plan once more than one
+    # person needs telling apart, deliberately deferred rather than forgotten.
+    - basic
+  entries:
+    caos-hooks:
+      # Self-granted by this distribution, not the interactive `hermes
+      # plugins enable` consent flow (which fails closed non-interactively
+      # anyway -- see hermes_cli/plugins_cmd_capabilities.py). Installing
+      # this profile IS the trust decision: you're choosing to let caos's
+      # own hook plugin stamp caos_session/caos_tool_use_id/caos_prompt_id
+      # onto caos tool calls, same as Claude Code's settings.json ships its
+      # PreToolUse hook pre-trusted rather than click-through-approved per
+      # install.
+      granted_capabilities:
+        - tools.override
+
+mcp_servers:
+  caos:
+    # Anchored to CAOS_HERMES_DIST_DIR (this distribution's own root), not
+    # ${HERMES_HOME} -- ${HERMES_HOME} resolves to the global ~/.hermes root
+    # under a Desktop session instead of this profile's own directory
+    # (confirmed via a real Desktop session logging FileNotFoundError on the
+    # profile-relative path), so don't depend on it. Not CAOS_REPO either:
+    # a bundled deploy's CAOS_HERMES_DIST_DIR is a nix build product with no
+    # integrations/hermes/ wrapper and no enclosing checkout at all, so the
+    # script's own location and "the caos checkout" are genuinely two
+    # different paths once a deploy isn't a hand-run Desktop profile.
+    command: "${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch"
+    args: []
+    env:
+      CAOS_HERMES_DIST_DIR: "${CAOS_HERMES_DIST_DIR}"
+      CAOS_REPO: "${CAOS_REPO}"
+      CAOS_BIN: "${CAOS_BIN}"
+      CAOS_LLM_STEP_REV: "${CAOS_LLM_STEP_REV}"
+      # Read by rust/crates/caos-cli/src/mcp/session_base.rs on a session's
+      # first prompt: with no `/caos-session-server <url>` directive on the
+      # prompt's leading line, this is the server a NEW session's scratch
+      # checkout gets its `caos` remote pointed at. No `cwd:`/local-checkout
+      # requirement needed any more -- that's the whole point of that change.
+      CAOS_MCP_DEFAULT_SERVER: "${CAOS_MCP_DEFAULT_SERVER}"
+    # Generous: a cold `nix build`/cold caos-server-side tool build can take
+    # minutes. Raise further if a first-session timeout is observed.
+    timeout: 1800
+    connect_timeout: 300

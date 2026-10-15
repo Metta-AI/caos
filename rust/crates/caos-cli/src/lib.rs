@@ -1,7 +1,7 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
 mod mcp;
-pub use mcp::cli_mcp;
+pub use mcp::{cli_mcp, default_server_transport};
 
 pub mod filesystem;
 pub mod host_git;
