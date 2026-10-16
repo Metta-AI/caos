@@ -685,6 +685,26 @@ HERMESENV
   HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
+  # The SAME toolset ban the caos profile's own config.yaml applies to
+  # itself (agent.disabled_toolsets: terminal/file/code_execution), applied
+  # HERE TOO, at the root -- closing a real gap, not a theoretical one:
+  # `hermes serve` is multi-profile and profile choice is the CONNECTING
+  # CLIENT's (nothing server-side forces anyone onto `caos` specifically --
+  # Hermes refuses to let a distribution install itself AS `default`, "that
+  # name is the built-in root profile" -- so a client that never adds
+  # `?profile=caos` lands on bare `default` instead). Confirmed directly:
+  # `default` already has a real model configured (Nous Portal, plus a
+  # live ANTHROPIC_API_KEY credential) and, without this, none of caos's own
+  # restrictions -- stock `terminal`/`file`/`code_execution` fully enabled,
+  # which is genuine shell access to this container (it runs runnerd and can
+  # reach the docker socket) for literally anyone who connects without
+  # bothering with the query param. This does not need to track caos's own
+  # config.yaml (a profile distribution's reinstall never touches the root),
+  # so it is set once here, the same way as the dashboard keys above.
+  HERMES_HOME="$hermes_home" "$hermes_bin" config set agent.disabled_toolsets \
+    '["terminal","file","code_execution"]' \
+    >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+
   echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop); Desktop's Remote-gateway connection form still wants a Session token -- use \$CAOS_DATA/stack/hermes-gateway-ws.secret" >&2
   start hermes env HERMES_HOME="$hermes_home" \
     HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$hermes_session_secret")" \
