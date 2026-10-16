@@ -696,19 +696,38 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # writes HERMES_DASHBOARD_OAUTH_CLIENT_ID into $hermes_home/.env itself,
   # which write_caos_env_file's preserve-filter leaves untouched, so it
   # survives every future `caosd up` with no extra wiring here.
-  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
+  #
+  # UNCONDITIONAL, every boot, regardless of profile_is_hardened below: this
+  # bit it once (fixed the hard way -- `default` lost `caos-hooks` from this
+  # SAME list on a second `caosd up`, failing every caos tool call with
+  # "caos_session is missing: the PreToolUse hook... is not installed").
+  # `profile_is_hardened` exists to skip the EXPENSIVE, rarely-changing part
+  # below (mcp_servers, discovery timeouts, the env file) on an
+  # already-hardened restart -- it must never also gate the one cheap write
+  # that decides the plugin list, or a later restart silently reverts
+  # caos-hooks out of it while leaving everything else alone.
+  caos_root_plugins='["basic","nous"]'
+  if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
+    caos_root_plugins='["basic","nous","caos-hooks"]'
+  fi
+  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled "$caos_root_plugins" \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
   # Cheap, no-`hermes`-subprocess check: has root's own config.yaml already
   # been hardened? Lets this stay idempotent/cheap to re-run across restarts
   # without spawning `hermes config set` subprocesses for keys that already
-  # hold the right value.
+  # hold the right value. Deliberately does NOT cover plugins.enabled -- see
+  # above.
   profile_is_hardened() { # <config.yaml path>
     local cfg=$1
     [ -f "$cfg" ] || return 1
     grep -q '^  disabled_toolsets:' "$cfg" || return 1
     if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
       grep -q '^mcp_servers:' "$cfg" || return 1
+      # Config can say caos-hooks is enabled while the plugin's own code
+      # was never copied (confirmed the hard way -- see the cp -RL below).
+      # Check the actual file, not just config.yaml's say-so.
+      [ -f "$(dirname "$cfg")/plugins/caos-hooks/__init__.py" ] || return 1
     fi
     return 0
   }
@@ -739,12 +758,11 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # everything it multiplexes" before building anything -- a write-once
   # (or even a poll) is racy against a profile created mid-session, and the
   # right fix depends on that still-unverified answer. Tracked as separate,
-  # deliberately deferred work -- `root` (this `default` profile) and the
-  # still-installed `caos`/`malcolm` profiles are the only profiles this
-  # gateway has today, so it is not an active gap on THIS stack.
+  # deliberately deferred work -- this `default` profile is the only one
+  # this gateway has today (the `caos` and `malcolm` named profiles were
+  # both removed), so it is not an active gap on THIS stack.
   apply_caos_profile_hardening() {
-    local cfg="$hermes_home/config.yaml" env_file="$hermes_home/.env" \
-      plugins='["basic","nous"]'
+    local cfg="$hermes_home/config.yaml" env_file="$hermes_home/.env"
     profile_is_hardened "$cfg" && return 0
 
     HERMES_HOME="$hermes_home" "$hermes_bin" config set agent.disabled_toolsets \
@@ -752,8 +770,23 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
       >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
     if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
-      plugins='["basic","nous","caos-hooks"]'
       write_caos_env_file "$env_file"
+      # The actual PLUGIN CODE, not just config referencing it by name --
+      # `hermes profile install` used to copy this as part of installing
+      # the whole distribution into a NAMED profile; now that this writes
+      # config.yaml keys directly instead, nothing else ever puts the
+      # plugin's own files where PluginManager looks for them
+      # ($HOME/plugins/<name>/). Confirmed the hard way: plugins.enabled
+      # correctly listed "caos-hooks" and EVERY caos tool call still failed
+      # with "caos_session is missing: the PreToolUse hook... is not
+      # installed" -- the config said the plugin was on, but the plugin's
+      # own __init__.py/plugin.yaml were never on disk to load at all.
+      # cp -RL, not -R: contents inside a nix build product are symlinks
+      # into /nix/store (dockerTools' lndir mirrors dirs, symlinks files),
+      # and -L follows them to real content.
+      mkdir -p "$hermes_home/plugins"
+      rm -rf "$hermes_home/plugins/caos-hooks"
+      cp -RL "$CAOS_STACK_HERMES_PROFILE/plugins/caos-hooks" "$hermes_home/plugins/caos-hooks"
       HERMES_HOME="$hermes_home" "$hermes_bin" config set \
         plugins.entries.caos-hooks.granted_capabilities '["tools.override"]' \
         >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
@@ -768,12 +801,15 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
       # resolves them from this profile's own .env at MCP-launch time, the
       # same mechanism the caos distribution's own config.yaml already
       # relies on, not something this script evaluates itself).
-      HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_servers \
+      # --force: without it, a SECOND run of this exact call (mcp_servers
+      # already existing as a recognized section from the first) is
+      # refused outright -- "'mcp_servers' is a configuration section...
+      # Use --force to replace the entire section" -- confirmed the hard
+      # way, this killed a whole `caosd up` on the very next restart.
+      HERMES_HOME="$hermes_home" "$hermes_bin" config set --force mcp_servers \
         '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_LLM_STEP_REV":"${CAOS_LLM_STEP_REV}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}"},"timeout":1800,"connect_timeout":300}}' \
         >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
     fi
-    HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled "$plugins" \
-      >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
   }
   apply_caos_profile_hardening
 
