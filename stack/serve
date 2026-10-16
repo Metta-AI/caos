@@ -615,11 +615,6 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   hermes_home="$CAOS_STACK_STATE/hermes"
   mkdir -p "$hermes_home"
 
-  HERMES_HOME="$hermes_home" "$hermes_bin" profile install "$CAOS_STACK_HERMES_PROFILE" --name caos --force -y \
-    >"$CAOS_STACK_LOGS/hermes-install.log" 2>&1 \
-    || fail "installing the bundled hermes profile (see $CAOS_STACK_LOGS/hermes-install.log)"
-  write_caos_env_file "$hermes_home/profiles/caos/.env"
-
   # NOW INERT, given the loopback bind above -- kept rather than deleted, in
   # case CAOS_STACK_HERMES_PORT/the bind ever needs to go back to 0.0.0.0 for
   # local debugging (e.g. reaching the dashboard directly without an iroh
@@ -684,9 +679,10 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
     "from plugins.dashboard_auth.basic import hash_password; print(hash_password('$hermes_password'))")
 
   # MACHINE-LEVEL config (dashboard.basic_auth + enabling the `basic`
-  # provider plugin) -- NOT the profile's own config.yaml. `hermes serve`
-  # unifies every profile behind ONE server and reads this gate from the
-  # root, never from --profile (see above).
+  # provider plugin) -- NOT a profile's own config.yaml, and genuinely
+  # root-only: `hermes serve` unifies every profile behind ONE server and
+  # reads its OWN login gate from the root, never from --profile (see
+  # above) -- there is no per-profile equivalent to set.
   HERMES_HOME="$hermes_home" "$hermes_bin" config set dashboard.basic_auth.username caos \
     >"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
   HERMES_HOME="$hermes_home" "$hermes_bin" config set dashboard.basic_auth.password_hash "$hermes_hash" \
@@ -699,70 +695,87 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # the operator's own Nous account) inside this HERMES_HOME. That registration
   # writes HERMES_DASHBOARD_OAUTH_CLIENT_ID into $hermes_home/.env itself,
   # which write_caos_env_file's preserve-filter leaves untouched, so it
-  # survives every future `caosd up` with no extra wiring here. `basic` stays
-  # listed alongside it as a login that needs no Nous account. `caos-hooks`
-  # rides along too, below, whenever the root profile also gets caos's own
-  # tools -- plugins.enabled is a single allowlist, so it has to be set once,
-  # with every plugin this gateway wants listed together, not accumulated
-  # across separate calls (a later `config set plugins.enabled` REPLACES the
-  # list, it does not append to it).
-  caos_root_plugins='["basic","nous"]'
-  if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
-    caos_root_plugins='["basic","nous","caos-hooks"]'
-  fi
-  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled "$caos_root_plugins" \
+  # survives every future `caosd up` with no extra wiring here.
+  HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
-  # The SAME toolset ban the caos profile's own config.yaml applies to
-  # itself (agent.disabled_toolsets: terminal/file/code_execution), applied
-  # HERE TOO, at the root -- closing a real gap, not a theoretical one:
+  # Cheap, no-`hermes`-subprocess check: has root's own config.yaml already
+  # been hardened? Lets this stay idempotent/cheap to re-run across restarts
+  # without spawning `hermes config set` subprocesses for keys that already
+  # hold the right value.
+  profile_is_hardened() { # <config.yaml path>
+    local cfg=$1
+    [ -f "$cfg" ] || return 1
+    grep -q '^  disabled_toolsets:' "$cfg" || return 1
+    if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
+      grep -q '^mcp_servers:' "$cfg" || return 1
+    fi
+    return 0
+  }
+
+  # Apply caos's hardening -- the SAME toolset ban caos's own distribution
+  # applies to itself (agent.disabled_toolsets: terminal/file/code_execution)
+  # -- and, by default, caos's own MCP tools too -- to the ROOT `default`
+  # profile ONLY, for now.
+  #
+  # WHY THIS EXISTS AT ALL, not just on a separately named `caos` profile:
   # `hermes serve` is multi-profile and profile choice is the CONNECTING
-  # CLIENT's (nothing server-side forces anyone onto `caos` specifically --
-  # Hermes refuses to let a distribution install itself AS `default`, "that
-  # name is the built-in root profile" -- so a client that never adds
-  # `?profile=caos` lands on bare `default` instead). Confirmed directly:
-  # `default` already has a real model configured (Nous Portal, plus a
-  # live ANTHROPIC_API_KEY credential) and, without this, none of caos's own
-  # restrictions -- stock `terminal`/`file`/`code_execution` fully enabled,
-  # which is genuine shell access to this container (it runs runnerd and can
-  # reach the docker socket) for literally anyone who connects without
-  # bothering with the query param. This does not need to track caos's own
-  # config.yaml (a profile distribution's reinstall never touches the root),
-  # so it is set once here, the same way as the dashboard keys above.
-  # UNCONDITIONAL, regardless of CAOS_STACK_HERMES_DEFAULT_TOOLS below: even
-  # a `default` WITH caos's own tools should never regain the stock ones
-  # caos itself bans -- the two settings are independent, not a toggle pair.
-  HERMES_HOME="$hermes_home" "$hermes_bin" config set agent.disabled_toolsets \
-    '["terminal","file","code_execution"]' \
-    >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+  # CLIENT's -- nothing server-side forces anyone onto any specific profile
+  # (Hermes refuses to let a distribution install itself AS `default`, "that
+  # name is the built-in root profile"), so a client that never bothers
+  # picking a profile lands on bare `default` instead. Confirmed directly:
+  # `default` already had a real model configured (Nous Portal, plus a live
+  # ANTHROPIC_API_KEY credential) and none of caos's own restrictions --
+  # stock `terminal`/`file`/`code_execution` fully enabled, genuine shell
+  # access to this container (it runs runnerd and can reach the docker
+  # socket). This closes exactly that gap, unconditionally, every boot.
+  #
+  # DELIBERATELY NOT GENERALIZED to every OTHER profile someone might create
+  # (a `hermes profile create <name>`, or Desktop's own `+` -- confirmed a
+  # real, remotely-reachable path: it POSTs to /api/profiles on the
+  # connected backend and the new profile is live immediately, no admin
+  # step). That needs a real answer to "does this gateway's single `hermes
+  # serve` process apply plugins/mcp_servers per-profile or once for
+  # everything it multiplexes" before building anything -- a write-once
+  # (or even a poll) is racy against a profile created mid-session, and the
+  # right fix depends on that still-unverified answer. Tracked as separate,
+  # deliberately deferred work -- `root` (this `default` profile) and the
+  # still-installed `caos`/`malcolm` profiles are the only profiles this
+  # gateway has today, so it is not an active gap on THIS stack.
+  apply_caos_profile_hardening() {
+    local cfg="$hermes_home/config.yaml" env_file="$hermes_home/.env" \
+      plugins='["basic","nous"]'
+    profile_is_hardened "$cfg" && return 0
 
-  # Give `default` the SAME caos MCP wiring the `caos` profile itself gets,
-  # default ON: a crippled, tool-less `default` was only ever an accident of
-  # the toolset ban above landing before this did, not a considered
-  # trust boundary -- caos's own tools are content-addressed and
-  # containerized (no shell, no raw filesystem), so there is nothing this
-  # withholds for security reasons once the stock toolsets are banned
-  # either way. Set CAOS_STACK_HERMES_DEFAULT_TOOLS=no to go back to the
-  # old crippled-default behavior instead.
-  if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
-    write_caos_env_file "$hermes_home/.env"
-    HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.entries.caos-hooks.granted_capabilities \
-      '["tools.override"]' \
+    HERMES_HOME="$hermes_home" "$hermes_bin" config set agent.disabled_toolsets \
+      '["terminal","file","code_execution"]' \
       >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
-    HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_discovery_timeout 180 \
+
+    if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
+      plugins='["basic","nous","caos-hooks"]'
+      write_caos_env_file "$env_file"
+      HERMES_HOME="$hermes_home" "$hermes_bin" config set \
+        plugins.entries.caos-hooks.granted_capabilities '["tools.override"]' \
+        >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+      HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_discovery_timeout 180 \
+        >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+      HERMES_HOME="$hermes_home" "$hermes_bin" config set \
+        mcp_single_query_discovery_timeout 180 \
+        >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+      # One JSON object for the whole mcp_servers key (matches
+      # integrations/hermes/config.yaml's own mcp_servers.caos entry exactly;
+      # the ${VAR} forms are written LITERALLY -- hermes's own config loader
+      # resolves them from this profile's own .env at MCP-launch time, the
+      # same mechanism the caos distribution's own config.yaml already
+      # relies on, not something this script evaluates itself).
+      HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_servers \
+        '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_LLM_STEP_REV":"${CAOS_LLM_STEP_REV}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}"},"timeout":1800,"connect_timeout":300}}' \
+        >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
+    fi
+    HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled "$plugins" \
       >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
-    HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_single_query_discovery_timeout 180 \
-      >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
-    # One JSON object for the whole mcp_servers key (matches
-    # integrations/hermes/config.yaml's own mcp_servers.caos entry exactly;
-    # the ${VAR} forms are written LITERALLY -- hermes's own config loader
-    # resolves them from this same $hermes_home/.env at MCP-launch time, the
-    # same mechanism the caos profile's own config.yaml already relies on,
-    # not something this script evaluates itself).
-    HERMES_HOME="$hermes_home" "$hermes_bin" config set mcp_servers \
-      '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_LLM_STEP_REV":"${CAOS_LLM_STEP_REV}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}"},"timeout":1800,"connect_timeout":300}}' \
-      >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
-  fi
+  }
+  apply_caos_profile_hardening
 
   echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop); Desktop's Remote-gateway connection form still wants a Session token -- use \$CAOS_DATA/stack/hermes-gateway-ws.secret" >&2
   start hermes env HERMES_HOME="$hermes_home" \
