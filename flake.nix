@@ -551,6 +551,17 @@
             # own, and flock(1) to serialise the copy that precedes it —
             # several containers seed one volume (see stack/bootstrap).
             linuxPkgs.util-linux
+            # Bridges the bundled Hermes gateway to a desktop client over iroh
+            # (stack/serve's CAOS_STACK_HERMES=yes block): `dumbpipe listen-tcp`
+            # splices to the gateway's own loopback-bound port, and the client
+            # side runs the SAME stock binary with `connect-tcp`. No caos-authored
+            # protocol here on purpose -- see design/iroh-transport.md's token
+            # rationale, which does not apply to a single-operator bridge with no
+            # other identity to protect: the gateway's own auth gate is off
+            # entirely (loopback bind), so the ticket IS the only credential,
+            # same security shape a caos-authored token would have added nothing
+            # over.
+            linuxPkgs.dumbpipe
             (if pkgs.stdenv.hostPlatform.isLinux then
               linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
             else
@@ -1666,8 +1677,10 @@ sandbox = false''
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
               if [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                echo "==> hermes gateway on http://127.0.0.1:$HERMES_PORT -- sign in as 'caos'," >&2
-                echo "    password in \$CAOS_DATA/stack/hermes-gateway.secret" >&2
+                echo "==> hermes gateway bound to 127.0.0.1:$HERMES_PORT inside the container --" >&2
+                echo "    its own login is off (loopback bind); reach it over the iroh bridge:" >&2
+                echo "    ticket in \$CAOS_DATA/stack/logs/caos-iroh-hermes.log, then on the" >&2
+                echo "    desktop: dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>" >&2
               fi
               ;;
             down)

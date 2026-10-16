@@ -120,22 +120,19 @@
 #                             container may not have). Required when
 #                             CAOS_STACK_HERMES=yes.
 #   CAOS_STACK_HERMES_PORT    port the gateway binds (default 9119, hermes's
-#                             own default). Reachable two ways: directly over
-#                             plain HTTP wherever `caosd up`'s own docker
-#                             publish reaches (not loopback-restricted, same
-#                             as :9090 -- a login is still required, see
-#                             basic_auth below), and through the SEPARATE
-#                             iroh relay below -- never through the main
-#                             caos-iroh endpoint's own protocol.
+#                             own default), loopback-only -- its own auth gate
+#                             is off (see the `CAOS_STACK_HERMES=yes` block in
+#                             the body), so the ONLY way in from outside this
+#                             container is the iroh bridge below
+#                             (`dumbpipe listen-tcp`/`connect-tcp`, a stock
+#                             binary on both ends) -- never through the main
+#                             caos-iroh endpoint's own request-line protocol.
 #   CAOS_STACK_HERMES_OIDC_ISSUER / _CLIENT_ID / _CLIENT_SECRET
-#                             NOT currently wired up. Per-user identity now
-#                             runs through the bundled `nous` provider instead
-#                             (OAuth against Nous Portal, not a self-hosted
-#                             IdP) -- `basic` stays on as a login that needs no
-#                             Nous account; `nous` activates once someone runs
-#                             `hermes auth add nous --type oauth` +
-#                             `hermes dashboard register` once by hand inside
-#                             this gateway's HERMES_HOME. `self_hosted` OIDC
+#                             NOT currently wired up, and currently moot: the
+#                             gateway's own login (`basic`/`nous`, below) never
+#                             engages at all while it's loopback-only. Kept for
+#                             a future local-debugging mode that puts the bind
+#                             back on 0.0.0.0; `self_hosted` OIDC
 #                             (a real IdP: Authentik, Keycloak, Okta, Google,
 #                             ...) is still an option later if a bare Nous
 #                             account isn't the right identity source -- these
@@ -148,13 +145,20 @@
 #                             self.dirtyRev`, the same source CAOS_REV uses.
 #   CAOS_STACK_HERMES_BIN     override for the `hermes` binary name/path
 #                             (default: `hermes` on PATH)
-#   CAOS_STACK_IROH_HERMES_STATE / _PORT / _ADVERTISE
-#                             the hermes-only iroh relay's own state dir
-#                             (default $CAOS_STACK_STATE/iroh-hermes), UDP
-#                             port (default 11205 -- the main caos-iroh
-#                             endpoint's own 11204 is a DIFFERENT endpoint and
-#                             cannot share it) and advertised addresses. Only
-#                             started when CAOS_STACK_IROH=yes as well.
+#   CAOS_STACK_IROH_HERMES_STATE / _PORT
+#                             the hermes bridge's own state dir (default
+#                             $CAOS_STACK_STATE/iroh-hermes, holding just a
+#                             persisted `secret` file -- dumbpipe's IROH_SECRET,
+#                             so the ticket survives a restart) and UDP port
+#                             (default 11205 -- the main caos-iroh endpoint's
+#                             own 11204 is a DIFFERENT endpoint and cannot
+#                             share it). Only started when CAOS_STACK_HERMES=
+#                             yes; does NOT depend on CAOS_STACK_IROH, since
+#                             it is a separate, independent `dumbpipe`
+#                             endpoint, not a feature of caos-iroh's own.
+#                             No _ADVERTISE: dumbpipe has no such flag, and
+#                             relies on dialing through its relay same as any
+#                             ordinary iroh endpoint would.
 #
 # Passed through to runnerd untouched, because they are the caller's business:
 # DOCKER_HOST (which engine), CAOS_DOCKER_NETWORK (which netns workers join),
@@ -425,33 +429,51 @@ if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
     --git-dir "$CAOS_STACK_STATE/git" \
     --relay "$CAOS_IROH_RELAY" \
     "${iroh_advertise[@]}"
+fi
 
-  # A SEPARATE endpoint and ticket for the bundled hermes gateway, not a fourth
-  # name in caos-iroh's own request-line protocol: hermes already gates real
-  # access with its own login (self_hosted OIDC, below), so a client that
-  # wants nothing but the gateway should not have to speak -- or even know
-  # about -- the protocol that multiplexes caos and git onto one endpoint.
-  # `caos-iroh relay` is exactly that: one token line, then a raw splice.
-  if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
-    IROH_HERMES_STATE=${CAOS_STACK_IROH_HERMES_STATE:-$CAOS_STACK_STATE/iroh-hermes}
-    mkdir -p "$IROH_HERMES_STATE"
-    # Its OWN --advertise set, not iroh_advertise above: those addresses were
-    # named for the main server's port (11204 by default), and reusing them
-    # here would advertise the WRONG port for this endpoint's own (11205).
-    iroh_hermes_advertise=()
-    for addr in ${CAOS_STACK_IROH_HERMES_ADVERTISE:-}; do
-      iroh_hermes_advertise+=(--advertise "$addr")
-    done
-    # A DIFFERENT UDP port from the main caos-iroh serve above (default
-    # 11204): two endpoints cannot share one port in this container's network
-    # namespace. 11205 is otherwise unclaimed.
-    start caos-iroh-hermes "$CAOS_STACK_BIN/caos-iroh" relay \
-      --state "$IROH_HERMES_STATE" \
-      --to "127.0.0.1:$HERMES_PORT" \
-      --relay "$CAOS_IROH_RELAY" \
-      --port "${CAOS_STACK_IROH_HERMES_PORT:-11205}" \
-      "${iroh_hermes_advertise[@]}"
+# A SEPARATE endpoint and ticket for the bundled hermes gateway, reached by a
+# STOCK `dumbpipe` on both ends (design/iroh-transport.md's token rationale
+# doesn't apply here: that token exists because an endpoint id can otherwise
+# be the only thing standing between the internet and a caos server that
+# runs containers and sees every secret -- this bridge protects nothing of
+# the kind, since `hermes serve` below binds LOOPBACK specifically so its
+# own auth gate is off entirely (Hermes's dashboard-auth skill: the gate
+# engages ONLY on a non-loopback bind). The ticket is already the one and
+# only credential either way; a caos-authored token-then-splice protocol on
+# top would add nothing a stock binary doesn't already give for free, and
+# costs a client-side tool nobody else has to build or install.
+# `dumbpipe connect-tcp <ticket>` on the desktop end is the whole client.
+#
+# INDEPENDENT of CAOS_STACK_IROH/CAOS_IROH_RELAY above, deliberately: those
+# exist because `caos_iroh::endpoint_builder` never uses n0's own relays (a
+# Claude Code cloud container can't reach them -- see that function's own
+# comment), so the MAIN caos-iroh endpoint needs an explicitly named relay of
+# this server's own or it fails fast rather than mint an unreachable ticket.
+# A stock `dumbpipe`, in contrast, is happy with iroh's ordinary default relay
+# infrastructure -- it takes no `--relay` flag at all -- so requiring
+# CAOS_STACK_IROH=yes here too would force standing up a relay this specific
+# bridge has no actual need for, just to reach your own bundled dashboard.
+if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
+  IROH_HERMES_STATE=${CAOS_STACK_IROH_HERMES_STATE:-$CAOS_STACK_STATE/iroh-hermes}
+  mkdir -p "$IROH_HERMES_STATE"
+  # A persisted secret key, the same reasoning as hermes-gateway.secret
+  # below: dumbpipe mints a random one per process otherwise, which would
+  # mint a brand new endpoint id (and so a dead ticket) on every `caosd up`.
+  hermes_iroh_secret="$IROH_HERMES_STATE/secret"
+  if [ ! -s "$hermes_iroh_secret" ]; then
+    (umask 177 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$hermes_iroh_secret")
   fi
+  # A fixed port (not dumbpipe's default random one), so the ticket's own
+  # direct addresses stay useful across restarts for a firewall rule or a
+  # direct (non-relayed) connection -- same reasoning as caos-iroh's own
+  # bind_endpoint. 11205, unclaimed by the main caos-iroh endpoint's 11204
+  # (only actually in use when CAOS_STACK_IROH=yes, but kept distinct
+  # regardless so the two never collide if both happen to run).
+  start caos-iroh-hermes env IROH_SECRET="$(cat "$hermes_iroh_secret")" \
+    dumbpipe listen-tcp \
+    --host "127.0.0.1:$HERMES_PORT" \
+    --ipv4-addr "0.0.0.0:${CAOS_STACK_IROH_HERMES_PORT:-11205}" \
+    --ipv6-addr "[::]:${CAOS_STACK_IROH_HERMES_PORT:-11205}"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -
@@ -517,14 +539,20 @@ fi
 # none of this; dropping --profile costs nothing a session needs, since the
 # profile is a connecting client's choice regardless.
 #
-# BOUND 0.0.0.0, NOT loopback: reached through docker's own port-publish
-# (`-p 127.0.0.1:$PORT:$PORT` on the host side, kept to the host's own
-# loopback), which forwards onto the container's EXTERNAL interface, not its
-# loopback -- a process bound only to 127.0.0.1 inside a container is not
-# reachable that way at all (a container-networking fact, not a caos or
-# Hermes one). A non-loopback bind engages Hermes's own auth gate
-# unconditionally, so the credentials below are not optional hardening --
-# they are the only way this starts at all.
+# BOUND 127.0.0.1, ON PURPOSE: this is what turns Hermes's own dashboard-auth
+# gate off entirely (Hermes's dashboard-auth skill: the gate engages ONLY on a
+# non-loopback bind, no override flag exists that skips it while keeping a
+# non-loopback bind). Real access control for this gateway is the iroh bridge
+# below (a stock `dumbpipe listen-tcp` pointed at this same port) rather than
+# Hermes's own login -- the login never provided per-user identity or
+# isolation anyway (every authenticated user shares one profile and its full
+# session history regardless of which provider they logged in through), so a
+# second, weaker gate in front of it bought nothing. The direct
+# docker-published port (`-p 127.0.0.1:$PORT:$PORT` on the host side) now
+# reaches nothing: docker's forward lands on the container's EXTERNAL
+# interface, which a loopback-bound process cannot see (same fact as the
+# reverse case this comment used to describe) -- the iroh bridge is the only
+# way in from outside this container now.
 if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   : "${CAOS_STACK_HERMES_PROFILE:?serve needs CAOS_STACK_HERMES_PROFILE when CAOS_STACK_HERMES=yes}"
   hermes_bin=${CAOS_STACK_HERMES_BIN:-hermes}
@@ -573,19 +601,14 @@ HERMESENV
     fi
   } >"$env_file"
 
-  # FIXED USERNAME/PASSWORD AS A FALLBACK -- quick to stand up, fine for a
-  # trusted network or as a break-glass login if Nous Portal is unreachable.
-  # `nous` (dashboard.oauth.*, enabled alongside `basic` below) is the real
-  # per-user-identity path now: OAuth against Nous Portal, which itself offers
-  # Google/Microsoft/GitHub/email upstream -- no per-provider dev keys needed
-  # on this gateway's side at all. Activate it once, by hand, with
-  # `hermes auth add nous --type oauth` (device-code login, no loopback port
-  # needed) then `hermes dashboard register` inside this HERMES_HOME; it
-  # writes HERMES_DASHBOARD_OAUTH_CLIENT_ID into $hermes_home/.env, a file
-  # this script never touches, so it survives every future `caosd up`.
-  # `self_hosted` OIDC (per-user identity from your OWN IdP instead of a Nous
-  # account) is still there if that's ever the better fit -- deliberately
-  # unused for now.
+  # NOW INERT, given the loopback bind above -- kept rather than deleted, in
+  # case CAOS_STACK_HERMES_PORT/the bind ever needs to go back to 0.0.0.0 for
+  # local debugging (e.g. reaching the dashboard directly without an iroh
+  # client installed). FIXED USERNAME/PASSWORD AS A FALLBACK, `nous` OAuth
+  # against Nous Portal (Google/Microsoft/GitHub/email upstream, no
+  # per-provider dev keys on this gateway's side) as the real per-user path,
+  # `self_hosted` OIDC reserved for a future real IdP -- none of them matter
+  # while nothing but 127.0.0.1 can reach this port.
   #
   # The gateway's own login credential, generated ONCE and kept OUTSIDE the
   # profile dir: the install above is `--force`d on every boot (so a tree
@@ -644,10 +667,10 @@ HERMESENV
   HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
-  echo "caosd serve: hermes gateway on :$HERMES_PORT -- sign in as 'caos', password in $hermes_secret" >&2
+  echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop)" >&2
   start hermes env HERMES_HOME="$hermes_home" \
     HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$hermes_session_secret")" \
-    "$hermes_bin" serve --host 0.0.0.0 --port "$HERMES_PORT" --skip-build
+    "$hermes_bin" serve --host 127.0.0.1 --port "$HERMES_PORT" --skip-build
 fi
 
 # Not `[ ... ] && ...`: under `set -e` a false test would make that list the
