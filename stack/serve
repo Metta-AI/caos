@@ -635,6 +635,24 @@ HERMESENV
     (umask 177 && head -c 32 /dev/urandom | base64 >"$hermes_session_secret")
   fi
 
+  # The DASHBOARD SESSION TOKEN -- a THIRD, independent secret from the two
+  # above, and the one that actually matters for this bridge: it gates
+  # sensitive /api routes regardless of dashboard-auth login state, and on a
+  # LOOPBACK bind (ours, now) it is the ONLY credential Hermes Desktop's own
+  # "Remote gateway" connection form will accept -- the form always demands
+  # either a session token or OAuth to save a connection at all, even when
+  # the backend needs neither (a known Desktop UI gap, not specific to this
+  # gateway). Left unset, `hermes serve` mints a fresh random one every
+  # single boot with nothing printed anywhere to copy it from, so pin and
+  # persist it the same way as the two secrets above. Passed as an env var
+  # on the `hermes serve` invocation ONLY, never written into .env: Hermes
+  # loads `~/.hermes/.env` with override=True, which would force this same
+  # value onto every OTHER hermes process on the machine, not just this one.
+  hermes_ws_token="$CAOS_STACK_STATE/hermes-gateway-ws.secret"
+  if [ ! -s "$hermes_ws_token" ]; then
+    (umask 177 && head -c 32 /dev/urandom | base64 >"$hermes_ws_token")
+  fi
+
   # Locating the interpreter hash_password() needs: the `hermes` wrapper nix
   # builds bakes it in as `export HERMES_PYTHON='...'` for exactly this (no
   # public subcommand does it). Pure text extraction, not sourcing -- the
@@ -667,9 +685,10 @@ HERMESENV
   HERMES_HOME="$hermes_home" "$hermes_bin" config set plugins.enabled '["basic","nous"]' \
     >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
-  echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop)" >&2
+  echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop); Desktop's Remote-gateway connection form still wants a Session token -- use \$CAOS_DATA/stack/hermes-gateway-ws.secret" >&2
   start hermes env HERMES_HOME="$hermes_home" \
     HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$hermes_session_secret")" \
+    HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$hermes_ws_token")" \
     "$hermes_bin" serve --host 127.0.0.1 --port "$HERMES_PORT" --skip-build
 fi
 

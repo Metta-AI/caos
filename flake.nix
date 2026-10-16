@@ -1681,6 +1681,9 @@ sandbox = false''
                 echo "    its own login is off (loopback bind); reach it over the iroh bridge:" >&2
                 echo "    ticket in \$CAOS_DATA/stack/logs/caos-iroh-hermes.log, then on the" >&2
                 echo "    desktop: dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>" >&2
+                echo "    Desktop's own Remote-gateway form still wants a Session token (its" >&2
+                echo "    Add-connection dialog always does, even when the backend needs none)" >&2
+                echo "    -- paste \$CAOS_DATA/stack/hermes-gateway-ws.secret" >&2
               fi
               ;;
             down)
