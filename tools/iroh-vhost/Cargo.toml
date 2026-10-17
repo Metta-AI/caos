@@ -1,0 +1,17 @@
+[package]
+name = "iroh-vhost"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP gateway: http://<dumbpipe ticket>.localhost/path reaches the host:port that ticket's `dumbpipe listen-tcp` forwards to"
+
+# Standalone: not a member of ../../rust, so it never touches the caos
+# workspace lock or the vendored-deps bake.
+[workspace]
+
+[dependencies]
+iroh = { version = "1", default-features = false, features = ["tls-ring", "platform-verifier"] }
+iroh-relay = { version = "1", default-features = false, features = ["platform-verifier"] }
+iroh-tickets = "1"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread", "macros", "io-util", "net", "time", "sync",
+] }
