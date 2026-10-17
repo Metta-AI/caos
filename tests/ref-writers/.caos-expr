@@ -1,0 +1,4 @@
+# tests/ref-writers, as an ENTRY: a CLIENT test (design/ref-writers.md). It
+# drives `caos-cli` against the stack under test, so its base is
+# `DEEP-DEPS/cli-test`, which stages a repo and runs `worker1` in it.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.

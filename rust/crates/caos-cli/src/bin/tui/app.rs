@@ -4238,6 +4238,11 @@ mod tests {
         let remote_path = remote.to_string_lossy().to_string();
         git_ok(&dir, &["init", "--bare", "-q", &remote_path]);
         let git_dir = format!("--git-dir={remote_path}");
+        // A caos server accepts the push option carrying a ref write's proof.
+        git_ok(
+            &dir,
+            &[&git_dir, "config", "receive.advertisePushOptions", "true"],
+        );
         let default_ref = format!("refs/heads/{branch}");
         git_ok(&dir, &[&git_dir, "symbolic-ref", "HEAD", &default_ref]);
         git_ok(&dir, &["remote", "add", "origin", &remote_path]);

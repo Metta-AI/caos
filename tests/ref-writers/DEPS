@@ -1,0 +1,4 @@
+# The client-test image, and the worker image the test's jobs push from
+# (dev/worker-test has git; std/bash does not).
+../../dev/cli-test cli-test
+../../dev/worker-test worker-test
