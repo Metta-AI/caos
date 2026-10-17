@@ -42,3 +42,4 @@ path = "../git-locator"
 
 [dependencies.conversation-protocol]
 path = "../conversation-protocol"
+features = ["ed25519"]

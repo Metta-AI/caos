@@ -39,6 +39,10 @@ pub(crate) struct Context {
     conversation: Option<String>,
     /// The conversation's head tree, when a `reader:@=` grant names it.
     head: Option<String>,
+    /// Which writer this run acts for (design/ref-writers.md). Not a secret
+    /// and not in any key; it rides here because this is what reaches every
+    /// sub-run.
+    writes: crate::ref_writers::Writes,
 }
 
 impl Context {
@@ -89,7 +93,17 @@ impl Context {
             pins: Arc::new(pins),
             conversation,
             head,
+            writes: crate::ref_writers::Writes::None,
         })
+    }
+
+    pub(crate) fn with_writes(mut self, writes: crate::ref_writers::Writes) -> Context {
+        self.writes = writes;
+        self
+    }
+
+    pub(crate) fn writes(&self) -> &crate::ref_writers::Writes {
+        &self.writes
     }
 
     pub(crate) fn is_empty(&self) -> bool {

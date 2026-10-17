@@ -155,11 +155,15 @@ enum IntegrityDepth {
 }
 
 const V3_PREFIX: &str = "refs/caos/v3/";
+/// Ref-writers namespaces (design/ref-writers.md): conversation heads and
+/// `writers` lists, held to the same rules as v3 heads.
+const NAMESPACE_PREFIX: &str = conversation_protocol::v3::writers::NAMESPACE_PREFIX;
 
 fn integrity_depth(refname: &str) -> IntegrityDepth {
     if refname.starts_with("refs/caos/req/")
         || refname.starts_with("refs/caos/res/")
         || refname.starts_with(V3_PREFIX)
+        || refname.starts_with(NAMESPACE_PREFIX)
     {
         IntegrityDepth::TargetOnly
     } else {
@@ -170,9 +174,10 @@ fn integrity_depth(refname: &str) -> IntegrityDepth {
 // A v3 conversation head is never rewound: an older reflog value can name a
 // state whose write-ahead effects (a landed publication push, half of an atomic
 // spawn) already happened. The loose ref is dropped and the reflog kept for a
-// human to restore from.
+// human to restore from. Nor is a `writers` list: an older one can name a
+// writer since removed.
 fn reflog_recoverable(refname: &str) -> bool {
-    !refname.starts_with(V3_PREFIX)
+    !refname.starts_with(V3_PREFIX) && !refname.starts_with(NAMESPACE_PREFIX)
 }
 
 #[derive(Default)]
@@ -379,6 +384,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn a_namespaced_ref_is_checked_and_kept_like_a_v3_head() {
+        for name in [
+            "refs/caos/v3/conversations/74616c6b/head",
+            "refs/caos/w/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/writers",
+        ] {
+            assert!(integrity_depth(name) == IntegrityDepth::TargetOnly);
+            assert!(!reflog_recoverable(name));
+        }
+        assert!(reflog_recoverable("refs/heads/main"));
+    }
 
     fn temp_repo() -> (gix::ThreadSafeRepository, PathBuf) {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);

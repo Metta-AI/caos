@@ -19,9 +19,10 @@ pub use tasks::{TaskRecord, TaskStatus};
 pub mod source_trees;
 pub mod validate;
 pub mod view;
+pub mod writers;
 
 #[cfg(feature = "git-cli")]
-pub use git_store::{GitStore, RefUpdate};
+pub use git_store::{GitStore, PushAuth, RefUpdate};
 pub use kinds::Kind;
 pub use oid::Oid;
 pub use reconcile::{reconcile, CodeOps};
