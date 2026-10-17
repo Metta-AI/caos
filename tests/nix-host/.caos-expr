@@ -1,0 +1,10 @@
+# tests/nix-host, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# THE TREE TO CHECK IS NOT AN ARGUMENT, for the reason tests/lint gives: `std`
+# and `prod` carry `.caos-expr` files, so binding them with `--x:@=DEEP-DEPS/…`
+# would EVALUATE them — building every std entry to type-check a NixOS module.
+# The deepened tree arrives anyway, because dev/run-test runs a test with
+# `run-then <the test's own tree>`, so `/cas/args/in/DEEP-DEPS` is exactly
+# these mounts, unevaluated and laid out like the repo.
+curry --base:@=DEEP-DEPS/test-stack --worker1:@=worker.sh
