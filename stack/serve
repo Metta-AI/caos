@@ -158,9 +158,14 @@
 #                             (default: `hermes` on PATH)
 #   CAOS_STACK_IROH_HERMES_STATE / _PORT
 #                             the hermes bridge's own state dir (default
-#                             $CAOS_STACK_STATE/iroh-hermes, holding just a
-#                             persisted `secret` file -- dumbpipe's IROH_SECRET,
-#                             so the ticket survives a restart) and UDP port
+#                             $CAOS_STACK_STATE/iroh-hermes -- mirrors the
+#                             main caos-iroh endpoint's own $IROH_STATE
+#                             layout: a persisted `secret` file (dumbpipe's
+#                             IROH_SECRET, so the ticket survives a restart)
+#                             and a `ticket` file holding the current
+#                             connect-tcp ticket, pulled out of dumbpipe's
+#                             own stderr since it has no --ticket-file of
+#                             its own) and UDP port
 #                             (default 11205 -- the main caos-iroh endpoint's
 #                             own 11204 is a DIFFERENT endpoint and cannot
 #                             share it). Only started when CAOS_STACK_HERMES=
@@ -530,6 +535,44 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
     --host "127.0.0.1:$HERMES_PORT" \
     --ipv4-addr "0.0.0.0:${CAOS_STACK_IROH_HERMES_PORT:-11205}" \
     --ipv6-addr "[::]:${CAOS_STACK_IROH_HERMES_PORT:-11205}"
+
+  # A `ticket` FILE in $IROH_HERMES_STATE, mirroring the main caos-iroh
+  # endpoint's own $IROH_STATE/ticket -- not just a log line. Unlike
+  # `caos-iroh`, plain `dumbpipe` has no --ticket-file/equivalent of its own
+  # (checked its --help directly): it only ever prints the ticket on
+  # stderr, as part of a human-readable "dumbpipe connect-tcp <ticket>"
+  # line, which is all caos-iroh-hermes.log has ever held. Pull the ticket
+  # back out of that same log and persist it as its own file, so
+  # `cat $IROH_HERMES_STATE/ticket` works the same way it already does for
+  # the main endpoint, instead of grep-ing a log by hand.
+  #
+  # SYNCHRONOUS, not backgrounded: a bare `wait -n` (the supervisor below)
+  # waits on ANY background job of this shell, not just the ones tracked in
+  # $pids -- confirmed the hard way, a backgrounded version of this exact
+  # poll loop finished after ~10s and the supervisor treated that completely
+  # unrelated exit as "a member died", tearing down the whole stack a few
+  # seconds after every `caosd up`. Blocking here instead costs at most 10s
+  # of startup, once, and guarantees the ticket file exists before this
+  # script ever reports "stack up".
+  hermes_ticket_log="$CAOS_STACK_LOGS/caos-iroh-hermes.log"
+  for _ in $(seq 1 50); do
+    hermes_ticket=$(grep -o 'dumbpipe connect-tcp [a-z0-9]*' "$hermes_ticket_log" 2>/dev/null \
+      | awk '{print $NF}') || true
+    if [ -n "$hermes_ticket" ]; then
+      printf '%s\n' "$hermes_ticket" >"$IROH_HERMES_STATE/ticket"
+      break
+    fi
+    sleep 0.2
+  done
+
+  # Stale leftovers from an EARLIER, no-longer-used approach for this same
+  # bridge (a caos-iroh-based one, before settling on stock dumbpipe) --
+  # `key`/`token` are caos-iroh's own state-file names, meaningless to
+  # dumbpipe, and a stale `ticket` here (caos-iroh's own `caos://...` URI
+  # form, not a dumbpipe ticket at all) would be actively misleading
+  # sitting next to the real one this now writes. Removed once, every
+  # boot, before the real ticket file above gets written.
+  rm -f "$IROH_HERMES_STATE/key" "$IROH_HERMES_STATE/token"
 fi
 
 # --- core-seeder-runner: the bootstrap answerer, when this placement wants it -
@@ -825,7 +868,7 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   }
   apply_caos_profile_hardening
 
-  echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in $CAOS_STACK_LOGS/caos-iroh-hermes.log, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop); Desktop's Remote-gateway connection form still wants a Session token -- it's 'caos' (\$CAOS_DATA/stack/hermes-gateway-ws.secret) unless overridden" >&2
+  echo "caosd serve: hermes gateway bound to loopback -- its own login is off; reach it over the iroh bridge (ticket in \$CAOS_DATA/stack/iroh-hermes/ticket, 'dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>' on the desktop); Desktop's Remote-gateway connection form still wants a Session token -- it's 'caos' (\$CAOS_DATA/stack/hermes-gateway-ws.secret) unless overridden" >&2
   start hermes env HERMES_HOME="$hermes_home" \
     HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$hermes_session_secret")" \
     HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$hermes_ws_token")" \
