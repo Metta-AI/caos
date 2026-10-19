@@ -34,6 +34,11 @@ env_requires:
       remote). Read once per session, not once per profile -- different
       sessions under this same profile can still override it per-prompt;
       this is only what a session gets when it doesn't ask for anything else.
+      Always set, on every deploy -- NOT specific to dev/testing despite
+      caos-mcp-launch also querying its refs/caos/dev as an automatic,
+      always-attempted probe for --llm-step's own revision (when that probe
+      finds nothing, --llm-step falls back to Metta-AI/caos-session's own
+      main tip, hardcoded, not configured through this or any other var).
     required: true
   - name: CAOS_BIN
     description: >
@@ -43,20 +48,12 @@ env_requires:
       the only binary-resolution path a bundled (CAOS_STACK_HERMES) deploy
       uses at all.
     required: false
-  - name: CAOS_LLM_STEP_REV
-    description: >
-      Explicit commit sha (already pushed to github:Metta-AI/caos) to pin
-      --llm-step to. Set this to skip CAOS_REPO's git-rev-parse entirely --
-      the only option a bundled deploy has, since its build product carries
-      no .git. A hand-run Desktop profile usually leaves this unset and lets
-      CAOS_REPO's own HEAD supply it.
-    required: false
   - name: CAOS_REPO
     description: >
-      Path to a local caos checkout, used ONLY as a fallback: to
-      `nix build $CAOS_REPO#caos-cli` when CAOS_BIN isn't set, and to supply
-      --llm-step's pinned rev via `git -C $CAOS_REPO rev-parse HEAD` when
-      CAOS_LLM_STEP_REV isn't set. Irrelevant (and fine to leave unset) for a
-      bundled deploy, which always sets both CAOS_BIN and CAOS_LLM_STEP_REV
-      directly.
+      Path to a local caos checkout, used ONLY as a fallback to
+      `nix build $CAOS_REPO#caos-cli` when CAOS_BIN isn't set -- i.e. only
+      for building the caos BINARY. Unrelated to --llm-step resolution,
+      which no longer reads this (or any other) var at all: it's either the
+      server's own refs/caos/dev probe, or the hardcoded
+      Metta-AI/caos-session fallback.
     required: false

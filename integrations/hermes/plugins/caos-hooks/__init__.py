@@ -149,6 +149,27 @@ def _dev_sha(profile_env: dict[str, str]) -> Optional[str]:
     return out.split()[0] if out else None
 
 
+def _session_sha() -> Optional[str]:
+    """Metta-AI/caos-session's current main tip -- the DEFAULT --llm-step
+    source once no dev ref is available (see _llm_step_arg). Same bounded
+    `git ls-remote` pattern as `_dev_sha`, just against a fixed repo instead
+    of a configured server."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "https://github.com/Metta-AI/caos-session", "main"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout.strip()
+    return out.split()[0] if out else None
+
+
 def _llm_step_arg(profile_env: dict[str, str]) -> str:
     """Same rewrite scripts/caos-mcp-launch applies, and for the same reason:
     `--llm-step:@=std/llm-step` is a path relative to the resolving
@@ -158,32 +179,31 @@ def _llm_step_arg(profile_env: dict[str, str]) -> str:
     PREFERS the server's own refs/caos/dev (`_dev_sha`), same as
     caos-mcp-launch and for the identical reason: it is the one locator that
     matches what THIS stack's seeded core actually answers for, uncommitted
-    changes included, with no second version to keep in sync. Falls back to
-    CAOS_LLM_STEP_REV / CAOS_REPO's HEAD -- the only options for a deploy
-    with no refs/caos/dev to ask -- and finally to the local form, which then
-    simply fails to resolve (caught by _run_hook's own fail-open handling)
-    rather than crashing this hook outright.
+    changes included, with no second version to keep in sync.
+
+    DEFAULT, otherwise: Metta-AI/caos-session's current main tip -- the
+    SAME tree a real Claude Code session reads its own pin from (its
+    `caos-std/` mount, per that repo's root `.caos-expr` +
+    `std/flake-input-loader`), via `:@@=`'s own evaluation of
+    caos-session's `.caos-expr` chain -- no local checkout needed, since
+    `:@@=` is "exactly right for an image locator" like this one
+    (session_base.rs's own words; it was only wrong for THAT module's
+    different purpose, resolving a conversation's raw content commit, not
+    an image). No CAOS_LLM_STEP_REV/CAOS_REPO fallback anymore -- those
+    were the only options for a deploy with no refs/caos/dev to ask, and a
+    bundled gateway deploy never has either set, so this always fell
+    through to the bare local form below and failed to resolve: the exact
+    bug this default replaces.
     """
     dev_sha = _dev_sha(profile_env)
     if dev_sha:
         return f"--llm-step:@@=git+caos://local?rev={dev_sha}&dir=std/llm-step"
-    explicit_rev = _env("CAOS_LLM_STEP_REV", profile_env)
-    if explicit_rev and not _unsubstituted(explicit_rev):
-        return f"--llm-step:@@=github:Metta-AI/caos?rev={explicit_rev}&dir=std/llm-step"
-    repo = _env("CAOS_REPO", profile_env)
-    if repo and not _unsubstituted(repo) and os.path.isdir(repo):
-        try:
-            rev = subprocess.run(
-                ["git", "-C", repo, "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            ).stdout.strip()
-            if rev:
-                return f"--llm-step:@@=github:Metta-AI/caos?rev={rev}&dir=std/llm-step"
-        except Exception:
-            pass
+    session_sha = _session_sha()
+    if session_sha:
+        return (
+            "--llm-step:@@=github:Metta-AI/caos-session"
+            f"?rev={session_sha}&dir=caos-std/llm-step"
+        )
     return "--llm-step:@=std/llm-step"
 
 

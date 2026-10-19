@@ -10,33 +10,75 @@
 #    checkout to find by walking up from this script's own path anymore, so
 #    CAOS_REPO must say where it is explicitly.
 #
+# --llm-step RESOLUTION, checked in this order:
+#
+#   1. CAOS_MCP_DEFAULT_SERVER's own refs/caos/dev, if it has one -- an
+#      automatic PROBE, attempted on every single launch regardless of
+#      deployment, not something anyone calls or toggles. It only ever
+#      SUCCEEDS on a stack started from a live checkout (which is what
+#      publishes that ref), so in practice this is what runs for a local
+#      dev stack and nothing to do with prod -- but that is incidental to
+#      when the ref happens to exist, not a deliberate mode switch. This
+#      variable's own job (distribution.yaml) is "which server a session
+#      talks to", set unconditionally on every deploy; its name does not
+#      imply anything about revision resolution at all.
+#   2. DEFAULT: Metta-AI/caos-session's current main tip -- the SAME tree a
+#      real Claude Code session reads its own pin from (its `caos-std/`
+#      mount, per that repo's root `.caos-expr` + `std/flake-input-loader`;
+#      integrations/claude-code/cloud/README.md). Resolved with a plain
+#      `git ls-remote` (no local checkout needed -- this runs inside the
+#      bundled server itself, which never has one), then handed to `:@@=`
+#      AS A LOCATOR rather than parsed by hand: `:@@=` already evaluates a
+#      tree's full `.caos-expr` chain, which is "exactly right for an image
+#      locator" like this one (rust/crates/caos-cli/src/mcp/session_base.rs's
+#      own words -- it was only wrong for THAT module's different purpose,
+#      resolving a conversation's raw content commit, not an image). So
+#      `:@@=github:Metta-AI/caos-session?rev=<sha>&dir=caos-std/llm-step`
+#      lets the evaluation mount caos's std/ from caos-session's OWN
+#      flake.lock pin itself, exactly like Claude Code's own
+#      `--llm-step:@=caos-std/llm-step` does for a local checkout -- no
+#      flake.lock parsing in this script at all.
+#
+# This replaced a THIRD, caos-specific scheme (self.rev/self.dirtyRev baked in
+# at nix-evaluation time via CAOS_LLM_STEP_REV, flake.nix's caosHermesRev) that
+# never worked for prod: deploy-caosd-prod's Go driver bakes in
+# `-X main.defaultFlake=path:${self}`, a NIX STORE PATH, and re-evaluates the
+# flake from THAT for the actual NixOS build -- a store-path copy carries no
+# .git at all, so self.rev/self.dirtyRev are unconditionally empty there,
+# every single deploy, not a one-off. Claude Code never had this problem
+# because its own launch runs on a machine (or cloud container) with a real
+# local checkout or a flake.lock to read, never inside the bundled server
+# itself. An EARLIER cut of this fix added CAOS_LLM_STEP_REV/CAOS_REPO as
+# explicit, opt-in overrides on top of the two tiers above (mirroring Claude
+# Code's own --dev-commit=<sha> in spirit) -- dropped again: a bundled
+# deploy never has a local checkout OR a reason to hand-pin a commit, so
+# they were dead weight, and `caos-hooks/__init__.py`'s `_llm_step_arg`
+# (kept in sync with this script by hand) never had them refined that way
+# either.
+#
 # Required in this process's environment (from this distribution's
 # mcp_servers.caos.env in config.yaml, substituted from the installed
 # profile's .env -- see distribution.yaml's env_requires):
 #   CAOS_HERMES_DIST_DIR  this distribution's own root (for ./scripts, not
 #                         used directly here -- Hermes resolves `command:`
 #                         from it before this script ever runs)
-#   CAOS_MCP_DEFAULT_SERVER  this stack's own server -- queried first for
-#                         refs/caos/dev (see below)
+#   CAOS_MCP_DEFAULT_SERVER  this stack's own server -- see tier 1 above;
+#                            always set, not an opt-in toggle
 # Optional:
 #   CAOS_BIN           a pre-built caos binary; skips CAOS_REPO/nix entirely
-#   CAOS_LLM_STEP_REV  explicit commit sha to pin --llm-step to, for a
-#                      FALLBACK path only now (see below) -- a deploy with no
-#                      refs/caos/dev to ask
-#   CAOS_REPO          local caos checkout, fallback for BOTH of the above
-#                      when unset: `nix build $CAOS_REPO#caos-cli`, and
-#                      `git -C $CAOS_REPO rev-parse HEAD` for --llm-step
+#   CAOS_REPO          local caos checkout, used ONLY to build the binary
+#                      when CAOS_BIN isn't set (`nix build $CAOS_REPO#caos-cli`)
+#                      -- unrelated to --llm-step resolution above.
 set -euo pipefail
 
 # Hermes's config.yaml ${VAR} substitution only replaces a name that's
 # present in the installed profile's .env (even as `NAME=`) -- an optional
 # var that's absent (the default shape .env.EXAMPLE leaves commented out)
 # comes through as the LITERAL, unexpanded text "${VAR_NAME}", not an empty
-# string. Measured directly: CAOS_LLM_STEP_REV unset in .env produced the
-# env value `${CAOS_LLM_STEP_REV}` verbatim, which `[ -n ... ]` reads as
-# "set" -- caos then failed far downstream with "rev must be a full-length
-# commit sha, got \"\${CAOS_LLM_STEP_REV}\"", blaming the rev instead of the
-# substitution. Treat that shape as absent too.
+# string. Measured directly via CAOS_LLM_STEP_REV, back when this script
+# still read it: `[ -n ... ]` reads that literal text as "set". Treat that
+# shape as absent too, for anything still read this way below
+# (CAOS_MCP_DEFAULT_SERVER).
 resolved() {
     case "${1:-}" in
     '' | '${'*'}') return 1 ;;
@@ -65,19 +107,21 @@ else
     fi
 fi
 
-# PREFER THE SERVER'S OWN refs/caos/dev, queried fresh on every launch. Every
-# `caosd up` run from a real checkout publishes the CURRENT working tree there
-# (flake.nix's "Publish this checkout to the stack it just started" --
-# uncommitted changes included, via a throwaway `git commit-tree`), and the
-# seeded core (build-builtins.sh) is hand-built from that SAME checkout at the
-# SAME moment. So a `git+caos://local?rev=<that commit>&dir=std/llm-step`
-# locator resolves against content the seeder actually answers for -- while
-# the old `github:Metta-AI/caos?rev=<HEAD commit sha>` form named whatever was
-# last PUSHED, which disagrees the moment there is so much as one uncommitted
-# staged file (confirmed the hard way: a seeded-sentinel 500, "the seeder
-# answers X, the job asks Y", reproducible byte-for-byte because X was built
-# from the dirty tree and Y from the clean pushed commit). No second version
-# to track: whatever `caosd up` just seeded is whatever this resolves.
+# TIER 1, THE LIVE-STACK PROBE (not an opt-in mode -- see the header comment):
+# THE SERVER'S OWN refs/caos/dev, queried fresh on every launch regardless of
+# deployment. Every `caosd up` run from a real checkout publishes the CURRENT
+# working tree there (flake.nix's "Publish this checkout to the stack it just
+# started" -- uncommitted changes included, via a throwaway `git
+# commit-tree`), and the seeded core (build-builtins.sh) is hand-built from
+# that SAME checkout at the SAME moment. So a `git+caos://local?rev=<that
+# commit>&dir=std/llm-step` locator resolves against content the seeder
+# actually answers for -- while the old `github:Metta-AI/caos?rev=<HEAD
+# commit sha>` form named whatever was last PUSHED, which disagrees the
+# moment there is so much as one uncommitted staged file (confirmed the hard
+# way: a seeded-sentinel 500, "the seeder answers X, the job asks Y",
+# reproducible byte-for-byte because X was built from the dirty tree and Y
+# from the clean pushed commit). No second version to track: whatever
+# `caosd up` just seeded is whatever this resolves.
 #
 # A `ref=` (branch name) is refused by design (server::locator -- the ArgTree
 # IS the cache key, so it has to be an immutable commit, never a moving ref);
@@ -90,7 +134,7 @@ fi
 dev_sha=""
 if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
     # `|| true`: a failed ls-remote (server unreachable, no refs/caos/dev)
-    # must fall through to the pin below, not abort the script under
+    # must fall through to the default below, not abort the script under
     # `set -e` -- this assignment is the last statement of the `if` body, so
     # an unguarded failure here is exactly the `[ cond ] && action` pitfall
     # AGENTS.md warns about, just spelled as a bare pipeline instead.
@@ -100,21 +144,26 @@ if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
         2>/dev/null | cut -f1)" || true
 fi
 
+# TIER 2, THE DEFAULT (only computed if tier 1 found nothing, to skip a
+# pointless second network round-trip when it already did): Metta-AI/
+# caos-session's current main tip. See the header comment for why this is
+# handed to `:@@=` as a locator rather than resolved by reading flake.lock
+# ourselves.
+session_sha=""
+if [ -z "$dev_sha" ]; then
+    session_sha="$(timeout 10 git ls-remote https://github.com/Metta-AI/caos-session main \
+        2>/dev/null | cut -f1)" || true
+fi
+
 if [ -n "$dev_sha" ]; then
     llm_step="--llm-step:@@=git+caos://local?rev=${dev_sha}&dir=std/llm-step"
-# FALLBACK, for a deploy with no refs/caos/dev to ask -- a production caosd
-# with no git checkout alongside it (dev_sha empty because the server was
-# never started from one, or CAOS_MCP_DEFAULT_SERVER unset/unreachable).
-elif resolved "${CAOS_LLM_STEP_REV:-}"; then
-    llm_step="--llm-step:@@=github:Metta-AI/caos?rev=${CAOS_LLM_STEP_REV}&dir=std/llm-step"
-elif resolved "${CAOS_REPO:-}" && [ -d "$CAOS_REPO" ] \
-    && caos_rev="$(git -C "$CAOS_REPO" rev-parse HEAD 2>/dev/null)"; then
-    llm_step="--llm-step:@@=github:Metta-AI/caos?rev=${caos_rev}&dir=std/llm-step"
+elif [ -n "$session_sha" ]; then
+    llm_step="--llm-step:@@=github:Metta-AI/caos-session?rev=${session_sha}&dir=caos-std/llm-step"
 else
-    echo "caos-mcp-launch: cannot resolve --llm-step -- the server has no" >&2
-    echo "refs/caos/dev (set CAOS_MCP_DEFAULT_SERVER to one that does), or" >&2
-    echo "set CAOS_LLM_STEP_REV (a commit pushed to github:Metta-AI/caos) or" >&2
-    echo "CAOS_REPO (a local checkout with a real HEAD)." >&2
+    echo "caos-mcp-launch: cannot resolve --llm-step. Tried:" >&2
+    echo "  - refs/caos/dev on \$CAOS_MCP_DEFAULT_SERVER (automatic probe)" >&2
+    echo "  - Metta-AI/caos-session's main tip (default) -- ls-remote failed," >&2
+    echo "    which usually means no network reach to github.com from here" >&2
     exit 1
 fi
 
