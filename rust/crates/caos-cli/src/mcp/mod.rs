@@ -47,7 +47,7 @@ use conversation_protocol::v3::records::{
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::tree::Signature;
 use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::ObjectStore;
+use conversation_protocol::v3::{Mode, ObjectStore};
 
 use crate::{
     conversation_ref, default_title, eval_base, fetch_head, mint_transition, oid, open_store,
