@@ -246,4 +246,32 @@ grep -qF 'here-string' here-bad.err \
   || fail "expected a here-string/image error, got: $(cat here-bad.err)"
 echo "  ok: \$IMG (a blob) rejected as an image" >&2
 
+echo "== get refuses a path that already exists, and destroys nothing ==" >&2
+# got-direct was checked out above. `get` once cleared its target first, so
+# `get <hash> .` deleted the working directory.
+echo keep > got-direct/sentinel
+if "$CAOS_CLI" get "$hash" got-direct 2>get-exists.err; then
+  fail "get onto an existing directory should have failed"
+fi
+grep -qF 'already exists' get-exists.err \
+  || fail "expected an 'already exists' error, got: $(cat get-exists.err)"
+[ "$(cat got-direct/sentinel)" = keep ] || fail "get clobbered an existing directory"
+if "$CAOS_CLI" get "$hash" . 2>get-dot.err; then
+  fail "get onto . should have failed"
+fi
+grep -qF 'already exists' get-dot.err \
+  || fail "expected an 'already exists' error for ., got: $(cat get-dot.err)"
+[ -d pkg-direct ] && [ -f got-direct/sentinel ] || fail "get . damaged the working directory"
+echo file > get-file-target
+if "$CAOS_CLI" get "$hash" get-file-target 2>/dev/null; then
+  fail "get onto an existing file should have failed"
+fi
+[ "$(cat get-file-target)" = file ] || fail "get clobbered an existing file"
+ln -s no-such-target get-dangling
+if "$CAOS_CLI" get "$hash" get-dangling 2>/dev/null; then
+  fail "get onto a dangling symlink should have failed"
+fi
+[ -L get-dangling ] || fail "get replaced a dangling symlink"
+echo "  ok: existing dir, '.', file and dangling symlink all refused, contents intact" >&2
+
 echo "eval-path: ALL PASS" >&2
