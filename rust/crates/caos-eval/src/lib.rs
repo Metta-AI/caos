@@ -620,6 +620,48 @@ fn eval_command(
 ) -> Result<(String, String), String> {
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     let verb = tokens.first().copied().unwrap_or("");
+    eval_command_args(
+        host,
+        input_tree,
+        verb,
+        tokens.get(1..).unwrap_or(&[]),
+        env,
+        true,
+    )
+}
+
+/// Evaluate ONE expression line — `verb` is `run` or `curry`, `args` its
+/// `--name[:type]=value` tokens, already split — with no local tree and no
+/// variables. This is the surface an HTTP caller has: nothing to name with
+/// `:@=`, no earlier line to bind a `$VAR`, and a value free to contain
+/// whitespace or to start with `$`.
+pub fn eval_line(
+    host: &dyn EvalHost,
+    verb: &str,
+    args: &[&str],
+) -> Result<(String, String), String> {
+    for &arg in args {
+        if let (name, ArgType::Path, _) = parse_arg(arg)? {
+            return Err(format!(
+                "--{name}:@= names a path in a local tree, and there is none here; \
+                 use :@@= (a pinned git ref) or :hash= (an object the server holds)"
+            ));
+        }
+    }
+    eval_command_args(host, "", verb, args, &HashMap::new(), false)
+}
+
+/// [`eval_command`]'s body over split tokens. `vars` says whether a value
+/// starting with `$` names a variable: true inside a `.caos-expr`, false for
+/// [`eval_line`], where nothing could have bound one and `$5` is a literal.
+fn eval_command_args(
+    host: &dyn EvalHost,
+    input_tree: &str,
+    verb: &str,
+    tokens: &[&str],
+    env: &HashMap<String, (String, String)>,
+    vars: bool,
+) -> Result<(String, String), String> {
     if verb != "run" && verb != "curry" {
         return Err(format!(
             "eval-path: expected `run` or `curry`, got {verb:?}"
@@ -630,7 +672,7 @@ fn eval_command(
     // worker to run (or curry onto); the rest are its args.
     let mut base: Option<(ArgType, &str)> = None;
     let mut arg_toks: Vec<&str> = Vec::new();
-    for &tok in &tokens[1..] {
+    for &tok in tokens {
         let (name, ty, value) = parse_arg(tok)?;
         if name == BASE_ARG {
             if base.replace((ty, value)).is_some() {
@@ -642,8 +684,8 @@ fn eval_command(
     }
     let (bty, bval) =
         base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
-    let image_ref = eval_expr_base(host, input_tree, bty, bval, env)?;
-    let entries = eval_expr_args(host, input_tree, &arg_toks, env)?;
+    let image_ref = eval_expr_base(host, input_tree, bty, bval, env, vars)?;
+    let entries = eval_expr_args(host, input_tree, &arg_toks, env, vars)?;
 
     if verb == "curry" {
         let oid = build_curry(host, &image_ref, entries)?;
@@ -666,10 +708,11 @@ fn eval_expr_base(
     ty: ArgType,
     value: &str,
     env: &HashMap<String, (String, String)>,
+    vars: bool,
 ) -> Result<String, String> {
     // A `$VAR` base names an object a prior assignment produced, whatever its
     // declared type — matched first, exactly as `eval_expr_args` does.
-    if let Some(var) = value.strip_prefix('$') {
+    if let Some(var) = value.strip_prefix('$').filter(|_| vars) {
         let (kind, oid) = env
             .get(var)
             .ok_or_else(|| format!("eval-path: undefined variable ${var}"))?;
@@ -750,11 +793,12 @@ fn eval_expr_args(
     input_tree: &str,
     toks: &[&str],
     env: &HashMap<String, (String, String)>,
+    vars: bool,
 ) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for &tok in toks {
         let (name, ty, value) = parse_arg(tok)?;
-        let (mode, oid) = if let Some(var) = value.strip_prefix('$') {
+        let (mode, oid) = if let Some(var) = value.strip_prefix('$').filter(|_| vars) {
             // `$VAR` names an object a prior assignment produced (or a
             // here-string's blob), whatever the declared type — matched first.
             let (kind, oid) = env

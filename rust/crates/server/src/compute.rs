@@ -2927,6 +2927,282 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+// ---- Expression lines: /eval/<verb>, /start/<verb>, /result/<ticket> ----------
+
+/// One `.caos-expr` line as an HTTP caller states it: a verb (`run` or `curry`)
+/// and the args of `caos-cli run`, with the type riding in the parameter's name
+/// (`?base:@@=<locator>&msg=hello`) exactly as it rides in `--base:@@=…`.
+/// `salt` is the one reserved parameter. There is no `:@=`: nothing local to
+/// name (`caos_eval::eval_line` says so).
+struct Expression {
+    verb: String,
+    /// `--name[:type]=value`, sorted, so two spellings of one call are one
+    /// ticket.
+    args: Vec<String>,
+    salt: String,
+}
+
+fn parse_expression(verb: &str, params: &str) -> Result<Expression, HttpError> {
+    let bad = |message: String| HttpError::new(400, message);
+    if verb != "run" && verb != "curry" {
+        return Err(bad(format!("expected /run or /curry, got {verb:?}")));
+    }
+    let mut args = Vec::new();
+    let mut names = HashSet::new();
+    let mut salt = String::new();
+    for pair in params.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| bad(format!("parameter {pair:?} has no `=`")))?;
+        let (key, value) = (percent_decode(key), percent_decode(value));
+        if key == "salt" {
+            salt = value;
+            continue;
+        }
+        let arg = format!("--{key}={value}");
+        let (name, _, _) = caos_eval::parse_arg(&arg).map_err(bad)?;
+        if !names.insert(name.to_string()) {
+            return Err(bad(format!("argument {name:?} given twice")));
+        }
+        args.push(arg);
+    }
+    args.sort();
+    Ok(Expression {
+        verb: verb.to_string(),
+        args,
+        salt,
+    })
+}
+
+/// The name of an evaluation, derived from its content: the git blob oid of its
+/// canonical form. Everything the answer depends on is in it — the verb, the
+/// salt, the args (which are content: a pinned locator, an oid, a literal) and
+/// the secret scope, whose readers change what a `curry` evaluates to. So the
+/// same call always has the same ticket, and `GET /status/<ticket>` reads its
+/// trace.
+fn ticket_of(
+    config: &Config,
+    expression: &Expression,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let canonical = serde_json::json!([
+        expression.verb,
+        expression.salt,
+        secrets.walk_key().unwrap_or_default(),
+        expression.args,
+    ]);
+    store_git_blob(config, canonical.to_string().as_bytes())
+        .map(|id| id.to_string())
+        .map_err(|e| HttpError::new(500, e))
+}
+
+fn eval_expression(
+    config: &Config,
+    expression: &Expression,
+    ticket: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let host = ServerEvalHost {
+        config,
+        salt: &expression.salt,
+        stack: &[],
+        secrets,
+        parent: ticket,
+        eval_path: "",
+        dispatches: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let args: Vec<&str> = expression.args.iter().map(String::as_str).collect();
+    caos_eval::eval_line(&host, &expression.verb, &args)
+        .map(|(kind, hash)| format!("{kind} {hash}"))
+        .map_err(|e| HttpError::new(500, e))
+}
+
+/// `GET|POST /eval/<verb>` — evaluate the line and block for the answer,
+/// `<kind> <hash>`. `run` is what `caos-cli run` does; `curry` forms the
+/// ArgTree and runs nothing.
+pub(crate) fn eval_expression_endpoint(
+    config: &Config,
+    verb: &str,
+    params: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<Vec<u8>, HttpError> {
+    let expression = parse_expression(verb, params)?;
+    let ticket = ticket_of(config, &expression, secrets)?;
+    eval_expression(config, &expression, &ticket, secrets)
+        .map(|result| format!("{result}\n").into_bytes())
+}
+
+/// Evaluations running in THIS process. A ticket recorded `pending` that is not
+/// in here belonged to a server that has since died.
+fn live_tickets() -> &'static Mutex<HashSet<String>> {
+    static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn ticket_key(config: &Config, ticket: &str) -> String {
+    if config.cache_namespace.is_empty() {
+        format!("caos:ticket:{ticket}")
+    } else {
+        format!("caos:ticket:{}:{ticket}", config.cache_namespace)
+    }
+}
+
+/// Ends a started evaluation however its thread ends: a panic must not leave a
+/// ticket `pending` for a caller to poll forever.
+struct TicketGuard {
+    config: std::sync::Arc<Config>,
+    ticket: String,
+    outcome: Option<String>,
+}
+
+impl TicketGuard {
+    /// Record `state` and release the ticket (the drop does both).
+    fn finish(mut self, state: String) {
+        self.outcome = Some(state);
+    }
+}
+
+impl Drop for TicketGuard {
+    fn drop(&mut self) {
+        let state = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| "failed 500 the evaluation panicked".to_string());
+        let key = ticket_key(&self.config, &self.ticket);
+        if let Err(e) = cache_set(&self.config.redis_addr, &key, &state) {
+            eprintln!("ticket {}: cannot record {state:?}: {e}", self.ticket);
+        }
+        live_tickets().lock().unwrap().remove(&self.ticket);
+    }
+}
+
+/// `POST /start/<verb>` — begin an evaluation and return its ticket at once.
+/// Starting the same call again returns the same ticket: while it runs it
+/// joins it, and once it has succeeded it is already answered. A FAILED one is
+/// started afresh, because a failure is not an answer (the same rule the
+/// result cache keeps).
+pub(crate) fn start_expression(
+    config: &std::sync::Arc<Config>,
+    verb: &str,
+    params: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<Vec<u8>, HttpError> {
+    let expression = parse_expression(verb, params)?;
+    let ticket = ticket_of(config, &expression, secrets)?;
+    let key = ticket_key(config, &ticket);
+    {
+        // Held across the read so two arrivals cannot both start it.
+        let mut live = live_tickets().lock().unwrap();
+        if live.contains(&ticket) {
+            return Ok(format!("{ticket}\n").into_bytes());
+        }
+        if let Ok(Some(state)) = cache_get(&config.redis_addr, &key) {
+            if state.starts_with("ok ") {
+                return Ok(format!("{ticket}\n").into_bytes());
+            }
+        }
+        cache_set(&config.redis_addr, &key, "pending")
+            .map_err(|e| HttpError::new(500, format!("cannot record ticket {ticket}: {e}")))?;
+        live.insert(ticket.clone());
+    }
+    let secrets = secrets.clone();
+    let guard = TicketGuard {
+        config: std::sync::Arc::clone(config),
+        ticket: ticket.clone(),
+        outcome: None,
+    };
+    let spawned = std::thread::Builder::new()
+        .name(format!("ticket-{ticket}"))
+        .spawn(move || {
+            let outcome = eval_expression(&guard.config, &expression, &guard.ticket, &secrets);
+            guard.finish(match outcome {
+                Ok(result) => format!("ok {result}"),
+                Err(e) => format!("failed {} {}", e.status(), e.message()),
+            });
+        });
+    if let Err(e) = spawned {
+        // The closure, and the guard in it, are gone: the guard's drop has
+        // already recorded the failure and released the ticket.
+        return Err(HttpError::new(
+            500,
+            format!("cannot start ticket {ticket}: {e}"),
+        ));
+    }
+    Ok(format!("{ticket}\n").into_bytes())
+}
+
+/// `GET /result/<ticket>` — `pending`, `ok <kind> <hash>`, or
+/// `failed <status> <message>`. It only reads: asking never dispatches work,
+/// which is what lets a caller poll without risk of re-running a failure.
+pub(crate) fn expression_result(config: &Config, ticket: &str) -> Result<Vec<u8>, HttpError> {
+    if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(HttpError::new(400, format!("invalid ticket: {ticket:?}")));
+    }
+    let state = cache_get(&config.redis_addr, &ticket_key(config, ticket))
+        .map_err(|e| HttpError::new(500, format!("cannot read ticket {ticket}: {e}")))?
+        .ok_or_else(|| HttpError::new(404, format!("unknown ticket {ticket}")))?;
+    let state = if state == "pending" && !live_tickets().lock().unwrap().contains(ticket) {
+        "failed 500 the server restarted before this finished; start it again".to_string()
+    } else {
+        state
+    };
+    Ok(format!("{state}\n").into_bytes())
+}
+
+#[cfg(test)]
+mod expression_tests {
+    use super::*;
+
+    fn parse(verb: &str, params: &str) -> Expression {
+        parse_expression(verb, params).unwrap_or_else(|e| panic!("{}", e.message()))
+    }
+
+    #[test]
+    fn args_are_sorted_so_one_call_has_one_spelling() {
+        let a = parse("run", "msg=hi&base:hash=abc");
+        let b = parse("run", "base:hash=abc&msg=hi");
+        assert_eq!(a.args, b.args);
+        assert_eq!(a.args, vec!["--base:hash=abc", "--msg=hi"]);
+    }
+
+    #[test]
+    fn the_type_rides_in_the_name_and_values_are_decoded() {
+        let e = parse(
+            "curry",
+            "base%3A%40%40=github%3Ao%2Fr%3Frev%3Dabc&msg=a%20b%3Dc",
+        );
+        assert_eq!(e.args, vec!["--base:@@=github:o/r?rev=abc", "--msg=a b=c"]);
+    }
+
+    #[test]
+    fn salt_is_a_parameter_not_an_argument() {
+        let e = parse("run", "salt=s1&base:hash=abc");
+        assert_eq!(e.salt, "s1");
+        assert_eq!(e.args, vec!["--base:hash=abc"]);
+    }
+
+    #[test]
+    fn caller_mistakes_are_400() {
+        for (verb, params) in [
+            ("walk", "base:hash=abc"),
+            ("run", "base:hash=abc&msg=a&msg=b"),
+            ("run", "base:hash=abc&msg"),
+            ("run", "base:nonsense=abc"),
+            ("run", "a%2Fb=1"),
+        ] {
+            let error = parse_expression(verb, params)
+                .err()
+                .unwrap_or_else(|| panic!("{verb} {params:?} should have been refused"));
+            assert_eq!(
+                error.status(),
+                400,
+                "{verb} {params:?}: {}",
+                error.message()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod single_flight_tests {
     use super::*;

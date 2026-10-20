@@ -707,6 +707,19 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
     )
 }
 
+/// An expression's parameters: the query string, plus a form-style body when
+/// the request has one.
+fn expression_params(request: &mut Request, query: &str) -> Result<String, HttpError> {
+    let mut body = String::new();
+    request.as_reader().read_to_string(&mut body)?;
+    let body = body.trim();
+    Ok(match (query.is_empty(), body.is_empty()) {
+        (_, true) => query.to_string(),
+        (true, false) => body.to_string(),
+        (false, false) => format!("{query}&{body}"),
+    })
+}
+
 /// A private repository's token for a `:@@=` fetch — the header
 /// `POST /git/import` takes, for the same reason: it is the caller's, scoped
 /// to one URL, and never looked up from the calling job's secrets.
@@ -746,6 +759,32 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
             let secrets = secret_context(config, request)?;
             let token = git_token(request)?;
             compute::eval_endpoint(config, &query, &secrets, token.as_deref())
+        }
+        // One `.caos-expr` line over HTTP: `/eval/run`, `/eval/curry`, and the
+        // same for `/start/…`. The args ride in the query and, for a value too
+        // big for one, in a POST body of the same `name:type=value&…` form.
+        Method::Get | Method::Post if path.starts_with("/eval/") => {
+            let params = expression_params(request, &query)?;
+            let secrets = secret_context(config, request)?;
+            compute::eval_expression_endpoint(
+                config,
+                path.trim_start_matches("/eval/"),
+                &params,
+                &secrets,
+            )
+        }
+        Method::Post if path.starts_with("/start/") => {
+            let params = expression_params(request, &query)?;
+            let secrets = secret_context(config, request)?;
+            compute::start_expression(
+                config,
+                path.trim_start_matches("/start/"),
+                &params,
+                &secrets,
+            )
+        }
+        Method::Get if path.starts_with("/result/") => {
+            compute::expression_result(config, path.trim_start_matches("/result/"))
         }
         Method::Post if path == "/submit" => {
             let secrets = secret_context(config, request)?;
