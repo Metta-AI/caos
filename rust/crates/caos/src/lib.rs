@@ -177,6 +177,10 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
 /// hash, and this is how you then read the thing. Costs only the objects the
 /// working repo is missing.
 pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> {
+    // `get` used to clear its target first, so `get <hash> .` deleted the
+    // working directory. It now only ever creates: the path must not exist
+    // (a dangling symlink counts). Checked before any network work.
+    refuse_existing_target(Path::new(path))?;
     // An EVALUABLE DIRECTORY resolves first: resolving is not running, and it
     // matters for an entry whose resolved value is DATA rather than an image —
     // `std/llm-stub` evaluates to a cargo result tree, and what a caller wants
