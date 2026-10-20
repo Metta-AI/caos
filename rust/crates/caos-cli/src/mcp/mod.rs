@@ -252,7 +252,11 @@ fn run_tool(
         declaration.ok_or_else(|| "the call was never declared".to_string())?;
 
     dispatch_call(t, options, &id, &request, &request_head, &call)?;
-    read_outcome(t, &id, &request, round, &call)
+    let outcome = read_outcome(t, &id, &request, round, &call)?;
+    let limit = options
+        .max_result_chars
+        .unwrap_or(DEFAULT_MAX_RESULT_CHARS);
+    Ok(spill_oversized(t, &id, &call, outcome, limit))
 }
 
 /// Run the declared call, as `llm-step` in its tools-only mode.
