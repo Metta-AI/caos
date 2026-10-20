@@ -107,6 +107,7 @@ test suite exercises them.
 | `llm-step` | The agent harness: one turn of a conversation, and the registry of tools it offers a model. |
 | `llm-client` | The Anthropic API client `llm-step` posts through. |
 | `llm-call` | A single model call as an entry, for an expression that wants one without a conversation. |
+| `tree-map` | Runs a worker (its `run` arg) over every directory of a tree and returns a sparse tree of the results, same shape as the input, one cached job per directory. Other args are forwarded to the worker. `rgrep` is built on it. |
 | `rgrep` | The search worker behind the step's `grep` tool. |
 | `run-and-update-ref` | The async worker: one binary, two stages, behind `run_async` and the subagent tools. |
 | `actor` | The actor wrapper: runs an inner `(state, message) -> (state', reply)` request against state on a Git branch, publishing by moving the branch with a compare-and-swap ([`actor/README.md`](actor/README.md)); a Go program on `std/go`. |
