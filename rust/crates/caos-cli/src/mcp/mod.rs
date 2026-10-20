@@ -141,7 +141,9 @@ fn usage() -> String {
     format!(
         "usage:\n  \
          caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n  \
+         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n    \
+         [--max-result-chars=<n>]  keep a longer tool result in the conversation and\n    \
+         answer with a preview (default 50000; 0 for no limit)\n  \
          caos mcp warm    (resolve the tools now and cache them for the next serve)\n\n\
          All name the step whose tools this session offers:\n  \
          {}",
