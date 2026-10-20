@@ -904,8 +904,10 @@ fn root_commit(
     let phase = std::time::Instant::now();
     let base = oid(
         &match &options.base {
-            Some(_) => eval_base(t, options)?,
-            None => session_base::resolve_default_base(t, prompt)?,
+            None if session_base::names_a_base(prompt) => {
+                session_base::resolve_default_base(t, prompt)?
+            }
+            _ => eval_base(t, options)?,
         },
         "conversation base",
     )?;

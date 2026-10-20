@@ -1,0 +1,8 @@
+# tests/expression-http, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A std/go WORKER test. Its subject is the server's HTTP surface for one
+# expression line — /eval/<verb>, /start/<verb>, /result/<ticket> — and Go's
+# net/http is all that needs. `--hello:@=DEEP-DEPS/hello` hands it the BUILT
+# hello image, whose oid is what every run below executes.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --hello:@=DEEP-DEPS/hello

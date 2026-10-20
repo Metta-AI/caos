@@ -1,0 +1,6 @@
+# What this test reaches for (format `<path> <name>`).
+#
+# hello is the worker every run below executes: small, and its answer is a
+# plain blob whose text depends only on the arguments it was given.
+../../std/go go
+../../std/hello hello

@@ -10,8 +10,8 @@
 //! as a leading one, so a prompt that merely quotes a directive further down
 //! is not a request):
 //!
-//!   /caos-session-server <url>              -- which caos server
-//!   /caos-session-start-from <git locator>  -- which commit seeds the content
+//!   /caos-session-server `<url>`            -- which caos server
+//!   /caos-session-start-from `<git locator>` -- which commit seeds the content
 //!
 //! Neither needs to be given. A server falls back to `CAOS_MCP_DEFAULT_SERVER`,
 //! then to the hook's own discovered checkout (unchanged pre-existing
@@ -147,6 +147,26 @@ fn ensure_scratch_checkout(session: &str, server_url: &str) -> Result<GitTranspo
     GitTransport::discover(&dir)
 }
 
+/// Whether this session NAMED where it comes from: a `/caos-session-server` or
+/// `/caos-session-start-from` directive, or `CAOS_MCP_DEFAULT_SERVER` /
+/// `CAOS_MCP_DEFAULT_SESSION_BASE` in the environment. Only then is the content
+/// base [`resolve_default_base`]'s; a hook that named nothing is standing in a
+/// real checkout, and that checkout is its base, as it was before this module
+/// existed. Without this test the default applied to every session, so a client
+/// repo's own commits never reached the conversation it recorded.
+pub(super) fn names_a_base(prompt: &str) -> bool {
+    names_a_base_in(
+        prompt,
+        std::env::var_os(SERVER_ENV).is_some(),
+        std::env::var_os(BASE_ENV).is_some(),
+    )
+}
+
+fn names_a_base_in(prompt: &str, server_env: bool, base_env: bool) -> bool {
+    let (server, start_from) = leading_directives(prompt);
+    server.is_some() || start_from.is_some() || server_env || base_env
+}
+
 /// The conversation's content base when no `--base=<sha>` was given on the
 /// command line (the CLI flag, unchanged, still wins over everything here --
 /// see `root_commit`). `t` must already be the session's resolved transport
@@ -233,21 +253,43 @@ fn query_value(locator: &str, key: &str) -> Option<String> {
 ///
 /// `None`, never an error, for an unreachable server or one with no such
 /// ref -- a real production deploy with nothing published there, the common
-/// case `repoint_to_dev` must fall through on rather than break. Bounded
-/// (`timeout`): a dead address does not refuse a connection, it hangs out a
-/// TCP retransmit (AGENTS.md, "Caches and defaults").
+/// case `repoint_to_dev` must fall through on rather than break. Bounded: a
+/// dead address does not refuse a connection, it hangs out a TCP retransmit
+/// (AGENTS.md, "Caches and defaults"). The bound is kept here rather than by
+/// running `git` under the `timeout` binary: an image with no coreutils (the
+/// cargo worker the unit tests run in) or a host without it (macOS) would
+/// fail to spawn it, and `None` is exactly what "no such ref" answers.
 fn probe_dev_sha(server: &str) -> Option<String> {
-    let output = std::process::Command::new("timeout")
-        .args(["10", "git", "ls-remote", server, "refs/caos/dev"])
-        .output()
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new("git")
+        .args(["ls-remote", server, "refs/caos/dev"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    if !status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
+    // One ref's line: far below a pipe's buffer, so the child never blocked
+    // writing it and reading after it exits loses nothing.
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
+    stdout.split_whitespace().next().map(str::to_string)
 }
 
 /// Repoint every `:@@=<scheme>?rev=<hex>&dir=<path>` locator found in a
@@ -466,6 +508,38 @@ fn repoint_to_dev(t: &GitTransport, commit: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A working repo that can commit. The suite runs these in a container with
+    /// no global git identity, so `git commit` would die "Author identity
+    /// unknown"; the identity is set on the repo, not assumed of the machine.
+    fn init_work(dir: &Path) {
+        host_git::capture_required("git", &["init", "--quiet"], dir).unwrap();
+        host_git::capture_required("git", &["config", "user.email", "test@example.com"], dir)
+            .unwrap();
+        host_git::capture_required("git", &["config", "user.name", "test"], dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_names_a_base_only_by_directive_or_environment() {
+        assert!(!names_a_base_in("do the thing", false, false));
+        assert!(!names_a_base_in(
+            "do the thing\n/caos-session-server http://x",
+            false,
+            false
+        ));
+        assert!(names_a_base_in(
+            "/caos-session-server http://x\ndo the thing",
+            false,
+            false
+        ));
+        assert!(names_a_base_in(
+            "/caos-session-start-from github:o/r?rev=abc\ngo",
+            false,
+            false
+        ));
+        assert!(names_a_base_in("do the thing", true, false));
+        assert!(names_a_base_in("do the thing", false, true));
+    }
+
     #[test]
     fn leading_directives_reads_both_in_either_order() {
         let (server, start_from) = leading_directives(
@@ -605,7 +679,7 @@ mod tests {
         assert_eq!(probe_dev_sha(&server), None, "a bare repo with no dev ref");
 
         let work = tempfile::tempdir().unwrap();
-        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        init_work(work.path());
         host_git::capture_required(
             "git",
             &[
@@ -642,7 +716,7 @@ mod tests {
         let server = bare.path().to_string_lossy().to_string();
 
         let work = tempfile::tempdir().unwrap();
-        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        init_work(work.path());
         host_git::capture_required("git", &["remote", "add", "caos", &server], work.path())
             .unwrap();
         let expr = "run --base:@@=github:Metta-AI/caos?rev=oldsha&dir=std/llm-step --in:@=.";
@@ -736,7 +810,7 @@ mod tests {
         let server = bare.path().to_string_lossy().to_string();
 
         let work = tempfile::tempdir().unwrap();
-        host_git::capture_required("git", &["init", "--quiet"], work.path()).unwrap();
+        init_work(work.path());
         host_git::capture_required("git", &["remote", "add", "caos", &server], work.path())
             .unwrap();
         std::fs::write(
