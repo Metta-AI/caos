@@ -194,15 +194,13 @@ pub fn cli_get(t: &dyn Transport, hash: &str, path: &str) -> Result<(), String> 
         _ => gix::objs::tree::EntryKind::Blob,
     };
     let target = PathBuf::from(path);
+    // Re-checked here, right before writing, in case the path appeared while
+    // objects were being fetched.
+    refuse_existing_target(&target)?;
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("creating {}: {e}", parent.display()))?;
-        }
-    }
-    if let Err(e) = std::fs::remove_dir_all(&target) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("clearing {path}: {e}"));
         }
     }
     checkout(t, &target, hash, root)?;
