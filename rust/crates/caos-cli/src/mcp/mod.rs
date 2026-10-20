@@ -14,9 +14,10 @@
 //! the ref is the whole record.
 //!
 //! AND THE TOOLS ARE ORDINARY TOOLS. Nothing here implements one. A call is
-//! recorded as the model's own declaration and then handed to `llm-step` in its
-//! tools-only mode, which runs it exactly as it runs a call in a turn it drives
-//! itself — so `caos mcp` offers whatever that step offers, in whatever
+//! one request to the server: `llm-step` in its tools-only mode, given the call,
+//! declares it as the model's own and runs it exactly as it runs a call in a
+//! turn it drives itself, and answers with what the tool said — so `caos mcp`
+//! offers whatever that step offers, in whatever
 //! repository it is pointed at, and a tool reads one way wherever a model meets
 //! it. The step is named by `--llm-step`, as `tui` and `chat` name it.
 //!
@@ -36,13 +37,12 @@ use serde_json::{json, Value};
 
 use caos::{GitTransport, Transport};
 use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
-use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::oid::{Oid, G3};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome,
-    TurnRecord, TurnStatus,
+    Block, CallStatus, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome, TurnRecord,
+    TurnStatus,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::tree::Signature;
@@ -148,15 +148,19 @@ struct ToolOutcome {
     is_error: bool,
 }
 
-/// Run one workspace tool, by declaring the call and handing it to `llm-step`.
+/// Run one workspace tool: one request to the server.
 ///
-/// TWO STEPS, and the second is the whole design: `caos mcp` records the call as the
-/// model's own declaration -- v3 accepts no tool that no message declared
-/// (`validate_current_call`) -- and then runs the step in its tools-only mode,
-/// which starts the tool, executes it and completes it exactly as it does for a
-/// turn it drives itself. Nothing here knows what `edit` is. That is why a
-/// session in another repository gets the same tools as the tui: they are the
-/// step's, reached through `--llm-step`, not a copy of them compiled in here.
+/// The request is `llm-step` in its tools-only mode, given the call -- its id,
+/// the tool and its arguments -- and the conversation it belongs to. The step
+/// declares the call on the conversation's active request, runs it, and answers
+/// with the call's record, so this process neither writes the conversation nor
+/// reads it back: it sends a call and receives what the tool said. Nothing here
+/// knows what `edit` is, which is why a session in another repository gets the
+/// same tools as the tui: they are the step's, reached through `--llm-step`.
+///
+/// The conversation must already exist. The prompt hook opens it, and runs in
+/// another process, so the first call can beat it; `wait_for_conversation`
+/// covers that race.
 fn run_tool(
     _serve_transport: &GitTransport,
     options: &TurnOptions,
@@ -174,113 +178,43 @@ fn run_tool(
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
     let t = &fresh;
     let id = resume::conversation_for_session(t, session)?;
-    // The prompt hook that opens this conversation runs in another process and
-    // takes seconds; the first tool call can beat it. Wait for the record
-    // rather than refuse the call. A no-op on every turn but the racing first.
     wait_for_conversation(t, &id);
     let call = args
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
         .unwrap_or(name)
         .to_string();
-    let declared = declared_args(args);
-    let username = resolve_username(t, None)?;
+    let arguments = declared_args(args).to_string();
 
-    // The request this call belongs to, captured from the attempt that won the
-    // compare-and-swap. Its round is the one BEFORE the declaration: a
-    // `model.complete` opens the next round, and the call belongs to the round
-    // that declared it.
-    let mut declaration: Option<(Oid, Oid, u64)> = None;
-    append(t, &id, |store, head| {
-        let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_turn()? else {
-            return Err(format!(
-                "no active request in {id:?}: a tool call arrived before this session's prompt"
-            ));
-        };
-        let ordinal = view.transcript_len()?;
-        drop(view);
-
-        let round = request.round;
-        let signature = inherited_signature(store, head)?;
-        let message_id = caos::fresh_entropy()?;
-        let dir = paths::transcript_payload_dir(ordinal, &message_id);
-        let admitted = paths::admit_external_id(&call);
-        let payload_name = format!("args-{admitted}.json");
-        let entry = TranscriptEntry {
-            message_id,
-            conversation: id.to_string(),
-            role: Role::Assistant,
-            actor: username.clone(),
-            request: Some(request.id.clone()),
-            round: Some(round),
-            model: Some(CLAUDE_CODE_MODEL.to_string()),
-            blocks: vec![Block::ToolUse {
-                id: call.clone(),
-                name: name.to_string(),
-                arguments: format!("{dir}/{payload_name}"),
-            }],
-            proposal: None,
-            source_tree_resolution: None,
-        };
-        declaration = Some((request.id.clone(), request.request_head.clone(), round));
-        Ok(Some(mint_transition(
-            store,
-            head,
-            &Transition::ModelComplete {
-                request: request.id.clone(),
-                entry,
-                payloads: vec![(payload_name, payload_bytes(&declared)?)],
-                calls: vec![DeclaredCall {
-                    id: call.clone(),
-                    name: name.to_string(),
-                }],
-            },
-            &signature,
-        )?))
-    })?;
-    let (request, request_head, round) =
-        declaration.ok_or_else(|| "the call was never declared".to_string())?;
-
-    dispatch_call(t, options, &id, &request, &request_head, &call)?;
-    read_outcome(t, &id, &request, round, &call)
-}
-
-/// Run the declared call, as `llm-step` in its tools-only mode.
-///
-/// The request is the one the prompt admitted, named by `--run` rather than
-/// implied: this ArgTree is not that one, and must not be, or a second call
-/// would be answered from the first's memo. `--tools-only` carries the call id
-/// for exactly that reason, and the step checks it ran before returning.
-///
-/// NOTHING ABOUT A TOOL IS RESOLVED HERE. `tool_help` and `run_tool` used to
-/// arrive with the tool already evaluated — `--client-tool-root`/`-path`/
-/// `-tree`, worked out against the conversation snapshot in this process — and
-/// the whole reason was that the server refused a `:@@=` locator, so a
-/// repository that pins caos could not be evaluated where the walk otherwise
-/// happens. The server resolves locators now (`server::locator`), so the step
-/// evaluates every tool the same way it evaluates `eval_path`, and there is one
-/// answer to "which version of this tool runs" rather than two that can
-/// disagree. It also means a session needs nothing of the tool on its own disk:
-/// what a conversation runs comes from the commit it was started from.
-fn dispatch_call(
-    t: &GitTransport,
-    options: &TurnOptions,
-    id: &str,
-    request: &Oid,
-    request_head: &Oid,
-    call: &str,
-) -> Result<(), String> {
-    let secrets = caos::Secrets::current().for_conversation(id);
-    let configuration = tools_configuration(t, options, id, &secrets)?;
-    let kvs = vec![
-        format!("--head:commit={request_head}"),
-        format!("--run={request}"),
-        format!("--tools-only={call}"),
+    let secrets = caos::Secrets::current().for_conversation(&id);
+    // REACHABLE FIRST, as for the prompt hook: resolving the step talks to the
+    // server, and through a dead tunnel that wait is unbounded.
+    wait_server_reachable(t)?;
+    let step = step_image(t, options, &secrets)?;
+    let salt = std::env::var("CAOS_SALT").unwrap_or_default();
+    let mut params = vec![
+        ("base:hash", step.as_str()),
+        ("conversation", id.as_str()),
+        ("tools-only", call.as_str()),
+        ("tool", name),
+        ("arguments", arguments.as_str()),
     ];
-    let dispatch = caos::prepare_client_request_with_secrets(t, &configuration, &kvs, &secrets)?;
-    let server = t.server_url()?;
-    caos::compute_client_request_with_secrets(&server, &dispatch, &secrets).map(drop)
+    if !salt.is_empty() {
+        params.push(("salt", salt.as_str()));
+    }
+    let (kind, result) = caos::eval_line_request(&t.server_url()?, "run", &params, &secrets)?;
+    if kind != "tree" {
+        return Err(format!("the step answered a {kind}, not a tool result"));
+    }
+    let files = caos::tree_blobs(t, &result)?;
+    let part = |file: &str| {
+        files
+            .get(file)
+            .ok_or_else(|| format!("the step's result {result} has no {file}"))
+    };
+    let status = String::from_utf8_lossy(part("status")?).into_owned();
+    let (is_error, text) = crate::tool_outcome(status.trim(), part("observation")?)?;
+    Ok(ToolOutcome { text, is_error })
 }
 
 /// The step a call runs on: `llm-step`, curried with everything that is the
@@ -411,30 +345,6 @@ fn wait_for_conversation(t: &GitTransport, id: &str) {
             std::thread::sleep(TOOL_WAIT_INTERVAL);
         }
     }
-}
-
-/// The observation the step recorded, read back from the conversation.
-///
-/// Read rather than returned: the run's own result names the conversation
-/// commit, but what Claude Code needs is one call's text, and the transcript is
-/// where that lives. A tool the model can act on and a tool the tui replays are
-/// then the same bytes.
-fn read_outcome(
-    t: &GitTransport,
-    id: &str,
-    request: &Oid,
-    round: u64,
-    call: &str,
-) -> Result<ToolOutcome, String> {
-    let store = open_store(t)?;
-    let (_, head) = fetch_head(t, &store, id)?
-        .ok_or_else(|| format!("conversation {id:?} disappeared while its tool ran"))?;
-    let view = Conversation::open(&store, &head)?;
-    let tool = view
-        .tool(request, round, call)?
-        .ok_or_else(|| format!("the step recorded no call {call} in round {round}"))?;
-    let (is_error, text) = crate::protocol_tool_result(&view, tool.result.as_ref())?;
-    Ok(ToolOutcome { text, is_error })
 }
 
 /// The last successful tool discovery's phase timings, for `caos_status` to
@@ -1074,16 +984,6 @@ fn append(
     Err(format!(
         "conversation {id:?} head moved during all {MAX_APPEND_ATTEMPTS} append attempts"
     ))
-}
-
-/// A payload's bytes, in the protocol's canonical framing.
-fn payload_bytes(value: &Value) -> Result<Vec<u8>, String> {
-    const PREFIX: &[u8] = b"{\"payload\":";
-    let wrapped = canonical_bytes(&json!({ "payload": value }))?;
-    if !wrapped.starts_with(PREFIX) || !wrapped.ends_with(b"}\n") {
-        return Err("canonical payload wrapper had an unexpected shape".to_string());
-    }
-    Ok(wrapped[PREFIX.len()..wrapped.len() - 2].to_vec())
 }
 
 /// The assistant's closing message, and the end of the request it answered.

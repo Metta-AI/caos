@@ -224,7 +224,7 @@ nowhere else.
 | Hook | Transitions |
 |---|---|
 | `UserPromptSubmit` | `message.append` (the prompt), `request.admit`, `request.claim` — or, while a request is held open, `request.interject` or a `request.terminal` first (below) |
-| tool call | `model.complete` declaring the call — then the step's own `tool.start` and `tool.complete` |
+| tool call | the step's own `model.complete` declaring the call, then its `tool.start` and `tool.complete` — this process writes nothing |
 | `Stop` | `model.complete` (the closing message), `request.terminal` idle — nothing, while a call is still running |
 | `StopFailure` | `message.append` (the error), `request.terminal` failed — the terminal only once no call is running |
 
@@ -253,17 +253,26 @@ resumed session extends the same conversation.
 **The prompt admits a REAL request** — an ArgTree over the step, prepared the
 way the tui prepares a turn, and claimed in the same compare-and-swap. Claimed
 here rather than by a runner because the turn is already running by the time the
-hook fires; and real rather than a synthetic id because every tool call of that
-turn RUNS it (`--run=<request> --tools-only=<call id>`, one fresh ArgTree per
-call, since the request is itself an ArgTree and a reused one would be answered
-from the first call's memo).
+hook fires; and real rather than a synthetic id because the request is what the
+step finds as the conversation's active one when a call arrives, and what a
+reader of the transcript follows from the prompt to the calls it made.
 
-So the two halves of a call have different authors, and that is the design: `caos mcp`
-declares the call as the model's own (v3 accepts no tool that no message
-declared) and the step records starting it, running it and completing it. The
-protocol's first invariant — record an action before launching it — is the
-step's to keep here as everywhere, so a long tool is visible in the tui while it
-runs and a session that dies mid-call leaves a record that it was attempted.
+**A call is one request to the server.** `POST /eval/run` of the step, as a
+form: `base:hash` (the step), `conversation`, `tools-only=<tool_use_id>`, `tool`
+and `arguments` (JSON). The step declares the call on the conversation's active
+request as the model's own — v3 accepts no tool that no message declared — and
+runs it, recording starting it and completing it. The answer is the call's own
+record, a tree of `status`, `observation` and `conversation`, so this process
+writes nothing and reads nothing back from the conversation. The protocol's first
+invariant — record an action before launching it — is the step's to keep here
+as everywhere, so a long tool is visible in the tui while it runs and a session
+that dies mid-call leaves a record that it was attempted. Each call is its own
+ArgTree because its id is in it, and a retry of the same call finds it already
+declared.
+
+The declaration lands a moment after the request reaches the server, not before
+it as it did when this process wrote it, so a `Stop` in that gap sees no call.
+Claude Code backgrounds a call only after 120s, long after the step has started.
 
 Claude Code does not expose the model's round number and does not need to: the
 declaration opens a round, the call belongs to the round that declared it, and a

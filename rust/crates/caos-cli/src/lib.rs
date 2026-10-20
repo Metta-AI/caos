@@ -1383,8 +1383,25 @@ fn protocol_tool_result(
 ) -> Result<(bool, String), String> {
     match result {
         Some(ProtocolToolResult::Complete { observation, .. }) => {
-            let bytes = conversation.payload(observation)?;
-            let value: Value = serde_json::from_slice(&bytes)
+            tool_outcome("complete", &conversation.payload(observation)?)
+        }
+        Some(ProtocolToolResult::Failed { error }) => {
+            tool_outcome("failed", &conversation.payload(error)?)
+        }
+        Some(ProtocolToolResult::Cancelled { reason }) => Ok((true, reason.clone())),
+        None => Ok((true, String::new())),
+    }
+}
+
+/// `(is_error, text)` for a call's recorded output, given which of `complete`,
+/// `failed` and `cancelled` it is. The bytes are the observation payload the
+/// conversation holds, which is also what a tools-only run returns as its
+/// `observation`, so a caller that reads a run's result and one that reads the
+/// conversation agree.
+pub(crate) fn tool_outcome(status: &str, observation: &[u8]) -> Result<(bool, String), String> {
+    match status {
+        "complete" => {
+            let value: Value = serde_json::from_slice(observation)
                 .map_err(|error| format!("parsing tool observation: {error}"))?;
             let is_error = value
                 .get("is_error")
@@ -1396,14 +1413,14 @@ fn protocol_tool_result(
                 .unwrap_or_else(|| tool_result_text(&value));
             Ok((is_error, content))
         }
-        Some(ProtocolToolResult::Failed { error }) => {
-            let bytes = conversation.payload(error)?;
-            let value: Value = serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        "failed" => {
+            let value: Value = serde_json::from_slice(observation).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(observation).into_owned())
+            });
             Ok((true, tool_result_text(&value)))
         }
-        Some(ProtocolToolResult::Cancelled { reason }) => Ok((true, reason.clone())),
-        None => Ok((true, String::new())),
+        "cancelled" => Ok((true, String::from_utf8_lossy(observation).into_owned())),
+        other => Err(format!("a tool result has no status {other:?}")),
     }
 }
 

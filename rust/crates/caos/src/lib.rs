@@ -4679,6 +4679,11 @@ fn request_compute_url(
             timeout_secs: None,
         },
     )?;
+    kind_and_hash(body)
+}
+
+/// The `<kind> <hash>` a compute route answers with.
+fn kind_and_hash(body: Vec<u8>) -> Result<(String, String), String> {
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
@@ -4689,6 +4694,66 @@ fn request_compute_url(
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
+}
+
+/// Evaluate one `.caos-expr` line on the server and wait for its answer:
+/// `POST /eval/<verb>` with `verb` `run` or `curry`, and `params` the line's
+/// arguments by the names the CLI gives them (`base:hash`, `tools-only`, ...).
+/// Returns the result's `(kind, hash)`.
+///
+/// The request carries everything: no tree is pushed first, so a caller needs
+/// only the server's address. The parameters travel as a form body, which has
+/// no length limit, with `secrets` presented out of band like any compute call.
+pub fn eval_line_request(
+    base: &str,
+    verb: &str,
+    params: &[(&str, &str)],
+    secrets: &Secrets,
+) -> Result<(String, String), String> {
+    let body = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", percent_encode(name), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut headers = secrets.headers();
+    headers.push((
+        "content-type",
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    let path = format!("/eval/{verb}");
+    // NO TIMEOUT, as for `/run`: this waits for the work.
+    kind_and_hash(server_call(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: &path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: None,
+        },
+    )?)
+}
+
+/// The blob entries of the tree `hash`, by name, with their contents. Entries
+/// that are not blobs (subtrees, a conversation's gitlink) are left out, so a
+/// result that names a conversation can be read without fetching it.
+pub fn tree_blobs(
+    t: &dyn Transport,
+    hash: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    let entries = fetch_tree_entries(t, hash)?.ok_or_else(|| format!("{hash} is not a tree"))?;
+    let mut blobs = std::collections::BTreeMap::new();
+    for entry in entries {
+        if !entry.mode.is_blob() {
+            continue;
+        }
+        let (_, content) = t.get_object(&entry.oid.to_string())?;
+        blobs.insert(
+            String::from_utf8_lossy(&entry.filename).into_owned(),
+            content,
+        );
+    }
+    Ok(blobs)
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),

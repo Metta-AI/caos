@@ -296,11 +296,18 @@ send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg request_id
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,
     arguments:{seconds:"25","request-id":$request_id}}}}')"
 # The Stop must land AFTER the call is declared, as a backgrounded call's does.
+#
+# The STEP declares the call now, on the server, a moment after the request
+# reaches it, so the declaration is not in this checkout's copy of the ref:
+# fetch it. And it is not the newest commit for long -- the step starts the tool
+# right behind it -- so look for it among the last few.
+sync_held() { git fetch -q caos "+$held_ref:$held_ref"; }
 declared=""
 for _ in $(seq 60); do
-  if [ "$(git log -1 --format=%s "$held_ref")" = model.complete ]; then
-    declared=yes
-    break
+  if sync_held 2>/dev/null; then
+    case "$(git log -4 --format=%s "$held_ref")" in
+      *model.complete*) declared=yes; break ;;
+    esac
   fi
   sleep 1
 done
