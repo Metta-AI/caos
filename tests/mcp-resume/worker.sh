@@ -38,7 +38,12 @@ ref_of() { # <conversation id>
   printf 'refs/caos/v3/conversations/%s/head' \
     "$(printf '%s' "$1" | od -An -tx1 | tr -d ' \n')"
 }
-head_of() { git rev-parse --verify -q "$(ref_of "$1")" || true; }
+# The step writes the conversation on the server, so this checkout has only
+# what it fetches: fetch the ref before reading it.
+head_of() {
+  git fetch -q caos "+$(ref_of "$1"):$(ref_of "$1")" 2>/dev/null || true
+  git rev-parse --verify -q "$(ref_of "$1")" || true
+}
 subjects() { git log --format=%s "$1" | tr '\n' ' '; }
 
 stamp="$(date +%s)-$$"
@@ -88,9 +93,9 @@ head_r=$(head_of "cc/$a")
 [ "$head_r" != "$head_a" ] || fail "the resumed session recorded nothing on the original branch"
 git merge-base --is-ancestor "$head_a" "$head_r" || fail "the branch was not extended"
 stop "$r" "the resumed session is done"
-case "$(subjects "$(ref_of "cc/$a")")" in
+case "$(subjects "$(head_of "cc/$a")")" in
   "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;
-  *) fail "the resumed turn was not recorded as one: $(subjects "$(ref_of "cc/$a")")" ;;
+  *) fail "the resumed turn was not recorded as one: $(subjects "$(head_of "cc/$a")")" ;;
 esac
 
 echo "== resume needs the head, and says so ==" >&2
@@ -130,9 +135,9 @@ esac
 
 h="resume-h-$stamp"
 prompt "$h" "/resume-caos-conversation $head_b" >/dev/null
-case "$(subjects "$(ref_of "cc/$b")")" in
+case "$(subjects "$(head_of "cc/$b")")" in
   "request.claim request.admit message.append request.terminal "*) ;;
-  *) fail "the open request was not closed on the resumed branch: $(subjects "$(ref_of "cc/$b")")" ;;
+  *) fail "the open request was not closed on the resumed branch: $(subjects "$(head_of "cc/$b")")" ;;
 esac
 
 echo "== a session's checkout is recorded once, and nothing else is consulted ==" >&2

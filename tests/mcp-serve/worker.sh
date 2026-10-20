@@ -222,6 +222,8 @@ session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
   | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
+# The prompt hook recorded it on the server; fetch it.
+git fetch -q caos "+refs/caos/v3/conversations/$key/head:refs/caos/v3/conversations/$key/head"
 head=$(git rev-parse "refs/caos/v3/conversations/$key/head")
 # Discover the repository mount, so this test does not prescribe startup's
 # source-tree prefix (or require a prefix if startup mounts content directly).
@@ -313,6 +315,7 @@ for _ in $(seq 60); do
 done
 if [ -z "$declared" ]; then fail "the call was never declared"; fi
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"moved to the background\"}"
+sync_held
 if [ "$(git log -1 --format=%s "$held_ref")" = request.terminal ]; then
   fail "Stop closed a request whose call was still running"
 fi
@@ -325,6 +328,7 @@ esac
 # and that one's Stop closes it as usual.
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"the result arrived\"}"
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"done\"}"
+sync_held
 subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
 case "$subjects" in
   "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;

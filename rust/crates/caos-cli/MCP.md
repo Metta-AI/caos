@@ -221,9 +221,26 @@ nowhere else.
 
 ## What gets recorded
 
+**The step writes all of it.** A hook sends one request to the server --
+`llm-step --record=prompt|stop|failure`, with the event's text, an actor and a
+message id the hook mints -- and the step makes these transitions on the
+conversation. This process writes no part of a conversation, for a hook or a
+tool call. A repeated event names the message id it already recorded and writes
+nothing, so a retried hook is harmless. The answer is `status` (`created`,
+`recorded`, `joined`, `held` or `nothing`) and `head`.
+
+The one thing the step cannot find is a NEW conversation's content: the base
+this checkout stands in (or a `/caos-session-start-from` names) is resolved
+and pushed here, and its tree is handed to the step. A conversation that exists
+needs none, so the base is resolved only for a session's first prompt.
+
+A checkout therefore holds only what it fetches. Anything that reads a
+conversation's ref from the local repository must fetch it first (`git fetch
+caos +<ref>:<ref>`); it used to be current because the hook pushed from here.
+
 | Hook | Transitions |
 |---|---|
-| `UserPromptSubmit` | `message.append` (the prompt), `request.admit`, `request.claim` — or, while a request is held open, `request.interject` or a `request.terminal` first (below) |
+| `UserPromptSubmit` | `conversation.root` (the first only), `message.append` (the prompt), `request.admit`, `request.claim` — or, while a request is held open, `request.interject` or a `request.terminal` first (below) |
 | tool call | the step's own `model.complete` declaring the call, then its `tool.start` and `tool.complete` — this process writes nothing |
 | `Stop` | `model.complete` (the closing message), `request.terminal` idle — nothing, while a call is still running |
 | `StopFailure` | `message.append` (the error), `request.terminal` failed — the terminal only once no call is running |
@@ -250,12 +267,13 @@ The conversation id is derived from the session id rather than stored in a map,
 so the ref is the whole record. `claude --resume` keeps its session id, so a
 resumed session extends the same conversation.
 
-**The prompt admits a REAL request** — an ArgTree over the step, prepared the
-way the tui prepares a turn, and claimed in the same compare-and-swap. Claimed
-here rather than by a runner because the turn is already running by the time the
-hook fires; and real rather than a synthetic id because the request is what the
-step finds as the conversation's active one when a call arrives, and what a
-reader of the transcript follows from the prompt to the calls it made.
+**The prompt admits a request and claims it in the same compare-and-swap.**
+Claimed here rather than by a runner because the turn is already running by the
+time the hook fires. The request is identified by the commit of the prompt that
+opened it -- unique, and known before the admission that names it is written --
+and it is what the step finds as the conversation's active one when a call
+arrives. It is not an ArgTree anyone can run: no runner will pick it up, and a
+call names no request.
 
 **A call is one request to the server.** `POST /eval/run` of the step, as a
 form: `base:hash` (the step), `conversation`, `tools-only=<tool_use_id>`, `tool`

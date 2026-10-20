@@ -22,8 +22,8 @@
 //! it. The step is named by `--llm-step`, as `tui` and `chat` name it.
 //!
 //! What Claude Code keeps is the MODEL. It chose the call and will read the
-//! result; the request a prompt admits is claimed here rather than by a worker,
-//! because the turn is already running by the time the hook fires.
+//! result; the request a prompt admits is claimed by the step in the same
+//! write, because the turn is already running by the time the hook fires.
 
 mod diag;
 mod resume;
@@ -36,23 +36,13 @@ use std::io::Read;
 use serde_json::{json, Value};
 
 use caos::{GitTransport, Transport};
-use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
-use conversation_protocol::v3::git_store::GitStore;
-use conversation_protocol::v3::oid::{Oid, G3};
-use conversation_protocol::v3::paths;
-use conversation_protocol::v3::records::{
-    Block, CallStatus, Identity, IdentityKind, Role, TranscriptEntry, TurnOutcome, TurnRecord,
-    TurnStatus,
-};
+use conversation_protocol::v3::oid::Oid;
 use conversation_protocol::v3::refs;
-use conversation_protocol::v3::tree::Signature;
-use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::ObjectStore;
 
 use crate::{
-    conversation_ref, default_title, eval_base, fetch_head, mint_transition, oid, open_store,
-    push_cas, resolve_username, seed_content, signature, update_local_cache, TurnOptions,
-    LLM_STEP_ARG, MAX_APPEND_ATTEMPTS,
+    conversation_ref, eval_base, fetch_head, oid, open_store, resolve_username, seed_content,
+    TurnOptions, LLM_STEP_ARG,
 };
 
 /// Conversation ids for recorded sessions live under one component so they are
@@ -185,24 +175,16 @@ fn run_tool(
         .unwrap_or(name)
         .to_string();
     let arguments = declared_args(args).to_string();
-
-    let secrets = caos::Secrets::current().for_conversation(&id);
-    // REACHABLE FIRST, as for the prompt hook: resolving the step talks to the
-    // server, and through a dead tunnel that wait is unbounded.
-    wait_server_reachable(t)?;
-    let step = step_image(t, options, &secrets)?;
-    let salt = std::env::var("CAOS_SALT").unwrap_or_default();
-    let mut params = vec![
-        ("base:hash", step.as_str()),
-        ("conversation", id.as_str()),
-        ("tools-only", call.as_str()),
-        ("tool", name),
-        ("arguments", arguments.as_str()),
-    ];
-    if !salt.is_empty() {
-        params.push(("salt", salt.as_str()));
-    }
-    let (kind, result) = caos::eval_line_request(&t.server_url()?, "run", &params, &secrets)?;
+    let (kind, result) = run_step(
+        t,
+        options,
+        &id,
+        &[
+            ("tools-only", call.as_str()),
+            ("tool", name),
+            ("arguments", arguments.as_str()),
+        ],
+    )?;
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
     }
@@ -217,40 +199,35 @@ fn run_tool(
     Ok(ToolOutcome { text, is_error })
 }
 
-/// The step a call runs on: `llm-step`, curried with everything that is the
-/// same for every call of this conversation.
+/// Run the step on a conversation: one request to the server, answered with the
+/// result's `(kind, hash)`. `params` are the step's own arguments for this call
+/// (a tool call, a recorded event); the step and the conversation are added.
 ///
-/// It is the request's recorded `configuration` too, so a conversation says
-/// which worker ran its tools -- and the tui can pick the turn up, because what
-/// it names is an ordinary step.
-fn tools_configuration(
+/// EVERYTHING a tool call or a hook does to a conversation goes through here, so
+/// that is the whole of the client's part: no checkout of the conversation is
+/// read, none is written, and nothing is pushed first.
+fn run_step(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
-    secrets: &caos::Secrets,
-) -> Result<String, String> {
-    // REACHABLE FIRST, IN FRONT OF EVERYTHING BELOW. Resolving the step and
-    // preparing a request both talk to the caos server, and in a cloud session
-    // that server is reached through a tunnel. A tunnel whose far end is gone
-    // accepts and swallows, so those waits are unbounded -- and this is the
-    // path a HOOK takes. A `UserPromptSubmit` hook that never returns takes the
-    // session's prompt with it, which presents as Claude Code hanging on the
-    // first thing you type, with nothing anywhere saying why.
-    //
-    // But a single 5s probe LOSES A RACE it must not lose. The SessionStart
-    // hook brings the tunnel up, and the first prompt can fire before it is
-    // proven -- and then this one probe fails, the whole conversation is never
-    // created, and every tool call of that first turn is refused with "no
-    // conversation to record into" while the tools list perfectly well (the
-    // serve resolver retries; this did not). So it retries, still bounded:
-    // enough to outlast tunnel bringup, never enough to hang the prompt.
+    params: &[(&str, &str)],
+) -> Result<(String, String), String> {
+    let secrets = caos::Secrets::current().for_conversation(id);
+    // REACHABLE FIRST, in front of everything below. Resolving the step talks
+    // to the server, and in a cloud session that server is reached through a
+    // tunnel whose far end, when gone, accepts and swallows: the wait is
+    // unbounded, and this is the path a HOOK takes. A `UserPromptSubmit` hook
+    // that never returns takes the session's prompt with it, which presents as
+    // Claude Code hanging on the first thing you type, with nothing saying why.
     wait_server_reachable(t)?;
-    // A host no longer snapshots merge refs into the turn: main's history and
-    // merge tools resolve against the conversation's own Git store, so a ref
-    // snapshot passed from here would be a second, staler source of truth.
-    let config = vec![format!("--conversation={id}")];
-    let base = step_image(t, options, secrets)?;
-    crate::curry_client_object(t, &base, &config).map(|hash| hash.to_string())
+    let step = step_image(t, options, &secrets)?;
+    let salt = std::env::var("CAOS_SALT").unwrap_or_default();
+    let mut all = vec![("base:hash", step.as_str()), ("conversation", id)];
+    all.extend_from_slice(params);
+    if !salt.is_empty() {
+        all.push(("salt", salt.as_str()));
+    }
+    caos::eval_line_request(&t.server_url()?, "run", &all, &secrets)
 }
 
 /// The step, resolved from the tree the conversation seeds from: `--base`'s
@@ -492,8 +469,8 @@ fn hook(discovered: Result<GitTransport, String>, options: &TurnOptions) -> Resu
     let result = match event {
         "UserPromptSubmit" => on_user_prompt(&t, options, &payload),
         "PreToolUse" => on_pre_tool_use(&payload),
-        "Stop" => on_stop(&t, &payload),
-        _ => on_stop_failure(&t, &payload),
+        "Stop" => on_stop(&t, options, &payload),
+        _ => on_stop_failure(&t, options, &payload),
     };
     debug_log_hook("end", event, &payload, Some((started.elapsed(), &result)));
     result
@@ -625,193 +602,94 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     Ok(())
 }
 
+/// What the step answered to a recorded event: which of its outcomes it was
+/// (`created`, `recorded`, `joined`, `held`, `nothing`) and the head it left.
+struct Recorded {
+    status: String,
+    head: String,
+}
+
+/// Send one event to the step (`llm-step --record=<kind>`) and read its answer.
+///
+/// The hooks used to write the conversation themselves, from the harness's
+/// checkout. A hook is now one request: the step makes the same transitions on
+/// the server, so this process needs no checkout of the conversation, writes
+/// nothing, and a repeated event (a retried hook) names the message id it
+/// already recorded and writes nothing twice.
+fn record_event(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    kind: &str,
+    extra: &[(&str, &str)],
+) -> Result<Recorded, String> {
+    let message_id = caos::fresh_entropy()?;
+    let username = resolve_username(t, None)?;
+    let mut params = vec![
+        ("record", kind),
+        ("message-id", message_id.as_str()),
+        ("actor", username.as_str()),
+    ];
+    params.extend_from_slice(extra);
+    let (answer, tree) = run_step(t, options, id, &params)?;
+    if answer != "tree" {
+        return Err(format!("the step answered a {answer}, not a record"));
+    }
+    let files = caos::tree_blobs(t, &tree)?;
+    let text = |file: &str| {
+        files
+            .get(file)
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+            .ok_or_else(|| format!("the step's answer {tree} has no {file}"))
+    };
+    Ok(Recorded {
+        status: text("status")?,
+        head: text("head")?,
+    })
+}
+
 /// Record a user's prompt, creating the conversation on the session's first one;
 /// true when this prompt is the one that created it.
 ///
-/// THREE TRANSITIONS, minted in one compare-and-swap: the message, the request
-/// it opens, and the claim that puts the request in `running`. v3 requires the
-/// last of those before any tool may be recorded (`require_request_running_or_-
-/// cancelling`), and Claude Code has already begun the turn by the time this
-/// hook fires -- so admitting and claiming together is not a shortcut, it is
-/// the truth: no runner is going to pick this request up.
+/// The step makes the message, the request it opens, and the claim that puts the
+/// request in `running`, in one compare-and-swap. The claim is not a shortcut:
+/// v3 requires it before any tool may be recorded, and Claude Code has already
+/// begun the turn by the time this hook fires, so no runner will pick the
+/// request up.
 ///
-/// The request is a REAL ONE all the same -- an ArgTree over the step, prepared
-/// exactly as the tui prepares a turn -- because each of the turn's tool calls
-/// runs it. A request id that named nothing would leave the calls nothing to
-/// run and the record claiming a configuration that never existed.
+/// A NEW conversation needs its content, and that is the one thing the step
+/// cannot find for itself: the base this hook stands in (or names) is resolved
+/// and pushed here, and the step is handed its tree. A conversation that
+/// exists needs none, so the base is not resolved for every prompt.
 fn record_prompt(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
     prompt: &str,
 ) -> Result<bool, String> {
-    let username = resolve_username(t, None)?;
-    let signature = signature(&username)?;
-    let refname = conversation_ref(id)?;
-    let secrets = caos::Secrets::current().for_conversation(id);
     let phase = std::time::Instant::now();
-    let configuration = tools_configuration(t, options, id, &secrets)?;
-    cc_timing("tools_configuration", phase.elapsed());
-
-    for _ in 0..MAX_APPEND_ATTEMPTS {
-        let mut store = open_store(t)?;
-        let observed = fetch_head(t, &store, id)?.map(|(_, head)| head);
-        let mut head = match &observed {
-            Some(head) => head.clone(),
-            None => root_commit(t, &mut store, id, prompt, options, &signature)?,
-        };
-
-        // A request `on_stop` left open for a backgrounded call. While that
-        // call still runs, the prompt joins its request, as a prompt typed into
-        // a running tui turn does. Once the call has finished -- and the turn
-        // Claude Code opens to deliver its result is one such prompt -- the
-        // request has nothing left to wait for and closes, and the prompt
-        // opens a request of its own.
-        let held = {
-            let view = Conversation::open(&store, &head)?;
-            match view.active_turn()? {
-                Some(active) => {
-                    let running = outstanding_call(&view, &active)?.is_some();
-                    Some((active.id, running))
-                }
-                None => None,
-            }
-        };
-        let mut interject_into = None;
-        if let Some((active, running)) = held {
-            if running {
-                interject_into = Some(active);
-            } else {
-                let closing = inherited_signature(&store, &head)?;
-                head = mint_transition(
-                    &mut store,
-                    &head,
-                    &Transition::TurnTerminal {
-                        request: active,
-                        outcome: TurnOutcome::Idle {
-                            result: None,
-                            interrupted: false,
-                        },
-                    },
-                    &closing,
-                )?;
-            }
-        }
-
-        // The message. Its id is fresh entropy, as the client's own is: a
-        // transcript entry is addressed by it, and two prompts in one session
-        // must not collide.
-        let message_id = caos::fresh_entropy()?;
-        let entry = TranscriptEntry {
-            message_id: message_id.clone(),
-            conversation: id.to_string(),
-            role: Role::User,
-            actor: username.clone(),
-            request: interject_into.clone(),
-            round: None,
-            model: None,
-            blocks: vec![Block::Text {
-                text: prompt.to_string(),
-            }],
-            proposal: None,
-            source_tree_resolution: None,
-        };
-        if let Some(request) = interject_into {
-            let joined = mint_transition(
-                &mut store,
-                &head,
-                &Transition::TurnInterject {
-                    request,
-                    entry,
-                    payloads: Vec::new(),
-                },
-                &signature,
-            )?;
-            if push_cas(&store, &refname, observed.as_ref(), &joined)? {
-                let _ = update_local_cache(t, &refname, joined.as_str());
-                return Ok(false);
-            }
-            continue;
-        }
-        let message = mint_transition(
-            &mut store,
-            &head,
-            &Transition::MessageAppend {
-                entry,
-                payloads: Vec::new(),
-            },
-            &signature,
-        )?;
-
-        // The request, prepared exactly as a turn the tui dispatches is: an
-        // ArgTree over the step, pinned to the head the prompt left. A tool
-        // call runs THIS request rather than one of its own, so what the step
-        // is handed -- the conversation, the head it was admitted at -- is what
-        // the record says it was.
+    let exists = fetch_head(t, &open_store(t)?, id)?.is_some();
+    cc_timing("fetch_head", phase.elapsed());
+    let content = if exists {
+        None
+    } else {
         let phase = std::time::Instant::now();
-        let request = oid(
-            &caos::prepare_client_request_with_secrets(
-                t,
-                &configuration,
-                &[format!("--head:commit={message}")],
-                &secrets,
-            )?,
-            "request",
-        )?;
-        cc_timing("prepare_request", phase.elapsed());
-        let record = TurnRecord {
-            id: request.clone(),
-            request_head: message.clone(),
-            model: CLAUDE_CODE_MODEL.to_string(),
-            configuration: configuration.clone(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        };
-        let admission = inherited_signature(&store, &message)?;
-        let admitted = mint_transition(
-            &mut store,
-            &message,
-            &Transition::TurnAdmit { record },
-            &admission,
-        )?;
-        let claimed = mint_transition(
-            &mut store,
-            &admitted,
-            &Transition::TurnClaim {
-                request,
-                latest_message: message_id,
-            },
-            &admission,
-        )?;
-
-        let phase = std::time::Instant::now();
-        let pushed = push_cas(&store, &refname, observed.as_ref(), &claimed)?;
-        cc_timing("push_cas", phase.elapsed());
-        if pushed {
-            let _ = update_local_cache(t, &refname, claimed.as_str());
-            return Ok(observed.is_none());
-        }
+        let content = content_tree(t, options, prompt)?;
+        cc_timing("content_tree", phase.elapsed());
+        Some(content.to_string())
+    };
+    let mut extra = vec![("text", prompt), ("model", CLAUDE_CODE_MODEL)];
+    if let Some(content) = &content {
+        extra.push(("content:hash", content));
     }
-    Err(format!(
-        "conversation {id:?} head moved during all {MAX_APPEND_ATTEMPTS} append attempts"
-    ))
+    let phase = std::time::Instant::now();
+    let recorded = record_event(t, options, id, "prompt", &extra)?;
+    cc_timing("record", phase.elapsed());
+    Ok(recorded.status == "created")
 }
 
-/// The conversation's root commit, for a session whose first prompt this is.
-fn root_commit(
-    t: &GitTransport,
-    store: &mut GitStore,
-    id: &str,
-    prompt: &str,
-    options: &TurnOptions,
-    signature: &Signature,
-) -> Result<Oid, String> {
-    let phase = std::time::Instant::now();
+/// The tree a new conversation starts with: the base commit's, on the server.
+fn content_tree(t: &GitTransport, options: &TurnOptions, prompt: &str) -> Result<Oid, String> {
     let base = oid(
         &match &options.base {
             None if session_base::names_a_base(prompt) => {
@@ -821,25 +699,8 @@ fn root_commit(
         },
         "conversation base",
     )?;
-    cc_timing("eval_base", phase.elapsed());
-    let phase = std::time::Instant::now();
-    // The client repo's own tree becomes the conversation's content, at the
-    // root -- the same `seed_content` the tui uses, so a recorded session and a
-    // hand-driven one start identically.
-    let content = seed_content(t, store, &base)?;
-    cc_timing("ensure_code_commit", phase.elapsed());
-    let genesis = oid(G3, "v3 genesis")?;
-    let root = Transition::ConversationRoot {
-        identity: Identity {
-            id: id.to_string(),
-            kind: IdentityKind::Root,
-            owner: None,
-        },
-        title: default_title(prompt),
-        content: Some(content),
-    };
-    let applied = apply(store, None, &root)?;
-    mint(store, &genesis, &applied, root.kind(), signature)
+    let mut store = open_store(t)?;
+    seed_content(t, &mut store, &base)
 }
 
 /// Tell a caos workspace tool which conversation it is working in.
@@ -890,34 +751,6 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// A call of `request` that has not finished, if there is one: one that
-/// started and has no result yet, or one the current round declared that has
-/// not started. A call is recorded in the round BEFORE `request.round`, which
-/// is the one its `model.complete` opened.
-fn outstanding_call(
-    view: &Conversation<'_>,
-    request: &TurnRecord,
-) -> Result<Option<String>, String> {
-    for round in 0..request.round {
-        if let Some(call) = view
-            .tools(&request.id, round)?
-            .into_iter()
-            .find(|call| call.status == CallStatus::Started)
-        {
-            return Ok(Some(call.id));
-        }
-    }
-    let Some(declaring) = request.round.checked_sub(1) else {
-        return Ok(None);
-    };
-    for call in &request.calls {
-        if view.tool(&request.id, declaring, &call.id)?.is_none() {
-            return Ok(Some(call.id.clone()));
-        }
-    }
-    Ok(None)
-}
-
 /// The conversation a hook payload's session records into: the one it was
 /// resumed onto (`resume`), or else the one its id derives.
 fn recorded_conversation(t: &GitTransport, payload: &Value) -> Result<String, String> {
@@ -950,131 +783,20 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("hook payload has no string {key}"))
 }
 
-/// Append whatever `step` mints, compare-and-swapping the conversation head.
-///
-/// `step` returns the new head, or `None` when there is nothing to record --
-/// a hook that fires for a turn this session never opened, say. The retries are
-/// not a concurrency model: the tool server handles one call at a time. They
-/// protect against ANOTHER writer, such as an interjection typed into the tui.
-///
-/// Returns the head it leaves: the one it pushed, or the one it read when there
-/// was nothing to record.
-fn append(
-    t: &GitTransport,
-    id: &str,
-    mut step: impl FnMut(&mut GitStore, &Oid) -> Result<Option<Oid>, String>,
-) -> Result<Oid, String> {
-    let refname = conversation_ref(id)?;
-    for _ in 0..MAX_APPEND_ATTEMPTS {
-        let mut store = open_store(t)?;
-        let Some((_, head)) = fetch_head(t, &store, id)? else {
-            return Err(format!(
-                "no conversation {id:?} to record into; \
-                 a session's first recorded event is its user prompt"
-            ));
-        };
-        let Some(candidate) = step(&mut store, &head)? else {
-            return Ok(head);
-        };
-        if push_cas(&store, &refname, Some(&head), &candidate)? {
-            let _ = update_local_cache(t, &refname, candidate.as_str());
-            return Ok(candidate);
-        }
-    }
-    Err(format!(
-        "conversation {id:?} head moved during all {MAX_APPEND_ATTEMPTS} append attempts"
-    ))
-}
-
 /// The assistant's closing message, and the end of the request it answered.
-fn on_stop(t: &GitTransport, payload: &Value) -> Result<(), String> {
+fn on_stop(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(t, payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let username = resolve_username(t, None)?;
-    let conversation = id.clone();
-    let head = append(t, &id, move |store, head| {
-        let _ = &conversation;
-        let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_turn()? else {
-            // Nothing to close. A Stop for a turn that opened no request is
-            // not an error: an interrupted session can leave one behind.
-            return Ok(None);
-        };
-        // Claude Code ends a turn with a call still running when it has moved
-        // that call to the background (it does so to any MCP call past 120s),
-        // and it delivers the result in a later turn. Only a RUNNING request
-        // accepts the call's completion, so the request stays open for it,
-        // and the prompt hook closes it once the call is done.
-        //
-        // The closing message is not recorded either. `model.complete` would
-        // open a new round, and the step checks a finishing call against the
-        // round current AT THE FINISH (`require_completed_call`), so it would
-        // fail the call as undeclared -- and a declared call that had not yet
-        // started would never start.
-        if let Some(call) = outstanding_call(&view, &request)? {
-            eprintln!(
-                "caos mcp hook: call {call} is still running; \
-                 leaving its request open for the result"
-            );
-            return Ok(None);
-        }
-        let ordinal = view.transcript_len()?;
-        let round = request.round;
-        drop(view);
-
-        let signature = inherited_signature(store, head)?;
-        let mut at = head.clone();
-        let mut result = None;
-        if !message.trim().is_empty() {
-            let message_id = caos::fresh_entropy()?;
-            let entry = TranscriptEntry {
-                message_id: message_id.clone(),
-                conversation: conversation.clone(),
-                role: Role::Assistant,
-                actor: username.clone(),
-                request: Some(request.id.clone()),
-                round: Some(round),
-                model: Some(CLAUDE_CODE_MODEL.to_string()),
-                blocks: vec![Block::Text {
-                    text: message.clone(),
-                }],
-                proposal: None,
-                source_tree_resolution: None,
-            };
-            at = mint_transition(
-                store,
-                &at,
-                &Transition::ModelComplete {
-                    request: request.id.clone(),
-                    entry,
-                    payloads: Vec::new(),
-                    calls: Vec::new(),
-                },
-                &signature,
-            )?;
-            // The turn's result is that message, by path -- what a reader
-            // shows for the turn, and the same thing `llm-step` names.
-            result = Some(paths::transcript_entry_path(ordinal, &message_id));
-        }
-        let terminal = mint_transition(
-            store,
-            &at,
-            &Transition::TurnTerminal {
-                request: request.id.clone(),
-                outcome: TurnOutcome::Idle {
-                    result,
-                    interrupted: false,
-                },
-            },
-            &signature,
-        )?;
-        Ok(Some(terminal))
-    })?;
-    announce(&format!("caos head {}", head.as_str()))
+        .unwrap_or("");
+    let recorded = record_event(t, options, &id, "stop", &[("text", message)])?;
+    if recorded.status == "held" {
+        eprintln!(
+            "caos mcp hook: a call is still running; leaving its request open for the result"
+        );
+    }
+    announce(&format!("caos head {}", recorded.head))
 }
 
 /// Show the person running the session where it is recorded: the conversation's
@@ -1094,7 +816,7 @@ fn announce(text: &str) -> Result<(), String> {
 }
 
 /// A turn that ended badly closes its request as failed.
-fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
+fn on_stop_failure(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(t, payload)?;
     let kind = payload
         .get("error_type")
@@ -1108,64 +830,7 @@ fn on_stop_failure(t: &GitTransport, payload: &Value) -> Result<(), String> {
         true => kind.to_string(),
         false => format!("{kind}: {detail}"),
     };
-    let username = resolve_username(t, None)?;
-    let conversation = id.clone();
-    append(t, &id, move |store, head| {
-        let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_turn()? else {
-            return Ok(None);
-        };
-        let ordinal = view.transcript_len()?;
-        let round = request.round;
-        // A backgrounded call still has its result to deliver, as in `on_stop`,
-        // so the failure is recorded but the request is left running for it.
-        let holding = outstanding_call(&view, &request)?.is_some();
-        drop(view);
-
-        // The outcome names a TRANSCRIPT ENTRY, not the text: `apply` validates
-        // it as a path, and the tui reads the failure by following it. So the
-        // message is recorded first and the terminal points at it.
-        let signature = inherited_signature(store, head)?;
-        let message_id = caos::fresh_entropy()?;
-        let recorded = mint_transition(
-            store,
-            head,
-            &Transition::MessageAppend {
-                entry: TranscriptEntry {
-                    message_id: message_id.clone(),
-                    conversation: conversation.clone(),
-                    role: Role::System,
-                    actor: username.clone(),
-                    request: Some(request.id.clone()),
-                    round: Some(round),
-                    model: None,
-                    blocks: vec![Block::Text {
-                        text: error.clone(),
-                    }],
-                    proposal: None,
-                    source_tree_resolution: None,
-                },
-                payloads: Vec::new(),
-            },
-            &signature,
-        )?;
-        if holding {
-            return Ok(Some(recorded));
-        }
-        let terminal = mint_transition(
-            store,
-            &recorded,
-            &Transition::TurnTerminal {
-                request: request.id,
-                outcome: TurnOutcome::Failed {
-                    error: paths::transcript_entry_path(ordinal, &message_id),
-                },
-            },
-            &signature,
-        )?;
-        Ok(Some(terminal))
-    })
-    .map(|_| ())
+    record_event(t, options, &id, "failure", &[("text", &error)]).map(|_| ())
 }
 
 #[cfg(test)]

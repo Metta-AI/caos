@@ -45,6 +45,9 @@ prompt "$session" "second prompt"
 stop "$session" "second answer"
 prompt "$session" "third prompt"
 stop "$session" "third answer"
+# The hooks write on the server; fetch what they recorded.
+git fetch -q caos "+$(ref_of "cc/$session"):$(ref_of "cc/$session")" \
+  || fail "the conversation was never recorded"
 head=$(git rev-parse --verify -q "$(ref_of "cc/$session")") \
   || fail "the conversation was never recorded"
 
