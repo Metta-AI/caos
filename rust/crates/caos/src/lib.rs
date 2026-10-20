@@ -172,6 +172,19 @@ fn report_conventions(t: &dyn Transport, name: &str, result: &str) -> Result<(),
     Ok(())
 }
 
+/// Error unless `target` is absent. `symlink_metadata` so a dangling symlink,
+/// which `exists()` would call absent, is refused too.
+fn refuse_existing_target(target: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => Err(format!(
+            "{} already exists; `get` will not overwrite it (remove it first, or choose a new path)",
+            target.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("checking {}: {e}", target.display())),
+    }
+}
+
 /// `get <hash> <path>` — check an existing result out on the host, as ordinary
 /// rw files. The counterpart to `run-tool` materializing nothing: it prints a
 /// hash, and this is how you then read the thing. Costs only the objects the
