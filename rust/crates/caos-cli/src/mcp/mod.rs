@@ -1418,6 +1418,42 @@ mod tests {
     }
 
     #[test]
+    fn a_result_over_the_limit_is_spilled_and_zero_means_no_limit() {
+        assert!(!exceeds(50_000, 50_000));
+        assert!(exceeds(50_001, 50_000));
+        assert!(!exceeds(usize::MAX, 0));
+    }
+
+    #[test]
+    fn the_notice_keeps_whole_lines_and_names_where_the_rest_is() {
+        let text = "alpha\nbeta\ngamma\ndelta\n".repeat(1_000);
+        let blob = Oid::parse(&"ab".repeat(20), "blob").unwrap();
+        let notice = spill_notice(
+            &text,
+            text.chars().count(),
+            DEFAULT_MAX_RESULT_CHARS,
+            "tool-results/toolu_1.txt",
+            Some(&blob),
+        );
+        let (preview, rest) = notice.split_once("\n\n[caos:").unwrap();
+        assert!(preview.chars().count() <= RESULT_PREVIEW_CHARS);
+        assert!(text.starts_with(preview));
+        assert!(text[preview.len()..].starts_with('\n'), "cut mid-line");
+        assert!(rest.contains("tool-results/toolu_1.txt"));
+        assert!(rest.contains(&format!("root={blob}")));
+        assert!(rest.contains("4000 lines"));
+    }
+
+    #[test]
+    fn the_preview_never_splits_a_character_or_outgrows_the_limit() {
+        let text = "é".repeat(500);
+        let notice = spill_notice(&text, 500, 100, "tool-results/x.txt", None);
+        let (preview, rest) = notice.split_once("\n\n[caos:").unwrap();
+        assert_eq!(preview.chars().count(), 100);
+        assert!(!rest.contains("root="));
+    }
+
+    #[test]
     fn a_payload_without_its_event_name_is_an_error() {
         assert!(string_field(&json!({}), "hook_event_name").is_err());
         assert!(string_field(&json!({"hook_event_name": 2}), "hook_event_name").is_err());
