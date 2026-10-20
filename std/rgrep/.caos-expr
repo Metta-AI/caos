@@ -1,8 +1,9 @@
-# std/rgrep's image (design/caos-expr.md, Phase 3): build this directory as a
-# Rust project with rustc. `--src:@=.` hands rustc this whole tree (its
-# Cargo.toml + src/; rustc skips the caos metadata — .caos-expr, DEPS,
-# DEEP-DEPS/), named by a LOCAL deep-deps mount (declared in DEPS) rather than
-# /std, so std carries no ambient self-reference. No runner is named: rustc
-# DEPENDS on the pool and curries the built binary onto it itself, so the result
-# is curry(runner, worker1=<the compiled binary>) — a ready-to-run worker.
-run --base:@=DEEP-DEPS/rustc --src:@=.
+# std/rgrep: recursive grep. tree-map does the recursion (one job per directory,
+# a sparse result tree of the same shape: only matching files appear, each
+# holding its matches as `linenum:line` lines); ./level is the grep of ONE
+# directory's files. `--pattern` is bound by the caller and forwarded by
+# tree-map to ./level, so a child's cache key is (subtree, pattern).
+#
+# Flattening to classic `path:linenum:line` output is the caller's presentation
+# choice (llm-step renders it at the transcript boundary).
+curry --base:@=DEEP-DEPS/tree-map --run:@=level
