@@ -255,9 +255,7 @@ fn run_tool(
 
     dispatch_call(t, options, &id, &request, &request_head, &call)?;
     let outcome = read_outcome(t, &id, &request, round, &call)?;
-    let limit = options
-        .max_result_chars
-        .unwrap_or(DEFAULT_MAX_RESULT_CHARS);
+    let limit = options.max_result_chars.unwrap_or(DEFAULT_MAX_RESULT_CHARS);
     Ok(spill_oversized(t, &id, &call, outcome, limit))
 }
 
