@@ -421,6 +421,12 @@ reach usually means the grant is missing.
 
 ## Pitfalls
 
+- This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
+  directly: `eval_path(path="caos-std")` gives a tree hash, then
+  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `git.md` is "no such path".
+- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
+  underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash, not a path or a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first.
 - An import is an unchanged snapshot. It never merges into or advances
