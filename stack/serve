@@ -757,10 +757,11 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # SAME list on a second `caosd up`, failing every caos tool call with
   # "caos_session is missing: the PreToolUse hook... is not installed").
   # `profile_is_hardened` exists to skip the EXPENSIVE, rarely-changing part
-  # below (mcp_servers, discovery timeouts, the env file) on an
-  # already-hardened restart -- it must never also gate the one cheap write
-  # that decides the plugin list, or a later restart silently reverts
-  # caos-hooks out of it while leaving everything else alone.
+  # below (mcp_servers, discovery timeouts) on an already-hardened restart --
+  # it must never also gate a cheap write whose content is build-specific
+  # (the plugin list above, the env file below), or a later restart silently
+  # reverts caos-hooks out of it, or keeps the env file pointing at a build
+  # that's already been garbage-collected, while everything else moves on.
   caos_root_plugins='["basic","nous"]'
   if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
     caos_root_plugins='["basic","nous","caos-hooks"]'
@@ -772,7 +773,19 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # been hardened? Lets this stay idempotent/cheap to re-run across restarts
   # without spawning `hermes config set` subprocesses for keys that already
   # hold the right value. Deliberately does NOT cover plugins.enabled -- see
-  # above.
+  # above -- and must NOT cover write_caos_env_file either, for the same
+  # reason: this check only asks whether config.yaml HAS the right KEYS
+  # (disabled_toolsets:, mcp_servers:), never whether the env file's VALUES
+  # are still current. Those values are nix store paths
+  # (CAOS_HERMES_DIST_DIR, CAOS_BIN) that are different on every build, so
+  # config.yaml's shape staying constant across restarts says nothing about
+  # whether the paths pinned in .env still exist. Confirmed the hard way:
+  # two full `deploy-caosd-prod` rebuilds in a row, each producing a new
+  # caos-stack-inputs store path, left .env (and therefore the MCP server
+  # Hermes actually launches) pointing at the FIRST boot's path from days
+  # earlier, forever -- config.yaml already had `mcp_servers:` from that
+  # first boot, so this check kept saying "hardened" and skipping the
+  # rewrite on every subsequent restart.
   profile_is_hardened() { # <config.yaml path>
     local cfg=$1
     [ -f "$cfg" ] || return 1
@@ -818,6 +831,16 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
   # both removed), so it is not an active gap on THIS stack.
   apply_caos_profile_hardening() {
     local cfg="$hermes_home/config.yaml" env_file="$hermes_home/.env"
+    # Unconditional, every boot, same reasoning as caos_root_plugins above:
+    # CAOS_HERMES_DIST_DIR/CAOS_BIN are THIS build's nix store paths, not a
+    # one-time fact about the profile, so this can never sit behind
+    # profile_is_hardened -- see that function's own comment. Also
+    # unconditional on CAOS_STACK_HERMES_DEFAULT_TOOLS: the write itself is
+    # inert when that's "no" (nothing reads these vars back out of .env
+    # unless mcp_servers.caos is ALSO configured, which stays gated on it
+    # below), so there is nothing to protect by skipping it.
+    write_caos_env_file "$env_file"
+
     profile_is_hardened "$cfg" && return 0
 
     HERMES_HOME="$hermes_home" "$hermes_bin" config set agent.disabled_toolsets \
@@ -825,7 +848,6 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
       >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
 
     if [ "${CAOS_STACK_HERMES_DEFAULT_TOOLS:-yes}" = yes ]; then
-      write_caos_env_file "$env_file"
       # The actual PLUGIN CODE, not just config referencing it by name --
       # `hermes profile install` used to copy this as part of installing
       # the whole distribution into a NAMED profile; now that this writes
