@@ -255,7 +255,7 @@ fail() {
 write_caos_env_file() { # <path>
   local target=$1 extra=""
   if [ -f "$target" ]; then
-    extra=$(grep -v '^\(CAOS_HERMES_DIST_DIR\|CAOS_BIN\|CAOS_MCP_DEFAULT_SERVER\|CAOS_LLM_STEP_REV\)=' "$target" || true)
+    extra=$(grep -v '^\(CAOS_HERMES_DIST_DIR\|CAOS_BIN\|CAOS_MCP_DEFAULT_SERVER\|CAOS_LLM_STEP_REV\|SSL_CERT_FILE\|NIX_SSL_CERT_FILE\)=' "$target" || true)
   fi
   # CAOS_BIN points at caos-cli, NOT caos: $CAOS_STACK_BIN/caos is the
   # WORKER-side binary (CAS get/put/curry/runner, no `mcp` subcommand at
@@ -264,6 +264,23 @@ write_caos_env_file() { # <path>
   # "Connection closed" after `caos` printed its own usage text and exited 1
   # on the unrecognized `mcp` verb -- nothing in that failure named
   # "caos-cli" or "wrong binary" at all.
+  #
+  # SSL_CERT_FILE/NIX_SSL_CERT_FILE: Hermes does NOT pass its own shell
+  # environment to an MCP subprocess, only a fixed safe-baseline allowlist
+  # (PATH, HOME, USER, LANG, LC_ALL, TERM, SHELL, TMPDIR, XDG_*) plus
+  # whatever this distribution's mcp_servers.caos.env names explicitly --
+  # neither SSL var is on that baseline. caos-mcp-launch's --llm-step
+  # resolution now needs `git ls-remote https://github.com/...` (the
+  # caos-session/main fallback), and this image's git is a nix build that
+  # trusts no CA bundle unless told one. Confirmed the hard way: the exact
+  # same `git ls-remote` succeeded by hand (inheriting this shell's own
+  # env) and failed under the MCP subprocess's filtered env with "SSL
+  # certificate ... unable to get local issuer certificate" -- surfaced by
+  # caos-mcp-launch only as a generic "ls-remote failed, which usually
+  # means no network reach", which it is not. Set from THIS process's own
+  # env, not hardcoded: it is already correct here (set by the stack
+  # image), and a hardcoded path would be wrong for any future non-Nix or
+  # non-Linux image.
   #
   # NO COMMENTS in the heredoc below: this file is rewritten every
   # `caosd up`, and the preserve-filter above only strips lines matching
@@ -278,6 +295,8 @@ CAOS_HERMES_DIST_DIR=$CAOS_STACK_HERMES_PROFILE
 CAOS_BIN=$CAOS_STACK_BIN/caos-cli
 CAOS_MCP_DEFAULT_SERVER=$SERVER_URL
 CAOS_LLM_STEP_REV=${CAOS_STACK_HERMES_REV:-}
+SSL_CERT_FILE=${SSL_CERT_FILE:-}
+NIX_SSL_CERT_FILE=${NIX_SSL_CERT_FILE:-}
 HERMESENV
     if [ -n "$extra" ]; then
       printf '%s\n' "$extra"
@@ -884,7 +903,7 @@ if [ "${CAOS_STACK_HERMES:-yes}" = yes ]; then
       # Use --force to replace the entire section" -- confirmed the hard
       # way, this killed a whole `caosd up` on the very next restart.
       HERMES_HOME="$hermes_home" "$hermes_bin" config set --force mcp_servers \
-        '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_LLM_STEP_REV":"${CAOS_LLM_STEP_REV}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}"},"timeout":1800,"connect_timeout":300}}' \
+        '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_LLM_STEP_REV":"${CAOS_LLM_STEP_REV}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}","SSL_CERT_FILE":"${SSL_CERT_FILE}","NIX_SSL_CERT_FILE":"${NIX_SSL_CERT_FILE}"},"timeout":1800,"connect_timeout":300}}' \
         >>"$CAOS_STACK_LOGS/hermes-install.log" 2>&1
     fi
   }
