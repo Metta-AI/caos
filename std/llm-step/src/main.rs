@@ -72,6 +72,13 @@ struct Config {
     /// so without it a second call would name the first's ArgTree and be
     /// answered from the memo.
     tools_only: Option<String>,
+    /// With `tools_only`: the call to run, as a tool name and its arguments,
+    /// instead of one a harness declared beforehand. The step declares it on
+    /// the conversation's active request (as the request's own model) and then
+    /// runs it, so a caller needs only this ArgTree -- no conversation access of
+    /// its own, and no request or head to name. A call already declared under
+    /// the id is not declared twice, so a retry runs it rather than failing.
+    tool_call: Option<(String, Value)>,
     /// Describe the tools and stop, writing the registry as JSON. A harness
     /// that drives the model itself has to publish these declarations to it,
     /// and they belong to the step that implements them.
@@ -99,6 +106,21 @@ impl Config {
             image_arg("run-and-update-ref-image")?
         };
         let tools_only = read_arg_opt("tools-only")?;
+        let tool_call = match (read_arg_opt("tool")?, read_arg_opt("arguments")?) {
+            (Some(_), _) | (_, Some(_)) if tools_only.is_none() => {
+                return Err("--tool and --arguments need --tools-only=<call id>".to_string())
+            }
+            (Some(name), arguments) => {
+                let arguments = match arguments {
+                    Some(text) => serde_json::from_str(&text)
+                        .map_err(|error| format!("--arguments is not JSON: {error}"))?,
+                    None => json!({}),
+                };
+                Some((name, arguments))
+            }
+            (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
+            (None, None) => None,
+        };
         let list_tools = read_arg_opt("list-tools")?.is_some();
         // Neither of those modes reaches the model, so neither may DEMAND what
         // a model call takes. The key especially: `caos mcp` runs Claude Code's
@@ -118,6 +140,7 @@ impl Config {
             merge_image: image_arg("merge-image")?,
             run_and_update_ref_image,
             tools_only,
+            tool_call,
             list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
             model: match answers_model {
@@ -140,11 +163,22 @@ fn run() -> Result<(), String> {
     if cfg.list_tools {
         return list_tools(&cfg);
     }
-    let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
-    let request = Oid::parse(&run_text, "conversation request")?;
-    let request_head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
     let mut state = progress::State::open(&cfg.conversation)?;
     timing::phase("state.open");
+    let (request, request_head) = match (&cfg.tools_only, &cfg.tool_call) {
+        // The caller named a call, not a request: the active one is the
+        // request, and it records its own head.
+        (Some(call), Some((name, arguments))) => {
+            declare_requested_call(&mut state, call, name, arguments)?
+        }
+        _ => {
+            let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+            (
+                Oid::parse(&run_text, "conversation request")?,
+                Oid::parse(&cas_hash(&arg("head"))?, "request head")?,
+            )
+        }
+    };
     let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
         callback(&cfg, &mut state, &request, &request_head)
     } else {
@@ -402,8 +436,7 @@ fn resume(
         // Its result is the conversation as it now stands, not a terminal one.
         if let Some(call) = &cfg.tools_only {
             require_completed_call(state, request, call)?;
-            let head = state.head().clone();
-            return forward_result(&head);
+            return forward_tool_result(state, request, call);
         }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
@@ -959,6 +992,31 @@ fn model_transition(
     blocks: &[Value],
     calls: &[Value],
 ) -> Result<(Transition, String), String> {
+    model_transition_by(
+        &cfg.conversation,
+        &cfg.model,
+        &cfg.model,
+        state,
+        request,
+        round,
+        blocks,
+        calls,
+    )
+}
+
+/// [`model_transition`] with the author and model named, for a caller whose
+/// model is not this step's: a harness that answers the model itself.
+#[allow(clippy::too_many_arguments)]
+fn model_transition_by(
+    conversation: &str,
+    actor: &str,
+    model: &str,
+    state: &progress::State,
+    request: &Oid,
+    round: u64,
+    blocks: &[Value],
+    calls: &[Value],
+) -> Result<(Transition, String), String> {
     let message_id = client_key()?;
     let ordinal = state.conversation()?.transcript_len()?;
     let dir = paths::transcript_payload_dir(ordinal, &message_id);
@@ -997,12 +1055,12 @@ fn model_transition(
     }
     let entry = TranscriptEntry {
         message_id: message_id.clone(),
-        conversation: cfg.conversation.clone(),
+        conversation: conversation.to_string(),
         role: Role::Assistant,
-        actor: cfg.model.clone(),
+        actor: actor.to_string(),
         request: Some(request.clone()),
         round: Some(round),
-        model: Some(cfg.model.clone()),
+        model: Some(model.to_string()),
         blocks: entry_blocks,
         proposal: None,
         source_tree_resolution: None,
@@ -1016,6 +1074,118 @@ fn model_transition(
         },
         message_id,
     ))
+}
+
+/// Declare `call` on the conversation's active request, unless something
+/// already has, and return that request and the head it was admitted at.
+///
+/// This is the half of a tool call a harness that drives the model itself used
+/// to do from its own checkout: record the model's `tool_use` so the protocol
+/// accepts a tool that a message declared (`validate_current_call`). It is
+/// authored by the request's own model, as the harness's declaration was.
+fn declare_requested_call(
+    state: &mut progress::State,
+    call: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<(Oid, Oid), String> {
+    loop {
+        let view = state.conversation()?;
+        let record = view.active_turn()?.ok_or_else(|| {
+            format!(
+                "no active request in {:?}: call {call} arrived before the prompt that opens one",
+                state_conversation_id(state).unwrap_or_default()
+            )
+        })?;
+        let mut declared = record.calls.iter().any(|declared| declared.id == call);
+        for round in 0..record.round {
+            declared |= view.tool(&record.id, round, call)?.is_some();
+        }
+        if declared {
+            return Ok((record.id, record.request_head));
+        }
+        if record.status == TurnStatus::Queued {
+            // Nobody has claimed the request yet; the step does, as it does
+            // before it answers a model.
+            let latest_message = newest_user_message(&view)?;
+            drop(view);
+            let expected = state.head().clone();
+            state.try_append_at(
+                &expected,
+                Transition::TurnClaim {
+                    request: record.id.clone(),
+                    latest_message,
+                },
+            )?;
+            continue;
+        }
+        if record.status != TurnStatus::Running {
+            return Err(format!(
+                "cannot declare call {call} on a request that is {:?}",
+                record.status
+            ));
+        }
+        let actor = newest_user_actor(&view)?;
+        drop(view);
+        let blocks = [json!({"type": "tool_use", "id": call, "name": name, "input": arguments})];
+        let calls = [json!({"id": call, "name": name, "args": arguments})];
+        let (transition, _) = model_transition_by(
+            &state_conversation_id(state)?,
+            &actor,
+            &record.model,
+            state,
+            &record.id,
+            record.round,
+            &blocks,
+            &calls,
+        )?;
+        let expected = state.head().clone();
+        match state.try_append_at(&expected, transition)? {
+            progress::TryAppend::Appended(_) => {
+                return Ok((record.id, record.request_head));
+            }
+            progress::TryAppend::HeadChanged(_) => continue,
+        }
+    }
+}
+
+/// The result of a tools-only run: the call's own record, so a caller with only
+/// the run's result needs no access to the conversation to read it.
+///
+/// - `observation`: what the tool said, in the bytes the conversation holds. For
+///   a completed call that is the `tool_result` JSON the model would be shown;
+///   for a failed one, its error; for a cancelled one, the reason.
+/// - `status`: `complete`, `failed` or `cancelled` -- which of those the
+///   observation is.
+/// - `conversation`: the conversation as it now stands.
+fn forward_tool_result(
+    state: &mut progress::State,
+    request: &Oid,
+    call: &str,
+) -> Result<(), String> {
+    let view = state.conversation()?;
+    let record = require_request(&view, request)?;
+    let round = round_state(&view, &record)?.declaring_round;
+    let tool = view
+        .tool(request, round, call)?
+        .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
+    let (status, observation) = match &tool.result {
+        Some(ToolResult::Complete { observation, .. }) => {
+            ("complete", view.payload(observation)?)
+        }
+        Some(ToolResult::Failed { error }) => ("failed", view.payload(error)?),
+        Some(ToolResult::Cancelled { reason }) => ("cancelled", reason.clone().into_bytes()),
+        None => return Err(format!("call {call} has no result to forward")),
+    };
+    drop(view);
+    let dir = scratch("llm-step-result")?;
+    fs::write(dir.join("status"), status)
+        .and_then(|()| fs::write(dir.join("observation"), observation))
+        .map_err(|error| format!("writing the tool result: {error}"))?;
+    let conversation_path = fresh("terminal-conversation");
+    caos(["get-hash", state.head().as_str(), &conversation_path])?;
+    link(&conversation_path, dir.join("conversation"))?;
+    caos(["put", path(&dir), "/cas/out"])
 }
 
 fn record_response_after_escape(
