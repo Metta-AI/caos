@@ -114,6 +114,15 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
             options.base = Some(sha.to_string());
             continue;
         }
+        // How long a tool result may be before it is kept in the conversation
+        // and answered with a preview (`spill_oversized`). 0 turns that off.
+        if let Some(value) = argument.strip_prefix("--max-result-chars=") {
+            let limit = value.parse().map_err(|_| {
+                format!("--max-result-chars must be a non-negative integer, not {value:?}")
+            })?;
+            options.max_result_chars = Some(limit);
+            continue;
+        }
         if !options.take_image_arg(argument) {
             rest.push(argument.as_str());
         }
