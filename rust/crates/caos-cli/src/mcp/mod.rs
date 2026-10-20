@@ -450,6 +450,111 @@ fn read_outcome(
     Ok(ToolOutcome { text, is_error })
 }
 
+/// A result longer than this many characters is kept in the conversation and
+/// answered with a preview. Claude Code refuses an MCP result past 25,000
+/// tokens, and what it does instead is write the whole thing to a file on ITS
+/// disk and tell the model to read that -- a path the model usually cannot open
+/// (a cloud session has no file tools to open it with). The limit sits well
+/// under that ceiling, because characters per token vary: dense output such as
+/// JSON or a trace tokenizes far worse than prose.
+const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
+
+/// How much of an oversized result the answer still carries, so the model can
+/// tell what it is before deciding how to page through it.
+const RESULT_PREVIEW_CHARS: usize = 2_000;
+
+/// Where oversized results are kept: one file per call, at the conversation's
+/// root. Plain files there are inert to everything that walks the tree -- only
+/// code references (`Mode::Commit`) are source trees -- and `read` reaches them
+/// like any other path.
+const RESULTS_DIR: &str = "tool-results";
+
+/// Keep an oversized result in the conversation and answer with where it is.
+///
+/// IN THE CONVERSATION RATHER THAN ON DISK, for reachability: the file is part
+/// of the commit this call leaves, so it travels with the conversation (a push,
+/// a fork, a resume) and `read` can fetch it wherever the conversation can be
+/// read. The answer names it both by path and by blob hash; `read` takes either
+/// (`root=<blob>` with no `file-path` reads a bare blob).
+///
+/// A failure to keep it never costs the result: the caller gets the full text
+/// back, as it did before this existed, and Claude Code's own spill applies.
+fn spill_oversized(
+    t: &GitTransport,
+    id: &str,
+    call: &str,
+    outcome: ToolOutcome,
+    limit: usize,
+) -> ToolOutcome {
+    let chars = outcome.text.chars().count();
+    if !exceeds(chars, limit) {
+        return outcome;
+    }
+    match save_result(t, id, call, &outcome.text) {
+        Ok((path, blob)) => ToolOutcome {
+            text: spill_notice(&outcome.text, chars, limit, &path, blob.as_ref()),
+            is_error: outcome.is_error,
+        },
+        Err(error) => {
+            eprintln!("caos mcp: could not keep the {chars}-character result of {call}: {error}");
+            outcome
+        }
+    }
+}
+
+/// 0 means no limit.
+fn exceeds(chars: usize, limit: usize) -> bool {
+    limit != 0 && chars > limit
+}
+
+/// Write `text` into the conversation at `tool-results/<call>.txt`; returns the
+/// path and, when it can be read back, the blob's hash.
+fn save_result(
+    t: &GitTransport,
+    id: &str,
+    call: &str,
+    text: &str,
+) -> Result<(String, Option<Oid>), String> {
+    let path = format!("{RESULTS_DIR}/{}.txt", paths::admit_external_id(call));
+    append(t, id, |store, head| {
+        let signature = inherited_signature(store, head)?;
+        let files = vec![(path.clone(), Some((Mode::Blob, text.as_bytes().to_vec())))];
+        mint_transition(store, head, &Transition::FilesApply { files }, &signature).map(Some)
+    })?;
+    // The hash is a convenience: the path alone is enough to read the file.
+    let store = open_store(t)?;
+    let blob = fetch_head(t, &store, id)
+        .ok()
+        .flatten()
+        .and_then(|(_, head)| Conversation::open(&store, &head).ok())
+        .and_then(|view| view.snapshot().entry(&path).ok().flatten())
+        .map(|entry| entry.oid);
+    Ok((path, blob))
+}
+
+/// What the model reads instead of the whole result: the start of it, cut at a
+/// line, and how to get the rest.
+fn spill_notice(text: &str, chars: usize, limit: usize, path: &str, blob: Option<&Oid>) -> String {
+    let keep = RESULT_PREVIEW_CHARS.min(limit);
+    let end = text
+        .char_indices()
+        .nth(keep)
+        .map_or(text.len(), |(index, _)| index);
+    let mut preview = &text[..end];
+    if let Some(newline) = preview.rfind('\n').filter(|&n| n > 0) {
+        preview = &preview[..newline];
+    }
+    let lines = text.lines().count();
+    let by_hash = blob.map_or(String::new(), |blob| {
+        format!(", or `read` with root={blob} and no file-path")
+    });
+    format!(
+        "{preview}\n\n[caos: this result is {chars} characters over {lines} lines, too long to \
+         return. The whole of it is saved in the conversation at {path}. Page through it with \
+         `read` (file-path={path}, offset, limit){by_hash}.]"
+    )
+}
+
 /// The last successful tool discovery's phase timings, for `caos_status` to
 /// report -- the one place a locked-down session can see WHERE the wait went.
 /// Discovery is not just the `:@@=` resolve `/resolve-locator` does; it also
