@@ -1,0 +1,6 @@
+# tests/llm-record-http, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# The writes a harness's hooks make -- a prompt, the end of a turn, a failure --
+# as requests to the step, with HTTP alone.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash-tool:@=DEEP-DEPS/bash-tool --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

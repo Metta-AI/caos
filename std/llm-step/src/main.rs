@@ -5,6 +5,7 @@ mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod record;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -79,6 +80,9 @@ struct Config {
     /// its own, and no request or head to name. A call already declared under
     /// the id is not declared twice, so a retry runs it rather than failing.
     tool_call: Option<(String, Value)>,
+    /// Record a harness's event (a prompt, the end of a turn, a failure) on the
+    /// conversation and stop: no model, no tool. See `record`.
+    record: Option<record::Request>,
     /// Describe the tools and stop, writing the registry as JSON. A harness
     /// that drives the model itself has to publish these declarations to it,
     /// and they belong to the step that implements them.
@@ -122,11 +126,12 @@ impl Config {
             (None, None) => None,
         };
         let list_tools = read_arg_opt("list-tools")?.is_some();
-        // Neither of those modes reaches the model, so neither may DEMAND what
-        // a model call takes. The key especially: `caos mcp` runs Claude Code's
+        let record = record::Request::read()?;
+        // None of those modes reaches the model, so none may DEMAND what a
+        // model call takes. The key especially: `caos mcp` runs Claude Code's
         // tools for a session whose model is Claude Code's own, and requiring
         // an Anthropic key of it would refuse a turn over a call nothing makes.
-        let answers_model = tools_only.is_none() && !list_tools;
+        let answers_model = tools_only.is_none() && !list_tools && record.is_none();
         Ok(Self {
             api_key: match answers_model {
                 true => secret("anthropic-api-key")?,
@@ -141,6 +146,7 @@ impl Config {
             run_and_update_ref_image,
             tools_only,
             tool_call,
+            record,
             list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
             model: match answers_model {
@@ -162,6 +168,9 @@ fn run() -> Result<(), String> {
     let cfg = Config::read()?;
     if cfg.list_tools {
         return list_tools(&cfg);
+    }
+    if let Some(request) = &cfg.record {
+        return record::run(&cfg.conversation, request);
     }
     let mut state = progress::State::open(&cfg.conversation)?;
     timing::phase("state.open");
@@ -1178,12 +1187,22 @@ fn forward_tool_result(
         None => return Err(format!("call {call} has no result to forward")),
     };
     drop(view);
+    forward_files(
+        state.head(),
+        &[("status", status.as_bytes()), ("observation", &observation)],
+    )
+}
+
+/// The run's result: `files` and the conversation as it stands at `head`, under
+/// `conversation`. By reference, so the conversation itself is not copied.
+fn forward_files(head: &Oid, files: &[(&str, &[u8])]) -> Result<(), String> {
     let dir = scratch("llm-step-result")?;
-    fs::write(dir.join("status"), status)
-        .and_then(|()| fs::write(dir.join("observation"), observation))
-        .map_err(|error| format!("writing the tool result: {error}"))?;
+    for (name, bytes) in files {
+        fs::write(dir.join(name), bytes)
+            .map_err(|error| format!("writing the result's {name}: {error}"))?;
+    }
     let conversation_path = fresh("terminal-conversation");
-    caos(["get-hash", state.head().as_str(), &conversation_path])?;
+    caos(["get-hash", head.as_str(), &conversation_path])?;
     link(&conversation_path, dir.join("conversation"))?;
     caos(["put", path(&dir), "/cas/out"])
 }
