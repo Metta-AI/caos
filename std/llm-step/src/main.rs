@@ -129,6 +129,13 @@ impl Config {
             (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
             (None, None) => None,
         };
+        let max_result_chars = match read_arg_opt("max-result-chars")? {
+            Some(text) => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("--max-result-chars is not a count: {text:?}"))?,
+            None => 0,
+        };
         let list_tools = read_arg_opt("list-tools")?.is_some();
         let record = record::Request::read()?;
         // None of those modes reaches the model, so none may DEMAND what a
