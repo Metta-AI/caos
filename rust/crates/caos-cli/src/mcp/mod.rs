@@ -220,9 +220,9 @@ fn run_tool(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
-    let call = prepare_call(session, name, args)?;
+    let call = prepare_call(config, session, name, args)?;
     let (kind, result) = run_step(config, &call.conversation, &call.params())?;
-    decode_result(&config.server()?, &kind, &result)
+    decode_result(config, &kind, &result)
 }
 
 /// Start a tool without waiting, and return the ticket to ask for it by. The same
