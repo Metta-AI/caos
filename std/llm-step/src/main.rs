@@ -80,6 +80,10 @@ struct Config {
     /// its own, and no request or head to name. A call already declared under
     /// the id is not declared twice, so a retry runs it rather than failing.
     tool_call: Option<(String, Value)>,
+    /// With `tools_only`: a completed call whose text is longer than this many
+    /// characters is also saved in the conversation, and the run's result says
+    /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
+    max_result_chars: usize,
     /// Record a harness's event (a prompt, the end of a turn, a failure) on the
     /// conversation and stop: no model, no tool. See `record`.
     record: Option<record::Request>,
