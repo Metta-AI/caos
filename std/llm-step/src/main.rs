@@ -54,7 +54,6 @@ struct Config {
     api_key: String,
     system: String,
     grep_image: Option<String>,
-    merge_image: Option<String>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
     /// do not terminate the request.
@@ -142,7 +141,6 @@ impl Config {
                 false => String::new(),
             },
             grep_image: image_arg("grep-image")?,
-            merge_image: image_arg("merge-image")?,
             run_and_update_ref_image,
             tools_only,
             tool_call,
@@ -1638,7 +1636,6 @@ fn prepare_compute(
             eval_then_catching(&start, &relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
-        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name => Ok(Prepared::Result(error_block(
             &call.id,
@@ -1647,38 +1644,6 @@ fn prepare_compute(
     }
 }
 
-
-fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepared, String> {
-    let theirs = match resolve_theirs(cfg, call) {
-        Ok(theirs) => theirs,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    // `merge-base` is checked like any `{commit}` parameter: a hash that names
-    // nothing, or names something other than a commit, is the model's mistake.
-    let base = match call["input"]["merge-base"].as_str().map(str::trim) {
-        None | Some("") => None,
-        Some(base) => match tools::resolve_object(base, "commit", None) {
-            Ok(bound) => Some(bound.ready()?),
-            Err(why) => {
-                let id = call["id"].as_str().unwrap_or("");
-                let error = format!("merge's `merge-base`: {why}");
-                return Ok(Prepared::Result(error_block(id, &error)));
-            }
-        },
-    };
-    let theirs_path = fresh("theirs");
-    caos(["get-hash", &theirs, &theirs_path])?;
-    let mut args = vec![("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))];
-    if let Some(base) = &base {
-        args.push(("merge-base", base.arg()));
-    }
-    let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    // NO `in`. merge never read one, and `ours` already determines the tree,
-    // so binding it only made the key bigger. Its help declares no `@in`.
-    let _ = ws;
-    prepared_request(&curried, &[], None)
-}
 
 fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
     let (scope, _) = match tools::grep_precheck(call, ws) {
@@ -1820,6 +1785,33 @@ fn launch_resolved_tool(
     }
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
+    // A tool that declares `@scope <param>` runs over, and a writer changes, the
+    // source tree its argument names, not the one its path happens to sit in:
+    // `merge` is reached at `caos-std/merge` and advances `feature/01-change`.
+    let selected = tool
+        .scope
+        .as_deref()
+        .and_then(|param| nested["input"][param].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (name, commit, ws, wc) = match selected {
+        None => (name, commit, ws, wc),
+        Some(selected) => {
+            match source_tree_target(&state.conversation()?, Some(selected)) {
+                Ok(Some((scoped, scoped_commit))) => {
+                    let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
+                    (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
+                }
+                Ok(None) | Err(_) => {
+                    let why = source_tree_target(&state.conversation()?, Some(selected))
+                        .err()
+                        .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
+                    site.failed(state, &error_block(id, &why), name.map(|name| (name, commit)))?;
+                    return resume(cfg, state, request, request_head);
+                }
+            }
+        }
+    };
     let conversation = state.conversation()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(conversation.as_str())) {
         Ok(bound) => bound,
@@ -3343,17 +3335,6 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(tools::grep_declaration());
     }
-    // MERGE IS THE EXCEPTION, and the reason is what its target is. Every other
-    // std tool reads a TREE, which `@in` lets a caller name; merge writes a
-    // merge commit into a source tree and so needs that tree's COMMIT (`ours`,
-    // from `wc`). Nothing but the step's own routing supplies one, and
-    // `run_tool` takes no source tree — so merge cannot yet be reached by path,
-    // and until it can, registering it is the only way to have it at all.
-    if cfg.merge_image.is_some() {
-        if let Some(tool) = tools::std_tool("merge", &arg("merge-image"))? {
-            registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
-        }
-    }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
     registry.push(json!({
         "name":"run_tool",
@@ -3411,15 +3392,6 @@ fn with_source_tree(mut declaration: Value) -> Value {
     declaration
 }
 
-
-fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
-    let id = call["id"].as_str().unwrap_or("");
-    let theirs = call["input"]["theirs"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    lookup_theirs(cfg.merge_refs.as_deref(), theirs).map_err(|error| error_block(id, &error))
-}
 
 fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, String> {
     let theirs = theirs

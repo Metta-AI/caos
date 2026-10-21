@@ -120,7 +120,7 @@ elapsed=$(( $(date +%s) - started ))
 send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
 listing=$(await '"id":9' 600) \
   || fail "the tools never resolved (see the server's stderr below)"
-for tool in read ls write edit grep log show diff run_tool tool_help merge; do
+for tool in read ls write edit grep log show diff run_tool tool_help; do
   case "$listing" in
     *"\"name\":\"$tool\""*) ;;
     *) fail "the resolved listing is missing $tool" ;;
@@ -131,10 +131,7 @@ done
 # `tool_help` describes it and `run_tool` runs it, over the tree named by `in`
 # (std/README.md is the index). Registering one as well would be a second way to
 # call it, and the two can disagree about which version runs.
-#
-# `merge` is the exception above: it writes into a source tree and so needs that
-# tree's COMMIT, which only the step's own routing supplies.
-for tool in bash caos-build caos-test caos-test-result; do
+for tool in bash caos-build caos-test caos-test-result merge; do
   case "$listing" in
     *"\"name\":\"$tool\""*)
       fail "$tool is registered; std tools are reached by path through run_tool" ;;

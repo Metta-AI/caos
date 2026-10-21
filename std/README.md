@@ -28,7 +28,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `caos-test` | Run the whole suite — unit tests and every `tests/<name>` — on the tree's stack, building and starting it if it is not up. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `read-trace` | Print the trace of a run (`/status/<hash>?all=1`) from the ArgTree hash `caos-test` prints in its "full trace" line: timings per node, the slowest nodes, and with `perf` the workers' out-trace data. |
-| `merge` | Three-way merge another commit into the current source tree. |
+| `merge` | Three-way merge another commit (a hash, or the path of an imported source tree) into the source tree you name with `source-tree`. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
 

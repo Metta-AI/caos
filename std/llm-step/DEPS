@@ -16,6 +16,5 @@
 ../llm-client llm-client
 ../../rust/crates/conversation-protocol conversation-protocol
 ../rgrep rgrep
-../merge merge
 ../run-and-update-ref run-and-update-ref
 ../../rust/crates/git-locator git-locator
