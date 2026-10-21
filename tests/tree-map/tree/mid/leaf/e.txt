@@ -1,0 +1,1 @@
+needle under a directory with no files of its own
