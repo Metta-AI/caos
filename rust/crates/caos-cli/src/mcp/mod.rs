@@ -180,7 +180,12 @@ impl PreparedCall {
 /// The conversation already exists: the prompt hook runs before the model sees
 /// the prompt, so a tool call can only follow it. A call with no conversation is
 /// the step's to refuse, naming it.
-fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
+fn prepare_call(
+    config: &Config,
+    session: &str,
+    name: &str,
+    args: &Value,
+) -> Result<PreparedCall, String> {
     let conversation = conversation_id_for(session)?;
     let call = args
         .get("caos_tool_use_id")
