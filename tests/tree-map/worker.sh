@@ -93,8 +93,9 @@ forwarded)
 
 bound)
   caos get /cas/args/cold
+  caos get -r /cas/args/result
   [ "$(caos hash /cas/args/result)" = "$(cat /cas/args/cold)" ] \
-    || fail "the caller's tag overrode the one run binds"
+    || fail "the caller's tag overrode the one run binds: $(files_of /cas/args/result) / $(cat /cas/args/result/a.txt 2>&1)"
   echo "  ok: run's own binding wins" >&2
 
   echo "== a subdirectory as --in ==" >&2
