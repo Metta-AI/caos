@@ -85,6 +85,7 @@ forwarded)
   echo "  ok: forwarded arg reaches run" >&2
 
   echo "== an arg run already binds wins over the caller's ==" >&2
+  caos get /cas/args/cold
   bound=$(caos curry --base:@=/cas/args/level --tag=needle)
   caos run-then /cas/args/tree \
     --run:hash="$(caos curry --base:@=/cas/args/treemap --run:hash="$bound" --tag=alpha)" \
