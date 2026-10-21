@@ -31,6 +31,10 @@ path prints its parameters, which is the description this table abbreviates.
 | `merge` | Three-way merge another commit (a hash, or the path of an imported source tree) into the source tree you name with `source-tree`. |
 | `import-source` | Import an HTTPS Git repository as a new snapshot at an unused conversation path (a source tree). The remote is observed when the call starts, so a fresh `into` is how you see a branch's current head. |
 | `publish-source` | Publish a source tree's exact commit to an HTTPS Git repository branch, preserving history; leased on the remote head observed at the start. Does not open a PR (`github` does). |
+| `agent-spawn` | Start a focused coding agent in a durable child conversation, with an isolated copy of the conversation (or the `paths` you select). Returns the child id. |
+| `agent-wait` | Wait for one child agent to report a terminal checkpoint, by joining its durable relay. |
+| `agent-harvest` | Apply a terminal child's content changes to the conversation, with the same atomic reconciliation as the file tools. |
+| `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
 
@@ -63,10 +67,11 @@ are entries under `std/`, reached as `caos-std/<name>` like any other tool. They
 `in` tree, which defaults to the conversation. `llm-step` still registers its own copies
 for the turns it drives itself; those are being retired in favour of these.
 
-`import-source` and `publish-source` are entries for OPERATIONS OF THE STEP (`@op` in their
-help): they write the conversation's own records (a source tree attached, a publication
-pinned before anything is pushed), so the step performs them in process. The entry gives
-the operation a path, a help and a place in `tool_help`/`run_tool`.
+`import-source`, `publish-source`, `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
+are entries for OPERATIONS OF THE STEP (`@op` in their help): they write the conversation's own
+records (a source tree attached, a publication pinned before anything is pushed, a child
+conversation, an async task), so the step performs them in process. The entry gives the
+operation a path, a help and a place in `tool_help`/`run_tool`.
 `eval-path` is not an entry: evaluating a path is one of the server's primitives (the
 `/eval` route), so it is a built-in tool, like `run`, `help`, `start` and `result`.
 

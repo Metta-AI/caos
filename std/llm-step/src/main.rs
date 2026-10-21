@@ -1177,9 +1177,7 @@ fn forward_tool_result(
         .tool(request, round, call)?
         .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
     let (status, observation) = match &tool.result {
-        Some(ToolResult::Complete { observation, .. }) => {
-            ("complete", view.payload(observation)?)
-        }
+        Some(ToolResult::Complete { observation, .. }) => ("complete", view.payload(observation)?),
         Some(ToolResult::Failed { error }) => ("failed", view.payload(error)?),
         Some(ToolResult::Cancelled { reason }) => ("cancelled", reason.clone().into_bytes()),
         None => return Err(format!("call {call} has no result to forward")),
@@ -1245,24 +1243,72 @@ fn op_call(call: &Call) -> Call {
 
 /// Perform a step operation (`@op` in a tool's help). Each owns its call's
 /// lifecycle: it writes the call's start, the records it exists for, and the
-/// call's completion itself.
-fn run_op(op: &str, state: &mut progress::State, site: &CallSite<'_>) -> Result<(), String> {
-    match op {
-        "import-source" => import_source::execute(state, site),
-        "publish-source" => publish_source::execute(state, site),
-        other => site.fail(state, &format!("unknown step operation {other:?}")),
+/// call's completion itself. `started` is the call's record when this is a RESUME
+/// of an operation that began and has not finished.
+///
+/// Returns whether the step should carry on at once. The one that does not is
+/// `agent-wait`, which dispatches a join on the child's relay and waits for its
+/// callback.
+fn run_op(
+    cfg: &Config,
+    op: &str,
+    state: &mut progress::State,
+    site: &CallSite<'_>,
+    started: Option<&CallRecord>,
+) -> Result<bool, String> {
+    match (op, started) {
+        ("import-source", _) => import_source::execute(state, site).map(|()| true),
+        ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
+        ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
+        ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
+        ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
+        ("agent-wait", None) => wait_agent_call(state, site),
+        ("agent-wait", Some(record)) => {
+            dispatch_wait_started(state, site.request, site.round, site.call, record)?;
+            Ok(false)
+        }
+        (other, _) => site
+            .fail(state, &format!("unknown step operation {other:?}"))
+            .map(|()| true),
     }
 }
 
-/// The operation a STARTED `run_tool` call is in the middle of, found from what it
-/// pinned before doing anything irreversible. A call that was resumed after a
-/// restart has only its record to go on, and re-evaluating the tool's path to
-/// learn the operation would be a build; the pin names it for free.
-fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<&'static str> {
+/// The payload an operation's start carries to say what it is, so a resume knows
+/// without evaluating the tool's path. Only a call reached by `run_tool` needs one:
+/// a call made by the operation's own name already says.
+fn op_marker(call: &Call, op: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if call.name != "run_tool" {
+        return Ok(Vec::new());
+    }
+    Ok(vec![(
+        "op.json".to_string(),
+        canonical_payload_bytes(&json!(op))?,
+    )])
+}
+
+/// Where a started operation names itself, for the ones that pin nothing else.
+fn op_marker_path(site: &CallSite<'_>) -> String {
+    format!(
+        "{}/op.json",
+        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+    )
+}
+
+/// The operation a STARTED `run_tool` call is in the middle of. A call resumed
+/// after a restart has only its record to go on, and re-evaluating the tool's path
+/// to learn the operation would be a build: so an operation says what it is in a
+/// payload of its own start, or by the pin it wrote before doing anything
+/// irreversible.
+fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<String> {
+    if let Ok(bytes) = view.payload(&op_marker_path(site)) {
+        if let Ok(Value::String(op)) = serde_json::from_slice::<Value>(&bytes) {
+            return Some(op);
+        }
+    }
     if view.payload(&import_source::pin_path(site)).is_ok() {
-        Some("import-source")
+        Some("import-source".to_string())
     } else if view.payload(&publish_source::pin_path(site)).is_ok() {
-        Some("publish-source")
+        Some("publish-source".to_string())
     } else {
         None
     }
@@ -1281,13 +1327,12 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
-            if existing.name == "run_tool" && existing.task.is_none() {
+            if existing.name == "run_tool" {
                 let inner = op_call(call);
                 let op_site = CallSite::new(request, round, &inner);
                 let op = started_op(&state.conversation()?, &op_site);
                 if let Some(op) = op {
-                    run_op(op, state, &op_site)?;
-                    return Ok(true);
+                    return run_op(cfg, &op, state, &op_site, Some(&existing));
                 }
             }
             if existing.name == "publish_source" {
@@ -1692,7 +1737,6 @@ fn prepare_compute(
     }
 }
 
-
 fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
     let (scope, _) = match tools::grep_precheck(call, ws) {
         Ok(scope) => scope,
@@ -1707,7 +1751,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     let curried = caos_curry(Arg::Hash(image), &[("pattern", Arg::Lit(pattern))])?;
     prepared_request(&curried, &[], Some(&scope))
 }
-
 
 /// Form the runnable request. `input` is bound as `in` when there is one, and
 /// there is one only when the tool asked for it — the tree is the biggest thing
@@ -1836,8 +1879,11 @@ fn launch_resolved_tool(
     if let Some(op) = tool.op.as_deref() {
         let inner = op_call(&call);
         let op_site = CallSite::at(request, round, &inner, &current.declaration_message);
-        run_op(op, state, &op_site)?;
-        return resume(cfg, state, request, request_head);
+        return if run_op(cfg, op, state, &op_site, None)? {
+            resume(cfg, state, request, request_head)
+        } else {
+            Ok(())
+        };
     }
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
@@ -1852,21 +1898,23 @@ fn launch_resolved_tool(
         .filter(|value| !value.is_empty());
     let (name, commit, ws, wc) = match selected {
         None => (name, commit, ws, wc),
-        Some(selected) => {
-            match source_tree_target(&state.conversation()?, Some(selected)) {
-                Ok(Some((scoped, scoped_commit))) => {
-                    let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
-                    (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
-                }
-                Ok(None) | Err(_) => {
-                    let why = source_tree_target(&state.conversation()?, Some(selected))
-                        .err()
-                        .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
-                    site.failed(state, &error_block(id, &why), name.map(|name| (name, commit)))?;
-                    return resume(cfg, state, request, request_head);
-                }
+        Some(selected) => match source_tree_target(&state.conversation()?, Some(selected)) {
+            Ok(Some((scoped, scoped_commit))) => {
+                let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
+                (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
             }
-        }
+            Ok(None) | Err(_) => {
+                let why = source_tree_target(&state.conversation()?, Some(selected))
+                    .err()
+                    .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
+                site.failed(
+                    state,
+                    &error_block(id, &why),
+                    name.map(|name| (name, commit)),
+                )?;
+                return resume(cfg, state, request, request_head);
+            }
+        },
     };
     let conversation = state.conversation()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(conversation.as_str())) {
@@ -2046,7 +2094,10 @@ fn dispatch_wait_started(
         ));
     }
     validate_child_relay(state, &child)?;
-    let extras = [("current-tool", Arg::Lit(call.name.as_str()))];
+    let mut extras = vec![("current-tool", Arg::Lit(call.name.as_str()))];
+    if call.name == "run_tool" {
+        extras.push(("op", Arg::Lit("agent-wait")));
+    }
     let me = self_curry(None, request, round, &call.id, &extras)?;
     let dispatched = run_request_then_catching(relay.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
@@ -2061,6 +2112,9 @@ fn callback_result(
     // are RENDERERS (`grep`'s sparse match tree) and the subagent join, not
     // class decisions: no tool's ability to change the tree depends on its
     // name any more.
+    if read_arg_opt("op")?.as_deref() == Some("agent-wait") {
+        return wait_callback_block(state, record);
+    }
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
     }
@@ -2117,11 +2171,8 @@ fn writer_callback(
         _ => {
             let proposal = Oid::parse(&cas_hash(&result.prop)?, "writer result commit")?;
             state.fetch_object(&proposal)?;
-            let descends = conversation_protocol::v3::CodeOps::is_ancestor(
-                state.store(),
-                base,
-                &proposal,
-            )?;
+            let descends =
+                conversation_protocol::v3::CodeOps::is_ancestor(state.store(), base, &proposal)?;
             if !descends {
                 return fail(format!(
                     "{tool}: the returned commit {proposal} does not descend from the commit \
@@ -2772,7 +2823,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
-            payloads: Vec::new(),
+            payloads: op_marker(call, "agent-wait")?,
             record: started.clone(),
         },
     )? {
@@ -3448,7 +3499,6 @@ fn with_source_tree(mut declaration: Value) -> Value {
     declaration
 }
 
-
 fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, String> {
     let theirs = theirs
         .ok_or_else(|| "merge needs a string `theirs` (a ref name or a commit hash)".to_string())?;
@@ -3654,6 +3704,7 @@ fn self_curry(
         "tool-git",
         "tool-in",
         "tool-writer",
+        "op",
         "in",
         "result",
         "error",
@@ -4639,7 +4690,9 @@ mod tests {
 
         // An explicit `root` IS the object to evaluate, so no source tree gets
         // to select it and the path stays relative to that root.
-        let rooted = eval(json!({"path": "project/revision/tests/hello", "root": test_oid('b').to_string()}));
+        let rooted = eval(
+            json!({"path": "project/revision/tests/hello", "root": test_oid('b').to_string()}),
+        );
         assert!(matches!(
             resolve_target(&view, &rooted).unwrap(),
             Target::Files

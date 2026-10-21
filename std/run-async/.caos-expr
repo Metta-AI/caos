@@ -1,0 +1,10 @@
+# std/run-async (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op` says llm-step
+# does the work in process (it owns the conversation's own records and the call's
+# lifecycle), so this entry exists to give the operation a path, a help and a place in
+# `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+Start or inspect an already-constructed CAOS request in the background. The request must be a complete 40-character ArgTree hash already stored in CAOS. Repeating the same request reads the same durable task; once complete, the result includes its result hash. Use this only for independent work whose complete context is in the request: detached work does not inherit secrets, credentials, model settings, or other ambient execution context.
+@param request The complete CAOS request (ArgTree) hash to run independently.
+@op run-async
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

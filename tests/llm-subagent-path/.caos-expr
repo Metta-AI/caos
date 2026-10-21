@@ -1,0 +1,7 @@
+# tests/llm-subagent-path, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# tests/llm-subagent with the three agent operations reached BY PATH: std/agent-spawn,
+# agent-wait and agent-harvest are entries for operations of the step (`@op`), so a
+# conversation that mounts them runs them with `run_tool` like any tool.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --agent-spawn:@=DEEP-DEPS/agent-spawn --agent-wait:@=DEEP-DEPS/agent-wait --agent-harvest:@=DEEP-DEPS/agent-harvest --run-async:@=DEEP-DEPS/run-async --hello:@=DEEP-DEPS/hello --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

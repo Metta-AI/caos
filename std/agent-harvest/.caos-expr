@@ -1,0 +1,11 @@
+# std/agent-harvest (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op` says llm-step
+# does the work in process (it owns the conversation's own records and the call's
+# lifecycle), so this entry exists to give the operation a path, a help and a place in
+# `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+Apply selected content changes from a terminal child using the same atomic reconciliation as file tools. Code, memories, and notes keep their conversation-relative paths; protocol metadata is excluded.
+@param child The terminal child id agent-spawn returned.
+@param {array} [paths] Paths to apply, including descendants. Omit for all changed content. Select code references as whole source trees.
+@op agent-harvest
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP
