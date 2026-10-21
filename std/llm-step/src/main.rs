@@ -1201,10 +1201,87 @@ fn forward_tool_result(
         None => return Err(format!("call {call} has no result to forward")),
     };
     drop(view);
-    forward_files(
-        state.head(),
-        &[("status", status.as_bytes()), ("observation", &observation)],
-    )
+    // Saved BEFORE the result is forwarded, so the `conversation` it carries is
+    // the one that holds the file.
+    let spilled = match status {
+        "complete" => spill_oversized(cfg, state, call, &observation),
+        _ => None,
+    };
+    let mut files: Vec<(&str, &[u8])> =
+        vec![("status", status.as_bytes()), ("observation", &observation)];
+    if let Some(spilled) = &spilled {
+        files.push(("spilled", spilled.as_bytes()));
+    }
+    forward_files(state.head(), &files)
+}
+
+/// Where a tools-only run keeps a result too long to hand back: one file per
+/// call at the conversation's root. Plain files there are inert to everything
+/// that walks the tree -- only code references (`Mode::Commit`) are source
+/// trees -- and `read` reaches them like any other path.
+const RESULTS_DIR: &str = "tool-results";
+
+/// Save a completed call's text in the conversation when it is longer than
+/// `--max-result-chars`, and say where: `"<path>\n<blob hash>"`.
+///
+/// Claude Code refuses an MCP result past its token limit and writes the whole
+/// of it to a file on ITS disk, which the model usually cannot open. A file in
+/// the conversation is part of the commit this call leaves, so it travels with
+/// the conversation (a push, a fork, a resume) and `read` can fetch it wherever
+/// the conversation can be read -- by path, or by blob hash as a bare `root`.
+///
+/// `None` when there is nothing to save, or saving failed: a failure here never
+/// costs the caller its result, which is then returned whole as before.
+fn spill_oversized(
+    cfg: &Config,
+    state: &mut progress::State,
+    call: &str,
+    observation: &[u8],
+) -> Option<String> {
+    if cfg.max_result_chars == 0 {
+        return None;
+    }
+    let text = observation_text(observation)?;
+    if text.chars().count() <= cfg.max_result_chars {
+        return None;
+    }
+    let path = format!("{RESULTS_DIR}/{}.txt", paths::admit_external_id(call));
+    let files = vec![(path.clone(), Some((Mode::Blob, text.into_bytes())))];
+    if let Err(error) = state.append(Transition::FilesApply { files }) {
+        eprintln!("llm-step: could not save the result of {call} in the conversation: {error}");
+        return None;
+    }
+    let blob = state
+        .conversation()
+        .and_then(|view| view.snapshot().entry(&path))
+        .ok()
+        .flatten()
+        .map(|entry| entry.oid.to_string())
+        .unwrap_or_default();
+    Some(format!("{path}\n{blob}"))
+}
+
+/// The text of a completed call's observation, as a reader of it is shown it:
+/// the `content` of the `tool_result` JSON, its text blocks joined, or the JSON
+/// itself when it is neither. This mirrors `caos mcp`'s `tool_outcome`, which
+/// this crate cannot call, so the two agree on what "the text" is.
+fn observation_text(observation: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(observation).ok()?;
+    let content = value.get("content").unwrap_or(&value);
+    if let Some(blocks) = content.as_array() {
+        let text: Vec<&str> = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect();
+        if !text.is_empty() {
+            return Some(text.join("\n"));
+        }
+    }
+    Some(match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content.to_string(),
+    })
 }
 
 /// The run's result: `files` and the conversation as it stands at `head`, under
