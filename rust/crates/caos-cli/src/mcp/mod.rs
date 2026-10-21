@@ -199,6 +199,8 @@ fn prepare_call(
             ("tools-only", call),
             ("tool", name.to_string()),
             ("arguments", arguments),
+            // The step saves what is longer than this, and the answer says where.
+            ("max-result-chars", config.max_result_chars().to_string()),
         ],
     })
 }
