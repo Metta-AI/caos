@@ -1208,7 +1208,7 @@ fn forward_tool_result(
         _ => None,
     };
     let mut files: Vec<(&str, &[u8])> =
-        vec![("status", status.as_bytes()), ("observation", &observation)];
+        vec![("status", status.as_bytes()), ("observation", observation.as_slice())];
     if let Some(spilled) = &spilled {
         files.push(("spilled", spilled.as_bytes()));
     }
