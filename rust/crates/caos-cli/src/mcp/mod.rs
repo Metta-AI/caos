@@ -257,11 +257,15 @@ fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
 
 /// What a tools-only run answered, as the model reads it: the call's `status` and
 /// `observation`, which are the same bytes the conversation recorded.
-fn decode_result(server: &str, kind: &str, result: &str) -> Result<ToolOutcome, String> {
+///
+/// When the step also says it `spilled` the text into the conversation, the
+/// model is given a preview and where to read the rest instead of the whole of
+/// it: Claude Code would refuse the whole of it past its token limit.
+fn decode_result(config: &Config, kind: &str, result: &str) -> Result<ToolOutcome, String> {
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
     }
-    let files = caos::tree_blobs(&HttpTransport::new(server), result)?;
+    let files = caos::tree_blobs(&HttpTransport::new(&config.server()?), result)?;
     let part = |file: &str| {
         files
             .get(file)
