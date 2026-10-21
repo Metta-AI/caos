@@ -3,10 +3,10 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-Unified diff between two revisions of a source tree, optionally scoped to a path. Defaults compare the previous commit to the source tree's own (what the latest step changed). `from` and `to` accept a commit hash, or HEAD with ~N or ^ ancestry.
+Unified diff between two revisions of a source tree, optionally scoped to a path. Defaults compare the previous commit to the source tree's own (what the latest step changed). `from` and `to` accept a commit hash, HEAD with ~N or ^ ancestry, or the path of another source tree in the conversation (such as sources/foo/00-base), which compares two source trees directly.
 @param source-tree Path of the source tree (a code reference in the conversation), such as feature/01-change.
-@param [from] The base revision (default HEAD~1, the commit before the source tree's own).
-@param [to] The revision to compare against the base (default HEAD, the source tree's own commit).
+@param [from] The base revision (default HEAD~1, the commit before the source tree's own), or the path of a source tree.
+@param [to] The revision to compare against the base (default HEAD, the source tree's own commit), or the path of a source tree.
 @param [path] Restrict the diff to this source-tree-relative path.
 @in
 END

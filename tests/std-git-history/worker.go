@@ -101,6 +101,8 @@ func main() {
 		write("/tmp/ws/notes.txt", "hello\n")
 		w.Must(os.MkdirAll("/tmp/ws/feature", 0o755))
 		w.Must(os.Symlink("/cas/commit-two", "/tmp/ws/feature/dirty"))
+		commit("other", "", "other", map[string]string{"a.txt": "zero\n"})
+		w.Must(os.Symlink("/cas/commit-other", "/tmp/ws/feature/base"))
 		run("caos", "put", "/tmp/ws", "/cas/ws")
 		ws := run("caos", "hash", "/cas/ws")
 
@@ -135,6 +137,12 @@ func main() {
 		w.True(strings.Contains(text, "+x") && !strings.Contains(text, "a.txt"), "diff scoped to a path: %s", text)
 		_, text = tool("diff", ws, "source-tree", "feature/dirty", "to", first)
 		w.True(strings.Contains(text, "no earlier revision"), "the root commit has no earlier revision: %s", text)
+
+		w.Step("diff: two source trees compared by path, even on unrelated histories")
+		_, text = tool("diff", ws, "source-tree", "feature/dirty", "from", "feature/base", "to", "feature/dirty")
+		w.True(strings.Contains(text, "-zero") && strings.Contains(text, "+two") && strings.Contains(text, "b.txt"), "path to path: %s", text)
+		_, text = tool("diff", ws, "source-tree", "feature/dirty", "from", "feature/base")
+		w.True(strings.Contains(text, "-zero") && strings.Contains(text, "+two"), "path against HEAD: %s", text)
 
 		w.Step("mistakes are values the model can act on")
 		for _, c := range []struct {

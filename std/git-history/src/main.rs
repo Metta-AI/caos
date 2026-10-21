@@ -10,7 +10,8 @@
 //! cannot say, which is why these need a commit and not the `in` tree's content.
 //!
 //! REVISIONS are a commit hash, `HEAD` (the source tree's own commit), and
-//! `~N`/`^` ancestry on either. Branch and tag names are not available: they
+//! `~N`/`^` ancestry on either, or (for `diff`) the path of another source tree in the
+//! conversation, which names that tree's own commit. Branch and tag names are not available: they
 //! resolved from a snapshot of the conversation's refs, which a tool run on its
 //! own does not have.
 //!
@@ -20,6 +21,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use conversation_protocol::v3::git_store::HistoryQuery;
 use conversation_protocol::v3::{GitStore, ObjectStore, Oid};
@@ -79,8 +81,7 @@ fn split_path(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// The commit of the source tree at `source-tree`: the ENTRY AS STORED, not what
-/// resolving it makes of it (that walks through the commit to its code tree).
+/// The commit of the source tree named by the `source-tree` argument.
 fn source_commit() -> Result<Oid, Failure> {
     let raw = input("source-tree")?.ok_or_else(|| {
         User(
@@ -88,7 +89,14 @@ fn source_commit() -> Result<Oid, Failure> {
                 .into(),
         )
     })?;
-    let comps = split_path(&raw);
+    commit_at(&raw)
+}
+
+/// The commit of the source tree at `raw`, a path in the `in` tree: the ENTRY AS
+/// STORED, not what resolving it makes of it (that walks through the commit to
+/// its code tree).
+fn commit_at(raw: &str) -> Result<Oid, Failure> {
+    let comps = split_path(raw);
     if comps.is_empty() || comps.iter().any(|c| c == "..") {
         return Err(User(format!("`source-tree` names no source tree: {raw:?}")));
     }
@@ -109,7 +117,11 @@ fn source_commit() -> Result<Oid, Failure> {
             )))
         }
     };
-    let parent = resolve(&comps[..comps.len() - 1].join("/"), "/cas/history-parent")?;
+    // One landing place per lookup: `diff` resolves two paths, and `caos resolve`
+    // does not overwrite.
+    static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    let landing = format!("/cas/history-parent-{}", LOOKUPS.fetch_add(1, Ordering::Relaxed));
+    let parent = resolve(&comps[..comps.len() - 1].join("/"), &landing)?;
     let entry = parent.join(&comps[comps.len() - 1]);
     if !entry.exists() {
         return Err(User(format!("{} is not in this tree", comps.join("/"))));
@@ -127,6 +139,13 @@ fn source_commit() -> Result<Oid, Failure> {
 /// A revision as git history takes it: `HEAD`/`wc`/`@` or a commit hash, then any
 /// `~N`/`^` ancestry.
 fn revision(store: &GitStore, head: &Oid, spec: &str) -> Result<Oid, Failure> {
+    // A path names another source tree in the conversation (`sources/foo/99-dirty`):
+    // its own commit, which may sit on a different line of history than `head`.
+    if spec.contains('/') {
+        let commit = commit_at(spec)?;
+        store.ensure_local(&commit).map_err(Infra)?;
+        return Ok(commit);
+    }
     let split = spec.find(['~', '^']).unwrap_or(spec.len());
     let (base, suffix) = spec.split_at(split);
     let base = match base {
