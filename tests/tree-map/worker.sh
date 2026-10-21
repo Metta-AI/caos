@@ -111,6 +111,7 @@ subdir)
   echo "  ok: subdirectory scoped" >&2
 
   echo "== a file as --in: run's result is the result ==" >&2
+  caos get /cas/args/tree
   caos run-then /cas/args/tree/a.txt --run:hash="$(map_job needle)" --then:hash="$(next file)"
   ;;
 
