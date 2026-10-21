@@ -274,10 +274,19 @@ func settingsJSON(a args, locator string) []byte {
 	}}
 
 	if a.enableBash {
-		// Nothing denies Claude Code's own tools any more, so there is nothing to
-		// lift. The flag is still accepted because setup lines in existing
-		// environments carry it, and an unknown flag is fatal.
-		say("--enable-bash: nothing to do; Claude Code's own tools are not denied")
+		// Lift the read/inspect tools out of deny and into allow, so a session
+		// can be driven to dump the container. Edit/Write/NotebookEdit/Monitor
+		// stay denied -- this is for looking, not for the model rewriting the
+		// checkout.
+		inspect := []string{"Bash", "Read", "Grep", "Glob"}
+		permissions, _ := settings["permissions"].(map[string]any)
+		if permissions == nil {
+			permissions = map[string]any{}
+			settings["permissions"] = permissions
+		}
+		permissions["deny"] = without(permissions["deny"], inspect)
+		permissions["allow"] = with(permissions["allow"], inspect)
+		say("--enable-bash: Bash/Read/Grep/Glob will be allowed this session")
 	}
 
 	data := marshal(settings)

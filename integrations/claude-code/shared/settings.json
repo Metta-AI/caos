@@ -5,6 +5,14 @@
   },
   "permissions": {
     "deny": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "NotebookEdit",
+      "Monitor",
       "mcp__claude-code-remote__add_repo",
       "mcp__github__actions_get",
       "mcp__github__actions_list",
