@@ -1,0 +1,6 @@
+# tests/std-grep, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A std/go WORKER test of std/grep, run over HTTP the way an agent runs a tool.
+# `--grep:@=DEEP-DEPS/grep` is the BUILT tool image.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --grep:@=DEEP-DEPS/grep

@@ -1,0 +1,14 @@
+# std/publish-source (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op`
+# says llm-step does the work in process (it owns the call's lifecycle: it pins the
+# publication intent before anything is pushed, then records the outcome), so this entry
+# exists to give the operation a path, a help and a place in `tool_help`/`run_tool`. The
+# image it curries is never run.
+HELP=<<END
+Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR (caos-std/github opens one) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+@param source-tree Path of the source tree to publish (a code reference in the conversation), such as feature/01-change.
+@param repository HTTPS Git repository URL, without credentials.
+@param branch Destination branch name (without refs/heads/).
+@param [force] true to allow a non-fast-forward update (a force push), still leased on the observed remote head.
+@op publish-source
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

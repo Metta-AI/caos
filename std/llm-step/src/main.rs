@@ -5,6 +5,8 @@ mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod record;
+mod settle;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -53,7 +55,6 @@ struct Config {
     api_key: String,
     system: String,
     grep_image: Option<String>,
-    merge_image: Option<String>,
     run_and_update_ref_image: Option<String>,
     /// Drain this request's declared calls and STOP -- do not call the model,
     /// do not terminate the request.
@@ -72,6 +73,16 @@ struct Config {
     /// so without it a second call would name the first's ArgTree and be
     /// answered from the memo.
     tools_only: Option<String>,
+    /// With `tools_only`: the call to run, as a tool name and its arguments,
+    /// instead of one a harness declared beforehand. The step declares it on
+    /// the conversation's active request (as the request's own model) and then
+    /// runs it, so a caller needs only this ArgTree -- no conversation access of
+    /// its own, and no request or head to name. A call already declared under
+    /// the id is not declared twice, so a retry runs it rather than failing.
+    tool_call: Option<(String, Value)>,
+    /// Record a harness's event (a prompt, the end of a turn, a failure) on the
+    /// conversation and stop: no model, no tool. See `record`.
+    record: Option<record::Request>,
     /// Describe the tools and stop, writing the registry as JSON. A harness
     /// that drives the model itself has to publish these declarations to it,
     /// and they belong to the step that implements them.
@@ -99,12 +110,28 @@ impl Config {
             image_arg("run-and-update-ref-image")?
         };
         let tools_only = read_arg_opt("tools-only")?;
+        let tool_call = match (read_arg_opt("tool")?, read_arg_opt("arguments")?) {
+            (Some(_), _) | (_, Some(_)) if tools_only.is_none() => {
+                return Err("--tool and --arguments need --tools-only=<call id>".to_string())
+            }
+            (Some(name), arguments) => {
+                let arguments = match arguments {
+                    Some(text) => serde_json::from_str(&text)
+                        .map_err(|error| format!("--arguments is not JSON: {error}"))?,
+                    None => json!({}),
+                };
+                Some((name, arguments))
+            }
+            (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
+            (None, None) => None,
+        };
         let list_tools = read_arg_opt("list-tools")?.is_some();
-        // Neither of those modes reaches the model, so neither may DEMAND what
-        // a model call takes. The key especially: `caos mcp` runs Claude Code's
+        let record = record::Request::read()?;
+        // None of those modes reaches the model, so none may DEMAND what a
+        // model call takes. The key especially: `caos mcp` runs Claude Code's
         // tools for a session whose model is Claude Code's own, and requiring
         // an Anthropic key of it would refuse a turn over a call nothing makes.
-        let answers_model = tools_only.is_none() && !list_tools;
+        let answers_model = tools_only.is_none() && !list_tools && record.is_none();
         Ok(Self {
             api_key: match answers_model {
                 true => secret("anthropic-api-key")?,
@@ -115,9 +142,10 @@ impl Config {
                 false => String::new(),
             },
             grep_image: image_arg("grep-image")?,
-            merge_image: image_arg("merge-image")?,
             run_and_update_ref_image,
             tools_only,
+            tool_call,
+            record,
             list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
             model: match answers_model {
@@ -140,11 +168,25 @@ fn run() -> Result<(), String> {
     if cfg.list_tools {
         return list_tools(&cfg);
     }
-    let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
-    let request = Oid::parse(&run_text, "conversation request")?;
-    let request_head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
+    if let Some(request) = &cfg.record {
+        return record::run(&cfg.conversation, request);
+    }
     let mut state = progress::State::open(&cfg.conversation)?;
     timing::phase("state.open");
+    let (request, request_head) = match (&cfg.tools_only, &cfg.tool_call) {
+        // The caller named a call, not a request: the active one is the
+        // request, and it records its own head.
+        (Some(call), Some((name, arguments))) => {
+            declare_requested_call(&mut state, call, name, arguments)?
+        }
+        _ => {
+            let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+            (
+                Oid::parse(&run_text, "conversation request")?,
+                Oid::parse(&cas_hash(&arg("head"))?, "request head")?,
+            )
+        }
+    };
     let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
         callback(&cfg, &mut state, &request, &request_head)
     } else {
@@ -402,8 +444,7 @@ fn resume(
         // Its result is the conversation as it now stands, not a terminal one.
         if let Some(call) = &cfg.tools_only {
             require_completed_call(state, request, call)?;
-            let head = state.head().clone();
-            return forward_result(&head);
+            return forward_tool_result(state, request, call);
         }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
@@ -959,6 +1000,31 @@ fn model_transition(
     blocks: &[Value],
     calls: &[Value],
 ) -> Result<(Transition, String), String> {
+    model_transition_by(
+        &cfg.conversation,
+        &cfg.model,
+        &cfg.model,
+        state,
+        request,
+        round,
+        blocks,
+        calls,
+    )
+}
+
+/// [`model_transition`] with the author and model named, for a caller whose
+/// model is not this step's: a harness that answers the model itself.
+#[allow(clippy::too_many_arguments)]
+fn model_transition_by(
+    conversation: &str,
+    actor: &str,
+    model: &str,
+    state: &progress::State,
+    request: &Oid,
+    round: u64,
+    blocks: &[Value],
+    calls: &[Value],
+) -> Result<(Transition, String), String> {
     let message_id = client_key()?;
     let ordinal = state.conversation()?.transcript_len()?;
     let dir = paths::transcript_payload_dir(ordinal, &message_id);
@@ -997,12 +1063,12 @@ fn model_transition(
     }
     let entry = TranscriptEntry {
         message_id: message_id.clone(),
-        conversation: cfg.conversation.clone(),
+        conversation: conversation.to_string(),
         role: Role::Assistant,
-        actor: cfg.model.clone(),
+        actor: actor.to_string(),
         request: Some(request.clone()),
         round: Some(round),
-        model: Some(cfg.model.clone()),
+        model: Some(model.to_string()),
         blocks: entry_blocks,
         proposal: None,
         source_tree_resolution: None,
@@ -1016,6 +1082,126 @@ fn model_transition(
         },
         message_id,
     ))
+}
+
+/// Declare `call` on the conversation's active request, unless something
+/// already has, and return that request and the head it was admitted at.
+///
+/// This is the half of a tool call a harness that drives the model itself used
+/// to do from its own checkout: record the model's `tool_use` so the protocol
+/// accepts a tool that a message declared (`validate_current_call`). It is
+/// authored by the request's own model, as the harness's declaration was.
+fn declare_requested_call(
+    state: &mut progress::State,
+    call: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<(Oid, Oid), String> {
+    loop {
+        let view = state.conversation()?;
+        let record = view.active_turn()?.ok_or_else(|| {
+            format!(
+                "no active request in {:?}: call {call} arrived before the prompt that opens one",
+                state_conversation_id(state).unwrap_or_default()
+            )
+        })?;
+        let mut declared = record.calls.iter().any(|declared| declared.id == call);
+        for round in 0..record.round {
+            declared |= view.tool(&record.id, round, call)?.is_some();
+        }
+        if declared {
+            return Ok((record.id, record.request_head));
+        }
+        if record.status == TurnStatus::Queued {
+            // Nobody has claimed the request yet; the step does, as it does
+            // before it answers a model.
+            let latest_message = newest_user_message(&view)?;
+            drop(view);
+            let expected = state.head().clone();
+            state.try_append_at(
+                &expected,
+                Transition::TurnClaim {
+                    request: record.id.clone(),
+                    latest_message,
+                },
+            )?;
+            continue;
+        }
+        if record.status != TurnStatus::Running {
+            return Err(format!(
+                "cannot declare call {call} on a request that is {:?}",
+                record.status
+            ));
+        }
+        let actor = newest_user_actor(&view)?;
+        drop(view);
+        let blocks = [json!({"type": "tool_use", "id": call, "name": name, "input": arguments})];
+        let calls = [json!({"id": call, "name": name, "args": arguments})];
+        let (transition, _) = model_transition_by(
+            &state_conversation_id(state)?,
+            &actor,
+            &record.model,
+            state,
+            &record.id,
+            record.round,
+            &blocks,
+            &calls,
+        )?;
+        let expected = state.head().clone();
+        match state.try_append_at(&expected, transition)? {
+            progress::TryAppend::Appended(_) => {
+                return Ok((record.id, record.request_head));
+            }
+            progress::TryAppend::HeadChanged(_) => continue,
+        }
+    }
+}
+
+/// The result of a tools-only run: the call's own record, so a caller with only
+/// the run's result needs no access to the conversation to read it.
+///
+/// - `observation`: what the tool said, in the bytes the conversation holds. For
+///   a completed call that is the `tool_result` JSON the model would be shown;
+///   for a failed one, its error; for a cancelled one, the reason.
+/// - `status`: `complete`, `failed` or `cancelled` -- which of those the
+///   observation is.
+/// - `conversation`: the conversation as it now stands.
+fn forward_tool_result(
+    state: &mut progress::State,
+    request: &Oid,
+    call: &str,
+) -> Result<(), String> {
+    let view = state.conversation()?;
+    let record = require_request(&view, request)?;
+    let round = round_state(&view, &record)?.declaring_round;
+    let tool = view
+        .tool(request, round, call)?
+        .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
+    let (status, observation) = match &tool.result {
+        Some(ToolResult::Complete { observation, .. }) => ("complete", view.payload(observation)?),
+        Some(ToolResult::Failed { error }) => ("failed", view.payload(error)?),
+        Some(ToolResult::Cancelled { reason }) => ("cancelled", reason.clone().into_bytes()),
+        None => return Err(format!("call {call} has no result to forward")),
+    };
+    drop(view);
+    forward_files(
+        state.head(),
+        &[("status", status.as_bytes()), ("observation", &observation)],
+    )
+}
+
+/// The run's result: `files` and the conversation as it stands at `head`, under
+/// `conversation`. By reference, so the conversation itself is not copied.
+fn forward_files(head: &Oid, files: &[(&str, &[u8])]) -> Result<(), String> {
+    let dir = scratch("llm-step-result")?;
+    for (name, bytes) in files {
+        fs::write(dir.join(name), bytes)
+            .map_err(|error| format!("writing the result's {name}: {error}"))?;
+    }
+    let conversation_path = fresh("terminal-conversation");
+    caos(["get-hash", head.as_str(), &conversation_path])?;
+    link(&conversation_path, dir.join("conversation"))?;
+    caos(["put", path(&dir), "/cas/out"])
 }
 
 fn record_response_after_escape(
@@ -1042,6 +1228,93 @@ enum Target {
     Files,
 }
 
+/// The call a step OPERATION sees: the declared `run_tool` call with its
+/// `arguments` as its input, which is where an operation reads its parameters.
+/// The NAME stays `run_tool`, because that is what the conversation declared and
+/// what the call's records must say.
+fn op_call(call: &Call) -> Call {
+    let mut inner = call.clone();
+    inner.input = call
+        .input
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    inner
+}
+
+/// Perform a step operation (`@op` in a tool's help). Each owns its call's
+/// lifecycle: it writes the call's start, the records it exists for, and the
+/// call's completion itself. `started` is the call's record when this is a RESUME
+/// of an operation that began and has not finished.
+///
+/// Returns whether the step should carry on at once. The one that does not is
+/// `agent-wait`, which dispatches a join on the child's relay and waits for its
+/// callback.
+fn run_op(
+    cfg: &Config,
+    op: &str,
+    state: &mut progress::State,
+    site: &CallSite<'_>,
+    started: Option<&CallRecord>,
+) -> Result<bool, String> {
+    match (op, started) {
+        ("import-source", _) => import_source::execute(state, site).map(|()| true),
+        ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
+        ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
+        ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
+        ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
+        ("agent-wait", None) => wait_agent_call(state, site),
+        ("agent-wait", Some(record)) => {
+            dispatch_wait_started(state, site.request, site.round, site.call, record)?;
+            Ok(false)
+        }
+        (other, _) => site
+            .fail(state, &format!("unknown step operation {other:?}"))
+            .map(|()| true),
+    }
+}
+
+/// The payload an operation's start carries to say what it is, so a resume knows
+/// without evaluating the tool's path. Only a call reached by `run_tool` needs one:
+/// a call made by the operation's own name already says.
+fn op_marker(call: &Call, op: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if call.name != "run_tool" {
+        return Ok(Vec::new());
+    }
+    Ok(vec![(
+        "op.json".to_string(),
+        canonical_payload_bytes(&json!(op))?,
+    )])
+}
+
+/// Where a started operation names itself, for the ones that pin nothing else.
+fn op_marker_path(site: &CallSite<'_>) -> String {
+    format!(
+        "{}/op.json",
+        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+    )
+}
+
+/// The operation a STARTED `run_tool` call is in the middle of. A call resumed
+/// after a restart has only its record to go on, and re-evaluating the tool's path
+/// to learn the operation would be a build: so an operation says what it is in a
+/// payload of its own start, or by the pin it wrote before doing anything
+/// irreversible.
+fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<String> {
+    if let Ok(bytes) = view.payload(&op_marker_path(site)) {
+        if let Ok(Value::String(op)) = serde_json::from_slice::<Value>(&bytes) {
+            return Some(op);
+        }
+    }
+    if view.payload(&import_source::pin_path(site)).is_ok() {
+        Some("import-source".to_string())
+    } else if view.payload(&publish_source::pin_path(site)).is_ok() {
+        Some("publish-source".to_string())
+    } else {
+        None
+    }
+}
+
 fn drive_call(
     cfg: &Config,
     state: &mut progress::State,
@@ -1055,6 +1328,14 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "run_tool" {
+                let inner = op_call(call);
+                let op_site = CallSite::new(request, round, &inner);
+                let op = started_op(&state.conversation()?, &op_site);
+                if let Some(op) = op {
+                    return run_op(cfg, &op, state, &op_site, Some(&existing));
+                }
+            }
             if existing.name == "publish_source" {
                 publish_source::execute(state, &site)?;
                 return Ok(true);
@@ -1449,46 +1730,12 @@ fn prepare_compute(
             eval_then_catching(&start, &relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
-        "merge" if cfg.merge_image.is_some() => prepare_merge(cfg, &clean, ws, wc),
         "grep" if cfg.grep_image.is_some() => prepare_grep(cfg, &clean, ws),
         name => Ok(Prepared::Result(error_block(
             &call.id,
             &format!("unavailable tool {name:?}; use run_tool with its conversation-relative path"),
         ))),
     }
-}
-
-
-fn prepare_merge(cfg: &Config, call: &Value, ws: &str, wc: &str) -> Result<Prepared, String> {
-    let theirs = match resolve_theirs(cfg, call) {
-        Ok(theirs) => theirs,
-        Err(block) => return Ok(Prepared::Result(block)),
-    };
-    // `merge-base` is checked like any `{commit}` parameter: a hash that names
-    // nothing, or names something other than a commit, is the model's mistake.
-    let base = match call["input"]["merge-base"].as_str().map(str::trim) {
-        None | Some("") => None,
-        Some(base) => match tools::resolve_object(base, "commit", None) {
-            Ok(bound) => Some(bound.ready()?),
-            Err(why) => {
-                let id = call["id"].as_str().unwrap_or("");
-                let error = format!("merge's `merge-base`: {why}");
-                return Ok(Prepared::Result(error_block(id, &error)));
-            }
-        },
-    };
-    let theirs_path = fresh("theirs");
-    caos(["get-hash", &theirs, &theirs_path])?;
-    let mut args = vec![("ours", Arg::Path(wc)), ("theirs", Arg::Path(&theirs_path))];
-    if let Some(base) = &base {
-        args.push(("merge-base", base.arg()));
-    }
-    let image = cfg.merge_image.as_deref().ok_or("merge image is absent")?;
-    let curried = caos_curry(Arg::Hash(image), &args)?;
-    // NO `in`. merge never read one, and `ours` already determines the tree,
-    // so binding it only made the key bigger. Its help declares no `@in`.
-    let _ = ws;
-    prepared_request(&curried, &[], None)
 }
 
 fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String> {
@@ -1505,7 +1752,6 @@ fn prepare_grep(cfg: &Config, call: &Value, ws: &str) -> Result<Prepared, String
     let curried = caos_curry(Arg::Hash(image), &[("pattern", Arg::Lit(pattern))])?;
     prepared_request(&curried, &[], Some(&scope))
 }
-
 
 /// Form the runnable request. `input` is bound as `in` when there is one, and
 /// there is one only when the tool asked for it — the tree is the biggest thing
@@ -1629,8 +1875,48 @@ fn launch_resolved_tool(
         site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
         return resume(cfg, state, request, request_head);
     }
+    // An operation of the step: the entry gave it a path and a help, and the step
+    // does the work here, in process.
+    if let Some(op) = tool.op.as_deref() {
+        let inner = op_call(&call);
+        let op_site = CallSite::at(request, round, &inner, &current.declaration_message);
+        return if run_op(cfg, op, state, &op_site, None)? {
+            resume(cfg, state, request, request_head)
+        } else {
+            Ok(())
+        };
+    }
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
+    // A tool that declares `@scope <param>` runs over, and a writer changes, the
+    // source tree its argument names, not the one its path happens to sit in:
+    // `merge` is reached at `caos-std/merge` and advances `feature/01-change`.
+    let selected = tool
+        .scope
+        .as_deref()
+        .and_then(|param| nested["input"][param].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (name, commit, ws, wc) = match selected {
+        None => (name, commit, ws, wc),
+        Some(selected) => match source_tree_target(&state.conversation()?, Some(selected)) {
+            Ok(Some((scoped, scoped_commit))) => {
+                let (scoped_ws, scoped_wc) = materialize_source_tree(state, &scoped_commit)?;
+                (Some(scoped), scoped_commit, scoped_ws, scoped_wc)
+            }
+            Ok(None) | Err(_) => {
+                let why = source_tree_target(&state.conversation()?, Some(selected))
+                    .err()
+                    .unwrap_or_else(|| format!("unknown source tree {selected:?}"));
+                site.failed(
+                    state,
+                    &error_block(id, &why),
+                    name.map(|name| (name, commit)),
+                )?;
+                return resume(cfg, state, request, request_head);
+            }
+        },
+    };
     let conversation = state.conversation()?.tree().clone();
     let bound = match tools::tree_tool_args(&nested, &tool, Some(conversation.as_str())) {
         Ok(bound) => bound,
@@ -1809,7 +2095,10 @@ fn dispatch_wait_started(
         ));
     }
     validate_child_relay(state, &child)?;
-    let extras = [("current-tool", Arg::Lit(call.name.as_str()))];
+    let mut extras = vec![("current-tool", Arg::Lit(call.name.as_str()))];
+    if call.name == "run_tool" {
+        extras.push(("op", Arg::Lit("agent-wait")));
+    }
     let me = self_curry(None, request, round, &call.id, &extras)?;
     let dispatched = run_request_then_catching(relay.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
@@ -1824,6 +2113,9 @@ fn callback_result(
     // are RENDERERS (`grep`'s sparse match tree) and the subagent join, not
     // class decisions: no tool's ability to change the tree depends on its
     // name any more.
+    if read_arg_opt("op")?.as_deref() == Some("agent-wait") {
+        return wait_callback_block(state, record);
+    }
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
     }
@@ -1880,11 +2172,8 @@ fn writer_callback(
         _ => {
             let proposal = Oid::parse(&cas_hash(&result.prop)?, "writer result commit")?;
             state.fetch_object(&proposal)?;
-            let descends = conversation_protocol::v3::CodeOps::is_ancestor(
-                state.store(),
-                base,
-                &proposal,
-            )?;
+            let descends =
+                conversation_protocol::v3::CodeOps::is_ancestor(state.store(), base, &proposal)?;
             if !descends {
                 return fail(format!(
                     "{tool}: the returned commit {proposal} does not descend from the commit \
@@ -2535,7 +2824,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     match state.try_append_at(
         &expected,
         Transition::ToolStart {
-            payloads: Vec::new(),
+            payloads: op_marker(call, "agent-wait")?,
             record: started.clone(),
         },
     )? {
@@ -3154,17 +3443,6 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     if cfg.grep_image.is_some() {
         registry.push(tools::grep_declaration());
     }
-    // MERGE IS THE EXCEPTION, and the reason is what its target is. Every other
-    // std tool reads a TREE, which `@in` lets a caller name; merge writes a
-    // merge commit into a source tree and so needs that tree's COMMIT (`ours`,
-    // from `wc`). Nothing but the step's own routing supplies one, and
-    // `run_tool` takes no source tree — so merge cannot yet be reached by path,
-    // and until it can, registering it is the only way to have it at all.
-    if cfg.merge_image.is_some() {
-        if let Some(tool) = tools::std_tool("merge", &arg("merge-image"))? {
-            registry.push(with_source_tree(tools::tree_tool_declaration(&tool)));
-        }
-    }
     registry.extend(githist::declarations().into_iter().map(with_source_tree));
     registry.push(json!({
         "name":"run_tool",
@@ -3220,16 +3498,6 @@ fn with_source_tree(mut declaration: Value) -> Value {
         required.push(json!("source_tree"));
     }
     declaration
-}
-
-
-fn resolve_theirs(cfg: &Config, call: &Value) -> Result<String, Value> {
-    let id = call["id"].as_str().unwrap_or("");
-    let theirs = call["input"]["theirs"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    lookup_theirs(cfg.merge_refs.as_deref(), theirs).map_err(|error| error_block(id, &error))
 }
 
 fn lookup_theirs(refs: Option<&str>, theirs: Option<&str>) -> Result<String, String> {
@@ -3437,6 +3705,7 @@ fn self_curry(
         "tool-git",
         "tool-in",
         "tool-writer",
+        "op",
         "in",
         "result",
         "error",
@@ -4422,7 +4691,9 @@ mod tests {
 
         // An explicit `root` IS the object to evaluate, so no source tree gets
         // to select it and the path stays relative to that root.
-        let rooted = eval(json!({"path": "project/revision/tests/hello", "root": test_oid('b').to_string()}));
+        let rooted = eval(
+            json!({"path": "project/revision/tests/hello", "root": test_oid('b').to_string()}),
+        );
         assert!(matches!(
             resolve_target(&view, &rooted).unwrap(),
             Target::Files

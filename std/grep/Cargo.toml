@@ -1,0 +1,32 @@
+# std/grep — search a tree with a regular expression. This directory IS the tool:
+# its Rust source (src/main.rs), this manifest, its `.caos-expr` and `DEPS`.
+#
+# It is two stages around std/rgrep. rgrep is the fold that finds the matches (one
+# job per directory, cached per subtree and pattern) and answers with a SPARSE
+# TREE; this tool validates the call, runs that fold over the scope the caller
+# named, and renders the tree as `path:linenum:line` lines, which is what a
+# person or a model can read.
+#
+# regex is a crates.io dependency, already seeded by the std/cargo bake
+# (std/cargo/bake.nix); the dev profile below matches it so cargo reuses the
+# seeded artifact rather than recompiling it (see std/rgrep/Cargo.toml).
+[package]
+name = "grep"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
+regex = "1"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0

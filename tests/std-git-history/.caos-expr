@@ -1,0 +1,6 @@
+# tests/std-git-history, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A std/go WORKER test of the history tools (std/log, show, diff), run over HTTP
+# the way an agent runs a tool.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --log:@=DEEP-DEPS/log --show:@=DEEP-DEPS/show --diff:@=DEEP-DEPS/diff

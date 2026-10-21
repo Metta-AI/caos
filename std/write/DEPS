@@ -1,0 +1,4 @@
+# What this tool builds from (format `<path> <name>`): the shared source of the
+# file tools, and the compiler.
+../files files
+../rustc rustc

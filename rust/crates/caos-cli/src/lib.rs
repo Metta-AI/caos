@@ -1,7 +1,7 @@
 //! Host-side conversation coordination for the v3 conversation protocol.
 
 mod mcp;
-pub use mcp::{cli_mcp, default_server_transport};
+pub use mcp::cli_mcp;
 
 pub mod filesystem;
 pub mod host_git;
@@ -109,7 +109,7 @@ fn image_arg_name(argument: &str) -> Option<&str> {
 
 /// Resolve one of the required image args, or say what to pass.
 fn resolve_image_arg(
-    t: &GitTransport,
+    t: &dyn Transport,
     argument: Option<&str>,
     name: &str,
     secrets: &Secrets,
@@ -1387,8 +1387,25 @@ fn protocol_tool_result(
 ) -> Result<(bool, String), String> {
     match result {
         Some(ProtocolToolResult::Complete { observation, .. }) => {
-            let bytes = conversation.payload(observation)?;
-            let value: Value = serde_json::from_slice(&bytes)
+            tool_outcome("complete", &conversation.payload(observation)?)
+        }
+        Some(ProtocolToolResult::Failed { error }) => {
+            tool_outcome("failed", &conversation.payload(error)?)
+        }
+        Some(ProtocolToolResult::Cancelled { reason }) => Ok((true, reason.clone())),
+        None => Ok((true, String::new())),
+    }
+}
+
+/// `(is_error, text)` for a call's recorded output, given which of `complete`,
+/// `failed` and `cancelled` it is. The bytes are the observation payload the
+/// conversation holds, which is also what a tools-only run returns as its
+/// `observation`, so a caller that reads a run's result and one that reads the
+/// conversation agree.
+pub(crate) fn tool_outcome(status: &str, observation: &[u8]) -> Result<(bool, String), String> {
+    match status {
+        "complete" => {
+            let value: Value = serde_json::from_slice(observation)
                 .map_err(|error| format!("parsing tool observation: {error}"))?;
             let is_error = value
                 .get("is_error")
@@ -1400,14 +1417,14 @@ fn protocol_tool_result(
                 .unwrap_or_else(|| tool_result_text(&value));
             Ok((is_error, content))
         }
-        Some(ProtocolToolResult::Failed { error }) => {
-            let bytes = conversation.payload(error)?;
-            let value: Value = serde_json::from_slice(&bytes)
-                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        "failed" => {
+            let value: Value = serde_json::from_slice(observation).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(observation).into_owned())
+            });
             Ok((true, tool_result_text(&value)))
         }
-        Some(ProtocolToolResult::Cancelled { reason }) => Ok((true, reason.clone())),
-        None => Ok((true, String::new())),
+        "cancelled" => Ok((true, String::from_utf8_lossy(observation).into_owned())),
+        other => Err(format!("a tool result has no status {other:?}")),
     }
 }
 
@@ -2003,12 +2020,26 @@ pub fn fork_conversation(
     title: &str,
     from: &str,
 ) -> Result<String, String> {
+    let mut store = open_store(t)?;
+    let head = fork_conversation_in(&mut store, user, id, title, from)?;
+    let _ = update_local_cache(t, &refs::head_ref(id)?, &head);
+    Ok(head)
+}
+
+/// [`fork_conversation`] over any store holding the source: a checkout's, or a
+/// scratch one that only talks to the server.
+pub fn fork_conversation_in(
+    store: &mut GitStore,
+    user: &str,
+    id: &str,
+    title: &str,
+    from: &str,
+) -> Result<String, String> {
     refs::validate_conversation_id(id)?;
     let title = validate_conversation_title(title)?.to_string();
     let from = oid(from, "fork source")?;
-    let mut store = open_store(t)?;
     store.ensure_local(&from)?;
-    let source = Conversation::open(&store, &from)?;
+    let source = Conversation::open(&*store, &from)?;
     let source_identity = source.identity()?;
     if source_identity.id == id {
         return Err("fork id must differ from its source conversation".to_string());
@@ -2023,7 +2054,7 @@ pub fn fork_conversation(
         },
         title: title.clone(),
     };
-    let candidate = mint_transition(&mut store, &from, &transition, &signature(user)?)?;
+    let candidate = mint_transition(store, &from, &transition, &signature(user)?)?;
     let head_ref = refs::head_ref(id)?;
     let active = refs::active_membership_ref(user, id)?;
     let archived = refs::archived_membership_ref(user, id)?;
@@ -2045,15 +2076,12 @@ pub fn fork_conversation(
         },
     ];
     match store.push(&updates) {
-        Ok(()) => {
-            let _ = update_local_cache(t, &head_ref, candidate.as_str());
-            Ok(candidate.to_string())
-        }
+        Ok(()) => Ok(candidate.to_string()),
         Err(error) => {
             let Some(observed) = store.fetch_ref(&head_ref)? else {
                 return Err(error);
             };
-            let conversation = Conversation::open(&store, &observed)?;
+            let conversation = Conversation::open(&*store, &observed)?;
             let identity = conversation.identity()?;
             if identity.id == id
                 && identity.kind
@@ -2062,7 +2090,7 @@ pub fn fork_conversation(
                     })
                 && conversation.title()? == title
             {
-                repair_creation_membership(&store, user, id, &observed)?;
+                repair_creation_membership(&*store, user, id, &observed)?;
                 Ok(observed.to_string())
             } else {
                 Err(format!(
@@ -2146,7 +2174,9 @@ fn resolve_username(t: &GitTransport, explicit: Option<&str>) -> Result<String, 
     Ok("user".to_string())
 }
 
-fn ambient_username(value: Result<String, std::env::VarError>) -> Result<Option<String>, String> {
+pub(crate) fn ambient_username(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, String> {
     match value {
         Ok(user) => normalized_username(&user).map(Some).ok_or_else(|| {
             "$USER is not a usable identity; pass --username explicitly".to_string()

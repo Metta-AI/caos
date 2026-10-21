@@ -129,7 +129,7 @@ fi
 # into that commit, same as integrations/claude-code/cloud/session.go's
 # `probeDev` does for a cloud session's OWN dev check.
 #
-# Over PLAIN HTTP to this stack's own server -- no ticket, no `caos` remote,
+# Over PLAIN HTTP to this stack's own server -- no ticket,
 # no `git-remote-caos` needed, same as the publish step on the other end.
 dev_sha=""
 if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
@@ -167,4 +167,10 @@ else
     exit 1
 fi
 
-exec "$bin" mcp serve "$llm_step"
+# The server is an argument, not an environment variable. Without one the tool
+# server still starts and `help` says what is missing.
+server_arg=()
+if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
+    server_arg=("--server=$CAOS_MCP_DEFAULT_SERVER")
+fi
+exec "$bin" mcp serve ${server_arg[@]+"${server_arg[@]}"} "$llm_step"

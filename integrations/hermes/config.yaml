@@ -77,11 +77,8 @@ mcp_servers:
       CAOS_REPO: "${CAOS_REPO}"
       CAOS_BIN: "${CAOS_BIN}"
       CAOS_LLM_STEP_REV: "${CAOS_LLM_STEP_REV}"
-      # Read by rust/crates/caos-cli/src/mcp/session_base.rs on a session's
-      # first prompt: with no `/caos-session-server <url>` directive on the
-      # prompt's leading line, this is the server a NEW session's scratch
-      # checkout gets its `caos` remote pointed at. No `cwd:`/local-checkout
-      # requirement needed any more -- that's the whole point of that change.
+      # The server `caos mcp` is told, as `--server=<url>`, by the launcher and
+      # the hook plugin.
       CAOS_MCP_DEFAULT_SERVER: "${CAOS_MCP_DEFAULT_SERVER}"
     # Generous: a cold `nix build`/cold caos-server-side tool build can take
     # minutes. Raise further if a first-session timeout is observed.

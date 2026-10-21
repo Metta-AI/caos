@@ -1,0 +1,13 @@
+# std/read — one of the file tools (std/files holds the source they share).
+# The help is a HERE-STRING so it lives in this expression, which is stripped
+# from the tree the build sees: editing the docs re-keys this tool's ArgTree and
+# nothing it builds from.
+HELP=<<END
+Read a file's contents. Paths start at the root of the tree this tool runs over (the conversation, unless `in` names another) and traverse code references, for example feature/dirty/README.md. Prefer this over `cat` via bash: it is immediate and needs no `paths` declaration. Large files are truncated at 100KB; page with `offset` and `limit` (line-based). To read inside an evaluated result such as caos-std/, pass the evaluated tree as `in`.
+@param file-path Path of the file, such as feature/dirty/README.md.
+@param [offset] 1-based first line to return.
+@param [limit] Number of lines to return.
+@in
+END
+IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/files
+curry --base=$IMAGE --op=read --help=$HELP

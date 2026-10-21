@@ -54,18 +54,10 @@ inside the checkout.
 
 - **StopFailure.** `post_llm_call` doesn't fire on an interrupted/errored
   turn and Hermes has no exact equivalent in its hook catalog yet. Not a
-  correctness gap — `resume.rs`'s `settle()` already closes a request a
+  correctness gap — `settle.rs`'s `settle()` (in the step) already closes a request a
   dead session left open, the same self-healing a killed Claude Code
   process relies on — just a messier log on a crash than a clean `Stop`
   would leave.
-- **The `--llm-step` locator rewrite.** `bin/caos-mcp-launch` hardcodes
-  `--llm-step:@=std/llm-step`, correct only when the installed profile's
-  source IS a caos checkout (this repo, or a caos-session clone that
-  DEPS-mounts `caos/std`). A profile installed from an unrelated repo needs
-  the pinned-remote form instead
-  (`--llm-step:@@=github:Metta-AI/caos?rev=<sha>&dir=std/llm-step`), the
-  same rewrite `cloud/install.go` performs for Claude Code. Not automated
-  here yet.
 - **Unverified: `${HERMES_HOME}` substitution in `mcp_servers.caos.command`.**
   Confirmed-working: `${VAR}` substitution in `config.yaml`'s `env:` values.
   Not yet confirmed: whether `$HERMES_HOME` is a real exported env var at
@@ -74,7 +66,7 @@ inside the checkout.
   the fast way to check; if it fails to resolve, hardcode the profile's
   absolute path instead (loses portability across machines, but is correct
   immediately).
-- **Claude Code's `/fork-caos-conversation` / `/resume-caos-conversation`
-  slash commands** have no Hermes equivalent yet — picking up a conversation
-  by its commit hash in a new Hermes session needs the same two verbs,
-  wired as Hermes slash commands or just plain prompted instructions for now.
+- **Claude Code's `/fork-caos-conversation`
+  slash command** has no Hermes equivalent yet — picking up a conversation
+  by its commit hash in a new Hermes session needs the same verb,
+  wired as a Hermes slash command or just plain prompted instructions for now.

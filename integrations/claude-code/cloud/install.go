@@ -23,6 +23,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -31,10 +32,11 @@ import (
 	"strings"
 )
 
-// What the shared assets say before this rewrites them. `std/llm-step` is caos'
-// own path and is wrong for every other repository, which is what makes a
-// substitution that silently matches nothing worth failing over.
-const sharedStep = "--llm-step:@=std/llm-step"
+// The placeholder the shared assets carry where `caos mcp`'s arguments go: the
+// step and the rest of what every process is told. It is a token no argument
+// could be, which is what makes a substitution that silently matches nothing
+// worth failing over.
+const sharedStep = "CAOS_MCP_ARGS_HERE"
 
 func say(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "caos-install: "+format+"\n", a...)
@@ -51,7 +53,10 @@ type args struct {
 	repo       string
 	commit     string
 	version    string
-	seedCommit string
+	server     string
+	step       string
+	content    string
+	readers    string
 	prefix     string
 	repoDir    string
 	homes      []string
@@ -74,8 +79,17 @@ func parseArgs(argv []string) args {
 			a.commit = value
 		case "--version":
 			a.version = value
-		case "--seed-commit":
-			a.seedCommit = value
+		// The step as a locator, when it is not caos' own pinned commit: dev mode
+		// runs the step of the dev tree, which the pinned commit does not have.
+		case "--step":
+			a.step = value
+		case "--server":
+			a.server = value
+		// What a NEW conversation starts from, as a locator the server fetches.
+		case "--content":
+			a.content = value
+		case "--secret-readers":
+			a.readers = value
 		case "--prefix":
 			a.prefix = value
 		case "--repo-dir":
@@ -219,44 +233,66 @@ func writeIfChanged(path string, data []byte) bool {
 }
 
 func marshal(value any) []byte {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
+	// Not HTML-escaped: a locator's `&` would otherwise be written as `&`,
+	// which is the same string to a JSON reader and a different one to anyone
+	// looking for the locator in the file.
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(value); err != nil {
 		fatal("could not write the configuration as JSON: %v", err)
 	}
-	return append(data, '\n')
+	return out.Bytes()
 }
 
-// A caos-client repo MOUNTS caos' std into its evaluated tree, so the step is an
-// ordinary path and the client resolves it by descent -- the same walk that
-// reaches `DEEP-DEPS/<x>` inside caos itself. This is also what makes
-// a `reader:@@=` grant on caos's `std/llm-step` match it (SPEC.md, "Secrets").
-//
-// The locator form pins the step to another repo's tree by full sha, for a
-// checkout with no std of its own.
+// The step is named by LOCATOR: `caos mcp` reads no checkout, so a path in one
+// (`--llm-step:@=<path>/llm-step`) would name nothing. The locator pins caos'
+// own tree by full sha, which is also what makes a `reader:@@=` grant on caos's
+// `std/llm-step` match it (SPEC.md, "Secrets").
 func stepLocator(a args) string {
-	if a.stdPath != "" {
-		return "--llm-step:@=" + a.stdPath + "/llm-step"
+	if a.step != "" {
+		return "--llm-step:@@=" + a.step
 	}
 	if a.repo == "" || a.commit == "" {
 		fatal("this build cannot say which commit it came from, so there is no\n" +
-			"  tree to pin the step to and the configuration would be useless.\n" +
-			"  (A caos-client repo avoids this: --caos-std-path=<path> names the\n" +
-			"   step by a path in the checkout instead.)")
+			"  tree to pin the step to and the configuration would be useless.")
 	}
 	return "--llm-step:@@=github:" + a.repo + "?rev=" + a.commit + "&dir=std/llm-step"
 }
 
-// THE HOOK NEEDS `--base` TOO: the HOOK creates the conversation
-// (`on_user_prompt`), not the tool server, so a seed put only on `mcp serve` --
-// where it looks like it belongs -- leaves every conversation seeded from HEAD.
+// What every `caos mcp` process is told beyond the step, each as its own argument:
+// the server, where a new conversation's content comes from, and the secret
+// readers it presents. None of it is read from the checkout.
+func sharedArgs(a args) []string {
+	var list []string
+	if a.server != "" {
+		list = append(list, "--server="+a.server)
+	}
+	if a.content != "" {
+		list = append(list, "--base:@@="+a.content)
+	}
+	if a.readers != "" {
+		list = append(list, "--secret-readers="+a.readers)
+	}
+	return list
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// THE HOOK NEEDS THEM TOO: the HOOK creates the conversation (`on_user_prompt`),
+// not the tool server, so a content locator put only on `mcp serve` -- where it
+// looks like it belongs -- leaves every conversation without code.
 func settingsJSON(a args, locator string) []byte {
 	settings := readJSON(filepath.Join(a.assets, "settings.json"))
 	// In a hook command the locator is a SHELL WORD, so its `&` and `?` are
 	// quoted; in an mcp `args` entry it is bare argv. The two are not
 	// interchangeable and this is the only place that difference is expressed.
-	shellStep := "'" + locator + "'"
-	if a.seedCommit != "" {
-		shellStep += " --base=" + a.seedCommit
+	shellStep := shellQuote(locator)
+	for _, extra := range sharedArgs(a) {
+		shellStep += " " + shellQuote(extra)
 	}
 	walkStrings(settings, func(s string) string {
 		s = strings.ReplaceAll(s, `"${CAOS_BIN:-caos}"`, "caos")
@@ -318,13 +354,14 @@ func mcpServers(a args, locator string) map[string]any {
 	if caos == nil {
 		fatal("the mcp asset declares no `caos` server")
 	}
-	// ITS OWN ARGV ELEMENT. Appended to the locator's string it is a single
-	// argument (`--llm-step:@=… --base=…`), which the client reads as one flag
-	// with a nonsense value.
-	if a.seedCommit != "" {
-		list, _ := caos["args"].([]any)
-		caos["args"] = append(list, "--base="+a.seedCommit)
+	// EACH ITS OWN ARGV ELEMENT. Appended to the locator's string they are a
+	// single argument (`--llm-step:@@=… --server=…`), which the client reads as
+	// one flag with a nonsense value.
+	list, _ := caos["args"].([]any)
+	for _, extra := range sharedArgs(a) {
+		list = append(list, extra)
 	}
+	caos["args"] = list
 	if !strings.Contains(string(marshal(servers)), locator) {
 		fatal("the mcp asset does not name --llm-step, so nothing points at the step")
 	}
@@ -372,10 +409,10 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-// The two slash commands that start a session from an earlier recorded
-// conversation. THE HOOK is what acts on them -- `caos mcp hook` sees the
-// first prompt and forks or resumes the conversation before the model's first
-// turn (rust/crates/caos-cli/src/mcp/resume.rs) -- so the marker line below is
+// The slash command that starts a session from an earlier recorded
+// conversation. THE HOOK is what acts on it -- `caos mcp hook` sees the
+// first prompt and forks the conversation before the model's first
+// turn (rust/crates/caos-cli/src/mcp/fork.rs) -- so the marker line below is
 // load-bearing: it is what the hook finds if Claude Code hands it the command's
 // expansion rather than the `/name <hash>` that was typed. The rest is for the
 // MODEL, which starts empty and has to be told to go and read what happened.
@@ -400,14 +437,6 @@ caos-conversation-command: fork $ARGUMENTS
 
 You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original.
 ` + commandFooter,
-	"resume-caos-conversation.md": `---
-description: Continue a recorded caos conversation in this new session (the same branch)
-argument-hint: <conversation-commit-hash>
----
-caos-conversation-command: resume $ARGUMENTS
-
-You are picking up work recorded in another caos conversation, and this session CONTINUES it: what you do is appended to that same conversation, on top of commit $ARGUMENTS, so its history and workspace (imports/, feature/, and so on) are already here.
-` + commandFooter,
 }
 
 func writeUserConfig(a args, locator string) {
@@ -429,6 +458,11 @@ func writeUserConfig(a args, locator string) {
 			if writeIfChanged(filepath.Join(home, ".claude/commands", name), []byte(body)) {
 				changed = true
 			}
+		}
+		// An earlier install wrote a resume command, which no longer exists.
+		stale := filepath.Join(home, ".claude/commands/resume-caos-conversation.md")
+		if err := os.Remove(stale); err == nil {
+			changed = true
 		}
 		// settings.json cannot declare an MCP server -- that lives in the user
 		// config beside it, MERGED, because it also holds account state a
@@ -498,7 +532,7 @@ func main() {
 
 	// What this client is, for whoever has to name the step it drives: the
 	// twelve digits in the wrapper cannot be expanded without it, and
-	// `caos_status` quotes it into a session's own diagnostic.
+	// `help` quotes it into a session's own diagnostic.
 	record := fmt.Sprintf("repo=%s\ncommit=%s\nversion=%s\n", a.repo, a.commit, a.version)
 	if err := os.MkdirAll(filepath.Join(a.prefix, "share/caos"), 0o755); err != nil {
 		fatal("could not make %s: %v", filepath.Join(a.prefix, "share/caos"), err)

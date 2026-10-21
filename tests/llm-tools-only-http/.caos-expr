@@ -1,0 +1,7 @@
+# tests/llm-tools-only-http, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# tests/llm-tools-only with the last hop over HTTP. A harness that has only
+# curl can run a declared call: the step is the same worker, started with
+# /start/run (or run with /eval/run) instead of `caos sub-run`.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --bash-tool:@=DEEP-DEPS/bash-tool --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

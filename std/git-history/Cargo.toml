@@ -1,0 +1,31 @@
+# std/git-history — read a source tree's git history: log, show and diff. ONE crate,
+# THREE entries (`std/log`, `std/show`, `std/diff`), each a directory of its own
+# with its `help` that builds THIS source and curries `--op=<name>`. This
+# directory has no `.caos-expr` on purpose: a `:@=` target without one is DATA.
+#
+# The tools are the history reads `llm-step` ran in-process against the
+# conversation's own store, over the same `GitStore`: it fetches the commit from
+# the server and asks git, so the tree alone is never asked to say what its
+# parent was.
+[package]
+name = "git-history"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
+conversation-protocol = { path = "conversation-protocol", features = ["git-cli"] }
+
+# Match the caos workspace's dev profile so dependency fingerprints line up with
+# the std/cargo bake (see std/run-and-update-ref/Cargo.toml).
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.build-override]
+opt-level = 0
