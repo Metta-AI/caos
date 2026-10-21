@@ -273,6 +273,14 @@ fn decode_result(config: &Config, kind: &str, result: &str) -> Result<ToolOutcom
     };
     let status = String::from_utf8_lossy(part("status")?).into_owned();
     let (is_error, text) = crate::tool_outcome(status.trim(), part("observation")?)?;
+    let text = match files.get("spilled") {
+        Some(spilled) => spill_notice(
+            &text,
+            config.max_result_chars(),
+            &String::from_utf8_lossy(spilled),
+        ),
+        None => text,
+    };
     Ok(ToolOutcome { text, is_error })
 }
 
