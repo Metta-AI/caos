@@ -1177,8 +1177,13 @@ fn declare_requested_call(
 ///   for a failed one, its error; for a cancelled one, the reason.
 /// - `status`: `complete`, `failed` or `cancelled` -- which of those the
 ///   observation is.
+/// - `spilled`: present only when the call's text was longer than
+///   `--max-result-chars` and was saved in the conversation: the path, then the
+///   blob's hash, on two lines. `observation` is still the whole of it; deciding
+///   what a reader is shown instead is the caller's.
 /// - `conversation`: the conversation as it now stands.
 fn forward_tool_result(
+    cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
     call: &str,
