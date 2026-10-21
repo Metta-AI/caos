@@ -284,6 +284,50 @@ fn decode_result(config: &Config, kind: &str, result: &str) -> Result<ToolOutcom
     Ok(ToolOutcome { text, is_error })
 }
 
+/// A tool's text longer than this many characters is kept in the conversation
+/// and answered with a preview. Claude Code refuses an MCP result past 25,000
+/// tokens, and what it does instead is write the whole thing to a file on ITS
+/// disk and tell the model to read that -- a path the model usually cannot open
+/// (a cloud session has no file tools to open it with). The limit sits well
+/// under that ceiling, because characters per token vary: dense output such as
+/// JSON or a trace tokenizes far worse than prose.
+const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
+
+/// How much of a spilled result the answer still carries, so the model can tell
+/// what it is before deciding how to page through it.
+const RESULT_PREVIEW_CHARS: usize = 2_000;
+
+/// What the model reads instead of a result the step saved in the conversation:
+/// the start of it, cut at a line, and how to get the rest. `spilled` is the
+/// step's own description of where it went: the path, then the blob's hash.
+///
+/// `read` takes either: `file-path` for the path, or the hash as a bare `root`
+/// with no `file-path`.
+fn spill_notice(text: &str, limit: usize, spilled: &str) -> String {
+    let (path, blob) = spilled.split_once('\n').unwrap_or((spilled, ""));
+    let (path, blob) = (path.trim(), blob.trim());
+    let keep = RESULT_PREVIEW_CHARS.min(limit);
+    let end = text
+        .char_indices()
+        .nth(keep)
+        .map_or(text.len(), |(index, _)| index);
+    let mut preview = &text[..end];
+    if let Some(newline) = preview.rfind('\n').filter(|&n| n > 0) {
+        preview = &preview[..newline];
+    }
+    let chars = text.chars().count();
+    let lines = text.lines().count();
+    let by_hash = match blob.is_empty() {
+        true => String::new(),
+        false => format!(", or `read` with root={blob} and no file-path"),
+    };
+    format!(
+        "{preview}\n\n[caos: this result is {chars} characters over {lines} lines, too long to \
+         return. The whole of it is saved in the conversation at {path}. Page through it with \
+         `read` (file-path={path}, offset, limit){by_hash}.]"
+    )
+}
+
 /// A request to run the step, ready to send: where, with what parameters, and
 /// presenting which secrets.
 struct StepRequest {
