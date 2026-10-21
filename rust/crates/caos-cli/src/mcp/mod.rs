@@ -941,21 +941,12 @@ mod tests {
 
     #[test]
     fn the_limit_is_an_argument_and_zero_means_none() {
-        let parse = |list: &[&str]| {
+        let parse = |list: &[&str]| -> Result<Config, String> {
             let given: Vec<String> = list.iter().map(|s| s.to_string()).collect();
-            Config::parse(&given)
+            Config::parse(&given).map(|(config, _)| config)
         };
-        assert_eq!(
-            parse(&["serve"]).unwrap().0.max_result_chars(),
-            DEFAULT_MAX_RESULT_CHARS
-        );
-        assert_eq!(
-            parse(&["serve", "--max-result-chars=0"])
-                .unwrap()
-                .0
-                .max_result_chars(),
-            0
-        );
+        assert_eq!(parse(&["serve"]).unwrap().max_result_chars(), DEFAULT_MAX_RESULT_CHARS);
+        assert_eq!(parse(&["serve", "--max-result-chars=0"]).unwrap().max_result_chars(), 0);
         assert!(parse(&["serve", "--max-result-chars=lots"]).is_err());
     }
 
