@@ -1,6 +1,3 @@
-# rgrep's dependencies (format `<path> <name>`, path relative to this dir): the
-# rustc worker factory that compiles it. rustc DEPENDS on the runner pool
-# itself and curries the built binary onto it, so no tool names a runner.
-# LOCAL deps (mounted under DEEP-DEPS/ by deepening) rather than /std, so std
-# has no ambient self-reference.
-../rustc rustc
+# rgrep's dependency (format `<path> <name>`, path relative to this dir): the
+# tree-map that recurses for it. The per-directory grep, ./level, has its own.
+../tree-map tree-map

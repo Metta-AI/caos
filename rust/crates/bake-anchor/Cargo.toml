@@ -23,7 +23,7 @@ path = "src/lib.rs"
 [dependencies]
 # conversation-protocol (loose Git object compression)
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# std/rgrep, std/llm-step
+# std/llm-step (std/rgrep is no longer a Rust tool)
 regex = "1"
 # std/llm-call, std/llm-step
 serde_json = "1"
