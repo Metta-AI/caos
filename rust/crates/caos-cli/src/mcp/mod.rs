@@ -142,7 +142,10 @@ fn usage() -> String {
          Both take the server (--server=<url>) and name the step that \
          runs this session's tools:\n  \
          {}\n\
-         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.",
+         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.\n\
+         `serve` takes `--max-result-chars=<n>`: a tool result longer than that is kept in \
+         the conversation and answered with a preview (default {DEFAULT_MAX_RESULT_CHARS}; \
+         0 for no limit).",
         crate::missing_image_arg(LLM_STEP_ARG)
     )
 }
