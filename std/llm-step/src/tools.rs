@@ -193,6 +193,9 @@ pub struct TreeTool {
     /// changes if it is a writer, is the one the argument `<param>` names. See
     /// [`Help::scope`].
     pub scope: Option<String>,
+    /// The tool declared `@op <name>`: the step performs this operation itself.
+    /// See [`Help::op`].
+    pub op: Option<String>,
 }
 
 /// What `@in` offers the model: the tree to run over, defaulting to the one
@@ -230,6 +233,7 @@ impl TreeTool {
             wants_in: help.wants_in,
             call: help.call,
             scope: help.scope,
+            op: help.op,
         }
     }
 
@@ -489,6 +493,12 @@ pub struct Help {
     /// and `in` defaults to its code. The parameter must be declared with
     /// `@param`: a tag that names none is reported, not obeyed.
     pub scope: Option<String>,
+    /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
+    /// that declares it exists to give the operation a path, a help and a place in
+    /// `tool_help`/`run_tool`; running it is the step doing the work in process,
+    /// because the operation writes the conversation's own records (a source tree
+    /// imported, a publication, a subagent) and owns its call's lifecycle.
+    pub op: Option<String>,
 }
 
 /// If `line` opens a javadoc BLOCK TAG, its name without the `@`.
@@ -522,6 +532,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut wants_in = false;
     let mut call = false;
     let mut scope: Option<String> = None;
+    let mut op: Option<String> = None;
     let mut in_tags = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -560,11 +571,22 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             } else {
                 scope = Some(name.to_string());
             }
+        } else if let Some(rest) = trimmed
+            .strip_prefix("@op")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+        {
+            in_tags = true;
+            let name = rest.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                eprintln!("{ctx}: @op names one operation, got {rest:?} — ignored");
+            } else {
+                op = Some(name.to_string());
+            }
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
             eprintln!(
                 "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in, @call, @scope)"
+                 (known: @param, @git, @writer, @in, @call, @scope, @op)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
@@ -588,6 +610,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         wants_in,
         call,
         scope,
+        op,
     }
 }
 
@@ -2266,6 +2289,7 @@ mod tests {
             wants_in: false,
             call: false,
             scope: None,
+            op: None,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -2287,6 +2311,7 @@ mod tests {
             wants_in: false,
             call: false,
             scope: None,
+            op: None,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -2319,6 +2344,7 @@ mod tests {
             wants_in: false,
             call: false,
             scope: None,
+            op: None,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 

@@ -1229,6 +1229,45 @@ enum Target {
     Files,
 }
 
+/// The call a step OPERATION sees: the declared `run_tool` call with its
+/// `arguments` as its input, which is where an operation reads its parameters.
+/// The NAME stays `run_tool`, because that is what the conversation declared and
+/// what the call's records must say.
+fn op_call(call: &Call) -> Call {
+    let mut inner = call.clone();
+    inner.input = call
+        .input
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    inner
+}
+
+/// Perform a step operation (`@op` in a tool's help). Each owns its call's
+/// lifecycle: it writes the call's start, the records it exists for, and the
+/// call's completion itself.
+fn run_op(op: &str, state: &mut progress::State, site: &CallSite<'_>) -> Result<(), String> {
+    match op {
+        "import-source" => import_source::execute(state, site),
+        "publish-source" => publish_source::execute(state, site),
+        other => site.fail(state, &format!("unknown step operation {other:?}")),
+    }
+}
+
+/// The operation a STARTED `run_tool` call is in the middle of, found from what it
+/// pinned before doing anything irreversible. A call that was resumed after a
+/// restart has only its record to go on, and re-evaluating the tool's path to
+/// learn the operation would be a build; the pin names it for free.
+fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<&'static str> {
+    if view.payload(&import_source::pin_path(site)).is_ok() {
+        Some("import-source")
+    } else if view.payload(&publish_source::pin_path(site)).is_ok() {
+        Some("publish-source")
+    } else {
+        None
+    }
+}
+
 fn drive_call(
     cfg: &Config,
     state: &mut progress::State,
@@ -1242,6 +1281,15 @@ fn drive_call(
         .tool(request, round.declaring_round, &call.id)?
     {
         if existing.status == CallStatus::Started {
+            if existing.name == "run_tool" && existing.task.is_none() {
+                let inner = op_call(call);
+                let op_site = CallSite::new(request, round, &inner);
+                let op = started_op(&state.conversation()?, &op_site);
+                if let Some(op) = op {
+                    run_op(op, state, &op_site)?;
+                    return Ok(true);
+                }
+            }
             if existing.name == "publish_source" {
                 publish_source::execute(state, &site)?;
                 return Ok(true);
@@ -1781,6 +1829,14 @@ fn launch_resolved_tool(
             false,
         );
         site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
+        return resume(cfg, state, request, request_head);
+    }
+    // An operation of the step: the entry gave it a path and a help, and the step
+    // does the work here, in process.
+    if let Some(op) = tool.op.as_deref() {
+        let inner = op_call(&call);
+        let op_site = CallSite::at(request, round, &inner, &current.declaration_message);
+        run_op(op, state, &op_site)?;
         return resume(cfg, state, request, request_head);
     }
     let nested = json!({"id": id, "input":
