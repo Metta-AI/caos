@@ -945,8 +945,16 @@ mod tests {
             let given: Vec<String> = list.iter().map(|s| s.to_string()).collect();
             Config::parse(&given).map(|(config, _)| config)
         };
-        assert_eq!(parse(&["serve"]).unwrap().max_result_chars(), DEFAULT_MAX_RESULT_CHARS);
-        assert_eq!(parse(&["serve", "--max-result-chars=0"]).unwrap().max_result_chars(), 0);
+        assert_eq!(
+            parse(&["serve"]).unwrap().max_result_chars(),
+            DEFAULT_MAX_RESULT_CHARS
+        );
+        assert_eq!(
+            parse(&["serve", "--max-result-chars=0"])
+                .unwrap()
+                .max_result_chars(),
+            0
+        );
         assert!(parse(&["serve", "--max-result-chars=lots"]).is_err());
     }
 
