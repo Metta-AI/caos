@@ -75,10 +75,6 @@ pub struct TurnOptions {
     pub llm_step: Option<String>,
     /// The `--llm-call:<type>=<value>` argument, verbatim (title generation).
     pub llm_call: Option<String>,
-    /// `caos mcp serve --max-result-chars=<n>`: a tool result longer than this
-    /// is saved in the conversation and answered with a preview and where to
-    /// read the rest. `Some(0)` turns that off; `None` is the server's default.
-    pub max_result_chars: Option<usize>,
 }
 
 impl TurnOptions {
