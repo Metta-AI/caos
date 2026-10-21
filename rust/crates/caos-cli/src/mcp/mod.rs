@@ -247,7 +247,7 @@ fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
                 .to_string(),
             is_error: false,
         },
-        caos::LineResult::Done { kind, hash } => decode_result(&server, &kind, &hash)?,
+        caos::LineResult::Done { kind, hash } => decode_result(config, &kind, &hash)?,
         caos::LineResult::Failed { status, message } => ToolOutcome {
             text: format!("the call failed ({status}): {message}"),
             is_error: true,
