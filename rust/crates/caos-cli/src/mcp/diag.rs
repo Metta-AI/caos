@@ -1,10 +1,9 @@
-//! What a degraded `caos mcp` process can say about where it is standing.
+//! What a degraded `caos mcp` process can say about where it is running.
 //!
-//! A resumed cloud session once came up in a new container with a working
-//! directory that was not a repository, and every hook failed discovery while
-//! nothing recorded what the directory WAS, what sat beside it, or whether the
-//! container was new. One function answers all of that, and every failure path
-//! calls it: the hooks, `caos_status`, and the SessionStart hook (through
+//! One function answers what a failed hook or tool call needs to be diagnosed
+//! after the fact: the environment (by name), the working directory, how the
+//! process was started, and whether the container is new. Every failure path
+//! calls it: the hooks, `help`, and the SessionStart hook (through
 //! `caos mcp diag`).
 //!
 //! It reads facts and invents none: a missing file or a failed command becomes
@@ -17,20 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use caos::GitTransport;
-
-/// The most directory entries listed per directory.
-const LISTED: usize = 50;
-/// The most directories visited looking for a `.git`, so a large `$HOME` is
-/// bounded rather than walked.
-const SCAN_BUDGET: usize = 2000;
-/// How deep below a root a `.git` is looked for.
-const SCAN_DEPTH: usize = 2;
-
 /// Who is asking, and why.
 #[derive(Default)]
 pub struct Context<'a> {
-    /// The hook event, or `caos_status` / `serve` for the callers that are not
+    /// The hook event, or `help` / `serve` for the callers that are not
     /// hooks.
     pub event: &'a str,
     /// `startup` or `resume`, from a SessionStart payload.
@@ -81,57 +70,6 @@ pub fn collect(ctx: &Context) -> String {
     names.sort();
     d.push_str(&format!("CAOS_* variables set (names only): {names:?}\n"));
 
-    d.push_str("discovery attempts:\n");
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
-        if !dir.is_empty() {
-            d.push_str(&attempt(&format!("CLAUDE_PROJECT_DIR={dir}"), &dir));
-        }
-    }
-    d.push_str(&attempt("cwd", "."));
-    if let Some(home) = &home {
-        d.push_str(&attempt("HOME", home));
-    }
-
-    if let Ok(cwd) = &cwd {
-        d.push_str(&listing("cwd", cwd));
-        if let Some(parent) = cwd.parent() {
-            d.push_str(&listing("cwd parent", parent));
-        }
-    }
-    if let Some(home) = &home {
-        d.push_str(&listing("HOME", Path::new(home)));
-    }
-    let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = &home {
-        roots.push(PathBuf::from(home));
-    }
-    if let Ok(cwd) = &cwd {
-        roots.push(cwd.clone());
-    }
-    let mut found = Vec::new();
-    for root in &roots {
-        let mut budget = SCAN_BUDGET;
-        scan_for_git(root, 0, &mut budget, &mut found);
-    }
-    found.sort();
-    found.dedup();
-    d.push_str(&format!(
-        ".git within {SCAN_DEPTH} levels of HOME and cwd: {}\n",
-        if found.is_empty() {
-            "none".to_string()
-        } else {
-            found
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    ));
-
-    d.push_str(&format!(
-        "caos remote configured: {}\n",
-        remote_configured()
-    ));
     d.push_str(&format!(
         "boot_id: {}\nuptime: {}\nhostname: {}\n",
         proc_line("/proc/sys/kernel/random/boot_id"),
@@ -204,73 +142,6 @@ fn append_journal(path: &Path, ctx: &Context, text: &str) {
         let _ = writeln!(file, "{record}");
     }
 }
-
-fn attempt(label: &str, dir: &str) -> String {
-    match GitTransport::discover(dir) {
-        Ok(t) => format!("  {label}: ok, worktree {}\n", t.work_dir().display()),
-        Err(error) => format!("  {label}: {}\n", error.replace('\n', " ")),
-    }
-}
-
-fn listing(label: &str, dir: &Path) -> String {
-    match std::fs::read_dir(dir) {
-        Err(error) => format!("{label} ({}): <unreadable: {error}>\n", dir.display()),
-        Ok(entries) => {
-            let mut names: Vec<String> = entries
-                .filter_map(Result::ok)
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            let total = names.len();
-            names.truncate(LISTED);
-            let more = if total > LISTED {
-                format!(" ... {} more", total - LISTED)
-            } else {
-                String::new()
-            };
-            format!("{label} ({}): {}{more}\n", dir.display(), names.join(" "))
-        }
-    }
-}
-
-fn scan_for_git(dir: &Path, depth: usize, budget: &mut usize, found: &mut Vec<PathBuf>) {
-    if *budget == 0 {
-        return;
-    }
-    *budget -= 1;
-    if dir.join(".git").exists() {
-        found.push(dir.join(".git"));
-    }
-    if depth >= SCAN_DEPTH {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        // A symlink could loop out of the tree; the depth bound alone would
-        // survive it, but following one says nothing about this directory.
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            scan_for_git(&entry.path(), depth + 1, budget, found);
-        }
-    }
-}
-
-fn remote_configured() -> String {
-    let mut cmd = std::process::Command::new("git");
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
-        if !dir.is_empty() {
-            cmd.args(["-C", &dir]);
-        }
-    }
-    // Presence only: the URL can be a ticket, and nothing here needs it.
-    match cmd.args(["remote", "get-url", "caos"]).output() {
-        Ok(out) if out.status.success() => "yes".to_string(),
-        Ok(out) => format!("no ({})", String::from_utf8_lossy(&out.stderr).trim()),
-        Err(error) => format!("unknown (git failed: {error})"),
-    }
-}
-
 fn proc_line(path: &str) -> String {
     match std::fs::read_to_string(path) {
         Ok(s) => s.trim().to_string(),
@@ -415,11 +286,8 @@ mod tests {
             "CLAUDE_PROJECT_DIR:",
             "HOME:",
             "uid:",
-            "discovery attempts:",
             "boot_id:",
             "process chain:",
-            "caos remote configured:",
-            ".git within 2 levels",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }

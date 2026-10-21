@@ -1,0 +1,15 @@
+# std/edit — one of the file tools (std/files holds the source they share).
+# The help is a HERE-STRING so it lives in this expression, which is stripped
+# from the tree the build sees: editing the docs re-keys this tool's ArgTree and
+# nothing it builds from.
+HELP=<<END
+Replace text in a file in the conversation or beneath a code reference. `old-string` must match the file content exactly and (unless `replace-all`) appear exactly once: include surrounding context to disambiguate. Prefer this over sed via bash.
+@param file-path Path of the file, such as feature/dirty/README.md.
+@param old-string Exact text to replace.
+@param new-string Replacement text.
+@param [replace-all] Replace every occurrence (default false).
+@writer
+@in
+END
+IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/files
+curry --base=$IMAGE --op=edit --help=$HELP

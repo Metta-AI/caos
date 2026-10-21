@@ -6,8 +6,8 @@ checking out source files.
 | Layer | Interface |
 | --- | --- |
 | Server | `POST /git/push {destination, commit, branch, expected, force?}` |
-| Worker command | `caos push-git <https-url> <commit> <branch> --expected=<oid\|absent> [--force]` |
-| Agent tool | `publish_source(source_tree, repository, branch, force?)` |
+| Worker command | `caos push-git <https-url> <commit> <branch> --expected=<oid\|absent> [--force] [--allow-ignored]` |
+| Agent tool | `publish_source(source_tree, repository, branch, force?, allow_ignored?)` |
 
 The request fields are:
 
@@ -18,6 +18,7 @@ The request fields are:
 | `branch` | Destination branch in that remote, e.g. `feature/parser`, without `refs/heads/`. |
 | `expected` | Full hash E expected at that same remote branch, or JSON `null` if it must not exist. Required; the CLI spells `null` as `absent`. |
 | `force` | Optional, default `false`. `true` permits a non-fast-forward update; see step 2. |
+| `allow_ignored` | Optional, default `false`. `true` skips the ignored-files check described below. |
 
 `refs/heads/feature/parser` is Git's full name for the branch `feature/parser`.
 Ordinary branch pushes can infer this prefix from a local branch. Since CAOS
@@ -38,7 +39,8 @@ The endpoint performs one push:
 2. If E is non-null, require E to be stored, and unless `force` is set, an
    ancestor of H. If H contains E, CAOS already has E. A missing E or a
    non-fast-forward without `force` is a rejection.
-   Reject H if its tree contains paths matched by its own .gitignore rules.
+   Unless `allow_ignored` is set, reject H if its tree contains paths matched
+   by its own .gitignore rules.
 3. Push H to the destination branch with
    --force-with-lease=refs/heads/<branch>:<E>, disabling tag following.
    Empty E requires creation. Without `force`, the ancestry check prevents
@@ -77,9 +79,17 @@ original push even if the branch later advances.
 
 Publication transfers the exact commit. Before pushing, the server checks H's
 tree against its versioned .gitignore files, including nested rules and
-negations. A match returns HTTP 422 with code `ignored-files`; the CLI and
-agent retain this as a definite rejection without remote reconciliation. Git
-performs the check using a private index; no source files are checked out.
+negations. A match returns HTTP 422 with code `ignored-files`, `total` (the
+number of matching paths) and `paths` (the first 100 of them); the CLI renders
+these into the diagnostic, and the agent retains the rejection as definite
+without remote reconciliation. Git performs the check using a private index;
+no source files are checked out.
+
+`allow_ignored` is the override for a source that legitimately tracks files its
+own rules match, for example files committed before a rule was added or
+force-added. It skips only this check; the commit, the lease and every other
+validation are unchanged. Like the check, it is a per-call decision: it is not
+remembered, so the next publication is checked again.
 
 This is deliberately stricter than ordinary Git: a tracked file matching an
 ignore rule is rejected too. Global excludes and .git/info/exclude do not

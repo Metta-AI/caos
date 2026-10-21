@@ -146,6 +146,51 @@ export CAOS_STUB_HOST
 
 git add -A && git commit -qm testtree
 
+# THE ARGUMENTS `caos mcp` TAKES, for a test that drives it. `caos mcp` reads no
+# checkout: it is told the server, the step and (for a conversation's first prompt)
+# where its content comes from, all by name. Set only for a test that carries
+# DEEP-DEPS/llm-step.
+#
+# THE STEP IS A HASH, not a path: a path names a file in a checkout. Evaluating it
+# here is the client's own `eval-path`, the same walk `:@=` does.
+if [ -d ./DEEP-DEPS/llm-step ]; then
+  step=$("$CAOS_CLI" eval-path DEEP-DEPS/llm-step) || fail "evaluating DEEP-DEPS/llm-step"
+  CAOS_MCP_ARGS="--server=$CAOS_SERVER_URL --llm-step:hash=${step##* }"
+  export CAOS_MCP_ARGS
+fi
+
+# A CONVERSATION'S CONTENT is named by locator, and the server fetches it: so this
+# repository is served over git, where the server can reach it (its own address, as
+# CAOS_STUB_HOST explains), and the locator pins HEAD. Commit first: what is not
+# committed is not there. Started on first use, once per test.
+#
+# Exported as a function, and the daemon it starts outlives the `$(...)` that
+# started it, which is how a test calls this.
+mcp_base_arg() {
+  local port
+  if [ ! -s /tmp/mcp-git-port ]; then
+    git -C /tmp/client config uploadpack.allowReachableSHA1InWant true
+    for _ in 1 2 3 4 5; do
+      port=$((20000 + RANDOM % 20000))
+      git daemon --reuseaddr --export-all --listen=0.0.0.0 --port="$port" \
+        --base-path=/tmp /tmp/client >/tmp/mcp-git-daemon.log 2>&1 &
+      for _ in $(seq 1 50); do
+        if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+          exec 3>&-
+          printf '%s' "$port" > /tmp/mcp-git-port
+          break 2
+        fi
+        sleep 0.1
+      done
+    done
+  fi
+  [ -s /tmp/mcp-git-port ] || fail "could not serve the client repository: $(cat /tmp/mcp-git-daemon.log)"
+  printf -- '--base:@@=git+git://%s:%s/client?rev=%s' \
+    "$CAOS_STUB_HOST" "$(cat /tmp/mcp-git-port)" "$(git -C /tmp/client rev-parse HEAD)"
+}
+export -f mcp_base_arg
+export -f fail
+
 # THE TEST, with everything it narrates captured once and used twice: relayed
 # to stderr, which is what a FAILING worker's error text carries (so the
 # report's excerpt is the test's own story), and published as the result blob

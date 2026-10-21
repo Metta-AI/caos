@@ -5,3 +5,4 @@
 ../../std/create-squashed-stack create-squashed-stack
 ../../std/llm-stub llm-stub
 ../../std/llm-test-tool llm-test-tool
+../../std/publish-source publish-source

@@ -25,6 +25,23 @@ let
   # interactive `caosd` have to agree on it.
   dataDir = "/data/caos";
   cfg = config.caos;
+
+  # The redis memory cap lives in a file on the machine, not in this config, so
+  # raising it is an edit on the box rather than a deploy. serve's own default
+  # (2gb, stack/serve) is far too small for a prod cache: at the cap redis
+  # evicts live `caos:result:` and blob keys under allkeys-lru, which shows up
+  # as rebuilds, failed registry copies and timeouts, not as an error. The
+  # file wins over that default; delete it to fall back. Its content is any
+  # value redis accepts, e.g. `16gb`. Read at every start, so a change takes
+  # effect on `systemctl restart caosd`.
+  redisMaxmemFile = "${dataDir}/redis-maxmemory";
+  startCaosd = pkgs.writeShellScript "caosd-up" ''
+    if [ -s ${redisMaxmemFile} ]; then
+      CAOS_STACK_REDIS_MAXMEM="$(${pkgs.coreutils}/bin/tr -d '[:space:]' < ${redisMaxmemFile})"
+      export CAOS_STACK_REDIS_MAXMEM
+    fi
+    exec ${cfg.package}/bin/caosd up --iroh
+  '';
 in
 {
   options.caos = {
@@ -316,7 +333,7 @@ in
         User = "caos";
         Group = "caos";
         WorkingDirectory = dataDir;
-        ExecStart = "${cfg.package}/bin/caosd up --iroh";
+        ExecStart = startCaosd;
         ExecStop = "${cfg.package}/bin/caosd down";
         # A cold first run builds every std worker image before it returns.
         TimeoutStartSec = "90min";

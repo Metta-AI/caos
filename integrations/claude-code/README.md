@@ -3,22 +3,23 @@
 Anthropic's Claude Code, wired to caos — in both directions, sharing one config:
 
 - **caos AS Claude Code's tools**: the `caos mcp serve` MCP server (see
-  [`../mcp`](../mcp)), declared in `shared/mcp.json`, with Claude Code's built-in
-  tools denied in `shared/settings.json` so the model uses caos's instead.
+  [`../mcp`](../mcp)), declared in `shared/mcp.json`. It offers five fixed tools (`run`,
+  `help`, `start`, `result`, `eval-path`) beside Claude Code's own, which stay: caos is a
+  separate git workspace the model reaches through them, not a replacement for its files.
 - **caos DRIVING Claude Code**: cloud sessions caos provisions and steers.
 
 ```
-shared/   the deny list, hooks, and server declaration both paths consume
+shared/   the deny list (GitHub tools caos covers), hooks, and server declaration both paths consume
 cli/      launch Claude Code locally against caos (run)
 drive/    start and inspect cloud sessions, from a terminal or as a caos worker
             drive.go          the program; .caos-expr + DEPS make it an entry
 cloud/    configure a claude.ai/code cloud environment
             bootstrap.go      stage 1: read the repo's pin, fetch the payload, run stage 2
             install.go        stage 2: put the package in place, write Claude Code's config
-            session.go        the SessionStart hook: warm the tool registry
+            session.go        the SessionStart hook: is the install the one a fresh setup would make?
 ```
 
-The deny list also bans the GitHub MCP server's tools (`mcp__github__*`) that
+The deny list bans the GitHub MCP server's tools (`mcp__github__*`) that
 caos covers with `import_source`, `publish_source` and `caos-std/github` (see
 [`std/GIT.md`](../../std/GIT.md)). Six stay available, because `caos-std/github`
 cannot do what they do or is not shown to: `get_job_logs` (GitHub serves CI logs

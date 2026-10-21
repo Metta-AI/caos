@@ -32,7 +32,7 @@ under test, not the place the tools run.
   edited; whether an edit elsewhere also breaks it has not been tested. The
   untouched import is the blessed copy, so it avoids the question.
 - `caos-stack` `op=start` needs `relay=http://<ip>/`. Your own session already
-  has one: `caos_status` shows `over RELAY relay:http://<ip>/` on its `push:`
+  has one: `help` (no path) shows `over RELAY relay:http://<ip>/` on its `push:`
   lines. Use `cloud-env=1` to get the environment, and a fresh `request-id` for
   every call.
 - `drive` `verb=start` with `env=z Caos Dev <commit>`, `repo=<owner>/<repo>`

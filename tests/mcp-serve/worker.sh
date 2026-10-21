@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 # What `caos mcp serve` must do, in the terms Claude Code judges it by.
 #
-# The contract is SYNCHRONOUS: `initialize` answers at once (it never resolves
-# the step), and `tools/list` resolves the step and answers with the result --
-# real tools, or, when the step cannot resolve, one `caos_status` tool that
-# explains why. There is no background retry, no timed hold, and no
-# `tools/list_changed` notification revising the list afterwards; the answer to
-# the one `tools/list` a re-list-averse client makes is the final answer.
-# (`warm`, run in the session-start hook before the client starts, normally
-# resolves the tools ahead of all this so `tools/list` is a cache read.)
+# The tools are FIVE AND FIXED -- run, help, start, result, eval-path -- so the
+# contract is plain and synchronous. `initialize` answers at once and carries the
+# `instructions` that tell the model how the five fit together. `tools/list` is a
+# CONSTANT: it needs no step, no cache, no warm-up hook and no server, so there is
+# nothing for a re-list-averse client to miss. A call is one request to the server,
+# and what a tool runs is named by a PATH in the conversation.
 #
-# The regressions this guards: resolving inside `initialize` blew the client's
-# startup budget and the session reported a server that closed; and an empty
-# tool list on failure made a model conclude caos is absent, so an empty
-# registry carries the one tool that explains itself.
+# The regressions this guards: a listing that waited on a worker run (a first
+# session in a tree built the step before the client's startup budget ran out, and
+# the session reported a server that closed); and a model handed zero tools that
+# concluded caos was absent. `help` with no path is how a session finds out the
+# truth about caos, so it must answer with no workspace and with no server.
 set -euo pipefail
 
-# The recorded-workspace store lives under $HOME/.cache, and the worker's HOME
+# `help` writes its diag journal under $HOME/.cache, and the worker's HOME
 # is not writable.
 HOME=$(mktemp -d)
 export HOME
@@ -27,8 +26,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # is request/response with UNSOLICITED notifications interleaved, so a reader
 # has to skip lines it did not ask for rather than assume the next line is its
 # answer.
-open_server() { # <llm-step argument>
-  coproc SERVER { "$CAOS_CLI" mcp serve "$1" 2>/tmp/mcp-serve.err; }
+open_server() { # <arguments: the server and the step>
+  coproc SERVER { "$CAOS_CLI" mcp serve $1 2>/tmp/mcp-serve.err; }
   SERVER_IN=${SERVER[1]}
   SERVER_OUT=${SERVER[0]}
 }
@@ -69,83 +68,66 @@ await() { # <grep pattern> <seconds> ; prints the matching line
   return 1
 }
 
-echo "== a step that cannot resolve still leaves the session a way to ask ==" >&2
-open_server "--llm-step:@=DEEP-DEPS/no-such-entry"
+echo "== with no server, the handshake and the list still answer, and help says why ==" >&2
+# The handshake and the list are constants the bridge answers itself (caos-world's
+# mcp module): a harness gives `initialize` a few seconds and drops a tool server
+# slower than that from the session with no tools and no reason, and a handshake
+# that crossed an iroh relay from a cold container lost that race. Only a call
+# needs the server, and a call to a dead one must say so.
+open_server "--server=http://127.0.0.1:9 --llm-step:hash=0000000000000000000000000000000000000000"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-# The handshake resolves NOTHING, so it answers at once. Ten seconds is a ceiling
-# that must not scale with the step, which takes minutes to build the first time.
-await '"id":1' 10 >/dev/null || fail "the handshake did not answer"
-
-# tools/list resolves the step and answers with the result. This step cannot
-# resolve, and a missing path fails FAST -- no build to wait out -- so the reply
-# is prompt, and it carries the one tool a toolless session still offers.
-send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-listing=$(await '"id":2' 15) || fail "tools/list did not answer"
-case "$listing" in
-  *caos_status*) ;;
-  *) fail "a server with no tools offered nothing to ask: $listing" ;;
-esac
-case "$listing" in
-  *'"name":"read"'*) fail "an unresolvable step somehow offered the real tools" ;;
-esac
-
-# The REASON is settled by the time tools/list answered (it did the resolving),
-# so caos_status names it on the first ask -- but the loop tolerates a slower
-# path. A status that says only "no tools" costs the same round trip and settles
-# nothing.
-status=""
-for id in 3 4 5 6 7 8; do
-  send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"caos_status\",\"arguments\":{}}}"
-  status=$(await "\"id\":$id" 20) || fail "caos_status did not answer"
-  case "$status" in *no-such-entry*) break ;; esac
-  sleep 2
+init=$(await '"id":1' 10) || fail "the handshake did not answer without a server"
+for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
+  case "$init" in
+    *"$needle"*) ;;
+    *) fail "the handshake's instructions lack $needle: $init" ;;
+  esac
 done
-case "$status" in
-  *no-such-entry*) ;;
-  *) fail "caos_status never named what failed: $status" ;;
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+listing=$(await '"id":2' 10) || fail "tools/list did not answer without a server"
+names=$(printf '%s' "$listing" | jq -r '.result.tools[].name' | tr '\n' ' ')
+[ "$names" = "run help start result eval-path " ] \
+  || fail "the list is not the five fixed tools, in order: $names"
+# `help` with no path is the one call that reports on caos itself, which is the
+# only diagnostic a locked-down session has.
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"help","arguments":{}}}'
+overview=$(await '"id":3' 20) || fail "help with no path did not answer"
+case "$overview" in
+  *DEGRADED*'--- caos diagnostics ---'*) ;;
+  *) fail "the degraded overview names no reason and carries no diagnostics: $overview" ;;
 esac
 close_server
 
-echo "== the real step: the handshake is immediate, tools/list resolves then answers ==" >&2
-open_server "--llm-step:@=DEEP-DEPS/llm-step"
+echo "== the real step: the same five tools, and none of the old registry ==" >&2
+open_server "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-started=$(date +%s)
-await '"id":1' 10 >/dev/null || fail "the handshake waited for the step to resolve"
-elapsed=$(( $(date +%s) - started ))
-[ "$elapsed" -lt 10 ] || fail "the handshake took ${elapsed}s"
-
-# GENEROUS, because this is the wait that used to sit on the handshake: the first
-# resolution in a tree BUILDS the step. It now sits on tools/list, which holds
-# its own reply until the tools are ready -- no notification, no re-ask.
+init=$(await '"id":1' 10) || fail "the handshake did not answer"
+# The instructions are how the model learns what to do with five tools and no
+# listing: where the standard ones are, how to find the index, what each primitive is.
+for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
+  case "$init" in
+    *"$needle"*) ;;
+    *) fail "the handshake's instructions lack $needle: $init" ;;
+  esac
+done
 send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
-listing=$(await '"id":9' 600) \
-  || fail "the tools never resolved (see the server's stderr below)"
-for tool in read ls write edit grep log show diff run_tool tool_help merge; do
+listing=$(await '"id":9' 10) || fail "tools/list did not answer"
+names=$(printf '%s' "$listing" | jq -r '.result.tools[].name' | tr '\n' ' ')
+[ "$names" = "run help start result eval-path " ] \
+  || fail "the list is not the five fixed tools, in order: $names"
+# EVERY TOOL accepts what the PreToolUse hook injects, or the hook's `updatedInput`
+# would fail schema validation on a call the model made correctly.
+printf '%s' "$listing" | jq -e '[.result.tools[].inputSchema.properties | has("caos_session")] | all' >/dev/null \
+  || fail "a tool does not declare the injected caos_session: $listing"
+# NOTHING OF THE STEP'S REGISTRY IS LISTED. The file tools, the history tools, the
+# std tools and the step's own `run_tool`/`tool_help` are all reached by path through
+# `run` and `help`; a listing that named them would be a second way to call one thing,
+# and the two can disagree about which version runs.
+for gone in caos_status read ls write edit grep log show diff merge run_tool tool_help bash caos-build caos-test; do
   case "$listing" in
-    *"\"name\":\"$tool\""*) ;;
-    *) fail "the resolved listing is missing $tool" ;;
+    *"\"name\":\"$gone\""*) fail "$gone is listed: the tools are the five fixed ones, and the rest are paths" ;;
   esac
 done
-# AND THE std TOOLS ARE NOT THERE. Each is an entry with its own HELP, so a
-# conversation whose tree mounts caos reaches it as `caos-std/<name>` --
-# `tool_help` describes it and `run_tool` runs it, over the tree named by `in`
-# (std/README.md is the index). Registering one as well would be a second way to
-# call it, and the two can disagree about which version runs.
-#
-# `merge` is the exception above: it writes into a source tree and so needs that
-# tree's COMMIT, which only the step's own routing supplies.
-for tool in bash caos-build caos-test caos-test-result; do
-  case "$listing" in
-    *"\"name\":\"$tool\""*)
-      fail "$tool is registered; std tools are reached by path through run_tool" ;;
-  esac
-done
-# caos_status rides ALONGSIDE the real tools, always: its provisioning
-# diagnostics are wanted most on a working session you are trying to confirm.
-case "$listing" in
-  *caos_status*) ;;
-  *) fail "caos_status vanished once the real tools resolved" ;;
-esac
 
 echo "== MCP reaches a tool at a PINNED GENERATED path ==" >&2
 # Two things at once, and the pin is what makes the second one real:
@@ -220,8 +202,10 @@ git add generated mcp-marker
 git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
 session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
-  | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+  | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
+# The prompt hook recorded it on the server; fetch it.
+git fetch -q caos "+refs/caos/v3/conversations/$key/head:refs/caos/v3/conversations/$key/head"
 head=$(git rev-parse "refs/caos/v3/conversations/$key/head")
 # Discover the repository mount, so this test does not prescribe startup's
 # source-tree prefix (or require a prefix if startup mounts content directly).
@@ -237,26 +221,41 @@ call_tool() { # <rpc id> <name> <leaf> [arguments JSON]
       path:$path,arguments:$arguments}}}')"
   await "\"id\":$id" 300 || fail "pinned tool call $id did not answer"
 }
-help=$(call_tool 20 tool_help hello)
+help=$(call_tool 20 help hello)
 case "$help" in
   *'"isError":false'*'Pinned generated tool.'*|*'Pinned generated tool.'*'"isError":false'*) ;;
   *) fail "pinned help missed the generated path: $help" ;;
 esac
-invalid=$(call_tool 21 run_tool hello)
+invalid=$(call_tool 21 run hello)
 case "$invalid" in
   *needs*word*) ;;
-  *) fail "run_tool did not reject missing arguments: $invalid" ;;
+  *) fail "run did not reject missing arguments: $invalid" ;;
 esac
-ran=$(call_tool 22 run_tool hello '{"word":"supplied"}')
+ran=$(call_tool 22 run hello '{"word":"supplied"}')
 case "$ran" in
   *'pinned supplied original-input'*) ;;
   *) fail "pinned invocation lost its path, arguments, or original input: $ran" ;;
 esac
-missing=$(call_tool 23 tool_help missing)
+missing=$(call_tool 23 help missing)
 case "$missing" in
   *'"isError":true'*missing*|*missing*'"isError":true'*) ;;
   *) fail "a missing generated path was not a recoverable tool error: $missing" ;;
 esac
+
+echo "== a raw locator names a subtree unevaluated ==" >&2
+# `raw=1&dir=hello` is the directory as the commit holds it, `.caos-expr` and all;
+# without `raw` the same locator evaluates it into the tool's image.
+locator="git+git://$CAOS_STUB_HOST:$git_port/tools?rev=$revision&dir=hello"
+raw_answer=$(curl -fsS "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "$locator&raw=1" '$l|@uri')") \
+  || fail "the server refused a raw locator with a dir"
+[ "${raw_answer%% *}" = tree ] || fail "a raw dir is not a tree: $raw_answer"
+"$CAOS_CLI" get "${raw_answer##* }" /tmp/raw-hello >/dev/null || fail "reading the raw tree"
+[ -f /tmp/raw-hello/.caos-expr ] || fail "the raw tree was evaluated: it has no .caos-expr ($(ls -A /tmp/raw-hello))"
+evaluated=$(curl -fsS "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "$locator" '$l|@uri')") \
+  || fail "the server refused the evaluated locator"
+[ "${evaluated##* }" != "${raw_answer##* }" ] || fail "raw and evaluated named the same tree"
+missing=$(curl -s -o /dev/null -w '%{http_code}' "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "${locator%dir=hello}raw=1&dir=nope" '$l|@uri')")
+[ "$missing" = 404 ] || fail "a raw dir that is not there answered $missing, not 404"
 
 echo "== a call still running at Stop keeps its request, and its result ==" >&2
 # Claude Code moves any MCP call past 120s to the background and ends the turn,
@@ -287,25 +286,33 @@ git add slow
 git -c user.name=test -c user.email=test@caos commit -qm slow-tool
 held="mcp-held-$(date +%s)-$$"
 hook() { # <event JSON>
-  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
 held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
 send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg request_id "$held" \
-  '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run_tool",arguments:{
+  '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run",arguments:{
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,
     arguments:{seconds:"25","request-id":$request_id}}}}')"
 # The Stop must land AFTER the call is declared, as a backgrounded call's does.
+#
+# The STEP declares the call now, on the server, a moment after the request
+# reaches it, so the declaration is not in this checkout's copy of the ref:
+# fetch it. And it is not the newest commit for long -- the step starts the tool
+# right behind it -- so look for it among the last few.
+sync_held() { git fetch -q caos "+$held_ref:$held_ref"; }
 declared=""
 for _ in $(seq 60); do
-  if [ "$(git log -1 --format=%s "$held_ref")" = model.complete ]; then
-    declared=yes
-    break
+  if sync_held 2>/dev/null; then
+    case "$(git log -4 --format=%s "$held_ref")" in
+      *model.complete*) declared=yes; break ;;
+    esac
   fi
   sleep 1
 done
 if [ -z "$declared" ]; then fail "the call was never declared"; fi
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"moved to the background\"}"
+sync_held
 if [ "$(git log -1 --format=%s "$held_ref")" = request.terminal ]; then
   fail "Stop closed a request whose call was still running"
 fi
@@ -318,6 +325,7 @@ esac
 # and that one's Stop closes it as usual.
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"the result arrived\"}"
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"done\"}"
+sync_held
 subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
 case "$subjects" in
   "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;
@@ -327,27 +335,31 @@ esac
 close_server
 
 echo "== an unreachable caos server is named, not waited on ==" >&2
-# LAST, because it breaks the remote for everything after it. A caos server
-# reached through a dead tunnel ACCEPTS and never answers, so the resolution
-# hangs rather than failing and the status can never improve -- which is what a
-# real cloud container showed, twenty-seven seconds into "nothing has failed
-# yet". A refused port is the testable half of that: it proves the probe runs
-# and that its message names the server. The swallowing half is the same code
-# path with a timeout instead of a refusal.
-git remote set-url caos http://127.0.0.1:9
-open_server "--llm-step:@=DEEP-DEPS/llm-step"
+# A server named at an address nothing listens on, keeping the step the session
+# would have used. A caos server reached through a dead tunnel ACCEPTS and never
+# answers, so anything that dialled it unbounded would hang and say nothing -- which
+# a real cloud container showed. A refused port is the testable half: it proves the
+# probe runs and that its message names the server. The swallowing half is the same
+# code path with a timeout instead of a refusal.
+open_server "--server=http://127.0.0.1:9 ${CAOS_MCP_ARGS#* }"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 await '"id":1' 10 >/dev/null || fail "the handshake did not answer without a server"
-status=""
-for id in 2 3 4 5; do
-  send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"caos_status\",\"arguments\":{}}}"
-  status=$(await "\"id\":$id" 20) || fail "caos_status did not answer"
-  case "$status" in *"cannot reach the CAOS server"*) break ;; esac
-  sleep 3
-done
+# `help` with no path, for a session: it says
+# the server cannot be reached rather than hanging on it.
+send "$(jq -nc --arg session "$session" \
+  '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"help",arguments:{caos_session:$session}}}')"
+status=$(await '"id":2' 30) || fail "help did not answer while the server was unreachable"
 case "$status" in
-  *"cannot reach the CAOS server"*) ;;
+  *DEGRADED*) ;;
   *) fail "an unreachable server was not named: $status" ;;
+esac
+# And a call that needs the server fails promptly, saying so, instead of waiting.
+send "$(jq -nc --arg session "$session" \
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run",arguments:{caos_session:$session,caos_tool_use_id:"unreachable-1",path:"caos-std/read",arguments:{"file-path":"README.md"}}}}')"
+refused=$(await '"id":3' 120) || fail "a call did not fail promptly while the server was unreachable"
+case "$refused" in
+  *DEGRADED*) ;;
+  *) fail "an unreachable server's call did not say why: $refused" ;;
 esac
 close_server
 

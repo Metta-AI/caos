@@ -23,29 +23,38 @@ feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 # see only `main`. The model stages it here with `write`, which is all a tool is
 # -- a directory whose `.caos-expr` names an image (std/bash-tool's, by hash).
 bash_tool_img=$(caos hash /cas/args/bash-tool)
-MIXED_CALLS='[
- {"id":"tu_tool","input":{"file-path":"tools/sh/.caos-expr","content":"curry --base:hash='"$bash_tool_img"'\n"},"name":"write","type":"tool_use"},
- {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
- {"id":"tu_create","input":{"arguments":{"cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
- {"id":"tu_mb","input":{"arguments":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
- {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
- {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
- {"id":"tu_mm","input":{"source_tree":"main","theirs":"feature"},"name":"merge","type":"tool_use"},
- {"id":"tu_side","input":{"source_tree":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
+merge_img=$(caos hash /cas/args/merge)
+# The stub reads its scripted responses when the turn asks for them, so it can
+# start empty: the merge call below names the feature commit by hash, and that
+# commit is made on top of the conversation's own base, which needs the stub's port.
 mkdir -p /tmp/stub
-printf '{"content":%s,"stop_reason":"tool_use"}' \
-  "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
-printf '%s\n' \
-  '{"content":[{"text":"mixed done","type":"text"}],"stop_reason":"end_turn"}' \
-  > /tmp/stub/response-2.json
 start_stub /tmp/stub
 
 new_llm_conversation tools-mixed "$STUB_PORT" "$ws"
 feature=$(mint_commit /cas/feature "$feature_tree" feature "$base")
 fetch_code "$feature" "fetching the feature commit"
 git push -q caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
-llm=$(caos curry --base:hash="$llm" --merge-refs="feature $feature") \
-  || fail "currying merge refs"
+
+# THE MERGE IS A TOOL TOO, at the conversation root like the shell, and it picks
+# the source tree it advances by ARGUMENT (`source-tree`), not by where it sits:
+# `@scope` in its help. `theirs` is a commit hash, the one thing the tool cannot
+# find for itself.
+MIXED_CALLS='[
+ {"id":"tu_tool","input":{"file-path":"tools/sh/.caos-expr","content":"curry --base:hash='"$bash_tool_img"'\n"},"name":"write","type":"tool_use"},
+ {"id":"tu_mtool","input":{"file-path":"tools/merge/.caos-expr","content":"curry --base:hash='"$merge_img"'\n"},"name":"write","type":"tool_use"},
+ {"id":"tu_mw","input":{"file-path":"main/mix.txt","content":"hello"},"name":"write","type":"tool_use"},
+ {"id":"tu_create","input":{"arguments":{"cmd":"cp -a main side; mkdir -p memories; echo remembered > memories/test.txt","paths":["main"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_mb","input":{"arguments":{"cmd":"tr a-z A-Z < side/mix.txt > main/mix3.txt; echo second > side/second.txt; mv side review; cp -a review side","paths":["main","side"]},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_me","input":{"source_tree":"main","file-path":"mix.txt","old-string":"hello","new-string":"world"},"name":"edit","type":"tool_use"},
+ {"id":"tu_mg","input":{"pattern":"world"},"name":"grep","type":"tool_use"},
+ {"id":"tu_mm","input":{"arguments":{"source-tree":"main","theirs":"'"$feature"'"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_mp","input":{"arguments":{"source-tree":"main","theirs":"side"},"path":"tools/merge"},"name":"run_tool","type":"tool_use"},
+ {"id":"tu_side","input":{"source_tree":"side","file-path":"side.txt","content":"isolated"},"name":"write","type":"tool_use"}]'
+printf '{"content":%s,"stop_reason":"tool_use"}' \
+  "$(printf '%s' "$MIXED_CALLS" | tr -d '\n')" > /tmp/stub/response-1.json
+printf '%s\n' \
+  '{"content":[{"text":"mixed done","type":"text"}],"stop_reason":"end_turn"}' \
+  > /tmp/stub/response-2.json
 dispatch_turn "write, run bash, edit, grep, and merge"
 wait_turn || fail "the mixed turn never reached a terminal head"
 
@@ -59,10 +68,14 @@ fetch_code "$source_tree" "fetching the mixed-tool source_tree"
   || fail "feature file did not land"
 git merge-base --is-ancestor "$feature" "$source_tree" \
   || fail "feature is not an ancestor of the resulting source_tree"
+# `theirs` named by PATH (`side`, a source tree the shell made) rather than by hash:
+# the tool takes the commit the code reference stores. Its `second.txt` arrives.
+[ "$(git show "$source_tree:second.txt")" = "second" ] \
+  || fail "merging the source tree at 'side' by path did not bring its file in"
 
 $TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/mixed-tools.jsonl
 jq -s -e '
-  (map(.id) | sort) == (["tu_tool","tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_create","tu_side"] | sort) and
+  (map(.id) | sort) == (["tu_tool","tu_mtool","tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_mp","tu_create","tu_side"] | sort) and
   (map(select(.id == "tu_mb"))[0] |
     .status == "complete" and .task != null and
     .input_commit != null and .source_tree_name == null and (.files_outcome.applied | sort) == ["main","review","side"]) and
@@ -70,6 +83,9 @@ jq -s -e '
     .status == "complete" and .result.proposal == null) and
   (map(select(.id == "tu_mm"))[0] |
     .status == "complete" and
+    (.source_tree_resolution.kind == "merged" or .source_tree_resolution.kind == "direct")) and
+  (map(select(.id == "tu_mp"))[0] |
+    .status == "complete" and .source_tree_name == "main" and
     (.source_tree_resolution.kind == "merged" or .source_tree_resolution.kind == "direct"))
 ' /tmp/mixed-tools.jsonl >/dev/null || { cat /tmp/mixed-tools.jsonl >&2; fail "mixed tool records are wrong"; }
 $TOOL parents --repo /tmp/repo --head "$head" > /tmp/mixed.parents

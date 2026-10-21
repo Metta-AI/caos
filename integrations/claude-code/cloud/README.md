@@ -28,7 +28,7 @@ not once before a snapshot, so there is no cheap phase to defer work to.
 |---|---|
 | `bootstrap.go` | stage 1: read the repo's pin, fetch the payload, run stage 2, leave the session ready |
 | `install.go` | stage 2: put the package in place and write Claude Code's configuration |
-| `session.go` | the `SessionStart` hook: warm the tool registry, say which caos this is |
+| `session.go` | the `SessionStart` hook: check the install against the checkout's pin, say which caos this is |
 
 **Two stages, because the installer is part of the payload.** Stage 1 is the only
 thing fetched from `--base`; it then runs the `install.go` it finds in the
@@ -85,11 +85,15 @@ install is blocked (below). Change the setup line (its first-line date will do)
 and start a new session. The hook cannot install the new pin itself: Claude Code
 has already started on the old files by the time it runs.
 
-With caos reachable at a path in the checkout (`caos-std/`, from the repo's
-root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
-rather than a locator pinned to the client's own build. The same path makes
-`caos-std/llm-step` the node a `reader:@@=` grant on caos's `std/llm-step` matches
-(SPEC.md, "Secrets").
+The step is named by locator, pinned to the commit the client was built from:
+`--llm-step:@@=github:<repo>?rev=<sha>&dir=std/llm-step`. `caos mcp` reads no
+checkout, so a path in one (`caos-std/llm-step`) names nothing. That locator is
+also what a `reader:@@=` grant on caos's `std/llm-step` matches (SPEC.md,
+"Secrets"). The server, the content a new conversation starts from, and the
+secret readers are arguments of their own (`--server`, `--base:@@=`,
+`--secret-readers`); setup computes the content locator from the checkout's
+`origin` and `HEAD` when it is on GitHub, so what is not committed and pushed is
+not in the conversation.
 
 Claude Code's own configuration is still user-level in the container, so one
 environment serves every repo. Three routes were possible; only one works:
@@ -105,11 +109,10 @@ found the hooks firing from `/root`. The CLI runs as root, even though the repo
 sits at `/home/user/repo` and Claude's own state under `/home/claude/.claude`.
 All three are written anyway; it costs nothing.
 
-Nothing has to be committed to a session repo for it to reach a server, either.
-The client finds caos through a `caos` git remote and an arbitrary checkout has
-none, so stage 1 adds it from its `--server` argument, before Claude Code starts.
-That is the only place a server is named: the hook reports a missing remote and
-does not repair one.
+Nothing has to be committed to a session repo for it to reach a server, either:
+stage 1 writes the server into the configuration as `--server=<url>` on every
+`caos mcp` command, and adds nothing to the checkout. That is the only place a
+server is named.
 
 **The checkout is there before the setup script runs**, which is what lets the
 pin be read that early — and reading it early matters, because work done after
@@ -168,11 +171,8 @@ again.
 - a plain `http://…` URL, when the server is reachable without one.
 
 **No environment variable.** `CAOS_SERVER_URL` is not read. The setup phase
-cannot see the environment's variables, so a server named there would produce a
-`caos` remote that appears only after Claude Code has started without one — and
-one ticket in one place cannot fall out of step with itself. A setup line with no
-`--server` fails immediately; an environment still setting the variable is
-reported by `caos_status` as unread rather than ignored.
+cannot see the environment's variables, and one ticket in one place cannot fall
+out of step with itself. A setup line with no `--server` fails immediately.
 
 It is a **credential** when it is a ticket: whoever holds it can drive
 that server, which runs containers and holds every secret. The status tool
@@ -232,15 +232,15 @@ Stage 1 fetches that commit and takes **everything** from it — the client,
 and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already
 fetched, so an edit to stage 1 is in the package like anything else). It then
 mints a commit that is HEAD with `.caos-expr` and `flake.lock` pointed at
-`git+caos://…?rev=<dev>`, and hands it to the client as `--base=<full sha>`.
+`git+caos://…?rev=<dev>`, pushes it to the server, and names it to the client as the
+conversation's content (`--base:@@=git+caos://local?rev=<seed>`).
 
 **Only that commit carries the dev pin; the checkout is left as cloned.** Blobs
 go in with `hash-object`, the tree through a throwaway index, the commit through
 `commit-tree`, so nothing on disk changes and Claude Code's stop hook has no diff
-to report. What makes that sufficient is on the client: with `--base`, `caos mcp`
-resolves `--llm-step:@=<std>/llm-step` in that commit's tree rather than
-ingesting `"."`. Before it did, the tool server read the checkout, so the files
-had to be rewritten in place — a dirty checkout holding a ticket.
+to report. What makes that sufficient is that `caos mcp` reads no checkout: it is
+told the commit by locator, and the server fetches it. The files never had to be
+rewritten in place, which would leave a dirty checkout holding a ticket.
 
 It is an **argument, not an environment variable**: the setup phase does not get
 the environment's variables at all.
@@ -250,15 +250,16 @@ Two things are less obvious and both cost a session to find:
 - **The committed GitHub pin is still required**, as a bootstrap. Fetching over
   `caos://` needs `git-remote-caos`, and the release install is what puts it on
   PATH; the dev package then replaces everything it laid down.
-- **`--base` goes on the hook, the tool server and the warm alike.** The hook —
-  not `mcp serve` — is what creates a conversation, and without it the
-  conversation would seed from `HEAD`; the tool server and the warm resolve the
-  step from it. Any one missing runs your client against the *committed* tools,
-  the half-update the whole arrangement exists to prevent. Nothing points at
-  that commit, so a `git push` cannot carry the ticket it contains.
+- **`--base:@@=` goes on the hook, and on the tool server too.** The hook — not
+  `mcp serve` — is what creates a conversation, and without it the conversation
+  would start without code. Dev mode also names the step as
+  `git+caos://local?rev=<dev>&dir=std/llm-step`: the pinned commit's step has no
+  record mode. Any one missing runs your client against the *committed* tools,
+  the half-update the whole arrangement exists to prevent. Nothing points at the
+  seed commit in a checkout, so a `git push` cannot carry the ticket it contains.
 
 `/usr/local/share/caos/dev-stamp` is written last, once every step has
-succeeded; `caos_status` and the session hook both report from it, and each
+succeeded; `help` and the session hook both report from it, and each
 step is fatal, so the file existing is the claim.
 
 **The relay has to be one of yours.** The setup phase reaches the network
@@ -279,7 +280,7 @@ working, which is why one lives in the environment indefinitely.
 What invalidates it is `caosd reset`, which wipes that directory and mints a new
 identity. The env's ticket then names an endpoint nobody answers for, and iroh's
 relay swallows the connection rather than refusing it — so it presents as
-`caos_status: cannot reach the CAOS server … timeout` and a hanging
+`help: server: cannot reach the CAOS server … timeout` and a hanging
 `git ls-remote caos`, indistinguishable from a network fault, which it is not.
 `caosd ticket` on the server prints the current one; its prefix must match the
 environment's.
@@ -288,34 +289,26 @@ environment's.
 
 Measured end to end, a fresh session on a correctly-ticketed environment:
 
-- **hooks fire** — `SessionStart` warms the tool registry;
+- **hooks fire** — `SessionStart` reports which caos this is;
   `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
   is honoured, `caos mcp serve` is spawned, and the model can call it.
-- **the full tool set resolves** — `bash read ls grep edit write caos-build
-  caos-test caos-test-result log show diff merge spawn_agent run_async
-  wait_agent harvest_agent`, within SECONDS of init when the server has the
-  `std/llm-step` image cached warm. The `caos_status` placeholder stands in only
-  until they arrive (`../../rust/crates/caos-cli/MCP.md`).
+- **the five fixed tools answer** — `help`, `run`, `start`, `result` and
+  `eval-path` (`../../rust/crates/caos-cli/MCP.md`); `caos-std/read` runs by path.
 
 The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
 is fixed on their side; the first session against a step-tree the server has
 never built also waits out one rustc compile, and only that first one.
 
-Measured again on a client repo, against a server that already held the std
-entries: resolving `--llm-step:@=caos-std/llm-step` through the
-`flake-input-loader` mount took **15.0s** and cached **20 tools** on the first
-attempt. Moving the pin does NOT by itself force a rebuild — `std/llm-step`'s
-tree is content-addressed, so a caos commit that does not touch it resolves to
-the same oid and stays a memo hit.
+Moving the pin does NOT by itself force a rebuild — `std/llm-step`'s tree is
+content-addressed, so a caos commit that does not touch it resolves to the same
+oid and stays a memo hit.
 
-**A session that records the prompt and then never takes a turn is a step that
-will not resolve.** `UserPromptSubmit` cannot form a request without resolving
-`--llm-step`, so a broken expression presents as a silent session rather than
-an error: the transcript holds one user event, no assistant event, and the hook
-log stops after `warming the caos tool registry`. Run
-`caos mcp warm "--llm-step:@=<path>/llm-step"` in a checkout with the `caos`
-remote set — it prints the real reason, which the session never does.
+**A session whose prompt is recorded but never takes a turn has a step that will
+not resolve.** `UserPromptSubmit` cannot form a request without the server
+resolving `--llm-step`, so a broken locator shows as a hook error, not a model
+error. `help` with no path in the session says whether the server is reachable
+and prints the diagnostics; the hook log (`CAOS_CC_HOOK_LOG`) has the reason.
 
 ## The setup-time budget
 
@@ -326,9 +319,9 @@ Nothing compiles in the container but the two Go programs themselves.
 
 Deferring work to a hook buys nothing, and that is the correction this
 arrangement is built on: the setup script runs on **every** session, so there is
-no cheap phase and no expensive one. What is left in the hook is there for a
-different reason — the registry warm needs the n0 relays, which the setup phase
-cannot reach (503 for all seven, measured) and a session can.
+no cheap phase and no expensive one. What is left in the hook is there because
+only a session can do it: compare the install with the checkout's pin, and ask
+the server what it serves as `refs/caos/dev`.
 
 ## A separate, untested direction: the stack in the container
 

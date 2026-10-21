@@ -187,6 +187,9 @@ pub(crate) fn eval_endpoint(
                 git_locator::parse_git_ref(&locator).map_err(|e| HttpError::new(400, e))?;
             let root = crate::locator::resolve_root(config, &git_ref, token)
                 .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+            if git_ref.raw {
+                return raw_root(config, &locator, &git_ref, &root).map(String::into_bytes);
+            }
             let dir = git_ref.dir.as_deref().unwrap_or("");
             let result = eval_in_tree(config, &root.to_string(), dir, secrets).map_err(|e| {
                 HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message()))
@@ -286,6 +289,59 @@ fn walk(
     Ok(result)
 }
 
+/// A `raw=1` locator's answer: the pinned commit's own tree (or the subtree its
+/// `dir=` names), unevaluated, as `"<kind> <hash>"`.
+fn raw_root(
+    config: &Config,
+    locator: &str,
+    git_ref: &git_locator::GitRef,
+    root: &gix::ObjectId,
+) -> Result<String, HttpError> {
+    let (kind, hash) = raw_walk(config, root, git_ref.dir.as_deref().unwrap_or(""))
+        .map_err(|e| HttpError::new(404, format!("git ref {locator:?}: {e}")))?;
+    Ok(format!("{kind} {hash}"))
+}
+
+/// Walk `root` down `dir` by tree entries alone: no `.caos-expr` is applied on the
+/// way, so what comes back is what the commit holds there.
+fn raw_walk(
+    config: &Config,
+    root: &gix::ObjectId,
+    dir: &str,
+) -> Result<(&'static str, gix::ObjectId), String> {
+    use gix::objs::tree::EntryKind;
+
+    let mut hash = *root;
+    let mut kind = "tree";
+    for component in dir.split('/').filter(|c| !c.is_empty() && *c != ".") {
+        if component == ".." {
+            return Err("dir= may not contain `..`".to_string());
+        }
+        let (found, content) = fetch_object(config, &hash.to_string())?;
+        if found != "tree" {
+            return Err(format!("{component:?} is below a {found}, not a tree"));
+        }
+        let tree = gix::objs::TreeRef::from_bytes(&content, gix::hash::Kind::Sha1)
+            .map_err(|e| format!("malformed tree {hash}: {e}"))?;
+        let entry = tree
+            .entries
+            .iter()
+            .find(|e| e.filename == component.as_bytes())
+            .ok_or_else(|| format!("{component:?} is not in the pinned tree"))?;
+        kind = match entry.mode.kind() {
+            EntryKind::Tree => "tree",
+            EntryKind::Commit => {
+                return Err(format!(
+                    "{component:?} is a submodule; raw=1 does not enter one"
+                ))
+            }
+            _ => "blob",
+        };
+        hash = entry.oid.to_owned();
+    }
+    Ok((kind, hash))
+}
+
 /// A locator's object: its `rev`'s tree, descended to `dir=` by evaluation.
 fn evaluate_locator(
     config: &Config,
@@ -296,6 +352,9 @@ fn evaluate_locator(
     let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
     let root = crate::locator::resolve_root(config, &git_ref, token)
         .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+    if git_ref.raw {
+        return raw_root(config, locator, &git_ref, &root);
+    }
     let dir = git_ref.dir.as_deref().unwrap_or("");
     let result = evaluate(config, &root.to_string(), dir, secrets)
         .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
@@ -1228,6 +1287,13 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         let git_ref = git_locator::parse_git_ref(value)?;
         let root = crate::locator::resolve_root(self.config, &git_ref, None)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;
+        if git_ref.raw {
+            // The pinned commit's own tree, unevaluated: a conversation's content,
+            // which is code to read, not an expression to run.
+            let (kind, hash) = raw_walk(self.config, &root, git_ref.dir.as_deref().unwrap_or(""))
+                .map_err(|e| format!("git ref {value:?}: {e}"))?;
+            return Ok((caos_eval::mode_of_kind(kind), hash));
+        }
         let dir = git_ref.dir.as_deref().unwrap_or("");
         let (kind, hash) = caos_eval::eval_path(self, &root.to_string(), dir)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;

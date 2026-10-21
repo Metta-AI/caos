@@ -13,13 +13,28 @@ path prints its parameters, which is the description this table abbreviates.
 | tool | one line |
 |---|---|
 | `bash-tool` | Run `sh -c` over a scratch copy of the conversation tree, to compute something over its content. List in `paths` every existing file or directory the command touches, or it sees an empty placeholder ([Using `bash-tool`](#using-bash-tool)). |
+| `read` | Read a file's contents, through code references (`feature/dirty/README.md`). Truncated at 100KB; page with `offset` and `limit`. |
+| `ls` | List a directory; source trees and directories end in `/`. |
+| `write` | Write a file, creating parent directories. Inside a source tree it makes a child commit. |
+| `edit` | Replace exact text in a file, once or everywhere. |
+| `copy` | Copy a file or directory; a source tree stays a source tree, with its history. |
+| `move` | Move or rename; a source tree stays a source tree. |
+| `remove` | Remove a file or directory; removing a source tree removes it whole. |
+| `grep` | Search a tree with a regular expression, through code references; matches as `path:linenum:line`. Results are cached per unchanged subtree. |
+| `log`, `show`, `diff` | A source tree's git history: commits, one commit with its diff, or a diff between two revisions. Take `source-tree`, the path of the code reference. |
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. A router to the stack daemon's `build` op. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
 | `caos-test` | Run the whole suite — unit tests and every `tests/<name>` — on the tree's stack, building and starting it if it is not up. |
 | `caos-test-result` | Print one test's COMPLETE record from a `caos-test` run, where the report carries only an excerpt. |
 | `read-trace` | Print the trace of a run (`/status/<hash>?all=1`) from the ArgTree hash `caos-test` prints in its "full trace" line: timings per node, the slowest nodes, and with `perf` the workers' out-trace data. |
-| `merge` | Three-way merge another commit into the current source tree. |
+| `merge` | Three-way merge another commit (a hash, or the path of an imported source tree) into the source tree you name with `source-tree`. |
+| `import-source` | Import an HTTPS Git repository as a new snapshot at an unused conversation path (a source tree). The remote is observed when the call starts, so a fresh `into` is how you see a branch's current head. |
+| `publish-source` | Publish a source tree's exact commit to an HTTPS Git repository branch, preserving history; leased on the remote head observed at the start. Does not open a PR (`github` does). |
+| `agent-spawn` | Start a focused coding agent in a durable child conversation, with an isolated copy of the conversation (or the `paths` you select). Returns the child id. |
+| `agent-wait` | Wait for one child agent to report a terminal checkpoint, by joining its durable relay. |
+| `agent-harvest` | Apply a terminal child's content changes to the conversation, with the same atomic reconciliation as the file tools. |
+| `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
 
@@ -47,9 +62,18 @@ needs `paths`:
 | delete | `remove` (`file-path`) |
 | see history or changes | `log`, `show`, `diff` |
 
-`copy` and `move` create missing parent directories and refuse an existing
-destination. They are registered by `llm-step`, so they appear in the model's
-tool list; they are not entries under `std/`.
+`read`, `ls`, `write`, `edit`, `copy`, `move`, `remove`, `grep`, `log`, `show` and `diff`
+are entries under `std/`, reached as `caos-std/<name>` like any other tool. They take an
+`in` tree, which defaults to the conversation. `llm-step` still registers its own copies
+for the turns it drives itself; those are being retired in favour of these.
+
+`import-source`, `publish-source`, `agent-spawn`, `agent-wait`, `agent-harvest` and `run-async`
+are entries for OPERATIONS OF THE STEP (`@op` in their help): they write the conversation's own
+records (a source tree attached, a publication pinned before anything is pushed, a child
+conversation, an async task), so the step performs them in process. The entry gives the
+operation a path, a help and a place in `tool_help`/`run_tool`.
+`eval-path` is not an entry: evaluating a path is one of the server's primitives (the
+`/eval` route), so it is a built-in tool, like `run`, `help`, `start` and `result`.
 
 ### Using `bash-tool`
 
@@ -69,12 +93,12 @@ different-looking ways (all of this is measured, with nothing in `paths`):
 
 All of them mean the same thing: add the path to `paths` and run it again. A
 directory in `paths` brings everything under it, source trees included, so
-`"paths": ["imports/repo/base"]` is enough for a recursive search of it.
+`"paths": ["sources/repo/00-base"]` is enough for a recursive search of it.
 
 ```
 run_tool(path="caos-std/bash-tool",
-         arguments={"cmd": "find imports/repo/base -name '*.md' | xargs wc -l",
-                    "paths": ["imports/repo/base"]})
+         arguments={"cmd": "find sources/repo/00-base -name '*.md' | xargs wc -l",
+                    "paths": ["sources/repo/00-base"]})
 ```
 
 - **New files and new directories need no `paths`.** `mkdir -p` the parent of

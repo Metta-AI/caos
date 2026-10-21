@@ -100,8 +100,8 @@ func parseArgs(argv []string) args {
 		switch key {
 		case "--base":
 			a.base = strings.TrimRight(value, "/")
-		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"), kept
-		// in the checkout's git config beside the `caos` remote `--server` adds.
+		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"),
+		// handed to `caos mcp` as `--secret-readers`.
 		case "--secret-readers":
 			a.readers = value
 		case "--server":
@@ -476,11 +476,11 @@ func installHelper(prefix, slug, tag string) {
 // The conversation's seed: HEAD with its `.caos-expr` and `flake.lock` pointed
 // at the dev server, so the tools resolve from there too.
 //
-// ONLY A COMMIT CARRIES IT; the checkout is left as it was cloned. The client
-// reads both the conversation's content and `--llm-step`'s tree from `--base`
-// (`step_image` in caos-cli's mcp), so nothing reads the files on disk. That is
-// why they are not rewritten: a dirty checkout holding a ticket is a diff an
-// agent may commit and a session end that Claude Code's stop hook flags.
+// ONLY A COMMIT CARRIES IT; the checkout is left as it was cloned. The commit is
+// pushed to the server and named to `caos mcp` as the conversation's content
+// (`--base:@@=git+caos://local?rev=<seed>`), so nothing reads the files on disk.
+// That is why they are not rewritten: a dirty checkout holding a ticket is a diff
+// an agent may commit and a session end that Claude Code's stop hook flags.
 //
 // BOTH FILES, or neither works: std/flake-input-loader refuses a tree whose
 // expression and flake.lock name different revisions.
@@ -587,7 +587,7 @@ func seedCommit(repoDir, server, sha string) string {
 }
 
 func writeStamp(path string, lines map[string]string) {
-	keys := []string{"built", "base", "rev", "seed", "repo", "std_path", "pin", "client"}
+	keys := []string{"built", "base", "rev", "seed", "repo", "std_path", "pin", "client", "content"}
 	var b strings.Builder
 	for _, key := range keys {
 		if value, ok := lines[key]; ok {
@@ -612,10 +612,9 @@ func main() {
 	if !strings.HasPrefix(a.base, raw+"/") || len(strings.Split(strings.TrimPrefix(a.base, raw+"/"), "/")) < 3 {
 		fatal("--base must look like\n  %s/<owner>/<repo>/<ref>\n  got: %s", raw, a.base)
 	}
-	// REQUIRED, and the only place a server is named: the client reaches caos
-	// through the `caos` git remote, and this phase is the only one that can add
-	// it before Claude Code starts. Nothing reads the environment for a fallback,
-	// so an unnamed server is a question, not a default.
+	// REQUIRED, and the only place a server is named: it becomes `--server=<url>`
+	// on every `caos mcp` command this phase writes. Nothing reads the environment
+	// for a fallback, so an unnamed server is a question, not a default.
 	// Checked before anything is fetched: an abbreviated sha would never equal
 	// the server's ref, and the refusal would then blame the server.
 	if a.devCommit != "" && !isSha(a.devCommit) {
@@ -724,6 +723,32 @@ func main() {
 		seed = seedCommit(repoDir, a.server, devRev)
 	}
 
+	// Unshallowed here: the dev seed commit is pushed below, and a push packs its
+	// whole reachable graph, so the history has to be
+	// present before the first prompt. claude.ai/code clones shallow. Non-fatal
+	// -- a big repo pays a one-time fetch here rather than failing later.
+	if shallow, _ := run(repoDir, "git", "rev-parse", "--is-shallow-repository"); shallow == "true" {
+		if _, err := run(repoDir, "git", "fetch", "--unshallow", "--quiet"); err != nil {
+			say("could not unshallow; a repo the server has not seen may fail to resolve")
+		}
+	}
+
+	// What a new conversation starts from, as a locator the server fetches: the
+	// session's checkout can hold uncommitted files, but `caos mcp` reads none, so
+	// what is not committed (and, for a checkout, pushed) is not in the
+	// conversation.
+	content := ""
+	if seed != "" {
+		// The seed is unreferenced here and the server cannot fetch it from a
+		// checkout, so it is pushed to the server itself and named as held there.
+		if _, err := run(repoDir, "git", "push", "-q", a.server, seed+":refs/caos/req/"+seed); err != nil {
+			say("could not push the dev seed commit to the server (%v); the first conversation will fail naming it", err)
+		}
+		content = "git+caos://local?rev=" + seed
+	} else {
+		content = checkoutLocator(repoDir)
+	}
+
 	// STAGE 2, from the payload. `go run` rather than an exec of a built binary:
 	// stage 1 has just compiled the same stdlib packages, so this costs the link
 	// and not the compile.
@@ -735,8 +760,15 @@ func main() {
 		"--version=" + pkg.version,
 		"--prefix=" + a.prefix,
 	}
-	if seed != "" {
-		install = append(install, "--seed-commit="+seed)
+	install = append(install, "--server="+a.server)
+	if devRev != "" {
+		install = append(install, "--step=git+caos://local?rev="+devRev+"&dir=std/llm-step")
+	}
+	if content != "" {
+		install = append(install, "--content="+content)
+	}
+	if a.readers != "" {
+		install = append(install, "--secret-readers="+a.readers)
 	}
 	if a.enableBash {
 		install = append(install, "--enable-bash")
@@ -769,48 +801,22 @@ func main() {
 		fatal("could not write %s: %v", launcherPath, err)
 	}
 
-	// The `caos` remote, from `--server`. The client finds caos through it and an
-	// arbitrary checkout has none, so this is what makes the arrangement
-	// repo-independent -- nothing has to be committed to a session repo.
-	//
-	// An existing remote is left alone: a checkout that already names a server
-	// was set up deliberately, and repointing it would move someone's work to a
-	// different stack. Absent is this probe's expected answer, so its stderr is
-	// not inherited -- git's `No such remote 'caos'` on the ordinary path reads
-	// as a failure.
-	probe := exec.Command("git", "remote", "get-url", "caos")
-	probe.Dir = repoDir
-	if err := probe.Run(); err != nil {
-		if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
-			say("could not add the caos remote; the session will have no server")
-		}
+	checkoutContent := ""
+	if seed == "" {
+		checkoutContent = content
 	}
-	if a.readers != "" {
-		if _, err := run(repoDir, "git", "config", "caos.secret-readers", a.readers); err != nil {
-			say("could not record --secret-readers; the session will present no secrets")
-		}
-	}
-
-	// Unshallowed here rather than in the hook: caos pushes the workspace commit
-	// and a push packs its whole reachable graph, so the history has to be
-	// present before the first prompt. claude.ai/code clones shallow. Non-fatal
-	// -- a big repo pays a one-time fetch here rather than failing later.
-	if shallow, _ := run(repoDir, "git", "rev-parse", "--is-shallow-repository"); shallow == "true" {
-		if _, err := run(repoDir, "git", "fetch", "--unshallow", "--quiet"); err != nil {
-			say("could not unshallow; a repo the server has not seen may fail to resolve")
-		}
-	}
-
 	stamp := map[string]string{
 		"built":    time.Now().Format(time.RFC3339),
 		"base":     a.base,
 		"pin":      p.slug() + "@" + p.rev,
 		"std_path": p.stdPath,
 		"client":   pkg.version,
+		// Only a locator derived from the checkout can go stale against it.
+		"content": checkoutContent,
 	}
 	writeStamp(filepath.Join(shareDir, "setup-stamp"), stamp)
 	// NOT THE TICKET. A `caos://` URL is the capability to drive that server, and
-	// these files are quoted verbatim into a model's context by `caos_status`.
+	// these files are quoted verbatim into a model's context by `help`.
 	if devRev != "" {
 		writeStamp(filepath.Join(shareDir, "dev-stamp"), map[string]string{
 			"rev":      devRev,
@@ -832,4 +838,33 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return "?"
+}
+
+// A locator for the commit the checkout is at, which the server can fetch:
+// `github:owner/repo?rev=<sha>` when the checkout's origin is on GitHub. "" says
+// the conversation starts without code -- an origin the server cannot reach (a
+// local proxy, a path) names nothing it could fetch.
+func checkoutLocator(repoDir string) string {
+	origin, err := run(repoDir, "git", "remote", "get-url", "origin")
+	if err != nil {
+		say("the checkout has no origin, so conversations start without code")
+		return ""
+	}
+	head, err := run(repoDir, "git", "rev-parse", "HEAD")
+	if err != nil || !isSha(head) {
+		say("the checkout has no commit, so conversations start without code")
+		return ""
+	}
+	slug := ""
+	for _, prefix := range []string{"https://github.com/", "git@github.com:", "ssh://git@github.com/"} {
+		if rest, ok := strings.CutPrefix(origin, prefix); ok {
+			slug = strings.TrimSuffix(strings.TrimSuffix(rest, "/"), ".git")
+			break
+		}
+	}
+	if slug == "" {
+		say("origin %s is not on GitHub, so conversations start without code", origin)
+		return ""
+	}
+	return "github:" + slug + "?rev=" + head
 }

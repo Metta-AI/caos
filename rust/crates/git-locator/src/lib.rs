@@ -26,6 +26,10 @@ pub struct GitRef {
     pub rev: Option<String>,
     /// The subtree within the fetched repo to descend into (`dir=`), if given.
     pub dir: Option<String>,
+    /// `raw=1`: name the pinned tree itself, UNEVALUATED. Without it a root that
+    /// carries a `.caos-expr` evaluates to whatever that says; with it the caller
+    /// gets the commit's own tree, which is what a conversation's content wants.
+    pub raw: bool,
 }
 
 impl GitRef {
@@ -73,7 +77,7 @@ pub fn parse_git_ref(value: &str) -> Result<GitRef, String> {
         ));
     }
 
-    let (mut rev, mut dir, mut has_ref) = (None, None, false);
+    let (mut rev, mut dir, mut has_ref, mut raw) = (None, None, false, false);
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair
             .split_once('=')
@@ -86,10 +90,16 @@ pub fn parse_git_ref(value: &str) -> Result<GitRef, String> {
                 return Err(format!("git ref {value:?}: dir given twice"))
             }
             "rev" | "dir" => {}
+            "raw" if v == "1" => raw = true,
+            "raw" => {
+                return Err(format!(
+                    "git ref {value:?}: raw takes the value 1, got {v:?}"
+                ))
+            }
             "ref" => has_ref = true,
             other => {
                 return Err(format!(
-                    "git ref {value:?}: unknown query key {other:?} (use rev=, dir=)"
+                    "git ref {value:?}: unknown query key {other:?} (use rev=, dir=, raw=1)"
                 ))
             }
         }
@@ -128,6 +138,7 @@ pub fn parse_git_ref(value: &str) -> Result<GitRef, String> {
         url: url.to_string(),
         rev,
         dir,
+        raw,
     })
 }
 
@@ -140,6 +151,7 @@ mod git_ref_tests {
             url: url.to_string(),
             rev: rev.map(String::from),
             dir: dir.map(String::from),
+            raw: false,
         }
     }
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567"; // 40 hex
@@ -212,6 +224,21 @@ mod git_ref_tests {
     fn path_rejects_a_rev() {
         let v = format!("path:./x?rev={SHA}");
         assert!(parse_git_ref(&v).unwrap_err().contains("takes no `rev=`"));
+    }
+
+    #[test]
+    fn raw_names_the_tree_unevaluated() {
+        let v = format!("git+https://h/r?rev={SHA}&raw=1");
+        assert!(parse_git_ref(&v).unwrap().raw);
+        assert!(
+            !parse_git_ref(&format!("git+https://h/r?rev={SHA}"))
+                .unwrap()
+                .raw
+        );
+        let v = format!("git+https://h/r?rev={SHA}&raw=yes");
+        assert!(parse_git_ref(&v)
+            .unwrap_err()
+            .contains("raw takes the value 1"));
     }
 
     #[test]

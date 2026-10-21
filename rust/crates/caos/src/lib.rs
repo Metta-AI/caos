@@ -459,6 +459,13 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// A transport to the server at `base`.
+    pub fn new(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+        }
+    }
+
     /// Read the server URL from [`SERVER_ENV`].
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
@@ -520,6 +527,25 @@ impl Transport for HttpTransport {
     }
 }
 
+/// Whether the server at `url` accepts connections.
+///
+/// The server deliberately returns 404 at its root, so any HTTP response proves
+/// reachability. Bounded: a dead address does not refuse, it swallows.
+pub fn check_server_reachable(url: &str) -> Result<(), String> {
+    const TIMEOUT_SECS: u64 = 5;
+    server_request(
+        url,
+        &ServerRequest {
+            method: "GET",
+            path: "/",
+            headers: &[],
+            body: None,
+            timeout_secs: Some(TIMEOUT_SECS),
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("cannot reach the CAOS server at {url}: {error}"))
+}
 /// The remote name a `caos-cli` working tree gives the server (`git remote add
 /// caos <url>`). Push/fetch use it.
 pub const CAOS_REMOTE: &str = "caos";
@@ -579,14 +605,6 @@ impl GitTransport {
         &self.work_dir
     }
 
-    /// The git directory of the worktree. A per-checkout scratch location the
-    /// `mcp serve` tool-registry cache lives under, so a `mcp warm` in the
-    /// session-start hook and the `mcp serve` spawned right after it agree on
-    /// one path without being told it.
-    pub fn git_dir(&self) -> &Path {
-        &self.git_dir
-    }
-
     /// Verify that the configured CAOS server accepts connections.
     ///
     /// The server deliberately returns 404 at its root, so any HTTP response
@@ -594,23 +612,10 @@ impl GitTransport {
     /// clients: it fails before they take over the terminal and turns a later,
     /// low-level Git transport error into one concise diagnosis.
     pub fn ensure_server_reachable(&self) -> Result<(), String> {
-        const TIMEOUT_SECS: u64 = 5;
-
         let url = self.server_url()?;
-        server_request(
-            &url,
-            &ServerRequest {
-                method: "GET",
-                path: "/",
-                headers: &[],
-                body: None,
-                timeout_secs: Some(TIMEOUT_SECS),
-            },
-        )
-        .map(|_| ())
-        .map_err(|error| {
+        check_server_reachable(&url).map_err(|error| {
             format!(
-                "cannot reach the CAOS server at {url}: {error}\n\
+                "{error}\n\
                  check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
             )
         })
@@ -4679,6 +4684,11 @@ fn request_compute_url(
             timeout_secs: None,
         },
     )?;
+    kind_and_hash(body)
+}
+
+/// The `<kind> <hash>` a compute route answers with.
+fn kind_and_hash(body: Vec<u8>) -> Result<(String, String), String> {
     let text =
         String::from_utf8(body).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
     let (kind, hash) = text
@@ -4689,6 +4699,210 @@ fn request_compute_url(
         return Err("server returned an empty result".to_string());
     }
     Ok((kind.to_string(), hash.to_string()))
+}
+
+/// Evaluate one `.caos-expr` line on the server and wait for its answer:
+/// `POST /eval/<verb>` with `verb` `run` or `curry`, and `params` the line's
+/// arguments by the names the CLI gives them (`base:hash`, `tools-only`, ...).
+/// Returns the result's `(kind, hash)`.
+///
+/// The request carries everything: no tree is pushed first, so a caller needs
+/// only the server's address. The parameters travel as a form body, which has
+/// no length limit, with `secrets` presented out of band like any compute call.
+pub fn eval_line_request(
+    base: &str,
+    verb: &str,
+    params: &[(&str, &str)],
+    secrets: &Secrets,
+) -> Result<(String, String), String> {
+    let body = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", percent_encode(name), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut headers = secrets.headers();
+    headers.push((
+        "content-type",
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    let path = format!("/eval/{verb}");
+    // NO TIMEOUT, as for `/run`: this waits for the work.
+    kind_and_hash(server_call(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: &path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: None,
+        },
+    )?)
+}
+
+/// Send one MCP JSON-RPC message to the server's `POST /mcp` and return its
+/// answer: `None` for a notification (the server answers `202` with no body).
+///
+/// This is all a client needs of MCP -- the protocol is the server's. `step`
+/// goes in `X-Caos-Step` (a git locator or a 40-hex hash) because the endpoint
+/// keeps no state between messages. No timeout: a `run` waits for its tool.
+pub fn mcp_post(
+    base: &str,
+    step: Option<&str>,
+    secrets: &Secrets,
+    max_result_chars: Option<usize>,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let mut headers = secrets.headers();
+    headers.push(("content-type", "application/json".to_string()));
+    if let Some(step) = step {
+        headers.push((caos_world::secrets::STEP_HEADER, step.to_string()));
+    }
+    if let Some(limit) = max_result_chars {
+        headers.push((
+            caos_world::secrets::MAX_RESULT_CHARS_HEADER,
+            limit.to_string(),
+        ));
+    }
+    let response = server_request(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: "/mcp",
+            headers: &headers,
+            body: Some(message.as_bytes()),
+            timeout_secs: None,
+        },
+    )?;
+    if response.status == 202 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "POST {base}/mcp: server returned {} {}: {}",
+            response.status,
+            response.reason,
+            String::from_utf8_lossy(&response.body).trim()
+        ));
+    }
+    String::from_utf8(response.body)
+        .map(Some)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))
+}
+
+/// Begin evaluating one line on the server without waiting: `POST /start/<verb>`,
+/// with `eval_line_request`'s parameters. Returns the TICKET, the name of the
+/// evaluation (the same call always has the same one); ask for its state with
+/// [`line_result`].
+pub fn start_line_request(
+    base: &str,
+    verb: &str,
+    params: &[(&str, &str)],
+    secrets: &Secrets,
+) -> Result<String, String> {
+    let body = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", percent_encode(name), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut headers = secrets.headers();
+    headers.push((
+        "content-type",
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    let path = format!("/start/{verb}");
+    let answer = server_call(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: &path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(60),
+        },
+    )?;
+    let ticket = String::from_utf8(answer)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?
+        .trim()
+        .to_string();
+    if !is_hex_hash(&ticket) {
+        return Err(format!("server returned a malformed ticket: {ticket:?}"));
+    }
+    Ok(ticket)
+}
+
+/// What a started evaluation has come to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineResult {
+    /// Still running.
+    Pending,
+    /// Done: the result's kind and hash.
+    Done { kind: String, hash: String },
+    /// Failed, with the HTTP status the failure carried and its message.
+    Failed { status: u16, message: String },
+}
+
+/// The state of a ticket from [`start_line_request`]: `GET /result/<ticket>`. It
+/// only reads, so asking never starts or repeats work.
+pub fn line_result(base: &str, ticket: &str) -> Result<LineResult, String> {
+    let path = format!("/result/{ticket}");
+    let answer = server_call(
+        base,
+        &ServerRequest {
+            method: "GET",
+            path: &path,
+            headers: &[],
+            body: None,
+            timeout_secs: Some(60),
+        },
+    )?;
+    let text =
+        String::from_utf8(answer).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+    parse_line_result(text.trim())
+}
+
+fn parse_line_result(text: &str) -> Result<LineResult, String> {
+    if text == "pending" {
+        return Ok(LineResult::Pending);
+    }
+    if let Some(rest) = text.strip_prefix("ok ") {
+        let (kind, hash) = rest
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed result {text:?}"))?;
+        return Ok(LineResult::Done {
+            kind: kind.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+    if let Some(rest) = text.strip_prefix("failed ") {
+        let (status, message) = rest.split_once(' ').unwrap_or((rest, ""));
+        return Ok(LineResult::Failed {
+            status: status.parse().unwrap_or(500),
+            message: message.to_string(),
+        });
+    }
+    Err(format!("the server answered an unknown state: {text:?}"))
+}
+
+/// The blob entries of the tree `hash`, by name, with their contents. Entries
+/// that are not blobs (subtrees, a conversation's gitlink) are left out, so a
+/// result that names a conversation can be read without fetching it.
+pub fn tree_blobs(
+    t: &dyn Transport,
+    hash: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, String> {
+    let entries = fetch_tree_entries(t, hash)?.ok_or_else(|| format!("{hash} is not a tree"))?;
+    let mut blobs = std::collections::BTreeMap::new();
+    for entry in entries {
+        if !entry.mode.is_blob() {
+            continue;
+        }
+        let (_, content) = t.get_object(&entry.oid.to_string())?;
+        blobs.insert(
+            String::from_utf8_lossy(&entry.filename).into_owned(),
+            content,
+        );
+    }
+    Ok(blobs)
 }
 
 /// Program name from `argv[0]` (`caos`/`caos-cli` in the image or build tree),
@@ -5444,5 +5658,30 @@ mod push_negotiation_tests {
         assert!(push_negotiation_args(true).contains(&"protocol.version=2"));
         assert!(push_negotiation_args(false).contains(&"push.negotiate=false"));
         assert!(!push_negotiation_args(false).contains(&"push.negotiate=true"));
+    }
+}
+
+#[cfg(test)]
+mod line_result_tests {
+    use super::*;
+
+    #[test]
+    fn a_ticket_state_parses_the_way_the_server_spells_it() {
+        assert_eq!(parse_line_result("pending"), Ok(LineResult::Pending));
+        assert_eq!(
+            parse_line_result("ok tree abc123"),
+            Ok(LineResult::Done {
+                kind: "tree".into(),
+                hash: "abc123".into()
+            })
+        );
+        assert_eq!(
+            parse_line_result("failed 500 the worker died: exit 2"),
+            Ok(LineResult::Failed {
+                status: 500,
+                message: "the worker died: exit 2".into()
+            })
+        );
+        assert!(parse_line_result("sleeping").is_err());
     }
 }

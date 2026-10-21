@@ -25,7 +25,7 @@ a commit to a branch, and `caos-std/github` does everything else on GitHub
 | duplicate a source tree, with its history | `copy` |
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
-| merge another commit into a source tree | `caos-std/merge` (or the registered `merge` tool) |
+| merge another commit into a source tree | `caos-std/merge` |
 | squash a stack to one commit per layer | `caos-std/create-squashed-stack` |
 | push a commit to a GitHub branch | `publish_source` |
 | open a PR, change its base, link a stack, read and answer comments | `caos-std/github` |
@@ -91,6 +91,41 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
 
+## Starting a brand-new repository
+
+`caos-std/github` can create a repo, and the rest of the flow above then
+applies unchanged. Verified end to end against a scratch repo:
+
+1. Create it, with `auto_init` so it has a default branch and a first commit.
+   Importing needs a branch to import, and importing a repo with no commits is
+   untested.
+
+   ```text
+   run_tool(path="caos-std/github", arguments={
+     "method": "POST", "path": "/orgs/<org>/repos",
+     "body": "{\"name\":\"<repo>\",\"private\":true,\"auto_init\":true}"})
+   ```
+
+   Use `POST /user/repos` for a personal account. Ask whether it should be
+   public or private if the user did not say; private is the safe default.
+   The response's `full_name` gives the org's canonical capitalisation
+   (`Metta-AI`, not `metta-ai`).
+2. `import_source` it into `sources/<repo>/00-base`, `copy` that to
+   `sources/<repo>/99-dirty`, `write` the files there.
+3. `publish_source` the `99-dirty` tree to `main`. This is a plain
+   fast-forward from the imported tip, so it needs no `force`. Prefer a
+   branch plus a PR unless the repo is a scratch one.
+4. Check the result with `GET /repos/<owner>/<repo>/contents/?ref=main`. A new
+   directory shows as `size: 0` in that listing, which is normal; `GET` the
+   directory to see what is in it.
+
+What the token could not do: `DELETE /repos/<owner>/<repo>` came back
+`403 Must have admin rights to Repository`, even on a repo the same token had
+just created. Creating is allowed and deleting is not, so a scratch repo has
+to be removed by a person (or archived with
+`PATCH /repos/<owner>/<repo>` `{"archived":true}`, if the token allows it;
+untried). Do not create throwaway repos casually.
+
 ## Stacks
 
 A stack is an ordered sequence of layers that share git ancestry, so a change
@@ -116,14 +151,17 @@ The examples that follow use the stack shown just before them.
 
 ### Merging
 
-`merge(source_tree=Y, theirs=X)` merges the full commit hash `X` into the
-gitlink `Y` and always mints a merge commit with parents `Y` and `X`. It picks
-the highest common ancestor as the base. The optional `merge-base` overrides
+`merge(source-tree=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
+merges `X` into the gitlink `Y` and always mints a merge commit with parents `Y` and `X`.
+It picks the highest common ancestor as the base. The optional `merge-base` overrides
 that, which you only need to replay a change onto a history that lacks its old
 base (a layer rebuilt on a force-pushed upstream: `merge-base` is the old tip
 of the previous layer).
 
-`theirs` must be a **full commit hash**. Get it from `log` on the source tree.
+`theirs` is a **full commit hash** (from `log` on a source tree) or the **path of a
+source tree** in the conversation, such as one `import_source` just made. A branch
+NAME is not accepted: to merge `origin/main`, `import_source` the remote at
+`revision=main` into a fresh path, then pass that path as `theirs`.
 
 On a conflict the merge still advances the gitlink, with git's inline markers
 in the files and a reserved `.caos/conflicts` file listing every unresolved
@@ -140,7 +178,7 @@ Edit `sources/repo/01-feature` (A becomes A2), then merge each layer into the
 one after it, earliest first:
 
 ```text
-merge(source_tree="sources/repo/02-tests",
+merge(source-tree="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 
 sources/repo/01-feature  -> A2  parent A
@@ -158,9 +196,9 @@ remove(file-path="sources/repo/00-base")
 remove(file-path="sources/repo/00-base.source.json")
 move(from="sources/repo/00-base-2", to="sources/repo/00-base")
 move(from="sources/repo/00-base-2.source.json", to="sources/repo/00-base.source.json")
-merge(source_tree="sources/repo/01-feature",
+merge(source-tree="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
-merge(source_tree="sources/repo/02-tests",
+merge(source-tree="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 ```
 
@@ -171,9 +209,9 @@ of the previous layer.
 
 ```text
 remove sources/repo/01-feature; copy sources/repo/00-base -> sources/repo/01-feature
-merge(source_tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
+merge(source-tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
 remove sources/repo/02-tests;   copy sources/repo/01-feature -> sources/repo/02-tests
-merge(source_tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
+merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
 ```
 
 ### Dropping, combining, splitting
@@ -253,8 +291,10 @@ publish_source(source_tree="publish/repo/02-tests", ...,
 - `publish_source` creates no PR and does not change the source gitlink.
 - It rejects any commit whose tree contains a path matched by the commit's own
   `.gitignore` rules, **including tracked files**. It never strips files or
-  rewrites commits. Remove the files or fix the rules, then publish again.
-  (Global excludes and `.git/info/exclude` do not apply, and only the
+  rewrites commits. The rejection lists the matching paths (the first 100, and
+  a count). Remove the files or fix the rules, then publish again; if the
+  source legitimately tracks them, pass `allow_ignored=true` to skip the check
+  for that call. (Global excludes and `.git/info/exclude` do not apply, and only the
   published snapshot is checked, not earlier commits.)
 - Resolve merge conflicts and clear `.caos/conflicts` first. The endpoint does
   not scan for the ledger or for inline markers.
@@ -386,12 +426,19 @@ reach usually means the grant is missing.
 
 ## Pitfalls
 
+- This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
+  directly: `eval_path(path="caos-std")` gives a tree hash, then
+  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `git.md` is "no such path".
+- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
+  underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash, not a path or a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
 - Ignored scratch files can ride along in a source during work, and then block
-  `publish_source`. Clean them before publishing.
+  `publish_source`, which lists them. Clean them before publishing, or pass
+  `allow_ignored=true` if they belong in the branch.
 - `bash-tool` runs over a scratch copy: declare every existing path it reads
   in `paths`. Use `read`, `grep`, `copy`, `move` and `remove` for those jobs.
 - Subagents have no file tools. Do any reading of a saved large result

@@ -53,6 +53,7 @@ mod git;
 mod grant_history;
 mod import;
 mod locator;
+mod mcp;
 mod push;
 mod remote_git;
 mod repair;
@@ -319,13 +320,37 @@ fn main() {
         );
     }
 
-    // Older servers accepted individual commits without their dependencies.
-    // Check all objects, including unreferenced ones, before trusting existence
-    // as proof of closure. Never delete history to make an upgrade pass.
-    verify_object_closure(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: object store has incomplete history; restore the missing objects before restarting: {error}");
-        std::process::exit(1);
-    });
+    // Both steps below read every object in the store, which on a long-lived
+    // repo takes minutes: far too long to pay on every start, and a test stack
+    // has nothing to check. `caosd` opts in (CAOS_STACK_STORE_CHECK); no other
+    // placement does.
+    if env_or("CAOS_STORE_CHECK", "no") == "yes" {
+        // This is the coordinated downtime the pack-count TODO above asks for:
+        // loose objects make the walk below slow. --keep-unreachable preserves
+        // ALL CAS objects, including unreferenced ones; plain `-a -d` would
+        // drop them.
+        run_required_git(&[
+            "-C",
+            &git_dir,
+            "repack",
+            "-a",
+            "-d",
+            "--keep-unreachable",
+            "-q",
+        ])
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: repacking the object store: {error}");
+            std::process::exit(1);
+        });
+        // Older servers accepted individual commits without their
+        // dependencies. Check all objects, including unreferenced ones, before
+        // trusting existence as proof of closure. Never delete history to make
+        // an upgrade pass.
+        verify_object_closure(&git_dir).unwrap_or_else(|error| {
+            eprintln!("fatal: object store has incomplete history; restore the missing objects before restarting: {error}");
+            std::process::exit(1);
+        });
+    }
 
     let secrets_git = env_or("CAOS_SECRETS_GIT_DIR", &secret_store::default_dir(&git_dir));
     secret_store::init(&secrets_git).unwrap_or_else(|error| {
@@ -662,6 +687,12 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     if git::is_git_path(&path) {
         return git::serve(&config, request);
     }
+    // MCP over HTTP (design: the caos tool server lives here, not in each
+    // harness's client). It sets its own status and content type, so like
+    // git it bypasses the `route` -> `from_data` path.
+    if path == "/mcp" {
+        return serve_mcp(&config, request);
+    }
     // The WORLD guard (design/test-stack-image.md): a caos client built for
     // the other world must not drive this stack. The dangerous crossing is
     // silent — a host client against the test stack passes until the tree
@@ -690,6 +721,47 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     }
 }
 
+/// `POST /mcp`: one JSON-RPC message in, its answer out (`202` with no body for
+/// a notification). What the caller is — which step, which secret readers — is
+/// in headers, because the endpoint keeps no connection state.
+fn serve_mcp(config: &Arc<Config>, mut request: Request) -> std::io::Result<()> {
+    let header = |request: &Request, name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    if *request.method() != Method::Post {
+        return request.respond(
+            Response::from_string("POST a JSON-RPC message\n").with_status_code(StatusCode(405)),
+        );
+    }
+    let caller = mcp::Caller {
+        step: header(&request, caos_world::secrets::STEP_HEADER).filter(|s| !s.trim().is_empty()),
+        readers: header(&request, caos_world::secrets::READERS_HEADER).unwrap_or_default(),
+        max_result_chars: header(&request, caos_world::secrets::MAX_RESULT_CHARS_HEADER)
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(mcp::DEFAULT_MAX_RESULT_CHARS),
+    };
+    let mut body = String::new();
+    if let Err(error) = request.as_reader().read_to_string(&mut body) {
+        return request.respond(
+            Response::from_string(format!("reading request: {error}\n"))
+                .with_status_code(StatusCode(400)),
+        );
+    }
+    match mcp::handle(config, &caller, &body) {
+        Some(message) => request.respond(
+            Response::from_string(message.to_string()).with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("a static header"),
+            ),
+        ),
+        None => request.respond(Response::empty(StatusCode(202))),
+    }
+}
+
 /// The secrets a request's SecretReaderKeys hold, for its conversation.
 /// Headers, never the ArgTree: a key is a credential.
 fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context, HttpError> {
@@ -712,12 +784,22 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
 fn expression_params(request: &mut Request, query: &str) -> Result<String, HttpError> {
     let mut body = String::new();
     request.as_reader().read_to_string(&mut body)?;
-    let body = body.trim();
-    Ok(match (query.is_empty(), body.is_empty()) {
+    Ok(join_params(query, &body))
+}
+
+/// `query` and `body` as one parameter string. A body is
+/// `application/x-www-form-urlencoded`, in which `+` is a space (`curl
+/// --data-urlencode` writes every space that way), so it is spelled `%20` here;
+/// a literal `+` is `%2B` in a form, and still decodes to one. The query string
+/// keeps the convention the rest of the server's URLs have, where `+` is
+/// itself.
+fn join_params(query: &str, body: &str) -> String {
+    let body = body.trim().replace('+', "%20");
+    match (query.is_empty(), body.is_empty()) {
         (_, true) => query.to_string(),
-        (true, false) => body.to_string(),
+        (true, false) => body,
         (false, false) => format!("{query}&{body}"),
-    })
+    }
 }
 
 /// A private repository's token for a `:@@=` fetch — the header
@@ -919,6 +1001,19 @@ fn spawn_request_ref_pruner(git_dir: String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_form_body_decodes_plus_as_space_and_a_query_does_not() {
+        use super::join_params;
+        // curl --data-urlencode "cmd=echo written > out.txt"
+        assert_eq!(
+            join_params("a=1+2", "cmd=echo+written+%3E+out.txt&p=a%2Bb"),
+            "a=1+2&cmd=echo%20written%20%3E%20out.txt&p=a%2Bb"
+        );
+        assert_eq!(join_params("a=1", ""), "a=1");
+        assert_eq!(join_params("", " b=2 \n"), "b=2");
+        assert_eq!(join_params("", ""), "");
+    }
+
     use super::{
         configure_ref_advertisements, remove_managed_pre_receive_hook, run_required_git,
         MANAGED_HOOK_MARKERS,

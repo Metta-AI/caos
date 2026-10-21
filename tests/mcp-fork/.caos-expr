@@ -1,0 +1,8 @@
+# tests/mcp-fork, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A CLIENT TEST — it drives `caos mcp hook` the way Claude Code does, to pin what
+# `/fork-caos-conversation <hash>` does on a NEW session's first prompt: a new
+# branch from the same commit, and a head a session died on is used as it is
+# (its open request closed on top of it) rather than refused.
+curry --base:@=DEEP-DEPS/cli-test --worker1:@=worker.sh --test:@=.
