@@ -114,6 +114,11 @@ impl Config {
             .clone()
             .ok_or_else(|| "no caos server: pass --server=<url>".to_string())
     }
+
+    /// How long a tool's text may be before it is spilled; 0 means no limit.
+    fn max_result_chars(&self) -> usize {
+        self.max_result_chars.unwrap_or(DEFAULT_MAX_RESULT_CHARS)
+    }
 }
 
 /// `--llm-step:@@=<locator>` names the step that runs this session's tools,
