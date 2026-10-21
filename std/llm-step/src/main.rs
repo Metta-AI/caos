@@ -3851,6 +3851,29 @@ mod tests {
     const USER_ID: &str = "11111111111111111111111111111111";
     const ASSISTANT_ID: &str = "22222222222222222222222222222222";
 
+    /// `observation_text` must agree with `caos mcp`'s `tool_outcome`, which is
+    /// what a reader of the result is shown: the length the step compares to
+    /// `--max-result-chars` is the length of the text that reader gets.
+    #[test]
+    fn observation_text_is_what_a_reader_is_shown() {
+        let text = |value: Value| observation_text(value.to_string().as_bytes());
+        assert_eq!(
+            text(json!({"content": "plain", "is_error": false})).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            text(json!({"content": [
+                {"type": "text", "text": "one"},
+                {"type": "image", "source": "ignored"},
+                {"type": "text", "text": "two"},
+            ]}))
+            .as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(text(json!("bare")).as_deref(), Some("bare"));
+        assert_eq!(observation_text(b"not json"), None);
+    }
+
     struct Golden {
         store: MemoryStore,
         head: Oid,
