@@ -73,6 +73,10 @@ pub struct Config {
     step: Option<String>,
     /// `--base:@@=<locator>`: the content a new conversation starts with.
     base: Option<String>,
+    /// `--max-result-chars=<n>`: how long a tool's text may be before it is
+    /// kept in the conversation and answered with a preview
+    /// ([`DEFAULT_MAX_RESULT_CHARS`] when absent; 0 for no limit).
+    max_result_chars: Option<usize>,
 }
 
 impl Config {
