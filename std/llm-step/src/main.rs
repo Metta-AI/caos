@@ -456,7 +456,7 @@ fn resume(
         // Its result is the conversation as it now stands, not a terminal one.
         if let Some(call) = &cfg.tools_only {
             require_completed_call(state, request, call)?;
-            return forward_tool_result(state, request, call);
+            return forward_tool_result(cfg, state, request, call);
         }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
