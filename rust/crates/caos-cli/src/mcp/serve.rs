@@ -12,6 +12,15 @@
 //! a stray `println!` desynchronizes the stream and the session dies with a
 //! parse error naming neither this file nor the line that wrote. Diagnostics go
 //! to stderr, which Claude Code surfaces without reading it as a message.
+//!
+//! THE TOOLS ARE FIVE, AND THEY NEVER CHANGE: `run`, `help`, `start`, `result` and
+//! `eval-path`. They are the server's own primitives (run something, describe it,
+//! begin it without waiting, ask how it went, evaluate a path), and what they run
+//! is named by a PATH in the conversation -- `caos-std/read`, `feature/01-change/
+//! caos-tools/test` -- so there is nothing to list and nothing to resolve first.
+//! A listing that depended on the step used to take a worker run, a cache, a
+//! warm-up hook and a stand-in tool for when it failed; this one is a constant.
+//! The model learns the rest from `instructions` (below), and from `help`.
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
@@ -32,10 +41,32 @@ const SUPPORTED: [&str; 2] = ["2025-06-18", "2024-11-05"];
 /// the hook is only supplying a value the tool always accepted.
 const SESSION_ARG: &str = "caos_session";
 
-/// The pause between resolve attempts, and between polls of `warm`'s cache.
-/// Both `warm` and `serve` retry on it: the two start TOGETHER rather than one
-/// after the other, so both have to survive the same cold start.
-const RESOLVE_FAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// What the model is told about caos when the server starts. MCP carries this in
+/// `initialize`, and a client puts it in front of the model, which is the one
+/// place to say how the five tools fit together.
+const INSTRUCTIONS: &str = "\
+caos is a separate git workspace, reached only through these tools. It is not your \
+local files: nothing moves between the two unless you copy it.
+
+- help(path): what the tool at a path does and which arguments it takes. help() with \
+no path says how caos is doing here.
+- run(path, arguments): run the tool at a path and wait for its output. Arguments are \
+strings (an array or object where the help says so).
+- start(path, arguments), then result(ticket): the same without waiting. start returns a \
+ticket; result says pending, or gives the output, or says how it failed.
+- eval-path(path): evaluate a path and get the hash of what it produces. Pass the hash \
+as `in` to read, ls or grep to look inside it.
+
+A tool is a directory of the conversation. The standard ones are under caos-std/: read, \
+ls, write, edit, copy, move, remove, grep, log, show, diff, merge, import-source, \
+publish-source, bash-tool, caos-build, caos-test, github and more. caos-std exists only in \
+the EVALUATED tree, so to see what is there: eval-path(\"caos-std\"), then run \
+caos-std/read with file-path README.md and `in` set to that hash. Call help on a tool \
+before you use one you have not used.
+
+To work on code in caos, import it with import-source into a fresh path under imports/, \
+copy it where you will change it, edit it with the file tools, and publish-source to push \
+the result. Tools that act on a source tree take its path as `source-tree`.";
 
 /// The workspace is passed in UNRESOLVED, and a failure to open it does not
 /// stop the server.
@@ -60,23 +91,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         }
     };
     let t = workspace.as_ref();
-    let registry: Registry = Arc::new(Mutex::new(Found::default()));
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
-
-    // An OPPORTUNISTIC read of the registry `mcp warm` cached, which is empty
-    // far more often than it looks: warm does not run before this process, it
-    // runs BESIDE it, and measurement puts serve 0.6s AHEAD of warm rather than
-    // behind it. So this read is a fast path for the second session in a
-    // checkout, not the mechanism -- `ensure_resolved` re-reads the same cache
-    // on the first request, which is where the handoff actually happens.
-    //
-    // The comment that used to sit here said warm ran "BEFORE the client
-    // started" and built the rest of the design on it. It was never true.
-    if let Ok(t) = t {
-        if let Some(tools) = read_cached_registry(t, &options) {
-            publish(&registry, tools);
-        }
-    }
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -84,7 +99,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         if line.trim().is_empty() {
             continue;
         }
-        let Some(response) = handle(t, &options, &registry, &line) else {
+        let Some(response) = handle(t, &options, &line) else {
             continue;
         };
         write_message(&out, &response)?;
@@ -92,391 +107,100 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
     Ok(())
 }
 
-/// Resolve the tools and leave them in the on-disk cache `mcp serve` reads.
-///
-/// This is what lets a session be ready on TURN ONE. `mcp serve` cannot answer
-/// `initialize` and go build an image before the client's first `tools/list`, so
-/// without a cache that first `tools/list` blocks on the resolve -- fine once the
-/// step is built, but the first time in a tree it is a rustc compile measured in
-/// minutes.
-///
-/// IT DOES NOT RUN BEFORE THE CLIENT. It runs from the session-start hook, and
-/// Claude Code spawns the tool server in parallel with that hook rather than
-/// after it -- measured, serve was 0.6s AHEAD. So this is not a resolve that
-/// happens "first"; it is one of two resolves racing, and what makes it useful
-/// is that serve WAITS for it ([`ensure_resolved`]) instead of duplicating it.
-/// Before that wait existed both ran to completion side by side, 8.5s and 8.2s,
-/// and fought over pushing the same object.
-///
-/// NON-FATAL by contract. It always returns `Ok`, because the hook must not fail
-/// a session over a cold cache: a warm that cannot reach the server yet, or a
-/// resolve that errors, simply leaves no cache and `mcp serve` resolves inline on
-/// the first `tools/list` exactly as it would have without this.
-pub fn warm(t: &GitTransport, options: &TurnOptions) -> Result<(), String> {
-    // RETRIED, because this races the session's own setup. The first attempt
-    // commonly fails -- the server a moment from answering, a `caos` remote a
-    // moment from being added -- and a single-shot warm that gave up there would
-    // cache nothing and leave that first `tools/list` to block on the resolve,
-    // which is the whole thing this exists to pre-empt. So keep trying until one
-    // succeeds or the outer `timeout` in the hook kills us; a reachability probe
-    // with a deadline sits in front so an unreachable server is a short failure,
-    // not a swallowed one.
-    // The real stop is the hook's `timeout`; this bound just keeps the loop
-    // finite. Each attempt is a reachability probe plus a full resolve, so even
-    // at a second of sleep between them the count is reached only if every
-    // resolve is returning fast failures -- exactly the setup-race case worth
-    // retrying through.
-    const WARM_ATTEMPTS: u32 = 120;
-    // Claimed for the hook's own cap (`timeout -k 10 150` in session-start.sh),
-    // so the marker cannot outlive the warm that owns it even when the warm is
-    // killed rather than returning.
-    let _marker = WarmMarker::claim(t, 150);
-    let mut last = "not started".to_string();
-    for attempt in 0..WARM_ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(RESOLVE_FAST_INTERVAL);
-        }
-        // TIMED, because the probe has a fixed budget and the question a failed
-        // attempt raises is whether the dial was slow or the server was absent.
-        // Those want opposite fixes and the message alone cannot tell them apart.
-        let probe = std::time::Instant::now();
-        if let Err(error) = t.ensure_server_reachable() {
-            last = format!(
-                "server not reachable after {:.1}s: {error}",
-                probe.elapsed().as_secs_f64()
-            );
-            eprintln!(
-                "caos mcp warm: attempt {} did not cache: {last}",
-                attempt + 1
-            );
-            continue;
-        }
-        match declarations(t, options) {
-            Ok(found) if !found.is_empty() => {
-                write_cached_registry(t, options, &found);
-                // WHERE the wait went, in the hook's own log. `declarations`
-                // measures its phases into a per-PROCESS static that only
-                // `serve`'s diagnostics read -- so a warm that took a minute
-                // reported the minute and threw the breakdown away, and the one
-                // session state where you need it (a slow start you are trying
-                // to explain) is the one with no `serve` resolve to print it.
-                let breakdown = super::discovery_timing()
-                    .map(|timing| format!(": {timing}"))
-                    .unwrap_or_default();
-                eprintln!(
-                    "caos mcp warm: cached {} tools for the first turn (attempt {}){breakdown}",
-                    found.len(),
-                    attempt + 1
-                );
-                return Ok(());
-            }
-            Ok(_) => last = "the step answered with no tools".to_string(),
-            Err(error) => last = error,
-        }
-        eprintln!(
-            "caos mcp warm: attempt {} did not cache: {last}",
-            attempt + 1
-        );
-    }
-    eprintln!("caos mcp warm: gave up ({last}); mcp serve will resolve on first use");
-    Ok(())
-}
-
-/// The per-checkout file the resolved tool registry is cached in. `mcp warm` and
-/// the `mcp serve` that follows it both open the same checkout, so both derive
-/// this path from the git directory without one having to tell the other.
-fn registry_cache_path(t: &GitTransport) -> std::path::PathBuf {
-    t.git_dir().join("caos-cc-registry.json")
-}
-
-/// The file held while a session-start hook is preparing this checkout, so
-/// `serve` can tell "a registry is coming" from "nobody is producing one".
-///
-/// CLAIMED BY THE HOOK, not by `warm`, and that distinction is the whole
-/// mechanism. `serve`'s first `tools/list` arrives within a second of the
-/// process starting -- before `warm` runs, and in the cloud before the hook has
-/// even finished adding the remote and unshallowing. A marker taken when warm
-/// STARTS is therefore taken too late to be seen: measured, serve asked, found
-/// no marker, and resolved alone exactly as it did before the marker existed.
-/// The hook knows a warm is coming long before it starts one, so it says so
-/// first (`integrations/claude-code/cloud/session-start.sh`).
-///
-/// `warm` claims it too, for a `caos mcp warm` run outside a hook.
-///
-/// Without it, waiting for the cache is a guess with no good answer. `serve` does
-/// NOT follow `warm`; the two start together and serve usually starts FIRST --
-/// measured at 0.6s ahead, after which both resolved the same step concurrently
-/// (8.5s and 8.2s), collided pushing the same object, and one of them ate a
-/// failed push and a retry. A fixed wait would have been wrong in both
-/// directions: too short to cover warm, and pure delay in a checkout where no
-/// warm is running at all (`integrations/claude-code/cli/run` starts a bare
-/// serve, and a serve that idled there before resolving would be slower than
-/// having no cache at all).
-///
-/// It carries the unix time by which warm will have given up, so a warm that is
-/// KILLED -- the hook's `timeout -k` does exactly that -- cannot leave a marker
-/// that makes every later serve wait for a process that is gone.
-fn warm_marker_path(t: &GitTransport) -> std::path::PathBuf {
-    t.git_dir().join("caos-cc-warming")
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Claim the marker for `for_secs`, and hand back a guard that removes it.
-struct WarmMarker(std::path::PathBuf);
-
-impl WarmMarker {
-    fn claim(t: &GitTransport, for_secs: u64) -> Self {
-        let path = warm_marker_path(t);
-        let _ = std::fs::write(&path, format!("{}\n", now_secs() + for_secs));
-        WarmMarker(path)
-    }
-}
-
-impl Drop for WarmMarker {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Is a `warm` still working on this checkout? False for a marker whose deadline
-/// has passed, because a killed warm leaves its marker behind.
-fn warm_in_flight(t: &GitTransport) -> bool {
-    let Ok(text) = std::fs::read_to_string(warm_marker_path(t)) else {
-        return false;
+/// The caos tools, as the model sees them. Every one carries the arguments the
+/// `PreToolUse` hook fills in (see [`with_injected`]).
+fn tools() -> Vec<Value> {
+    let path_and_arguments = |path_doc: &str| {
+        with_injected(json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": path_doc },
+                "arguments": {
+                    "type": "object",
+                    "description": "The tool's arguments by name, as `help` lists them. \
+                                    Strings, unless the help says an array."
+                },
+            },
+            "required": ["path"],
+        }))
     };
-    text.trim()
-        .parse::<u64>()
-        .map(|deadline| now_secs() < deadline)
-        .unwrap_or(false)
+    vec![
+        json!({
+            "name": "run",
+            "description": "Run the caos tool at a path and wait for its output. The path \
+                            names a directory of the conversation, such as caos-std/bash-tool \
+                            or caos-std/read; `help` at a path says what it takes. A tool \
+                            that changes files changes the conversation's own copy, not your \
+                            local checkout. For a long run use `start`.",
+            "inputSchema": path_and_arguments(
+                "Conversation path of the tool, such as caos-std/read or feature/01-change/caos-tools/test."
+            ),
+        }),
+        json!({
+            "name": "help",
+            "description": "Describe the caos tool at a path: what it does and the arguments \
+                            it takes. With no path, say how caos is doing in this session \
+                            (the conversation, its head commit, and diagnostics) -- call this \
+                            and report it verbatim if caos seems missing or broken.",
+            "inputSchema": with_injected(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string",
+                              "description": "Conversation path of the tool. Omit for the session overview." },
+                },
+                "required": [],
+            })),
+        }),
+        json!({
+            "name": "start",
+            "description": "Start the caos tool at a path without waiting. Returns a ticket; \
+                            ask `result` for it. The same call always has the same ticket, and \
+                            starting one that has finished does not run it again.",
+            "inputSchema": path_and_arguments(
+                "Conversation path of the tool, such as caos-std/caos-test."
+            ),
+        }),
+        json!({
+            "name": "result",
+            "description": "The state of a started call: still pending, its output, or how it \
+                            failed. Asking never runs anything.",
+            "inputSchema": with_injected(json!({
+                "type": "object",
+                "properties": {
+                    "ticket": { "type": "string", "description": "The ticket `start` returned." },
+                },
+                "required": ["ticket"],
+            })),
+        }),
+        json!({
+            "name": "eval-path",
+            "description": "Evaluate a path in the caos conversation and return the hash of \
+                            what it produces: the build product of a tree, without having to \
+                            know which tool makes it. caos-std exists only this way. Pass the \
+                            hash as `in` to read, ls or grep to look inside it.",
+            "inputSchema": with_injected(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string",
+                              "description": "Path to evaluate, such as caos-std. Omit for the conversation root." },
+                    "root": { "type": "string",
+                              "description": "A tree or commit hash to evaluate within instead of the conversation; `path` is then relative to it." },
+                },
+                "required": [],
+            })),
+        }),
+    ]
 }
 
-/// The cache the previous function's path holds, IF it is for the step this
-/// server was configured with. Keyed by `--llm-step` and `--base` so a client rebuilt to
-/// drive a different step cannot be handed the old step's tools; a mismatch or
-/// an empty list reads as "no cache" and the caller resolves from scratch.
-fn read_cached_registry(t: &GitTransport, options: &TurnOptions) -> Option<Vec<Value>> {
-    let bytes = std::fs::read(registry_cache_path(t)).ok()?;
-    let cached: Value = serde_json::from_slice(&bytes).ok()?;
-    if cached.get("llm_step").and_then(Value::as_str) != options.llm_step.as_deref()
-        || cached.get("base").and_then(Value::as_str) != options.base.as_deref()
-    {
-        return None;
-    }
-    let tools = cached.get("tools")?.as_array()?.clone();
-    if tools.is_empty() {
-        None
-    } else {
-        Some(tools)
-    }
-}
-
-/// Write the registry cache. Best-effort and via a temp-then-rename, so a `cc
-/// serve` reading it concurrently sees either the old file or the new one whole,
-/// never a half-written one; a failure to write just means the next server
-/// resolves from scratch, which is the behaviour before any cache existed.
-fn write_cached_registry(t: &GitTransport, options: &TurnOptions, tools: &[Value]) {
-    let payload = json!({ "llm_step": options.llm_step, "base": options.base, "tools": tools });
-    let Ok(bytes) = serde_json::to_vec(&payload) else {
-        return;
-    };
-    let path = registry_cache_path(t);
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
-}
-
-/// The tools this server offers, and what it would say about them. Populated by
-/// `warm`'s cache at startup, or by the inline resolve on the first `tools/list`
-/// (`ensure_resolved`); empty until one of those has run.
-type Registry = Arc<Mutex<Found>>;
-
-#[derive(Default)]
-struct Found {
-    tools: Vec<Value>,
-    /// What happened while looking, in the words the reader needs. Read out by
-    /// [`STATUS_TOOL`] and by nothing else.
-    status: Option<String>,
-}
-
-/// The one tool this server implements itself, offered ONLY while it has no
-/// others -- and it exists because of how the alternative failed.
-///
-/// A model that is handed zero tools does not report "my tool server has no
-/// tools". It reports that caos is not there, because from inside the session
-/// those are the same observation: a connected server with an empty list is
-/// indistinguishable from an absent one through anything the model can see.
-/// That cost a day of relaying container output by hand.
-///
-/// So an empty registry is not silence. It is one tool whose description says
-/// the tools are still coming and whose result says how it is going.
-const STATUS_TOOL: &str = "caos_status";
-
-fn status_declaration() -> Value {
-    json!({
-        "name": STATUS_TOOL,
-        "description": "caos provisioning diagnostics: this session's client build, env \
-                        stamp, `caos` remote, git remote helper, and the tool-resolution \
-                        status. Always available. If the other caos workspace tools are \
-                        MISSING, call this and report its FULL output verbatim rather than \
-                        concluding caos is absent -- it says why (and whether they are \
-                        still resolving). It takes no arguments and changes nothing.",
-        "inputSchema": with_injected(json!({
-            "type": "object", "properties": {}, "required": [],
-        })),
-    })
-}
-
-/// Resolve the tools ONCE, inline, if it has not happened yet -- then return, so
-/// the caller reads a settled registry. This is what `tools/list` and
-/// `caos_status` call before answering when `warm` left no cache.
-///
-/// Idempotent: a registry that already holds tools is left alone. The handler
-/// loop is single-threaded, so no two requests race this.
-///
-/// It does three things in order, and the ORDER is the fix for two measured
-/// failures:
-///
-/// 1. RE-READ the on-disk cache. `serve` reads it once at startup, and at that
-///    moment `warm` -- which starts at the same time, usually a moment later --
-///    has not written it yet. A startup-only read can therefore never see the
-///    cache it exists to consume.
-/// 2. WAIT while a `warm` is in flight, instead of resolving in parallel with
-///    it. Measured without this: serve and warm resolved the same step
-///    concurrently (8.5s and 8.2s), pushed the same object at the same time, and
-///    one of them took a failed push plus a retry for it. Waiting turns a race
-///    into a handoff and costs nothing, because the session is blocked on the
-///    hook that runs warm anyway.
-/// 3. RESOLVE, retried. The previous version resolved exactly once and recorded
-///    whatever came back forever -- so a single `ensure_server_reachable` timing
-///    out decided the whole session. That is not a hypothetical: the probe's
-///    budget is 5s and a cold dial from a cloud container measures 0.9-1.7s,
-///    close enough that it fails intermittently. One cold dial must not be the
-///    thing that answers "does caos work here".
-///
-/// A recorded failure is no longer sticky for the CACHE either: a later call
-/// re-reads it, so a warm that lands after serve gave up still wins.
-fn ensure_resolved(t: Option<&GitTransport>, options: &TurnOptions, registry: &Registry) {
-    if let Ok(found) = registry.lock() {
-        if !found.tools.is_empty() {
-            return;
-        }
-    }
-
-    // How long to wait on a warm. Bounded well inside any plausible MCP startup
-    // timeout, because the cost of overrunning it is the whole server being
-    // dropped -- strictly worse than answering with `caos_status` alone.
-    // `MCP_TIMEOUT` is raised in the shipped settings to give this room.
-    const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
-    const RESOLVE_ATTEMPTS: u32 = 3;
-
-    if let Some(t) = t {
-        let deadline = std::time::Instant::now() + WARM_WAIT;
-        let mut waited = false;
-        loop {
-            if let Some(tools) = read_cached_registry(t, options) {
-                if waited {
-                    eprintln!("caos mcp serve: took the registry the warm just cached");
-                }
-                publish(registry, tools);
-                return;
-            }
-            if !warm_in_flight(t) || std::time::Instant::now() >= deadline {
-                break;
-            }
-            if !waited {
-                waited = true;
-                eprintln!(
-                    "caos mcp serve: a warm is resolving; waiting for it rather than \
-                           resolving alongside it"
-                );
-            }
-            std::thread::sleep(RESOLVE_FAST_INTERVAL);
-        }
-    }
-
-    let mut last = String::new();
-    for attempt in 0..RESOLVE_ATTEMPTS {
-        if attempt > 0 {
-            std::thread::sleep(RESOLVE_FAST_INTERVAL);
-            // The warm may have finished while we were failing.
-            if let Some(t) = t {
-                if let Some(tools) = read_cached_registry(t, options) {
-                    publish(registry, tools);
-                    return;
-                }
-            }
-        }
-        match resolve_once(t, options) {
-            Ok(tools) => {
-                publish(registry, tools);
-                return;
-            }
-            Err(reason) => last = reason,
-        }
-    }
-    if let Ok(mut found) = registry.lock() {
-        found.status = Some(last);
-    }
-}
-
-/// One resolution attempt: open the workspace, prove the server is reachable
-/// (a bounded probe, so an unreachable server is named rather than swallowed), then ask
-/// the step for its tools.
-///
-/// It does NOT write the on-disk cache -- `warm` owns that. A serve resolving
-/// here is the fallback for a session `warm` did not reach, and persisting its
-/// result would outlive the session's server: a later serve in the same checkout
-/// would then report the cached tools even against a server that has since gone,
-/// hiding exactly the unreachable-server failure `caos_status` exists to name.
-fn resolve_once(
-    workspace: Option<&GitTransport>,
-    options: &TurnOptions,
-) -> Result<Vec<Value>, String> {
-    let t = reopen(workspace).map_err(|e| format!("cannot open the caos workspace: {e}"))?;
-    t.ensure_server_reachable()?;
-    declarations(&t, options)
-}
-
-/// A FRESH transport for the checkout this server was started in.
-///
-/// Fresh, because a transport opened at startup can predate the `caos` remote
-/// that setup adds a moment later (see `run_tool`). But fresh from the SAME
-/// WORKTREE, not from the working directory: this used to call
-/// `GitTransport::from_cwd()`, so a server that found its checkout through
-/// `$CLAUDE_PROJECT_DIR` while standing elsewhere resolved against the cwd and
-/// failed -- or, in a cwd that happened to be some other repository, resolved
-/// that one's tools. Only with no workspace at all (the server could not open
-/// one) is the working directory the best that is left.
-fn reopen(workspace: Option<&GitTransport>) -> Result<GitTransport, String> {
-    match workspace {
-        Some(t) => GitTransport::discover(t.work_dir()),
-        None => GitTransport::from_cwd(),
-    }
-}
-
-/// The `tools/list` result: the resolved tools, plus the `caos_status` stand-in.
-fn tools_list_reply(id: Value, registry: &Registry) -> Value {
-    match registry.lock() {
-        Ok(found) => {
-            // ALWAYS include `caos_status`, resolved or not. It used to be the
-            // stand-in offered ONLY while the real tools were missing, so it
-            // vanished the moment they resolved -- which meant its provisioning
-            // diagnostics (build, remote, helper) were unreachable in the one
-            // session state where you might still want them: a working one you
-            // are trying to confirm. It carries no session and records nothing,
-            // so it is a harmless read to keep beside the workspace tools.
-            let mut tools = found.tools.clone();
-            tools.push(status_declaration());
-            reply(id, json!({ "tools": tools }))
-        }
-        Err(_) => fail(id, -32603, "the tool registry lock is poisoned"),
+/// The step's name for each of this server's tools. The step implements them
+/// under the names it has always had; the server presents them under the names the
+/// model reads.
+fn step_tool(name: &str) -> Option<&'static str> {
+    match name {
+        "run" | "start" => Some("run_tool"),
+        "help" => Some("tool_help"),
+        "eval-path" => Some("eval_path"),
+        _ => None,
     }
 }
 
@@ -512,19 +236,30 @@ fn conversation_status(session: Option<&str>) -> String {
     format!("conversation: {id}\nconversation head: {head}\n")
 }
 
-fn status_result(registry: &Registry, conversation: &str, degraded: Option<&str>) -> Value {
-    let text = match registry.lock() {
-        Err(_) => "the caos tool registry lock is poisoned; this server is broken".to_string(),
-        Ok(found) => match (&found.status, found.tools.is_empty()) {
-            (_, false) => format!("{} caos tools are available.", found.tools.len()),
-            (Some(status), true) => status.clone(),
-            (None, true) => "the caos tools have not been resolved yet; call tools/list \
-                             (or any caos tool) to resolve them."
-                .to_string(),
-        },
+/// Whether the server answers, for the overview: asked of a transport, bounded, so
+/// a dead address is reported in seconds rather than waited on. It says the same
+/// words a tool call would fail with (`cannot reach the CAOS server`), because a
+/// model told only "the call failed" cannot tell a dead server from a wrong tool.
+fn server_status(session: Option<&str>) -> String {
+    let Some(session) = session else {
+        return String::new();
     };
-    // THE REASON LEADS. A degraded server has no tools to describe, and the
-    // reader of this text is usually a model deciding what to tell a person.
+    let Ok(t) = super::workspace::open(session) else {
+        return String::new();
+    };
+    match super::wait_server_reachable(&t) {
+        Ok(()) => "server: reachable\n".to_string(),
+        Err(error) => format!("server: {error}\n"),
+    }
+}
+
+/// `help` with no path: how caos is doing here. A model that finds caos missing
+/// should be able to ask and get the reason, not conclude caos is absent -- a
+/// connected server with nothing to say looks, from inside the session, exactly
+/// like no server at all.
+fn overview(conversation: &str, degraded: Option<&str>) -> Value {
+    // THE REASON LEADS. A degraded server has nothing to run, and the reader of
+    // this text is usually a model deciding what to tell a person.
     let lead = match degraded {
         Some(reason) => format!(
             "caos is DEGRADED: it has no workspace, so no tool can run.\nreason: {reason}\n\n"
@@ -532,11 +267,14 @@ fn status_result(registry: &Registry, conversation: &str, degraded: Option<&str>
         None => String::new(),
     };
     let diag = super::diag::emit(&super::diag::Context {
-        event: STATUS_TOOL,
+        event: "help",
         reason: degraded,
         ..Default::default()
     });
-    let text = format!("{lead}{text}\n{conversation}{}\n{diag}", diagnostics());
+    let text = format!(
+        "{lead}{INSTRUCTIONS}\n\n{conversation}{}\n{diag}",
+        diagnostics()
+    );
     json!({ "content": [{ "type": "text", "text": text }], "isError": false })
 }
 
@@ -646,17 +384,11 @@ fn diagnostics() -> String {
     // first push with "git: 'remote-caos' is not a git command", which reads as
     // a git problem rather than an install one.
     d.push_str(&format!("git-remote-caos: {}\n", git_remote_helper()));
-    // Where the discovery time went, once a resolve has succeeded: the phases of
-    // the one resolution, AFTER the server was reachable (the reachability probe
-    // is separate). Blank until a resolve has run.
-    if let Some(timing) = super::discovery_timing() {
-        d.push_str(&format!("tool discovery: {timing}\n"));
-    }
     // The CROSS-PROCESS phase journal, which is the only way this session can
     // see what the other caos processes did. `mcp hook` fires per prompt and
-    // pays the conversation-base push; `mcp warm` resolves the tools. Neither
-    // can print to a transcript, and a cloud session has no shell to go looking
-    // with -- so they write here and this reads it back.
+    // pays the conversation-base push. It
+    // cannot print to a transcript, and a cloud session has no shell to go looking
+    // with -- so it writes here and this reads it back.
     let phases = caos::timing::tail(25);
     if phases.is_empty() {
         d.push_str("phase journal: empty\n");
@@ -666,55 +398,16 @@ fn diagnostics() -> String {
             d.push_str(&format!("  {line}\n"));
         }
     }
-    // The warm step's own log: session-start runs `mcp warm` before the client
-    // starts, and this is where it says whether it resolved and cached the
-    // tools or why it could not -- the reason a first turn does or does not
-    // already have them.
-    d.push_str("warm log (/tmp/caos-warm.log):\n");
-    d.push_str(&indent(&tail(&read_file("/tmp/caos-warm.log"), 10)));
-    // Whether a warm cache was on disk for THIS serve to load at startup.
-    d.push_str(&format!("registry cache: {}\n", registry_cache_state()));
     // REDACTED ONCE, OVER THE WHOLE DOCUMENT, rather than field by field. A
     // `caos://` URL is the capability to drive that server and this text is
     // quoted verbatim by a model into a transcript; most of what is above comes
-    // from OTHER processes -- the phase journal's git command lines, the warm
+    // from OTHER processes -- the phase journal's git command lines, the hook
     // log, git's own errors -- which quote the remote URL in full and cannot be
     // asked not to. Redacting the assembled text is what makes that safe by
     // construction, so a field added later is covered without anyone
     // remembering. It is also why nothing below here re-redacts: applied twice,
     // the second pass mangles the first pass's marker.
     redact_secrets(&d)
-}
-
-/// A one-line note on the on-disk tool-registry cache: present with how many
-/// tools and for which step, or why not. `mcp warm` writes it and `mcp serve`
-/// loads it (see [`registry_cache_path`]); a first turn with no tools when this
-/// says "absent" means the warm did not finish, and when it says "present" means
-/// the load key did not match.
-fn registry_cache_state() -> String {
-    let mut cmd = std::process::Command::new("git");
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
-        cmd.args(["-C", &dir]);
-    }
-    let git_dir = match cmd.args(["rev-parse", "--absolute-git-dir"]).output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => return "<no git dir to look in>".to_string(),
-    };
-    let path = std::path::Path::new(&git_dir).join("caos-cc-registry.json");
-    match std::fs::read(&path) {
-        Err(e) => format!("absent ({e}) at {}", path.display()),
-        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(v) => {
-                let n = v.get("tools").and_then(Value::as_array).map_or(0, Vec::len);
-                let step = v
-                    .get("llm_step")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<none>");
-                format!("present: {n} tools, step {step}")
-            }
-            Err(e) => format!("present but unparseable ({e})"),
-        },
-    }
 }
 
 /// Scrub anything a status must never surface.
@@ -756,12 +449,6 @@ fn read_file(path: &str) -> String {
         Ok(s) => s.trim_end().to_string(),
         Err(e) => format!("<unreadable: {e}>"),
     }
-}
-
-/// The last `n` lines of `s`.
-fn tail(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 /// Two-space-indent every line, or a placeholder for the empty string, so a
@@ -831,26 +518,10 @@ fn write_message(out: &Out, message: &Value) -> Result<(), String> {
         .map_err(|error| format!("flushing response: {error}"))
 }
 
-/// Publish what was found, and stop describing the search.
-fn publish(registry: &Registry, tools: Vec<Value>) {
-    match registry.lock() {
-        Ok(mut found) => {
-            found.tools = tools;
-            found.status = None;
-        }
-        Err(_) => eprintln!("caos mcp serve: the tool registry lock is poisoned"),
-    }
-}
-
 /// Handle one message. `None` means "say nothing", which is required rather
 /// than merely polite: a JSON-RPC notification has no `id`, and answering one
 /// is a protocol violation.
-fn handle(
-    t: Result<&GitTransport, &String>,
-    options: &TurnOptions,
-    registry: &Registry,
-    line: &str,
-) -> Option<Value> {
+fn handle(t: Result<&GitTransport, &String>, options: &TurnOptions, line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // A malformed line has no id to answer against, so the only correct
@@ -867,33 +538,18 @@ fn handle(
     let id = id.unwrap_or(Value::Null);
     match method {
         "initialize" => Some(reply(id, initialize(&params))),
-        // The tools. `warm` normally cached them before the client started, so
-        // this is a read. When it did not, the FIRST `tools/list` resolves them
-        // once, inline, and answers with the result -- real tools, or (on a
-        // failure) the `caos_status` stand-in that says why. No hold on a fixed
-        // clock, no `tools/list_changed` correction later: the answer to this one
-        // read is the settled answer, which is what a client that reads the list
-        // exactly once (the mounted Claude Code) needs and what makes the timing
-        // predictable. It can block for one resolution -- a server round trip,
-        // at most a cold build -- but never for a retry loop.
-        "tools/list" => {
-            ensure_resolved(t.ok(), options, registry);
-            Some(tools_list_reply(id, registry))
-        }
+        // A constant: see the module docs.
+        "tools/list" => Some(reply(id, json!({ "tools": tools() }))),
         // A workspace we could not open is the model's problem to report, not
         // a protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
         //
         // The server's OWN startup-time workspace (`t`, fixed for this
-        // process's whole life) is a FALLBACK now, not the only source: a
-        // call naming a session with its own recorded workspace --
-        // `session_base.rs`'s scratch checkout, or any other workspace a
-        // session's first prompt pinned -- uses THAT instead, exactly what
-        // `conversation_status` below already does for its own report. This
-        // is what makes different sessions sharing this one long-running
-        // server able to use different checkouts/servers at all: a `t` fixed
-        // at process startup could never do that regardless of anything a
-        // later session recorded.
+        // process's whole life) is a FALLBACK: a call naming a session with its
+        // own recorded workspace -- `session_base.rs`'s scratch checkout, or any
+        // other workspace a session's first prompt pinned -- uses THAT instead.
+        // This is what lets different sessions sharing this one long-running
+        // server use different checkouts and servers at all.
         "tools/call" => Some({
             let session = params
                 .get("arguments")
@@ -904,10 +560,14 @@ fn handle(
                 Some(opened) => Ok(opened),
                 None => t,
             };
+            let is_overview = params.get("name").and_then(Value::as_str) == Some("help")
+                && params
+                    .get("arguments")
+                    .and_then(|args| args.get("path"))
+                    .and_then(Value::as_str)
+                    .is_none_or(|path| path.trim().is_empty());
             match resolved {
-                Err(error) if params.get("name").and_then(Value::as_str) == Some(STATUS_TOOL) => {
-                    reply(id, status_result(registry, "", Some(error)))
-                }
+                Err(error) if is_overview => reply(id, overview("", Some(error))),
                 Err(error) => reply(
                     id,
                     json!({
@@ -915,12 +575,13 @@ fn handle(
                             "caos has no workspace, so no tool can run: {error}\n\
                              The tool server is started by Claude Code, so it looks for the \
                              repository at $CLAUDE_PROJECT_DIR and falls back to its working \
-                             directory. Neither was a git working tree."
+                             directory. Neither was a git working tree. `help` with no path \
+                             says more."
                         ) }],
                         "isError": true,
                     }),
                 ),
-                Ok(t) => match call(t, options, registry, &params) {
+                Ok(t) => match call(t, options, &params) {
                     Ok(result) => reply(id, result),
                     // A tool that could not run at all is a JSON-RPC error; a tool
                     // that ran and failed is a result with `isError`, which the
@@ -946,52 +607,64 @@ fn initialize(params: &Value) -> Value {
     };
     json!({
         "protocolVersion": version,
-        // `listChanged` is false: `tools/list` now resolves before it answers, so
-        // its reply is final and this server never revises the list behind the
-        // client's back. Advertising the capability would promise a notification
-        // that no longer comes.
+        // `listChanged` is false: the list is a constant, so this server never
+        // revises it behind the client's back.
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "caos", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": INSTRUCTIONS,
     })
 }
 
-fn call(
-    t: &GitTransport,
-    options: &TurnOptions,
-    registry: &Registry,
-    params: &Value,
-) -> Result<Value, String> {
+fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call has no tool name".to_string())?;
-    // This server's own tool, and the one call that belongs to no conversation:
-    // it reports on the server, so it takes no session and records nothing.
-    if name == STATUS_TOOL {
-        // Resolve first, so a status called before any `tools/list` (a client
-        // that opens with a diagnostic) still reports what happened rather than
-        // "not resolved yet" -- the unreachable-server case names the server here.
-        ensure_resolved(Some(t), options, registry);
-        let session = params
-            .get("arguments")
-            .and_then(|args| args.get(SESSION_ARG))
-            .and_then(Value::as_str);
-        return Ok(status_result(registry, &conversation_status(session), None));
-    }
     let args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let session = args
-        .get(SESSION_ARG)
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{SESSION_ARG} is missing: the PreToolUse hook that supplies it \
-                 is not installed, so this call cannot be attributed to a conversation"
-            )
-        })?;
-    let outcome = super::run_tool(t, options, session, name, &args)?;
+    let session = args.get(SESSION_ARG).and_then(Value::as_str);
+    // `help` with no path reports on the server and belongs to no conversation
+    // call: it takes the session only to say which conversation that is.
+    if name == "help"
+        && args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        let status = format!("{}{}", conversation_status(session), server_status(session));
+        return Ok(overview(&status, None));
+    }
+    let session = session.ok_or_else(|| {
+        format!(
+            "{SESSION_ARG} is missing: the PreToolUse hook that supplies it \
+             is not installed, so this call cannot be attributed to a conversation"
+        )
+    })?;
+    let outcome = match name {
+        "start" => {
+            let ticket = super::start_tool(options, session, "run_tool", &args)?;
+            super::ToolOutcome {
+                text: format!(
+                    "ticket: {ticket}\n\nAsk for it with result(ticket=\"{ticket}\"). It is \
+                     pending until the tool finishes."
+                ),
+                is_error: false,
+            }
+        }
+        "result" => {
+            let ticket = args
+                .get("ticket")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "result needs the `ticket` start returned".to_string())?;
+            super::tool_result(session, ticket.trim())?
+        }
+        other => {
+            let step = step_tool(other).ok_or_else(|| format!("unknown tool {other:?}"))?;
+            super::run_tool(t, options, session, step, &args)?
+        }
+    };
     Ok(json!({
         "content": [{ "type": "text", "text": outcome.text }],
         "isError": outcome.is_error,
@@ -1006,46 +679,13 @@ fn fail(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// The tool registry Claude Code is given, from the step that implements it.
-///
-/// A LISTING IS A WORKER RUN. It resolves `--llm-step`, runs it, and reads the
-/// declarations back, which is the point -- the tools are the step's, so a
-/// session in any repository offers exactly what the tui offers there.
-///
-/// The error is RETURNED rather than logged, because the caller has somewhere
-/// to put it: the status this server reports when it has no tools. A reason
-/// that reaches only stderr reaches nobody who is asking.
-fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
-    Ok(super::declarations(t, options)?
-        .iter()
-        .map(mcp_declaration)
-        .collect())
-}
-
-/// One of the step's declarations, as MCP spells it: `inputSchema` rather than
-/// the Anthropic API's `input_schema`, plus the arguments the `PreToolUse` hook
-/// fills in. Those are DECLARED rather than smuggled, so the model's own call
-/// stays schema-valid and the hook only supplies values the tool accepted.
-fn mcp_declaration(declaration: &Value) -> Value {
-    let schema = declaration
-        .get("input_schema")
-        .cloned()
-        .unwrap_or_else(|| json!({ "type": "object", "properties": {}, "required": [] }));
-    json!({
-        "name": declaration.get("name").cloned().unwrap_or(Value::Null),
-        "description": declaration.get("description").cloned().unwrap_or(Value::Null),
-        "inputSchema": with_injected(schema),
-    })
-}
-
 /// A schema that also accepts what the `PreToolUse` hook fills in.
 ///
-/// EVERY tool this server offers goes through here, `caos_status` included.
-/// The hook matches on the `mcp__caos__` prefix, so it injects into any call to
-/// this server -- and a tool whose schema does not declare those arguments gets
-/// an `updatedInput` that fails validation, which reads as the model calling
-/// the tool wrongly. Declaring them keeps the model's own call valid with or
-/// without them.
+/// EVERY tool this server offers goes through here. The hook matches on the
+/// `mcp__caos__` prefix, so it injects into any call to this server -- and a tool
+/// whose schema does not declare those arguments gets an `updatedInput` that fails
+/// validation, which reads as the model calling the tool wrongly. Declaring them
+/// keeps the model's own call valid with or without them.
 fn with_injected(mut schema: Value) -> Value {
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
@@ -1072,60 +712,13 @@ mod tests {
     fn notifications_are_never_answered() {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let workspace = "no workspace".to_string();
-        let registry: Registry = Arc::new(Mutex::new(Found::default()));
-        assert!(handle(
-            Err(&workspace),
-            &TurnOptions::default(),
-            &registry,
-            notification
-        )
-        .is_none());
-    }
-
-    /// With no workspace the status still answers, and its first words are the
-    /// reason rather than the registry's "not resolved yet".
-    #[test]
-    fn a_degraded_status_leads_with_its_reason() {
-        let registry: Registry = Arc::new(Mutex::new(Found::default()));
-        let result = status_result(&registry, "", Some("not a git working tree"));
-        let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.starts_with("caos is DEGRADED"), "{text}");
-        assert!(text.contains("reason: not a git working tree"), "{text}");
-        assert!(text.contains("--- caos diag ---"), "{text}");
-    }
-
-    /// A resolve re-opens the workspace the server was given, not whatever
-    /// repository the working directory happens to be in. The test runs inside
-    /// the caos checkout, so `from_cwd()` would succeed and name the WRONG one.
-    #[test]
-    fn a_resolve_reopens_the_servers_own_worktree_not_the_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .arg(dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init failed");
-        let opened = GitTransport::discover(dir.path()).unwrap();
-
-        let reopened = reopen(Some(&opened)).unwrap();
-        assert_eq!(
-            reopened.work_dir().canonicalize().unwrap(),
-            dir.path().canonicalize().unwrap(),
-        );
+        assert!(handle(Err(&workspace), &TurnOptions::default(), notification).is_none());
     }
 
     #[test]
     fn an_unparseable_line_produces_no_response() {
         let workspace = "no workspace".to_string();
-        let registry: Registry = Arc::new(Mutex::new(Found::default()));
-        assert!(handle(
-            Err(&workspace),
-            &TurnOptions::default(),
-            &registry,
-            "{not json"
-        )
-        .is_none());
+        assert!(handle(Err(&workspace), &TurnOptions::default(), "{not json").is_none());
     }
 
     #[test]
@@ -1140,39 +733,96 @@ mod tests {
         );
     }
 
+    /// The model learns how caos fits together from `instructions`, so it must say
+    /// where the tools are and how to find out more.
+    #[test]
+    fn the_handshake_tells_the_model_how_to_use_the_tools() {
+        let instructions = initialize(&json!({}))["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for needle in [
+            "help(path)",
+            "run(path",
+            "start(",
+            "result(",
+            "eval-path",
+            "caos-std/",
+        ] {
+            assert!(
+                instructions.contains(needle),
+                "instructions lack {needle:?}"
+            );
+        }
+    }
+
+    /// The list is a constant and holds exactly these five, in this order.
+    #[test]
+    fn the_tool_list_is_five_fixed_tools() {
+        let names: Vec<String> = tools()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["run", "help", "start", "result", "eval-path"]);
+        let listed = handle(
+            Err(&"no workspace".to_string()),
+            &TurnOptions::default(),
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+        )
+        .unwrap();
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 5);
+    }
+
     /// Every tool must accept the injected session arg, or the hook's
     /// `updatedInput` would produce a call that fails schema validation.
     #[test]
-    fn a_declaration_carries_the_injected_args() {
-        let declared = mcp_declaration(&json!({
-            "name": "read",
-            "description": "Read a file.",
-            "input_schema": {
-                "type": "object",
-                "properties": { "file_path": { "type": "string" } },
-                "required": ["file_path"],
-            },
-        }));
-        let properties = &declared["inputSchema"]["properties"];
-        assert!(properties.get(SESSION_ARG).is_some());
-        assert!(properties.get("file_path").is_some());
-        assert_eq!(declared["inputSchema"]["required"], json!(["file_path"]));
-        assert!(declared.get("input_schema").is_none());
+    fn every_tool_carries_the_injected_args() {
+        for tool in tools() {
+            let properties = &tool["inputSchema"]["properties"];
+            for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
+                assert!(
+                    properties.get(injected).is_some(),
+                    "{} does not declare {injected}",
+                    tool["name"]
+                );
+            }
+        }
     }
 
-    /// Including this server's OWN tool. The `PreToolUse` hook matches on the
-    /// `mcp__caos__` prefix, so it injects into a `caos_status` call too, and a
-    /// schema that did not declare those arguments would fail validation on the
-    /// one call whose whole job is to explain why the others are missing.
+    /// `run`, `help` and `eval-path` are the step's `run_tool`, `tool_help` and
+    /// `eval_path`; `start` begins the same call `run` does.
     #[test]
-    fn the_status_tool_carries_the_injected_args_too() {
-        let properties = &status_declaration()["inputSchema"]["properties"];
-        for injected in [SESSION_ARG, "caos_tool_use_id", "caos_prompt_id"] {
-            assert!(
-                properties.get(injected).is_some(),
-                "{STATUS_TOOL} does not declare {injected}"
-            );
-        }
+    fn the_tools_are_the_steps_under_the_names_the_model_reads() {
+        assert_eq!(step_tool("run"), Some("run_tool"));
+        assert_eq!(step_tool("start"), Some("run_tool"));
+        assert_eq!(step_tool("help"), Some("tool_help"));
+        assert_eq!(step_tool("eval-path"), Some("eval_path"));
+        assert_eq!(step_tool("result"), None);
+        assert_eq!(step_tool("read"), None);
+    }
+
+    /// With no workspace `help` still answers, and its first words are the reason.
+    #[test]
+    fn a_degraded_overview_leads_with_its_reason() {
+        let result = overview("", Some("not a git working tree"));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("caos is DEGRADED"), "{text}");
+        assert!(text.contains("reason: not a git working tree"), "{text}");
+        assert!(text.contains("--- caos diag ---"), "{text}");
+    }
+
+    /// The same, asked through the protocol: no workspace, `help` with no path.
+    #[test]
+    fn help_with_no_workspace_explains_instead_of_failing() {
+        let response = handle(
+            Err(&"no repository".to_string()),
+            &TurnOptions::default(),
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"help","arguments":{}}}"#,
+        )
+        .unwrap();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("reason: no repository"), "{text}");
+        assert_eq!(response["result"]["isError"], false);
     }
 }
 
@@ -1206,7 +856,7 @@ mod redaction_tests {
         let journal = format!(
             "phase journal (most recent last):\n  \
              push-failed: 7662 after 0.6s: git push --progress {ticket} 7662:refs/caos/req/7662\n  \
-             warm log: fatal: could not read from remote repository {ticket}\n"
+             hook log: fatal: could not read from remote repository {ticket}\n"
         );
         let shown = redact_secrets(&journal);
         assert!(
@@ -1229,8 +879,8 @@ mod redaction_tests {
 
 #[cfg(test)]
 mod env_diagnostic_tests {
-    /// The status text must NAME a variable nothing reads, because a cloud session
-    /// cannot read the hook's log and this tool is all it has. A misconfigured
+    /// The overview must NAME a variable nothing reads, because a cloud session
+    /// cannot read the hook's log and this is all it has. A misconfigured
     /// environment reported only as "no caos remote" sends whoever is debugging
     /// it looking at the repository instead of the env.
     #[test]

@@ -274,10 +274,15 @@ func main() {
 		permissions, _ := settings["permissions"].(map[string]any)
 		deny := fmt.Sprint(permissions["deny"])
 		allow := fmt.Sprint(permissions["allow"])
-		w.True(!strings.Contains(deny, "Bash") && strings.Contains(allow, "Bash"),
-			"--enable-bash did not move Bash from deny to allow (deny=%s allow=%s)", deny, allow)
-		w.True(strings.Contains(deny, "Write"),
-			"--enable-bash let Write out of the deny list (deny=%s)", deny)
+		// Claude Code's own tools are not denied, with or without the (now inert) flag:
+		// caos is a separate workspace beside them, not a replacement for them.
+		for _, builtin := range []string{"Bash", "Read", "Edit", "Write", "Glob", "Grep"} {
+			w.True(!strings.Contains(deny, " "+builtin+" ") && !strings.HasPrefix(deny, "["+builtin+" "),
+				"%s is denied (deny=%s)", builtin, deny)
+		}
+		w.True(strings.Contains(deny, "mcp__github__create_pull_request"),
+			"the GitHub tools caos covers are no longer denied (deny=%s)", deny)
+		_ = allow
 
 		args := mcpArgs(readJSON("/tmp/home/.claude.json"))
 		w.True(len(args) > 0, "the caos server takes no arguments")
@@ -318,7 +323,7 @@ func main() {
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
 		w.True(dev["std_path"] == "caos-std" && dev["repo"] == repo,
 			"the dev stamp does not describe the checkout it seeded from: %v", dev)
-		// A stamp is quoted verbatim into a model's context by `caos_status`.
+		// A stamp is quoted verbatim into a model's context by `help`.
 		for _, name := range []string{"dev-stamp", "setup-stamp"} {
 			body := read("/tmp/share/" + name)
 			w.True(!strings.Contains(body, "caos://"),
@@ -404,8 +409,8 @@ func main() {
 		w.Step("the session hook fails a cached install the checkout's pin has left")
 		// -------------------------------------------------------------------
 		// A cached setup is not re-run when the repo moves its pin, so the hook
-		// is the only thing that can notice. No std_path in these stamps: the
-		// hook then stops before the warm, which would need a server.
+		// is the only thing that can notice. The stamps name no server, so the
+		// hook can only compare pins.
 		pinRepo := fixtureRepo("/tmp/pin-repo")
 		hook := func(shareDir, pin, devRev string) (string, bool) {
 			write(filepath.Join(shareDir, "setup-stamp"), "pin="+pin+"\n", 0o644)

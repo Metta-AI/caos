@@ -35,79 +35,55 @@ added to that repository, and only the resolved oid enters the cache key.
 
 ## What the model sees
 
-Claude Code's built-in file and shell tools are denied, which removes them from
-the model's context entirely rather than merely refusing their calls. In their
-place the tool server offers **`llm-step`'s tools** — read, ls, grep, write,
-edit, the history tools, `merge`, `import_source`, `publish_source`, and
-`tool_help`/`run_tool`. Shell is not among them by name: it is
-`run_tool(path="caos-std/bash-tool")`, reached by path like every std tool
-that carries its own help (`std/README.md`), and so are the caos build/test
-tools.
+**Five fixed tools, and they never change:** `run`, `help`, `start`, `result` and
+`eval-path`. They are the caos server's own primitives — run something, describe it,
+begin it without waiting, ask how it went, evaluate a path — and what they run is
+named by a PATH in the conversation: `caos-std/read`, `caos-std/bash-tool`,
+`feature/01-change/caos-tools/test`. Nothing is listed and nothing has to resolve
+first, so `tools/list` is a constant and a client that reads it once, or ignores
+`tools/list_changed`, is correct rather than stale.
 
-The deny list is `Bash, Read, Edit, Write, Glob, Grep, NotebookEdit` — every
-built-in whose job a workspace tool does, so the model works in the RECORDED
-conversation tree, not the container's raw checkout (which a caos `write` never
-touches, so the two diverge). `Monitor` is on the list for a different reason:
-it is not a file tool, but it runs an arbitrary shell `command`, so leaving it
-would be a hole straight back to the shell the `Bash` deny closes — a session
-was seen reading files and running commands through it while everything else was
-blocked. Web access (`WebFetch`/`WebSearch`) and subagents (`Task`) are left
-alone: the step offers no equivalent, so denying them would remove a capability
-rather than redirect it. **Any new harness tool that can run a command or read a
-path belongs on this list**; the deny list is only as tight as its last audit.
+| tool | what it does |
+|---|---|
+| `help(path)` | what the tool at a path does and the arguments it takes. `help()` with no path says how caos is doing in this session: the conversation and its head commit, and diagnostics. |
+| `run(path, arguments)` | run the tool at a path and wait for its output. |
+| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. |
+| `result(ticket)` | pending, or the output, or how it failed. Asking never runs anything. |
+| `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass the hash as `in` to `read`, `ls` or `grep` to look inside it. |
 
-`mcp__claude-code-remote__add_repo` is denied too, though it is not a file tool.
-It adds a repo to the cloud session's sources, and nothing can read the clone it
-asks for (no `Read`, no `Bash`), so it buys nothing. It also costs something: a
-session with a second source was seen restarting in `/home/user`, which is no
-repository, and the tool server then offered only `caos_status`. Import a
-repository into the conversation with `import_source` instead.
+The model learns the rest from the server's `instructions`, which the handshake
+carries and a client puts in front of the model, and from `help`. Both say where the
+standard tools are (`caos-std/`: `read`, `ls`, `write`, `edit`, `copy`, `move`,
+`remove`, `grep`, `log`, `show`, `diff`, `merge`, `import-source`, `publish-source`,
+`bash-tool`, `caos-build`, `caos-test`, `github`, …) and how to find the index
+(`eval-path("caos-std")`, then `read` its `README.md`). `std/README.md` is the index.
 
-Not a copy of them: THE SAME ONES. `tools/list` runs the step with
-`--list-tools` and hands back the registry it answers with, and a call runs the
-step with `--tools-only`, which executes it exactly as it does for a turn the
-step drives itself. So this client knows what `edit` is only in the sense that
-it passes the name along, and a tool reads and behaves one way whether a model
-meets it here or in the tui.
+**caos is a separate git workspace, not a replacement for Claude Code's own tools.**
+The conversation was seeded from a commit, not from the container's checkout, so
+nothing diverges: Claude Code's `Read`, `Edit` and `Bash` act on the container's
+files, and caos's tools act on the conversation's. Nothing moves between the two
+unless the model copies it (`import-source` brings code in; `publish-source` sends a
+source tree out). `shared/settings.json` therefore denies none of the built-ins. It
+still denies the GitHub MCP server's tools that caos covers, and `add_repo`: a second
+source was seen restarting the session in `/home/user`, which is no repository, and
+the server then could not find its workspace.
 
-That also settles what used to be a standing hazard: the tools were once
-implemented twice, and the two copies drifted — a second description of every
-tool, a second bash-input shape (and so a second cache key for an identical
-command), a second rendering of a grep result. What is offered here now is
-whatever the named step offers, in whatever repository it is pointed at.
+Each call is ONE request to the server: `run` is `POST /eval/run` of `llm-step` in its
+tools-only mode, `start` is `POST /start/run`, `result` is `GET /result/<ticket>`
+(HTTP API, `/eval/<verb>`). The step declares the call on the conversation's active
+request, runs the tool, and answers with the call's own record, so this client neither
+writes the conversation nor reads it back. The tools run exactly as they run in a turn
+the step drives itself, and a tool reads and behaves one way whether a model meets it
+here or in the tui.
 
-Resolving the step is a worker run — the first time in a tree it BUILDS the step,
-minutes of rustc — so it cannot sit in front of the handshake. `caos mcp warm`
-resolves it in the session-start hook, BEFORE Claude Code starts, and leaves the
-registry in an on-disk cache; `tools/list` then serves that cache from its first
-read. Without a warm (a dev checkout, or one that could not finish) the first
-`tools/list` resolves ONCE, inline, and answers with the result — real tools, or,
-on failure, the stand-in below. The reply is final: no timed hold, no background
-retry, no `tools/list_changed` revising it afterward, which is what a client that
-reads the list exactly once needs.
+**A path that does not exist is the model's mistake, and it is told so.** `help` or `run`
+at a path nothing evaluates comes back as an error result, naming the sibling
+directories, not as a failed server.
 
-When there are no workspace tools there is one, **`caos_status`**, and it exists
-because of how the alternative failed: a model handed zero tools does not report
-"my tool server has no tools", it reports that caos is absent — which is what
-every session said while its server sat connected and working. `caos_status`
-answers with the actual reason (client build, `caos` remote, the git remote
-helper, the
-resolution's phases), and it rides alongside the real tools too, since those
-diagnostics are wanted most on a session you are trying to confirm.
-
-**No tree is named for the listing, and the listing is tree-independent because
-of it.** A repository's own tools are reached by path (`tool_help` describes
-one, `run_tool` runs it), so the declarations are the same whatever the
-conversation carries. This listing used to name the workspace tree, which
-pushed the whole working tree to the caos server: for a repository that defined
-no tools, a push of everything to be told "none" — and against a server that no
-longer answers it did not fail, it waited. The step never read the argument.
-
-**The workspace is the conversation's tree, not your checkout.** A `write`
-never touches a file on disk; it produces a new tree and the step appends a
-transition carrying it. Your working copy is untouched for the whole session,
-exactly as it is when the TUI runs a turn. To bring the result into your
-checkout, use the conversation like any other — `caos tui`, then `Ctrl+L`.
+When there is no workspace (the hook could not find a repository), `help` with no path
+still answers and leads with the reason; every other tool says the same. That one call is
+the whole of the diagnostic surface: a model handed a server that says nothing cannot
+tell it from no server at all.
 
 ## Configuration
 
@@ -133,9 +109,8 @@ binary (`rust/target/debug/caos-cli`, say). The default is relative, so a
 by-hand launch from elsewhere will not find it; the launcher resolves an
 absolute path from its own location and has no such constraint.
 
-`settings.json` denies Claude Code's built-in file and shell tools, which
-removes them from the model's context rather than merely refusing their calls,
-and points every hook at `caos mcp hook`. `mcp.json` declares the tool server.
+`settings.json` points every hook at `caos mcp hook` (and denies the GitHub tools caos covers, below).
+`mcp.json` declares the tool server.
 Both pass `--llm-step:@=std/llm-step`, which is a statement about THIS
 checkout and nothing more: these two files are the caller. Elsewhere they say
 something else — `install.sh --user-config` rewrites that argument
@@ -154,12 +129,10 @@ That distinction is worth the paragraph because of how it fails. An unset
 variable in `mcp.json` is not an error: Claude Code warns, uses the literal
 `${CLAUDE_PROJECT_DIR}` as the command, and still reports the server as loaded.
 The session then runs with **no caos tools at all** — and a model with no tools
-does not say so. Asked to write a file, it will emit a plausible `bash` block
-and report success, having written nothing. `integrations/claude-code/run` therefore
-probes `tools/list` before launching, so a missing binary — or a caos server
-that is not up, since the listing comes from the step — is an error at startup
-instead of a fabricated result later.
-
+does not say so. Asked to use caos, it will describe doing it and report success,
+having done nothing. `integrations/claude-code/run` therefore probes `tools/list`
+before launching, so a missing binary is an error at startup instead of a fabricated
+result later.
 ## Driving a cloud session from elsewhere
 
 A local Claude session (or a person at a terminal) can start a cloud session,
@@ -308,7 +281,7 @@ the tui against the same conversation.
 A cloud session is disposable and its Claude Code context dies with it; the
 conversation does not. Two slash commands, both taking the conversation COMMIT to
 start from — the `caos head <hash>` a turn prints, or `conversation head:` from
-`caos_status`. A commit, because it is immutable where a ref moves.
+`help` with no path. A commit, because it is immutable where a ref moves.
 
 | Command | Result |
 |---|---|
@@ -327,7 +300,7 @@ than the `/name <hash>` that was typed.
 A resumed conversation keeps its OLD id, so the session has to be told which one
 it writes to. That is the one piece of local state in `caos mcp`: a file per
 session under the checkout's git directory (`caos-cc-sessions/`), read wherever a
-session id becomes a conversation id (the hook, the tool server, `caos_status`).
+session id becomes a conversation id (the hook, the tool server, `help`).
 A session that loses it records into its own derived conversation, never into
 someone else's.
 
@@ -345,24 +318,9 @@ and the protocol refuses that fork with its own message.
 ## Not yet done
 
 - **Subagents.** `SubagentStart`/`SubagentStop` are not wired, so Claude Code's
-  own `Agent` call records nothing. (`spawn_agent` and `run_async` are a
-  different thing and ARE offered — they are the step's tools, so they arrive
-  with everything else — but nothing here has exercised them yet.)
+  own `Agent` call records nothing. (`agent-spawn` and `run-async` are a
+  different thing and ARE reachable, as `caos-std/agent-spawn` and the like, but
+  nothing here has exercised them from Claude Code yet.)
 - **Model attribution.** The `Stop` payload carries no model name, so assistant
   entries say `claude-code` rather than naming a model. Better than a
   plausible-looking string nothing verified.
-- **A cold server build.** Resolving the step is now ONE `GET /eval?root:@@=`
-  request to the caos server, which walks `.caos-expr` there — where each hop is
-  sub-millisecond — instead of the ~54 chatty round trips the client used to
-  make (measured over the dumbpipe tunnel this replaced: the difference between
-  ~30s and ~2s, and the
-  reason a cloud session's first turn works at all rather than the prompt hook
-  being killed mid-resolve). The result is memoized server-side, so only the
-  FIRST session against a step-tree the server has never built waits for the
-  real rustc/cargo compiles — `caos_status` explains that wait — and every
-  session after is a memo hit. `caos mcp warm` now does that resolve in the
-  session-start hook, before Claude Code starts, and caches the result — so a
-  warm server's first turn is a cache read. What remains is the genuinely-cold
-  case: the FIRST session against a step-tree the server has never built, where
-  even the warm can outlast the hook's bounded budget and the tools arrive a
-  turn late instead of on turn one. `caos_status` explains that wait.

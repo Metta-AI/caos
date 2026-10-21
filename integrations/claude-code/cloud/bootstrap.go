@@ -810,7 +810,7 @@ func main() {
 	}
 	writeStamp(filepath.Join(shareDir, "setup-stamp"), stamp)
 	// NOT THE TICKET. A `caos://` URL is the capability to drive that server, and
-	// these files are quoted verbatim into a model's context by `caos_status`.
+	// these files are quoted verbatim into a model's context by `help`.
 	if devRev != "" {
 		writeStamp(filepath.Join(shareDir, "dev-stamp"), map[string]string{
 			"rev":      devRev,

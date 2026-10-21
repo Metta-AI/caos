@@ -4,7 +4,7 @@
 //! directory that was not a repository, and every hook failed discovery while
 //! nothing recorded what the directory WAS, what sat beside it, or whether the
 //! container was new. One function answers all of that, and every failure path
-//! calls it: the hooks, `caos_status`, and the SessionStart hook (through
+//! calls it: the hooks, `help`, and the SessionStart hook (through
 //! `caos mcp diag`).
 //!
 //! It reads facts and invents none: a missing file or a failed command becomes
@@ -30,7 +30,7 @@ const SCAN_DEPTH: usize = 2;
 /// Who is asking, and why.
 #[derive(Default)]
 pub struct Context<'a> {
-    /// The hook event, or `caos_status` / `serve` for the callers that are not
+    /// The hook event, or `help` / `serve` for the callers that are not
     /// hooks.
     pub event: &'a str,
     /// `startup` or `resume`, from a SessionStart payload.

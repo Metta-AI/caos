@@ -38,7 +38,6 @@ use serde_json::{json, Value};
 use caos::{GitTransport, Transport};
 use conversation_protocol::v3::oid::Oid;
 use conversation_protocol::v3::refs;
-use conversation_protocol::v3::ObjectStore;
 
 use crate::{
     conversation_ref, eval_base, fetch_head, oid, open_store, resolve_username, seed_content,
@@ -113,7 +112,6 @@ pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Resu
         // Needs no workspace: it exists to describe one that is missing.
         Some("diag") => diag::cli(&rest[1..]),
         Some("serve") => serve::serve(workspace, options),
-        Some("warm") => serve::warm(&workspace?, &options),
         _ => Err(usage()),
     }
 }
@@ -122,9 +120,8 @@ fn usage() -> String {
     format!(
         "usage:\n  \
          caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
-         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n  \
-         caos mcp warm    (resolve the tools now and cache them for the next serve)\n\n\
-         All name the step whose tools this session offers:\n  \
+         caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
+         Both name the step that runs this session's tools:\n  \
          {}",
         crate::missing_image_arg(LLM_STEP_ARG)
     )
@@ -138,19 +135,65 @@ struct ToolOutcome {
     is_error: bool,
 }
 
-/// Run one workspace tool: one request to the server.
+/// A tool call, ready to send: the session's workspace, the conversation it
+/// belongs to, and the parameters of the request that carries it.
+struct PreparedCall {
+    workspace: GitTransport,
+    conversation: String,
+    params: Vec<(&'static str, String)>,
+}
+
+impl PreparedCall {
+    fn params(&self) -> Vec<(&str, &str)> {
+        self.params
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    }
+}
+
+/// Everything a tool call needs before it is sent: open the session's
+/// workspace, find the conversation, and form the step's parameters.
+///
+/// A FRESH transport, not the one `serve` opened at spawn. That one was read
+/// once, and in a cloud session it can predate the SessionStart hook that adds the
+/// `caos` remote -- so a call driven through it dials a server it does not know
+/// and fails "no `caos` git remote" while the remote is right there.
+///
+/// The conversation must already exist. The prompt hook opens it, and runs in
+/// another process, so the first call can beat it; `wait_for_conversation` covers
+/// that race.
+fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
+    let workspace = workspace::open(session)
+        .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
+    let conversation = resume::conversation_for_session(&workspace, session)?;
+    wait_for_conversation(&workspace, &conversation);
+    let call = args
+        .get("caos_tool_use_id")
+        .and_then(Value::as_str)
+        .unwrap_or(name)
+        .to_string();
+    let arguments = declared_args(args).to_string();
+    Ok(PreparedCall {
+        workspace,
+        conversation,
+        params: vec![
+            ("tools-only", call),
+            ("tool", name.to_string()),
+            ("arguments", arguments),
+        ],
+    })
+}
+
+/// Run one tool and wait for what it said: one request to the server.
 ///
 /// The request is `llm-step` in its tools-only mode, given the call -- its id,
 /// the tool and its arguments -- and the conversation it belongs to. The step
 /// declares the call on the conversation's active request, runs it, and answers
 /// with the call's record, so this process neither writes the conversation nor
-/// reads it back: it sends a call and receives what the tool said. Nothing here
-/// knows what `edit` is, which is why a session in another repository gets the
-/// same tools as the tui: they are the step's, reached through `--llm-step`.
-///
-/// The conversation must already exist. The prompt hook opens it, and runs in
-/// another process, so the first call can beat it; `wait_for_conversation`
-/// covers that race.
+/// reads it back: it sends a call and receives what the tool said. `name` is the
+/// STEP's name for the tool (`run_tool`, `tool_help`, `eval_path`); the server
+/// presents them as `run`, `help` and `eval-path`.
 fn run_tool(
     _serve_transport: &GitTransport,
     options: &TurnOptions,
@@ -158,37 +201,54 @@ fn run_tool(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
-    // A FRESH transport, not the one `serve` opened at spawn. That one was read
-    // once, and in a cloud session it can predate the SessionStart hook that
-    // adds the `caos` remote -- so a call driven through it dials a server it
-    // does not know and fails "no `caos` git remote" while the remote is right
-    // there. The resolver thread re-opens per attempt for exactly this reason
-    // (see `resolve_in_background`); a call has to as well.
-    let fresh = workspace::open(session)
+    let call = prepare_call(session, name, args)?;
+    let (kind, result) = run_step(&call.workspace, options, &call.conversation, &call.params())?;
+    decode_result(&call.workspace, &kind, &result)
+}
+
+/// Start a tool without waiting, and return the ticket to ask for it by. The same
+/// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
+/// what a client will wait for is not lost with its connection.
+fn start_tool(
+    options: &TurnOptions,
+    session: &str,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let call = prepare_call(session, name, args)?;
+    start_step(&call.workspace, options, &call.conversation, &call.params())
+}
+
+/// The state of a started tool, from its ticket.
+fn tool_result(session: &str, ticket: &str) -> Result<ToolOutcome, String> {
+    if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("{ticket:?} is not a ticket; `start` returns one"));
+    }
+    let workspace = workspace::open(session)
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
-    let t = &fresh;
-    let id = resume::conversation_for_session(t, session)?;
-    wait_for_conversation(t, &id);
-    let call = args
-        .get("caos_tool_use_id")
-        .and_then(Value::as_str)
-        .unwrap_or(name)
-        .to_string();
-    let arguments = declared_args(args).to_string();
-    let (kind, result) = run_step(
-        t,
-        options,
-        &id,
-        &[
-            ("tools-only", call.as_str()),
-            ("tool", name),
-            ("arguments", arguments.as_str()),
-        ],
-    )?;
+    wait_server_reachable(&workspace)?;
+    Ok(match caos::line_result(&workspace.server_url()?, ticket)? {
+        caos::LineResult::Pending => ToolOutcome {
+            text: "pending: the call has not finished. Ask for `result` again with this \
+                       ticket."
+                .to_string(),
+            is_error: false,
+        },
+        caos::LineResult::Done { kind, hash } => decode_result(&workspace, &kind, &hash)?,
+        caos::LineResult::Failed { status, message } => ToolOutcome {
+            text: format!("the call failed ({status}): {message}"),
+            is_error: true,
+        },
+    })
+}
+
+/// What a tools-only run answered, as the model reads it: the call's `status` and
+/// `observation`, which are the same bytes the conversation recorded.
+fn decode_result(t: &GitTransport, kind: &str, result: &str) -> Result<ToolOutcome, String> {
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
     }
-    let files = caos::tree_blobs(t, &result)?;
+    let files = caos::tree_blobs(t, result)?;
     let part = |file: &str| {
         files
             .get(file)
@@ -199,19 +259,37 @@ fn run_tool(
     Ok(ToolOutcome { text, is_error })
 }
 
-/// Run the step on a conversation: one request to the server, answered with the
-/// result's `(kind, hash)`. `params` are the step's own arguments for this call
-/// (a tool call, a recorded event); the step and the conversation are added.
+/// A request to run the step, ready to send: where, with what parameters, and
+/// presenting which secrets.
+struct StepRequest {
+    server: String,
+    params: Vec<(String, String)>,
+    secrets: caos::Secrets,
+}
+
+impl StepRequest {
+    fn params(&self) -> Vec<(&str, &str)> {
+        self.params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect()
+    }
+}
+
+/// The request that runs the step on a conversation, ready to send: the server,
+/// the parameters (`params` are the step's own arguments for this call -- a tool
+/// call, a recorded event -- and the step and the conversation are added), and
+/// the secrets to present.
 ///
 /// EVERYTHING a tool call or a hook does to a conversation goes through here, so
 /// that is the whole of the client's part: no checkout of the conversation is
 /// read, none is written, and nothing is pushed first.
-fn run_step(
+fn step_request(
     t: &GitTransport,
     options: &TurnOptions,
     id: &str,
     params: &[(&str, &str)],
-) -> Result<(String, String), String> {
+) -> Result<StepRequest, String> {
     let secrets = caos::Secrets::current().for_conversation(id);
     // REACHABLE FIRST, in front of everything below. Resolving the step talks
     // to the server, and in a cloud session that server is reached through a
@@ -221,13 +299,48 @@ fn run_step(
     // Claude Code hanging on the first thing you type, with nothing saying why.
     wait_server_reachable(t)?;
     let step = step_image(t, options, &secrets)?;
+    let mut all: Vec<(String, String)> = vec![
+        ("base:hash".to_string(), step),
+        ("conversation".to_string(), id.to_string()),
+    ];
+    all.extend(
+        params
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
     let salt = std::env::var("CAOS_SALT").unwrap_or_default();
-    let mut all = vec![("base:hash", step.as_str()), ("conversation", id)];
-    all.extend_from_slice(params);
     if !salt.is_empty() {
-        all.push(("salt", salt.as_str()));
+        all.push(("salt".to_string(), salt));
     }
-    caos::eval_line_request(&t.server_url()?, "run", &all, &secrets)
+    Ok(StepRequest {
+        server: t.server_url()?,
+        params: all,
+        secrets,
+    })
+}
+
+/// Run the step on a conversation and wait: the result's `(kind, hash)`.
+fn run_step(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    params: &[(&str, &str)],
+) -> Result<(String, String), String> {
+    let request = step_request(t, options, id, params)?;
+    let all = request.params();
+    caos::eval_line_request(&request.server, "run", &all, &request.secrets)
+}
+
+/// Start the step on a conversation without waiting: the ticket.
+fn start_step(
+    t: &GitTransport,
+    options: &TurnOptions,
+    id: &str,
+    params: &[(&str, &str)],
+) -> Result<String, String> {
+    let request = step_request(t, options, id, params)?;
+    let all = request.params();
+    caos::start_line_request(&request.server, "run", &all, &request.secrets)
 }
 
 /// The step, resolved from the tree the conversation seeds from: `--base`'s
@@ -282,7 +395,7 @@ fn step_image(
 const HOOK_REACH_ATTEMPTS: u32 = 6;
 const HOOK_REACH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
+pub(super) fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
     let mut last = t.ensure_server_reachable();
     let mut attempt = 1;
     while last.is_err() && attempt < HOOK_REACH_ATTEMPTS {
@@ -322,78 +435,6 @@ fn wait_for_conversation(t: &GitTransport, id: &str) {
             std::thread::sleep(TOOL_WAIT_INTERVAL);
         }
     }
-}
-
-/// The last successful tool discovery's phase timings, for `caos_status` to
-/// report -- the one place a locked-down session can see WHERE the wait went.
-/// Discovery is not just the `:@@=` resolve `/resolve-locator` does; it also
-/// runs `llm-step` in a worker, and only a measurement says which dominates.
-/// Written once per successful resolve.
-static DISCOVERY_TIMING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-/// The timing string [`declarations`] last recorded, or `None` before the first
-/// successful resolve.
-pub(crate) fn discovery_timing() -> Option<String> {
-    DISCOVERY_TIMING.lock().ok().and_then(|slot| slot.clone())
-}
-
-/// The tools this session offers, as MCP declarations.
-///
-/// Asked of the step that implements them, so there is one description of
-/// `edit` wherever a model meets it. A tool a repository defines is NOT among
-/// them: it is reached by path through `tool_help` / `run_tool`, exactly as in
-/// the tui.
-fn declarations(t: &GitTransport, options: &TurnOptions) -> Result<Vec<Value>, String> {
-    let total = std::time::Instant::now();
-    let secrets = caos::Secrets::current();
-    let mark = std::time::Instant::now();
-    let base = step_image(t, options, &secrets)?;
-    let resolve_step = mark.elapsed();
-    // NO TREE IS NAMED HERE, and the listing is tree-INDEPENDENT because of it.
-    // A repository's own tools are reached by PATH (`tool_help` to describe one,
-    // `run_tool` to invoke it), so the declarations are the same whatever the
-    // conversation carries -- which is what lets this answer be cached, and
-    // makes a client that ignores `tools/list_changed` correct rather than
-    // stale.
-    //
-    // It used to pass `--workspace:hash=<tree>`, which PUSHED THE WHOLE WORKING
-    // TREE to the caos server -- by its own comment the most expensive thing
-    // this client does, and through a dead tunnel a push that never returns, so
-    // the session got a tool server that was connected and permanently empty.
-    // The step never read the argument: `grep -rn workspace std/llm-step/src/`
-    // is empty, and `registry` never enumerated tree tools.
-    let kvs = vec!["--list-tools=1".to_string()];
-    let mark = std::time::Instant::now();
-    let (_, result) = caos::run_client_request_with_secrets(t, &base, &kvs, &secrets)?;
-    let run_list = mark.elapsed();
-    let objects = open_store(t)?;
-    let result = oid(&result, "tool registry")?;
-    objects.ensure_local(&result)?;
-    let bytes = objects.read_blob(&result).map_err(String::from)?;
-    let tools = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("parsing the tool registry: {error}"))?;
-    // The run-list phase includes pushing the workspace closure to the server,
-    // so a big number there is usually the push, not the worker's own work.
-    let (held, sent) = caos::push_counts();
-    caos::timing::record(
-        "declarations",
-        &format!(
-            "resolve-llm-step {:.1}s, run-list-tools {:.1}s (total {:.1}s) \
-             [objects: {held} already on the server, {sent} pushed]",
-            resolve_step.as_secs_f64(),
-            run_list.as_secs_f64(),
-            total.elapsed().as_secs_f64(),
-        ),
-    );
-    if let Ok(mut slot) = DISCOVERY_TIMING.lock() {
-        *slot = Some(format!(
-            "resolve-llm-step {:.1}s, run-list-tools {:.1}s (total {:.1}s)",
-            resolve_step.as_secs_f64(),
-            run_list.as_secs_f64(),
-            total.elapsed().as_secs_f64(),
-        ));
-    }
-    Ok(tools)
 }
 
 /// The model's own arguments, without the values the hook injected: those are
@@ -803,7 +844,7 @@ fn on_stop(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(
 /// ref once, when the first prompt creates it, and its head after every turn.
 ///
 /// A `systemMessage` goes to the USER, not the model. Without it the head is
-/// reachable only by asking the model to call `caos_status`, and the id itself
+/// reachable only by asking the model to call `help`, and the id itself
 /// (`cc/<Claude Code's internal session id>`) appears in no URL.
 fn announce(text: &str) -> Result<(), String> {
     let message = json!({ "systemMessage": text });

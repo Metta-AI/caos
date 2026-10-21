@@ -274,19 +274,10 @@ func settingsJSON(a args, locator string) []byte {
 	}}
 
 	if a.enableBash {
-		// Lift the read/inspect tools out of deny and into allow, so a session
-		// can be driven to dump the container. Edit/Write/NotebookEdit/Monitor
-		// stay denied -- this is for looking, not for the model rewriting the
-		// checkout.
-		inspect := []string{"Bash", "Read", "Grep", "Glob"}
-		permissions, _ := settings["permissions"].(map[string]any)
-		if permissions == nil {
-			permissions = map[string]any{}
-			settings["permissions"] = permissions
-		}
-		permissions["deny"] = without(permissions["deny"], inspect)
-		permissions["allow"] = with(permissions["allow"], inspect)
-		say("--enable-bash: Bash/Read/Grep/Glob will be allowed this session")
+		// Nothing denies Claude Code's own tools any more, so there is nothing to
+		// lift. The flag is still accepted because setup lines in existing
+		// environments carry it, and an unknown flag is fatal.
+		say("--enable-bash: nothing to do; Claude Code's own tools are not denied")
 	}
 
 	data := marshal(settings)
@@ -498,7 +489,7 @@ func main() {
 
 	// What this client is, for whoever has to name the step it drives: the
 	// twelve digits in the wrapper cannot be expanded without it, and
-	// `caos_status` quotes it into a session's own diagnostic.
+	// `help` quotes it into a session's own diagnostic.
 	record := fmt.Sprintf("repo=%s\ncommit=%s\nversion=%s\n", a.repo, a.commit, a.version)
 	if err := os.MkdirAll(filepath.Join(a.prefix, "share/caos"), 0o755); err != nil {
 		fatal("could not make %s: %v", filepath.Join(a.prefix, "share/caos"), err)

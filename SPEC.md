@@ -167,7 +167,7 @@ README or design docs — not from a listing. That is the whole point of the
 change: enumerating them meant injecting every source tree's tools into the
 system prompt, so a conversation that gained a source tree mid-run re-keyed the
 prompt and grew it per tree. Naming a path instead makes the tool list
-TREE-INDEPENDENT, which is also what lets `caos mcp`'s listing be cached and
+TREE-INDEPENDENT, which is also what lets `caos mcp` offer a FIXED list of five tools and
 makes a client that ignores `tools/list_changed` correct rather than stale. The
 price is real and deliberate: an undocumented tool is invisible. Prose may drift
 from the tool; `tool_help` is the authority.

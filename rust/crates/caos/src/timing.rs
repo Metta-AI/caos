@@ -10,7 +10,7 @@
 //! again with a stopwatch" is not available either.
 //!
 //! So: one append-only file, written by whichever process did the work and read
-//! back by `caos_status`. Best-effort throughout -- a phase journal that can
+//! back by `help`. Best-effort throughout -- a phase journal that can
 //! fail a run is worse than no phase journal, and this exists to explain slow
 //! runs, not to gate them.
 

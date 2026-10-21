@@ -26,14 +26,13 @@ if [ ! -x "$CAOS_BIN" ]; then
 fi
 export CAOS_BIN
 
-# Prove the server actually answers before handing it to a session, so a broken
-# binary or an unreachable server is an error here rather than a toolless model
-# later. `tools/list` is a WORKER RUN -- the tools are `std/llm-step`'s and it
-# is asked to describe them -- so this probe needs the caos server up, and the
-# same `--llm-step` mcp.json passes.
+# Prove the binary answers before handing it to a session, so a broken or stale
+# one is an error here rather than a toolless model later. `tools/list` is a
+# constant (five tools, nothing resolved), so this tests the binary and its argv,
+# not the server: `help` with no path, in a session, is what reports on the server.
 #
-# Stderr is kept: a listing that fails says why there, and "no tools" without
-# the reason is the failure this whole script exists to prevent.
+# Stderr is kept: a failure says why there, and "no tools" without the reason is
+# the failure this whole script exists to prevent.
 #
 # The output is captured rather than piped into `grep -q`: grep exits at its
 # first match and closes the pipe, the server takes SIGPIPE, and under
@@ -61,8 +60,7 @@ case "$probe" in
     *caos_session*) ;;
     *)
         echo "$CAOS_BIN mcp serve listed no tools (see the error above)." >&2
-        echo "The tools come from std/llm-step through the caos server, so" >&2
-        echo "check that the server is up and the binary is current." >&2
+        echo "Check that the binary is current: it must know \`mcp serve\`." >&2
         exit 1
         ;;
 esac

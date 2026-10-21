@@ -4734,6 +4734,100 @@ pub fn eval_line_request(
     )?)
 }
 
+/// Begin evaluating one line on the server without waiting: `POST /start/<verb>`,
+/// with `eval_line_request`'s parameters. Returns the TICKET, the name of the
+/// evaluation (the same call always has the same one); ask for its state with
+/// [`line_result`].
+pub fn start_line_request(
+    base: &str,
+    verb: &str,
+    params: &[(&str, &str)],
+    secrets: &Secrets,
+) -> Result<String, String> {
+    let body = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", percent_encode(name), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut headers = secrets.headers();
+    headers.push((
+        "content-type",
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    let path = format!("/start/{verb}");
+    let answer = server_call(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: &path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(60),
+        },
+    )?;
+    let ticket = String::from_utf8(answer)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?
+        .trim()
+        .to_string();
+    if !is_hex_hash(&ticket) {
+        return Err(format!("server returned a malformed ticket: {ticket:?}"));
+    }
+    Ok(ticket)
+}
+
+/// What a started evaluation has come to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LineResult {
+    /// Still running.
+    Pending,
+    /// Done: the result's kind and hash.
+    Done { kind: String, hash: String },
+    /// Failed, with the HTTP status the failure carried and its message.
+    Failed { status: u16, message: String },
+}
+
+/// The state of a ticket from [`start_line_request`]: `GET /result/<ticket>`. It
+/// only reads, so asking never starts or repeats work.
+pub fn line_result(base: &str, ticket: &str) -> Result<LineResult, String> {
+    let path = format!("/result/{ticket}");
+    let answer = server_call(
+        base,
+        &ServerRequest {
+            method: "GET",
+            path: &path,
+            headers: &[],
+            body: None,
+            timeout_secs: Some(60),
+        },
+    )?;
+    let text =
+        String::from_utf8(answer).map_err(|e| format!("server returned invalid UTF-8: {e}"))?;
+    parse_line_result(text.trim())
+}
+
+fn parse_line_result(text: &str) -> Result<LineResult, String> {
+    if text == "pending" {
+        return Ok(LineResult::Pending);
+    }
+    if let Some(rest) = text.strip_prefix("ok ") {
+        let (kind, hash) = rest
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed result {text:?}"))?;
+        return Ok(LineResult::Done {
+            kind: kind.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+    if let Some(rest) = text.strip_prefix("failed ") {
+        let (status, message) = rest.split_once(' ').unwrap_or((rest, ""));
+        return Ok(LineResult::Failed {
+            status: status.parse().unwrap_or(500),
+            message: message.to_string(),
+        });
+    }
+    Err(format!("the server answered an unknown state: {text:?}"))
+}
+
 /// The blob entries of the tree `hash`, by name, with their contents. Entries
 /// that are not blobs (subtrees, a conversation's gitlink) are left out, so a
 /// result that names a conversation can be read without fetching it.
@@ -5509,5 +5603,30 @@ mod push_negotiation_tests {
         assert!(push_negotiation_args(true).contains(&"protocol.version=2"));
         assert!(push_negotiation_args(false).contains(&"push.negotiate=false"));
         assert!(!push_negotiation_args(false).contains(&"push.negotiate=true"));
+    }
+}
+
+#[cfg(test)]
+mod line_result_tests {
+    use super::*;
+
+    #[test]
+    fn a_ticket_state_parses_the_way_the_server_spells_it() {
+        assert_eq!(parse_line_result("pending"), Ok(LineResult::Pending));
+        assert_eq!(
+            parse_line_result("ok tree abc123"),
+            Ok(LineResult::Done {
+                kind: "tree".into(),
+                hash: "abc123".into()
+            })
+        );
+        assert_eq!(
+            parse_line_result("failed 500 the worker died: exit 2"),
+            Ok(LineResult::Failed {
+                status: 500,
+                message: "the worker died: exit 2".into()
+            })
+        );
+        assert!(parse_line_result("sleeping").is_err());
     }
 }

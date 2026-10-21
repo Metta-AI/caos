@@ -1,7 +1,7 @@
 // The SessionStart hook for a caos cloud session, run through
 // /usr/local/bin/caos-cloud-session-start.
 //
-// It does three things. The setup phase has already installed the client, the
+// It does two things. The setup phase has already installed the client, the
 // git helper, the configuration and the `caos` remote by the time Claude Code
 // starts -- but it may have done so in an EARLIER session: an environment caches
 // its setup and re-runs it only when the setup text changes
@@ -15,10 +15,6 @@
 // setup left it. In dev mode it is the commit the server serves: setup refuses
 // a `--dev-commit` the server is not serving, but a cached setup is not asked
 // again, so a stack republished since is caught only here.
-//
-// THE REGISTRY WARM, which fills the cache `mcp serve` reads. It could run in
-// setup -- nothing stops it reaching the server from there -- but it is the step
-// that decides whether a first turn has tools, and it is proven here.
 //
 // ONE LINE OF STDOUT naming the build. A SessionStart hook contributes its
 // stdout to the session; its stderr is captured as a non-transcript event and
@@ -43,11 +39,6 @@ var shareDir = "/usr/local/share/caos"
 
 // The `caos` wrapper refuses every call while this exists (install.go).
 func staleMarker() string { return filepath.Join(shareDir, "stale-install") }
-
-// Long enough for the observed resolve (~110s in a cloud session, which talks to
-// the server and may run the step to list its tools), so a cap short enough to be
-// "tight" would time out every warm and cache nothing.
-const warmBudget = 150 * time.Second
 
 func log(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "caos: "+format+"\n", a...)
@@ -95,12 +86,12 @@ func main() {
 		}
 	}
 	payload := readPayload()
-	gitDir, err := git("rev-parse", "--absolute-git-dir")
+	_, err := git("rev-parse", "--absolute-git-dir")
 	if err != nil {
-		// A DEGRADED STATE, said where the session can read it. This used to log
-		// "nothing to warm" to stderr -- which a SessionStart hook drops -- and
-		// exit 0, so a session in the wrong directory looked healthy and every
-		// later caos hook failed with nothing to show for it.
+		// A DEGRADED STATE, said where the session can read it: on stdout, because a
+		// SessionStart hook drops stderr. Said only to stderr, a session in the wrong
+		// directory would look healthy and every later caos hook would fail with
+		// nothing to show for it.
 		reason := fmt.Sprintf("%s is not a git repository (CLAUDE_PROJECT_DIR=%q)",
 			mustGetwd(), os.Getenv("CLAUDE_PROJECT_DIR"))
 		log("%s; caos is disabled for this session", reason)
@@ -120,8 +111,8 @@ func main() {
 		}
 	}
 	// Dev mode installs the dev commit whatever the checkout pins, so there the
-	// pin says nothing about staleness. No warm after a failure: every call it
-	// would make is refused.
+	// pin says nothing about staleness. Nothing more after a failure: every call
+	// would be refused.
 	if dev["rev"] == "" && pinMoved(setup["pin"]) {
 		return
 	}
@@ -135,46 +126,11 @@ func main() {
 		log("  points this checkout at a server. Every tool call will fail.")
 	}
 
-	// Beside the warm rather than before it, so a session pays for one round
-	// trip to the server, not two.
+	// The one round trip to the server this hook makes, and only in dev mode: what
+	// the server serves NOW as refs/caos/dev, to say whether the install is stale.
 	served := make(chan devProbe, 1)
 	if dev["rev"] != "" {
 		go func() { served <- probeDev() }()
-	}
-
-	stepPath := setup["std_path"]
-	if stepPath == "" {
-		log("the setup stamp names no std path, so nothing can name the step;")
-		log("  leaving the tools to mcp serve's background resolve")
-		if rev := dev["rev"]; rev != "" {
-			reportDev(rev, <-served)
-		}
-		return
-	}
-	locator := "--llm-step:@=" + stepPath + "/llm-step"
-
-	// CLAIMED BEFORE THE WARM STARTS, not by the warm itself. Claude Code spawns
-	// the tool server in PARALLEL with this hook and its first `tools/list` lands
-	// within a second; without a claim already on disk that server resolves the
-	// tools itself, duplicating the warm and colliding with it on a push of the
-	// same object. `mcp serve` waits for this file instead (`warm_in_flight`).
-	//
-	// It carries the unix time by which the warm will have given up, so a warm
-	// that is killed cannot make every later serve wait for a process that is
-	// gone.
-	marker := filepath.Join(gitDir, "caos-cc-warming")
-	deadline := time.Now().Add(warmBudget + 30*time.Second).Unix()
-	os.WriteFile(marker, []byte(fmt.Sprintf("%d\n", deadline)), 0o644)
-	defer os.Remove(marker)
-
-	// The same `--base` the hook and the tool server were given: the step resolves
-	// in that commit, and the cache this leaves is keyed by it.
-	warmArgs := []string{"mcp", "warm", locator}
-	if seed := dev["seed"]; seed != "" {
-		warmArgs = append(warmArgs, "--base="+seed)
-	}
-	if !warm(warmArgs, gitDir) {
-		reportNoTools()
 	}
 
 	// STDOUT, because it is the only stream a session keeps. The stamp is the
@@ -236,8 +192,8 @@ func runDiag(payload []byte, reason string) {
 // session, and failing here would only hide this message.
 func reportDegraded(reason string) {
 	text := "caos is DISABLED for this session: " + reason + ". " +
-		"No caos tools will be available except caos_status, and nothing is being " +
-		"recorded. Start the session in the project's checkout, or check " +
+		"No caos tool will run, and nothing is being " +
+		"recorded. Ask caos `help` with no path for the reason. Start the session in the project's checkout, or check " +
 		"CLAUDE_PROJECT_DIR. Diagnostics: ~/.cache/caos/diag.jsonl."
 	out, _ := json.Marshal(map[string]any{
 		"systemMessage": text,
@@ -276,8 +232,8 @@ func probeDev() devProbe {
 // A mismatch FAILS THE SESSION: it is the state in which everything else
 // looks right and the tree under test is not the one running.
 //
-// A probe that failed only goes to stderr -- the warm reports an unreachable
-// server on its own, and a dev check that cannot be made is not a mismatch.
+// A probe that failed only goes to stderr: a dev check that cannot be made is
+// not a mismatch.
 func reportDev(installed string, p devProbe) {
 	if p.err != nil {
 		log("could not read the server's refs/caos/dev to check the dev install: %v", p.err)
@@ -372,84 +328,6 @@ func fail(msg string) {
 		log("could not write %s, so this session is NOT blocked: %v", staleMarker(), err)
 	}
 	fmt.Print(msg)
-}
-
-// `mcp serve` cannot resolve the tools before it must answer the client's first
-// `tools/list` -- the resolution may build an image -- so a client that reads
-// that list exactly once at startup (the mounted Claude Code a cloud environment
-// uses) is left with no caos tools however fast the resolve then finishes.
-// Resolve them here, while this hook still blocks the session from starting, and
-// leave them in the cache `mcp serve` reads when it launches.
-//
-// Reports whether it left a registry behind. That is the FILE, not the exit
-// status: `caos mcp warm` is non-fatal by contract and exits 0 having cached
-// nothing, so a status check would call a cold session warm.
-func warm(args []string, gitDir string) bool {
-	if _, err := exec.LookPath("caos"); err != nil {
-		log("no caos on PATH; the setup phase installed no client")
-		return false
-	}
-	// ITS OUTPUT GOES TO A FILE, and that is not tidiness: Claude Code holds the
-	// session at "starting" until this hook's output stream reaches EOF, so a warm
-	// that inherited that stream and left a child (a `git` the resolve forked)
-	// writing to it would keep the WHOLE SESSION from starting long after the
-	// warm itself returned.
-	out, err := os.Create("/tmp/caos-warm.log")
-	if err != nil {
-		log("could not open the warm log: %v", err)
-		return false
-	}
-	defer out.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), warmBudget)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "caos", args...)
-	cmd.Stdout, cmd.Stderr = out, out
-	cmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+mustGetwd())
-	// A resolve blocked on a network read can ignore the cancel; without this the
-	// hook would wait for it anyway and hold the session past the cap.
-	cmd.WaitDelay = 10 * time.Second
-	log("warming the caos tool registry for the first turn")
-	if err := cmd.Run(); err != nil {
-		log("could not warm the tools in time; mcp serve will resolve in the background")
-	}
-	if data, err := os.ReadFile("/tmp/caos-warm.log"); err == nil {
-		for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
-			if line != "" {
-				log("warm: %s", line)
-			}
-		}
-	}
-	_, err = os.Stat(filepath.Join(gitDir, "caos-cc-registry.json"))
-	return err == nil
-}
-
-// A cold registry means the session may have NO caos tools, and nothing else
-// says so anywhere a reader can see: the drop happens inside Claude Code, and
-// the warm's own account of it goes to this hook's STDERR, which a SessionStart
-// hook has dropped. Hence stdout, the one stream a session keeps.
-//
-// It names what NOT to investigate, because the two things a reader reaches for
-// first both look like the fault and are not it. `claude mcp list` is the trap:
-// run from a shell it dials a server that by then has a warm cache and answers
-// Connected, which is a different question from the one the client asked at
-// startup.
-func reportNoTools() {
-	fmt.Print("caos: THE TOOL REGISTRY DID NOT RESOLVE IN TIME, so this session may have\n" +
-		"no caos tools at all -- not even caos_status. Claude Code starts the tool\n" +
-		"server in parallel with this hook, and with no cached registry that server\n" +
-		"must resolve and build std/llm-step before it can answer its first\n" +
-		"tools/list. A startup that overruns the client's MCP timeout drops the\n" +
-		"whole server rather than leaving it empty.\n" +
-		"The work is NOT lost. Building std/llm-step and running it to list its tools\n" +
-		"happens on the caos SERVER, which carries on after this hook's client is\n" +
-		"killed and memoizes the result, so the next session's warm is a fast memo hit\n" +
-		"and starts with the tools. A NEW session is the fix. Another turn in THIS one\n" +
-		"will not bring them back: the client reads its tool list when it starts, and\n" +
-		"the dropped server is not asked again.\n" +
-		"The configuration is not the fault: the declaration in ~/.claude.json is\n" +
-		"correct, and `claude mcp list` reports caos as Connected once the cache\n" +
-		"lands. Neither of those contradicts this.\n")
 }
 
 func mustGetwd() string {

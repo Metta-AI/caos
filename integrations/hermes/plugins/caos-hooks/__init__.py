@@ -74,7 +74,7 @@ def _read_profile_env() -> dict[str, str]:
     `_caos_bin()` always returned None here (the `_REPO_ROOT/result/bin/caos`
     fallback never existing in a bundled deploy either), so `_run_hook` was a
     silent no-op for EVERY UserPromptSubmit/Stop call -- no conversation was
-    ever created, which is why `caos_status` reported having none.
+    ever created, which is why the overview reported having none.
     `_DIST_ROOT` is the installed profile's own directory (see above), the
     same place `.env` lives, so read it from there instead.
     """
