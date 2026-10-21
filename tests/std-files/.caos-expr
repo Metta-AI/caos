@@ -1,0 +1,7 @@
+# tests/std-files, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A std/go WORKER test of the file tools. Each `--<tool>:@=DEEP-DEPS/<tool>` is
+# the BUILT tool image (naming a dependency evaluates it), run over HTTP the way
+# an agent runs a tool: `base:hash=<image>` and `in:hash=<tree>`.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --read:@=DEEP-DEPS/read --ls:@=DEEP-DEPS/ls --write:@=DEEP-DEPS/write --edit:@=DEEP-DEPS/edit --copy:@=DEEP-DEPS/copy --move:@=DEEP-DEPS/move --remove:@=DEEP-DEPS/remove

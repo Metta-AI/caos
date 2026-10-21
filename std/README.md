@@ -13,6 +13,13 @@ path prints its parameters, which is the description this table abbreviates.
 | tool | one line |
 |---|---|
 | `bash-tool` | Run `sh -c` over a scratch copy of the conversation tree, to compute something over its content. List in `paths` every existing file or directory the command touches, or it sees an empty placeholder ([Using `bash-tool`](#using-bash-tool)). |
+| `read` | Read a file's contents, through code references (`feature/dirty/README.md`). Truncated at 100KB; page with `offset` and `limit`. |
+| `ls` | List a directory; source trees and directories end in `/`. |
+| `write` | Write a file, creating parent directories. Inside a source tree it makes a child commit. |
+| `edit` | Replace exact text in a file, once or everywhere. |
+| `copy` | Copy a file or directory; a source tree stays a source tree, with its history. |
+| `move` | Move or rename; a source tree stays a source tree. |
+| `remove` | Remove a file or directory; removing a source tree removes it whole. |
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. A router to the stack daemon's `build` op. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
 | `caos-conversation-list` | List the recorded conversations on the server, newest first: time of the last message, id, tip hash, title and who has each. The tip hash is what `caos-conversation` takes. |
@@ -47,9 +54,11 @@ needs `paths`:
 | delete | `remove` (`file-path`) |
 | see history or changes | `log`, `show`, `diff` |
 
-`copy` and `move` create missing parent directories and refuse an existing
-destination. They are registered by `llm-step`, so they appear in the model's
-tool list; they are not entries under `std/`.
+`read`, `ls`, `write`, `edit`, `copy`, `move` and `remove` are entries under
+`std/` (one shared source, `std/files`), reached as `caos-std/<name>` like any
+other tool. They take an `in` tree, which defaults to the conversation. `llm-step`
+still registers its own copies for the turns it drives itself; those are being
+retired in favour of these.
 
 ### Using `bash-tool`
 

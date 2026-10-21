@@ -1,0 +1,23 @@
+# std/files — the file tools of a conversation tree: read, ls, write, edit, copy,
+# move and remove. ONE crate, SEVEN entries: `std/read`, `std/ls` and the rest
+# are directories of their own (each with its `.caos-expr` and its `help`) that
+# build THIS source and curry `--op=<name>`, so the tools have paths and docs of
+# their own and share one compiled binary. This directory has no `.caos-expr`
+# on purpose: a `:@=` target without one is DATA, referenced raw, which is what
+# `--src:@=DEEP-DEPS/files` wants.
+#
+# No crates.io dependencies: the tools these were taken from carried none, and a
+# dependency here would have to be anchored in the std/cargo bake.
+[package]
+name = "files"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }
