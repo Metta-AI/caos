@@ -91,6 +91,41 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
 
+## Starting a brand-new repository
+
+`caos-std/github` can create a repo, and the rest of the flow above then
+applies unchanged. Verified end to end against a scratch repo:
+
+1. Create it, with `auto_init` so it has a default branch and a first commit.
+   Importing needs a branch to import, and importing a repo with no commits is
+   untested.
+
+   ```text
+   run_tool(path="caos-std/github", arguments={
+     "method": "POST", "path": "/orgs/<org>/repos",
+     "body": "{\"name\":\"<repo>\",\"private\":true,\"auto_init\":true}"})
+   ```
+
+   Use `POST /user/repos` for a personal account. Ask whether it should be
+   public or private if the user did not say; private is the safe default.
+   The response's `full_name` gives the org's canonical capitalisation
+   (`Metta-AI`, not `metta-ai`).
+2. `import_source` it into `sources/<repo>/00-base`, `copy` that to
+   `sources/<repo>/99-dirty`, `write` the files there.
+3. `publish_source` the `99-dirty` tree to `main`. This is a plain
+   fast-forward from the imported tip, so it needs no `force`. Prefer a
+   branch plus a PR unless the repo is a scratch one.
+4. Check the result with `GET /repos/<owner>/<repo>/contents/?ref=main`. A new
+   directory shows as `size: 0` in that listing, which is normal; `GET` the
+   directory to see what is in it.
+
+What the token could not do: `DELETE /repos/<owner>/<repo>` came back
+`403 Must have admin rights to Repository`, even on a repo the same token had
+just created. Creating is allowed and deleting is not, so a scratch repo has
+to be removed by a person (or archived with
+`PATCH /repos/<owner>/<repo>` `{"archived":true}`, if the token allows it;
+untried). Do not create throwaway repos casually.
+
 ## Stacks
 
 A stack is an ordered sequence of layers that share git ancestry, so a change
@@ -386,6 +421,12 @@ reach usually means the grant is missing.
 
 ## Pitfalls
 
+- This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
+  directly: `eval_path(path="caos-std")` gives a tree hash, then
+  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `git.md` is "no such path".
+- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
+  underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash, not a path or a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first.
 - An import is an unchanged snapshot. It never merges into or advances
