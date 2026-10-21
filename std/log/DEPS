@@ -1,7 +1,7 @@
 # What this tool builds from (format `<path> <name>`): the shared source of the
 # history tools, the compiler, the crates the source uses, and the runner that has
 # git (the tools ask git about a commit).
-../history history
+../git-history git-history
 ../rustc rustc
 ../git-runner git-runner
 ../../rust/crates/conversation-protocol conversation-protocol

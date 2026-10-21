@@ -1,4 +1,4 @@
-# std/history — read a source tree's git history: log, show and diff. ONE crate,
+# std/git-history — read a source tree's git history: log, show and diff. ONE crate,
 # THREE entries (`std/log`, `std/show`, `std/diff`), each a directory of its own
 # with its `help` that builds THIS source and curries `--op=<name>`. This
 # directory has no `.caos-expr` on purpose: a `:@=` target without one is DATA.
@@ -8,7 +8,7 @@
 # the server and asks git, so the tree alone is never asked to say what its
 # parent was.
 [package]
-name = "history"
+name = "git-history"
 version = "0.0.0"
 edition = "2021"
 

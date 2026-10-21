@@ -1,4 +1,4 @@
-// tests/std-history — a WORKER test of the history tools: log, show and diff over
+// tests/std-git-history — a WORKER test of the history tools: log, show and diff over
 // a source tree's git history.
 //
 // The source tree is a commit entry (`feature/dirty`) whose history this test
@@ -67,7 +67,7 @@ func tool(name, tree string, params ...string) (kind, text string) {
 	form := url.Values{}
 	form.Set("base:hash", run("caos", "hash", "/cas/args/"+name))
 	form.Set("in:hash", tree)
-	form.Set("salt", fmt.Sprintf("std-history-%d-%d", os.Getpid(), seq))
+	form.Set("salt", fmt.Sprintf("std-git-history-%d-%d", os.Getpid(), seq))
 	for i := 0; i < len(params); i += 2 {
 		form.Set(params[i], params[i+1])
 	}

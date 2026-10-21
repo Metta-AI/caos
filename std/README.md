@@ -21,7 +21,6 @@ path prints its parameters, which is the description this table abbreviates.
 | `move` | Move or rename; a source tree stays a source tree. |
 | `remove` | Remove a file or directory; removing a source tree removes it whole. |
 | `grep` | Search a tree with a regular expression, through code references; matches as `path:linenum:line`. Results are cached per unchanged subtree. |
-| `eval-path` | Evaluate a path and say what it produces (`<kind> <hash>`): the build product of a tree. Pass the hash as `in` to look inside it. |
 | `log`, `show`, `diff` | A source tree's git history: commits, one commit with its diff, or a diff between two revisions. Take `source-tree`, the path of the code reference. |
 | `caos-build` | Compile the caos tree with `nix build`, against a persisted nix store, returning the build log. A router to the stack daemon's `build` op. |
 | `caos-conversation` | Read a recorded conversation (e.g. a Claude Code session) from the hash of its tip commit: messages, and each tool call with its arguments and result. For reviewing how a session went. |
@@ -57,11 +56,13 @@ needs `paths`:
 | delete | `remove` (`file-path`) |
 | see history or changes | `log`, `show`, `diff` |
 
-`read`, `ls`, `write`, `edit`, `copy`, `move`, `remove`, `grep`, `eval-path`, `log`, `show` and
-`diff` are entries under `std/`, reached as `caos-std/<name>` like any other tool.
-They take an `in` tree, which defaults to the conversation. `llm-step` still
-registers its own copies for the turns it drives itself; those are being retired
-in favour of these.
+`read`, `ls`, `write`, `edit`, `copy`, `move`, `remove`, `grep`, `log`, `show` and `diff`
+are entries under `std/`, reached as `caos-std/<name>` like any other tool. They take an
+`in` tree, which defaults to the conversation. `llm-step` still registers its own copies
+for the turns it drives itself; those are being retired in favour of these.
+
+`eval-path` is not an entry: evaluating a path is one of the server's primitives (the
+`/eval` route), so it is a built-in tool, like `run`, `help`, `start` and `result`.
 
 ### Using `bash-tool`
 

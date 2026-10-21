@@ -1,4 +1,4 @@
-# tests/std-history, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# tests/std-git-history, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A std/go WORKER test of the history tools (std/log, show, diff), run over HTTP
