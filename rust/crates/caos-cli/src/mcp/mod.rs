@@ -89,6 +89,10 @@ impl Config {
                 // Read by `secret_store::reader_keys`, before any command runs.
             } else if let Some(url) = argument.strip_prefix("--server=") {
                 config.server = Some(url.to_string());
+            } else if let Some(count) = argument.strip_prefix("--max-result-chars=") {
+                config.max_result_chars = Some(count.parse().map_err(|_| {
+                    format!("--max-result-chars must be a non-negative integer, not {count:?}")
+                })?);
             } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
                 config.base = Some(locator.to_string());
             } else if argument.starts_with("--base=") || argument.starts_with("--base:") {
