@@ -1,0 +1,13 @@
+# std/show — one of the history tools (std/history holds the source they share).
+# The help is a HERE-STRING so it lives in this expression, which is stripped
+# from the tree the build sees: editing the docs re-keys this tool's ArgTree and
+# nothing it builds from.
+HELP=<<END
+Show one commit of a source tree: its hash, parents, author, full message, and the unified diff it introduced (against its first parent). Optionally scope the diff to a path.
+@param source-tree Path of the source tree (a code reference in the conversation), such as feature/01-change.
+@param [rev] The commit to show (default HEAD, the source tree's own commit). A commit hash, or HEAD with ~N or ^ ancestry.
+@param [path] Restrict the shown diff to this source-tree-relative path.
+@in
+END
+IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/history --dep0:@=DEEP-DEPS/conversation-protocol --dep1:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
+curry --base=$IMAGE --op=show --help=$HELP

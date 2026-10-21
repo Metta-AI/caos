@@ -1,0 +1,16 @@
+# std/eval-path — evaluate a path and say what it produces. This directory IS the
+# tool: its Rust source (src/main.rs), this manifest, its `.caos-expr` and `DEPS`.
+# No crates.io dependencies.
+[package]
+name = "eval-path"
+version = "0.0.0"
+edition = "2021"
+
+# std/rustc's `finish` step takes the binary named `worker`.
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+# Spliced in by std/rustc at `worker-common/` (its `--worker-common` arg).
+worker-common = { path = "worker-common" }

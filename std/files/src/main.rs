@@ -104,7 +104,11 @@ fn reader(outcome: Result<String, Fail>) -> Result<(), String> {
 
 /// A writer's answer. On a mistake `prop` is the input, unchanged, so the
 /// harness has nothing to apply and the model reads why.
-fn writer(ws: &str, op: &str, outcome: Result<(String, String, String), Fail>) -> Result<(), String> {
+fn writer(
+    ws: &str,
+    op: &str,
+    outcome: Result<(String, String, String), Fail>,
+) -> Result<(), String> {
     let dir = scratch("files-out")?;
     let (prop, out, message, failed) = match outcome {
         Ok((prop, out, message)) => (prop, out, Some(message), false),
@@ -303,7 +307,9 @@ fn ls(ws: &str) -> Result<String, Fail> {
     let total = lines.len();
     if total > MAX_ENTRIES {
         lines.truncate(MAX_ENTRIES);
-        lines.push(format!("[truncated: first {MAX_ENTRIES} of {total} entries]"));
+        lines.push(format!(
+            "[truncated: first {MAX_ENTRIES} of {total} entries]"
+        ));
     }
     if lines.is_empty() {
         return Ok("(empty directory)".to_string());
@@ -321,7 +327,8 @@ type Written = (String, String, String);
 fn write(ws: &str) -> Result<Written, Fail> {
     let comps = components("file-path")?;
     reject_protocol(&comps)?;
-    let content = input("content")?.ok_or_else(|| User("write needs a string `content`".to_string()))?;
+    let content =
+        input("content")?.ok_or_else(|| User("write needs a string `content`".to_string()))?;
     let prop = rebuild(ws, &comps, content.as_bytes(), None)?;
     Ok((
         prop,
@@ -336,8 +343,8 @@ fn edit(ws: &str) -> Result<Written, Fail> {
     let old = input("old-string")?
         .filter(|s| !s.is_empty())
         .ok_or_else(|| User("edit needs a non-empty `old-string`".to_string()))?;
-    let new = input("new-string")?
-        .ok_or_else(|| User("edit needs a string `new-string`".to_string()))?;
+    let new =
+        input("new-string")?.ok_or_else(|| User("edit needs a string `new-string`".to_string()))?;
     let replace_all = flag("replace-all")?;
 
     let p = resolve(ws, &comps)?;
@@ -357,22 +364,21 @@ fn edit(ws: &str) -> Result<Written, Fail> {
     })?;
 
     let count = text.matches(old.as_str()).count();
-    let replaced = match (count, replace_all) {
-        (0, _) => {
-            return Err(User(
+    let replaced =
+        match (count, replace_all) {
+            (0, _) => return Err(User(
                 "old-string not found in the file (it must match exactly, including whitespace)"
                     .to_string(),
-            ))
-        }
-        (n, false) if n > 1 => {
-            return Err(User(format!(
-                "old-string appears {n} times; include more surrounding context to make it \
+            )),
+            (n, false) if n > 1 => {
+                return Err(User(format!(
+                    "old-string appears {n} times; include more surrounding context to make it \
                  unique, or set replace-all"
-            )))
-        }
-        (_, true) => text.replace(old.as_str(), &new),
-        (_, false) => text.replacen(old.as_str(), &new, 1),
-    };
+                )))
+            }
+            (_, true) => text.replace(old.as_str(), &new),
+            (_, false) => text.replacen(old.as_str(), &new, 1),
+        };
     let prop = rebuild(ws, &comps, replaced.as_bytes(), Some(mode))?;
     let n = if replace_all { count } else { 1 };
     Ok((
@@ -565,7 +571,10 @@ mod tests {
 
     #[test]
     fn a_missing_path_names_the_way_to_a_mount() {
-        let message = resolve_failure("caos-std/README.md", "caos: no such path: caos-std/README.md");
+        let message = resolve_failure(
+            "caos-std/README.md",
+            "caos: no such path: caos-std/README.md",
+        );
         assert!(message.starts_with("caos-std/README.md is not in this tree"));
         assert!(message.contains("EVALUATED tree"), "{message}");
         let other = resolve_failure("a", "caos: \"a\" traverses a non-directory");
