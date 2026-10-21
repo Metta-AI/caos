@@ -229,7 +229,7 @@ fn run_tool(
 /// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
 /// what a client will wait for is not lost with its connection.
 fn start_tool(config: &Config, session: &str, name: &str, args: &Value) -> Result<String, String> {
-    let call = prepare_call(session, name, args)?;
+    let call = prepare_call(config, session, name, args)?;
     start_step(config, &call.conversation, &call.params())
 }
 
