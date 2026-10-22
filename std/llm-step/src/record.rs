@@ -17,6 +17,7 @@
 //! `status` saying what happened:
 //!
 //! - `created`: the first prompt, which made the conversation
+//! - `forked`: the first prompt, which made the conversation as a fork of `from`
 //! - `recorded`: the event was written (or had been already)
 //! - `joined`: a prompt that joined a request still held open for a running call
 //! - `held`: a stop that left its request open because a call is still running
@@ -58,6 +59,10 @@ pub(crate) struct Request {
     model: String,
     /// A tree to seed a NEW conversation's content with.
     content: Option<Oid>,
+    /// A conversation commit to FORK, for a NEW conversation: the prompt's
+    /// conversation is then made as a fork of it (settled first, if a session
+    /// died mid-turn) rather than as a root.
+    from: Option<Oid>,
 }
 
 impl Request {
@@ -79,6 +84,10 @@ impl Request {
         } else {
             None
         };
+        let from = match read_arg_opt("from")? {
+            Some(hash) => Some(Oid::parse(hash.trim(), "--from")?),
+            None => None,
+        };
         Ok(Some(Self {
             kind,
             message_id,
@@ -86,6 +95,7 @@ impl Request {
             actor: read_arg("actor")?.trim().to_string(),
             model: read_arg_opt("model")?.unwrap_or_default().trim().to_string(),
             content,
+            from,
         }))
     }
 }
@@ -98,7 +108,7 @@ pub(crate) fn run(conversation: &str, request: &Request) -> Result<(), String> {
                 // Another prompt may create it between our look and our push; the
                 // loser opens the winner's.
                 if let Some(state) = create(conversation, request)? {
-                    return forward(&state, "created");
+                    return forward(&state, if request.from.is_some() { "forked" } else { "created" });
                 }
             }
             None => {
@@ -229,10 +239,84 @@ fn configuration(conversation: &str) -> Result<String, String> {
     caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
 }
 
+/// Make the conversation as a FORK of `from`, with its first prompt: the source
+/// settled (a session that died mid-turn left work open, which the protocol will
+/// not fork), the fork, then the prompt's request, pushed together with the
+/// creator's membership refs. `None` when the conversation exists, so the caller
+/// records onto it.
+fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Option<State>, String> {
+    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    let mut store = State::scratch_store()?;
+    if store.fetch_ref(&refname)?.is_some() {
+        return Ok(None);
+    }
+    store.ensure_local(from)?;
+    if Conversation::open(&store, from)?.identity()?.id == conversation {
+        return Err("a fork's id must differ from its source conversation".to_string());
+    }
+    let settled = crate::settle::settle(&mut store, from)?;
+    let signature = signature(&request.actor)?;
+    let transition = Transition::ConversationFork {
+        identity: Identity {
+            id: conversation.to_string(),
+            kind: IdentityKind::Fork {
+                source: from.clone(),
+            },
+            owner: None,
+        },
+        title: format!("fork of {}", &from.as_str()[..12]),
+    };
+    let applied = apply(&mut store, Some(&settled), &transition)?;
+    let forked = mint(&mut store, &settled, &applied, transition.kind(), &signature)?;
+    let mut state = State::from_store(store, refname.clone(), forked.clone())?;
+    let (claimed, _) = open_request(
+        &mut state,
+        &forked,
+        conversation,
+        request,
+        &configuration(conversation)?,
+        &signature,
+    )?;
+    let active = conversation_protocol::v3::refs::active_membership_ref(&request.actor, conversation)?;
+    let archived =
+        conversation_protocol::v3::refs::archived_membership_ref(&request.actor, conversation)?;
+    let pushed = state.store().push(&[
+        RefUpdate {
+            refname: refname.clone(),
+            expected: None,
+            new: Some(claimed.clone()),
+        },
+        RefUpdate {
+            refname: active,
+            expected: None,
+            new: Some(forked),
+        },
+        RefUpdate {
+            refname: archived,
+            expected: None,
+            new: None,
+        },
+    ]);
+    match pushed {
+        Ok(()) => State::from_store(state.into_store(), refname, claimed).map(Some),
+        Err(error) => {
+            // Lost the race to create it, or the push failed outright.
+            if state.store().fetch_ref(&refname)?.is_some() {
+                Ok(None)
+            } else {
+                Err(format!("forking into {refname}: {error}"))
+            }
+        }
+    }
+}
+
 /// Make the conversation, with its first prompt: root, message, admission and
 /// claim, pushed together to a ref that must not exist. `None` when it does, so
 /// the caller records onto the winner's.
 fn create(conversation: &str, request: &Request) -> Result<Option<State>, String> {
+    if let Some(from) = &request.from {
+        return create_fork(conversation, request, from);
+    }
     let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
     let mut store = State::scratch_store()?;
     let genesis = ensure_genesis(&mut store)?;

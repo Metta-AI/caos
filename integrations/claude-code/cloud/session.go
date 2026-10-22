@@ -2,7 +2,7 @@
 // /usr/local/bin/caos-cloud-session-start.
 //
 // It does two things. The setup phase has already installed the client, the
-// git helper, the configuration and the `caos` remote by the time Claude Code
+// git helper and the configuration by the time Claude Code
 // starts -- but it may have done so in an EARLIER session: an environment caches
 // its setup and re-runs it only when the setup text changes
 // (design/cloud-setup.md).
@@ -115,15 +115,6 @@ func main() {
 	// would be refused.
 	if dev["rev"] == "" && pinMoved(setup["pin"]) {
 		return
-	}
-
-	// REPORTED, NOT REPAIRED. The setup phase adds this from `--server` before
-	// Claude Code starts, and that is the only place a server is named. Adding it
-	// here instead would be a remote that appears after the tool server has
-	// already started without one.
-	if _, err := git("remote", "get-url", "caos"); err != nil {
-		log("no caos remote: the setup line named no --server=<url>, so nothing")
-		log("  points this checkout at a server. Every tool call will fail.")
 	}
 
 	// The one round trip to the server this hook makes, and only in dev mode: what

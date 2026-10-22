@@ -19,10 +19,10 @@ process has no repository to be standing in, and a path (`--llm-step:@=std/llm-s
 is refused by name because it would name a file in one:
 
 ```text
---server=<url>                the caos server (or CAOS_SERVER_URL, CAOS_MCP_DEFAULT_SERVER)
+--server=<url>                the caos server
 --llm-step:@@=<git locator>   the step that runs the tools, pinned: git+…?rev=<40 hex>&dir=std/llm-step
 --base:@@=<git locator>       what a NEW conversation starts from (the hook; optional)
---secret-readers=<key …>      the secret reader keys this process presents (or CAOS_SECRET_READERS)
+--secret-readers=<key …>      the secret reader keys this process presents (else the checkout's git config)
 ```
 
 A locator is resolved by the server (`:@@=`, design/flake-inputs.md), so a harness
@@ -287,7 +287,7 @@ session: a session's conversation is always the one its id derives, so nothing
 about it is kept locally.
 
 `cloud/install.go` writes the command into Claude Code's user config. The hook
-acts on a session's **first prompt** (`resume.rs`): it recognises the command, sets
+acts on a session's **first prompt** (`fork.rs`): it recognises the command and hands the commit to the step (`llm-step --record=prompt --from=<hash>`), which sets
 up the conversation, and only then records the prompt as usual — so history and
 workspace are in place before the model's first turn. The command's own text is
 what tells the MODEL to go and read that history; the hook cannot put it in the

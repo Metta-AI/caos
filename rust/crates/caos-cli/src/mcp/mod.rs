@@ -32,7 +32,7 @@
 //! write, because the turn is already running by the time the hook fires.
 
 mod diag;
-mod resume;
+mod fork;
 mod serve;
 mod session_base;
 
@@ -42,6 +42,7 @@ use serde_json::{json, Value};
 
 use caos::HttpTransport;
 use conversation_protocol::v3::git_store::GitStore;
+use conversation_protocol::v3::oid::Oid;
 use conversation_protocol::v3::refs;
 
 use crate::{conversation_ref, TurnOptions, LLM_STEP_ARG};
@@ -61,10 +62,6 @@ const TOOL_PREFIX: &str = "mcp__caos__";
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
-
-/// The environment variable that names the server when `--server` is not given:
-/// the one every caos client reads, then the one the Hermes launcher sets.
-const SERVER_ENVS: [&str; 2] = ["CAOS_SERVER_URL", "CAOS_MCP_DEFAULT_SERVER"];
 
 /// What a `caos mcp` process is told, by its arguments: where the server is,
 /// which step runs the tools, and where a new conversation's content comes from.
@@ -105,22 +102,9 @@ impl Config {
 
     /// The server this process talks to.
     fn server(&self) -> Result<String, String> {
-        self.server_from(|name| std::env::var(name).ok())
-    }
-
-    fn server_from(&self, env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
-        if let Some(url) = &self.server {
-            return Ok(url.clone());
-        }
-        SERVER_ENVS
-            .iter()
-            .find_map(|name| env(name).filter(|v| !v.is_empty()))
-            .ok_or_else(|| {
-                format!(
-                    "no caos server: pass --server=<url>, or set {}",
-                    SERVER_ENVS.join(" or ")
-                )
-            })
+        self.server
+            .clone()
+            .ok_or_else(|| "no caos server: pass --server=<url>".to_string())
     }
 }
 
@@ -142,7 +126,7 @@ fn usage() -> String {
         "usage:\n  \
          caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
          caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
-         Both take the server (--server=<url>, or CAOS_SERVER_URL) and name the step that \
+         Both take the server (--server=<url>) and name the step that \
          runs this session's tools:\n  \
          {}\n\
          and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.",
@@ -628,39 +612,38 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
         return Ok(());
     }
     // `/fork-caos-conversation <hash>` makes the conversation this session records
-    // into, so it runs before the prompt is recorded. It is a no-op once the
-    // session has its conversation.
-    let command = || -> Result<Option<String>, String> {
-        match resume::parse_command(prompt)? {
-            Some(from) => {
-                // It talks to the server before anything below would have
-                // proven it reachable.
-                let server = config.server()?;
-                wait_server_reachable(&server)?;
-                resume::begin(&server, string_field(payload, "session_id")?, &from)
-            }
-            None => Ok(None),
-        }
-    };
-    let note = match command() {
-        Ok(note) => note,
+    // into, as a fork of that commit. The step does it with the first prompt, and
+    // does nothing once the session has its conversation.
+    //
+    // A refusal exits 2, the one status with which Claude Code blocks the prompt
+    // and shows the reason: a session that ran on would have no conversation
+    // behind it, and a tool call would fail with a reason nobody sees.
+    let from = match fork::parse_command(prompt) {
+        Ok(from) => from,
         Err(error) => refuse_prompt(&error),
     };
     let id = recorded_conversation(payload)?;
     let readers = crate::secret_store::reader_summary();
-    if record_prompt(config, &id, prompt)? {
-        announce(&format!(
+    let status = match record_prompt(config, &id, prompt, from.as_ref()) {
+        Ok(status) => status,
+        Err(error) if from.is_some() => refuse_prompt(&error),
+        Err(error) => return Err(error),
+    };
+    match (status.as_str(), &from) {
+        ("forked", Some(from)) => announce(&format!(
+            "caos conversation ref {} forked from {from}; {readers}",
+            conversation_ref(&id)?
+        )),
+        ("created", _) => announce(&format!(
             "caos conversation ref {}; {readers}",
             conversation_ref(&id)?
-        ))?;
-    } else if let Some(note) = note {
-        announce(&format!("{note}; {readers}"))?;
+        )),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// What the step answered to a recorded event: which of its outcomes it was
-/// (`created`, `recorded`, `joined`, `held`, `nothing`) and the head it left.
+/// (`created`, `forked`, `recorded`, `joined`, `held`, `nothing`) and the head it left.
 struct Recorded {
     status: String,
     head: String,
@@ -709,7 +692,7 @@ fn username() -> Result<String, String> {
 }
 
 /// Record a user's prompt, creating the conversation on the session's first one;
-/// true when this prompt is the one that created it.
+/// the step's status says what happened (`created`, `forked`, `recorded`, ...).
 ///
 /// The step makes the message, the request it opens, and the claim that puts the
 /// request in `running`, in one compare-and-swap. The claim is not a shortcut:
@@ -717,20 +700,28 @@ fn username() -> Result<String, String> {
 /// begun the turn by the time this hook fires, so no runner will pick the
 /// request up.
 ///
-/// A NEW conversation needs its content, which the step cannot find for itself,
-/// so the locator naming it goes with every prompt: the server resolves it
-/// (once -- a pinned locator is memoized) and the step uses it only when the
-/// conversation does not exist yet.
-fn record_prompt(config: &Config, id: &str, prompt: &str) -> Result<bool, String> {
+/// A NEW conversation needs where it starts from, which the step cannot find for
+/// itself: `from`, the commit it forks, or else the locator naming its content.
+/// Both go with every prompt and the step uses them only when the conversation
+/// does not exist yet (a pinned locator is resolved once and memoized).
+fn record_prompt(
+    config: &Config,
+    id: &str,
+    prompt: &str,
+    from: Option<&Oid>,
+) -> Result<String, String> {
     let mut extra = vec![("text", prompt), ("model", CLAUDE_CODE_MODEL)];
+    let from = from.map(|from| from.to_string());
     let content = session_base::content_locator(config.base.as_deref(), prompt);
-    if let Some(content) = &content {
+    if let Some(from) = &from {
+        extra.push(("from", from));
+    } else if let Some(content) = &content {
         extra.push(("content:@@", content));
     }
     let phase = std::time::Instant::now();
     let recorded = record_event(config, id, "prompt", &extra)?;
     cc_timing("record", phase.elapsed());
-    Ok(recorded.status == "created")
+    Ok(recorded.status)
 }
 
 /// Tell a caos workspace tool which conversation it is working in.
@@ -929,30 +920,14 @@ mod config_tests {
             assert!(error.contains("--base:@@=<git locator>"), "{error}");
         }
     }
-
     #[test]
-    fn the_argument_beats_the_environment_and_the_environment_is_searched_in_order() {
-        let env = |name: &str| match name {
-            "CAOS_SERVER_URL" => Some("http://env".to_string()),
-            "CAOS_MCP_DEFAULT_SERVER" => Some("http://hermes".to_string()),
-            _ => None,
-        };
+    fn a_server_is_named_by_argument_only() {
         let named = Config {
             server: Some("http://arg".into()),
             ..Config::default()
         };
-        assert_eq!(named.server_from(env).unwrap(), "http://arg");
-        assert_eq!(Config::default().server_from(env).unwrap(), "http://env");
-        let only_hermes =
-            |name: &str| (name == "CAOS_MCP_DEFAULT_SERVER").then(|| "http://hermes".to_string());
-        assert_eq!(
-            Config::default().server_from(only_hermes).unwrap(),
-            "http://hermes"
-        );
-        let error = Config::default().server_from(|_| None).unwrap_err();
-        assert!(
-            error.contains("--server=<url>") && error.contains("CAOS_SERVER_URL"),
-            "{error}"
-        );
+        assert_eq!(named.server().unwrap(), "http://arg");
+        let error = Config::default().server().unwrap_err();
+        assert!(error.contains("--server=<url>"), "{error}");
     }
 }

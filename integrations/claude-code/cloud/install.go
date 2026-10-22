@@ -404,7 +404,7 @@ func contains(haystack []string, needle string) bool {
 // The slash command that starts a session from an earlier recorded
 // conversation. THE HOOK is what acts on it -- `caos mcp hook` sees the
 // first prompt and forks the conversation before the model's first
-// turn (rust/crates/caos-cli/src/mcp/resume.rs) -- so the marker line below is
+// turn (rust/crates/caos-cli/src/mcp/fork.rs) -- so the marker line below is
 // load-bearing: it is what the hook finds if Claude Code hands it the command's
 // expansion rather than the `/name <hash>` that was typed. The rest is for the
 // MODEL, which starts empty and has to be told to go and read what happened.

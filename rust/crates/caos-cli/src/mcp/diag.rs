@@ -70,7 +70,6 @@ pub fn collect(ctx: &Context) -> String {
     names.sort();
     d.push_str(&format!("CAOS_* variables set (names only): {names:?}\n"));
 
-    d.push_str(&format!("server named by environment: {}\n", server_env()));
     d.push_str(&format!(
         "boot_id: {}\nuptime: {}\nhostname: {}\n",
         proc_line("/proc/sys/kernel/random/boot_id"),
@@ -143,20 +142,6 @@ fn append_journal(path: &Path, ctx: &Context, text: &str) {
         let _ = writeln!(file, "{record}");
     }
 }
-/// Which of the variables that can name the server are set (names only: a value
-/// can be a ticket).
-fn server_env() -> String {
-    let set: Vec<&str> = ["CAOS_SERVER_URL", "CAOS_MCP_DEFAULT_SERVER"]
-        .into_iter()
-        .filter(|name| std::env::var_os(name).is_some())
-        .collect();
-    if set.is_empty() {
-        "none (only --server=<url> can have named it)".to_string()
-    } else {
-        set.join(", ")
-    }
-}
-
 fn proc_line(path: &str) -> String {
     match std::fs::read_to_string(path) {
         Ok(s) => s.trim().to_string(),
@@ -301,7 +286,6 @@ mod tests {
             "CLAUDE_PROJECT_DIR:",
             "HOME:",
             "uid:",
-            "server named by environment:",
             "boot_id:",
             "process chain:",
         ] {

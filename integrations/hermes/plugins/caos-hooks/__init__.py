@@ -26,7 +26,7 @@ Three events, three jobs, matching serve.rs/mod.rs exactly:
 Deliberately NOT wired for v1: StopFailure. post_llm_call does not fire on
 an interrupted/errored turn, and Hermes has no exact equivalent hook in the
 current catalog. This is a known gap, not a silent one -- but it is also
-not a correctness gap: rust/crates/caos-cli/src/mcp/resume.rs's `settle()`
+not a correctness gap: std/llm-step/src/settle.rs's `settle()`
 already exists specifically to close a request a dead session left open
 (cancelled calls, interrupted request) the next time anything forks/resumes
 that conversation. A Hermes crash mid-turn behaves exactly like a killed
@@ -207,15 +207,11 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
     return None
 
 
-def _base_args(profile_env: dict[str, str]) -> list[str]:
+def _base_args() -> list[str]:
     """What a NEW conversation starts from, as `--base:@@=<locator>`:
-    `CAOS_MCP_DEFAULT_SESSION_BASE` if set (a locator pinned with `rev=`),
-    else Metta-AI/caos-session at its current main tip. `caos mcp` reads no
+    Metta-AI/caos-session at its current main tip. `caos mcp` reads no
     checkout, so the server fetches this commit itself; a prompt can still
     name another with a leading `/caos-session-start-from <locator>` line."""
-    named = _env("CAOS_MCP_DEFAULT_SESSION_BASE", profile_env)
-    if named and not _unsubstituted(named):
-        return [f"--base:@@={named}"]
     session_sha = _session_sha()
     if session_sha:
         return [f"--base:@@=github:Metta-AI/caos-session?rev={session_sha}"]
@@ -235,23 +231,27 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     step = _llm_step_arg(profile_env)
     if step is None:
         return None
-    # CAOS_MCP_DEFAULT_SERVER, EXPLICITLY, not just inherited: this process
-    # (`hermes serve`) never has it in its OWN environment (see
-    # `_read_profile_env`'s docstring), and `caos mcp hook` takes the server
-    # from it (or from `--server=`) -- it reads no checkout.
+    # The server is an ARGUMENT: this process (`hermes serve`) never has
+    # CAOS_MCP_DEFAULT_SERVER in its own environment (see `_read_profile_env`'s
+    # docstring), so it is read from the profile and passed by name.
     server = _env("CAOS_MCP_DEFAULT_SERVER", profile_env)
-    env = dict(os.environ)
-    if server and not _unsubstituted(server):
-        env["CAOS_MCP_DEFAULT_SERVER"] = server
+    if not server or _unsubstituted(server):
+        return None
     try:
         result = subprocess.run(
-            [bin_path, "mcp", "hook", step, *_base_args(profile_env)],
+            [
+                bin_path,
+                "mcp",
+                "hook",
+                f"--server={server}",
+                step,
+                *_base_args(),
+            ],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
-            env=env,
         )
     except Exception:
         return None

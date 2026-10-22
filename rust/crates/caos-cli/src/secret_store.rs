@@ -130,7 +130,7 @@ fn expand_home(d: &str) -> Result<PathBuf, String> {
 /// The SecretReaderKeys this process presents, space-separated. Named by
 /// `--secret-readers=<key …>` on the command line, which is how a harness that
 /// writes the argv of its own hooks says it (a hook command is not a shell, so it
-/// cannot set an environment variable); else `CAOS_SECRET_READERS`; else the
+/// cannot set an environment variable); else the
 /// checkout's `caos.secret-readers` (`git config caos.secret-readers <key>`).
 pub fn reader_keys() -> Vec<String> {
     let split =
@@ -139,12 +139,6 @@ pub fn reader_keys() -> Vec<String> {
         std::env::args().find_map(|a| a.strip_prefix("--secret-readers=").map(split))
     {
         return named;
-    }
-    if let Some(named) = std::env::var("CAOS_SECRET_READERS")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        return split(&named);
     }
     let Ok(out) = std::process::Command::new("git")
         .args(["config", "--get", "caos.secret-readers"])
@@ -165,7 +159,7 @@ pub fn reader_keys() -> Vec<String> {
 pub fn reader_summary() -> String {
     let keys = reader_keys();
     if keys.is_empty() {
-        return "secret readers: none -- no --secret-readers, CAOS_SECRET_READERS or \
+        return "secret readers: none -- no --secret-readers or \
                 caos.secret-readers is set, so no secret can be granted"
             .to_string();
     }

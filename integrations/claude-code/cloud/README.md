@@ -109,11 +109,10 @@ found the hooks firing from `/root`. The CLI runs as root, even though the repo
 sits at `/home/user/repo` and Claude's own state under `/home/claude/.claude`.
 All three are written anyway; it costs nothing.
 
-Nothing has to be committed to a session repo for it to reach a server, either.
-The client finds caos through a `caos` git remote and an arbitrary checkout has
-none, so stage 1 adds it from its `--server` argument, before Claude Code starts.
-That is the only place a server is named: the hook reports a missing remote and
-does not repair one.
+Nothing has to be committed to a session repo for it to reach a server, either:
+stage 1 writes the server into the configuration as `--server=<url>` on every
+`caos mcp` command, and adds nothing to the checkout. That is the only place a
+server is named.
 
 **The checkout is there before the setup script runs**, which is what lets the
 pin be read that early — and reading it early matters, because work done after
@@ -172,11 +171,8 @@ again.
 - a plain `http://…` URL, when the server is reachable without one.
 
 **No environment variable.** `CAOS_SERVER_URL` is not read. The setup phase
-cannot see the environment's variables, so a server named there would produce a
-`caos` remote that appears only after Claude Code has started without one — and
-one ticket in one place cannot fall out of step with itself. A setup line with no
-`--server` fails immediately; an environment still setting the variable is
-reported by `caos_status` as unread rather than ignored.
+cannot see the environment's variables, and one ticket in one place cannot fall
+out of step with itself. A setup line with no `--server` fails immediately.
 
 It is a **credential** when it is a ticket: whoever holds it can drive
 that server, which runs containers and holds every secret. The status tool

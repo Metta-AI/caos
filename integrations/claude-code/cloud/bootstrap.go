@@ -100,8 +100,8 @@ func parseArgs(argv []string) args {
 		switch key {
 		case "--base":
 			a.base = strings.TrimRight(value, "/")
-		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"), kept
-		// in the checkout's git config beside the `caos` remote `--server` adds.
+		// The SecretReaderKeys this session presents (SPEC.md, "Secrets"),
+		// handed to `caos mcp` as `--secret-readers`.
 		case "--secret-readers":
 			a.readers = value
 		case "--server":
@@ -612,10 +612,9 @@ func main() {
 	if !strings.HasPrefix(a.base, raw+"/") || len(strings.Split(strings.TrimPrefix(a.base, raw+"/"), "/")) < 3 {
 		fatal("--base must look like\n  %s/<owner>/<repo>/<ref>\n  got: %s", raw, a.base)
 	}
-	// REQUIRED, and the only place a server is named: the client reaches caos
-	// through the `caos` git remote, and this phase is the only one that can add
-	// it before Claude Code starts. Nothing reads the environment for a fallback,
-	// so an unnamed server is a question, not a default.
+	// REQUIRED, and the only place a server is named: it becomes `--server=<url>`
+	// on every `caos mcp` command this phase writes. Nothing reads the environment
+	// for a fallback, so an unnamed server is a question, not a default.
 	// Checked before anything is fetched: an abbreviated sha would never equal
 	// the server's ref, and the refusal would then blame the server.
 	if a.devCommit != "" && !isSha(a.devCommit) {
@@ -724,30 +723,8 @@ func main() {
 		seed = seedCommit(repoDir, a.server, devRev)
 	}
 
-	// The `caos` remote, from `--server`. The client finds caos through it and an
-	// arbitrary checkout has none, so this is what makes the arrangement
-	// repo-independent -- nothing has to be committed to a session repo.
-	//
-	// An existing remote is left alone: a checkout that already names a server
-	// was set up deliberately, and repointing it would move someone's work to a
-	// different stack. Absent is this probe's expected answer, so its stderr is
-	// not inherited -- git's `No such remote 'caos'` on the ordinary path reads
-	// as a failure.
-	probe := exec.Command("git", "remote", "get-url", "caos")
-	probe.Dir = repoDir
-	if err := probe.Run(); err != nil {
-		if _, err := run(repoDir, "git", "remote", "add", "caos", a.server); err != nil {
-			say("could not add the caos remote; the session will have no server")
-		}
-	}
-	if a.readers != "" {
-		if _, err := run(repoDir, "git", "config", "caos.secret-readers", a.readers); err != nil {
-			say("could not record --secret-readers; the session will present no secrets")
-		}
-	}
-
-	// Unshallowed here rather than in the hook: caos pushes the workspace commit
-	// and a push packs its whole reachable graph, so the history has to be
+	// Unshallowed here: the dev seed commit is pushed below, and a push packs its
+	// whole reachable graph, so the history has to be
 	// present before the first prompt. claude.ai/code clones shallow. Non-fatal
 	// -- a big repo pays a one-time fetch here rather than failing later.
 	if shallow, _ := run(repoDir, "git", "rev-parse", "--is-shallow-repository"); shallow == "true" {

@@ -1,53 +1,21 @@
-//! Picking a recorded conversation up in a NEW Claude Code session.
+//! Closing what a dead session left open, so its conversation can be forked.
 //!
-//! One command, named by the conversation COMMIT it starts from (the hash
-//! `caos head <hash>` printed after a turn -- a commit is immutable, where a ref
-//! moves):
-//!
-//! ```text
-//! /fork-caos-conversation <hash>     a NEW branch: the new session's own
-//!                                    `cc/<session>` conversation, whose
-//!                                    history is <hash>'s, then diverges
-//! ```
-//!
-//! It is recognised by the `UserPromptSubmit` hook on a session's first prompt,
-//! so the conversation exists -- and holds the earlier history and workspace --
-//! before the model takes its first turn. What the MODEL sees of that history is
-//! the slash command's own text (see `cloud/install.go`); this file is the record
-//! side.
-//!
-//! A fork needs no bookkeeping: its id is derived from the session id like any
-//! other, so a session's conversation is always `conversation_id_for(session)`.
-//!
-//! THE HEAD IS USED AS IT IS, EVEN IF IT IS INCOMPLETE. A session that died
-//! mid-turn leaves a running request and calls that will never finish; the
-//! protocol refuses to fork such a conversation. `settle` closes them the way
-//! `llm-step` does for a cancelled turn -- each open call becomes `cancelled`,
-//! the request ends `interrupted` -- as new commits on top of the head. Nothing
-//! is rewritten, and the transcript says plainly which results never arrived.
+//! The protocol refuses to fork a conversation with a running request, and a
+//! session that died mid-turn leaves one, with calls that will never finish.
+//! [`settle`] appends commits that leave nothing open, as new commits on top of
+//! the head: nothing is rewritten, and the transcript says plainly which results
+//! never arrived.
 
 use serde_json::{json, Value};
 
-use conversation_protocol::v3::apply::{inherited_signature, Transition};
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
 use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::git_store::GitStore;
-use conversation_protocol::v3::oid::Oid;
-use conversation_protocol::v3::paths;
-use conversation_protocol::v3::records::{
-    CallRecord, CallStatus, Role, TaskStatus, ToolResult, TurnOutcome, TurnStatus,
-};
 use conversation_protocol::v3::view::Conversation;
-
-use conversation_protocol::v3::refs;
-
-use crate::{conversation_ref, mint_transition, oid};
-
-pub(super) const FORK_COMMAND: &str = "fork-caos-conversation";
-
-/// A line the slash command's expanded text carries, so the hook still finds the
-/// request if Claude Code hands it the expansion rather than what was typed.
-/// `caos-conversation-command: fork <hash>`.
-pub(super) const MARKER: &str = "caos-conversation-command:";
+use conversation_protocol::v3::{
+    paths, CallRecord, CallStatus, Oid, Role, Signature, TaskStatus, ToolResult, TurnOutcome,
+    TurnStatus,
+};
 
 /// Why a call or request a session left open was closed.
 const ABANDONED: &str =
@@ -57,67 +25,15 @@ const ABANDONED: &str =
 /// its background tasks); it exists so a bug cannot loop forever.
 const MAX_SETTLE_STEPS: usize = 1024;
 
-/// The commit a prompt asks to fork, if it asks for one.
-///
-/// The slash form counts only as the FIRST line of the prompt: a prompt that
-/// merely quotes one further down is not a request to fork anything. The marker
-/// form may be anywhere, because it is text the command itself expanded to.
-pub(super) fn parse_command(prompt: &str) -> Result<Option<Oid>, String> {
-    let trimmed = prompt.trim_start();
-    if let Some(first) = trimmed.lines().next().and_then(|l| l.strip_prefix('/')) {
-        let mut words = first.split_whitespace();
-        if words.next() == Some(FORK_COMMAND) {
-            return commit(words.next()).map(Some);
-        }
-    }
-    for line in prompt.lines() {
-        let Some(rest) = line.trim().strip_prefix(MARKER) else {
-            continue;
-        };
-        let mut words = rest.split_whitespace();
-        return match words.next() {
-            Some("fork") => commit(words.next()).map(Some),
-            other => Err(format!("unknown {MARKER} mode {other:?}")),
-        };
-    }
-    Ok(None)
+fn mint_transition(
+    store: &mut GitStore,
+    parent: &Oid,
+    transition: &Transition,
+    signature: &Signature,
+) -> Result<Oid, String> {
+    let applied = apply(store, Some(parent), transition)?;
+    mint(store, parent, &applied, transition.kind(), signature)
 }
-
-fn commit(hash: Option<&str>) -> Result<Oid, String> {
-    let hash = hash.ok_or_else(|| format!("usage: /{FORK_COMMAND} <conversation-commit-hash>"))?;
-    if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "/{FORK_COMMAND} takes a full 40-character commit hash (the one `caos head` printed), not {hash:?}"
-        ));
-    }
-    oid(&hash.to_ascii_lowercase(), "conversation commit")
-}
-
-// --- the command ------------------------------------------------------------
-
-/// A new branch: the session's own conversation, made by forking `from` after
-/// settling it. The original is untouched. `None` when the session already has
-/// its conversation, so this is not its first prompt.
-pub(super) fn begin(server: &str, session: &str, from: &Oid) -> Result<Option<String>, String> {
-    let user = super::username()?;
-    let id = super::conversation_id_for(session)?;
-    let mut store = super::server_store(server)?;
-    if store.read_ref(&refs::head_ref(&id)?)?.is_some() {
-        return Ok(None);
-    }
-    store.ensure_local(from)?;
-    let settled = settle(&mut store, from)?;
-    let title = format!("fork of {}", &from.as_str()[..12]);
-    // `settled` is `from` itself when nothing was open, so this is exactly the
-    // TUI's fork in the common case.
-    crate::fork_conversation_in(&mut store, &user, &id, &title, settled.as_str())?;
-    Ok(Some(format!(
-        "caos conversation ref {} forked from {from}",
-        conversation_ref(&id)?
-    )))
-}
-
-// --- closing what a dead session left open ----------------------------------
 
 enum Action {
     /// A request that never started: escape it.
@@ -142,7 +58,7 @@ enum Action {
 /// request ends `interrupted`. What it does not touch is a pending publication --
 /// that is a fact about a remote, not something to guess at -- so a conversation
 /// holding one is still refused, by the protocol, with its own message.
-pub(super) fn settle(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
+pub(crate) fn settle(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
     let mut head = head.clone();
     for _ in 0..MAX_SETTLE_STEPS {
         let action = {
@@ -303,57 +219,3 @@ fn observation_bytes(value: &Value) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
-
-    #[test]
-    fn the_slash_form_is_recognised_on_the_first_line() {
-        let want = Some(commit(Some(HASH)).unwrap());
-        assert_eq!(
-            parse_command(&format!("  /{FORK_COMMAND}   {HASH}\nmore text")).unwrap(),
-            want
-        );
-    }
-
-    #[test]
-    fn the_expanded_marker_is_recognised_anywhere() {
-        let prompt = format!("Some preamble.\n{MARKER} fork {HASH}\nmore.");
-        assert_eq!(
-            parse_command(&prompt).unwrap(),
-            Some(commit(Some(HASH)).unwrap())
-        );
-    }
-
-    #[test]
-    fn other_prompts_and_builtin_commands_are_not_ours() {
-        assert_eq!(parse_command("fix the bug").unwrap(), None);
-        // Claude Code's own /resume must not be mistaken for ours.
-        assert_eq!(parse_command(&format!("/resume {HASH}")).unwrap(), None);
-        assert_eq!(
-            parse_command(&format!("/resume-caos-conversation {HASH}")).unwrap(),
-            None
-        );
-        // Quoting a command further down is not asking for it.
-        assert_eq!(
-            parse_command(&format!("look:\n/{FORK_COMMAND} {HASH}")).unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn a_bad_hash_is_an_error_naming_the_command() {
-        for prompt in [
-            format!("/{FORK_COMMAND}"),
-            format!("/{FORK_COMMAND} main"),
-            format!("/{FORK_COMMAND} {}", &HASH[..12]),
-        ] {
-            let error = parse_command(&prompt).unwrap_err();
-            assert!(error.contains("/fork-caos-conversation"));
-        }
-        assert!(parse_command(&format!("{MARKER} sideways {HASH}")).is_err());
-        assert!(parse_command(&format!("{MARKER} resume {HASH}")).is_err());
-    }
-}

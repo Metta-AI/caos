@@ -6,12 +6,11 @@
 //! resolve the locator: it hands the server `content:@@=<locator>` with the first
 //! prompt, and the server fetches the commit and records its tree.
 //!
-//! Three places can name the locator, most specific first:
+//! Two places can name the locator, most specific first:
 //!
 //! ```text
 //! /caos-session-start-from <git locator>   a leading line of the first prompt
 //! --base:@@=<git locator>                  the hook's and the tool server's argument
-//! CAOS_MCP_DEFAULT_SESSION_BASE            the environment
 //! ```
 //!
 //! A directive counts only as a LEADING line, so a prompt that merely quotes one
@@ -25,7 +24,6 @@
 //! when the locator lacks it.
 
 const START_FROM_COMMAND: &str = "caos-session-start-from";
-const BASE_ENV: &str = "CAOS_MCP_DEFAULT_SESSION_BASE";
 
 /// The locator on the prompt's leading `/caos-session-start-from` line, if any.
 fn leading_start_from(prompt: &str) -> Option<String> {
@@ -41,7 +39,6 @@ fn leading_start_from(prompt: &str) -> Option<String> {
 pub(super) fn content_locator(configured: Option<&str>, prompt: &str) -> Option<String> {
     leading_start_from(prompt)
         .or_else(|| configured.map(str::to_string))
-        .or_else(|| std::env::var(BASE_ENV).ok().filter(|v| !v.is_empty()))
         .map(|locator| raw(&locator))
 }
 

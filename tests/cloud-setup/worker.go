@@ -314,8 +314,6 @@ func main() {
 		w.True(git(repo, "status", "--porcelain") == "",
 			"stage 1 left the checkout dirty, which Claude Code's stop hook reports:\n%s",
 			git(repo, "status", "--porcelain"))
-		w.True(git(repo, "config", "--get", "caos.secret-readers") == readers,
-			"--secret-readers is not in the checkout's git config, where the client reads it")
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
@@ -359,7 +357,7 @@ func main() {
 		// ONE TICKET, NAMED ONCE: `--server` is the only place a server is named,
 		// and nothing falls back to the environment. A setup line that names none
 		// must fail HERE rather than produce a session whose every tool call dies
-		// on a missing remote.
+		// on a missing server.
 		noServer := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base, "--dev-commit="+devRev, "--dev-tree="+devTree,
 			"--prefix=/tmp/prefix2", "--share-dir=/tmp/share2", "--homes=/tmp/home1")
@@ -390,8 +388,11 @@ func main() {
 		}
 
 		w.Step("stage 1 leaves a session ready to start")
-		w.True(git(repo, "remote", "get-url", "caos") == ticket,
-			"the checkout has no caos remote, which is what the client finds the server through")
+		devSettings := readJSON("/tmp/home1/.claude/settings.json")
+		w.True(strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--server="+ticket+"'") &&
+			strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--secret-readers="+readers+"'"),
+			"the hook is not told the server and the readers by argument: %s", hookCommand(devSettings, "UserPromptSubmit"))
+		w.True(git(repo, "remote") == "", "stage 1 added a git remote to the checkout")
 		launcher := read("/tmp/prefix1/bin/caos-cloud-session-start")
 		w.True(strings.Contains(launcher, "/tmp/share/session.go"),
 			"the session hook launcher does not run the hook: %s", launcher)
