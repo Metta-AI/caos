@@ -28,7 +28,7 @@ not once before a snapshot, so there is no cheap phase to defer work to.
 |---|---|
 | `bootstrap.go` | stage 1: read the repo's pin, fetch the payload, run stage 2, leave the session ready |
 | `install.go` | stage 2: put the package in place and write Claude Code's configuration |
-| `session.go` | the `SessionStart` hook: warm the tool registry, say which caos this is |
+| `session.go` | the `SessionStart` hook: check the install against the checkout's pin, say which caos this is |
 
 **Two stages, because the installer is part of the payload.** Stage 1 is the only
 thing fetched from `--base`; it then runs the `install.go` it finds in the
@@ -250,15 +250,16 @@ Two things are less obvious and both cost a session to find:
 - **The committed GitHub pin is still required**, as a bootstrap. Fetching over
   `caos://` needs `git-remote-caos`, and the release install is what puts it on
   PATH; the dev package then replaces everything it laid down.
-- **`--base` goes on the hook, the tool server and the warm alike.** The hook —
-  not `mcp serve` — is what creates a conversation, and without it the
-  conversation would seed from `HEAD`; the tool server and the warm resolve the
-  step from it. Any one missing runs your client against the *committed* tools,
-  the half-update the whole arrangement exists to prevent. Nothing points at
-  that commit, so a `git push` cannot carry the ticket it contains.
+- **`--base:@@=` goes on the hook, and on the tool server too.** The hook — not
+  `mcp serve` — is what creates a conversation, and without it the conversation
+  would start without code. Dev mode also names the step as
+  `git+caos://local?rev=<dev>&dir=std/llm-step`: the pinned commit's step has no
+  record mode. Any one missing runs your client against the *committed* tools,
+  the half-update the whole arrangement exists to prevent. Nothing points at the
+  seed commit in a checkout, so a `git push` cannot carry the ticket it contains.
 
 `/usr/local/share/caos/dev-stamp` is written last, once every step has
-succeeded; `caos_status` and the session hook both report from it, and each
+succeeded; `help` and the session hook both report from it, and each
 step is fatal, so the file existing is the claim.
 
 **The relay has to be one of yours.** The setup phase reaches the network
@@ -279,7 +280,7 @@ working, which is why one lives in the environment indefinitely.
 What invalidates it is `caosd reset`, which wipes that directory and mints a new
 identity. The env's ticket then names an endpoint nobody answers for, and iroh's
 relay swallows the connection rather than refusing it — so it presents as
-`caos_status: cannot reach the CAOS server … timeout` and a hanging
+`help: server: cannot reach the CAOS server … timeout` and a hanging
 `git ls-remote caos`, indistinguishable from a network fault, which it is not.
 `caosd ticket` on the server prints the current one; its prefix must match the
 environment's.
@@ -288,15 +289,12 @@ environment's.
 
 Measured end to end, a fresh session on a correctly-ticketed environment:
 
-- **hooks fire** — `SessionStart` warms the tool registry;
+- **hooks fire** — `SessionStart` reports which caos this is;
   `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
   is honoured, `caos mcp serve` is spawned, and the model can call it.
-- **the full tool set resolves** — `bash read ls grep edit write caos-build
-  caos-test caos-test-result log show diff merge spawn_agent run_async
-  wait_agent harvest_agent`, within SECONDS of init when the server has the
-  `std/llm-step` image cached warm. The `caos_status` placeholder stands in only
-  until they arrive (`../../rust/crates/caos-cli/MCP.md`).
+- **the five fixed tools answer** — `help`, `run`, `start`, `result` and
+  `eval-path` (`../../rust/crates/caos-cli/MCP.md`); `caos-std/read` runs by path.
 
 The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
 is fixed on their side; the first session against a step-tree the server has
@@ -321,9 +319,9 @@ Nothing compiles in the container but the two Go programs themselves.
 
 Deferring work to a hook buys nothing, and that is the correction this
 arrangement is built on: the setup script runs on **every** session, so there is
-no cheap phase and no expensive one. What is left in the hook is there for a
-different reason — the registry warm needs the n0 relays, which the setup phase
-cannot reach (503 for all seven, measured) and a session can.
+no cheap phase and no expensive one. What is left in the hook is there because
+only a session can do it: compare the install with the checkout's pin, and ask
+the server what it serves as `refs/caos/dev`.
 
 ## A separate, untested direction: the stack in the container
 

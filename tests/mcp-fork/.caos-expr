@@ -1,4 +1,4 @@
-# tests/mcp-resume, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# tests/mcp-fork, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
 # directory yields the test's ARG TREE, which dev/run-test then runs.
 #
 # A CLIENT TEST — it drives `caos mcp hook` the way Claude Code does, to pin what

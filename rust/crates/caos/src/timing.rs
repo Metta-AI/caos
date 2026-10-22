@@ -2,7 +2,7 @@
 //!
 //! The expensive work in a Claude Code session is spread across processes that
 //! nobody can watch: `mcp hook` fires per prompt and pushes the conversation
-//! base, `mcp warm` resolves the tools, `mcp serve` answers `tools/list`. Each
+//! base, `mcp serve` answers the tool calls. Each
 //! measured its own phases into a per-PROCESS static that only its own later
 //! code read -- so `ensure_code_commit`'s own doc comment can quote
 //! `ensure-pushed 115.0s` while a session that just waited out that push has no

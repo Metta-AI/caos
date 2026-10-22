@@ -109,4 +109,4 @@ err=$(env -u CAOS_SERVER_URL -u CAOS_MCP_DEFAULT_SERVER "$CAOS_CLI" mcp hook \
 [ "$rc" = 2 ] || fail "a first prompt with no server exited $rc, not 2"
 case "$err" in *"--server=<url>"*) ;; *) fail "the refusal does not say how to name a server: $err" ;; esac
 
-echo "mcp-resume: ALL PASS" >&2
+echo "mcp-fork: ALL PASS" >&2
