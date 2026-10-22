@@ -1,0 +1,7 @@
+# tests/llm-import-path, as an ENTRY (design/caos-expr.md, Phase 3): evaluating this
+# directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# tests/llm-import with the import reached BY PATH: `std/import-source` is an entry for
+# an operation of the step (`@op`), so a conversation that mounts it at a path runs it with
+# `run_tool` like any tool. `--import-source:@=DEEP-DEPS/import-source` is the built entry.
+curry --base:@=DEEP-DEPS/worker-test --worker1:@=worker.sh --import-source:@=DEEP-DEPS/import-source --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool --common:@=DEEP-DEPS/llm-test/worker-common.sh

@@ -176,7 +176,7 @@ fn parse_ref(revision: &str, output: &str) -> Result<(String, Option<String>), S
     ))
 }
 
-fn pin_path(site: &CallSite<'_>) -> String {
+pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/import.json",
         paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)

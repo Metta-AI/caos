@@ -245,9 +245,18 @@ func main() {
 			return use(id, "publish_source", map[string]any{"source_tree": source,
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
 		}
+		// The same operation reached BY PATH: std/publish-source is an entry for an
+		// operation of the step (`@op`), so a conversation that mounts it runs it with
+		// run_tool like any tool. Its arguments are strings, like every tool's.
+		publishByPath := func(id, source string) map[string]any {
+			return use(id, "run_tool", map[string]any{"path": "tools/publish-source", "arguments": map[string]any{
+				"source-tree": source, "repository": "https://caos-squash-publish.invalid/repo.git",
+				"branch": "feature", "force": "true"}})
+		}
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
 			write("tu_cx", "tools/squash/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/squash")),
+			write("tu_px", "tools/publish-source/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/publish-source")),
 			shell("tu_l1", "mkdir -p mystack && cp -a main mystack/00-base && cp -a main mystack/01-feature && echo feature > mystack/01-feature/feature.txt", "main"))
 		respond(2,
 			shell("tu_l2", "cp -a mystack/01-feature mystack/02-tests && echo tests > mystack/02-tests/tests.txt", "mystack"),
@@ -256,7 +265,8 @@ func main() {
 		// The republish: reword one message and squash again over the
 		// publish/mystack the first call wrote.
 		respond(4, write("tu_plan2", "mystack.plan", plan(m1, m2b)), squash2)
-		respond(5, publish("tu_pub", "publish/mystack/01-feature"), publish("tu_dir", "publish/mystack"))
+		respond(5, publish("tu_pub", "publish/mystack/01-feature"), publish("tu_dir", "publish/mystack"),
+			publishByPath("tu_pub2", "publish/mystack/01-feature"), publishByPath("tu_dir2", "publish/mystack"))
 		respond(6, map[string]any{"type": "text", "text": "published"})
 
 		w.Step("the turn")
@@ -311,6 +321,14 @@ func main() {
 		// read the remote.
 		w.True(strings.Contains(child, "remote branch lookup failed"), "publish_source on the squashed layer failed somewhere unexpected: %s", child)
 		note("ok: publish_source took the squashed layer and stopped only at the remote")
+
+		// By path, the operation answers the same way: it found the source gitlink and
+		// went on to read the remote, and it refuses a plain folder as before.
+		childByPath, dirByPath := seen(6, "tu_pub2"), seen(6, "tu_dir2")
+		note("publish-source by path, publish/mystack/01-feature: %s", childByPath)
+		w.True(strings.Contains(dirByPath, "requires an existing source gitlink"), "the control call by path on a plain folder was not refused as one: %s", dirByPath)
+		w.True(strings.Contains(childByPath, "remote branch lookup failed"), "publish-source by path on the squashed layer failed somewhere unexpected: %s", childByPath)
+		note("ok: publish-source by path took the squashed layer and stopped only at the remote")
 
 		w.Report(narration.String() + "chat-squash-publish: ALL PASS\n")
 	})

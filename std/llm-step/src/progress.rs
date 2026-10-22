@@ -12,7 +12,7 @@ use conversation_protocol::v3::{
 };
 use worker_common::{path, scratch};
 
-const MAX_APPEND_ATTEMPTS: usize = 32;
+pub(crate) const MAX_APPEND_ATTEMPTS: usize = 32;
 const MAX_RECOVERY_WALK: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,14 +68,29 @@ pub struct State<S: RefStore = GitStore> {
 
 impl State<GitStore> {
     pub fn open(conversation: &str) -> Result<Self, String> {
+        Self::open_if_present(conversation)?.ok_or_else(|| {
+            let refname = conversation_protocol::v3::refs::head_ref(conversation)
+                .unwrap_or_else(|_| conversation.to_string());
+            format!("conversation ref {refname} does not exist")
+        })
+    }
+
+    /// [`State::open`], or `None` when the conversation has no ref yet: the one
+    /// case a caller may create it, which is a first prompt's.
+    pub fn open_if_present(conversation: &str) -> Result<Option<Self>, String> {
         let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+        let store = Self::scratch_store()?;
+        match store.fetch_ref(&refname)? {
+            Some(head) => Self::from_store(store, refname, head).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// An empty local store whose remote is the caos server.
+    pub fn scratch_store() -> Result<GitStore, String> {
         let server =
             std::env::var("CAOS_SERVER_URL").map_err(|_| "CAOS_SERVER_URL not set".to_string())?;
-        let store = GitStore::scratch("llm-step-git", server.trim_end_matches('/'))?;
-        let head = store
-            .fetch_ref(&refname)?
-            .ok_or_else(|| format!("conversation ref {refname} does not exist"))?;
-        Self::from_store(store, refname, head)
+        GitStore::scratch("llm-step-git", server.trim_end_matches('/'))
     }
 
     /// Publish a commit object after its referenced tree and parents are known
@@ -292,6 +307,10 @@ impl<S: RefStore> State<S> {
         &mut self.store
     }
 
+    pub fn into_store(self) -> S {
+        self.store
+    }
+
     pub fn conversation(&self) -> Result<Conversation<'_>, String> {
         Conversation::open(&self.store, &self.head)
     }
@@ -335,6 +354,28 @@ impl<S: RefStore> State<S> {
         transition: Transition,
     ) -> Result<TryAppend, String> {
         self.try_append_many_at(expected, vec![transition])
+    }
+
+    /// Move the ref from `expected` to `candidate`, a commit the caller minted
+    /// itself on [`State::store_mut`]. For a chain whose later transitions name
+    /// an earlier commit (a request is identified by the message that opened
+    /// it), which [`State::try_append_many_at`] cannot express because it hides
+    /// the commits it mints. Same compare-and-swap, and the same recovery from
+    /// an ambiguous push.
+    pub fn push_chain(
+        &mut self,
+        expected: &Oid,
+        candidate: Oid,
+        ordinal: Option<u64>,
+    ) -> Result<TryAppend, String> {
+        if &self.head != expected {
+            return Ok(TryAppend::HeadChanged(self.head.clone()));
+        }
+        let pushed = self
+            .store
+            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
+        crate::timing::phase("push chain");
+        self.finish_append(expected, candidate, ordinal, pushed)
     }
 
     pub fn try_append_pair_at(

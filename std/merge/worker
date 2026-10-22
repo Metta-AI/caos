@@ -7,7 +7,8 @@
 #
 # The merge worker (SPEC "Merging and conflict resolution"). The caos runner
 # execs us as /worker with the args materialized under /cas/args:
-#   ours   (:commit=)  the source tree commit to merge into (the current side)
+#   wc     (:commit=)  the source tree commit to merge into (the current side), bound
+#                      by the launch because the tool declares `@scope source-tree`
 #   theirs (:commit=)  the commit to merge in
 #   merge-base (:commit=)  optional: the merge base to use instead of the one
 #                      git finds, e.g. the old tip of the layer below when
@@ -22,7 +23,7 @@ set -euo pipefail
 # The commit args materialize as raw commit-object files; `caos hash` reads the
 # recorded id without fetching content — and the id is all we need, since the
 # objects themselves come from the server over git below.
-ours=$(caos hash /cas/args/ours)
+ours=$(caos hash /cas/args/wc)
 theirs=$(caos hash /cas/args/theirs)
 base=()
 if [ -e /cas/args/merge-base ]; then

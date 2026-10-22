@@ -187,7 +187,9 @@ func main() {
 		w.Do(script.Exec("caos get -r " + shared))
 
 		assets := fixtureAssets("/tmp/assets")
-		const step = "--llm-step:@=caos-std/llm-step"
+		step := "--llm-step:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/llm-step"
+		const serverURL = "http://caos.test"
+		const readersArg = "--secret-readers=abcd"
 		// A home that does not exist is skipped rather than invented (/home/claude
 		// is not on every container), so a fixture home has to be made first.
 		w.Must(os.MkdirAll("/tmp/home", 0o755))
@@ -203,7 +205,9 @@ func main() {
 			"--repo=Metta-AI/caos",
 			"--commit="+pinRev,
 			"--version=build-"+pinRev[:12],
-			"--seed-commit="+seed,
+			"--server="+serverURL,
+			"--content=git+caos://local?rev="+seed,
+			readersArg,
 			"--prefix=/tmp/prefix",
 			"--homes=/tmp/home",
 			"--enable-bash")
@@ -243,8 +247,8 @@ func main() {
 		// seeded from HEAD while everything else about dev mode worked.
 		w.True(strings.Contains(prompt, "'"+step+"'"),
 			"the prompt hook does not name the step as a quoted shell word: %s", prompt)
-		w.True(strings.Contains(prompt, "--base="+seed),
-			"the prompt hook does not seed the conversation: %s", prompt)
+		w.True(strings.Contains(prompt, "'--base:@@=git+caos://local?rev="+seed+"'") && strings.Contains(prompt, "'--server="+serverURL+"'") && strings.Contains(prompt, "'"+readersArg+"'"),
+			"the prompt hook does not name the server, the content and the readers: %s", prompt)
 		w.True(!strings.Contains(prompt, "${CAOS_BIN"),
 			"the shared asset's ${CAOS_BIN} placeholder survived into the config: %s", prompt)
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
@@ -255,13 +259,12 @@ func main() {
 		timeout, _ := promptHook["timeout"].(float64)
 		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
-		// The slash commands that start a session from a recorded conversation.
+		// The slash command that starts a session from a recorded conversation.
 		// The marker line is what the prompt hook keys on if it is handed the
 		// expansion rather than what was typed, so it is asserted, not just the
 		// file.
 		for name, mode := range map[string]string{
-			"fork-caos-conversation.md":   "fork",
-			"resume-caos-conversation.md": "resume",
+			"fork-caos-conversation.md": "fork",
 		} {
 			body, err := os.ReadFile("/tmp/home/.claude/commands/" + name)
 			w.Must(err)
@@ -284,8 +287,8 @@ func main() {
 		w.True(contains(args, step), "the tool server does not name the step: %v", args)
 		// Its own argv element. Appended to the locator it became one argument,
 		// which the client reads as a flag with a nonsense value.
-		w.True(contains(args, "--base="+seed),
-			"the tool server does not seed the conversation as its own argument: %v", args)
+		w.True(contains(args, "--base:@@=git+caos://local?rev="+seed) && contains(args, "--server="+serverURL) && contains(args, readersArg),
+			"the tool server is not told the server, the content and the readers, each as its own argument: %v", args)
 
 		// -------------------------------------------------------------------
 		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
@@ -311,14 +314,12 @@ func main() {
 		w.True(git(repo, "status", "--porcelain") == "",
 			"stage 1 left the checkout dirty, which Claude Code's stop hook reports:\n%s",
 			git(repo, "status", "--porcelain"))
-		w.True(git(repo, "config", "--get", "caos.secret-readers") == readers,
-			"--secret-readers is not in the checkout's git config, where the client reads it")
 
 		dev := stamp("/tmp/share/dev-stamp")
 		w.True(dev["rev"] == devRev, "the dev stamp names %q, not the fetched revision", dev["rev"])
 		w.True(dev["std_path"] == "caos-std" && dev["repo"] == repo,
 			"the dev stamp does not describe the checkout it seeded from: %v", dev)
-		// A stamp is quoted verbatim into a model's context by `caos_status`.
+		// A stamp is quoted verbatim into a model's context by `help`.
 		for _, name := range []string{"dev-stamp", "setup-stamp"} {
 			body := read("/tmp/share/" + name)
 			w.True(!strings.Contains(body, "caos://"),
@@ -356,7 +357,7 @@ func main() {
 		// ONE TICKET, NAMED ONCE: `--server` is the only place a server is named,
 		// and nothing falls back to the environment. A setup line that names none
 		// must fail HERE rather than produce a session whose every tool call dies
-		// on a missing remote.
+		// on a missing server.
 		noServer := exec.Command("go", "run", filepath.Join(cloud, "bootstrap.go"),
 			"--base="+base, "--dev-commit="+devRev, "--dev-tree="+devTree,
 			"--prefix=/tmp/prefix2", "--share-dir=/tmp/share2", "--homes=/tmp/home1")
@@ -387,8 +388,13 @@ func main() {
 		}
 
 		w.Step("stage 1 leaves a session ready to start")
-		w.True(git(repo, "remote", "get-url", "caos") == ticket,
-			"the checkout has no caos remote, which is what the client finds the server through")
+		devSettings := readJSON("/tmp/home1/.claude/settings.json")
+		w.True(strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--llm-step:@@=git+caos://local?rev="+devRev+"&dir=std/llm-step'"),
+			"dev mode does not run the dev tree's step, so the hook would run a step without record mode: %s", hookCommand(devSettings, "UserPromptSubmit"))
+		w.True(strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--server="+ticket+"'") &&
+			strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--secret-readers="+readers+"'"),
+			"the hook is not told the server and the readers by argument: %s", hookCommand(devSettings, "UserPromptSubmit"))
+		w.True(git(repo, "remote") == "", "stage 1 added a git remote to the checkout")
 		launcher := read("/tmp/prefix1/bin/caos-cloud-session-start")
 		w.True(strings.Contains(launcher, "/tmp/share/session.go"),
 			"the session hook launcher does not run the hook: %s", launcher)
@@ -397,7 +403,7 @@ func main() {
 		// Stage 1 ran stage 2 out of the PAYLOAD, which is the whole reason there
 		// are two stages: in dev mode that is the working tree.
 		devPrompt := hookCommand(readJSON("/tmp/home1/.claude/settings.json"), "UserPromptSubmit")
-		w.True(strings.Contains(devPrompt, "--base="+seedCommit),
+		w.True(strings.Contains(devPrompt, "--base:@@=git+caos://local?rev="+seedCommit),
 			"the session would seed from HEAD rather than from the dev commit: %s", devPrompt)
 
 		// -------------------------------------------------------------------
@@ -431,6 +437,20 @@ func main() {
 		// Dev mode installs the dev commit whatever the checkout pins.
 		hookOut, marked = hook("/tmp/share-dev", "Metta-AI/caos@"+otherRev, devRev)
 		w.True(!marked, "the hook failed a dev install over the checkout's pin:\n%s", hookOut)
+
+		// The conversation base setup computed is a commit; a checkout now at another
+		// one is told so, without failing the session.
+		write("/tmp/share-content/setup-stamp",
+			"pin=Metta-AI/caos@"+pinRev+"\ncontent=github:o/r?rev="+otherRev+"\n", 0o644)
+		contentCmd := exec.Command("go", "run", filepath.Join(cloud, "session.go"), "--share-dir=/tmp/share-content")
+		contentCmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+pinRepo)
+		contentCmd.Dir = "/tmp"
+		contentOut, err := contentCmd.Output()
+		w.True(err == nil, "the session hook failed on a stale content commit: %v", err)
+		w.True(strings.Contains(string(contentOut), "new conversations start from "+otherRev[:12]),
+			"the hook did not say the conversation base is behind the checkout:\n%s", contentOut)
+		_, statErr := os.Stat("/tmp/share-content/stale-install")
+		w.True(statErr != nil, "a stale conversation base failed the session; it should only be noted")
 
 		w.Report(fmt.Sprintf("cloud-setup: stage 2 installed and configured; stage 1 repointed a\n"+
 			"checkout at %s and seeded %s\n", devRev[:12], seedCommit[:12]))

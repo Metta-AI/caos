@@ -25,7 +25,7 @@ a commit to a branch, and `caos-std/github` does everything else on GitHub
 | duplicate a source tree, with its history | `copy` |
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
-| merge another commit into a source tree | `caos-std/merge` (or the registered `merge` tool) |
+| merge another commit into a source tree | `caos-std/merge` |
 | squash a stack to one commit per layer | `caos-std/create-squashed-stack` |
 | push a commit to a GitHub branch | `publish_source` |
 | open a PR, change its base, link a stack, read and answer comments | `caos-std/github` |
@@ -151,14 +151,17 @@ The examples that follow use the stack shown just before them.
 
 ### Merging
 
-`merge(source_tree=Y, theirs=X)` merges the full commit hash `X` into the
-gitlink `Y` and always mints a merge commit with parents `Y` and `X`. It picks
-the highest common ancestor as the base. The optional `merge-base` overrides
+`merge(source-tree=Y, theirs=X)` (run as `run_tool(path="caos-std/merge", arguments={...})`)
+merges `X` into the gitlink `Y` and always mints a merge commit with parents `Y` and `X`.
+It picks the highest common ancestor as the base. The optional `merge-base` overrides
 that, which you only need to replay a change onto a history that lacks its old
 base (a layer rebuilt on a force-pushed upstream: `merge-base` is the old tip
 of the previous layer).
 
-`theirs` must be a **full commit hash**. Get it from `log` on the source tree.
+`theirs` is a **full commit hash** (from `log` on a source tree) or the **path of a
+source tree** in the conversation, such as one `import_source` just made. A branch
+NAME is not accepted: to merge `origin/main`, `import_source` the remote at
+`revision=main` into a fresh path, then pass that path as `theirs`.
 
 On a conflict the merge still advances the gitlink, with git's inline markers
 in the files and a reserved `.caos/conflicts` file listing every unresolved
@@ -175,7 +178,7 @@ Edit `sources/repo/01-feature` (A becomes A2), then merge each layer into the
 one after it, earliest first:
 
 ```text
-merge(source_tree="sources/repo/02-tests",
+merge(source-tree="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 
 sources/repo/01-feature  -> A2  parent A
@@ -193,9 +196,9 @@ remove(file-path="sources/repo/00-base")
 remove(file-path="sources/repo/00-base.source.json")
 move(from="sources/repo/00-base-2", to="sources/repo/00-base")
 move(from="sources/repo/00-base-2.source.json", to="sources/repo/00-base.source.json")
-merge(source_tree="sources/repo/01-feature",
+merge(source-tree="sources/repo/01-feature",
       theirs="<full hash of sources/repo/00-base>")
-merge(source_tree="sources/repo/02-tests",
+merge(source-tree="sources/repo/02-tests",
       theirs="<full hash of sources/repo/01-feature>")
 ```
 
@@ -206,9 +209,9 @@ of the previous layer.
 
 ```text
 remove sources/repo/01-feature; copy sources/repo/00-base -> sources/repo/01-feature
-merge(source_tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
+merge(source-tree="sources/repo/01-feature", theirs="<A>", merge-base="<H>")
 remove sources/repo/02-tests;   copy sources/repo/01-feature -> sources/repo/02-tests
-merge(source_tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
+merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
 ```
 
 ### Dropping, combining, splitting

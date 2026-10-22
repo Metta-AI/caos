@@ -11,11 +11,32 @@ pub(super) const HELP: &str = "Publish the exact selected source commit to an HT
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Parameters {
+    #[serde(rename = "source-tree", alias = "source_tree")]
     source_tree: String,
     repository: String,
     branch: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "bool_or_string")]
     force: bool,
+}
+
+/// A boolean as a JSON boolean or as the string a tool's arguments are: through
+/// `run_tool` every argument is a string, and `force` is declared like the rest.
+fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    use serde::de::Error;
+    match <Value as serde::Deserialize>::deserialize(deserializer)? {
+        Value::Bool(value) => Ok(value),
+        Value::String(text) => match text.trim() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" | "" => Ok(false),
+            other => Err(D::Error::custom(format!(
+                "force is true or false, not {other:?}"
+            ))),
+        },
+        Value::Null => Ok(false),
+        other => Err(D::Error::custom(format!(
+            "force is true or false, not {other}"
+        ))),
+    }
 }
 
 fn parameters(call: &Call) -> Result<Parameters, String> {
@@ -30,7 +51,7 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
     Ok(p)
 }
 
-fn pin_path(site: &CallSite<'_>) -> String {
+pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/publication.json",
         paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
@@ -344,4 +365,46 @@ pub(super) fn finish<S: progress::RefStore>(
         }
     }
     Err("conversation kept moving while completing publication".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn force(value: Value) -> Result<bool, String> {
+        let mut input = json!({
+            "source-tree": "feature/01-change",
+            "repository": "https://example.invalid/r.git",
+            "branch": "feature",
+        });
+        if !value.is_null() {
+            input["force"] = value;
+        }
+        serde_json::from_value::<Parameters>(input)
+            .map(|p| p.force)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn force_is_a_boolean_or_the_string_every_tool_argument_is() {
+        assert_eq!(force(json!(true)), Ok(true));
+        assert_eq!(force(json!("true")), Ok(true));
+        assert_eq!(force(json!("false")), Ok(false));
+        assert_eq!(force(Value::Null), Ok(false), "absent means no force");
+        assert!(force(json!("maybe")).is_err());
+        assert!(force(json!(3)).is_err());
+    }
+
+    #[test]
+    fn the_source_tree_parameter_has_a_dash_and_keeps_its_old_spelling() {
+        for name in ["source-tree", "source_tree"] {
+            let input = json!({
+                name: "feature/01-change",
+                "repository": "https://example.invalid/r.git",
+                "branch": "feature",
+            });
+            let parsed: Parameters = serde_json::from_value(input).unwrap();
+            assert_eq!(parsed.source_tree, "feature/01-change");
+        }
+    }
 }

@@ -73,7 +73,7 @@ merge_run() { # <ours-cas-path> <theirs-cas-path> [merge-base-cas-path] -> a req
   local base=()
   if [ -n "${3:-}" ]; then base=(--merge-base:@="$3"); fi
   caos prepare-request --base:hash="$(caos hash /cas/args/merge)" \
-    --ours:@="$1" --theirs:@="$2" "${base[@]}"
+    --wc:@="$1" --theirs:@="$2" "${base[@]}"
 }
 result_commit() {
   caos get /cas/args/result >/dev/null

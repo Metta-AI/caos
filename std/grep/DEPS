@@ -1,0 +1,4 @@
+# What this tool builds from and runs (format `<path> <name>`): the compiler, and
+# the fold that finds the matches.
+../rustc rustc
+../rgrep rgrep

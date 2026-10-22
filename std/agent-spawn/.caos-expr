@@ -1,0 +1,11 @@
+# std/agent-spawn (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op` says llm-step
+# does the work in process (it owns the conversation's own records and the call's
+# lifecycle), so this entry exists to give the operation a path, a help and a place in
+# `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with agent-wait, then selected content can be applied with agent-harvest. Returns the child id.
+@param prompt A self-contained task with the desired output and constraints.
+@param {array} [paths] Conversation-relative paths to copy. Omit for all content. Select code references as whole source trees. Protocol metadata is always excluded.
+@op agent-spawn
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

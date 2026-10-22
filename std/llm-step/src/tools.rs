@@ -189,6 +189,13 @@ pub struct TreeTool {
     /// The tool declared `@call`: bind this tool call's id as `call`. See
     /// [`Help::call`].
     pub call: bool,
+    /// The tool declared `@scope <param>`: the SOURCE TREE it runs over, and
+    /// changes if it is a writer, is the one the argument `<param>` names. See
+    /// [`Help::scope`].
+    pub scope: Option<String>,
+    /// The tool declared `@op <name>`: the step performs this operation itself.
+    /// See [`Help::op`].
+    pub op: Option<String>,
 }
 
 /// What `@in` offers the model: the tree to run over, defaulting to the one
@@ -225,6 +232,8 @@ impl TreeTool {
             writer: help.writer,
             wants_in: help.wants_in,
             call: help.call,
+            scope: help.scope,
+            op: help.op,
         }
     }
 
@@ -470,6 +479,26 @@ pub struct Help {
     /// and the call id is unique to the call yet the same when a call is
     /// recovered, so a retry gets the stored result and a new call does not.
     pub call: bool,
+    /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
+    /// TREE the argument `<param>` names (the path of a code reference in the
+    /// conversation, such as `feature/01-change`).
+    ///
+    /// Everything else gets its scope from WHERE THE TOOL SITS: a tool reached
+    /// at `feature/01-change/caos-tools/test` runs over `feature/01-change`, and
+    /// one at `caos-std/…` over the conversation. That is wrong for a tool that
+    /// is a SHARED one and acts on a tree the caller picks: `merge` is reached at
+    /// `caos-std/merge` and must advance `feature/01-change`. The tag says which
+    /// parameter names the tree; with it the tool gets that tree's commit as
+    /// `wc` (it implies `@git`), a writer's proposal advances THAT source tree,
+    /// and `in` defaults to its code. The parameter must be declared with
+    /// `@param`: a tag that names none is reported, not obeyed.
+    pub scope: Option<String>,
+    /// `@op <name>`: the tool is an OPERATION OF THE STEP, not a worker. The entry
+    /// that declares it exists to give the operation a path, a help and a place in
+    /// `tool_help`/`run_tool`; running it is the step doing the work in process,
+    /// because the operation writes the conversation's own records (a source tree
+    /// imported, a publication, a subagent) and owns its call's lifecycle.
+    pub op: Option<String>,
 }
 
 /// If `line` opens a javadoc BLOCK TAG, its name without the `@`.
@@ -502,6 +531,8 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut writer = false;
     let mut wants_in = false;
     let mut call = false;
+    let mut scope: Option<String> = None;
+    let mut op: Option<String> = None;
     let mut in_tags = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -529,24 +560,57 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         } else if trimmed == "@call" {
             in_tags = true;
             call = true;
+        } else if let Some(rest) = trimmed
+            .strip_prefix("@scope")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+        {
+            in_tags = true;
+            let name = rest.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                eprintln!("{ctx}: @scope names one parameter, got {rest:?} — ignored");
+            } else {
+                scope = Some(name.to_string());
+            }
+        } else if let Some(rest) = trimmed
+            .strip_prefix("@op")
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+        {
+            in_tags = true;
+            let name = rest.trim();
+            if name.is_empty() || name.contains(char::is_whitespace) {
+                eprintln!("{ctx}: @op names one operation, got {rest:?} — ignored");
+            } else {
+                op = Some(name.to_string());
+            }
         } else if let Some(tag) = block_tag(trimmed) {
             in_tags = true;
             eprintln!(
                 "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in, @call)"
+                 (known: @param, @git, @writer, @in, @call, @scope, @op)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
             doc.push(trimmed);
         }
     }
+    // A scope that names no declared parameter would select nothing, silently:
+    // report it where the author can see it, and do not obey it.
+    if let Some(name) = &scope {
+        if !args.iter().any(|declared| &declared.name == name) {
+            eprintln!("{ctx}: @scope names {name:?}, which no @param declares — ignored");
+            scope = None;
+        }
+    }
     Help {
         doc: doc.join(" ").trim().to_string(),
         args,
-        git,
+        // A scoped tool is handed its tree's commit, which is what `@git` is.
+        git: git || scope.is_some(),
         writer,
         wants_in,
         call,
+        scope,
+        op,
     }
 }
 
@@ -940,13 +1004,46 @@ pub fn resolve_object(
     if is_oid(value) {
         caos(["get-hash", value, &materialized])
             .map_err(|_| format!("no object {value} — is the hash right, and pushed?"))?;
-    } else {
-        if want == "commit" {
-            return Err(format!(
-                "{value:?} is not a commit hash. A path names a tree, not a commit; \
-                 use a hash such as one printed by log, show or diff"
-            ));
+    } else if want == "commit" {
+        // A path cannot name a commit in general, because `caos resolve` walks
+        // THROUGH a code reference to the tree inside it. But the entry itself,
+        // as stored, IS a commit, and a source tree is exactly a code
+        // reference: `imports/repo/main-2` names the commit that was imported.
+        // So a path is accepted when it names one, and nothing else.
+        let not_a_commit = || {
+            format!(
+                "{value:?} is not a commit hash or the path of a source tree (a code \
+                 reference in the conversation). A path to anything else names a tree, \
+                 not a commit; use a hash such as one printed by log, show or diff"
+            )
+        };
+        let Some(tree) = conversation else {
+            return Err(not_a_commit());
+        };
+        let comps: Vec<&str> = value
+            .trim()
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        let Some((last, ancestors)) = comps.split_last() else {
+            return Err(not_a_commit());
+        };
+        if comps.contains(&"..") {
+            return Err(not_a_commit());
         }
+        let parent = fresh("arg-parent");
+        caos(["resolve", tree, &ancestors.join("/"), &parent])
+            .map_err(|_| format!("no such path: {value}"))?;
+        let entry = Path::new(&parent).join(last);
+        if !entry.exists() {
+            return Err(format!("no such path: {value}"));
+        }
+        if worker_common::cas_kind(path(&entry))? != "commit" {
+            return Err(not_a_commit());
+        }
+        return Ok(Bound::Commit(worker_common::cas_hash(path(&entry))?));
+    } else {
         let Some(tree) = conversation else {
             return Err(format!(
                 "{value:?} is a path, and this tool runs without a tree to resolve \
@@ -2191,6 +2288,8 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            scope: None,
+            op: None,
         };
         let d = tree_tool_declaration(&tool);
         assert_eq!(d["input_schema"]["properties"]["hash"]["type"], "string");
@@ -2211,6 +2310,8 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            scope: None,
+            op: None,
         };
         let d = tree_tool_declaration(&bare);
         assert_eq!(
@@ -2242,6 +2343,8 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            scope: None,
+            op: None,
         };
         let call = |input: Value| json!({"id": "toolu_01", "name": "echo-arg", "input": input});
 

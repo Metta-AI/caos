@@ -712,12 +712,22 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
 fn expression_params(request: &mut Request, query: &str) -> Result<String, HttpError> {
     let mut body = String::new();
     request.as_reader().read_to_string(&mut body)?;
-    let body = body.trim();
-    Ok(match (query.is_empty(), body.is_empty()) {
+    Ok(join_params(query, &body))
+}
+
+/// `query` and `body` as one parameter string. A body is
+/// `application/x-www-form-urlencoded`, in which `+` is a space (`curl
+/// --data-urlencode` writes every space that way), so it is spelled `%20` here;
+/// a literal `+` is `%2B` in a form, and still decodes to one. The query string
+/// keeps the convention the rest of the server's URLs have, where `+` is
+/// itself.
+fn join_params(query: &str, body: &str) -> String {
+    let body = body.trim().replace('+', "%20");
+    match (query.is_empty(), body.is_empty()) {
         (_, true) => query.to_string(),
-        (true, false) => body.to_string(),
+        (true, false) => body,
         (false, false) => format!("{query}&{body}"),
-    })
+    }
 }
 
 /// A private repository's token for a `:@@=` fetch — the header
@@ -919,6 +929,19 @@ fn spawn_request_ref_pruner(git_dir: String) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_form_body_decodes_plus_as_space_and_a_query_does_not() {
+        use super::join_params;
+        // curl --data-urlencode "cmd=echo written > out.txt"
+        assert_eq!(
+            join_params("a=1+2", "cmd=echo+written+%3E+out.txt&p=a%2Bb"),
+            "a=1+2&cmd=echo%20written%20%3E%20out.txt&p=a%2Bb"
+        );
+        assert_eq!(join_params("a=1", ""), "a=1");
+        assert_eq!(join_params("", " b=2 \n"), "b=2");
+        assert_eq!(join_params("", ""), "");
+    }
+
     use super::{
         configure_ref_advertisements, remove_managed_pre_receive_hook, run_required_git,
         MANAGED_HOOK_MARKERS,

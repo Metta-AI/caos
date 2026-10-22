@@ -26,7 +26,7 @@ Three events, three jobs, matching serve.rs/mod.rs exactly:
 Deliberately NOT wired for v1: StopFailure. post_llm_call does not fire on
 an interrupted/errored turn, and Hermes has no exact equivalent hook in the
 current catalog. This is a known gap, not a silent one -- but it is also
-not a correctness gap: rust/crates/caos-cli/src/mcp/resume.rs's `settle()`
+not a correctness gap: std/llm-step/src/settle.rs's `settle()`
 already exists specifically to close a request a dead session left open
 (cancelled calls, interrupted request) the next time anything forks/resumes
 that conversation. A Hermes crash mid-turn behaves exactly like a killed
@@ -74,7 +74,7 @@ def _read_profile_env() -> dict[str, str]:
     `_caos_bin()` always returned None here (the `_REPO_ROOT/result/bin/caos`
     fallback never existing in a bundled deploy either), so `_run_hook` was a
     silent no-op for EVERY UserPromptSubmit/Stop call -- no conversation was
-    ever created, which is why `caos_status` reported having none.
+    ever created, which is why the overview reported having none.
     `_DIST_ROOT` is the installed profile's own directory (see above), the
     same place `.env` lives, so read it from there instead.
     """
@@ -170,11 +170,11 @@ def _session_sha() -> Optional[str]:
     return out.split()[0] if out else None
 
 
-def _llm_step_arg(profile_env: dict[str, str]) -> str:
+def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
     """Same rewrite scripts/caos-mcp-launch applies, and for the same reason:
-    `--llm-step:@=std/llm-step` is a path relative to the resolving
-    process's OWN cwd, which this subprocess call's caller (the Hermes
-    agent process) never puts inside a caos checkout.
+    `--llm-step:@=std/llm-step` is a path in a checkout, which `caos mcp` does not read;
+    this rewrite names the step by locator instead. `None` when no locator can be
+    resolved, and the hook then does nothing.
 
     PREFERS the server's own refs/caos/dev (`_dev_sha`), same as
     caos-mcp-launch and for the identical reason: it is the one locator that
@@ -204,7 +204,18 @@ def _llm_step_arg(profile_env: dict[str, str]) -> str:
             "--llm-step:@@=github:Metta-AI/caos-session"
             f"?rev={session_sha}&dir=caos-std/llm-step"
         )
-    return "--llm-step:@=std/llm-step"
+    return None
+
+
+def _base_args() -> list[str]:
+    """What a NEW conversation starts from, as `--base:@@=<locator>`:
+    Metta-AI/caos-session at its current main tip. `caos mcp` reads no
+    checkout, so the server fetches this commit itself; a prompt can still
+    name another with a leading `/caos-session-start-from <locator>` line."""
+    session_sha = _session_sha()
+    if session_sha:
+        return [f"--base:@@=github:Metta-AI/caos-session?rev={session_sha}"]
+    return []
 
 
 def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -217,30 +228,30 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     bin_path = _caos_bin(profile_env)
     if bin_path is None:
         return None
-    # CAOS_MCP_DEFAULT_SERVER, EXPLICITLY, not just inherited: this process
-    # (`hermes serve`) never has it in its OWN environment (see
-    # `_read_profile_env`'s docstring), and `caos mcp hook` needs it to find
-    # a workspace at all when there is no real git checkout at its cwd or
-    # $CLAUDE_PROJECT_DIR -- `session_base::default_server_scratch()` reads
-    # exactly this var and returns `None` (not an error; just "nothing to
-    # fall back to") when it is unset. Confirmed the hard way: with every
-    # other part of this fix in place, the subprocess still failed with
-    # "caos-cli must run inside a git working tree (none found)" until this
-    # one variable was added to its environment -- a conversation was still
-    # never created.
+    step = _llm_step_arg(profile_env)
+    if step is None:
+        return None
+    # The server is an ARGUMENT: this process (`hermes serve`) never has
+    # CAOS_MCP_DEFAULT_SERVER in its own environment (see `_read_profile_env`'s
+    # docstring), so it is read from the profile and passed by name.
     server = _env("CAOS_MCP_DEFAULT_SERVER", profile_env)
-    env = dict(os.environ)
-    if server and not _unsubstituted(server):
-        env["CAOS_MCP_DEFAULT_SERVER"] = server
+    if not server or _unsubstituted(server):
+        return None
     try:
         result = subprocess.run(
-            [bin_path, "mcp", "hook", _llm_step_arg(profile_env)],
+            [
+                bin_path,
+                "mcp",
+                "hook",
+                f"--server={server}",
+                step,
+                *_base_args(),
+            ],
             input=json.dumps(payload),
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
-            env=env,
         )
     except Exception:
         return None

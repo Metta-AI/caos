@@ -1,0 +1,11 @@
+# std/grep (design/caos-expr.md): this directory built by rustc, with the built
+# rgrep image curried on as the fold it runs. The help is a HERE-STRING so it
+# lives in this expression, which is stripped from the tree the build sees.
+HELP=<<END
+Search a tree with a regular expression (Rust regex syntax, line-based). Returns matches as `path:linenum:line`. The tree is the one this tool runs over (the conversation, unless `in` names another) and the search goes through code references. Scope with `path` (a directory or file) to narrow it; results are cached per unchanged subtree, so repeated and scoped searches are cheap. Output is cut at 100KB, with the number of files left out. Prefer this over grep or find via bash. To search inside an evaluated result such as caos-std/, pass the evaluated tree as `in`.
+@param pattern The regular expression to search for.
+@param [path] Directory or file to search; omit for everything.
+@in
+END
+IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=.
+curry --base=$IMAGE --rgrep:@=DEEP-DEPS/rgrep --help=$HELP

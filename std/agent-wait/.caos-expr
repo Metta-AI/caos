@@ -1,0 +1,10 @@
+# std/agent-wait (design/caos-expr.md): an entry for an OPERATION OF THE STEP. `@op` says llm-step
+# does the work in process (it owns the conversation's own records and the call's
+# lifecycle), so this entry exists to give the operation a path, a help and a place in
+# `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+Wait for one owned child agent to report a terminal checkpoint. This joins the child's durable relay rather than polling its moving conversation ref.
+@param child The child id agent-spawn returned.
+@op agent-wait
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP
