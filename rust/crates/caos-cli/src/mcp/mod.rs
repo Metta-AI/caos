@@ -161,17 +161,11 @@ impl PreparedCall {
 /// Everything a tool call needs before it is sent: the conversation and the
 /// step's parameters.
 ///
-/// The conversation may not exist yet. The prompt hook opens it, and runs in
-/// another process, so the first call can beat it; `wait_for_conversation` covers
-/// that race.
-fn prepare_call(
-    config: &Config,
-    session: &str,
-    name: &str,
-    args: &Value,
-) -> Result<PreparedCall, String> {
+/// The conversation already exists: the prompt hook runs before the model sees
+/// the prompt, so a tool call can only follow it. A call with no conversation is
+/// the step's to refuse, naming it.
+fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
     let conversation = conversation_id_for(session)?;
-    wait_for_conversation(&config.server()?, &conversation);
     let call = args
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
@@ -203,7 +197,7 @@ fn run_tool(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
-    let call = prepare_call(config, session, name, args)?;
+    let call = prepare_call(session, name, args)?;
     let (kind, result) = run_step(config, &call.conversation, &call.params())?;
     decode_result(&config.server()?, &kind, &result)
 }
@@ -212,7 +206,7 @@ fn run_tool(
 /// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
 /// what a client will wait for is not lost with its connection.
 fn start_tool(config: &Config, session: &str, name: &str, args: &Value) -> Result<String, String> {
-    let call = prepare_call(config, session, name, args)?;
+    let call = prepare_call(session, name, args)?;
     start_step(config, &call.conversation, &call.params())
 }
 
@@ -417,40 +411,6 @@ fn server_store(server: &str) -> Result<ServerStore, String> {
         store,
         dir: std::path::PathBuf::from(format!("/tmp/{name}")),
     })
-}
-
-/// How long a tool call waits for its conversation to exist before proceeding
-/// to the append that would refuse it.
-///
-/// The conversation is created by the `UserPromptSubmit` hook, a SEPARATE
-/// process, and Claude Code does not hold the turn for it -- so the model's
-/// first tool call can arrive before the record lands and would otherwise be
-/// refused ("no conversation to record into"), failing a session's whole first
-/// turn while every later turn works (by then the record exists). So a call
-/// WAITS for the record the hook is still writing.
-///
-/// In a cloud session the hook takes ~10s, so this is a short wait. Probing is
-/// cheap: a ref read, with no fetch. Bounded well past the hook's time; a
-/// conversation that never appears still errors, just after the wait.
-const TOOL_WAIT_ATTEMPTS: u32 = 20;
-const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn wait_for_conversation(server: &str, id: &str) {
-    let Ok(refname) = refs::head_ref(id) else {
-        return;
-    };
-    let Ok(store) = server_store(server) else {
-        return;
-    };
-    for attempt in 0..TOOL_WAIT_ATTEMPTS {
-        // An unreadable ref is a server problem, which the call itself reports.
-        if !matches!(store.read_ref(&refname), Ok(None)) {
-            return;
-        }
-        if attempt + 1 < TOOL_WAIT_ATTEMPTS {
-            std::thread::sleep(TOOL_WAIT_INTERVAL);
-        }
-    }
 }
 
 /// The model's own arguments, without the values the hook injected: those are

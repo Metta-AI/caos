@@ -389,6 +389,8 @@ func main() {
 
 		w.Step("stage 1 leaves a session ready to start")
 		devSettings := readJSON("/tmp/home1/.claude/settings.json")
+		w.True(strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--llm-step:@@=git+caos://local?rev="+devRev+"&dir=std/llm-step'"),
+			"dev mode does not run the dev tree's step, so the hook would run a step without record mode: %s", hookCommand(devSettings, "UserPromptSubmit"))
 		w.True(strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--server="+ticket+"'") &&
 			strings.Contains(hookCommand(devSettings, "UserPromptSubmit"), "'--secret-readers="+readers+"'"),
 			"the hook is not told the server and the readers by argument: %s", hookCommand(devSettings, "UserPromptSubmit"))

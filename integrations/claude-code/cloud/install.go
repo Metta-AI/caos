@@ -54,6 +54,7 @@ type args struct {
 	commit     string
 	version    string
 	server     string
+	step       string
 	content    string
 	readers    string
 	prefix     string
@@ -78,6 +79,10 @@ func parseArgs(argv []string) args {
 			a.commit = value
 		case "--version":
 			a.version = value
+		// The step as a locator, when it is not caos' own pinned commit: dev mode
+		// runs the step of the dev tree, which the pinned commit does not have.
+		case "--step":
+			a.step = value
 		case "--server":
 			a.server = value
 		// What a NEW conversation starts from, as a locator the server fetches.
@@ -246,6 +251,9 @@ func marshal(value any) []byte {
 // own tree by full sha, which is also what makes a `reader:@@=` grant on caos's
 // `std/llm-step` match it (SPEC.md, "Secrets").
 func stepLocator(a args) string {
+	if a.step != "" {
+		return "--llm-step:@@=" + a.step
+	}
 	if a.repo == "" || a.commit == "" {
 		fatal("this build cannot say which commit it came from, so there is no\n" +
 			"  tree to pin the step to and the configuration would be useless.")

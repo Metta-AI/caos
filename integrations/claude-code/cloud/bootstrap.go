@@ -761,6 +761,9 @@ func main() {
 		"--prefix=" + a.prefix,
 	}
 	install = append(install, "--server="+a.server)
+	if devRev != "" {
+		install = append(install, "--step=git+caos://local?rev="+devRev+"&dir=std/llm-step")
+	}
 	if content != "" {
 		install = append(install, "--content="+content)
 	}

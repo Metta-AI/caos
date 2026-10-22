@@ -232,6 +232,21 @@ case "$missing" in
   *) fail "a missing generated path was not a recoverable tool error: $missing" ;;
 esac
 
+echo "== a raw locator names a subtree unevaluated ==" >&2
+# `raw=1&dir=hello` is the directory as the commit holds it, `.caos-expr` and all;
+# without `raw` the same locator evaluates it into the tool's image.
+locator="git+git://$CAOS_STUB_HOST:$git_port/tools?rev=$revision&dir=hello"
+raw_answer=$(curl -fsS "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "$locator&raw=1" '$l|@uri')") \
+  || fail "the server refused a raw locator with a dir"
+[ "${raw_answer%% *}" = tree ] || fail "a raw dir is not a tree: $raw_answer"
+"$CAOS_CLI" get "${raw_answer##* }" /tmp/raw-hello >/dev/null || fail "reading the raw tree"
+[ -f /tmp/raw-hello/.caos-expr ] || fail "the raw tree was evaluated: it has no .caos-expr ($(ls -A /tmp/raw-hello))"
+evaluated=$(curl -fsS "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "$locator" '$l|@uri')") \
+  || fail "the server refused the evaluated locator"
+[ "${evaluated##* }" != "${raw_answer##* }" ] || fail "raw and evaluated named the same tree"
+missing=$(curl -s -o /dev/null -w '%{http_code}' "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "${locator%dir=hello}raw=1&dir=nope" '$l|@uri')")
+[ "$missing" = 404 ] || fail "a raw dir that is not there answered $missing, not 404"
+
 echo "== a call still running at Stop keeps its request, and its result ==" >&2
 # Claude Code moves any MCP call past 120s to the background and ends the turn,
 # so `Stop` fires while the call runs and the result arrives in a later turn --
