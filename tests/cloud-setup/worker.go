@@ -438,6 +438,20 @@ func main() {
 		hookOut, marked = hook("/tmp/share-dev", "Metta-AI/caos@"+otherRev, devRev)
 		w.True(!marked, "the hook failed a dev install over the checkout's pin:\n%s", hookOut)
 
+		// The conversation base setup computed is a commit; a checkout now at another
+		// one is told so, without failing the session.
+		write("/tmp/share-content/setup-stamp",
+			"pin=Metta-AI/caos@"+pinRev+"\ncontent=github:o/r?rev="+otherRev+"\n", 0o644)
+		contentCmd := exec.Command("go", "run", filepath.Join(cloud, "session.go"), "--share-dir=/tmp/share-content")
+		contentCmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+pinRepo)
+		contentCmd.Dir = "/tmp"
+		contentOut, err := contentCmd.Output()
+		w.True(err == nil, "the session hook failed on a stale content commit: %v", err)
+		w.True(strings.Contains(string(contentOut), "new conversations start from "+otherRev[:12]),
+			"the hook did not say the conversation base is behind the checkout:\n%s", contentOut)
+		_, statErr := os.Stat("/tmp/share-content/stale-install")
+		w.True(statErr != nil, "a stale conversation base failed the session; it should only be noted")
+
 		w.Report(fmt.Sprintf("cloud-setup: stage 2 installed and configured; stage 1 repointed a\n"+
 			"checkout at %s and seeded %s\n", devRev[:12], seedCommit[:12]))
 	})

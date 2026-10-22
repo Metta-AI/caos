@@ -587,7 +587,7 @@ func seedCommit(repoDir, server, sha string) string {
 }
 
 func writeStamp(path string, lines map[string]string) {
-	keys := []string{"built", "base", "rev", "seed", "repo", "std_path", "pin", "client"}
+	keys := []string{"built", "base", "rev", "seed", "repo", "std_path", "pin", "client", "content"}
 	var b strings.Builder
 	for _, key := range keys {
 		if value, ok := lines[key]; ok {
@@ -801,12 +801,18 @@ func main() {
 		fatal("could not write %s: %v", launcherPath, err)
 	}
 
+	checkoutContent := ""
+	if seed == "" {
+		checkoutContent = content
+	}
 	stamp := map[string]string{
 		"built":    time.Now().Format(time.RFC3339),
 		"base":     a.base,
 		"pin":      p.slug() + "@" + p.rev,
 		"std_path": p.stdPath,
 		"client":   pkg.version,
+		// Only a locator derived from the checkout can go stale against it.
+		"content": checkoutContent,
 	}
 	writeStamp(filepath.Join(shareDir, "setup-stamp"), stamp)
 	// NOT THE TICKET. A `caos://` URL is the capability to drive that server, and

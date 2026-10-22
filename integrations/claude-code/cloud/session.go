@@ -134,6 +134,7 @@ func main() {
 			"(HEAD pointed at the dev server; the checkout is untouched).\n", short(rev), short(dev["seed"]))
 		reportDev(rev, <-served)
 	} else {
+		reportContent(setup["content"])
 		fmt.Printf("caos dev mode: off -- this session runs the caos its repo pins (%s).\n",
 			setup["client"])
 	}
@@ -327,4 +328,23 @@ func mustGetwd() string {
 		return "."
 	}
 	return dir
+}
+
+// Says so when the commit new conversations start from is not the checkout's.
+// Setup computes that commit once and the environment caches the result, so a
+// checkout cloned later at a newer HEAD starts its conversations from the older
+// one. A NOTE, not a failure: refusing every session after any commit to the
+// repo would make the setup line a thing to edit on each push.
+func reportContent(installed string) {
+	_, rest, ok := strings.Cut(installed, "?rev=")
+	if !ok || !strings.HasPrefix(installed, "github:") {
+		return
+	}
+	rev, _, _ := strings.Cut(rest, "&")
+	head, err := git("rev-parse", "HEAD")
+	if err != nil || head == rev {
+		return
+	}
+	fmt.Printf("caos: new conversations start from %s, the commit setup saw; this checkout is at %s.\n"+
+		"  Change the environment's setup line to start from the checkout's.\n", short(rev), short(head))
 }
