@@ -187,6 +187,9 @@ pub(crate) fn eval_endpoint(
                 git_locator::parse_git_ref(&locator).map_err(|e| HttpError::new(400, e))?;
             let root = crate::locator::resolve_root(config, &git_ref, token)
                 .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+            if git_ref.raw {
+                return raw_root(&locator, &git_ref, &root).map(String::into_bytes);
+            }
             let dir = git_ref.dir.as_deref().unwrap_or("");
             let result = eval_in_tree(config, &root.to_string(), dir, secrets).map_err(|e| {
                 HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message()))
@@ -286,6 +289,21 @@ fn walk(
     Ok(result)
 }
 
+/// A `raw=1` locator's answer: the pinned commit's own tree, unevaluated.
+fn raw_root(
+    locator: &str,
+    git_ref: &git_locator::GitRef,
+    root: &gix::ObjectId,
+) -> Result<String, HttpError> {
+    if git_ref.dir.is_some() {
+        return Err(HttpError::new(
+            400,
+            format!("git ref {locator:?}: raw=1 takes no dir="),
+        ));
+    }
+    Ok(format!("tree {root}"))
+}
+
 /// A locator's object: its `rev`'s tree, descended to `dir=` by evaluation.
 fn evaluate_locator(
     config: &Config,
@@ -296,6 +314,9 @@ fn evaluate_locator(
     let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
     let root = crate::locator::resolve_root(config, &git_ref, token)
         .map_err(|e| HttpError::new(502, format!("git ref {locator:?}: {e}")))?;
+    if git_ref.raw {
+        return raw_root(locator, &git_ref, &root);
+    }
     let dir = git_ref.dir.as_deref().unwrap_or("");
     let result = evaluate(config, &root.to_string(), dir, secrets)
         .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
@@ -1228,6 +1249,14 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         let git_ref = git_locator::parse_git_ref(value)?;
         let root = crate::locator::resolve_root(self.config, &git_ref, None)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;
+        if git_ref.raw {
+            // The pinned commit's own tree, unevaluated: a conversation's content,
+            // which is code to read, not an expression to run.
+            if git_ref.dir.is_some() {
+                return Err(format!("git ref {value:?}: raw=1 takes no dir="));
+            }
+            return Ok((gix::objs::tree::EntryKind::Tree.into(), root));
+        }
         let dir = git_ref.dir.as_deref().unwrap_or("");
         let (kind, hash) = caos_eval::eval_path(self, &root.to_string(), dir)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;

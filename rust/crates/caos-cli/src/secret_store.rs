@@ -127,10 +127,25 @@ fn expand_home(d: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(rest))
 }
 
-/// The SecretReaderKeys this process presents: the checkout's
-/// `caos.secret-readers`, space-separated. A cloud session's setup line puts
-/// them there; elsewhere, `git config caos.secret-readers <key>`.
+/// The SecretReaderKeys this process presents, space-separated. Named by
+/// `--secret-readers=<key …>` on the command line, which is how a harness that
+/// writes the argv of its own hooks says it (a hook command is not a shell, so it
+/// cannot set an environment variable); else `CAOS_SECRET_READERS`; else the
+/// checkout's `caos.secret-readers` (`git config caos.secret-readers <key>`).
 pub fn reader_keys() -> Vec<String> {
+    let split =
+        |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_string).collect() };
+    if let Some(named) =
+        std::env::args().find_map(|a| a.strip_prefix("--secret-readers=").map(split))
+    {
+        return named;
+    }
+    if let Some(named) = std::env::var("CAOS_SECRET_READERS")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        return split(&named);
+    }
     let Ok(out) = std::process::Command::new("git")
         .args(["config", "--get", "caos.secret-readers"])
         .stderr(std::process::Stdio::null())
@@ -138,10 +153,7 @@ pub fn reader_keys() -> Vec<String> {
     else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+    split(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// One line naming the keys [`reader_keys`] presents, for a transcript. A
@@ -153,8 +165,8 @@ pub fn reader_keys() -> Vec<String> {
 pub fn reader_summary() -> String {
     let keys = reader_keys();
     if keys.is_empty() {
-        return "secret readers: none -- caos.secret-readers is unset in this \
-                checkout, so no secret can be granted"
+        return "secret readers: none -- no --secret-readers, CAOS_SECRET_READERS or \
+                caos.secret-readers is set, so no secret can be granted"
             .to_string();
     }
     let shown: Vec<String> = keys

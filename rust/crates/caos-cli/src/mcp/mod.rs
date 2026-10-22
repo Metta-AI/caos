@@ -13,13 +13,19 @@
 //! than stored in a side table, so there is no local state to lose or corrupt:
 //! the ref is the whole record.
 //!
+//! NOTHING HERE READS A CHECKOUT. A process knows the server it talks to (from
+//! `--server=<url>`, or the environment), the step that runs tools
+//! (`--llm-step:@@=<locator>`) and, for a conversation's first prompt, where its
+//! content comes from (`--base:@@=<locator>`); the rest is a request to the
+//! server. A harness that wants uncommitted files in a conversation commits and
+//! pushes them first, and names the commit.
+//!
 //! AND THE TOOLS ARE ORDINARY TOOLS. Nothing here implements one. A call is
 //! one request to the server: `llm-step` in its tools-only mode, given the call,
 //! declares it as the model's own and runs it exactly as it runs a call in a
 //! turn it drives itself, and answers with what the tool said — so `caos mcp`
-//! offers whatever that step offers, in whatever
-//! repository it is pointed at, and a tool reads one way wherever a model meets
-//! it. The step is named by `--llm-step`, as `tui` and `chat` name it.
+//! offers whatever that step offers, and a tool reads one way wherever a model
+//! meets it.
 //!
 //! What Claude Code keeps is the MODEL. It chose the call and will read the
 //! result; the request a prompt admits is claimed by the step in the same
@@ -29,20 +35,16 @@ mod diag;
 mod resume;
 mod serve;
 mod session_base;
-mod workspace;
 
 use std::io::Read;
 
 use serde_json::{json, Value};
 
-use caos::{GitTransport, Transport};
-use conversation_protocol::v3::oid::Oid;
+use caos::HttpTransport;
+use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::refs;
 
-use crate::{
-    conversation_ref, eval_base, fetch_head, oid, open_store, resolve_username, seed_content,
-    TurnOptions, LLM_STEP_ARG,
-};
+use crate::{conversation_ref, TurnOptions, LLM_STEP_ARG};
 
 /// Conversation ids for recorded sessions live under one component so they are
 /// obvious in the sidebar and cannot collide with a hand-named conversation.
@@ -60,58 +62,77 @@ const TOOL_PREFIX: &str = "mcp__caos__";
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
 
-/// Exposed for `caos-cli.rs`'s own `cc_transport()`: a server-wide scratch
-/// checkout (see `session_base`'s module doc comment) for the callers that
-/// run before any session is known at all -- `tools/list`, `caos mcp warm`,
-/// `caos mcp diag`. `None` when `CAOS_MCP_DEFAULT_SERVER` is not set, so a
-/// caller's existing cwd/`$CLAUDE_PROJECT_DIR`-not-a-repo error is unchanged.
-pub fn default_server_transport() -> Option<Result<GitTransport, String>> {
-    session_base::default_server_scratch()
+/// The environment variable that names the server when `--server` is not given:
+/// the one every caos client reads, then the one the Hermes launcher sets.
+const SERVER_ENVS: [&str; 2] = ["CAOS_SERVER_URL", "CAOS_MCP_DEFAULT_SERVER"];
+
+/// What a `caos mcp` process is told, by its arguments: where the server is,
+/// which step runs the tools, and where a new conversation's content comes from.
+#[derive(Clone, Debug, Default)]
+pub struct Config {
+    /// `--server=<url>`; the environment otherwise ([`Config::server`]).
+    server: Option<String>,
+    /// The `--llm-step:@@=<locator>` argument, verbatim.
+    step: Option<String>,
+    /// `--base:@@=<locator>`: the content a new conversation starts with.
+    base: Option<String>,
 }
 
-/// The workspace arrives UNRESOLVED because only `serve` can carry on without
-/// one. A hook that cannot find the repository has nothing to record into and
-/// should say so; a tool server that cannot find it still has to answer, or
-/// the session sees `CONNECTION_CLOSED` and no reason at all.
-///
-/// `--llm-step:<type>=<value>` names the step that runs the tools, exactly as
-/// `tui` and `chat` take it: a session in another repository points it at
-/// wherever that repository mounted caos.
-pub fn cli_mcp(workspace: Result<GitTransport, String>, args: &[String]) -> Result<(), String> {
-    let mut options = TurnOptions::default();
-    let mut rest = Vec::new();
-    for argument in args {
-        // `--base=<full sha>` SEEDS THE CONVERSATION from a commit other than
-        // HEAD, and resolves `--llm-step` in that commit's tree rather than
-        // the workspace (`step_image`). Dev mode needs both: `bootstrap.go`
-        // mints a commit whose `.caos-expr` points at the dev stack and leaves
-        // the checkout clean. Measured before this existed: a session ran the
-        // dev client and dev step while every `caos-std/<entry>` still
-        // resolved through the committed pin.
-        //
-        // A FULL SHA AND NOTHING ELSE. A revspec here would reintroduce
-        // "resolved through a moving head" in a place nobody would think to
-        // look -- the same pairing `install.sh` refuses `--base` a branch for.
-        // The caller mints an unreferenced commit (`git commit-tree`), so there
-        // is no name for this to accept anyway.
-        if let Some(sha) = argument.strip_prefix("--base=") {
-            if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+impl Config {
+    fn parse(args: &[String]) -> Result<(Self, Vec<&str>), String> {
+        let mut config = Config::default();
+        let mut turn = TurnOptions::default();
+        let mut rest = Vec::new();
+        for argument in args {
+            if argument.starts_with("--secret-readers=") {
+                // Read by `secret_store::reader_keys`, before any command runs.
+            } else if let Some(url) = argument.strip_prefix("--server=") {
+                config.server = Some(url.to_string());
+            } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
+                config.base = Some(locator.to_string());
+            } else if argument.starts_with("--base=") || argument.starts_with("--base:") {
                 return Err(format!(
-                    "--base must be a full 40-character commit sha, not {sha:?}"
+                    "{argument}: a conversation's content is named by locator, \
+                     `--base:@@=<git locator>`, and the commit it names is pushed first"
                 ));
+            } else if !turn.take_image_arg(argument) {
+                rest.push(argument.as_str());
             }
-            options.base = Some(sha.to_string());
-            continue;
         }
-        if !options.take_image_arg(argument) {
-            rest.push(argument.as_str());
-        }
+        config.step = turn.llm_step;
+        Ok((config, rest))
     }
+
+    /// The server this process talks to.
+    fn server(&self) -> Result<String, String> {
+        self.server_from(|name| std::env::var(name).ok())
+    }
+
+    fn server_from(&self, env: impl Fn(&str) -> Option<String>) -> Result<String, String> {
+        if let Some(url) = &self.server {
+            return Ok(url.clone());
+        }
+        SERVER_ENVS
+            .iter()
+            .find_map(|name| env(name).filter(|v| !v.is_empty()))
+            .ok_or_else(|| {
+                format!(
+                    "no caos server: pass --server=<url>, or set {}",
+                    SERVER_ENVS.join(" or ")
+                )
+            })
+    }
+}
+
+/// `--llm-step:@@=<locator>` names the step that runs this session's tools,
+/// exactly as `tui` and `chat` take it. It has to be a locator (or a hash): a
+/// path names a file in a checkout, and nothing here has one.
+pub fn cli_mcp(args: &[String]) -> Result<(), String> {
+    let (config, rest) = Config::parse(args)?;
     match rest.first().copied() {
-        Some("hook") => hook(workspace, &options),
-        // Needs no workspace: it exists to describe one that is missing.
+        Some("hook") => hook(&config),
         Some("diag") => diag::cli(&rest[1..]),
-        Some("serve") => serve::serve(workspace, options),
+        Some("serve") => serve::serve(config),
         _ => Err(usage()),
     }
 }
@@ -121,8 +142,10 @@ fn usage() -> String {
         "usage:\n  \
          caos mcp hook    (reads one Claude Code hook payload on stdin)\n  \
          caos mcp serve   (workspace tool server; JSON-RPC on stdio)\n\n\
-         Both name the step that runs this session's tools:\n  \
-         {}",
+         Both take the server (--server=<url>, or CAOS_SERVER_URL) and name the step that \
+         runs this session's tools:\n  \
+         {}\n\
+         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.",
         crate::missing_image_arg(LLM_STEP_ARG)
     )
 }
@@ -135,10 +158,9 @@ struct ToolOutcome {
     is_error: bool,
 }
 
-/// A tool call, ready to send: the session's workspace, the conversation it
-/// belongs to, and the parameters of the request that carries it.
+/// A tool call, ready to send: the conversation it belongs to, and the
+/// parameters of the request that carries it.
 struct PreparedCall {
-    workspace: GitTransport,
     conversation: String,
     params: Vec<(&'static str, String)>,
 }
@@ -152,22 +174,20 @@ impl PreparedCall {
     }
 }
 
-/// Everything a tool call needs before it is sent: open the session's
-/// workspace, find the conversation, and form the step's parameters.
+/// Everything a tool call needs before it is sent: the conversation and the
+/// step's parameters.
 ///
-/// A FRESH transport, not the one `serve` opened at spawn. That one was read
-/// once, and in a cloud session it can predate the SessionStart hook that adds the
-/// `caos` remote -- so a call driven through it dials a server it does not know
-/// and fails "no `caos` git remote" while the remote is right there.
-///
-/// The conversation must already exist. The prompt hook opens it, and runs in
+/// The conversation may not exist yet. The prompt hook opens it, and runs in
 /// another process, so the first call can beat it; `wait_for_conversation` covers
 /// that race.
-fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
-    let workspace = workspace::open(session)
-        .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
+fn prepare_call(
+    config: &Config,
+    session: &str,
+    name: &str,
+    args: &Value,
+) -> Result<PreparedCall, String> {
     let conversation = conversation_id_for(session)?;
-    wait_for_conversation(&workspace, &conversation);
+    wait_for_conversation(&config.server()?, &conversation);
     let call = args
         .get("caos_tool_use_id")
         .and_then(Value::as_str)
@@ -175,7 +195,6 @@ fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall,
         .to_string();
     let arguments = declared_args(args).to_string();
     Ok(PreparedCall {
-        workspace,
         conversation,
         params: vec![
             ("tools-only", call),
@@ -195,46 +214,39 @@ fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall,
 /// STEP's name for the tool (`run_tool`, `tool_help`, `eval_path`); the server
 /// presents them as `run`, `help` and `eval-path`.
 fn run_tool(
-    _serve_transport: &GitTransport,
-    options: &TurnOptions,
+    config: &Config,
     session: &str,
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
-    let call = prepare_call(session, name, args)?;
-    let (kind, result) = run_step(&call.workspace, options, &call.conversation, &call.params())?;
-    decode_result(&call.workspace, &kind, &result)
+    let call = prepare_call(config, session, name, args)?;
+    let (kind, result) = run_step(config, &call.conversation, &call.params())?;
+    decode_result(&config.server()?, &kind, &result)
 }
 
 /// Start a tool without waiting, and return the ticket to ask for it by. The same
 /// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
 /// what a client will wait for is not lost with its connection.
-fn start_tool(
-    options: &TurnOptions,
-    session: &str,
-    name: &str,
-    args: &Value,
-) -> Result<String, String> {
-    let call = prepare_call(session, name, args)?;
-    start_step(&call.workspace, options, &call.conversation, &call.params())
+fn start_tool(config: &Config, session: &str, name: &str, args: &Value) -> Result<String, String> {
+    let call = prepare_call(config, session, name, args)?;
+    start_step(config, &call.conversation, &call.params())
 }
 
 /// The state of a started tool, from its ticket.
-fn tool_result(session: &str, ticket: &str) -> Result<ToolOutcome, String> {
+fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
     if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("{ticket:?} is not a ticket; `start` returns one"));
     }
-    let workspace = workspace::open(session)
-        .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
-    wait_server_reachable(&workspace)?;
-    Ok(match caos::line_result(&workspace.server_url()?, ticket)? {
+    let server = config.server()?;
+    wait_server_reachable(&server)?;
+    Ok(match caos::line_result(&server, ticket)? {
         caos::LineResult::Pending => ToolOutcome {
             text: "pending: the call has not finished. Ask for `result` again with this \
                        ticket."
                 .to_string(),
             is_error: false,
         },
-        caos::LineResult::Done { kind, hash } => decode_result(&workspace, &kind, &hash)?,
+        caos::LineResult::Done { kind, hash } => decode_result(&server, &kind, &hash)?,
         caos::LineResult::Failed { status, message } => ToolOutcome {
             text: format!("the call failed ({status}): {message}"),
             is_error: true,
@@ -244,11 +256,11 @@ fn tool_result(session: &str, ticket: &str) -> Result<ToolOutcome, String> {
 
 /// What a tools-only run answered, as the model reads it: the call's `status` and
 /// `observation`, which are the same bytes the conversation recorded.
-fn decode_result(t: &GitTransport, kind: &str, result: &str) -> Result<ToolOutcome, String> {
+fn decode_result(server: &str, kind: &str, result: &str) -> Result<ToolOutcome, String> {
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
     }
-    let files = caos::tree_blobs(t, result)?;
+    let files = caos::tree_blobs(&HttpTransport::new(server), result)?;
     let part = |file: &str| {
         files
             .get(file)
@@ -282,14 +294,10 @@ impl StepRequest {
 /// the secrets to present.
 ///
 /// EVERYTHING a tool call or a hook does to a conversation goes through here, so
-/// that is the whole of the client's part: no checkout of the conversation is
-/// read, none is written, and nothing is pushed first.
-fn step_request(
-    t: &GitTransport,
-    options: &TurnOptions,
-    id: &str,
-    params: &[(&str, &str)],
-) -> Result<StepRequest, String> {
+/// that is the whole of the client's part: nothing is read from disk, written, or
+/// pushed first.
+fn step_request(config: &Config, id: &str, params: &[(&str, &str)]) -> Result<StepRequest, String> {
+    let server = config.server()?;
     let secrets = caos::Secrets::current().for_conversation(id);
     // REACHABLE FIRST, in front of everything below. Resolving the step talks
     // to the server, and in a cloud session that server is reached through a
@@ -297,8 +305,8 @@ fn step_request(
     // unbounded, and this is the path a HOOK takes. A `UserPromptSubmit` hook
     // that never returns takes the session's prompt with it, which presents as
     // Claude Code hanging on the first thing you type, with nothing saying why.
-    wait_server_reachable(t)?;
-    let step = step_image(t, options, &secrets)?;
+    wait_server_reachable(&server)?;
+    let step = step_image(config, &server, &secrets)?;
     let mut all: Vec<(String, String)> = vec![
         ("base:hash".to_string(), step),
         ("conversation".to_string(), id.to_string()),
@@ -313,7 +321,7 @@ fn step_request(
         all.push(("salt".to_string(), salt));
     }
     Ok(StepRequest {
-        server: t.server_url()?,
+        server,
         params: all,
         secrets,
     })
@@ -321,58 +329,44 @@ fn step_request(
 
 /// Run the step on a conversation and wait: the result's `(kind, hash)`.
 fn run_step(
-    t: &GitTransport,
-    options: &TurnOptions,
+    config: &Config,
     id: &str,
     params: &[(&str, &str)],
 ) -> Result<(String, String), String> {
-    let request = step_request(t, options, id, params)?;
+    let request = step_request(config, id, params)?;
     let all = request.params();
     caos::eval_line_request(&request.server, "run", &all, &request.secrets)
 }
 
 /// Start the step on a conversation without waiting: the ticket.
-fn start_step(
-    t: &GitTransport,
-    options: &TurnOptions,
-    id: &str,
-    params: &[(&str, &str)],
-) -> Result<String, String> {
-    let request = step_request(t, options, id, params)?;
+fn start_step(config: &Config, id: &str, params: &[(&str, &str)]) -> Result<String, String> {
+    let request = step_request(config, id, params)?;
     let all = request.params();
     caos::start_line_request(&request.server, "run", &all, &request.secrets)
 }
 
-/// The step, resolved from the tree the conversation seeds from: `--base`'s
-/// when given, the workspace otherwise.
+/// The step, resolved by the server from its locator.
 ///
-/// ONE TREE FOR BOTH. Dev mode's `--base` is a commit whose `.caos-expr` points
-/// at the dev stack, and nothing else carries that pin -- the checkout is left
-/// as it was cloned. Resolved from the workspace instead, the session would run
-/// a dev client against the committed tools.
-fn step_image(
-    t: &GitTransport,
-    options: &TurnOptions,
-    secrets: &caos::Secrets,
-) -> Result<String, String> {
-    let tree = match &options.base {
-        Some(base) => Some(
-            t.git_capture(
-                &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
-                None,
-            )
-            .map_err(|e| format!("reading --base {base}: {e}"))?
-            .trim()
-            .to_string(),
-        ),
-        None => None,
-    };
+/// A path (`--llm-step:@=std/llm-step`) names a file in a checkout, and a
+/// process with no checkout cannot answer it: it is refused by name rather than
+/// resolved against whatever directory the harness happened to start in.
+fn step_image(config: &Config, server: &str, secrets: &caos::Secrets) -> Result<String, String> {
+    if config
+        .step
+        .as_deref()
+        .is_some_and(|argument| argument.starts_with(&format!("--{LLM_STEP_ARG}:@=")))
+    {
+        return Err(format!(
+            "--{LLM_STEP_ARG}:@=<path> names a file in a checkout, and `caos mcp` reads none; \
+             name the step by locator: --{LLM_STEP_ARG}:@@=git+https://…?rev=<sha>&dir=std/{LLM_STEP_ARG}"
+        ));
+    }
     crate::resolve_image_arg(
-        t,
-        options.llm_step.as_deref(),
+        &HttpTransport::new(server),
+        config.step.as_deref(),
         LLM_STEP_ARG,
         secrets,
-        tree.as_deref(),
+        None,
     )
 }
 
@@ -383,27 +377,62 @@ fn step_image(
 /// the first prompt races tunnel bringup and loses (the bug this exists for);
 /// too long and a genuinely-down server hangs the prompt, since a
 /// `UserPromptSubmit` hook blocks the turn until it returns. Each attempt is
-/// `ensure_server_reachable`'s own 5s round trip, so `HOOK_REACH_ATTEMPTS`
+/// `check_server_reachable`'s own 5s round trip, so `HOOK_REACH_ATTEMPTS`
 /// probes plus the interstitial sleeps is the ceiling -- ~35s, which outlasts
 /// tunnel bringup. The common case returns on the first probe.
 ///
 /// THE HOOK'S OWN TIMEOUT IS SET, in `shared/settings.json`, because Claude
-/// Code's 60s default is not enough over iroh: this wait plus a resume's fetch,
-/// settle and push plus `record_prompt`'s pushes exceeded it in a cloud
-/// session, and a killed hook lets the prompt through with no conversation and
-/// no reason given.
+/// Code's 60s default is not enough over iroh: this wait plus the first
+/// prompt's content fetch exceeded it in a cloud session, and a killed hook
+/// lets the prompt through with no conversation and no reason given.
 const HOOK_REACH_ATTEMPTS: u32 = 6;
 const HOOK_REACH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-pub(super) fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
-    let mut last = t.ensure_server_reachable();
+pub(super) fn wait_server_reachable(server: &str) -> Result<(), String> {
+    let mut last = caos::check_server_reachable(server);
     let mut attempt = 1;
     while last.is_err() && attempt < HOOK_REACH_ATTEMPTS {
         std::thread::sleep(HOOK_REACH_INTERVAL);
-        last = t.ensure_server_reachable();
+        last = caos::check_server_reachable(server);
         attempt += 1;
     }
     last
+}
+
+/// A store that talks only to the server, for reading refs and forking: no
+/// checkout, a scratch object directory named for this process and removed
+/// when the store is dropped.
+struct ServerStore {
+    store: GitStore,
+    dir: std::path::PathBuf,
+}
+
+impl std::ops::Deref for ServerStore {
+    type Target = GitStore;
+    fn deref(&self) -> &GitStore {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for ServerStore {
+    fn deref_mut(&mut self) -> &mut GitStore {
+        &mut self.store
+    }
+}
+
+impl Drop for ServerStore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn server_store(server: &str) -> Result<ServerStore, String> {
+    let name = format!("caos-mcp-{}", std::process::id());
+    let store = GitStore::scratch(&name, server)?;
+    Ok(ServerStore {
+        store,
+        dir: std::path::PathBuf::from(format!("/tmp/{name}")),
+    })
 }
 
 /// How long a tool call waits for its conversation to exist before proceeding
@@ -416,20 +445,23 @@ pub(super) fn wait_server_reachable(t: &GitTransport) -> Result<(), String> {
 /// turn while every later turn works (by then the record exists). So a call
 /// WAITS for the record the hook is still writing.
 ///
-/// In a cloud session the hook takes ~10s -- its curry, base push and
-/// conversation push each cross the iroh tunnel -- so this is a short wait.
-/// Probing is cheap: `fetch_head` returns early on an absent ref,
-/// with no fetch and no local write. Bounded well past the hook's time; a
+/// In a cloud session the hook takes ~10s, so this is a short wait. Probing is
+/// cheap: a ref read, with no fetch. Bounded well past the hook's time; a
 /// conversation that never appears still errors, just after the wait.
 const TOOL_WAIT_ATTEMPTS: u32 = 20;
 const TOOL_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn wait_for_conversation(t: &GitTransport, id: &str) {
+fn wait_for_conversation(server: &str, id: &str) {
+    let Ok(refname) = refs::head_ref(id) else {
+        return;
+    };
+    let Ok(store) = server_store(server) else {
+        return;
+    };
     for attempt in 0..TOOL_WAIT_ATTEMPTS {
-        if let Ok(store) = open_store(t) {
-            if matches!(fetch_head(t, &store, id), Ok(Some(_))) {
-                return;
-            }
+        // An unreadable ref is a server problem, which the call itself reports.
+        if !matches!(store.read_ref(&refname), Ok(None)) {
+            return;
         }
         if attempt + 1 < TOOL_WAIT_ATTEMPTS {
             std::thread::sleep(TOOL_WAIT_INTERVAL);
@@ -454,15 +486,13 @@ fn declared_args(args: &Value) -> Value {
 /// Code fires many, and a settings file that routes extra ones here should keep
 /// working rather than failing a turn.
 ///
-/// THE CHECKOUT COMES FROM THE SESSION'S RECORDED ENTRY (`workspace`), never
-/// from wherever this process happens to stand. The one exception is a
-/// session's first prompt, which has no entry yet and so uses the discovered
-/// `workspace` and records it. Any other event with no entry fails, loudly:
-/// diagnostics first (stderr and the diag journal), then exit 2 for the two
-/// events where that is visible (a prompt is blocked with the reason shown, a
-/// tool call is refused with it shown to the model). Elsewhere a failed hook is
-/// shown only as an error line, and exit 2 on `Stop` would force the session on.
-fn hook(discovered: Result<GitTransport, String>, options: &TurnOptions) -> Result<(), String> {
+/// A prompt with no server to record into is refused outright (exit 2): the
+/// diagnostics go first (stderr and the diag journal), because exit 2 is the
+/// one status with which Claude Code shows the reason, and a session that runs
+/// on with nothing recorded is worse than one that stops. Elsewhere a failed
+/// hook is shown only as an error line, and exit 2 on `Stop` would force the
+/// session on.
+fn hook(config: &Config) -> Result<(), String> {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -481,37 +511,23 @@ fn hook(discovered: Result<GitTransport, String>, options: &TurnOptions) -> Resu
     debug_log_hook("start", event, &payload, None);
     let started = std::time::Instant::now();
     let session = string_field(&payload, "session_id")?;
-    let first_prompt = event == "UserPromptSubmit" && !workspace::exists(session)?;
-    let opened = if first_prompt {
-        let prompt = payload.get("prompt").and_then(Value::as_str).unwrap_or("");
-        session_base::open_for_new_session(session, prompt, discovered)
-            .and_then(|t| workspace::record(session, &t).map(|()| t))
-    } else {
-        workspace::open(session)
-    };
-    let t = match opened {
-        Ok(t) => t,
-        Err(error) => {
+    if event == "UserPromptSubmit" {
+        if let Err(error) = config.server() {
             diag::emit(&diag::Context {
                 event,
                 source: payload.get("source").and_then(Value::as_str),
                 session: Some(session),
                 reason: Some(&error),
             });
-            if matches!(event, "UserPromptSubmit" | "PreToolUse") {
-                eprintln!(
-                    "caos: this session's workspace is unavailable, so caos did nothing: {error}"
-                );
-                std::process::exit(2);
-            }
-            return Err(error);
+            eprintln!("caos: this session has no server, so caos did nothing: {error}");
+            std::process::exit(2);
         }
-    };
+    }
     let result = match event {
-        "UserPromptSubmit" => on_user_prompt(&t, options, &payload),
+        "UserPromptSubmit" => on_user_prompt(config, &payload),
         "PreToolUse" => on_pre_tool_use(&payload),
-        "Stop" => on_stop(&t, options, &payload),
-        _ => on_stop_failure(&t, options, &payload),
+        "Stop" => on_stop(config, &payload),
+        _ => on_stop_failure(config, &payload),
     };
     debug_log_hook("end", event, &payload, Some((started.elapsed(), &result)));
     result
@@ -589,10 +605,6 @@ fn debug_log_hook(
         "{phase} {event} session={session} prompt_len={prompt_len}{tail}\n"
     ));
 }
-
-/// The user's prompt, and the only event allowed to create the conversation:
-/// the first prompt of a session establishes its base and fallback title
-/// exactly as the TUI's first message does.
 /// EXIT 2, the one status with which Claude Code blocks a prompt and shows the
 /// hook's stderr. Any other failure lets the prompt through and drops the
 /// reason, and for a failed fork or resume that is a session running on with
@@ -607,7 +619,10 @@ fn refuse_prompt(error: &str) -> ! {
     std::process::exit(2)
 }
 
-fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
+/// The user's prompt, and the only event allowed to create the conversation:
+/// the first prompt of a session establishes its base and fallback title
+/// exactly as the TUI's first message does.
+fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
     let prompt = string_field(payload, "prompt")?;
     if prompt.trim().is_empty() {
         return Ok(());
@@ -620,8 +635,9 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
             Some(from) => {
                 // It talks to the server before anything below would have
                 // proven it reachable.
-                wait_server_reachable(t)?;
-                resume::begin(t, string_field(payload, "session_id")?, &from)
+                let server = config.server()?;
+                wait_server_reachable(&server)?;
+                resume::begin(&server, string_field(payload, "session_id")?, &from)
             }
             None => Ok(None),
         }
@@ -632,7 +648,7 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     };
     let id = recorded_conversation(payload)?;
     let readers = crate::secret_store::reader_summary();
-    if record_prompt(t, options, &id, prompt)? {
+    if record_prompt(config, &id, prompt)? {
         announce(&format!(
             "caos conversation ref {}; {readers}",
             conversation_ref(&id)?
@@ -652,31 +668,29 @@ struct Recorded {
 
 /// Send one event to the step (`llm-step --record=<kind>`) and read its answer.
 ///
-/// The hooks used to write the conversation themselves, from the harness's
-/// checkout. A hook is now one request: the step makes the same transitions on
-/// the server, so this process needs no checkout of the conversation, writes
-/// nothing, and a repeated event (a retried hook) names the message id it
-/// already recorded and writes nothing twice.
+/// A hook is one request: the step makes the transitions on the server, so this
+/// process needs no checkout of the conversation, writes nothing, and a repeated
+/// event (a retried hook) names the message id it already recorded and writes
+/// nothing twice.
 fn record_event(
-    t: &GitTransport,
-    options: &TurnOptions,
+    config: &Config,
     id: &str,
     kind: &str,
     extra: &[(&str, &str)],
 ) -> Result<Recorded, String> {
     let message_id = caos::fresh_entropy()?;
-    let username = resolve_username(t, None)?;
+    let username = username()?;
     let mut params = vec![
         ("record", kind),
         ("message-id", message_id.as_str()),
         ("actor", username.as_str()),
     ];
     params.extend_from_slice(extra);
-    let (answer, tree) = run_step(t, options, id, &params)?;
+    let (answer, tree) = run_step(config, id, &params)?;
     if answer != "tree" {
         return Err(format!("the step answered a {answer}, not a record"));
     }
-    let files = caos::tree_blobs(t, &tree)?;
+    let files = caos::tree_blobs(&HttpTransport::new(&config.server()?), &tree)?;
     let text = |file: &str| {
         files
             .get(file)
@@ -689,6 +703,11 @@ fn record_event(
     })
 }
 
+/// Who is acting: `$USER`, as every caos client says it.
+fn username() -> Result<String, String> {
+    Ok(crate::ambient_username(std::env::var("USER"))?.unwrap_or_else(|| "user".to_string()))
+}
+
 /// Record a user's prompt, creating the conversation on the session's first one;
 /// true when this prompt is the one that created it.
 ///
@@ -698,50 +717,20 @@ fn record_event(
 /// begun the turn by the time this hook fires, so no runner will pick the
 /// request up.
 ///
-/// A NEW conversation needs its content, and that is the one thing the step
-/// cannot find for itself: the base this hook stands in (or names) is resolved
-/// and pushed here, and the step is handed its tree. A conversation that
-/// exists needs none, so the base is not resolved for every prompt.
-fn record_prompt(
-    t: &GitTransport,
-    options: &TurnOptions,
-    id: &str,
-    prompt: &str,
-) -> Result<bool, String> {
-    let phase = std::time::Instant::now();
-    let exists = fetch_head(t, &open_store(t)?, id)?.is_some();
-    cc_timing("fetch_head", phase.elapsed());
-    let content = if exists {
-        None
-    } else {
-        let phase = std::time::Instant::now();
-        let content = content_tree(t, options, prompt)?;
-        cc_timing("content_tree", phase.elapsed());
-        Some(content.to_string())
-    };
+/// A NEW conversation needs its content, which the step cannot find for itself,
+/// so the locator naming it goes with every prompt: the server resolves it
+/// (once -- a pinned locator is memoized) and the step uses it only when the
+/// conversation does not exist yet.
+fn record_prompt(config: &Config, id: &str, prompt: &str) -> Result<bool, String> {
     let mut extra = vec![("text", prompt), ("model", CLAUDE_CODE_MODEL)];
+    let content = session_base::content_locator(config.base.as_deref(), prompt);
     if let Some(content) = &content {
-        extra.push(("content:hash", content));
+        extra.push(("content:@@", content));
     }
     let phase = std::time::Instant::now();
-    let recorded = record_event(t, options, id, "prompt", &extra)?;
+    let recorded = record_event(config, id, "prompt", &extra)?;
     cc_timing("record", phase.elapsed());
     Ok(recorded.status == "created")
-}
-
-/// The tree a new conversation starts with: the base commit's, on the server.
-fn content_tree(t: &GitTransport, options: &TurnOptions, prompt: &str) -> Result<Oid, String> {
-    let base = oid(
-        &match &options.base {
-            None if session_base::names_a_base(prompt) => {
-                session_base::resolve_default_base(t, prompt)?
-            }
-            _ => eval_base(t, options)?,
-        },
-        "conversation base",
-    )?;
-    let mut store = open_store(t)?;
-    seed_content(t, &mut store, &base)
 }
 
 /// Tell a caos workspace tool which conversation it is working in.
@@ -817,13 +806,13 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
 }
 
 /// The assistant's closing message, and the end of the request it answered.
-fn on_stop(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
+fn on_stop(config: &Config, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let recorded = record_event(t, options, &id, "stop", &[("text", message)])?;
+    let recorded = record_event(config, &id, "stop", &[("text", message)])?;
     if recorded.status == "held" {
         eprintln!(
             "caos mcp hook: a call is still running; leaving its request open for the result"
@@ -848,8 +837,7 @@ fn announce(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A turn that ended badly closes its request as failed.
-fn on_stop_failure(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
+fn on_stop_failure(config: &Config, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(payload)?;
     let kind = payload
         .get("error_type")
@@ -863,7 +851,7 @@ fn on_stop_failure(t: &GitTransport, options: &TurnOptions, payload: &Value) -> 
         true => kind.to_string(),
         false => format!("{kind}: {detail}"),
     };
-    record_event(t, options, &id, "failure", &[("text", &error)]).map(|_| ())
+    record_event(config, &id, "failure", &[("text", &error)]).map(|_| ())
 }
 
 #[cfg(test)]
@@ -901,5 +889,70 @@ mod tests {
     fn a_payload_without_its_event_name_is_an_error() {
         assert!(string_field(&json!({}), "hook_event_name").is_err());
         assert!(string_field(&json!({"hook_event_name": 2}), "hook_event_name").is_err());
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_arguments_name_the_server_the_step_and_the_base() {
+        let given = args(&[
+            "hook",
+            "--server=http://s",
+            "--llm-step:@@=github:o/r?rev=abc",
+            "--base:@@=github:o/c?rev=def",
+        ]);
+        let (config, rest) = Config::parse(&given).unwrap();
+        assert_eq!(rest, ["hook"]);
+        assert_eq!(config.server.as_deref(), Some("http://s"));
+        assert_eq!(
+            config.step.as_deref(),
+            Some("--llm-step:@@=github:o/r?rev=abc")
+        );
+        assert_eq!(config.base.as_deref(), Some("github:o/c?rev=def"));
+    }
+
+    /// `--base=<sha>` named a commit in a checkout, and nothing reads one now.
+    #[test]
+    fn a_base_that_is_not_a_locator_is_refused_with_the_replacement() {
+        for old in [
+            "--base=0123456789abcdef0123456789abcdef01234567",
+            "--base:@=std",
+        ] {
+            let error = Config::parse(&args(&["hook", old])).unwrap_err();
+            assert!(error.contains("--base:@@=<git locator>"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_argument_beats_the_environment_and_the_environment_is_searched_in_order() {
+        let env = |name: &str| match name {
+            "CAOS_SERVER_URL" => Some("http://env".to_string()),
+            "CAOS_MCP_DEFAULT_SERVER" => Some("http://hermes".to_string()),
+            _ => None,
+        };
+        let named = Config {
+            server: Some("http://arg".into()),
+            ..Config::default()
+        };
+        assert_eq!(named.server_from(env).unwrap(), "http://arg");
+        assert_eq!(Config::default().server_from(env).unwrap(), "http://env");
+        let only_hermes =
+            |name: &str| (name == "CAOS_MCP_DEFAULT_SERVER").then(|| "http://hermes".to_string());
+        assert_eq!(
+            Config::default().server_from(only_hermes).unwrap(),
+            "http://hermes"
+        );
+        let error = Config::default().server_from(|_| None).unwrap_err();
+        assert!(
+            error.contains("--server=<url>") && error.contains("CAOS_SERVER_URL"),
+            "{error}"
+        );
     }
 }

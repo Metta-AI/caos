@@ -58,14 +58,6 @@ inside the checkout.
   dead session left open, the same self-healing a killed Claude Code
   process relies on — just a messier log on a crash than a clean `Stop`
   would leave.
-- **The `--llm-step` locator rewrite.** `bin/caos-mcp-launch` hardcodes
-  `--llm-step:@=std/llm-step`, correct only when the installed profile's
-  source IS a caos checkout (this repo, or a caos-session clone that
-  DEPS-mounts `caos/std`). A profile installed from an unrelated repo needs
-  the pinned-remote form instead
-  (`--llm-step:@@=github:Metta-AI/caos?rev=<sha>&dir=std/llm-step`), the
-  same rewrite `cloud/install.go` performs for Claude Code. Not automated
-  here yet.
 - **Unverified: `${HERMES_HOME}` substitution in `mcp_servers.caos.command`.**
   Confirmed-working: `${VAR}` substitution in `config.yaml`'s `env:` values.
   Not yet confirmed: whether `$HERMES_HOME` is a real exported env var at

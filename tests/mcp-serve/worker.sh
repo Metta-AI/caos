@@ -15,7 +15,7 @@
 # truth about caos, so it must answer with no workspace and with no server.
 set -euo pipefail
 
-# The recorded-workspace store lives under $HOME/.cache, and the worker's HOME
+# `help` writes its diag journal under $HOME/.cache, and the worker's HOME
 # is not writable.
 HOME=$(mktemp -d)
 export HOME
@@ -26,8 +26,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # is request/response with UNSOLICITED notifications interleaved, so a reader
 # has to skip lines it did not ask for rather than assume the next line is its
 # answer.
-open_server() { # <llm-step argument>
-  coproc SERVER { "$CAOS_CLI" mcp serve "$1" 2>/tmp/mcp-serve.err; }
+open_server() { # <arguments: the server and the step>
+  coproc SERVER { "$CAOS_CLI" mcp serve $1 2>/tmp/mcp-serve.err; }
   SERVER_IN=${SERVER[1]}
   SERVER_OUT=${SERVER[0]}
 }
@@ -70,7 +70,7 @@ await() { # <grep pattern> <seconds> ; prints the matching line
 
 echo "== the handshake and the list need nothing: no step, no server, no cache ==" >&2
 # A step that does not exist: nothing in a handshake or a listing may touch it.
-open_server "--llm-step:@=DEEP-DEPS/no-such-entry"
+open_server "--server=http://127.0.0.1:9 --llm-step:hash=0000000000000000000000000000000000000000"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer"
 # The instructions are how the model learns what to do with five tools and no
@@ -104,7 +104,7 @@ esac
 close_server
 
 echo "== the real step: the same five tools, and none of the old registry ==" >&2
-open_server "--llm-step:@=DEEP-DEPS/llm-step"
+open_server "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 await '"id":1' 10 >/dev/null || fail "the handshake did not answer"
 send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
@@ -192,7 +192,7 @@ git add generated mcp-marker
 git -c user.name=test -c user.email=test@caos commit -qm mcp-generated-tools
 session="mcp-path-$(date +%s)-$$"
 printf '{"hook_event_name":"UserPromptSubmit","session_id":"%s","prompt":"test generated tools"}\n' "$session" \
-  | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+  | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 key=$(printf 'cc/%s' "$session" | od -An -tx1 | tr -d ' \n')
 # The prompt hook recorded it on the server; fetch it.
 git fetch -q caos "+refs/caos/v3/conversations/$key/head:refs/caos/v3/conversations/$key/head"
@@ -261,7 +261,7 @@ git add slow
 git -c user.name=test -c user.email=test@caos commit -qm slow-tool
 held="mcp-held-$(date +%s)-$$"
 hook() { # <event JSON>
-  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step
+  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)"
 }
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"run slow\"}"
 held_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$held" | od -An -tx1 | tr -d ' \n')/head"
@@ -310,17 +310,16 @@ esac
 close_server
 
 echo "== an unreachable caos server is named, not waited on ==" >&2
-# LAST, because it breaks the remote for everything after it. A caos server reached
-# through a dead tunnel ACCEPTS and never answers, so anything that dialled it
-# unbounded would hang and say nothing -- which a real cloud container showed. A
-# refused port is the testable half: it proves the probe runs and that its message
-# names the server. The swallowing half is the same code path with a timeout instead
-# of a refusal.
-git remote set-url caos http://127.0.0.1:9
-open_server "--llm-step:@=DEEP-DEPS/llm-step"
+# A server named at an address nothing listens on, keeping the step the session
+# would have used. A caos server reached through a dead tunnel ACCEPTS and never
+# answers, so anything that dialled it unbounded would hang and say nothing -- which
+# a real cloud container showed. A refused port is the testable half: it proves the
+# probe runs and that its message names the server. The swallowing half is the same
+# code path with a timeout instead of a refusal.
+open_server "--server=http://127.0.0.1:9 ${CAOS_MCP_ARGS#* }"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 await '"id":1' 10 >/dev/null || fail "the handshake did not answer without a server"
-# `help` with no path, for the session that already has a recorded workspace: it says
+# `help` with no path, for a session: it says
 # the server cannot be reached rather than hanging on it.
 send "$(jq -nc --arg session "$session" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"help",arguments:{caos_session:$session}}}')"

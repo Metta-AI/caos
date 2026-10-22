@@ -187,7 +187,9 @@ func main() {
 		w.Do(script.Exec("caos get -r " + shared))
 
 		assets := fixtureAssets("/tmp/assets")
-		const step = "--llm-step:@=caos-std/llm-step"
+		step := "--llm-step:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/llm-step"
+		const serverURL = "http://caos.test"
+		const readersArg = "--secret-readers=abcd"
 		// A home that does not exist is skipped rather than invented (/home/claude
 		// is not on every container), so a fixture home has to be made first.
 		w.Must(os.MkdirAll("/tmp/home", 0o755))
@@ -203,7 +205,9 @@ func main() {
 			"--repo=Metta-AI/caos",
 			"--commit="+pinRev,
 			"--version=build-"+pinRev[:12],
-			"--seed-commit="+seed,
+			"--server="+serverURL,
+			"--content=git+caos://local?rev="+seed,
+			readersArg,
 			"--prefix=/tmp/prefix",
 			"--homes=/tmp/home",
 			"--enable-bash")
@@ -243,8 +247,8 @@ func main() {
 		// seeded from HEAD while everything else about dev mode worked.
 		w.True(strings.Contains(prompt, "'"+step+"'"),
 			"the prompt hook does not name the step as a quoted shell word: %s", prompt)
-		w.True(strings.Contains(prompt, "--base="+seed),
-			"the prompt hook does not seed the conversation: %s", prompt)
+		w.True(strings.Contains(prompt, "'--base:@@=git+caos://local?rev="+seed+"'") && strings.Contains(prompt, "'--server="+serverURL+"'") && strings.Contains(prompt, "'"+readersArg+"'"),
+			"the prompt hook does not name the server, the content and the readers: %s", prompt)
 		w.True(!strings.Contains(prompt, "${CAOS_BIN"),
 			"the shared asset's ${CAOS_BIN} placeholder survived into the config: %s", prompt)
 		w.True(hookCommand(settings, "SessionStart") == "caos-cloud-session-start",
@@ -283,8 +287,8 @@ func main() {
 		w.True(contains(args, step), "the tool server does not name the step: %v", args)
 		// Its own argv element. Appended to the locator it became one argument,
 		// which the client reads as a flag with a nonsense value.
-		w.True(contains(args, "--base="+seed),
-			"the tool server does not seed the conversation as its own argument: %v", args)
+		w.True(contains(args, "--base:@@=git+caos://local?rev="+seed) && contains(args, "--server="+serverURL) && contains(args, readersArg),
+			"the tool server is not told the server, the content and the readers, each as its own argument: %v", args)
 
 		// -------------------------------------------------------------------
 		w.Step("stage 1 in dev mode seeds a conversation and leaves the checkout clean")
@@ -396,7 +400,7 @@ func main() {
 		// Stage 1 ran stage 2 out of the PAYLOAD, which is the whole reason there
 		// are two stages: in dev mode that is the working tree.
 		devPrompt := hookCommand(readJSON("/tmp/home1/.claude/settings.json"), "UserPromptSubmit")
-		w.True(strings.Contains(devPrompt, "--base="+seedCommit),
+		w.True(strings.Contains(devPrompt, "--base:@@=git+caos://local?rev="+seedCommit),
 			"the session would seed from HEAD rather than from the dev commit: %s", devPrompt)
 
 		// -------------------------------------------------------------------

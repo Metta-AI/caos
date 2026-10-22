@@ -26,6 +26,56 @@ if [ ! -x "$CAOS_BIN" ]; then
 fi
 export CAOS_BIN
 
+# `caos mcp` reads no checkout. It is told, by argument, the server, the step that
+# runs tools and (for a new conversation) where its content comes from -- all by
+# name, and the step and the content by locator, which the server resolves:
+#
+#   CAOS_SERVER_URL  the server (required)
+#   CAOS_STEP        a git locator for the step, `git+…?rev=<sha>&dir=std/llm-step`;
+#                    by default the server's own `refs/caos/dev`, which `caosd up`
+#                    publishes
+#   CAOS_BASE        a git locator for what a new conversation starts from; it must
+#                    be committed (and pushed) first. Optional: without it the
+#                    conversation starts without code.
+server="${CAOS_SERVER_URL:?set CAOS_SERVER_URL to the URL of the caos server}"
+step="${CAOS_STEP:-}"
+if [ -z "$step" ]; then
+    line="$(git ls-remote "$server" refs/caos/dev || true)"
+    dev_sha="${line%%[[:space:]]*}"
+    if [ -z "$dev_sha" ]; then
+        echo "no CAOS_STEP, and $server has no refs/caos/dev to take the step from." >&2
+        echo "Set CAOS_STEP to git+<url>?rev=<sha>&dir=std/llm-step." >&2
+        exit 1
+    fi
+    step="git+caos://local?rev=${dev_sha}&dir=std/llm-step"
+fi
+mcp_args=("--server=$server" "--llm-step:@@=$step")
+if [ -n "${CAOS_BASE:-}" ]; then
+    mcp_args+=("--base:@@=$CAOS_BASE")
+fi
+
+# The shared assets carry a placeholder where those arguments go. In a hook
+# command (a shell word list) each is single-quoted, as its `&` and `?` need; in
+# mcp.json each is an argv element.
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq is needed to write the configuration of the session (nix run nixpkgs#jq, or add it to the flake)." >&2
+    exit 1
+fi
+placeholder="CAOS_MCP_ARGS_HERE"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+quoted=""
+for argument in "${mcp_args[@]}"; do
+    quoted+=" '${argument}'"
+done
+jq --arg quoted "${quoted# }" --arg p "$placeholder" \
+    'walk(if type == "string" then sub($p; $quoted) else . end)' \
+    "$here/../shared/settings.json" > "$work/settings.json"
+jq --argjson given "$(printf '%s\n' "${mcp_args[@]}" | jq -R . | jq -s .)" --arg p "$placeholder" \
+    '.mcpServers.caos.args |= map(if . == $p then $given[] else . end)' \
+    "$here/../shared/mcp.json" > "$work/mcp.json"
+mcp_config="$work/mcp.json"
+
 # Prove the binary answers before handing it to a session, so a broken or stale
 # one is an error here rather than a toolless model later. `tools/list` is a
 # constant (five tools, nothing resolved), so this tests the binary and its argv,
@@ -44,11 +94,6 @@ export CAOS_BIN
 # time while every session it launched got "error connecting to caos". The cloud
 # path could not catch it either; its `caos-serve` wrapper ignores argv and execs
 # the verb it wants.
-mcp_config="$here/../shared/mcp.json"
-if ! command -v jq >/dev/null 2>&1; then
-    echo "jq is needed to read $mcp_config (nix run nixpkgs#jq, or add it to the flake)." >&2
-    exit 1
-fi
 mapfile -t serve_args < <(jq -r '.mcpServers.caos.args[]' "$mcp_config")
 if [ "${#serve_args[@]}" = 0 ]; then
     echo "no .mcpServers.caos.args in $mcp_config" >&2
@@ -65,8 +110,11 @@ case "$probe" in
         ;;
 esac
 
-exec claude \
-    --settings "$here/../shared/settings.json" \
-    --mcp-config "$here/../shared/mcp.json" \
+# Not `exec`: the configuration written above lives in a directory this removes.
+status=0
+claude \
+    --settings "$work/settings.json" \
+    --mcp-config "$mcp_config" \
     --strict-mcp-config \
-    "$@"
+    "$@" || status=$?
+exit "$status"

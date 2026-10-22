@@ -14,24 +14,23 @@ caos mcp hook     record one Claude Code hook payload (JSON on stdin)
 caos mcp serve    the workspace tool server (JSON-RPC on stdio)
 ```
 
-Both take `--llm-step:<type>=<value>`, exactly as `caos tui` and `caos chat`
-do: the step that runs the tools, and NOTHING KNOWS WHERE IT LIVES. There is no
-default and no convention — the caller says, in any of the image arg types, and
-which one is right depends on where the caller is standing:
+Both are told, by argument, everything they need. **Neither reads a checkout.** A
+process has no repository to be standing in, and a path (`--llm-step:@=std/llm-step`)
+is refused by name because it would name a file in one:
 
 ```text
---llm-step:@=std/llm-step                              a path in this tree
---llm-step:@@=github:<owner>/<repo>?rev=<40 hex>&dir=std/llm-step
-                                                       another repo, pinned
+--server=<url>                the caos server (or CAOS_SERVER_URL, CAOS_MCP_DEFAULT_SERVER)
+--llm-step:@@=<git locator>   the step that runs the tools, pinned: git+…?rev=<40 hex>&dir=std/llm-step
+--base:@@=<git locator>       what a NEW conversation starts from (the hook; optional)
+--secret-readers=<key …>      the secret reader keys this process presents (or CAOS_SECRET_READERS)
 ```
 
-`integrations/claude-code/`'s configuration uses the first, because it is caos' own
-checkout — that file is the caller, playing the part a person plays when they
-type `caos tui --llm-step:@=…`. A session in somebody else's repository uses
-the second, and that is the whole answer to "how does a session in an arbitrary
-repo find the step": the client fetches the pinned tree and evaluates it
-exactly as it would a local directory (design/flake-inputs.md). Nothing is
-added to that repository, and only the resolved oid enters the cache key.
+A locator is resolved by the server (`:@@=`, design/flake-inputs.md), so a harness
+that wants uncommitted files in a conversation commits and pushes them first and
+names the commit. `--llm-step:hash=<oid>` also works, for a step the caller already
+holds. The content locator names the commit's own tree, not what evaluating it
+produces (`raw=1`, added when absent), because content is code to read. A first
+prompt can name another with a leading `/caos-session-start-from <locator>` line.
 
 ## What the model sees
 
@@ -66,7 +65,7 @@ unless the model copies it (`import-source` brings code in; `publish-source` sen
 source tree out). `shared/settings.json` therefore denies none of the built-ins. It
 still denies the GitHub MCP server's tools that caos covers, and `add_repo`: a second
 source was seen restarting the session in `/home/user`, which is no repository, and
-the server then could not find its workspace.
+the session then ran somewhere caos had not been told about.
 
 Each call is ONE request to the server: `run` is `POST /eval/run` of `llm-step` in its
 tools-only mode, `start` is `POST /start/run`, `result` is `GET /result/<ticket>`
@@ -80,7 +79,7 @@ here or in the tui.
 at a path nothing evaluates comes back as an error result, naming the sibling
 directories, not as a failed server.
 
-When there is no workspace (the hook could not find a repository), `help` with no path
+When there is no server (none named by argument or environment), `help` with no path
 still answers and leads with the reason; every other tool says the same. That one call is
 the whole of the diagnostic surface: a model handed a server that says nothing cannot
 tell it from no server at all.
@@ -111,13 +110,11 @@ absolute path from its own location and has no such constraint.
 
 `settings.json` points every hook at `caos mcp hook` (and denies the GitHub tools caos covers, below).
 `mcp.json` declares the tool server.
-Both pass `--llm-step:@=std/llm-step`, which is a statement about THIS
-checkout and nothing more: these two files are the caller. Elsewhere they say
-something else — `install.sh --user-config` rewrites that argument
-into a locator pinned to the commit the installed client was built from, so a
-session in an unrelated repository runs the step from the same tree as its
-client. It runs at setup AND at every session start, because the client is
-refreshed per session and the two must not drift apart.
+Both carry the placeholder `CAOS_MCP_ARGS_HERE` where those arguments go: `run`
+fills it from `CAOS_SERVER_URL`, `CAOS_STEP` (by default the server's own
+`refs/caos/dev`) and `CAOS_BASE`, and the cloud installer fills it with the
+server, a step locator pinned to the commit the installed client was built from,
+and the content locator its setup computed.
 
 **`${CLAUDE_PROJECT_DIR}` expands in a hook command but NOT in `mcp.json`.**
 Claude Code sets that variable in the environment *of* a spawned stdio server;

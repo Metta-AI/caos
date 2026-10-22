@@ -23,7 +23,7 @@ export HOME
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 hook() { # <event JSON>
-  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook --llm-step:@=DEEP-DEPS/llm-step >/dev/null
+  printf '%s\n' "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS "$(mcp_base_arg)" >/dev/null
 }
 prompt() { hook "$(jq -nc --arg s "$1" --arg p "$2" \
   '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:$p}')"; }

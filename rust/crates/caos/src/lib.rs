@@ -459,6 +459,13 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// A transport to the server at `base`.
+    pub fn new(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+        }
+    }
+
     /// Read the server URL from [`SERVER_ENV`].
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
@@ -520,6 +527,25 @@ impl Transport for HttpTransport {
     }
 }
 
+/// Whether the server at `url` accepts connections.
+///
+/// The server deliberately returns 404 at its root, so any HTTP response proves
+/// reachability. Bounded: a dead address does not refuse, it swallows.
+pub fn check_server_reachable(url: &str) -> Result<(), String> {
+    const TIMEOUT_SECS: u64 = 5;
+    server_request(
+        url,
+        &ServerRequest {
+            method: "GET",
+            path: "/",
+            headers: &[],
+            body: None,
+            timeout_secs: Some(TIMEOUT_SECS),
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| format!("cannot reach the CAOS server at {url}: {error}"))
+}
 /// The remote name a `caos-cli` working tree gives the server (`git remote add
 /// caos <url>`). Push/fetch use it.
 pub const CAOS_REMOTE: &str = "caos";
@@ -594,23 +620,10 @@ impl GitTransport {
     /// clients: it fails before they take over the terminal and turns a later,
     /// low-level Git transport error into one concise diagnosis.
     pub fn ensure_server_reachable(&self) -> Result<(), String> {
-        const TIMEOUT_SECS: u64 = 5;
-
         let url = self.server_url()?;
-        server_request(
-            &url,
-            &ServerRequest {
-                method: "GET",
-                path: "/",
-                headers: &[],
-                body: None,
-                timeout_secs: Some(TIMEOUT_SECS),
-            },
-        )
-        .map(|_| ())
-        .map_err(|error| {
+        check_server_reachable(&url).map_err(|error| {
             format!(
-                "cannot reach the CAOS server at {url}: {error}\n\
+                "{error}\n\
                  check that it is running and that the `{CAOS_REMOTE}` git remote points to the right URL"
             )
         })

@@ -85,11 +85,15 @@ install is blocked (below). Change the setup line (its first-line date will do)
 and start a new session. The hook cannot install the new pin itself: Claude Code
 has already started on the old files by the time it runs.
 
-With caos reachable at a path in the checkout (`caos-std/`, from the repo's
-root `.caos-expr`), the step is named as one: `--llm-step:@=caos-std/llm-step`
-rather than a locator pinned to the client's own build. The same path makes
-`caos-std/llm-step` the node a `reader:@@=` grant on caos's `std/llm-step` matches
-(SPEC.md, "Secrets").
+The step is named by locator, pinned to the commit the client was built from:
+`--llm-step:@@=github:<repo>?rev=<sha>&dir=std/llm-step`. `caos mcp` reads no
+checkout, so a path in one (`caos-std/llm-step`) names nothing. That locator is
+also what a `reader:@@=` grant on caos's `std/llm-step` matches (SPEC.md,
+"Secrets"). The server, the content a new conversation starts from, and the
+secret readers are arguments of their own (`--server`, `--base:@@=`,
+`--secret-readers`); setup computes the content locator from the checkout's
+`origin` and `HEAD` when it is on GitHub, so what is not committed and pushed is
+not in the conversation.
 
 Claude Code's own configuration is still user-level in the container, so one
 environment serves every repo. Three routes were possible; only one works:
@@ -232,15 +236,15 @@ Stage 1 fetches that commit and takes **everything** from it — the client,
 and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already
 fetched, so an edit to stage 1 is in the package like anything else). It then
 mints a commit that is HEAD with `.caos-expr` and `flake.lock` pointed at
-`git+caos://…?rev=<dev>`, and hands it to the client as `--base=<full sha>`.
+`git+caos://…?rev=<dev>`, pushes it to the server, and names it to the client as the
+conversation's content (`--base:@@=git+caos://local?rev=<seed>`).
 
 **Only that commit carries the dev pin; the checkout is left as cloned.** Blobs
 go in with `hash-object`, the tree through a throwaway index, the commit through
 `commit-tree`, so nothing on disk changes and Claude Code's stop hook has no diff
-to report. What makes that sufficient is on the client: with `--base`, `caos mcp`
-resolves `--llm-step:@=<std>/llm-step` in that commit's tree rather than
-ingesting `"."`. Before it did, the tool server read the checkout, so the files
-had to be rewritten in place — a dirty checkout holding a ticket.
+to report. What makes that sufficient is that `caos mcp` reads no checkout: it is
+told the commit by locator, and the server fetches it. The files never had to be
+rewritten in place, which would leave a dirty checkout holding a ticket.
 
 It is an **argument, not an environment variable**: the setup phase does not get
 the environment's variables at all.
@@ -302,20 +306,15 @@ The remaining latency is Anthropic's ~2 minutes of provisioning and init, which
 is fixed on their side; the first session against a step-tree the server has
 never built also waits out one rustc compile, and only that first one.
 
-Measured again on a client repo, against a server that already held the std
-entries: resolving `--llm-step:@=caos-std/llm-step` through the
-`flake-input-loader` mount took **15.0s** and cached **20 tools** on the first
-attempt. Moving the pin does NOT by itself force a rebuild — `std/llm-step`'s
-tree is content-addressed, so a caos commit that does not touch it resolves to
-the same oid and stays a memo hit.
+Moving the pin does NOT by itself force a rebuild — `std/llm-step`'s tree is
+content-addressed, so a caos commit that does not touch it resolves to the same
+oid and stays a memo hit.
 
-**A session that records the prompt and then never takes a turn is a step that
-will not resolve.** `UserPromptSubmit` cannot form a request without resolving
-`--llm-step`, so a broken expression presents as a silent session rather than
-an error: the transcript holds one user event, no assistant event, and the hook
-log stops after `warming the caos tool registry`. Run
-`caos mcp warm "--llm-step:@=<path>/llm-step"` in a checkout with the `caos`
-remote set — it prints the real reason, which the session never does.
+**A session whose prompt is recorded but never takes a turn has a step that will
+not resolve.** `UserPromptSubmit` cannot form a request without the server
+resolving `--llm-step`, so a broken locator shows as a hook error, not a model
+error. `help` with no path in the session says whether the server is reachable
+and prints the diagnostics; the hook log (`CAOS_CC_HOOK_LOG`) has the reason.
 
 ## The setup-time budget
 

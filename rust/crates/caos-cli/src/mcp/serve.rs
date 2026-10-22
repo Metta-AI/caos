@@ -27,9 +27,9 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use caos::GitTransport;
+use conversation_protocol::v3::refs;
 
-use crate::TurnOptions;
+use super::Config;
 
 /// The version we implement. A client that asks for another gets its own value
 /// echoed back when we can speak it, per MCP's negotiation rule.
@@ -68,29 +68,23 @@ To work on code in caos, import it with import-source into a fresh path under im
 copy it where you will change it, edit it with the file tools, and publish-source to push \
 the result. Tools that act on a source tree take its path as `source-tree`.";
 
-/// The workspace is passed in UNRESOLVED, and a failure to open it does not
-/// stop the server.
+/// A server that cannot find caos does not stop.
 ///
 /// Claude Code reports a tool server that dies before it speaks as
-/// `CONNECTION_CLOSED`, which says nothing about a repository, a directory or
-/// caos, and whatever it printed goes wherever a dead child's stderr goes.
-/// Answering `initialize` and then naming the problem on the first tool call
-/// puts the reason in front of the person who can fix it.
-pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> Result<(), String> {
-    let workspace = match workspace {
-        Ok(t) => Ok(t),
-        Err(error) => {
-            eprintln!("caos mcp serve: cannot open the caos workspace: {error}");
-            eprintln!("caos mcp serve: serving anyway; tools will report this when called");
-            super::diag::emit(&super::diag::Context {
-                event: "serve",
-                reason: Some(&error),
-                ..Default::default()
-            });
-            Err(error)
-        }
-    };
-    let t = workspace.as_ref();
+/// `CONNECTION_CLOSED`, which says nothing about a server, a locator or caos,
+/// and whatever it printed goes wherever a dead child's stderr goes. Answering
+/// `initialize` and then naming the problem on the first tool call puts the
+/// reason in front of the person who can fix it.
+pub fn serve(config: Config) -> Result<(), String> {
+    if let Err(error) = config.server() {
+        eprintln!("caos mcp serve: {error}");
+        eprintln!("caos mcp serve: serving anyway; tools will report this when called");
+        super::diag::emit(&super::diag::Context {
+            event: "serve",
+            reason: Some(&error),
+            ..Default::default()
+        });
+    }
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
 
     let stdin = std::io::stdin();
@@ -99,7 +93,7 @@ pub fn serve(workspace: Result<GitTransport, String>, options: TurnOptions) -> R
         if line.trim().is_empty() {
             continue;
         }
-        let Some(response) = handle(t, &options, &line) else {
+        let Some(response) = handle(&config, &line) else {
             continue;
         };
         write_message(&out, &response)?;
@@ -209,45 +203,38 @@ fn step_tool(name: &str) -> Option<&'static str> {
 /// way to learn it: the id is `cc/<Claude Code's internal session id>`, which
 /// appears in no URL, so without this line finding it means reading the session's
 /// events from outside with `drive --verb=conv`.
-///
-/// A FRESH transport, for the reason `run_tool` gives: the one `serve` opened at
-/// spawn can predate the hook that adds the `caos` remote.
-fn conversation_status(session: Option<&str>) -> String {
+fn conversation_status(config: &Config, session: Option<&str>) -> String {
     let Some(session) = session else {
         return format!(
             "conversation: unknown -- this call carried no {SESSION_ARG}, so the \
              PreToolUse hook that supplies it is not installed\n"
         );
     };
-    let t = match super::workspace::open(session) {
-        Ok(t) => t,
-        Err(error) => return format!("conversation: cannot open the workspace: {error}\n"),
-    };
     let id = match super::conversation_id_for(session) {
         Ok(id) => id,
         Err(error) => return format!("conversation: session {session:?} is unusable: {error}\n"),
     };
-    let head = crate::open_store(&t).and_then(|store| crate::fetch_head(&t, &store, &id));
+    let head = config
+        .server()
+        .and_then(|server| super::server_store(&server))
+        .and_then(|store| store.read_ref(&refs::head_ref(&id)?));
     let head = match head {
-        Ok(Some((_, head))) => head.as_str().to_string(),
+        Ok(Some(head)) => head.as_str().to_string(),
         Ok(None) => "none yet -- no turn has been recorded".to_string(),
         Err(error) => format!("<unreadable: {error}>"),
     };
     format!("conversation: {id}\nconversation head: {head}\n")
 }
 
-/// Whether the server answers, for the overview: asked of a transport, bounded, so
-/// a dead address is reported in seconds rather than waited on. It says the same
-/// words a tool call would fail with (`cannot reach the CAOS server`), because a
-/// model told only "the call failed" cannot tell a dead server from a wrong tool.
-fn server_status(session: Option<&str>) -> String {
-    let Some(session) = session else {
-        return String::new();
-    };
-    let Ok(t) = super::workspace::open(session) else {
-        return String::new();
-    };
-    match super::wait_server_reachable(&t) {
+/// Whether the server answers, for the overview: bounded, so a dead address is
+/// reported in seconds rather than waited on. It says the same words a tool call
+/// would fail with (`cannot reach the CAOS server`), because a model told only
+/// "the call failed" cannot tell a dead server from a wrong tool.
+fn server_status(config: &Config) -> String {
+    match config
+        .server()
+        .and_then(|server| super::wait_server_reachable(&server))
+    {
         Ok(()) => "server: reachable\n".to_string(),
         Err(error) => format!("server: {error}\n"),
     }
@@ -261,11 +248,12 @@ fn overview(conversation: &str, degraded: Option<&str>) -> Value {
     // THE REASON LEADS. A degraded server has nothing to run, and the reader of
     // this text is usually a model deciding what to tell a person.
     let lead = match degraded {
-        Some(reason) => format!(
-            "caos is DEGRADED: it has no workspace, so no tool can run.\nreason: {reason}\n\n"
-        ),
+        Some(reason) => {
+            format!("caos is DEGRADED: it has no server, so no tool can run.\nreason: {reason}\n\n")
+        }
         None => String::new(),
     };
+    let conversation = redact_secrets(conversation);
     let diag = super::diag::emit(&super::diag::Context {
         event: "help",
         reason: degraded,
@@ -360,22 +348,6 @@ fn diagnostics() -> String {
     // Where the env came from, stamped once at setup.
     d.push_str("env stamp (/usr/local/share/caos/setup-stamp):\n");
     d.push_str(&indent(&read_file("/usr/local/share/caos/setup-stamp")));
-    // A VARIABLE NOTHING READS IS NAMED, not silently ignored. The server is
-    // named by the setup line's `--server=<url>`, which adds the `caos` remote
-    // below; an environment still setting one of these is configuration left
-    // behind. Reported here because a cloud session cannot read the hook's log,
-    // and a missing remote reported on its own sends whoever is debugging it to
-    // the repository, which is the one thing that is not wrong.
-    for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
-        if std::env::var_os(name).is_some() {
-            d.push_str(&format!(
-                "{name}: set, and nothing reads it -- the setup line's \
-                 --server=<url> is what names the server now\n"
-            ));
-        }
-    }
-    // The remote the client dials -- present means the setup phase added it.
-    d.push_str(&format!("caos remote: {}\n", caos_remote()));
     d.push_str(&format!("{}\n", crate::secret_store::reader_summary()));
     // Whether git can reach a `caos://` remote, which is a DIFFERENT question
     // from whether this client can: the client speaks the transport itself,
@@ -460,8 +432,6 @@ fn indent(s: &str) -> String {
     s.lines().map(|l| format!("  {l}\n")).collect::<String>()
 }
 
-/// The URL of the `caos` git remote, read from the project the hook names (a
-/// tool server's cwd is not contractually the repo -- see `run_tool`).
 /// Where git would find the `caos://` remote helper, or why it would not.
 ///
 /// ASKED OF GIT, not of the filesystem: git resolves `git-remote-caos` by its
@@ -489,18 +459,6 @@ fn git_remote_helper() -> String {
     }
 }
 
-fn caos_remote() -> String {
-    let mut cmd = std::process::Command::new("git");
-    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
-        cmd.args(["-C", &dir]);
-    }
-    match cmd.args(["remote", "get-url", "caos"]).output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        Ok(out) => format!("<none: {}>", String::from_utf8_lossy(&out.stderr).trim()),
-        Err(e) => format!("<git failed: {e}>"),
-    }
-}
-
 /// Stdout, behind its own lock, not stdout's: the protocol is one message per
 /// line, and two writers interleaving mid-message would corrupt the stream that
 /// `std::io::Stdout`'s internal lock protects
@@ -521,7 +479,7 @@ fn write_message(out: &Out, message: &Value) -> Result<(), String> {
 /// Handle one message. `None` means "say nothing", which is required rather
 /// than merely polite: a JSON-RPC notification has no `id`, and answering one
 /// is a protocol violation.
-fn handle(t: Result<&GitTransport, &String>, options: &TurnOptions, line: &str) -> Option<Value> {
+fn handle(config: &Config, line: &str) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(request) => request,
         // A malformed line has no id to answer against, so the only correct
@@ -540,48 +498,29 @@ fn handle(t: Result<&GitTransport, &String>, options: &TurnOptions, line: &str) 
         "initialize" => Some(reply(id, initialize(&params))),
         // A constant: see the module docs.
         "tools/list" => Some(reply(id, json!({ "tools": tools() }))),
-        // A workspace we could not open is the model's problem to report, not
-        // a protocol error: `isError` reaches the transcript, where a -32603
+        // A server we cannot find is the model's problem to report, not a
+        // protocol error: `isError` reaches the transcript, where a -32603
         // reaches a log nobody is reading.
-        //
-        // The server's OWN startup-time workspace (`t`, fixed for this
-        // process's whole life) is a FALLBACK: a call naming a session with its
-        // own recorded workspace -- `session_base.rs`'s scratch checkout, or any
-        // other workspace a session's first prompt pinned -- uses THAT instead.
-        // This is what lets different sessions sharing this one long-running
-        // server use different checkouts and servers at all.
         "tools/call" => Some({
-            let session = params
-                .get("arguments")
-                .and_then(|args| args.get(SESSION_ARG))
-                .and_then(Value::as_str);
-            let session_t = session.and_then(|s| super::workspace::open(s).ok());
-            let resolved: Result<&GitTransport, &String> = match &session_t {
-                Some(opened) => Ok(opened),
-                None => t,
-            };
             let is_overview = params.get("name").and_then(Value::as_str) == Some("help")
                 && params
                     .get("arguments")
                     .and_then(|args| args.get("path"))
                     .and_then(Value::as_str)
                     .is_none_or(|path| path.trim().is_empty());
-            match resolved {
-                Err(error) if is_overview => reply(id, overview("", Some(error))),
+            match config.server() {
+                Err(error) if is_overview => reply(id, overview("", Some(&error))),
                 Err(error) => reply(
                     id,
                     json!({
                         "content": [{ "type": "text", "text": format!(
-                            "caos has no workspace, so no tool can run: {error}\n\
-                             The tool server is started by Claude Code, so it looks for the \
-                             repository at $CLAUDE_PROJECT_DIR and falls back to its working \
-                             directory. Neither was a git working tree. `help` with no path \
-                             says more."
+                            "caos has no server, so no tool can run: {error}\n\
+                             `help` with no path says more."
                         ) }],
                         "isError": true,
                     }),
                 ),
-                Ok(t) => match call(t, options, &params) {
+                Ok(_) => match call(config, &params) {
                     Ok(result) => reply(id, result),
                     // A tool that could not run at all is a JSON-RPC error; a tool
                     // that ran and failed is a result with `isError`, which the
@@ -615,7 +554,7 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value, String> {
+fn call(config: &Config, params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -633,7 +572,11 @@ fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value
             .and_then(Value::as_str)
             .is_none_or(|path| path.trim().is_empty())
     {
-        let status = format!("{}{}", conversation_status(session), server_status(session));
+        let status = format!(
+            "{}{}",
+            conversation_status(config, session),
+            server_status(config)
+        );
         return Ok(overview(&status, None));
     }
     let session = session.ok_or_else(|| {
@@ -644,7 +587,7 @@ fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value
     })?;
     let outcome = match name {
         "start" => {
-            let ticket = super::start_tool(options, session, "run_tool", &args)?;
+            let ticket = super::start_tool(config, session, "run_tool", &args)?;
             super::ToolOutcome {
                 text: format!(
                     "ticket: {ticket}\n\nAsk for it with result(ticket=\"{ticket}\"). It is \
@@ -658,11 +601,11 @@ fn call(t: &GitTransport, options: &TurnOptions, params: &Value) -> Result<Value
                 .get("ticket")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "result needs the `ticket` start returned".to_string())?;
-            super::tool_result(session, ticket.trim())?
+            super::tool_result(config, ticket.trim())?
         }
         other => {
             let step = step_tool(other).ok_or_else(|| format!("unknown tool {other:?}"))?;
-            super::run_tool(t, options, session, step, &args)?
+            super::run_tool(config, session, step, &args)?
         }
     };
     Ok(json!({
@@ -711,14 +654,12 @@ mod tests {
     #[test]
     fn notifications_are_never_answered() {
         let notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        let workspace = "no workspace".to_string();
-        assert!(handle(Err(&workspace), &TurnOptions::default(), notification).is_none());
+        assert!(handle(&Config::default(), notification).is_none());
     }
 
     #[test]
     fn an_unparseable_line_produces_no_response() {
-        let workspace = "no workspace".to_string();
-        assert!(handle(Err(&workspace), &TurnOptions::default(), "{not json").is_none());
+        assert!(handle(&Config::default(), "{not json").is_none());
     }
 
     #[test]
@@ -765,8 +706,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["run", "help", "start", "result", "eval-path"]);
         let listed = handle(
-            Err(&"no workspace".to_string()),
-            &TurnOptions::default(),
+            &Config::default(),
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
         )
         .unwrap();
@@ -801,28 +741,14 @@ mod tests {
         assert_eq!(step_tool("read"), None);
     }
 
-    /// With no workspace `help` still answers, and its first words are the reason.
+    /// With no server `help` still answers, and its first words are the reason.
     #[test]
     fn a_degraded_overview_leads_with_its_reason() {
-        let result = overview("", Some("not a git working tree"));
+        let result = overview("", Some("no caos server"));
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("caos is DEGRADED"), "{text}");
-        assert!(text.contains("reason: not a git working tree"), "{text}");
+        assert!(text.contains("reason: no caos server"), "{text}");
         assert!(text.contains("--- caos diag ---"), "{text}");
-    }
-
-    /// The same, asked through the protocol: no workspace, `help` with no path.
-    #[test]
-    fn help_with_no_workspace_explains_instead_of_failing() {
-        let response = handle(
-            Err(&"no repository".to_string()),
-            &TurnOptions::default(),
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"help","arguments":{}}}"#,
-        )
-        .unwrap();
-        let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("reason: no repository"), "{text}");
-        assert_eq!(response["result"]["isError"], false);
     }
 }
 
@@ -874,27 +800,5 @@ mod redaction_tests {
     fn an_http_remote_is_left_alone() {
         let line = "caos remote: http://localhost:9090";
         assert_eq!(redact_secrets(line), line);
-    }
-}
-
-#[cfg(test)]
-mod env_diagnostic_tests {
-    /// The overview must NAME a variable nothing reads, because a cloud session
-    /// cannot read the hook's log and this is all it has. A misconfigured
-    /// environment reported only as "no caos remote" sends whoever is debugging
-    /// it looking at the repository instead of the env.
-    #[test]
-    fn the_diagnostics_name_the_variables_that_moved() {
-        let source = include_str!("serve.rs");
-        for name in ["CAOS_SERVER_URL", "CAOS_IROH_TICKET"] {
-            assert!(
-                source.contains(name),
-                "the status text no longer names {name}"
-            );
-        }
-        assert!(
-            source.contains("set, and nothing reads it"),
-            "the status text no longer says the variable is unread"
-        );
     }
 }

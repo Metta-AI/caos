@@ -28,7 +28,6 @@
 
 use serde_json::{json, Value};
 
-use caos::GitTransport;
 use conversation_protocol::v3::apply::{inherited_signature, Transition};
 use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::git_store::GitStore;
@@ -39,7 +38,9 @@ use conversation_protocol::v3::records::{
 };
 use conversation_protocol::v3::view::Conversation;
 
-use crate::{conversation_ref, fetch_head, mint_transition, oid, open_store, resolve_username};
+use conversation_protocol::v3::refs;
+
+use crate::{conversation_ref, mint_transition, oid};
 
 pub(super) const FORK_COMMAND: &str = "fork-caos-conversation";
 
@@ -97,11 +98,11 @@ fn commit(hash: Option<&str>) -> Result<Oid, String> {
 /// A new branch: the session's own conversation, made by forking `from` after
 /// settling it. The original is untouched. `None` when the session already has
 /// its conversation, so this is not its first prompt.
-pub(super) fn begin(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>, String> {
-    let user = resolve_username(t, None)?;
+pub(super) fn begin(server: &str, session: &str, from: &Oid) -> Result<Option<String>, String> {
+    let user = super::username()?;
     let id = super::conversation_id_for(session)?;
-    let mut store = open_store(t)?;
-    if fetch_head(t, &store, &id)?.is_some() {
+    let mut store = super::server_store(server)?;
+    if store.read_ref(&refs::head_ref(&id)?)?.is_some() {
         return Ok(None);
     }
     store.ensure_local(from)?;
@@ -109,7 +110,7 @@ pub(super) fn begin(t: &GitTransport, session: &str, from: &Oid) -> Result<Optio
     let title = format!("fork of {}", &from.as_str()[..12]);
     // `settled` is `from` itself when nothing was open, so this is exactly the
     // TUI's fork in the common case.
-    crate::fork_conversation(t, &user, &id, &title, settled.as_str())?;
+    crate::fork_conversation_in(&mut store, &user, &id, &title, settled.as_str())?;
     Ok(Some(format!(
         "caos conversation ref {} forked from {from}",
         conversation_ref(&id)?

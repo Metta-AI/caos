@@ -476,11 +476,11 @@ func installHelper(prefix, slug, tag string) {
 // The conversation's seed: HEAD with its `.caos-expr` and `flake.lock` pointed
 // at the dev server, so the tools resolve from there too.
 //
-// ONLY A COMMIT CARRIES IT; the checkout is left as it was cloned. The client
-// reads both the conversation's content and `--llm-step`'s tree from `--base`
-// (`step_image` in caos-cli's mcp), so nothing reads the files on disk. That is
-// why they are not rewritten: a dirty checkout holding a ticket is a diff an
-// agent may commit and a session end that Claude Code's stop hook flags.
+// ONLY A COMMIT CARRIES IT; the checkout is left as it was cloned. The commit is
+// pushed to the server and named to `caos mcp` as the conversation's content
+// (`--base:@@=git+caos://local?rev=<seed>`), so nothing reads the files on disk.
+// That is why they are not rewritten: a dirty checkout holding a ticket is a diff
+// an agent may commit and a session end that Claude Code's stop hook flags.
 //
 // BOTH FILES, or neither works: std/flake-input-loader refuses a tree whose
 // expression and flake.lock name different revisions.
@@ -724,51 +724,6 @@ func main() {
 		seed = seedCommit(repoDir, a.server, devRev)
 	}
 
-	// STAGE 2, from the payload. `go run` rather than an exec of a built binary:
-	// stage 1 has just compiled the same stdlib packages, so this costs the link
-	// and not the compile.
-	install := []string{"run", filepath.Join(pkg.dir, "install.go"),
-		"--assets=" + pkg.dir,
-		"--caos-std-path=" + p.stdPath,
-		"--repo=" + p.slug(),
-		"--commit=" + p.rev,
-		"--version=" + pkg.version,
-		"--prefix=" + a.prefix,
-	}
-	if seed != "" {
-		install = append(install, "--seed-commit="+seed)
-	}
-	if a.enableBash {
-		install = append(install, "--enable-bash")
-	}
-	if a.homes != "" {
-		install = append(install, "--homes="+a.homes)
-	}
-	if a.repoFiles {
-		install = append(install, "--repo-files", "--repo-dir="+repoDir)
-	}
-	cmd := exec.Command("go", install...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		fatal("the install package would not install; this session has no client.")
-	}
-
-	// The hook, which is the only caos code that runs per session now that the
-	// install is not repeated: it warms the tool registry and says which caos
-	// this session is. Kept as source beside the assets so its `go run` reuses
-	// the build cache the two stages above just filled.
-	hook := filepath.Join(shareDir, "session.go")
-	if data, err := os.ReadFile(filepath.Join(pkg.dir, "session.go")); err == nil {
-		os.WriteFile(hook, data, 0o644)
-	} else {
-		fatal("the install package has no session.go: %v", err)
-	}
-	launcher := "#!/bin/sh\nexec go run " + hook + " \"$@\"\n"
-	launcherPath := filepath.Join(a.prefix, "bin/caos-cloud-session-start")
-	if err := os.WriteFile(launcherPath, []byte(launcher), 0o755); err != nil {
-		fatal("could not write %s: %v", launcherPath, err)
-	}
-
 	// The `caos` remote, from `--server`. The client finds caos through it and an
 	// arbitrary checkout has none, so this is what makes the arrangement
 	// repo-independent -- nothing has to be committed to a session repo.
@@ -799,6 +754,71 @@ func main() {
 		if _, err := run(repoDir, "git", "fetch", "--unshallow", "--quiet"); err != nil {
 			say("could not unshallow; a repo the server has not seen may fail to resolve")
 		}
+	}
+
+	// What a new conversation starts from, as a locator the server fetches: the
+	// session's checkout can hold uncommitted files, but `caos mcp` reads none, so
+	// what is not committed (and, for a checkout, pushed) is not in the
+	// conversation.
+	content := ""
+	if seed != "" {
+		// The seed is unreferenced here and the server cannot fetch it from a
+		// checkout, so it is pushed to the server itself and named as held there.
+		if _, err := run(repoDir, "git", "push", "-q", a.server, seed+":refs/caos/req/"+seed); err != nil {
+			say("could not push the dev seed commit to the server (%v); the first conversation will fail naming it", err)
+		}
+		content = "git+caos://local?rev=" + seed
+	} else {
+		content = checkoutLocator(repoDir)
+	}
+
+	// STAGE 2, from the payload. `go run` rather than an exec of a built binary:
+	// stage 1 has just compiled the same stdlib packages, so this costs the link
+	// and not the compile.
+	install := []string{"run", filepath.Join(pkg.dir, "install.go"),
+		"--assets=" + pkg.dir,
+		"--caos-std-path=" + p.stdPath,
+		"--repo=" + p.slug(),
+		"--commit=" + p.rev,
+		"--version=" + pkg.version,
+		"--prefix=" + a.prefix,
+	}
+	install = append(install, "--server="+a.server)
+	if content != "" {
+		install = append(install, "--content="+content)
+	}
+	if a.readers != "" {
+		install = append(install, "--secret-readers="+a.readers)
+	}
+	if a.enableBash {
+		install = append(install, "--enable-bash")
+	}
+	if a.homes != "" {
+		install = append(install, "--homes="+a.homes)
+	}
+	if a.repoFiles {
+		install = append(install, "--repo-files", "--repo-dir="+repoDir)
+	}
+	cmd := exec.Command("go", install...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fatal("the install package would not install; this session has no client.")
+	}
+
+	// The hook, which is the only caos code that runs per session now that the
+	// install is not repeated: it warms the tool registry and says which caos
+	// this session is. Kept as source beside the assets so its `go run` reuses
+	// the build cache the two stages above just filled.
+	hook := filepath.Join(shareDir, "session.go")
+	if data, err := os.ReadFile(filepath.Join(pkg.dir, "session.go")); err == nil {
+		os.WriteFile(hook, data, 0o644)
+	} else {
+		fatal("the install package has no session.go: %v", err)
+	}
+	launcher := "#!/bin/sh\nexec go run " + hook + " \"$@\"\n"
+	launcherPath := filepath.Join(a.prefix, "bin/caos-cloud-session-start")
+	if err := os.WriteFile(launcherPath, []byte(launcher), 0o755); err != nil {
+		fatal("could not write %s: %v", launcherPath, err)
 	}
 
 	stamp := map[string]string{
@@ -832,4 +852,33 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return "?"
+}
+
+// A locator for the commit the checkout is at, which the server can fetch:
+// `github:owner/repo?rev=<sha>` when the checkout's origin is on GitHub. "" says
+// the conversation starts without code -- an origin the server cannot reach (a
+// local proxy, a path) names nothing it could fetch.
+func checkoutLocator(repoDir string) string {
+	origin, err := run(repoDir, "git", "remote", "get-url", "origin")
+	if err != nil {
+		say("the checkout has no origin, so conversations start without code")
+		return ""
+	}
+	head, err := run(repoDir, "git", "rev-parse", "HEAD")
+	if err != nil || !isSha(head) {
+		say("the checkout has no commit, so conversations start without code")
+		return ""
+	}
+	slug := ""
+	for _, prefix := range []string{"https://github.com/", "git@github.com:", "ssh://git@github.com/"} {
+		if rest, ok := strings.CutPrefix(origin, prefix); ok {
+			slug = strings.TrimSuffix(strings.TrimSuffix(rest, "/"), ".git")
+			break
+		}
+	}
+	if slug == "" {
+		say("origin %s is not on GitHub, so conversations start without code", origin)
+		return ""
+	}
+	return "github:" + slug + "?rev=" + head
 }
