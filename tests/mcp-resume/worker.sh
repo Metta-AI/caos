@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`,
-# as the hook sees them on a new session's first prompt.
+# `/fork-caos-conversation <hash>`, as the hook sees it on a new session's first
+# prompt: the new session gets its OWN conversation, whose history is <hash>'s;
+# the original does not move.
 #
-#   fork    the new session gets its OWN conversation, whose history is <hash>'s;
-#           the original does not move.
-#   resume  the new session records into the SAME conversation, on top of <hash>;
-#           it gets no conversation of its own.
-#   a head left open (a session that died mid-turn) is used as it is: the
-#   protocol refuses to fork or continue a running request, so the hook closes
-#   it as new commits on top, and the record says so.
+# A head left open (a session that died mid-turn) is used as it is: the
+# protocol refuses to fork a running request, so the hook closes it as new
+# commits on top, and the record says so.
 #
 # Driven through `caos mcp hook` only -- no tool server, no model. What that
 # leaves untested is the closing of a CALL a dead session left running or
@@ -81,37 +78,6 @@ esac
 prompt "$f" "/fork-caos-conversation $head_a" >/dev/null
 stop "$f" "forked and done"
 
-echo "== resume: the same branch ==" >&2
-r="resume-r-$stamp"
-out=$(prompt "$r" "/resume-caos-conversation $head_a")
-case "$out" in
-  *"resumed at"*) ;;
-  *) fail "the hook did not say it resumed: $out" ;;
-esac
-[ -z "$(head_of "cc/$r")" ] || fail "a resumed session got a conversation of its own"
-head_r=$(head_of "cc/$a")
-[ "$head_r" != "$head_a" ] || fail "the resumed session recorded nothing on the original branch"
-git merge-base --is-ancestor "$head_a" "$head_r" || fail "the branch was not extended"
-stop "$r" "the resumed session is done"
-case "$(subjects "$(head_of "cc/$a")")" in
-  "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;
-  *) fail "the resumed turn was not recorded as one: $(subjects "$(head_of "cc/$a")")" ;;
-esac
-
-echo "== resume needs the head, and says so ==" >&2
-# EXIT 2 exactly: it is the only status with which Claude Code blocks the prompt
-# and shows the reason. Any other failure lets the prompt through with no
-# conversation behind it and the reason dropped.
-old_head=$head_a   # the branch has moved past it now
-rc=0
-prompt "resume-stale-$stamp" "/resume-caos-conversation $old_head" >/tmp/stale.out 2>/tmp/stale.err || rc=$?
-[ "$rc" = 2 ] || fail "a resume from a stale head exited $rc, not 2: $(cat /tmp/stale.err)"
-grep -q "not the head" /tmp/stale.err || fail "the refusal does not say why: $(cat /tmp/stale.err)"
-rc=0
-prompt "resume-bad-$stamp" "/resume-caos-conversation main" >/dev/null 2>/tmp/bad.err || rc=$?
-[ "$rc" = 2 ] || fail "a resume naming a branch exited $rc, not 2: $(cat /tmp/bad.err)"
-grep -q "40-character" /tmp/bad.err || fail "the refusal does not say what is wanted: $(cat /tmp/bad.err)"
-
 echo "== a head left open is used as it is ==" >&2
 # A session that died mid-turn: its prompt was recorded, its Stop never fired.
 b="resume-b-$stamp"
@@ -132,13 +98,6 @@ case "$(subjects "$head_g")" in
   *) fail "the open request was not closed before the fork: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
-
-h="resume-h-$stamp"
-prompt "$h" "/resume-caos-conversation $head_b" >/dev/null
-case "$(subjects "$(head_of "cc/$b")")" in
-  "request.claim request.admit message.append request.terminal "*) ;;
-  *) fail "the open request was not closed on the resumed branch: $(subjects "$(head_of "cc/$b")")" ;;
-esac
 
 echo "== a session's checkout is recorded once, and nothing else is consulted ==" >&2
 # A later hook from a directory that is no repository still lands in the same

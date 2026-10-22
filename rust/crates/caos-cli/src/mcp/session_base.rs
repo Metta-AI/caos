@@ -6,7 +6,7 @@
 //! instead of unconditionally trusting the hook's own cwd/`$CLAUDE_PROJECT_DIR`
 //! discovery. Two independent things a session can name, each on its own
 //! leading prompt line (same convention `resume::parse_command` uses for
-//! `/fork-caos-conversation`/`/resume-caos-conversation`: a line counts only
+//! `/fork-caos-conversation`: a line counts only
 //! as a leading one, so a prompt that merely quotes a directive further down
 //! is not a request):
 //!

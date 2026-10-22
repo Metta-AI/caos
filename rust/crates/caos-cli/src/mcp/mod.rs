@@ -166,7 +166,7 @@ impl PreparedCall {
 fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
     let workspace = workspace::open(session)
         .map_err(|error| format!("cannot open the caos workspace for this call: {error}"))?;
-    let conversation = resume::conversation_for_session(&workspace, session)?;
+    let conversation = conversation_id_for(session)?;
     wait_for_conversation(&workspace, &conversation);
     let call = args
         .get("caos_tool_use_id")
@@ -612,16 +612,16 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    // `/fork-caos-conversation <hash>` and `/resume-caos-conversation <hash>`
-    // decide WHICH conversation this session records into, so they run before it
-    // is looked up. Both are no-ops once the session has its conversation.
+    // `/fork-caos-conversation <hash>` makes the conversation this session records
+    // into, so it runs before the prompt is recorded. It is a no-op once the
+    // session has its conversation.
     let command = || -> Result<Option<String>, String> {
         match resume::parse_command(prompt)? {
-            Some(command) => {
-                // Both talk to the server before anything below would have
+            Some(from) => {
+                // It talks to the server before anything below would have
                 // proven it reachable.
                 wait_server_reachable(t)?;
-                resume::begin(t, string_field(payload, "session_id")?, &command)
+                resume::begin(t, string_field(payload, "session_id")?, &from)
             }
             None => Ok(None),
         }
@@ -630,7 +630,7 @@ fn on_user_prompt(t: &GitTransport, options: &TurnOptions, payload: &Value) -> R
         Ok(note) => note,
         Err(error) => refuse_prompt(&error),
     };
-    let id = recorded_conversation(t, payload)?;
+    let id = recorded_conversation(payload)?;
     let readers = crate::secret_store::reader_summary();
     if record_prompt(t, options, &id, prompt)? {
         announce(&format!(
@@ -792,22 +792,14 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// The conversation a hook payload's session records into: the one it was
-/// resumed onto (`resume`), or else the one its id derives.
-fn recorded_conversation(t: &GitTransport, payload: &Value) -> Result<String, String> {
-    resume::conversation_for_session(t, string_field(payload, "session_id")?)
+/// The conversation a hook payload's session records into.
+fn recorded_conversation(payload: &Value) -> Result<String, String> {
+    conversation_id_for(string_field(payload, "session_id")?)
 }
 
 /// A session's conversation id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
-/// (The one exception is a session RESUMED onto an existing conversation, which
-/// keeps that conversation's id; `resume` owns that, and this is what every
-/// other session gets.)
-#[cfg(test)]
-fn conversation_id(payload: &Value) -> Result<String, String> {
-    conversation_id_for(string_field(payload, "session_id")?)
-}
-
+///
 /// A session id is the one ref component we do not author, so it is validated
 /// through the protocol's own parser rather than trusted — whether it arrives
 /// in a hook payload or as a tool argument.
@@ -826,7 +818,7 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
 
 /// The assistant's closing message, and the end of the request it answered.
 fn on_stop(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
-    let id = recorded_conversation(t, payload)?;
+    let id = recorded_conversation(payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
@@ -858,7 +850,7 @@ fn announce(text: &str) -> Result<(), String> {
 
 /// A turn that ended badly closes its request as failed.
 fn on_stop_failure(t: &GitTransport, options: &TurnOptions, payload: &Value) -> Result<(), String> {
-    let id = recorded_conversation(t, payload)?;
+    let id = recorded_conversation(payload)?;
     let kind = payload
         .get("error_type")
         .and_then(Value::as_str)
@@ -882,7 +874,7 @@ mod tests {
     fn session_ids_become_valid_conversation_ids() {
         let payload = json!({"session_id": "88888abc-9ae5-4d07-a44d-54b366776bdc"});
         assert_eq!(
-            conversation_id(&payload).unwrap(),
+            recorded_conversation(&payload).unwrap(),
             "cc/88888abc-9ae5-4d07-a44d-54b366776bdc"
         );
     }
@@ -895,7 +887,7 @@ mod tests {
     fn hostile_session_ids_cannot_escape_the_ref_namespace() {
         for hostile in ["../../etc", "a/../b", "with space", "head", "a.lock"] {
             let payload = json!({ "session_id": hostile });
-            let id = conversation_id(&payload).unwrap();
+            let id = recorded_conversation(&payload).unwrap();
             let refname = conversation_ref(&id).unwrap();
             assert!(
                 refname.starts_with("refs/caos/v3/conversations/"),

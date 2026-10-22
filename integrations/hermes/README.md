@@ -74,7 +74,7 @@ inside the checkout.
   the fast way to check; if it fails to resolve, hardcode the profile's
   absolute path instead (loses portability across machines, but is correct
   immediately).
-- **Claude Code's `/fork-caos-conversation` / `/resume-caos-conversation`
-  slash commands** have no Hermes equivalent yet — picking up a conversation
-  by its commit hash in a new Hermes session needs the same two verbs,
-  wired as Hermes slash commands or just plain prompted instructions for now.
+- **Claude Code's `/fork-caos-conversation`
+  slash command** has no Hermes equivalent yet — picking up a conversation
+  by its commit hash in a new Hermes session needs the same verb,
+  wired as a Hermes slash command or just plain prompted instructions for now.

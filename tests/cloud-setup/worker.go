@@ -255,13 +255,12 @@ func main() {
 		timeout, _ := promptHook["timeout"].(float64)
 		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
-		// The slash commands that start a session from a recorded conversation.
+		// The slash command that starts a session from a recorded conversation.
 		// The marker line is what the prompt hook keys on if it is handed the
 		// expansion rather than what was typed, so it is asserted, not just the
 		// file.
 		for name, mode := range map[string]string{
-			"fork-caos-conversation.md":   "fork",
-			"resume-caos-conversation.md": "resume",
+			"fork-caos-conversation.md": "fork",
 		} {
 			body, err := os.ReadFile("/tmp/home/.claude/commands/" + name)
 			w.Must(err)

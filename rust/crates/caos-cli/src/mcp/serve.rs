@@ -223,7 +223,7 @@ fn conversation_status(session: Option<&str>) -> String {
         Ok(t) => t,
         Err(error) => return format!("conversation: cannot open the workspace: {error}\n"),
     };
-    let id = match super::resume::conversation_for_session(&t, session) {
+    let id = match super::conversation_id_for(session) {
         Ok(id) => id,
         Err(error) => return format!("conversation: session {session:?} is unusable: {error}\n"),
     };

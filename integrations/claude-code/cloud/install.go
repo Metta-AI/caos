@@ -372,9 +372,9 @@ func contains(haystack []string, needle string) bool {
 	return false
 }
 
-// The two slash commands that start a session from an earlier recorded
-// conversation. THE HOOK is what acts on them -- `caos mcp hook` sees the
-// first prompt and forks or resumes the conversation before the model's first
+// The slash command that starts a session from an earlier recorded
+// conversation. THE HOOK is what acts on it -- `caos mcp hook` sees the
+// first prompt and forks the conversation before the model's first
 // turn (rust/crates/caos-cli/src/mcp/resume.rs) -- so the marker line below is
 // load-bearing: it is what the hook finds if Claude Code hands it the command's
 // expansion rather than the `/name <hash>` that was typed. The rest is for the
@@ -400,14 +400,6 @@ caos-conversation-command: fork $ARGUMENTS
 
 You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original.
 ` + commandFooter,
-	"resume-caos-conversation.md": `---
-description: Continue a recorded caos conversation in this new session (the same branch)
-argument-hint: <conversation-commit-hash>
----
-caos-conversation-command: resume $ARGUMENTS
-
-You are picking up work recorded in another caos conversation, and this session CONTINUES it: what you do is appended to that same conversation, on top of commit $ARGUMENTS, so its history and workspace (imports/, feature/, and so on) are already here.
-` + commandFooter,
 }
 
 func writeUserConfig(a args, locator string) {
@@ -429,6 +421,11 @@ func writeUserConfig(a args, locator string) {
 			if writeIfChanged(filepath.Join(home, ".claude/commands", name), []byte(body)) {
 				changed = true
 			}
+		}
+		// An earlier install wrote a resume command, which no longer exists.
+		stale := filepath.Join(home, ".claude/commands/resume-caos-conversation.md")
+		if err := os.Remove(stale); err == nil {
+			changed = true
 		}
 		// settings.json cannot declare an MCP server -- that lives in the user
 		// config beside it, MERGED, because it also holds account state a

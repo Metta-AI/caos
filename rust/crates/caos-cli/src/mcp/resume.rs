@@ -1,6 +1,6 @@
 //! Picking a recorded conversation up in a NEW Claude Code session.
 //!
-//! Two commands, both named by the conversation COMMIT they start from (the hash
+//! One command, named by the conversation COMMIT it starts from (the hash
 //! `caos head <hash>` printed after a turn -- a commit is immutable, where a ref
 //! moves):
 //!
@@ -8,34 +8,23 @@
 //! /fork-caos-conversation <hash>     a NEW branch: the new session's own
 //!                                    `cc/<session>` conversation, whose
 //!                                    history is <hash>'s, then diverges
-//! /resume-caos-conversation <hash>   the SAME branch: the new session
-//!                                    appends to the conversation <hash>
-//!                                    belongs to
 //! ```
 //!
-//! Both are recognised by the `UserPromptSubmit` hook on a session's first
-//! prompt, so the conversation exists -- and holds the earlier history and
-//! workspace -- before the model takes its first turn. What the MODEL sees of
-//! that history is the slash command's own text (see `cloud/install.go`); this
-//! file is the record side.
+//! It is recognised by the `UserPromptSubmit` hook on a session's first prompt,
+//! so the conversation exists -- and holds the earlier history and workspace --
+//! before the model takes its first turn. What the MODEL sees of that history is
+//! the slash command's own text (see `cloud/install.go`); this file is the record
+//! side.
 //!
 //! A fork needs no bookkeeping: its id is derived from the session id like any
-//! other. A resume does: the conversation keeps its OLD id, so the session has to
-//! be told which one it is writing to. That is a small file under the checkout's
-//! git directory, read wherever a session id becomes a conversation id, and it
-//! is the one piece of local state in `caos mcp`. Losing it (a fresh container
-//! for the same session) is safe in the way that matters: the session then
-//! records into its own derived conversation rather than into someone else's.
+//! other, so a session's conversation is always `conversation_id_for(session)`.
 //!
 //! THE HEAD IS USED AS IT IS, EVEN IF IT IS INCOMPLETE. A session that died
 //! mid-turn leaves a running request and calls that will never finish; the
-//! protocol refuses to fork such a conversation and a resumed session could never
-//! close it. `settle` closes them the way `llm-step` does for a cancelled turn --
-//! each open call becomes `cancelled`, the request ends `interrupted` -- as new
-//! commits on top of the head. Nothing is rewritten, and the transcript says
-//! plainly which results never arrived.
-
-use std::path::PathBuf;
+//! protocol refuses to fork such a conversation. `settle` closes them the way
+//! `llm-step` does for a cancelled turn -- each open call becomes `cancelled`,
+//! the request ends `interrupted` -- as new commits on top of the head. Nothing
+//! is rewritten, and the transcript says plainly which results never arrived.
 
 use serde_json::{json, Value};
 
@@ -48,20 +37,15 @@ use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
     CallRecord, CallStatus, Role, TaskStatus, ToolResult, TurnOutcome, TurnStatus,
 };
-use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
 
-use crate::{
-    conversation_ref, fetch_head, mint_transition, oid, open_store, push_cas, resolve_username,
-    update_local_cache,
-};
+use crate::{conversation_ref, fetch_head, mint_transition, oid, open_store, resolve_username};
 
-pub(super) const RESUME_COMMAND: &str = "resume-caos-conversation";
 pub(super) const FORK_COMMAND: &str = "fork-caos-conversation";
 
-/// A line the slash commands' expanded text carries, so the hook still finds the
+/// A line the slash command's expanded text carries, so the hook still finds the
 /// request if Claude Code hands it the expansion rather than what was typed.
-/// `caos-conversation-command: resume <hash>` or `... fork <hash>`.
+/// `caos-conversation-command: fork <hash>`.
 pub(super) const MARKER: &str = "caos-conversation-command:";
 
 /// Why a call or request a session left open was closed.
@@ -72,28 +56,17 @@ const ABANDONED: &str =
 /// its background tasks); it exists so a bug cannot loop forever.
 const MAX_SETTLE_STEPS: usize = 1024;
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Command {
-    Resume(Oid),
-    Fork(Oid),
-}
-
-/// The command a prompt asks for, if it asks for one.
+/// The commit a prompt asks to fork, if it asks for one.
 ///
 /// The slash form counts only as the FIRST line of the prompt: a prompt that
 /// merely quotes one further down is not a request to fork anything. The marker
 /// form may be anywhere, because it is text the command itself expanded to.
-pub(super) fn parse_command(prompt: &str) -> Result<Option<Command>, String> {
+pub(super) fn parse_command(prompt: &str) -> Result<Option<Oid>, String> {
     let trimmed = prompt.trim_start();
     if let Some(first) = trimmed.lines().next().and_then(|l| l.strip_prefix('/')) {
         let mut words = first.split_whitespace();
-        let resume = match words.next() {
-            Some(RESUME_COMMAND) => Some(true),
-            Some(FORK_COMMAND) => Some(false),
-            _ => None,
-        };
-        if let Some(resume) = resume {
-            return command(resume, words.next()).map(Some);
+        if words.next() == Some(FORK_COMMAND) {
+            return commit(words.next()).map(Some);
         }
     }
     for line in prompt.lines() {
@@ -101,89 +74,31 @@ pub(super) fn parse_command(prompt: &str) -> Result<Option<Command>, String> {
             continue;
         };
         let mut words = rest.split_whitespace();
-        let resume = match words.next() {
-            Some("resume") => true,
-            Some("fork") => false,
-            other => return Err(format!("unknown {MARKER} mode {other:?}")),
+        return match words.next() {
+            Some("fork") => commit(words.next()).map(Some),
+            other => Err(format!("unknown {MARKER} mode {other:?}")),
         };
-        return command(resume, words.next()).map(Some);
     }
     Ok(None)
 }
 
-fn command(resume: bool, hash: Option<&str>) -> Result<Command, String> {
-    let name = if resume { RESUME_COMMAND } else { FORK_COMMAND };
-    let hash = hash.ok_or_else(|| format!("usage: /{name} <conversation-commit-hash>"))?;
+fn commit(hash: Option<&str>) -> Result<Oid, String> {
+    let hash = hash.ok_or_else(|| format!("usage: /{FORK_COMMAND} <conversation-commit-hash>"))?;
     if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "/{name} takes a full 40-character commit hash (the one `caos head` printed), not {hash:?}"
+            "/{FORK_COMMAND} takes a full 40-character commit hash (the one `caos head` printed), not {hash:?}"
         ));
     }
-    let hash = oid(&hash.to_ascii_lowercase(), "conversation commit")?;
-    Ok(if resume {
-        Command::Resume(hash)
-    } else {
-        Command::Fork(hash)
-    })
+    oid(&hash.to_ascii_lowercase(), "conversation commit")
 }
 
-// --- which conversation a session writes to ---------------------------------
-
-fn mapping_path(t: &GitTransport, session: &str) -> PathBuf {
-    t.git_dir()
-        .join("caos-cc-sessions")
-        .join(paths::admit_external_id(session))
-}
-
-/// The conversation a RESUMED session was pointed at, if it was.
-fn mapped(t: &GitTransport, session: &str) -> Option<String> {
-    let text = std::fs::read_to_string(mapping_path(t, session)).ok()?;
-    let id = text.trim();
-    (!id.is_empty()).then(|| id.to_string())
-}
-
-fn remember(t: &GitTransport, session: &str, id: &str) -> Result<(), String> {
-    let path = mapping_path(t, session);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|error| format!("creating {}: {error}", dir.display()))?;
-    }
-    std::fs::write(&path, format!("{id}\n"))
-        .map_err(|error| format!("writing {}: {error}", path.display()))
-}
-
-/// The conversation a session records into: the one it was resumed onto, or the
-/// one its id derives.
-pub(super) fn conversation_for_session(t: &GitTransport, session: &str) -> Result<String, String> {
-    match mapped(t, session) {
-        Some(id) => {
-            refs::validate_conversation_id(&id)?;
-            Ok(id)
-        }
-        None => super::conversation_id_for(session),
-    }
-}
-
-// --- the two commands -------------------------------------------------------
-
-/// Do what a session's first prompt asked, returning a note for the person
-/// running it, or `None` when there was nothing to do (the session already has
-/// its conversation, so this is not its first prompt).
-pub(super) fn begin(
-    t: &GitTransport,
-    session: &str,
-    command: &Command,
-) -> Result<Option<String>, String> {
-    let user = resolve_username(t, None)?;
-    match command {
-        Command::Fork(from) => fork(t, session, &user, from),
-        Command::Resume(from) => resume(t, session, from),
-    }
-}
+// --- the command ------------------------------------------------------------
 
 /// A new branch: the session's own conversation, made by forking `from` after
-/// settling it. The original is untouched.
-fn fork(t: &GitTransport, session: &str, user: &str, from: &Oid) -> Result<Option<String>, String> {
+/// settling it. The original is untouched. `None` when the session already has
+/// its conversation, so this is not its first prompt.
+pub(super) fn begin(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>, String> {
+    let user = resolve_username(t, None)?;
     let id = super::conversation_id_for(session)?;
     let mut store = open_store(t)?;
     if fetch_head(t, &store, &id)?.is_some() {
@@ -194,49 +109,9 @@ fn fork(t: &GitTransport, session: &str, user: &str, from: &Oid) -> Result<Optio
     let title = format!("fork of {}", &from.as_str()[..12]);
     // `settled` is `from` itself when nothing was open, so this is exactly the
     // TUI's fork in the common case.
-    crate::fork_conversation(t, user, &id, &title, settled.as_str())?;
+    crate::fork_conversation(t, &user, &id, &title, settled.as_str())?;
     Ok(Some(format!(
         "caos conversation ref {} forked from {from}",
-        conversation_ref(&id)?
-    )))
-}
-
-/// The same branch: the session appends to the conversation `from` belongs to.
-///
-/// `from` must BE that conversation's head. A commit further back would have the
-/// session append to a branch that has since moved, and a silent divergence is
-/// worse than a refusal that names the fork command.
-fn resume(t: &GitTransport, session: &str, from: &Oid) -> Result<Option<String>, String> {
-    if mapped(t, session).is_some() {
-        return Ok(None);
-    }
-    let mut store = open_store(t)?;
-    store.ensure_local(from)?;
-    let id = Conversation::open(&store, from)?.identity()?.id;
-    let refname = refs::head_ref(&id)?;
-    let head = store
-        .read_ref(&refname)?
-        .ok_or_else(|| format!("conversation {id:?} has no head on this caos server"))?;
-    if head != *from {
-        return Err(format!(
-            "{from} is not the head of conversation {id:?}, which is at {head}. \
-             /{RESUME_COMMAND} continues a branch from its latest commit; \
-             use /{FORK_COMMAND} to start a new branch from this one"
-        ));
-    }
-    let settled = settle(&mut store, from)?;
-    if settled != *from {
-        if !push_cas(&store, &refname, Some(from), &settled)? {
-            return Err(format!(
-                "conversation {id:?} moved while it was being resumed; \
-                 run the command again with its new head"
-            ));
-        }
-        let _ = update_local_cache(t, &refname, settled.as_str());
-    }
-    remember(t, session, &id)?;
-    Ok(Some(format!(
-        "caos conversation ref {} resumed at {settled}",
         conversation_ref(&id)?
     )))
 }
@@ -434,15 +309,11 @@ mod tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
-    fn the_slash_forms_are_recognised_on_the_first_line() {
-        let want = |resume: bool| Some(command(resume, Some(HASH)).unwrap());
-        assert_eq!(
-            parse_command(&format!("/{RESUME_COMMAND} {HASH}")).unwrap(),
-            want(true)
-        );
+    fn the_slash_form_is_recognised_on_the_first_line() {
+        let want = Some(commit(Some(HASH)).unwrap());
         assert_eq!(
             parse_command(&format!("  /{FORK_COMMAND}   {HASH}\nmore text")).unwrap(),
-            want(false)
+            want
         );
     }
 
@@ -451,7 +322,7 @@ mod tests {
         let prompt = format!("Some preamble.\n{MARKER} fork {HASH}\nmore.");
         assert_eq!(
             parse_command(&prompt).unwrap(),
-            Some(command(false, Some(HASH)).unwrap())
+            Some(commit(Some(HASH)).unwrap())
         );
     }
 
@@ -460,6 +331,10 @@ mod tests {
         assert_eq!(parse_command("fix the bug").unwrap(), None);
         // Claude Code's own /resume must not be mistaken for ours.
         assert_eq!(parse_command(&format!("/resume {HASH}")).unwrap(), None);
+        assert_eq!(
+            parse_command(&format!("/resume-caos-conversation {HASH}")).unwrap(),
+            None
+        );
         // Quoting a command further down is not asking for it.
         assert_eq!(
             parse_command(&format!("look:\n/{FORK_COMMAND} {HASH}")).unwrap(),
@@ -472,14 +347,12 @@ mod tests {
         for prompt in [
             format!("/{FORK_COMMAND}"),
             format!("/{FORK_COMMAND} main"),
-            format!("/{RESUME_COMMAND} {}", &HASH[..12]),
+            format!("/{FORK_COMMAND} {}", &HASH[..12]),
         ] {
             let error = parse_command(&prompt).unwrap_err();
-            assert!(
-                error.contains("/fork-caos-conversation")
-                    || error.contains("/resume-caos-conversation")
-            );
+            assert!(error.contains("/fork-caos-conversation"));
         }
         assert!(parse_command(&format!("{MARKER} sideways {HASH}")).is_err());
+        assert!(parse_command(&format!("{MARKER} resume {HASH}")).is_err());
     }
 }

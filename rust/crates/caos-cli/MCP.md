@@ -279,16 +279,17 @@ the tui against the same conversation.
 ## Picking a conversation up in a new session
 
 A cloud session is disposable and its Claude Code context dies with it; the
-conversation does not. Two slash commands, both taking the conversation COMMIT to
-start from — the `caos head <hash>` a turn prints, or `conversation head:` from
-`help` with no path. A commit, because it is immutable where a ref moves.
+conversation does not. One slash command takes the conversation COMMIT to start
+from — the `caos head <hash>` a turn prints, or `conversation head:` from `help`
+with no path. A commit, because it is immutable where a ref moves.
 
-| Command | Result |
-|---|---|
-| `/fork-caos-conversation <hash>` | a NEW branch: the session's own `cc/<session>` conversation, made by `conversation.fork` on `<hash>`. The original does not move. |
-| `/resume-caos-conversation <hash>` | the SAME branch: the session records into the conversation `<hash>` belongs to, and gets none of its own. `<hash>` must be that conversation's current head; otherwise the hook refuses and names `/fork-caos-conversation`. |
+`/fork-caos-conversation <hash>` makes a NEW branch: the session's own
+`cc/<session>` conversation, made by `conversation.fork` on `<hash>`. The original
+does not move. There is no command that continues the SAME branch from a new
+session: a session's conversation is always the one its id derives, so nothing
+about it is kept locally.
 
-`cloud/install.go` writes both commands into Claude Code's user config. The hook
+`cloud/install.go` writes the command into Claude Code's user config. The hook
 acts on a session's **first prompt** (`resume.rs`): it recognises the command, sets
 up the conversation, and only then records the prompt as usual — so history and
 workspace are in place before the model's first turn. The command's own text is
@@ -297,23 +298,15 @@ model's context. Its first line is a `caos-conversation-command:` marker, which
 is what the hook finds if Claude Code passes it the command's expansion rather
 than the `/name <hash>` that was typed.
 
-A resumed conversation keeps its OLD id, so the session has to be told which one
-it writes to. That is the one piece of local state in `caos mcp`: a file per
-session under the checkout's git directory (`caos-cc-sessions/`), read wherever a
-session id becomes a conversation id (the hook, the tool server, `help`).
-A session that loses it records into its own derived conversation, never into
-someone else's.
-
 **An incomplete head is used as it is.** A session that died mid-turn leaves a
 running request, and perhaps calls that started and never finished. The protocol
-refuses to fork such a conversation, and a resumed session could never close
-its request, so `settle` first appends commits that close it the way `llm-step`
-does for a cancelled turn: each open call completes as `cancelled` (its
-observation says the session ended before it finished), and the request ends
-`interrupted`. Nothing is rewritten. For a fork these commits land on the NEW
-branch, so the original is not touched; for a resume they extend the branch, which
-is the point. A pending publication is not settled — it is a fact about a remote —
-and the protocol refuses that fork with its own message.
+refuses to fork such a conversation, so `settle` first appends commits that close
+it the way `llm-step` does for a cancelled turn: each open call completes as
+`cancelled` (its observation says the session ended before it finished), and the
+request ends `interrupted`. Nothing is rewritten, and these commits land on the
+NEW branch, so the original is not touched. A pending publication is not settled
+— it is a fact about a remote — and the protocol refuses that fork with its own
+message.
 
 ## Not yet done
 
