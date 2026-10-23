@@ -206,12 +206,6 @@ command -v podman >/dev/null 2>&1 || fail "no podman in this image"
 # severed and serve runs with none of it. Not a parse error, so `bash -n` passes
 # and it surfaces as a stack dying at bring-up over a variable that is right
 # there in the source (CLAUDE.md).
-#
-# CAOS_STACK_HERMES=no, overriding stack/serve's own "yes" default: this
-# devbox image (dev/devbox/flake.nix) does not carry the `hermes` binary, so
-# the default would just fail every test-stack bring-up over a tool the
-# suite never asked for. A test stack that deliberately wants one bundled
-# has to be a dedicated opt-in (image + test), not this one's default.
 phase "starting serve"
 ready=$run/stack.ready
 rm -f "$ready"
@@ -221,7 +215,6 @@ CAOS_STACK_STATE="$state" \
 CAOS_STACK_LOGS="$run/logs" \
 CAOS_STACK_READY="$ready" \
 CAOS_STACK_BIN="$inputs/bin" \
-CAOS_STACK_HERMES=no \
 CAOS_STACK_PUBLISH=yes \
 CAOS_STACK_PUBLISH_SCRIPT="$PWD/stack/build-builtins.sh" \
 CAOS_REGISTRY_HTTP="${CAOS_DEV_REGISTRY:-caos-registry:5000}" \
