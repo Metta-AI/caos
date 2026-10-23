@@ -481,11 +481,10 @@ fi
 # A member like any other, so it shares the group's lifetime and its log, and
 # `caosd logs` shows the ticket it published.
 #
-# It needs BOTH halves of this stack's surface: `--to` for the HTTP API (the
-# server is already up, checked above) and `--git-dir` for git, which it serves
-# by spawning `git upload-pack`/`receive-pack` on the same repo the server uses.
-# That is not a way around the server's protections — they are git config on the
-# repo (see design/iroh-transport.md).
+# It needs only `--to`, the server's HTTP port (already up, checked above):
+# every stream it accepts is a TCP connection to it, git included, which the
+# server serves as smart HTTP at /info/refs and /git-{upload,receive}-pack
+# (design/iroh-transport.md).
 #
 # NOT WAITED FOR, unlike the members above. Binding an endpoint means reaching a
 # relay, so it takes seconds and can fail on a machine with no route out — and
@@ -500,7 +499,7 @@ if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
   # FATAL HERE, where the message is read, rather than minting a ticket that
   # cannot be reached. n0's relays are never used (caos_iroh::endpoint_builder),
   # so there is nothing to fall back to -- and a ticket carrying an unreachable
-  # relay keeps its endpoint id and token, so it is indistinguishable from the
+  # relay keeps its endpoint id, so it is indistinguishable from the
   # one already in someone's environment while every session against it times
   # out a whole phase away from here.
   if [ -z "${CAOS_IROH_RELAY:-}" ]; then
@@ -520,7 +519,6 @@ if [ "${CAOS_STACK_IROH:-no}" = yes ]; then
   start caos-iroh "$CAOS_STACK_BIN/caos-iroh" serve \
     --state "$IROH_STATE" \
     --to "127.0.0.1:80" \
-    --git-dir "$CAOS_STACK_STATE/git" \
     --relay "$CAOS_IROH_RELAY" \
     "${iroh_advertise[@]}"
 fi

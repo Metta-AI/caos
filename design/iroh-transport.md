@@ -50,62 +50,64 @@ there is nothing to collide over:
 
 ```
 [remote "caos"]
-    url = caos://<endpoint ticket>.<token>   # id, addresses, relays, token
+    url = caos://<endpoint ticket>   # id, addresses, relays: what dumbpipe prints
 ```
 
-**git reaches it through a remote helper.** A `caos://` URL makes git exec
-`git-remote-caos` (gitremote-helpers(7)), which advertises exactly one
-capability, `connect`, and needs nothing else: git asks it to connect to
-`git-upload-pack` or `git-receive-pack`, it answers with a blank line, and from
-then on its stdin and stdout *are* that service's. **There is no pack protocol
-in the helper at all** — the server spawns the real service at the far end.
+**The protocol is dumbpipe's, and nothing else.** The listener answers the ALPN
+`DUMBPIPEV0`; an opener writes the five bytes `hello` on a fresh bi-stream, and
+from then on that stream is a TCP connection to the one port the listener
+forwards to, the caos server's HTTP port. There is no request line, no service
+to name and no reply. So a ticket from `caos-iroh serve` is a dumbpipe ticket,
+and stock `dumbpipe connect-tcp` or `tools/iroh-vhost` reach the server with it.
 
-**One connection, one bi-stream per request.** Each stream opens with a request
-line naming its service, and the listener answers:
+**Everything the server offers is a URL path**, and that is what made this
+possible: `/object`, `/run`, `/eval`, `/start`, `/result`, `/mcp`, and git smart
+HTTP at `/info/refs`, `/git-upload-pack` and `/git-receive-pack`. The listener
+needs no idea what any of them are.
 
-```
-caos1 <token> <service>[ <extra>]\n   ->  ok\n  |  err <message>\n
-```
-
-`<service>` is `http`, `git-upload-pack` or `git-receive-pack`; `<extra>` is a
-`GIT_PROTOCOL` value the listener puts back in the environment of the git it
-spawns. The reply is what makes a refusal legible: a revoked token or an
-unspawnable service arrives as a message the client prints, not as a closed
-stream and git's "the remote end hung up unexpectedly".
-
-A stream per request rather than per connection because the client is
+**One connection, one bi-stream per request.** The one thing the listener does
+beyond dumbpipe's own is keep a connection open and answer many streams on it
+(stock `dumbpipe listen-tcp` serves one and closes, which costs a QUIC
+handshake per request). A stock client sends one stream and loses nothing; ours
+holds one connection and opens a stream per request, because the client is
 concurrent — `run_chat_turn` holds a long `GET /run` on one thread while the
 main thread polls status — and because the object walk asks for one object at a
 time by design, so each ask must cost a stream and not a handshake.
 
-## The listener spawns git directly, and that is not a shortcut
+A backend the listener cannot dial is answered with an HTTP 502 on the stream,
+naming it, because the stream carries HTTP and a reason is better than a hangup.
 
-`caos-iroh serve` answers a git stream by running `git upload-pack <dir>` /
-`git receive-pack <dir>`, with no `http-backend` in front. This looks like it
-bypasses the protections the server installs on that object database. It does
-not, and the reason is worth keeping: every one of them — `gc.auto=0`,
-`receive.autogc=false`, `maintenance.geometric-repack.enabled=false`,
-`uploadpack.allowFilter`, the hidden-ref configuration — is written as **git
-config on the repo** (`crates/server/src/main.rs`), so it binds whatever process
-opens it. The one genuinely http-only setting is `http.receivepack`, which a
-direct `receive-pack` never consults.
+## git is smart HTTP, through git's own transport
 
-It is also *less* machinery than the HTTP path: no CGI environment, no
-stateless-rpc framing, no chunked response.
+`git-remote-caos` holds no pack protocol and no longer asks the server for a
+direct `upload-pack`. It listens on a loopback port, forwards every connection
+git's own HTTP helper makes to it over the ticket (one stream each, on one iroh
+connection), and runs `git remote-http` against that port with git's stdio. A
+`caos://` URL still makes git exec the helper (gitremote-helpers(7)), so nothing
+that uses a ticket as a remote changed.
 
-## Authentication is the token, not the endpoint id
+This replaced a listener that spawned `git upload-pack` / `git receive-pack`
+directly. That was not unsafe — every protection the server installs on the
+object database is git config on the repo — but it was a second way in, and it
+skipped what the HTTP path adds: `receive-pack`'s boundary validation, the
+refusal of shallow and encoded pushes (`crates/server/src/git.rs`). Going
+through HTTP means a push over a ticket is checked exactly like a push over
+`http://localhost`. git's own HTTP transport also negotiates protocol v2 and
+inflates what it compresses, so the helper has nothing to volunteer or decode.
 
-The ticket carries both. An endpoint id is **discoverable by design** — the
-listener publishes its addresses to DNS under it — so "knows the id" cannot be
-what authorizes driving a caos server, which runs containers and, per
-design/secrets.md, sees every secret. The token is a bearer capability checked
-before the listener reads anything else, and it is rotatable without changing
-the endpoint id, so revoking a leaked ticket does not invalidate everyone's
-remote URL.
+## Authentication is the ticket
 
-The client's own key is ephemeral: there is nothing to enroll, store, or lose. A
-node-id allowlist can be layered on later for clients that want stable
-identities; the token is what makes that optional rather than urgent.
+There is none beyond it. The endpoint id is a public key, and knowing it, with a
+relay or an address, is the whole credential, as with `dumbpipe`. An earlier
+version added a shared token to every stream, checked before anything else and
+rotatable without changing the id. It was dropped on purpose: it made the
+protocol ours alone, and a ticket is already something to keep private. Treat one
+as you would a password to the server, which runs containers and, per
+design/secrets.md, sees every secret. n0's discovery is not used, so an id is not
+published anywhere unless the ticket leaks. Old `caos://<ticket>.<token>` URLs
+still parse; the suffix is ignored.
+
+The client's own key is ephemeral: there is nothing to enroll, store, or lose.
 
 ## What actually went wrong, so it is not rediscovered
 
@@ -145,27 +147,12 @@ with the same shape: a small answer works, a real one hangs.
   paid per command. It is capped at 25 ms now, which is enough for the transmit
   in practice (the listener logs `closed by peer`, not a timeout).
 
-- **git speaks v0 to this helper, and that is git's choice.** The version
-  plumbing works — driven by hand with `GIT_PROTOCOL=version=2`, the server
-  answers a v2 capability advertisement — but git only offers v2 to a helper
-  advertising `stateless-connect`, which its own documentation calls
-  experimental and for internal use; a plain `connect` helper is spoken to in
-  v0, even under `-c protocol.version=2`. Which costs little here:
-  `uploadpack.hideRefs` already keeps `refs/caos/req/` and `refs/caos/res/` out
-  of **fetch** advertisements, so the one a fetch reads is small. The
-  advertisement that grows without bound is **receive-pack's**, where those refs
-  are deliberately visible so a client can negotiate against a server-side
-  result — and v2 never applied to push at all. So `stateless-connect` is worth
-  having eventually, but it is not on the path of the cost AGENTS.md warns about.
-
-  **And v2 turns out not to need `stateless-connect` at all.** git discovers the
-  version from the server's first pkt-line, so it copes with a server that
-  volunteers v2 even when told not to ask for it: with `-c protocol.version=0`
-  and the listener handed `version=2`, the trace shows `version 2` coming back,
-  `ls-refs` running, and the command succeeding. The helper could therefore ask
-  for v2 unconditionally. It does not, because the version is the client's to
-  choose — someone who set `protocol.version` meant it — but that is a decision,
-  not a limit, and it is the cheap way in if the advertisement ever does hurt.
+- **git over a ticket is git over HTTP now**, so the version question that used
+  to live here is git's own: its HTTP transport sends `Git-Protocol: version=2`,
+  the server forwards it to `http-backend` (`git.rs`), and `push.negotiate` has
+  the v2 `fetch --negotiate-only` it needs. The direct-spawn helper had to
+  volunteer v2 and could not be asked; that workaround, and the v0 advertisement
+  cost it was written around, are gone.
 
 - **A ticket with NO addresses never upgrades to a direct path, and that cost
   46x.** A relayed connection is supposed to become direct within a second, and
