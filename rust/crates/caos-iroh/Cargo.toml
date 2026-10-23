@@ -68,4 +68,5 @@ tokio = { version = "1", default-features = false, features = [
     "net",
     "process",
     "time",
+    "sync",
 ] }

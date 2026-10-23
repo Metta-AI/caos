@@ -140,12 +140,9 @@ ensure_iroh() {
   for addr in $advertise; do
     flags+=(--advertise "$addr")
   done
-  # --git-dir is the repo the dev stack's server uses (stack/serve:
-  # $CAOS_STACK_STATE/git, and stack-up's state is /caos-dev).
   "$inputs/bin/caos-iroh" serve \
     --state "$state" \
     --to 127.0.0.1:80 \
-    --git-dir /caos-dev/git \
     --relay "$relay" \
     "${flags[@]}" > "$RUN/logs/iroh.log" 2>&1 &
   echo $! > "$IROH_PID"
