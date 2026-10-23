@@ -70,3 +70,16 @@ inside the checkout.
   slash command** has no Hermes equivalent yet — picking up a conversation
   by its commit hash in a new Hermes session needs the same verb,
   wired as a Hermes slash command or just plain prompted instructions for now.
+
+## Running a gateway
+
+A Hermes gateway for a caos server is its own program, not part of `caosd`:
+
+```bash
+nix run github:Metta-AI/caos#hermes-gateway        # or `nix run .#hermes-gateway`
+```
+
+It talks to the server named by `CAOS_SERVER` (default `http://localhost:9090`,
+a `caosd up` stack), keeps its state under `CAOS_HERMES_STATE`, and prints an
+iroh ticket for a desktop to `dumbpipe connect-tcp` to. `gateway` is the
+script, and its header lists every variable.
