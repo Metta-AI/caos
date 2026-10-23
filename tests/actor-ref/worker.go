@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha1"
 	"fmt"
 	"io"
@@ -101,7 +102,15 @@ func main() {
 		// HASHED, because a salt is free text and a refname is not: the
 		// suggested `--test-salt=$(date --iso=s)` has colons, which git
 		// refuses as a "funny refname".
-		ref := fmt.Sprintf("refs/heads/actors/ref-%x-%d", sha1.Sum([]byte(salt)), os.Getpid())
+		//
+		// Not the pid: every worker container starts at about the same pid, and
+		// the server (and so the ref) outlives the job, so a rerun under the same
+		// salt, after a changed tree say, met its predecessor's ref. Random bytes
+		// make the name new on every execution.
+		nonce := make([]byte, 8)
+		_, err := rand.Read(nonce)
+		w.Must(err)
+		ref := fmt.Sprintf("refs/heads/actors/ref-%x-%x", sha1.Sum([]byte(salt)), nonce)
 
 		w.Step("mint two commits with caos put-commit (no push)")
 		c1 := commit("one", "1", "")
