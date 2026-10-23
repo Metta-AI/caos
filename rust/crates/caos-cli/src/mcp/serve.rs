@@ -78,6 +78,13 @@ pub fn serve(config: Config) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
+        // A notification (no `id`) is answered by nobody and means nothing to the
+        // server: `notifications/initialized` arrives right behind the handshake,
+        // and forwarding it would put a network round trip in front of the
+        // `tools/list` queued behind it.
+        if request_of(&line).is_none() {
+            continue;
+        }
         // The handshake and the list answer from constants, at once, with no
         // server: a harness gives `initialize` a few seconds and drops a tool
         // server slower than that without a word.
