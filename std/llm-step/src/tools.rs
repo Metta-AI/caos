@@ -1008,7 +1008,7 @@ pub fn resolve_object(
         // A path cannot name a commit in general, because `caos resolve` walks
         // THROUGH a code reference to the tree inside it. But the entry itself,
         // as stored, IS a commit, and a source tree is exactly a code
-        // reference: `imports/repo/main-2` names the commit that was imported.
+        // reference: `sources/repo/00-base-2` names the commit that was imported.
         // So a path is accepted when it names one, and nothing else.
         let not_a_commit = || {
             format!(
