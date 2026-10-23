@@ -20,8 +20,8 @@ env_requires:
     description: >
       Path to this distribution's own root (the directory containing
       scripts/caos-mcp-launch) -- distinct from CAOS_REPO below: a bundled
-      deployment (stack/serve under CAOS_STACK_HERMES=yes) installs from a
-      nix build product (.#caos-stack-inputs's hermes-profile output), not a
+      deployment (`nix run .#hermes-gateway`) installs from a
+      nix build product (integrations/hermes copied into the store), not a
       live caos checkout, so the two are different paths there. For a
       hand-run Desktop profile they're usually the same checkout's
       integrations/hermes subdirectory.
@@ -45,7 +45,7 @@ env_requires:
       Optional path to a pre-built caos binary. When set, skips CAOS_REPO
       and the nix build entirely -- useful for a dev build
       (rust/target/debug/caos-cli) without waiting on a release build, and
-      the only binary-resolution path a bundled (CAOS_STACK_HERMES) deploy
+      the only binary-resolution path a `hermes-gateway` deploy
       uses at all.
     required: false
   - name: CAOS_REPO
