@@ -2,62 +2,41 @@
 //! by hand.
 //!
 //! ```text
-//! caos-iroh serve --state <dir> --to <host:port> --relay <url> [--git-dir <dir>] [--port <n>]
+//! caos-iroh serve --state <dir> --to <host:port> --relay <url> [--port <n>]
 //! caos-iroh ticket --state <dir>
-//! caos-iroh pipe <service> <url>
+//! caos-iroh pipe <url>
 //! ```
 //!
 //! `serve` runs beside a caos server — as a member of the stack group, so it
-//! shares the server's lifetime and its log directory. Every stream it accepts
-//! is one request:
+//! shares the server's lifetime and its log directory. It speaks dumbpipe's
+//! protocol (see `caos_iroh`): every stream it accepts is a TCP connection to
+//! `--to`, the server's own HTTP port, so `/object`, `/run`, `/mcp` and git
+//! smart HTTP (`/info/refs`, `/git-upload-pack`, `/git-receive-pack`) all work
+//! unchanged, and the ticket it prints is one `dumbpipe connect-tcp` accepts.
 //!
-//! * `http` is spliced to `--to`, the server's own HTTP port, so `/object`,
-//!   `/run` and `/status` work unchanged.
-//! * `git-upload-pack` / `git-receive-pack` spawn that git service on
-//!   `--git-dir` directly.
-//!
-//! SPAWNING GIT DIRECTLY IS NOT A SHORTCUT PAST THE SERVER'S PROTECTIONS, and
-//! it's worth knowing why, because it looks like one. Everything the server
-//! asserts to keep this object database safe — `gc.auto=0`,
-//! `receive.autogc=false`, `maintenance.geometric-repack.enabled=false`,
-//! `uploadpack.allowFilter`, the hidden-ref configuration — is written as GIT
-//! CONFIG on the repo (`server/src/main.rs`), so it binds any process that opens
-//! it, not merely the `http-backend` the server happens to exec. The one
-//! genuinely http-only setting is `http.receivepack`, which a direct
-//! `receive-pack` never consults.
-//!
-//! `--state` holds three files, all 0600: `key`, the endpoint's identity, and
-//! `token`, the shared secret — both created on first use — plus the `ticket`
-//! this serving publishes. Persisting the first two is what makes a ticket
-//! durable: a new key or token would invalidate every remote URL already in
+//! `--state` holds `key`, the endpoint's identity (0600, created on first use),
+//! and the `ticket` this serving publishes. Persisting the key is what makes a
+//! ticket durable: a new one would invalidate every remote URL already in
 //! someone's `.git/config`.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use caos_iroh::{
-    load_or_create_secret, load_or_create_token, splice, Relay, Server, Service, Ticket, ALPN,
-    ONLINE_TIMEOUT, RELAY_ALPN,
-};
+use caos_iroh::{load_or_create_secret, splice, Server, Ticket, ALPN, ONLINE_TIMEOUT};
 use iroh::SecretKey;
 
 const USAGE: &str = "\
 usage:
   caos-iroh serve --state <dir> --to <host:port> --relay <url>
-                  [--git-dir <dir>] [--port <n>]
-                  [--advertise <host:port> ...]
-  caos-iroh relay --state <dir> --to <host:port> --relay <url>
                   [--port <n>] [--advertise <host:port> ...]
   caos-iroh ticket --state <dir>
-  caos-iroh pipe <service> <url>
-  caos-iroh relay-pipe <url>
+  caos-iroh pipe <url>
   caos-iroh probe <url> [seconds]
 
-  serve   answer caos:// streams: HTTP ones spliced to --to, git ones served
-          from --git-dir, on UDP --port (default 11204; a FIXED port is what
-          keeps the ticket stable). Writes the ticket to <dir>/ticket and
-          prints it.
+  serve   answer dumbpipe streams: each is a TCP connection to --to, on UDP
+          --port (default 11204; a FIXED port is what keeps the ticket stable).
+          Writes the ticket to <dir>/ticket and prints it.
           --relay is the relay clients reach this endpoint through, and is
           REQUIRED: n0's are never used, and a default would mint a ticket
           that looks right and reaches nothing. `http://<host>/` is fine
@@ -65,21 +44,11 @@ usage:
           --advertise REPLACES the addresses it finds for itself with ones it
           cannot discover — a published container port, say. Repeatable; it
           never removes the relays, so a client always has a way in.
-  relay   a SEPARATE, simpler endpoint: every stream opened against it is
-          spliced straight to --to, with no request line and no service to
-          name -- not `serve`'s protocol, a different ALPN entirely. For a
-          backend with its own real auth (a login page, say), where the
-          caos/git multiplexing protocol would be a second gate nobody asked
-          for. Same flags, own ticket, own state dir -- point --state
-          somewhere other than a `serve` on the same machine uses.
-  ticket  print the ticket, for handing to a client. Reads <dir>/ticket (works
-          for either `serve`'s or `relay`'s state dir).
+  ticket  print the ticket, for handing to a client.
   probe   report how a client reaches that server, once a second: a RELAY path
           costs a round trip to the relay on every request.
-  pipe    splice stdin/stdout to one `serve` stream (<service> is http,
-          git-upload-pack or git-receive-pack). What `ext::` remotes use.
-  relay-pipe  splice stdin/stdout to one `relay` stream. For testing a relay
-          ticket by hand.
+  pipe    splice stdin/stdout to one stream: a raw TCP connection to the
+          server's HTTP port, for asking it a question by hand.
 ";
 
 #[tokio::main]
@@ -94,7 +63,6 @@ async fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => serve(Options::parse(args)?).await,
-        Some("relay") => relay(Options::parse(args)?).await,
         Some("ticket") => ticket(Options::parse(args)?),
         Some("probe") => {
             let url = args.next().ok_or_else(|| USAGE.to_string())?;
@@ -107,13 +75,8 @@ async fn run() -> Result<(), String> {
             probe(&url, seconds).await
         }
         Some("pipe") => {
-            let service = args.next().ok_or_else(|| USAGE.to_string())?;
             let url = args.next().ok_or_else(|| USAGE.to_string())?;
-            pipe(&service, &url).await
-        }
-        Some("relay-pipe") => {
-            let url = args.next().ok_or_else(|| USAGE.to_string())?;
-            relay_pipe(&url).await
+            pipe(&url).await
         }
         _ => Err(USAGE.to_string()),
     }
@@ -129,7 +92,6 @@ struct Options {
     port: Option<u16>,
     state: Option<PathBuf>,
     to: Option<String>,
-    git_dir: Option<PathBuf>,
     /// The relay clients reach this endpoint through. Required for `serve`; see
     /// `caos_iroh::endpoint_builder` for why it has no default.
     relay: Option<iroh::RelayUrl>,
@@ -147,7 +109,6 @@ impl Options {
             match arg.as_str() {
                 "--state" => options.state = Some(value()?.into()),
                 "--to" => options.to = Some(value()?),
-                "--git-dir" => options.git_dir = Some(value()?.into()),
                 "--relay" => {
                     let raw = value()?;
                     let url = raw
@@ -194,12 +155,9 @@ impl Options {
         })
     }
 
-    /// The persisted identity and shared token, created on first use.
-    fn identity(&self) -> Result<(SecretKey, String), String> {
-        let state = self.state()?;
-        let key = load_or_create_secret(&state.join("key"))?;
-        let token = load_or_create_token(&state.join("token"))?;
-        Ok((key, token))
+    /// The persisted identity, created on first use.
+    fn identity(&self) -> Result<SecretKey, String> {
+        load_or_create_secret(&self.state()?.join("key"))
     }
 
     /// The UDP port to bind. `0` asks the kernel for a free one and gives up a
@@ -264,7 +222,6 @@ fn mint_ticket(
     options: &Options,
     endpoint: &iroh::Endpoint,
     relay: iroh::RelayUrl,
-    token: String,
 ) -> Result<(Ticket, Vec<String>, Vec<String>), String> {
     // THE RELAY GOES IN WHETHER OR NOT IT HAS BEEN REACHED — see `serve`'s own
     // comment for why `addr()` alone is not enough here.
@@ -293,27 +250,25 @@ fn mint_ticket(
     };
     let direct: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
     let relays: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
-    let ticket = Ticket { addr, token };
+    let ticket = Ticket { addr };
     // WRITTEN BEFORE THE FIRST ACCEPT, so whatever brought this process up can
-    // wait on the file and then hand the ticket out. 0600 like the token it
-    // contains.
+    // wait on the file and then hand the ticket out. 0600 like the key it
+    // names.
     let path = options.ticket_file()?;
     caos_iroh::write_private(&path, &format!("{}\n", ticket.to_url()), true)?;
     Ok((ticket, direct, relays))
 }
 
 async fn serve(options: Options) -> Result<(), String> {
-    let (key, token) = options.identity()?;
+    let key = options.identity()?;
     let server = Arc::new(Server {
         to: options
             .to
             .clone()
             .ok_or_else(|| format!("--to is required\n{USAGE}"))?,
-        git_dir: options.git_dir.clone(),
-        token: token.clone(),
     });
     let (endpoint, relay) = bind_endpoint(&options, key, ALPN).await?;
-    let (ticket, direct, relays) = mint_ticket(&options, &endpoint, relay, token)?;
+    let (ticket, direct, relays) = mint_ticket(&options, &endpoint, relay)?;
     // REPORTED FROM THE TICKET, not from the endpoint: with `--advertise` the
     // two differ, and the ticket's set is the one clients act on. An empty one
     // means every client is relayed wherever it sits — worth saying out loud,
@@ -325,10 +280,6 @@ async fn serve(options: Options) -> Result<(), String> {
         eprintln!("caos-iroh: ticket addresses: {}", direct.join(" "));
     }
     eprintln!("caos-iroh: relays: {}", relays.join(" "));
-    match &server.git_dir {
-        Some(dir) => eprintln!("caos-iroh: git services on {}", dir.display()),
-        None => eprintln!("caos-iroh: no --git-dir: git services will be refused"),
-    }
     let url = ticket.to_url();
     eprintln!("caos-iroh: ticket: {url}");
     eprintln!("caos-iroh: a client uses it as: git remote add caos {url}");
@@ -348,44 +299,6 @@ async fn serve(options: Options) -> Result<(), String> {
     // loud about. As a stack member this also takes the group down with a
     // reason, rather than exiting 0 and leaving `serve` to guess.
     Err("the iroh endpoint stopped accepting connections".to_string())
-}
-
-/// A relay endpoint: see [`caos_iroh::Relay`] for what it does and why it is
-/// deliberately not `serve`'s protocol.
-async fn relay(options: Options) -> Result<(), String> {
-    let (key, token) = options.identity()?;
-    let relay_server = Arc::new(Relay {
-        to: options
-            .to
-            .clone()
-            .ok_or_else(|| format!("--to is required\n{USAGE}"))?,
-        token: token.clone(),
-    });
-    let (endpoint, relay_url) = bind_endpoint(&options, key, RELAY_ALPN).await?;
-    let (ticket, direct, relays) = mint_ticket(&options, &endpoint, relay_url, token)?;
-    eprintln!(
-        "caos-iroh: relaying to {} as {}",
-        relay_server.to,
-        endpoint.addr().id
-    );
-    if direct.is_empty() {
-        eprintln!("caos-iroh: ticket has no direct addresses — every client will be relayed");
-    } else {
-        eprintln!("caos-iroh: ticket addresses: {}", direct.join(" "));
-    }
-    eprintln!("caos-iroh: relays: {}", relays.join(" "));
-    let url = ticket.to_url();
-    eprintln!("caos-iroh: ticket: {url}");
-
-    while let Some(incoming) = endpoint.accept().await {
-        let relay_server = relay_server.clone();
-        tokio::spawn(async move {
-            if let Err(error) = relay_server.accept(incoming).await {
-                eprintln!("caos-iroh: relay: connection: {error}");
-            }
-        });
-    }
-    Err("the iroh relay endpoint stopped accepting connections".to_string())
 }
 
 /// Print the ticket for handing to a client.
@@ -411,35 +324,23 @@ fn ticket(options: Options) -> Result<(), String> {
         }
         Err(_) => {}
     }
-    let (key, token) = options.identity()?;
+    let key = options.identity()?;
     let ticket = Ticket {
         addr: iroh::EndpointAddr::new(key.public()),
-        token,
     };
     println!("{}", ticket.to_url());
     Ok(())
 }
 
-/// Splice stdin/stdout to one `serve` stream. Two uses: `ext::` remotes
-/// (`url = "ext::caos-iroh pipe %s caos://<ticket>"`), and asking a server a
-/// question by hand with a request typed into stdin.
-async fn pipe(service: &str, url: &str) -> Result<(), String> {
-    let service = Service::parse(service)?;
+/// Splice stdin/stdout to one stream: a raw TCP connection to the server's HTTP
+/// port. For asking a server a question by hand with a request typed into stdin.
+async fn pipe(url: &str) -> Result<(), String> {
     let ticket = Ticket::parse(url)?;
     let client = caos_iroh::Client::connect(&ticket).await?;
-    let git_protocol = std::env::var("GIT_PROTOCOL").ok();
-    let (send, recv) = client.open(service, git_protocol.as_deref()).await?;
-    splice(send, recv, tokio::io::stdin(), tokio::io::stdout()).await
-}
-
-/// Splice stdin/stdout to one `relay` stream — `pipe`'s equivalent for a
-/// relay ticket, for testing one by hand.
-async fn relay_pipe(url: &str) -> Result<(), String> {
-    let ticket = Ticket::parse(url)?;
-    let client = caos_iroh::RelayClient::connect(&ticket).await?;
     let (send, recv) = client.open().await?;
     splice(send, recv, tokio::io::stdin(), tokio::io::stdout()).await
 }
+
 /// `probe <url> [seconds]` — how does this client reach that server, and does it
 /// get better?
 ///
@@ -459,7 +360,7 @@ async fn probe(url: &str, seconds: u64) -> Result<(), String> {
     while std::time::Instant::now() < deadline {
         // WITH TRAFFIC ON IT, because an idle connection proves nothing: a path
         // is upgraded while there is something to move.
-        match client.open(Service::Http, None).await {
+        match client.open().await {
             Ok((send, recv)) => {
                 let request = caos_iroh::http::encode_request("GET", "/", &[], None);
                 if let Err(error) = caos_iroh::http::exchange(send, recv, "GET", request).await {
