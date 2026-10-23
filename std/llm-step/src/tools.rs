@@ -73,7 +73,7 @@ const EDIT_HELP: &str = "Replace text in a conversation file or beneath a code r
 @param [replace-all] Replace every occurrence (default false).";
 
 const COPY_HELP: &str = "Copy a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. The copy is the entry itself: a source tree stays a source tree, with its history. Prefer this over cp via bash — it needs no `paths` declaration.
-@param from Conversation path to copy, such as imports/repo/base.
+@param from Conversation path to copy, such as sources/repo/00-base.
 @param to Conversation path of the copy, such as feature/01-change.";
 
 const MOVE_HELP: &str = "Move or rename a file or directory to a new conversation path, creating any missing parent directories. The destination must not exist. A source tree stays a source tree, with its history. Prefer this over mv via bash — it needs no `paths` declaration.
