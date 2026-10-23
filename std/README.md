@@ -93,12 +93,12 @@ different-looking ways (all of this is measured, with nothing in `paths`):
 
 All of them mean the same thing: add the path to `paths` and run it again. A
 directory in `paths` brings everything under it, source trees included, so
-`"paths": ["imports/repo/base"]` is enough for a recursive search of it.
+`"paths": ["sources/repo/00-base"]` is enough for a recursive search of it.
 
 ```
 run_tool(path="caos-std/bash-tool",
-         arguments={"cmd": "find imports/repo/base -name '*.md' | xargs wc -l",
-                    "paths": ["imports/repo/base"]})
+         arguments={"cmd": "find sources/repo/00-base -name '*.md' | xargs wc -l",
+                    "paths": ["sources/repo/00-base"]})
 ```
 
 - **New files and new directories need no `paths`.** `mkdir -p` the parent of
