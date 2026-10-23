@@ -1,5 +1,31 @@
 Read ./SPEC.md
 
+# Running the tests
+
+An agent session runs them with `caos-std/caos-test`, not `cargo test` (there is
+no shell). It compiles the tree it is given inside workers and runs the unit
+tests plus every `tests/<name>`:
+
+```
+run_tool(path="caos-std/caos-test",
+         arguments={"in": "sources/caos/<layer>", "only": "git-import"})
+```
+
+- `in` is the source tree you edited. Omitting it tests the tree the tool sits
+  in, which is not your change.
+- `only` takes bare `tests/` directory names, space-separated, no `tests/`
+  prefix. Use it while iterating; run the whole suite before you finish.
+- `test-salt=<fresh value>` re-runs cached tests. Use it for anything on a push
+  path (see below).
+- `caos-std/caos-test-result` with a hash from the report prints one test's
+  full output or an inner stack log; `caos-std/read-trace` prints timings.
+- `caos-std/caos-build` runs `nix build`, which the suite does not cover (see
+  "Before committing").
+- A test you add is an entry under `tests/<name>/`; see "Tests" below.
+
+Run these, and read the pitfalls under "Before committing", before reporting a
+change done. "I could not run the tests" means you did not read this section.
+
 # Shell, under `set -euo pipefail`
 
 Every script here runs with it, and two constructs quietly break under it.
