@@ -80,6 +80,10 @@ struct Config {
     /// its own, and no request or head to name. A call already declared under
     /// the id is not declared twice, so a retry runs it rather than failing.
     tool_call: Option<(String, Value)>,
+    /// With `tools_only`: a completed call whose text is longer than this many
+    /// characters is also saved in the conversation, and the run's result says
+    /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
+    max_result_chars: usize,
     /// Record a harness's event (a prompt, the end of a turn, a failure) on the
     /// conversation and stop: no model, no tool. See `record`.
     record: Option<record::Request>,
@@ -125,6 +129,13 @@ impl Config {
             (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
             (None, None) => None,
         };
+        let max_result_chars = match read_arg_opt("max-result-chars")? {
+            Some(text) => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("--max-result-chars is not a count: {text:?}"))?,
+            None => 0,
+        };
         let list_tools = read_arg_opt("list-tools")?.is_some();
         let record = record::Request::read()?;
         // None of those modes reaches the model, so none may DEMAND what a
@@ -145,6 +156,7 @@ impl Config {
             run_and_update_ref_image,
             tools_only,
             tool_call,
+            max_result_chars,
             record,
             list_tools,
             merge_refs: read_arg_opt("merge-refs")?,
@@ -444,7 +456,7 @@ fn resume(
         // Its result is the conversation as it now stands, not a terminal one.
         if let Some(call) = &cfg.tools_only {
             require_completed_call(state, request, call)?;
-            return forward_tool_result(state, request, call);
+            return forward_tool_result(cfg, state, request, call);
         }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
@@ -1165,8 +1177,13 @@ fn declare_requested_call(
 ///   for a failed one, its error; for a cancelled one, the reason.
 /// - `status`: `complete`, `failed` or `cancelled` -- which of those the
 ///   observation is.
+/// - `spilled`: present only when the call's text was longer than
+///   `--max-result-chars` and was saved in the conversation: the path, then the
+///   blob's hash, on two lines. `observation` is still the whole of it; deciding
+///   what a reader is shown instead is the caller's.
 /// - `conversation`: the conversation as it now stands.
 fn forward_tool_result(
+    cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
     call: &str,
@@ -1184,10 +1201,87 @@ fn forward_tool_result(
         None => return Err(format!("call {call} has no result to forward")),
     };
     drop(view);
-    forward_files(
-        state.head(),
-        &[("status", status.as_bytes()), ("observation", &observation)],
-    )
+    // Saved BEFORE the result is forwarded, so the `conversation` it carries is
+    // the one that holds the file.
+    let spilled = match status {
+        "complete" => spill_oversized(cfg, state, call, &observation),
+        _ => None,
+    };
+    let mut files: Vec<(&str, &[u8])> =
+        vec![("status", status.as_bytes()), ("observation", observation.as_slice())];
+    if let Some(spilled) = &spilled {
+        files.push(("spilled", spilled.as_bytes()));
+    }
+    forward_files(state.head(), &files)
+}
+
+/// Where a tools-only run keeps a result too long to hand back: one file per
+/// call at the conversation's root. Plain files there are inert to everything
+/// that walks the tree -- only code references (`Mode::Commit`) are source
+/// trees -- and `read` reaches them like any other path.
+const RESULTS_DIR: &str = "tool-results";
+
+/// Save a completed call's text in the conversation when it is longer than
+/// `--max-result-chars`, and say where: `"<path>\n<blob hash>"`.
+///
+/// Claude Code refuses an MCP result past its token limit and writes the whole
+/// of it to a file on ITS disk, which the model usually cannot open. A file in
+/// the conversation is part of the commit this call leaves, so it travels with
+/// the conversation (a push, a fork, a resume) and `read` can fetch it wherever
+/// the conversation can be read -- by path, or by blob hash as a bare `root`.
+///
+/// `None` when there is nothing to save, or saving failed: a failure here never
+/// costs the caller its result, which is then returned whole as before.
+fn spill_oversized(
+    cfg: &Config,
+    state: &mut progress::State,
+    call: &str,
+    observation: &[u8],
+) -> Option<String> {
+    if cfg.max_result_chars == 0 {
+        return None;
+    }
+    let text = observation_text(observation)?;
+    if text.chars().count() <= cfg.max_result_chars {
+        return None;
+    }
+    let path = format!("{RESULTS_DIR}/{}.txt", paths::admit_external_id(call));
+    let files = vec![(path.clone(), Some((Mode::Blob, text.into_bytes())))];
+    if let Err(error) = state.append(Transition::FilesApply { files }) {
+        eprintln!("llm-step: could not save the result of {call} in the conversation: {error}");
+        return None;
+    }
+    let blob = state
+        .conversation()
+        .and_then(|view| view.snapshot().entry(&path))
+        .ok()
+        .flatten()
+        .map(|entry| entry.oid.to_string())
+        .unwrap_or_default();
+    Some(format!("{path}\n{blob}"))
+}
+
+/// The text of a completed call's observation, as a reader of it is shown it:
+/// the `content` of the `tool_result` JSON, its text blocks joined, or the JSON
+/// itself when it is neither. This mirrors `caos mcp`'s `tool_outcome`, which
+/// this crate cannot call, so the two agree on what "the text" is.
+fn observation_text(observation: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(observation).ok()?;
+    let content = value.get("content").unwrap_or(&value);
+    if let Some(blocks) = content.as_array() {
+        let text: Vec<&str> = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect();
+        if !text.is_empty() {
+            return Some(text.join("\n"));
+        }
+    }
+    Some(match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content.to_string(),
+    })
 }
 
 /// The run's result: `files` and the conversation as it stands at `head`, under
@@ -3756,6 +3850,29 @@ mod tests {
     const CONVERSATION: &str = "conversation";
     const USER_ID: &str = "11111111111111111111111111111111";
     const ASSISTANT_ID: &str = "22222222222222222222222222222222";
+
+    /// `observation_text` must agree with `caos mcp`'s `tool_outcome`, which is
+    /// what a reader of the result is shown: the length the step compares to
+    /// `--max-result-chars` is the length of the text that reader gets.
+    #[test]
+    fn observation_text_is_what_a_reader_is_shown() {
+        let text = |value: Value| observation_text(value.to_string().as_bytes());
+        assert_eq!(
+            text(json!({"content": "plain", "is_error": false})).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            text(json!({"content": [
+                {"type": "text", "text": "one"},
+                {"type": "image", "source": "ignored"},
+                {"type": "text", "text": "two"},
+            ]}))
+            .as_deref(),
+            Some("one\ntwo")
+        );
+        assert_eq!(text(json!("bare")).as_deref(), Some("bare"));
+        assert_eq!(observation_text(b"not json"), None);
+    }
 
     struct Golden {
         store: MemoryStore,

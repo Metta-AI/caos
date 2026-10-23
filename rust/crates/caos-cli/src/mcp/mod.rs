@@ -73,6 +73,10 @@ pub struct Config {
     step: Option<String>,
     /// `--base:@@=<locator>`: the content a new conversation starts with.
     base: Option<String>,
+    /// `--max-result-chars=<n>`: how long a tool's text may be before it is
+    /// kept in the conversation and answered with a preview
+    /// ([`DEFAULT_MAX_RESULT_CHARS`] when absent; 0 for no limit).
+    max_result_chars: Option<usize>,
 }
 
 impl Config {
@@ -85,6 +89,10 @@ impl Config {
                 // Read by `secret_store::reader_keys`, before any command runs.
             } else if let Some(url) = argument.strip_prefix("--server=") {
                 config.server = Some(url.to_string());
+            } else if let Some(count) = argument.strip_prefix("--max-result-chars=") {
+                config.max_result_chars = Some(count.parse().map_err(|_| {
+                    format!("--max-result-chars must be a non-negative integer, not {count:?}")
+                })?);
             } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
                 config.base = Some(locator.to_string());
             } else if argument.starts_with("--base=") || argument.starts_with("--base:") {
@@ -105,6 +113,11 @@ impl Config {
         self.server
             .clone()
             .ok_or_else(|| "no caos server: pass --server=<url>".to_string())
+    }
+
+    /// How long a tool's text may be before it is spilled; 0 means no limit.
+    fn max_result_chars(&self) -> usize {
+        self.max_result_chars.unwrap_or(DEFAULT_MAX_RESULT_CHARS)
     }
 }
 
@@ -129,7 +142,10 @@ fn usage() -> String {
          Both take the server (--server=<url>) and name the step that \
          runs this session's tools:\n  \
          {}\n\
-         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.",
+         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.\n\
+         `serve` takes `--max-result-chars=<n>`: a tool result longer than that is kept in \
+         the conversation and answered with a preview (default {DEFAULT_MAX_RESULT_CHARS}; \
+         0 for no limit).",
         crate::missing_image_arg(LLM_STEP_ARG)
     )
 }
@@ -164,7 +180,12 @@ impl PreparedCall {
 /// The conversation already exists: the prompt hook runs before the model sees
 /// the prompt, so a tool call can only follow it. A call with no conversation is
 /// the step's to refuse, naming it.
-fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
+fn prepare_call(
+    config: &Config,
+    session: &str,
+    name: &str,
+    args: &Value,
+) -> Result<PreparedCall, String> {
     let conversation = conversation_id_for(session)?;
     let call = args
         .get("caos_tool_use_id")
@@ -178,6 +199,8 @@ fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall,
             ("tools-only", call),
             ("tool", name.to_string()),
             ("arguments", arguments),
+            // The step saves what is longer than this, and the answer says where.
+            ("max-result-chars", config.max_result_chars().to_string()),
         ],
     })
 }
@@ -197,16 +220,16 @@ fn run_tool(
     name: &str,
     args: &Value,
 ) -> Result<ToolOutcome, String> {
-    let call = prepare_call(session, name, args)?;
+    let call = prepare_call(config, session, name, args)?;
     let (kind, result) = run_step(config, &call.conversation, &call.params())?;
-    decode_result(&config.server()?, &kind, &result)
+    decode_result(config, &kind, &result)
 }
 
 /// Start a tool without waiting, and return the ticket to ask for it by. The same
 /// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
 /// what a client will wait for is not lost with its connection.
 fn start_tool(config: &Config, session: &str, name: &str, args: &Value) -> Result<String, String> {
-    let call = prepare_call(session, name, args)?;
+    let call = prepare_call(config, session, name, args)?;
     start_step(config, &call.conversation, &call.params())
 }
 
@@ -224,7 +247,7 @@ fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
                 .to_string(),
             is_error: false,
         },
-        caos::LineResult::Done { kind, hash } => decode_result(&server, &kind, &hash)?,
+        caos::LineResult::Done { kind, hash } => decode_result(config, &kind, &hash)?,
         caos::LineResult::Failed { status, message } => ToolOutcome {
             text: format!("the call failed ({status}): {message}"),
             is_error: true,
@@ -234,11 +257,15 @@ fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
 
 /// What a tools-only run answered, as the model reads it: the call's `status` and
 /// `observation`, which are the same bytes the conversation recorded.
-fn decode_result(server: &str, kind: &str, result: &str) -> Result<ToolOutcome, String> {
+///
+/// When the step also says it `spilled` the text into the conversation, the
+/// model is given a preview and where to read the rest instead of the whole of
+/// it: Claude Code would refuse the whole of it past its token limit.
+fn decode_result(config: &Config, kind: &str, result: &str) -> Result<ToolOutcome, String> {
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
     }
-    let files = caos::tree_blobs(&HttpTransport::new(server), result)?;
+    let files = caos::tree_blobs(&HttpTransport::new(&config.server()?), result)?;
     let part = |file: &str| {
         files
             .get(file)
@@ -246,7 +273,59 @@ fn decode_result(server: &str, kind: &str, result: &str) -> Result<ToolOutcome, 
     };
     let status = String::from_utf8_lossy(part("status")?).into_owned();
     let (is_error, text) = crate::tool_outcome(status.trim(), part("observation")?)?;
+    let text = match files.get("spilled") {
+        Some(spilled) => spill_notice(
+            &text,
+            config.max_result_chars(),
+            &String::from_utf8_lossy(spilled),
+        ),
+        None => text,
+    };
     Ok(ToolOutcome { text, is_error })
+}
+
+/// A tool's text longer than this many characters is kept in the conversation
+/// and answered with a preview. Claude Code refuses an MCP result past 25,000
+/// tokens, and what it does instead is write the whole thing to a file on ITS
+/// disk and tell the model to read that -- a path the model usually cannot open
+/// (a cloud session has no file tools to open it with). The limit sits well
+/// under that ceiling, because characters per token vary: dense output such as
+/// JSON or a trace tokenizes far worse than prose.
+const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
+
+/// How much of a spilled result the answer still carries, so the model can tell
+/// what it is before deciding how to page through it.
+const RESULT_PREVIEW_CHARS: usize = 2_000;
+
+/// What the model reads instead of a result the step saved in the conversation:
+/// the start of it, cut at a line, and how to get the rest. `spilled` is the
+/// step's own description of where it went: the path, then the blob's hash.
+///
+/// `read` takes either: `file-path` for the path, or the hash as a bare `root`
+/// with no `file-path`.
+fn spill_notice(text: &str, limit: usize, spilled: &str) -> String {
+    let (path, blob) = spilled.split_once('\n').unwrap_or((spilled, ""));
+    let (path, blob) = (path.trim(), blob.trim());
+    let keep = RESULT_PREVIEW_CHARS.min(limit);
+    let end = text
+        .char_indices()
+        .nth(keep)
+        .map_or(text.len(), |(index, _)| index);
+    let mut preview = &text[..end];
+    if let Some(newline) = preview.rfind('\n').filter(|&n| n > 0) {
+        preview = &preview[..newline];
+    }
+    let chars = text.chars().count();
+    let lines = text.lines().count();
+    let by_hash = match blob.is_empty() {
+        true => String::new(),
+        false => format!(", or `read` with root={blob} and no file-path"),
+    };
+    format!(
+        "{preview}\n\n[caos: this result is {chars} characters over {lines} lines, too long to \
+         return. The whole of it is saved in the conversation at {path}. Page through it with \
+         `read` (file-path={path}, offset, limit){by_hash}.]"
+    )
 }
 
 /// A request to run the step, ready to send: where, with what parameters, and
@@ -834,6 +913,49 @@ mod tests {
             );
             assert_eq!(refs::parse_head_ref(&refname).unwrap(), id);
         }
+    }
+
+    #[test]
+    fn the_notice_keeps_whole_lines_and_names_where_the_rest_is() {
+        let text = "alpha\nbeta\ngamma\ndelta\n".repeat(1_000);
+        let blob = "ab".repeat(20);
+        let spilled = format!("tool-results/toolu_1.txt\n{blob}");
+        let notice = spill_notice(&text, DEFAULT_MAX_RESULT_CHARS, &spilled);
+        let (preview, rest) = notice.split_once("\n\n[caos:").unwrap();
+        assert!(preview.chars().count() <= RESULT_PREVIEW_CHARS);
+        assert!(text.starts_with(preview));
+        assert!(text[preview.len()..].starts_with('\n'), "cut mid-line");
+        assert!(rest.contains("tool-results/toolu_1.txt"));
+        assert!(rest.contains(&format!("root={blob}")));
+        assert!(rest.contains("4000 lines"));
+    }
+
+    #[test]
+    fn the_preview_never_splits_a_character_or_outgrows_the_limit() {
+        let text = "é".repeat(500);
+        let notice = spill_notice(&text, 100, "tool-results/x.txt\n");
+        let (preview, rest) = notice.split_once("\n\n[caos:").unwrap();
+        assert_eq!(preview.chars().count(), 100);
+        assert!(!rest.contains("root="), "no hash was given");
+    }
+
+    #[test]
+    fn the_limit_is_an_argument_and_zero_means_none() {
+        let parse = |list: &[&str]| -> Result<Config, String> {
+            let given: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+            Config::parse(&given).map(|(config, _)| config)
+        };
+        assert_eq!(
+            parse(&["serve"]).unwrap().max_result_chars(),
+            DEFAULT_MAX_RESULT_CHARS
+        );
+        assert_eq!(
+            parse(&["serve", "--max-result-chars=0"])
+                .unwrap()
+                .max_result_chars(),
+            0
+        );
+        assert!(parse(&["serve", "--max-result-chars=lots"]).is_err());
     }
 
     #[test]
