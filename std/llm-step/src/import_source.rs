@@ -2,7 +2,7 @@
 use super::*;
 use std::process::Command;
 
-pub(super) const HELP: &str = "Import an HTTPS Git repository as a new, unchanged snapshot at an unused conversation path. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. Public repositories need no token. For origin/main, select the repository from the chosen source's .source.json provenance and request main; use an explicit repository when ambiguous. Local checkouts use the client's /import command.
+pub(super) const HELP: &str = "Import an HTTPS Git repository as a new, unchanged snapshot at an unused conversation path. Returns its full commit hash; preserves its tree and ancestor history. Does not merge or overwrite code. Import into sources/<repo>/00-base, the upstream tip the stack builds on: it is never edited, so `copy` it to sources/<repo>/99-dirty to work (see std/GIT.md). Public repositories need no token. For origin/main, select the repository from the chosen source's .source.json provenance and request main; use an explicit repository when ambiguous. Local checkouts use the client's /import command.
 @param source HTTPS repository URL, without credentials.
 @param [revision] Remote branch, full refs/... name, or full commit hash. Omit for the remote default branch. A new call observes the remote again.
 @param into Unused conversation path, such as imports/repo/main-2. Its .source.json sibling must also be free.";
