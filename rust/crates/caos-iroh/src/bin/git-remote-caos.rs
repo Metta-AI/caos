@@ -13,139 +13,127 @@
 //! keeps per-worktree state. Nothing is shared between two checkouts, so nothing
 //! can be fought over.
 //!
-//! Only the `connect` capability is advertised, and it is all that is needed:
-//! git asks us to connect to `git-upload-pack` or `git-receive-pack`, we answer
-//! with a blank line, and from then on our stdin/stdout ARE that service's. So
-//! there is no pack protocol in here at all — the server spawns the real service
-//! at the other end of the stream (see `caos-iroh serve`).
+//! WHAT THIS DOES IS LET GIT SPEAK HTTP. The server's git is smart HTTP at
+//! `/info/refs`, `/git-upload-pack` and `/git-receive-pack`, like everything else
+//! it serves, so this helper holds no pack protocol at all. It listens on a
+//! loopback port, forwards every connection git's own HTTP helper makes to it
+//! over the ticket (one stream each, on one iroh connection), and runs
+//! `git remote-http` against that port with git's stdio. git's HTTP transport
+//! negotiates protocol v2, inflates what it compresses and chunks what it
+//! streams, none of which is ours to reimplement.
+//!
+//! Over HTTP is also the route that carries the server's push checks (the
+//! boundary validation in `server/src/git.rs`), which a direct `receive-pack`
+//! on the object database never did.
 
-use std::io::{Read, Write};
+use std::process::Command;
+use std::sync::Arc;
 
-use caos_iroh::{splice, Client, Service, Ticket};
+use caos_iroh::{splice, Client, Ticket};
+use tokio::net::TcpListener;
+use tokio::sync::OnceCell;
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("git-remote-caos: {error}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("git-remote-caos: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<i32, String> {
     let mut args = std::env::args().skip(1);
-    // git passes <remote name> <url>. The name is ours to ignore; a remote
-    // configured with a URL and no name (`git fetch caos://…`) passes the URL
-    // for both.
-    let _remote = args.next();
-    let url = args
-        .next()
-        .ok_or("usage: git-remote-caos <remote> <caos://ticket> (git invokes this)")?;
+    // git passes <remote name> <url>. A remote configured with a URL and no name
+    // (`git fetch caos://…`) passes the URL for both.
+    let remote = args.next().ok_or(USAGE)?;
+    let url = args.next().ok_or(USAGE)?;
     let ticket = Ticket::parse(&url)?;
 
-    loop {
-        let command = read_command()?;
-        let command = command.trim_end();
-        // An empty line (or EOF) ends the conversation.
-        if command.is_empty() {
-            return Ok(());
-        }
-        match command.split_once(' ') {
-            Some(("connect", service)) => return connect(&ticket, service),
-            _ if command == "capabilities" => {
-                // `connect` alone: with a smart transport available there is
-                // nothing for `fetch`/`push`/`option` to add.
-                print!("connect\n\n");
-                std::io::stdout()
-                    .flush()
-                    .map_err(|e| format!("writing capabilities: {e}"))?;
-            }
-            _ => return Err(format!("unsupported command {command:?}")),
-        }
-    }
-}
-
-/// Read one command line from git WITHOUT reading ahead.
-///
-/// Byte at a time on purpose. `Stdin::read_line` fills an 8 KiB internal buffer,
-/// and the bytes past the line would be the spliced service's first bytes — git
-/// waits for our blank-line reply before sending them, so this is belt and
-/// braces, but losing them would present as a protocol error with no visible
-/// cause.
-fn read_command() -> Result<String, String> {
-    let stdin = std::io::stdin();
-    let mut handle = stdin.lock();
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match handle.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                line.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break;
-                }
-            }
-            Err(error) => return Err(format!("reading a command: {error}")),
-        }
-    }
-    String::from_utf8(line).map_err(|_| "command is not UTF-8".to_string())
-}
-
-/// Hand our stdio to the remote service.
-///
-/// The blank line is written only once the stream is open and the server has
-/// accepted it, so a bad ticket or a revoked token is reported as an error
-/// message here rather than as an unexplained hangup inside git's protocol.
-fn connect(ticket: &Ticket, service: &str) -> Result<(), String> {
-    let service = Service::parse(service)?;
-    // WE VOLUNTEER v2 FOR FETCHES, because git will not ask for it here and
-    // cannot be made to: `GIT_PROTOCOL` is unset in a helper's environment for
-    // `connect` at every client version (measured), and git offers a helper v2
-    // only through `stateless-connect` — "experimental; for internal use only".
-    //
-    // It works anyway, because the version is discovered from the service's
-    // FIRST PKT-LINE rather than requested: tell the listener `version=2` and
-    // the client reads `version 2` and switches. Measured safe for a client that
-    // asked for something else — `protocol.version` 0, 1, 2 and unset all
-    // negotiated v2 and returned correct refs.
-    //
-    // THE REASON IS `push.negotiate`, not the advertisement. An earlier version
-    // of this comment declined to volunteer v2 on the grounds that the gain was
-    // small because `uploadpack.hideRefs` already trims what a fetch advertises.
-    // That weighed the wrong thing. `push.negotiate` runs a `fetch
-    // --negotiate-only`, which EXISTS ONLY IN v2, and it is the only way this
-    // client can discover that the server already holds a commit's history when
-    // no ref points at it — which is the normal state here, since request refs
-    // are pruned after ten minutes. Without it a push falls back to excluding
-    // what the advertisement names, finds nothing, and re-sends the whole
-    // closure: measured 318 objects against 3 for one commit on top of history
-    // the server already had.
-    //
-    // Fetch only. `receive-pack` has no v2 at all, so a push stays v0 and the
-    // negotiation that precedes it is what this unlocks.
-    let git_protocol = match service {
-        Service::GitUploadPack => Some("version=2"),
-        Service::GitReceivePack | Service::Http => None,
-    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| format!("starting a runtime: {e}"))?;
-    runtime.block_on(async move {
-        let client = Client::connect(ticket).await?;
-        let (send, recv) = client.open(service, git_protocol).await?;
-        // Only now: the connection is up and the service is running.
-        {
-            let stdout = std::io::stdout();
-            let mut stdout = stdout.lock();
-            stdout
-                .write_all(b"\n")
-                .map_err(|e| format!("acknowledging connect: {e}"))?;
-            stdout
-                .flush()
-                .map_err(|e| format!("acknowledging connect: {e}"))?;
+
+    // Bound here, before the child exists, so the port it is told is already
+    // listening. The iroh connection is made when git first uses it, not now:
+    // `capabilities` and `list` do not need it to be up, and a bad ticket is
+    // then reported by git's own request failing with our message on stderr.
+    let listener = runtime
+        .block_on(TcpListener::bind("127.0.0.1:0"))
+        .map_err(|e| format!("listening on loopback: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("reading the loopback port: {e}"))?
+        .port();
+    runtime.spawn(forward(listener, ticket));
+
+    let mut command = git_remote_http();
+    command
+        .arg(&remote)
+        .arg(format!("http://127.0.0.1:{port}/"))
+        // A proxy variable must not capture a loopback connection.
+        .env("no_proxy", "127.0.0.1")
+        .env("NO_PROXY", "127.0.0.1");
+    let status = command
+        .status()
+        .map_err(|e| format!("running git remote-http: {e}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+const USAGE: &str = "usage: git-remote-caos <remote> <caos://ticket> (git invokes this)";
+
+/// The `git remote-http` to run. git sets `GIT_EXEC_PATH` for its helpers, which
+/// is where the sibling helper is; `git` on PATH is the fallback for a person
+/// running this by hand.
+fn git_remote_http() -> Command {
+    if let Some(dir) = std::env::var_os("GIT_EXEC_PATH") {
+        let path = std::path::Path::new(&dir).join("git-remote-http");
+        if path.exists() {
+            return Command::new(path);
         }
-        let result = splice(send, recv, tokio::io::stdin(), tokio::io::stdout()).await;
-        client.close().await;
-        result
-    })
+    }
+    let mut command = Command::new("git");
+    command.arg("remote-http");
+    command
+}
+
+/// Accept connections from git's HTTP helper and give each its own stream.
+async fn forward(listener: TcpListener, ticket: Ticket) {
+    let client: Arc<OnceCell<Client>> = Arc::new(OnceCell::new());
+    let ticket = Arc::new(ticket);
+    loop {
+        let (socket, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                eprintln!("git-remote-caos: accepting: {error}");
+                return;
+            }
+        };
+        let (client, ticket) = (client.clone(), ticket.clone());
+        tokio::spawn(async move {
+            // ONE connection for the life of this process, dialled by whichever
+            // request comes first; every other request is a stream on it.
+            let client = match client.get_or_try_init(|| Client::connect(&ticket)).await {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("git-remote-caos: {error}");
+                    return;
+                }
+            };
+            let (send, recv) = match client.open().await {
+                Ok(streams) => streams,
+                Err(error) => {
+                    eprintln!("git-remote-caos: {error}");
+                    return;
+                }
+            };
+            let (read, write) = socket.into_split();
+            if let Err(error) = splice(send, recv, read, write).await {
+                eprintln!("git-remote-caos: {error}");
+            }
+        });
+    }
 }

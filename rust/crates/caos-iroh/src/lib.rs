@@ -14,60 +14,34 @@
 //!
 //! # Shape
 //!
-//! One iroh connection carries every kind of traffic, one BI-STREAM per request,
-//! distinguished by a request line the opener writes first:
+//! **This is dumbpipe's protocol, and nothing else.** The listener answers the
+//! ALPN `DUMBPIPEV0`; an opener writes the five bytes `hello` on a fresh
+//! bi-stream and from then on the stream IS a TCP connection to the one port the
+//! listener was told to forward to (the caos server's HTTP port). There is no
+//! request line, no service to name and no reply. So a ticket from `caos-iroh
+//! serve` is a dumbpipe ticket: stock `dumbpipe connect-tcp`, `iroh-vhost` and
+//! anything else that speaks dumbpipe reach the server with it, and everything
+//! the server offers is a URL path — `/object`, `/run`, `/eval`, `/mcp`, and git
+//! smart HTTP at `/info/refs`, `/git-upload-pack` and `/git-receive-pack`.
 //!
-//! ```text
-//! caos1 <token> <service>[ <extra>]\n     ->   ok\n
-//!                                          |   err <message>\n
-//! ```
-//!
-//! The reply matters: a stream that fails to authenticate, or a git service the
-//! listener cannot spawn, says so in a line the client can print, instead of
-//! closing and leaving git to report "the remote end hung up unexpectedly".
-//!
-//! `<service>` is one of [`Service`]. For the git services `<extra>` carries a
-//! `GIT_PROTOCOL` value, which the listener puts back in the environment of the
-//! git it spawns — so the wire version is the client's to choose and it reaches
-//! the far end. Proven by hand: with `version=2` the server answers a v2
-//! capability advertisement (`000eversion 2`, `ls-refs=unborn`, …), without it a
-//! v0 ref advertisement.
-//!
-//! **In practice git asks for v0 here**, and that is git's choice, not a gap in
-//! this plumbing: it offers v2 to a remote helper only over
-//! `stateless-connect`, which its own documentation calls experimental and for
-//! internal use, and a helper advertising plain `connect` is spoken to in v0.
-//! (A listener told `version=2` anyway is understood — git discovers the version
-//! from the first pkt-line — so v2 is reachable without `stateless-connect`;
-//! `git-remote-caos` says why it does not do that.)
-//! Which costs little on this server — `uploadpack.hideRefs` already keeps
-//! `refs/caos/req/` and `refs/caos/res/` out of fetch advertisements
-//! (`server/src/main.rs`), so the advertisement a fetch reads is small. The
-//! advertisement that does grow without bound is receive-pack's, where those
-//! refs are deliberately visible, and v2 never applied to push at all.
-//!
-//! # Why a stream per request rather than a stream per connection
-//!
-//! Because the client is concurrent: `caos-cli`'s chat turn runs a long
-//! `GET /run` on one thread while the main thread polls status, so a transport
-//! that serialised onto a single stream would deadlock the poll behind the run.
-//! Streams are also what makes the object walk affordable — `checkout` asks for
-//! one object at a time by design, and each ask costs a stream, not a QUIC
-//! handshake.
+//! One thing is added to what dumbpipe does, and it is invisible to a stock
+//! client: the listener keeps a connection open and answers MANY streams on it.
+//! Stock `dumbpipe listen-tcp` serves one stream and closes, so every request
+//! there pays a QUIC handshake. A client of ours holds one connection and opens a
+//! stream per request — `caos-cli`'s chat turn runs a long `GET /run` on one
+//! thread while another polls status, and the object walk asks for one object
+//! at a time, so a stream must be cheap and independent.
 //!
 //! # Authentication
 //!
-//! The ticket is a bearer capability: it carries an endpoint id AND a token, and
-//! the listener refuses any stream whose token does not match. The token is what
-//! makes it a capability rather than obscurity — an endpoint id is discoverable
-//! by design (the listener publishes its addresses to DNS under it), so "knows
-//! the id" cannot be the thing that authorizes driving a server that runs
-//! containers and holds every secret. It also means a compromised ticket is
-//! revoked by rotating the token, with the endpoint id — and so everyone's
-//! remote URL — left alone.
+//! There is none beyond the ticket. The endpoint id is a public key, and
+//! knowing it (with a relay or an address) is the whole credential, exactly as
+//! with `dumbpipe`. An earlier version added a shared token to every stream; it
+//! was dropped, deliberately, because it made the protocol ours alone and a
+//! ticket is already something to keep private. Treat one as you would a
+//! password to the server: it runs containers and holds every secret.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,26 +56,18 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// The ALPN both ends name. Versioned: a future incompatible request line gets
-/// `caos/2` and an old listener refuses the connection outright, rather than
-/// failing halfway through a stream.
-pub const ALPN: &[u8] = b"caos/1";
+/// The ALPN dumbpipe names, which is what makes a ticket from here a dumbpipe
+/// ticket and a dumbpipe client a client of ours.
+pub const ALPN: &[u8] = b"DUMBPIPEV0";
+
+/// The five bytes dumbpipe's opener writes before anything else. A stream is
+/// invisible to the peer's `accept_bi` until it carries data, so this is what
+/// makes it appear at all.
+pub const HELLO: &[u8; 5] = b"hello";
 
 /// URL scheme of a caos ticket remote. Also the name git resolves the remote
 /// helper from: a `caos://` URL makes git exec `git-remote-caos` off PATH.
 pub const URL_SCHEME: &str = "caos://";
-
-/// First word of the request line, so a listener that somehow gets something
-/// else on this ALPN fails on the first line with a diagnosis.
-const REQUEST_MAGIC: &str = "caos1";
-
-/// Length of the shared auth token, in bytes (hex-encoded in the ticket).
-const TOKEN_BYTES: usize = 32;
-
-/// Cap on a request or reply line. Both are short; anything longer is a client
-/// talking a protocol we do not speak, and reading it unbounded would let one
-/// stream chew memory.
-const MAX_LINE: usize = 1024;
 
 /// How long to wait for the endpoint to learn its own addresses before minting a
 /// ticket. Exceeding it is not fatal — an id-only ticket still resolves through
@@ -189,8 +155,8 @@ pub fn relay_map(relay: &iroh::RelayUrl) -> Result<iroh_relay::RelayMap, String>
 /// with no default.
 ///
 /// A fallback here is worse than an error, because of the shape of the failure it
-/// produces: a ticket carrying an unreachable relay keeps its endpoint id and
-/// token, so it is indistinguishable from the ticket already in someone's
+/// produces: a ticket carrying an unreachable relay keeps its endpoint id, so it is
+/// indistinguishable from the ticket already in someone's
 /// environment, and every session against it fails a whole phase away with
 /// `connecting to <id>: timed out`. Which relay to use is a question only the
 /// operator can answer.
@@ -229,89 +195,34 @@ pub fn client_endpoint_builder(ticket: &Ticket) -> iroh::endpoint::Builder {
     }
 }
 
-/// What a stream asks the listener for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Service {
-    /// Splice to the caos server's HTTP port: `/object`, `/run`, `/status`, …
-    Http,
-    /// `git upload-pack` on the server's object database (a fetch).
-    GitUploadPack,
-    /// `git receive-pack` on the server's object database (a push).
-    GitReceivePack,
-}
-
-impl Service {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Service::Http => "http",
-            Service::GitUploadPack => "git-upload-pack",
-            Service::GitReceivePack => "git-receive-pack",
-        }
-    }
-
-    /// Parse a service name.
-    ///
-    /// BOTH SPELLINGS, because git uses both: a remote helper's `connect`
-    /// command names the service `git-upload-pack`, while `git-remote-ext`'s
-    /// `%s` expands to the bare `upload-pack`. Accepting one only works until
-    /// the other form arrives.
-    pub fn parse(name: &str) -> Result<Self, String> {
-        match name.strip_prefix("git-").unwrap_or(name) {
-            "http" => Ok(Service::Http),
-            "upload-pack" => Ok(Service::GitUploadPack),
-            "receive-pack" => Ok(Service::GitReceivePack),
-            _ => Err(format!("unknown service {name:?}")),
-        }
-    }
-
-    /// The `git` subcommand serving this, or None for [`Service::Http`].
-    pub fn git_subcommand(self) -> Option<&'static str> {
-        match self {
-            Service::Http => None,
-            Service::GitUploadPack => Some("upload-pack"),
-            Service::GitReceivePack => Some("receive-pack"),
-        }
-    }
-}
-
-/// Everything a client needs to reach one server: where the endpoint is, and the
-/// token proving it may.
+/// Everything a client needs to reach one server: where the endpoint is.
 #[derive(Debug, Clone)]
 pub struct Ticket {
     pub addr: EndpointAddr,
-    pub token: String,
 }
 
 impl Ticket {
-    /// The `caos://<endpoint ticket>.<token>` form that lives in a git remote's
-    /// URL. `.` is a safe separator: an iroh ticket's own encoding is base32, so
-    /// it contains no dot of its own.
+    /// The `caos://<endpoint ticket>` form that lives in a git remote's URL.
+    /// The part after the scheme is exactly the ticket `dumbpipe` prints.
     pub fn to_url(&self) -> String {
         let ticket = EndpointTicket::new(self.addr.clone());
-        format!("{URL_SCHEME}{ticket}.{}", self.token)
+        format!("{URL_SCHEME}{ticket}")
     }
 
     pub fn parse(url: &str) -> Result<Self, String> {
         let body = url
             .strip_prefix(URL_SCHEME)
             .ok_or_else(|| format!("not a caos URL (expected {URL_SCHEME}<ticket>): {url:?}"))?;
-        // From the RIGHT: the endpoint ticket is dot-free, the token is the last
-        // field, and splitting the other way would break the moment a future
-        // ticket encoding grows a separator.
-        let (ticket, token) = body.rsplit_once('.').ok_or_else(|| {
-            "caos URL has no token (expected caos://<ticket>.<token>)".to_string()
-        })?;
+        // A `.<token>` suffix is IGNORED rather than refused. Tickets minted
+        // before the token was dropped carry one (`caos://<ticket>.<hex>`), they
+        // sit in git remotes and cloud environments, and an iroh ticket's own
+        // encoding is base32, which has no dot.
+        let ticket = body.split_once('.').map_or(body, |(ticket, _)| ticket);
         let ticket: EndpointTicket = ticket
             .parse()
             .map_err(|e| format!("invalid endpoint ticket in caos URL: {e}"))?;
-        if hex_decode(token)?.len() != TOKEN_BYTES {
-            return Err(format!(
-                "caos URL token must be {TOKEN_BYTES} hex-encoded bytes"
-            ));
-        }
         Ok(Self {
             addr: ticket.endpoint_addr().clone(),
-            token: token.to_string(),
         })
     }
 }
@@ -327,12 +238,11 @@ pub struct Client {
     /// Held so the connection stays alive — dropping the endpoint closes it.
     endpoint: Endpoint,
     connection: Connection,
-    token: String,
 }
 
 impl Client {
     /// Dial the ticket's endpoint. The client's own key is EPHEMERAL: the
-    /// listener authenticates the token, not the caller's identity, so there is
+    /// listener does not authenticate the caller's identity, so there is
     /// no client key to store, lose, or have to enroll with a server.
     pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
         let endpoint = client_endpoint_builder(ticket)
@@ -376,7 +286,6 @@ impl Client {
         let client = Self {
             endpoint,
             connection,
-            token: ticket.token.clone(),
         };
         client.trace_path();
         Ok(client)
@@ -412,41 +321,24 @@ impl Client {
         }
     }
 
-    /// Open one stream and ask for `service`. Returns once the listener has
-    /// accepted it, so the caller can splice without a second handshake.
+    /// Open one stream to the server's HTTP port. Returns at once: the stream is
+    /// a TCP connection from here on, and the first thing on it is the caller's
+    /// request.
     ///
-    /// `extra` is the client's `GIT_PROTOCOL` for a git service, None otherwise.
-    pub async fn open(
-        &self,
-        service: Service,
-        extra: Option<&str>,
-    ) -> Result<(SendStream, RecvStream), String> {
-        let (mut send, mut recv) = self
+    /// The `hello` is dumbpipe's handshake and the only thing this adds. There
+    /// is no reply to wait for, so a server that cannot be reached shows up as a
+    /// stream that ends or a response that never comes — the listener answers a
+    /// backend it cannot dial with an HTTP 502 saying so.
+    pub async fn open(&self) -> Result<(SendStream, RecvStream), String> {
+        let (mut send, recv) = self
             .connection
             .open_bi()
             .await
             .map_err(|e| format!("opening a stream: {e}"))?;
-        let mut line = format!("{REQUEST_MAGIC} {} {}", self.token, service.as_str());
-        if let Some(extra) = extra {
-            // A newline here would forge a second request line; a space would
-            // split one field into two. Neither can appear in a GIT_PROTOCOL
-            // value, so refuse rather than sanitize.
-            if extra.contains('\n') || extra.contains(' ') {
-                return Err(format!("invalid request extra {extra:?}"));
-            }
-            line.push(' ');
-            line.push_str(extra);
-        }
-        line.push('\n');
-        send.write_all(line.as_bytes())
+        send.write_all(HELLO)
             .await
-            .map_err(|e| format!("writing the request line: {e}"))?;
-        let reply = read_line(&mut recv).await?;
-        match reply.strip_prefix("err ") {
-            Some(message) => Err(format!("{}: {message}", service.as_str())),
-            None if reply == "ok" => Ok((send, recv)),
-            None => Err(format!("unexpected reply from the server: {reply:?}")),
-        }
+            .map_err(|e| format!("writing the handshake: {e}"))?;
+        Ok((send, recv))
     }
 
     /// Tell the peer we are done, so it frees the connection now instead of
@@ -480,36 +372,12 @@ impl Client {
     }
 }
 
-/// Read one `\n`-terminated line, without buffering past it.
-///
-/// Byte at a time, deliberately: a `BufReader` would read ahead into bytes that
-/// belong to the spliced payload and drop them when it is discarded. The lines
-/// are under 200 bytes and the reads come out of the connection's own buffer.
-pub async fn read_line(recv: &mut RecvStream) -> Result<String, String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match recv.read_exact(&mut byte).await {
-            Ok(()) => {}
-            Err(e) if line.is_empty() => return Err(format!("reading a line: {e}")),
-            Err(e) => return Err(format!("reading a line (after {line:?}): {e}")),
-        }
-        if byte[0] == b'\n' {
-            return String::from_utf8(line).map_err(|_| "line is not UTF-8".to_string());
-        }
-        line.push(byte[0]);
-        if line.len() > MAX_LINE {
-            return Err(format!("line longer than {MAX_LINE} bytes"));
-        }
-    }
-}
-
 /// Copy in both directions until each side ends, then finish the stream.
 ///
-/// Each direction completes INDEPENDENTLY, which is the whole requirement: git's
-/// services half-close — `upload-pack` gets EOF on stdin while it is still
-/// writing a pack — so a splice that tore down both halves when either finished
-/// would truncate the pack. `try_join` also means an error in one direction
+/// Each direction completes INDEPENDENTLY, which is the whole requirement: a
+/// request that ends its body half-closes while the response is still
+/// coming — so a splice that tore down both halves when either finished
+/// would truncate it. `try_join` also means an error in one direction
 /// drops the other, which is the right answer for a broken connection.
 pub async fn splice(
     mut send: SendStream,
@@ -579,22 +447,6 @@ pub fn load_or_create_secret(path: &Path) -> Result<SecretKey, String> {
     Ok(key)
 }
 
-/// Read the hex-encoded auth token, creating one if the file is absent.
-pub fn load_or_create_token(path: &Path) -> Result<String, String> {
-    if let Some(text) = read_secret_file(path)? {
-        if hex_decode(&text)?.len() != TOKEN_BYTES {
-            return Err(format!(
-                "{}: token must be {TOKEN_BYTES} hex-encoded bytes",
-                path.display()
-            ));
-        }
-        return Ok(text);
-    }
-    let token = hex_encode(&random_bytes()?);
-    write_secret_file(path, &token)?;
-    Ok(token)
-}
-
 fn read_secret_file(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text.trim().to_string())),
@@ -609,15 +461,15 @@ fn write_secret_file(path: &Path, contents: &str) -> Result<(), String> {
 
 /// Write `contents` to a file only its owner can read.
 ///
-/// `replace` says what an existing file means: `false` for a key or token, where
+/// `replace` says what an existing file means: `false` for a key, where
 /// finding one is the normal case and overwriting it would invalidate every
 /// ticket already handed out; `true` for the published ticket, which is rewritten
 /// on every start.
 ///
 /// The replace path UNLINKS FIRST and creates anew, rather than truncating: the
 /// mode argument applies only when a file is created, so truncating an existing
-/// world-readable file would leave it world-readable — and this file contains the
-/// token, which is the capability itself.
+/// world-readable file would leave it world-readable — and a ticket file is the
+/// capability itself.
 pub fn write_private(path: &Path, contents: &str, replace: bool) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -682,184 +534,14 @@ pub fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Compare two tokens without leaking where they first differ.
-pub fn tokens_match(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
-/// The ALPN a [`Relay`] negotiates — deliberately NOT [`ALPN`]. A relay speaks
-/// no request line and dispatches no service; it is one endpoint wired to one
-/// backend. A client dialling the wrong ALPN by mistake fails the handshake
-/// instead of being misunderstood by a listener built for the other protocol.
-pub const RELAY_ALPN: &[u8] = b"caos-relay/1";
-
-/// A relay endpoint: every accepted stream is spliced straight to one local TCP
-/// backend, after one line proves the token.
-///
-/// DELIBERATELY NOT [`Server`]/[`Service`]: that protocol exists to multiplex
-/// caos, git and (once) hermes onto a single endpoint, and a client that wants
-/// only "the hermes gateway, nothing else" should not have to know that
-/// protocol exists at all — no magic string, no service name, no dispatch.
-/// One endpoint, one backend, one line.
-///
-/// The line is kept, not dropped, for the same reason [`Server`]'s is: a
-/// ticket is a bearer capability, and the token is what makes a compromised
-/// one revocable without reminting the endpoint's whole identity (see the
-/// module doc's Authentication section). Real auth for whatever is reached
-/// through it — login, identity — belongs to that backend, not to this relay.
-pub struct Relay {
-    /// `host:port` every accepted stream is spliced to.
-    pub to: String,
-    /// The token every stream must present, as the one line before the splice.
-    pub token: String,
-}
-
-impl Relay {
-    /// Answer one connection's streams until the peer closes it. Same shape as
-    /// [`Server::accept`] — see it for why each stream is spawned rather than
-    /// answered in sequence.
-    pub async fn accept(self: Arc<Self>, incoming: Incoming) -> Result<(), String> {
-        let connection = incoming
-            .accept()
-            .map_err(|e| format!("accepting: {e}"))?
-            .await
-            .map_err(|e| format!("completing the handshake: {e}"))?;
-        let remote = connection.remote_id().fmt_short();
-        eprintln!("caos-iroh: relay: connected {remote}");
-        loop {
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(pair) => pair,
-                Err(error) => {
-                    eprintln!("caos-iroh: relay: {remote} done: {error}");
-                    return Ok(());
-                }
-            };
-            let relay = self.clone();
-            tokio::spawn(async move {
-                if let Err(error) = relay.answer(send, recv).await {
-                    eprintln!("caos-iroh: relay: stream: {error}");
-                }
-            });
-        }
-    }
-
-    /// Read the one-line token, check it, and splice to `self.to`.
-    async fn answer(&self, mut send: SendStream, mut recv: RecvStream) -> Result<(), String> {
-        let presented = read_line(&mut recv).await?;
-        if !tokens_match(&presented, &self.token) {
-            return refuse(send, "unauthorized").await;
-        }
-        let stream = match TcpStream::connect(&self.to).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                return refuse(send, &format!("connecting to {}: {error}", self.to)).await
-            }
-        };
-        send.write_all(b"ok\n")
-            .await
-            .map_err(|e| format!("accepting the stream: {e}"))?;
-        let (read, write) = stream.into_split();
-        splice(send, recv, read, write).await
-    }
-}
-
-/// The client half of [`Relay`]: one QUIC connection, and a stream per request
-/// opened against it. No [`Service`] to name — a relay dispatches nothing.
-pub struct RelayClient {
-    /// Held so the connection stays alive — dropping the endpoint closes it.
-    endpoint: Endpoint,
-    connection: Connection,
-    token: String,
-}
-
-impl RelayClient {
-    /// Dial the ticket's endpoint over [`RELAY_ALPN`].
-    pub async fn connect(ticket: &Ticket) -> Result<Self, String> {
-        let endpoint = client_endpoint_builder(ticket)
-            .bind()
-            .await
-            .map_err(|e| format!("binding an iroh endpoint: {e}"))?;
-        Self::connect_on(endpoint, ticket).await
-    }
-
-    /// Dial on an endpoint the caller already has. See [`Client::connect_on`]
-    /// for why a test or a long-lived client wants this.
-    pub async fn connect_on(endpoint: Endpoint, ticket: &Ticket) -> Result<Self, String> {
-        let connection = endpoint
-            .connect(ticket.addr.clone(), RELAY_ALPN)
-            .await
-            .map_err(|e| format!("connecting to {}: {e}", ticket.addr.id.fmt_short()))?;
-        Ok(Self {
-            endpoint,
-            connection,
-            token: ticket.token.clone(),
-        })
-    }
-
-    /// Open one stream and present the token. Returns once the relay has
-    /// accepted it, so the caller can splice without a second handshake.
-    pub async fn open(&self) -> Result<(SendStream, RecvStream), String> {
-        let (mut send, mut recv) = self
-            .connection
-            .open_bi()
-            .await
-            .map_err(|e| format!("opening a stream: {e}"))?;
-        send.write_all(format!("{}\n", self.token).as_bytes())
-            .await
-            .map_err(|e| format!("writing the token: {e}"))?;
-        let reply = read_line(&mut recv).await?;
-        match reply.strip_prefix("err ") {
-            Some(message) => Err(message.to_string()),
-            None if reply == "ok" => Ok((send, recv)),
-            None => Err(format!("unexpected reply from the relay: {reply:?}")),
-        }
-    }
-
-    /// Tell the peer we are done. See [`Client::close`] for why this is
-    /// bounded rather than a full graceful close.
-    pub async fn close(self) {
-        self.connection.close(0u32.into(), b"done");
-        let _ = tokio::time::timeout(CLOSE_TIMEOUT, self.endpoint.close()).await;
-    }
-}
-
-/// Parse a request line into its service and extra. The magic and token are
-/// checked here too, so a listener has one place to reject a stream.
-pub fn parse_request(line: &str, token: &str) -> Result<(Service, Option<String>), String> {
-    let mut fields = line.split(' ');
-    let magic = fields.next().unwrap_or_default();
-    if magic != REQUEST_MAGIC {
-        return Err(format!("unexpected protocol {magic:?}"));
-    }
-    let presented = fields.next().ok_or("request line has no token")?;
-    if !tokens_match(presented, token) {
-        return Err("unauthorized".to_string());
-    }
-    let service = Service::parse(fields.next().ok_or("request line has no service")?)?;
-    let extra = fields.next().map(|e| e.to_string());
-    Ok((service, extra))
-}
-
 /// The serving half: what one accepted connection's streams are answered with.
 ///
 /// Held in an `Arc` and shared by every connection, because it is configuration
-/// and nothing else — the state a request touches is the object database git
-/// opens and the socket HTTP is spliced to.
+/// and nothing else.
 pub struct Server {
-    /// `host:port` of the caos server's own HTTP listener, for [`Service::Http`].
+    /// `host:port` of the caos server's own HTTP listener. Every stream is a TCP
+    /// connection to it.
     pub to: String,
-    /// The object database git services are served from. None refuses them,
-    /// which is a real placement: a listener in front of a server that has no
-    /// repo to offer.
-    pub git_dir: Option<PathBuf>,
-    /// The token every stream must present.
-    pub token: String,
 }
 
 impl Server {
@@ -868,6 +550,8 @@ impl Server {
     /// MANY STREAMS PER CONNECTION, each spawned: a client opens one per request
     /// and has more than one in flight (a long `GET /run` alongside a status
     /// poll), so answering them in sequence here would serialise the client.
+    /// This is the one thing beyond dumbpipe's own listener, which serves a
+    /// single stream and closes; a stock client sends one and loses nothing.
     pub async fn accept(self: Arc<Self>, incoming: Incoming) -> Result<(), String> {
         let connection = incoming
             .accept()
@@ -894,103 +578,37 @@ impl Server {
         }
     }
 
-    /// Read one request line, authenticate it, and answer it.
-    pub async fn answer(&self, send: SendStream, mut recv: RecvStream) -> Result<(), String> {
-        let line = read_line(&mut recv).await?;
-        let (service, extra) = match parse_request(&line, &self.token) {
-            Ok(request) => request,
-            Err(error) => return refuse(send, &error).await,
-        };
-        match (service.git_subcommand(), &self.git_dir) {
-            (None, _) => self.splice_to_http(send, recv).await,
-            (Some(subcommand), Some(git_dir)) => {
-                serve_git(send, recv, subcommand, git_dir, extra.as_deref()).await
-            }
-            (Some(_), None) => {
-                let error = format!("this server serves no git ({})", service.as_str());
-                refuse(send, &error).await
-            }
+    /// Read the handshake and splice the stream to the backend.
+    pub async fn answer(&self, mut send: SendStream, mut recv: RecvStream) -> Result<(), String> {
+        let mut hello = [0u8; 5];
+        recv.read_exact(&mut hello)
+            .await
+            .map_err(|e| format!("reading the handshake: {e}"))?;
+        if &hello != HELLO {
+            return Err(format!("unexpected handshake {hello:?}, not `hello`"));
         }
-    }
-
-    async fn splice_to_http(&self, mut send: SendStream, recv: RecvStream) -> Result<(), String> {
         let stream = match TcpStream::connect(&self.to).await {
             Ok(stream) => stream,
             Err(error) => {
-                return refuse(send, &format!("connecting to {}: {error}", self.to)).await
+                // The stream carries HTTP, so say so in HTTP: a client that
+                // reads a response sees the reason instead of a hangup.
+                let message = format!("caos-iroh: connecting to {}: {error}\n", self.to);
+                eprintln!("{message}");
+                let response = format!(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{message}",
+                    message.len()
+                );
+                let _ = send.write_all(response.as_bytes()).await;
+                let _ = send.finish();
+                return Ok(());
             }
         };
-        send.write_all(b"ok\n")
-            .await
-            .map_err(|e| format!("accepting the stream: {e}"))?;
         let (read, write) = stream.into_split();
         splice(send, recv, read, write).await
     }
 }
 
-/// Tell the client why, rather than closing the stream and leaving git to report
-/// that the remote hung up. Not an error for the listener: a refused stream is
-/// an answered stream.
-async fn refuse(mut send: SendStream, error: &str) -> Result<(), String> {
-    eprintln!("caos-iroh: refused: {error}");
-    let _ = send.write_all(format!("err {error}\n").as_bytes()).await;
-    let _ = send.finish();
-    Ok(())
-}
-
-/// Serve a fetch or a push by spawning git on the object database.
-///
-/// Straight to `git upload-pack` / `git receive-pack`, with no `http-backend` in
-/// front, and that is not a way past the protections the caos server installs on
-/// this repo. Every one of them — `gc.auto=0`, `receive.autogc=false`,
-/// `maintenance.geometric-repack.enabled=false`, `uploadpack.allowFilter`, the
-/// hidden refs — is GIT CONFIG on the repo itself, so it binds whoever opens it.
-/// The one setting that is http-only is `http.receivepack`, which a direct
-/// `receive-pack` never consults.
-async fn serve_git(
-    mut send: SendStream,
-    recv: RecvStream,
-    subcommand: &str,
-    git_dir: &Path,
-    git_protocol: Option<&str>,
-) -> Result<(), String> {
-    let mut command = tokio::process::Command::new("git");
-    command
-        .arg(subcommand)
-        .arg(git_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Inherited: git's diagnostics belong in this member's log, next to the
-        // line naming the stream they came from.
-        .stderr(Stdio::inherit());
-    // The wire version the client asked for, put back where git looks for it.
-    // REMOVED rather than left alone when the client asked for nothing: this
-    // process inherits the environment of whatever started the listener, and an
-    // ambient `GIT_PROTOCOL` there would make the service answer a version the
-    // client is not speaking.
-    match git_protocol {
-        Some(value) => command.env("GIT_PROTOCOL", value),
-        None => command.env_remove("GIT_PROTOCOL"),
-    };
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return refuse(send, &format!("spawning git {subcommand}: {error}")).await,
-    };
-    send.write_all(b"ok\n")
-        .await
-        .map_err(|e| format!("accepting the stream: {e}"))?;
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let result = splice(send, recv, stdout, stdin).await;
-    // Reap it either way; its exit status is git's own diagnosis of a failed
-    // fetch or push and belongs in the log.
-    match child.wait().await {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("caos-iroh: git {subcommand} exited {status}"),
-        Err(error) => eprintln!("caos-iroh: waiting for git {subcommand}: {error}"),
-    }
-    result
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,7 +617,6 @@ mod tests {
         let key = SecretKey::from_bytes(&[7u8; 32]);
         Ticket {
             addr: EndpointAddr::new(key.public()),
-            token: hex_encode(&[9u8; TOKEN_BYTES]),
         }
     }
 
@@ -1010,14 +627,24 @@ mod tests {
         assert!(is_caos_url(&url));
         let parsed = Ticket::parse(&url).expect("parses");
         assert_eq!(parsed.addr.id, ticket.addr.id);
-        assert_eq!(parsed.token, ticket.token);
     }
 
+    /// The part after `caos://` is the ticket dumbpipe prints, so one pasted from
+    /// either tool is the other's.
     #[test]
-    fn a_url_without_a_token_is_refused() {
-        let ticket = EndpointTicket::new(a_ticket().addr);
-        let error = Ticket::parse(&format!("{URL_SCHEME}{ticket}")).expect_err("no token");
-        assert!(error.contains("no token"), "{error}");
+    fn the_url_is_the_endpoint_ticket_and_nothing_else() {
+        let ticket = a_ticket();
+        let bare = EndpointTicket::new(ticket.addr.clone()).to_string();
+        assert_eq!(ticket.to_url(), format!("{URL_SCHEME}{bare}"));
+    }
+
+    /// Tickets minted while a token was part of the protocol are still in git
+    /// remotes and cloud environments.
+    #[test]
+    fn a_url_that_still_carries_a_token_still_parses() {
+        let ticket = a_ticket();
+        let old = format!("{}.{}", ticket.to_url(), "ab".repeat(32));
+        assert_eq!(Ticket::parse(&old).expect("parses").addr.id, ticket.addr.id);
     }
 
     #[test]
@@ -1028,20 +655,11 @@ mod tests {
         assert!(hex_decode("abc").is_err());
     }
 
+    /// dumbpipe's ALPN and handshake, byte for byte: they are what make a stock
+    /// client work.
     #[test]
-    fn a_request_line_carries_the_service_and_git_protocol() {
-        let token = hex_encode(&[1u8; TOKEN_BYTES]);
-        let line = format!("{REQUEST_MAGIC} {token} git-upload-pack version=2");
-        let (service, extra) = parse_request(&line, &token).expect("parses");
-        assert_eq!(service, Service::GitUploadPack);
-        assert_eq!(extra.as_deref(), Some("version=2"));
-    }
-
-    #[test]
-    fn a_bad_token_is_unauthorized_whatever_the_service() {
-        let token = hex_encode(&[1u8; TOKEN_BYTES]);
-        let line = format!("{REQUEST_MAGIC} {} http", hex_encode(&[2u8; TOKEN_BYTES]));
-        let error = parse_request(&line, &token).expect_err("refused");
-        assert_eq!(error, "unauthorized");
+    fn the_protocol_is_dumbpipes() {
+        assert_eq!(ALPN, b"DUMBPIPEV0");
+        assert_eq!(HELLO, b"hello");
     }
 }
