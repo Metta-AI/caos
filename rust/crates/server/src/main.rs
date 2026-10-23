@@ -53,6 +53,7 @@ mod git;
 mod grant_history;
 mod import;
 mod locator;
+mod mcp;
 mod push;
 mod remote_git;
 mod repair;
@@ -662,6 +663,12 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
     if git::is_git_path(&path) {
         return git::serve(&config, request);
     }
+    // MCP over HTTP (design: the caos tool server lives here, not in each
+    // harness's client). It sets its own status and content type, so like
+    // git it bypasses the `route` -> `from_data` path.
+    if path == "/mcp" {
+        return serve_mcp(&config, request);
+    }
     // The WORLD guard (design/test-stack-image.md): a caos client built for
     // the other world must not drive this stack. The dangerous crossing is
     // silent — a host client against the test stack passes until the tree
@@ -687,6 +694,44 @@ fn handle(config: Arc<Config>, mut request: Request) -> std::io::Result<()> {
             Response::from_string(format!("{}\n", err.message))
                 .with_status_code(tiny_http::StatusCode(err.status)),
         ),
+    }
+}
+
+/// `POST /mcp`: one JSON-RPC message in, its answer out (`202` with no body for
+/// a notification). What the caller is — which step, which secret readers — is
+/// in headers, because the endpoint keeps no connection state.
+fn serve_mcp(config: &Arc<Config>, mut request: Request) -> std::io::Result<()> {
+    let header = |request: &Request, name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    if *request.method() != Method::Post {
+        return request.respond(
+            Response::from_string("POST a JSON-RPC message\n").with_status_code(StatusCode(405)),
+        );
+    }
+    let caller = mcp::Caller {
+        step: header(&request, caos_world::secrets::STEP_HEADER).filter(|s| !s.trim().is_empty()),
+        readers: header(&request, caos_world::secrets::READERS_HEADER).unwrap_or_default(),
+    };
+    let mut body = String::new();
+    if let Err(error) = request.as_reader().read_to_string(&mut body) {
+        return request.respond(
+            Response::from_string(format!("reading request: {error}\n"))
+                .with_status_code(StatusCode(400)),
+        );
+    }
+    match mcp::handle(config, &caller, &body) {
+        Some(message) => request.respond(
+            Response::from_string(message.to_string()).with_header(
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .expect("a static header"),
+            ),
+        ),
+        None => request.respond(Response::empty(StatusCode(202))),
     }
 }
 

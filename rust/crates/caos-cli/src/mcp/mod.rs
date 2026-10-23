@@ -41,7 +41,6 @@ use std::io::Read;
 use serde_json::{json, Value};
 
 use caos::HttpTransport;
-use conversation_protocol::v3::git_store::GitStore;
 use conversation_protocol::v3::oid::Oid;
 use conversation_protocol::v3::refs;
 
@@ -134,121 +133,6 @@ fn usage() -> String {
     )
 }
 
-/// What one tool call answers with: the observation the transcript kept, and
-/// whether the tool itself failed. A failed tool is a RESULT, not an error --
-/// the model is meant to read it and react.
-struct ToolOutcome {
-    text: String,
-    is_error: bool,
-}
-
-/// A tool call, ready to send: the conversation it belongs to, and the
-/// parameters of the request that carries it.
-struct PreparedCall {
-    conversation: String,
-    params: Vec<(&'static str, String)>,
-}
-
-impl PreparedCall {
-    fn params(&self) -> Vec<(&str, &str)> {
-        self.params
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect()
-    }
-}
-
-/// Everything a tool call needs before it is sent: the conversation and the
-/// step's parameters.
-///
-/// The conversation already exists: the prompt hook runs before the model sees
-/// the prompt, so a tool call can only follow it. A call with no conversation is
-/// the step's to refuse, naming it.
-fn prepare_call(session: &str, name: &str, args: &Value) -> Result<PreparedCall, String> {
-    let conversation = conversation_id_for(session)?;
-    let call = args
-        .get("caos_tool_use_id")
-        .and_then(Value::as_str)
-        .unwrap_or(name)
-        .to_string();
-    let arguments = declared_args(args).to_string();
-    Ok(PreparedCall {
-        conversation,
-        params: vec![
-            ("tools-only", call),
-            ("tool", name.to_string()),
-            ("arguments", arguments),
-        ],
-    })
-}
-
-/// Run one tool and wait for what it said: one request to the server.
-///
-/// The request is `llm-step` in its tools-only mode, given the call -- its id,
-/// the tool and its arguments -- and the conversation it belongs to. The step
-/// declares the call on the conversation's active request, runs it, and answers
-/// with the call's record, so this process neither writes the conversation nor
-/// reads it back: it sends a call and receives what the tool said. `name` is the
-/// STEP's name for the tool (`run_tool`, `tool_help`, `eval_path`); the server
-/// presents them as `run`, `help` and `eval-path`.
-fn run_tool(
-    config: &Config,
-    session: &str,
-    name: &str,
-    args: &Value,
-) -> Result<ToolOutcome, String> {
-    let call = prepare_call(session, name, args)?;
-    let (kind, result) = run_step(config, &call.conversation, &call.params())?;
-    decode_result(&config.server()?, &kind, &result)
-}
-
-/// Start a tool without waiting, and return the ticket to ask for it by. The same
-/// call as [`run_tool`], begun with `POST /start/run`, so a tool that outlasts
-/// what a client will wait for is not lost with its connection.
-fn start_tool(config: &Config, session: &str, name: &str, args: &Value) -> Result<String, String> {
-    let call = prepare_call(session, name, args)?;
-    start_step(config, &call.conversation, &call.params())
-}
-
-/// The state of a started tool, from its ticket.
-fn tool_result(config: &Config, ticket: &str) -> Result<ToolOutcome, String> {
-    if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{ticket:?} is not a ticket; `start` returns one"));
-    }
-    let server = config.server()?;
-    wait_server_reachable(&server)?;
-    Ok(match caos::line_result(&server, ticket)? {
-        caos::LineResult::Pending => ToolOutcome {
-            text: "pending: the call has not finished. Ask for `result` again with this \
-                       ticket."
-                .to_string(),
-            is_error: false,
-        },
-        caos::LineResult::Done { kind, hash } => decode_result(&server, &kind, &hash)?,
-        caos::LineResult::Failed { status, message } => ToolOutcome {
-            text: format!("the call failed ({status}): {message}"),
-            is_error: true,
-        },
-    })
-}
-
-/// What a tools-only run answered, as the model reads it: the call's `status` and
-/// `observation`, which are the same bytes the conversation recorded.
-fn decode_result(server: &str, kind: &str, result: &str) -> Result<ToolOutcome, String> {
-    if kind != "tree" {
-        return Err(format!("the step answered a {kind}, not a tool result"));
-    }
-    let files = caos::tree_blobs(&HttpTransport::new(server), result)?;
-    let part = |file: &str| {
-        files
-            .get(file)
-            .ok_or_else(|| format!("the step's result {result} has no {file}"))
-    };
-    let status = String::from_utf8_lossy(part("status")?).into_owned();
-    let (is_error, text) = crate::tool_outcome(status.trim(), part("observation")?)?;
-    Ok(ToolOutcome { text, is_error })
-}
-
 /// A request to run the step, ready to send: where, with what parameters, and
 /// presenting which secrets.
 struct StepRequest {
@@ -316,13 +200,6 @@ fn run_step(
     caos::eval_line_request(&request.server, "run", &all, &request.secrets)
 }
 
-/// Start the step on a conversation without waiting: the ticket.
-fn start_step(config: &Config, id: &str, params: &[(&str, &str)]) -> Result<String, String> {
-    let request = step_request(config, id, params)?;
-    let all = request.params();
-    caos::start_line_request(&request.server, "run", &all, &request.secrets)
-}
-
 /// The step, resolved by the server from its locator.
 ///
 /// A path (`--llm-step:@=std/llm-step`) names a file in a checkout, and a
@@ -375,55 +252,6 @@ pub(super) fn wait_server_reachable(server: &str) -> Result<(), String> {
         attempt += 1;
     }
     last
-}
-
-/// A store that talks only to the server, for reading refs and forking: no
-/// checkout, a scratch object directory named for this process and removed
-/// when the store is dropped.
-struct ServerStore {
-    store: GitStore,
-    dir: std::path::PathBuf,
-}
-
-impl std::ops::Deref for ServerStore {
-    type Target = GitStore;
-    fn deref(&self) -> &GitStore {
-        &self.store
-    }
-}
-
-impl std::ops::DerefMut for ServerStore {
-    fn deref_mut(&mut self) -> &mut GitStore {
-        &mut self.store
-    }
-}
-
-impl Drop for ServerStore {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn server_store(server: &str) -> Result<ServerStore, String> {
-    let name = format!("caos-mcp-{}", std::process::id());
-    let store = GitStore::scratch(&name, server)?;
-    Ok(ServerStore {
-        store,
-        dir: std::path::PathBuf::from(format!("/tmp/{name}")),
-    })
-}
-
-/// The model's own arguments, without the values the hook injected: those are
-/// plumbing, and showing them in the transcript would misrepresent the call the
-/// model actually made.
-fn declared_args(args: &Value) -> Value {
-    let mut declared = args.clone();
-    if let Some(object) = declared.as_object_mut() {
-        object.remove("caos_session");
-        object.remove("caos_tool_use_id");
-        object.remove("caos_prompt_id");
-    }
-    declared
 }
 
 /// Dispatch one hook payload. An event we do not record is not an error: Claude
