@@ -13,8 +13,8 @@
 
     flake-utils.url = "github:numtide/flake-utils";
 
-    # The Hermes gateway bundled into a caos stack by stack/serve under
-    # CAOS_STACK_HERMES=yes (the default). Own nixpkgs, deliberately NOT
+    # The Hermes gateway `hermes-gateway` runs (integrations/hermes/gateway),
+    # separately from any caos stack. Own nixpkgs, deliberately NOT
     # `follows`'d to this flake's -- its pinning is its own project's
     # concern, and the two never share a build.
     hermes-agent.url = "github:NousResearch/hermes-agent";
@@ -51,24 +51,6 @@
         # Rust workspace on every commit, so a docs-only commit would rebuild
         # everything.
         caosRev = self.rev or self.dirtyRev or "unknown";
-
-        # The commit the bundled Hermes gateway pins --llm-step to
-        # (CAOS_STACK_HERMES_REV, stack/serve): its build product carries no
-        # .git for caos-mcp-launch to rev-parse itself, so this has to be
-        # baked in at the SAME point `caosRev` is -- the only place a git
-        # rev is available at all. `caosRev`'s own "unknown" fallback would
-        # be a fetchable-looking but bogus rev here, so this falls back to
-        # "" instead (stack/serve's resolver treats empty as absent and
-        # reports why, rather than trying to fetch literal commit "unknown").
-        # `dirtyRev`'s own "-dirty" suffix is cosmetic -- the sha underneath
-        # is still a real, potentially-fetchable commit -- so it is stripped
-        # rather than carried into a `rev=` that would otherwise read as
-        # "rev must be a full-length commit sha, got \"<sha>-dirty\"".
-        caosHermesRev =
-          let
-            r = self.rev or self.dirtyRev or "";
-          in
-          if r == "" then "" else nixpkgs.lib.removeSuffix "-dirty" r;
 
         # The Linux system whose binaries the Docker images carry. We build for
         # the host's architecture (no arch-cross), so on Linux this is just the
@@ -551,46 +533,10 @@
             # own, and flock(1) to serialise the copy that precedes it —
             # several containers seed one volume (see stack/bootstrap).
             linuxPkgs.util-linux
-            # Bridges the bundled Hermes gateway to a desktop client over iroh
-            # (stack/serve's CAOS_STACK_HERMES=yes block): `dumbpipe listen-tcp`
-            # splices to the gateway's own loopback-bound port, and the client
-            # side runs the SAME stock binary with `connect-tcp`. No caos-authored
-            # protocol here on purpose -- see design/iroh-transport.md's token
-            # rationale, which does not apply to a single-operator bridge with no
-            # other identity to protect: the gateway's own auth gate is off
-            # entirely (loopback bind), so the ticket IS the only credential,
-            # same security shape a caos-authored token would have added nothing
-            # over.
-            linuxPkgs.dumbpipe
             (if pkgs.stdenv.hostPlatform.isLinux then
               linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
             else
               linuxPkgs.docker-client)
-            # The bundled Hermes gateway (CAOS_STACK_HERMES=yes, the
-            # default) -- `minimal`, not `default`/`desktop`: this stack
-            # never opens a browser UI, it only ever serves the headless
-            # JSON-RPC/WebSocket backend a Desktop app attaches to remotely.
-            #
-            # `.override { extraDependencyGroups = [ "anthropic" ]; }`,
-            # NOT PLAIN `minimal`: hermes-agent's own provider SDKs (the
-            # `anthropic` PyPI package, for the Anthropic provider) are an
-            # opt-in dependency GROUP, absent from `minimal` by design —
-            # hermes-agent's own flake builds an `anthropic`-carrying
-            # `full`/`default` package for exactly this reason, with a
-            # comment that says why plainly: "lazy-install can't write to
-            # the read-only /nix/store". Confirmed the hard way: hermes's
-            # own lazy-install gate (`pm/client.py`'s `sync_venv`) refuses
-            # UNCONDITIONALLY — not fixable via `security.allow_lazy_installs`
-            # in config.yaml at all -- the moment it is not running from a
-            # venv IT manages, and a Nix-built interpreter never is one
-            # ("a Nix Python" is named explicitly in that function's own
-            # comment as one of the refused cases). `full` would also work
-            # but drags in azure/bedrock/daytona/matrix/tts-premium/etc. --
-            # nothing this stack has a use for -- so only the one group
-            # actually needed is named here, not the whole bundle.
-            (hermes-agent.packages.${linuxSystem}.minimal.override {
-              extraDependencyGroups = [ "anthropic" ];
-            })
         ];
         stackEnv = [
           "PATH=/bin"
@@ -737,9 +683,8 @@ sandbox = false''
             printf 'root:x:0:0:root:/root:/bin/bash\n' > etc/passwd
             printf 'root:x:0:\n' > etc/group
             # /usr/bin/env, for every `#!/usr/bin/env ...`-shebanged script
-            # this image runs that ISN'T caos's own -- the bundled Hermes
-            # gateway's own scripts (its `#!/usr/bin/env bash` MCP launcher)
-            # chiefly. Worker images get this for free from the
+            # this image runs that ISN'T caos's own. Worker images get this
+            # for free from the
             # `layer-additions/usr/bin/env` the flake-builder stacks on at
             # build-builtins.sh time (see AGENTS.md) -- but this image is
             # the one caosd runs DIRECTLY, with nothing stacked onto it, and
@@ -1023,22 +968,12 @@ sandbox = false''
         # `<inputs>/bin/<name>` exactly as it would in a plain build output. The
         # images keep their store basenames, which is how build-builtins maps
         # each back to its builtin (`*-caos-worker-<name>.tar.gz`).
-        #
-        # `hermes-profile` is `integrations/hermes/` (the Hermes profile
-        # distribution for the bundled gateway `stack/serve` optionally starts
-        # under CAOS_STACK_HERMES=yes) as a REAL build product, not a path into
-        # the source tree: `stack/serve` runs inside a container that has this
-        # `nix build` result and nothing else of the checkout, so the tree
-        # itself is not a thing to point at. `cp`, not a symlink -- a profile
-        # install may want to touch its own copy, and the store's is read-only.
         stackInputs =
           pname: bins:
           pkgs.runCommand pname { } ''
             mkdir -p $out/images
             ln -s ${bins}/bin $out/bin
             ${pkgs.lib.concatMapStringsSep "\n" (i: "ln -s ${i} $out/images/") builtinWorkerImages}
-            cp -r ${./integrations/hermes} $out/hermes-profile
-            chmod -R u+w $out/hermes-profile
           '';
 
         # The dev stack's control command. Subcommands:
@@ -1421,37 +1356,6 @@ sandbox = false''
               iroh_publish=()
               if [ "$IROH" = yes ]; then iroh_publish=(-p 11204:11204/udp); fi
 
-              # The bundled Hermes gateway's port, published WITHOUT a host-IP
-              # prefix (matching :9090 and $REGISTRY_PORT above) -- NOT
-              # loopback-only. `caosd up` itself usually runs inside a
-              # container (agent-sandbox, say): a host-side `127.0.0.1:…`
-              # bind is scoped to loopback ONE LEVEL UP (whatever netns the
-              # docker daemon answering this `docker run` lives in), so a
-              # request arriving at THAT container's own external interface
-              # from an outer port-forward -- exactly how "reach it from
-              # outside the sandbox" gets there -- does not match loopback
-              # and is refused. The SAME reasoning that put hermes itself on
-              # 0.0.0.0 instead of its own loopback, one layer further out.
-              # Independent of the iroh relay below
-              # (CAOS_STACK_IROH_HERMES_PORT). An ARRAY for the same reason as
-              # iroh_publish above: "no port" has to be no argument, not an
-              # empty one.
-              HERMES_PORT="''${CAOS_STACK_HERMES_PORT:-9119}"
-              hermes_publish=()
-              if [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                hermes_publish=(-p "$HERMES_PORT:$HERMES_PORT")
-              fi
-
-              # The hermes-only iroh relay's own UDP port (stack/serve,
-              # CAOS_STACK_IROH_HERMES_PORT, default 11205) -- a SEPARATE
-              # endpoint from the main caos-iroh one above, so its own port,
-              # published the same way for the same reason.
-              HERMES_IROH_PORT="''${CAOS_STACK_IROH_HERMES_PORT:-11205}"
-              hermes_iroh_publish=()
-              if [ "$IROH" = yes ] && [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                hermes_iroh_publish=(-p "$HERMES_IROH_PORT:$HERMES_IROH_PORT/udp")
-              fi
-
               # WHAT GOES IN THE TICKET: exactly what the operator names,
               # and nothing else.
               #
@@ -1549,7 +1453,7 @@ sandbox = false''
                 --network-alias caos-redis \
                 --cap-add SYS_ADMIN \
                 --security-opt apparmor=unconfined \
-                -p 9090:80 -p "$REGISTRY_PORT:5000" "''${iroh_publish[@]}" "''${hermes_publish[@]}" "''${hermes_iroh_publish[@]}" \
+                -p 9090:80 -p "$REGISTRY_PORT:5000" "''${iroh_publish[@]}" \
                 -v "$CAOS_DATA/stack:/state" \
                 -v caos-vol-mounted-nix:/mounted-nix \
                 -v /var/run/docker.sock:/var/run/docker.sock \
@@ -1572,13 +1476,6 @@ sandbox = false''
                 -e CAOS_STACK_IROH="$IROH" \
                 -e CAOS_STACK_IROH_ADVERTISE="$IROH_ADVERTISE" \
                 -e CAOS_IROH_RELAY="''${CAOS_IROH_RELAY:-}" \
-                -e CAOS_STACK_HERMES="''${CAOS_STACK_HERMES:-yes}" \
-                -e CAOS_STACK_HERMES_PORT="$HERMES_PORT" \
-                -e CAOS_STACK_HERMES_REV="${caosHermesRev}" \
-                -e CAOS_STACK_HERMES_OIDC_ISSUER="''${CAOS_STACK_HERMES_OIDC_ISSUER:-}" \
-                -e CAOS_STACK_HERMES_OIDC_CLIENT_ID="''${CAOS_STACK_HERMES_OIDC_CLIENT_ID:-}" \
-                -e CAOS_STACK_HERMES_OIDC_CLIENT_SECRET="''${CAOS_STACK_HERMES_OIDC_CLIENT_SECRET:-}" \
-                -e CAOS_STACK_IROH_HERMES_PORT="$HERMES_IROH_PORT" \
                 -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                 -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
                 -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
@@ -1678,15 +1575,6 @@ sandbox = false''
               fi
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
-              if [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                echo "==> hermes gateway bound to 127.0.0.1:$HERMES_PORT inside the container --" >&2
-                echo "    its own login is off (loopback bind); reach it over the iroh bridge:" >&2
-                echo "    ticket in \$CAOS_DATA/stack/iroh-hermes/ticket, then on the" >&2
-                echo "    desktop: dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>" >&2
-                echo "    Desktop's own Remote-gateway form still wants a Session token (its" >&2
-                echo "    Add-connection dialog always does, even when the backend needs none)" >&2
-                echo "    -- it's 'caos' (\$CAOS_DATA/stack/hermes-gateway-ws.secret) unless overridden" >&2
-              fi
               ;;
             down)
               echo "==> stopping stack (CAOS_DATA kept; 'caosd reset' wipes it)" >&2
@@ -1731,9 +1619,46 @@ sandbox = false''
             esac
           '';
         };
+
+        # `nix run .#hermes-gateway`: a Hermes gateway wired to a caos server,
+        # run on its own rather than inside `caosd` (integrations/hermes/gateway
+        # says how, and what it reads). Null where hermes-agent has no build
+        # for this system, so the outputs below simply omit it.
+        #
+        # The anthropic group is not optional: Hermes's own lazy-install
+        # refuses to write into a Nix-built interpreter, so the provider SDK has
+        # to be in the package. `full` would carry azure, bedrock, matrix and
+        # more that nothing here uses.
+        hermesGateway =
+          if hermes-agent.packages ? ${system} then
+            pkgs.writeShellApplication {
+              name = "hermes-gateway";
+              runtimeInputs = [
+                (hermes-agent.packages.${system}.minimal.override {
+                  extraDependencyGroups = [ "anthropic" ];
+                })
+                # The bridge to a desktop over iroh: `listen-tcp` here,
+                # `connect-tcp` on the client, both the stock binary.
+                pkgs.dumbpipe
+                # caos-mcp-launch's `git ls-remote`, and the script's own tools.
+                pkgs.gitMinimal
+                pkgs.coreutils
+                pkgs.gnugrep
+                pkgs.gnused
+                pkgs.gawk
+              ];
+              text = ''
+                export CAOS_HERMES_PROFILE=${./integrations/hermes}
+                export CAOS_HERMES_CLI=${caos-cli}/bin/caos-cli
+                export SSL_CERT_FILE=''${SSL_CERT_FILE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}
+                exec bash ${./integrations/hermes/gateway} "$@"
+              '';
+            }
+          else
+            null;
       in
       {
-        packages = {
+        packages = nixpkgs.lib.optionalAttrs (hermesGateway != null) { hermes-gateway = hermesGateway; } // {
           # The client a cloud container can actually exec, built for the
           # container's architecture rather than this machine's. `caosd up`
           # pushes it into caosd; see `clientForTarget`.
@@ -1806,7 +1731,13 @@ sandbox = false''
           caosImage = builderImage;
         };
 
-        apps = {
+        apps = nixpkgs.lib.optionalAttrs (hermesGateway != null) {
+          # A Hermes gateway for a caos server, on its own (not part of caosd).
+          hermes-gateway = {
+            type = "app";
+            program = "${hermesGateway}/bin/hermes-gateway";
+          };
+        } // {
           # Bring the whole stack up in the foreground (Ctrl-C tears it down).
           caosd = {
             type = "app";
