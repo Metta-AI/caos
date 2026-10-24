@@ -6,6 +6,13 @@
 pub const READERS_HEADER: &str = "X-Caos-Secret-Readers";
 /// The conversation a request is for, which `reader:@=` grants are scoped to.
 pub const CONVERSATION_HEADER: &str = "X-Caos-Conversation";
+/// The step that runs the tools of an MCP connection (`POST /mcp`): a git
+/// locator, or a bare 40-hex hash. A header because the endpoint is stateless
+/// and every message of a connection must say it.
+pub const STEP_HEADER: &str = "X-Caos-Step";
+/// How long a tool's text may be before the step keeps it in the conversation
+/// and the answer carries a preview (`POST /mcp`; absent means the default).
+pub const MAX_RESULT_CHARS_HEADER: &str = "X-Caos-Max-Result-Chars";
 
 /// The SecretReaderKey a push replaces the tree of.
 pub const PUSH_KEY_HEADER: &str = "X-Caos-Secret-Reader-Key";
