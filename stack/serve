@@ -23,6 +23,10 @@
 #   CAOS_STACK_LOGS    dir for <member>.log (required)
 #   CAOS_STACK_READY   file to touch once every member is serving (optional)
 #   CAOS_STACK_BIN     dir holding `server` and `runnerd` (required)
+#   CAOS_STACK_STORE_CHECK    "yes" to repack and verify the server's object
+#                             store before it serves (default no). Minutes on
+#                             a long-lived repo, so only `caosd` asks; a test
+#                             stack's store is new and is not checked.
 #   CAOS_STACK_REDIS_PORT     redis port (required)
 #   CAOS_STACK_REDIS_PERSIST  "yes" for an appendonly cache, "no" to keep it
 #                             in memory and lose it with the process
@@ -407,8 +411,15 @@ start server env \
   CAOS_REDIS_ADDR="$REDIS_ADDR" \
   CAOS_CACHE_NAMESPACE="${CAOS_CACHE_NAMESPACE:-}" \
   CAOS_PENDING_TIMEOUT_SECS="${CAOS_PENDING_TIMEOUT_SECS:-900}" \
+  CAOS_STORE_CHECK="${CAOS_STACK_STORE_CHECK:-no}" \
   "$CAOS_STACK_BIN/server"
 ok=""
+# The server does not listen until its store check is done, so a checking stack
+# waits up to an hour (0.1s steps) instead of 30s: at 30s the first start after
+# the repo grew past it died with "server never came up" and systemd retried
+# the same walk forever.
+server_wait_steps=300
+if [ "${CAOS_STACK_STORE_CHECK:-no}" = yes ]; then server_wait_steps=36000; fi
 # `git ls-remote`, NOT curl: this script also runs in the seed placement,
 # whose image is the BUILDER, and that flake has no curl — a curl probe here is
 # exit 127 on every attempt, so the loop runs out and every seed stack dies with
@@ -417,8 +428,11 @@ ok=""
 # The 0.1s step is still worth having, for the same reason as redis above: the
 # server answers in well under a second, and a 1s step meant a bring-up usually
 # paid most of a second for nothing.
-for _ in $(seq 1 300); do
+for _ in $(seq 1 "$server_wait_steps"); do
   if git ls-remote "$SERVER_URL" >/dev/null 2>&1; then ok=1; break; fi
+  # A server that has died will never answer; with the long wait above, that
+  # must not cost an hour to notice.
+  kill -0 "${pids[-1]}" 2>/dev/null || fail "server exited (see server.log)"
   sleep 0.1
 done
 [ -n "$ok" ] || fail "server never came up"
