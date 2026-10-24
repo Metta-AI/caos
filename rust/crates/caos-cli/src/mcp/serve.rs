@@ -312,7 +312,7 @@ fn diagnostics() -> String {
 
 /// Scrub anything a status must never surface.
 ///
-/// A `caos://` URL IS A CREDENTIAL — it ends in the token that authorizes
+/// A `caos://` URL IS A CREDENTIAL — the ticket is the whole of what authorizes
 /// driving that server (design/iroh-transport.md) — and this text is reported
 /// VERBATIM by a model, into a transcript that may be pasted anywhere. So a
 /// ticket is shown by its leading characters only: enough to tell two servers

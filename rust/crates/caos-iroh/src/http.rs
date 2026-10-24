@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 
-use crate::{Client, RecvStream, SendStream, Service, Ticket};
+use crate::{Client, RecvStream, SendStream, Ticket};
 
 /// A response, decoded far enough to hand back: everything after the header
 /// block, de-chunked.
@@ -103,13 +103,13 @@ impl HttpClient {
     /// written yet.
     async fn open(&self, url: &str) -> Result<(Arc<Client>, SendStream, RecvStream), String> {
         if let Some(client) = self.cached(url) {
-            if let Ok((send, recv)) = client.open(Service::Http, None).await {
+            if let Ok((send, recv)) = client.open().await {
                 return Ok((client, send, recv));
             }
         }
         let ticket = Ticket::parse(url)?;
         let client = Arc::new(Client::connect(&ticket).await?);
-        let (send, recv) = client.open(Service::Http, None).await?;
+        let (send, recv) = client.open().await?;
         self.connections
             .lock()
             .expect("connection map")
