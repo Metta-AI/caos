@@ -4739,6 +4739,56 @@ pub fn eval_line_request(
     )?)
 }
 
+/// Send one MCP JSON-RPC message to the server's `POST /mcp` and return its
+/// answer: `None` for a notification (the server answers `202` with no body).
+///
+/// This is all a client needs of MCP -- the protocol is the server's. `step`
+/// goes in `X-Caos-Step` (a git locator or a 40-hex hash) because the endpoint
+/// keeps no state between messages. No timeout: a `run` waits for its tool.
+pub fn mcp_post(
+    base: &str,
+    step: Option<&str>,
+    secrets: &Secrets,
+    max_result_chars: Option<usize>,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let mut headers = secrets.headers();
+    headers.push(("content-type", "application/json".to_string()));
+    if let Some(step) = step {
+        headers.push((caos_world::secrets::STEP_HEADER, step.to_string()));
+    }
+    if let Some(limit) = max_result_chars {
+        headers.push((
+            caos_world::secrets::MAX_RESULT_CHARS_HEADER,
+            limit.to_string(),
+        ));
+    }
+    let response = server_request(
+        base,
+        &ServerRequest {
+            method: "POST",
+            path: "/mcp",
+            headers: &headers,
+            body: Some(message.as_bytes()),
+            timeout_secs: None,
+        },
+    )?;
+    if response.status == 202 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "POST {base}/mcp: server returned {} {}: {}",
+            response.status,
+            response.reason,
+            String::from_utf8_lossy(&response.body).trim()
+        ));
+    }
+    String::from_utf8(response.body)
+        .map(Some)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))
+}
+
 /// Begin evaluating one line on the server without waiting: `POST /start/<verb>`,
 /// with `eval_line_request`'s parameters. Returns the TICKET, the name of the
 /// evaluation (the same call always has the same one); ask for its state with

@@ -8,6 +8,9 @@ edition = "2021"
 # about what world they are in — the same reason std/cargo/bake.nix is one
 # file with two consumers. No dependencies.
 
+[dependencies]
+serde_json = "1"
+
 [lib]
 name = "caos_world"
 path = "src/lib.rs"

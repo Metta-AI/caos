@@ -11,7 +11,7 @@ Two commands make that work:
 
 ```text
 caos mcp hook     record one Claude Code hook payload (JSON on stdin)
-caos mcp serve    the workspace tool server (JSON-RPC on stdio)
+caos mcp serve    a stdio bridge to the server's tool server (POST /mcp)
 ```
 
 Both are told, by argument, everything they need. **Neither reads a checkout.** A
@@ -31,6 +31,39 @@ names the commit. `--llm-step:hash=<oid>` also works, for a step the caller alre
 holds. The content locator names the commit's own tree, not what evaluating it
 produces (`raw=1`, added when absent), because content is code to read. A first
 prompt can name another with a leading `/caos-session-start-from <locator>` line.
+
+## Where the tool server lives
+
+**In the caos server, at `POST /mcp`** (`rust/crates/server/src/mcp.rs`). The
+handshake, the `instructions`, the constant `tools/list` and the decoding of a
+call's result are all there, so a harness adds no copy of them. One JSON-RPC
+message per request, answered in the body (`202` with no body for a
+notification), over MCP's streamable HTTP transport minus the optional event
+stream: nothing is pushed to a client.
+
+A request says who it is in headers, because the endpoint keeps nothing between
+messages:
+
+| header | |
+|---|---|
+| `X-Caos-Step` | the step that runs the tools: a git locator, or a bare 40-hex hash |
+| `X-Caos-Secret-Readers` | the reader keys, as on every other endpoint |
+
+The conversation is not a header. Each tool call names its session in the
+`caos_session` argument, which the harness's PreToolUse hook fills in, and the
+conversation id derives from it (`cc/<session>`).
+
+A harness that can reach the server by URL points its MCP config at `/mcp` and
+needs no caos binary. **One that can only reach it through `caos://`** (a cloud
+container dials out and listens for nothing, and `caos://` is a transport only
+our client speaks) runs `caos mcp serve`, which is now a bridge: a line on stdin
+goes to `/mcp`, the answer comes back as a line on stdout. The handshake and the
+tool list it answers itself, from the constants in `caos-world` that the server
+uses too, because a harness drops a tool server whose `initialize` is slow, and one
+that crossed an iroh relay from a cold container was. It adds two things the
+server cannot know: this container's diagnostics on `help()`, and a
+reason, in place of an error, when the server cannot be
+reached.
 
 ## What the model sees
 
