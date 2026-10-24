@@ -82,4 +82,5 @@ nix run github:Metta-AI/caos#hermes-gateway        # or `nix run .#hermes-gatewa
 It talks to the server named by `CAOS_SERVER` (default `http://localhost:9090`,
 a `caosd up` stack), keeps its state under `CAOS_HERMES_STATE`, and prints an
 iroh ticket and the exact `iroh-vhost` commands a desktop runs to reach it.
-`gateway` is the script, and its header lists every variable.
+`gateway` is the script, and its header lists every variable. `drive/` talks to a
+running one.
