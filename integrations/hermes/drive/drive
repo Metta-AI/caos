@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Drive a Hermes gateway: drive [--ticket T | --url U] [--token X] VERB ...
+# Verbs: send TEXT [--session ID] [--profile P], list, history ID. See README.md.
+set -euo pipefail
+
+# Needs python3 with websockets, dumbpipe and curl; fetch them if this shell has not.
+if [ -z "${HERMES_DRIVE_BOOTED:-}" ]; then
+  expr='let p = (builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem};
+        in p.symlinkJoin { name = "hermes-drive-env"; paths = [
+          (p.python3.withPackages (ps: [ ps.websockets ])) p.dumbpipe p.curl ]; }'
+  HERMES_DRIVE_BOOTED=1 exec nix shell --impure --expr "$expr" \
+    -c "${BASH_SOURCE[0]}" "$@"
+fi
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ticket=${HERMES_TICKET:-}
+url=${HERMES_URL:-}
+token=${HERMES_TOKEN:-caos}
+while [ $# -gt 0 ]; do
+  case $1 in
+    --ticket) ticket=$2; shift 2 ;;
+    --url) url=$2; shift 2 ;;
+    --token) token=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+if [ -z "$url" ] && [ -z "$ticket" ]; then
+  echo "drive: need --ticket (or HERMES_TICKET) or --url (or HERMES_URL)" >&2
+  exit 2
+fi
+
+if [ -z "$url" ]; then
+  port=$(( 20000 + RANDOM % 20000 ))
+  log=$(mktemp)
+  dumbpipe connect-tcp --addr "127.0.0.1:$port" "$ticket" >"$log" 2>&1 &
+  pipe=$!
+  trap 'kill "$pipe" 2>/dev/null || true; rm -f "$log"' EXIT
+  url=http://127.0.0.1:$port
+  # dumbpipe has no ready signal; the first request after bind is the probe.
+  up=
+  for _ in $(seq 1 60); do
+    if [ -n "$(curl -s -m 3 "$url/api/status" || true)" ]; then up=1; break; fi
+    sleep 1
+  done
+  if [ -z "$up" ]; then
+    echo "drive: gateway unreachable through ticket" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+fi
+
+exec python3 "$here/drive.py" --url "$url" --token "$token" "$@"
