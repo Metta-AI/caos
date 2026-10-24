@@ -68,9 +68,38 @@ await() { # <grep pattern> <seconds> ; prints the matching line
   return 1
 }
 
-echo "== the handshake and the list need nothing: no step, no server, no cache ==" >&2
-# A step that does not exist: nothing in a handshake or a listing may touch it.
+echo "== with no server, the handshake and the list still answer, and help says why ==" >&2
+# The handshake and the list are constants the bridge answers itself (caos-world's
+# mcp module): a harness gives `initialize` a few seconds and drops a tool server
+# slower than that from the session with no tools and no reason, and a handshake
+# that crossed an iroh relay from a cold container lost that race. Only a call
+# needs the server, and a call to a dead one must say so.
 open_server "--server=http://127.0.0.1:9 --llm-step:hash=0000000000000000000000000000000000000000"
+send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+init=$(await '"id":1' 10) || fail "the handshake did not answer without a server"
+for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
+  case "$init" in
+    *"$needle"*) ;;
+    *) fail "the handshake's instructions lack $needle: $init" ;;
+  esac
+done
+send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+listing=$(await '"id":2' 10) || fail "tools/list did not answer without a server"
+names=$(printf '%s' "$listing" | jq -r '.result.tools[].name' | tr '\n' ' ')
+[ "$names" = "run help start result eval-path " ] \
+  || fail "the list is not the five fixed tools, in order: $names"
+# `help` with no path is the one call that reports on caos itself, which is the
+# only diagnostic a locked-down session has.
+send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"help","arguments":{}}}'
+overview=$(await '"id":3' 20) || fail "help with no path did not answer"
+case "$overview" in
+  *DEGRADED*'--- caos diagnostics ---'*) ;;
+  *) fail "the degraded overview names no reason and carries no diagnostics: $overview" ;;
+esac
+close_server
+
+echo "== the real step: the same five tools, and none of the old registry ==" >&2
+open_server "$CAOS_MCP_ARGS"
 send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 init=$(await '"id":1' 10) || fail "the handshake did not answer"
 # The instructions are how the model learns what to do with five tools and no
@@ -81,9 +110,8 @@ for needle in 'instructions' 'help(path)' 'run(path' 'eval-path' 'caos-std'; do
     *) fail "the handshake's instructions lack $needle: $init" ;;
   esac
 done
-
-send '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-listing=$(await '"id":2' 10) || fail "tools/list did not answer without a step"
+send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
+listing=$(await '"id":9' 10) || fail "tools/list did not answer"
 names=$(printf '%s' "$listing" | jq -r '.result.tools[].name' | tr '\n' ' ')
 [ "$names" = "run help start result eval-path " ] \
   || fail "the list is not the five fixed tools, in order: $names"
@@ -91,24 +119,6 @@ names=$(printf '%s' "$listing" | jq -r '.result.tools[].name' | tr '\n' ' ')
 # would fail schema validation on a call the model made correctly.
 printf '%s' "$listing" | jq -e '[.result.tools[].inputSchema.properties | has("caos_session")] | all' >/dev/null \
   || fail "a tool does not declare the injected caos_session: $listing"
-
-# `help` with no path is the one call that needs no conversation: it reports on caos
-# itself, which is the only diagnostic a locked-down session has.
-send '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"help","arguments":{}}}'
-overview=$(await '"id":3' 20) || fail "help with no path did not answer"
-case "$overview" in
-  *'"isError":false'*'--- caos diagnostics ---'*) ;;
-  *'--- caos diagnostics ---'*'"isError":false'*) ;;
-  *) fail "the overview is not an answer with diagnostics: $overview" ;;
-esac
-close_server
-
-echo "== the real step: the same five tools, and none of the old registry ==" >&2
-open_server "$CAOS_MCP_ARGS"
-send '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-await '"id":1' 10 >/dev/null || fail "the handshake did not answer"
-send '{"jsonrpc":"2.0","id":9,"method":"tools/list"}'
-listing=$(await '"id":9' 10) || fail "tools/list did not answer"
 # NOTHING OF THE STEP'S REGISTRY IS LISTED. The file tools, the history tools, the
 # std tools and the step's own `run_tool`/`tool_help` are all reached by path through
 # `run` and `help`; a listing that named them would be a second way to call one thing,
@@ -340,7 +350,7 @@ send "$(jq -nc --arg session "$session" \
   '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"help",arguments:{caos_session:$session}}}')"
 status=$(await '"id":2' 30) || fail "help did not answer while the server was unreachable"
 case "$status" in
-  *"cannot reach the CAOS server"*) ;;
+  *DEGRADED*) ;;
   *) fail "an unreachable server was not named: $status" ;;
 esac
 # And a call that needs the server fails promptly, saying so, instead of waiting.
@@ -348,7 +358,7 @@ send "$(jq -nc --arg session "$session" \
   '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run",arguments:{caos_session:$session,caos_tool_use_id:"unreachable-1",path:"caos-std/read",arguments:{"file-path":"README.md"}}}}')"
 refused=$(await '"id":3' 120) || fail "a call did not fail promptly while the server was unreachable"
 case "$refused" in
-  *"cannot reach the CAOS server"*|*"no conversation"*|*"cannot open"*) ;;
+  *DEGRADED*) ;;
   *) fail "an unreachable server's call did not say why: $refused" ;;
 esac
 close_server
