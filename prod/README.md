@@ -77,6 +77,21 @@ The ticket is the one string a client needs, and it survives restarts:
 git remote add caos caos://<ticket>
 ```
 
+## Tuning redis memory
+
+Redis is capped at 2gb unless the machine says otherwise, and at the cap it
+evicts live results and blobs (`allkeys-lru`) rather than failing. Set the cap
+in a file on the box; no deploy is needed, only a restart:
+
+```sh
+echo 16gb | sudo -u caos tee /data/caos/redis-maxmemory
+sudo systemctl restart caosd
+```
+
+The file overrides the default for the `caosd` unit; delete it to go back to
+2gb. Check with `docker exec caos-stack redis-cli info memory` (`maxmemory_human`,
+`evicted_keys`).
+
 ## Migrating a machine that already ran caos by hand
 
 Wipe the stack state; do **not** chown it.
