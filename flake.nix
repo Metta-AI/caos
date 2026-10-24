@@ -1563,6 +1563,7 @@ sandbox = false''
                 -e CAOS_REGISTRY_HTTP=localhost:5000 \
                 -e CAOS_STACK_REDIS_PORT=6379 \
                 -e CAOS_STACK_REDIS_PERSIST=yes \
+                -e CAOS_STACK_STORE_CHECK=yes \
                 -e CAOS_STACK_REDIS_MAXMEM="''${CAOS_STACK_REDIS_MAXMEM:-}" \
                 -e CAOS_STACK_REGISTRY=yes \
                 -e CAOS_STACK_REDIS=yes \

@@ -319,13 +319,37 @@ fn main() {
         );
     }
 
-    // Older servers accepted individual commits without their dependencies.
-    // Check all objects, including unreferenced ones, before trusting existence
-    // as proof of closure. Never delete history to make an upgrade pass.
-    verify_object_closure(&git_dir).unwrap_or_else(|error| {
-        eprintln!("fatal: object store has incomplete history; restore the missing objects before restarting: {error}");
-        std::process::exit(1);
-    });
+    // Both steps below read every object in the store, which on a long-lived
+    // repo takes minutes: far too long to pay on every start, and a test stack
+    // has nothing to check. `caosd` opts in (CAOS_STACK_STORE_CHECK); no other
+    // placement does.
+    if env_or("CAOS_STORE_CHECK", "no") == "yes" {
+        // This is the coordinated downtime the pack-count TODO above asks for:
+        // loose objects make the walk below slow. --keep-unreachable preserves
+        // ALL CAS objects, including unreferenced ones; plain `-a -d` would
+        // drop them.
+        run_required_git(&[
+            "-C",
+            &git_dir,
+            "repack",
+            "-a",
+            "-d",
+            "--keep-unreachable",
+            "-q",
+        ])
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: repacking the object store: {error}");
+            std::process::exit(1);
+        });
+        // Older servers accepted individual commits without their
+        // dependencies. Check all objects, including unreferenced ones, before
+        // trusting existence as proof of closure. Never delete history to make
+        // an upgrade pass.
+        verify_object_closure(&git_dir).unwrap_or_else(|error| {
+            eprintln!("fatal: object store has incomplete history; restore the missing objects before restarting: {error}");
+            std::process::exit(1);
+        });
+    }
 
     let secrets_git = env_or("CAOS_SECRETS_GIT_DIR", &secret_store::default_dir(&git_dir));
     secret_store::init(&secrets_git).unwrap_or_else(|error| {
