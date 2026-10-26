@@ -29,6 +29,10 @@
 #                         under $CAOS_DATA/stack, so pointing this there carries
 #                         its sessions and saved keys over.
 #   CAOS_HERMES_PORT      the gateway's loopback port (default 9119)
+#   CAOS_HERMES_VHOST_PORT
+#                         the port the DESKTOP runs iroh-vhost on, printed into
+#                         both of the commands it is told to run (default 8080).
+#                         Not the gateway's port: on one machine they would collide.
 #   CAOS_HERMES_IROH_PORT the bridge's UDP port (default 11205)
 #   CAOS_HERMES_DEFAULT_TOOLS
 #                         yes|no, default yes. Whether the root `default`
@@ -48,6 +52,7 @@ server=${CAOS_SERVER:-http://localhost:9090}
 state=${CAOS_HERMES_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/caos-hermes}
 port=${CAOS_HERMES_PORT:-9119}
 iroh_port=${CAOS_HERMES_IROH_PORT:-11205}
+vhost_port=${CAOS_HERMES_VHOST_PORT:-8080}
 default_tools=${CAOS_HERMES_DEFAULT_TOOLS:-yes}
 
 hermes_home="$state/hermes"
@@ -201,10 +206,10 @@ echo "  ticket:  $ticket" >&2
   echo ""
   echo "  On the desktop, start the client side:"
   echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
-  echo "      --host 127.0.0.1:$port"
+  echo "      --port $vhost_port --host 127.0.0.1:$port"
   echo "  then give Remote gateway the URL this prints:"
   echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
-  echo "      url $ticket"
+  echo "      url --port $vhost_port $ticket"
   echo "  and the session token '$(cat "$ws_token")'."
   echo ""
 } >&2
