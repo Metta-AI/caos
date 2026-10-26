@@ -1,0 +1,3 @@
+# The per-directory worker tests/tree-map hands tree-map as its `run`: a bash
+# worker, run by tree-map, never on its own.
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh

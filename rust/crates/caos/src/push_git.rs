@@ -4,6 +4,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut token_file = None;
     let mut expected = None;
     let mut force = false;
+    let mut allow_ignored = false;
     for arg in args {
         if let Some(value) = arg.strip_prefix("--github-token-file=") {
             if token_file.replace(value).is_some() {
@@ -18,6 +19,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 return Err("duplicate force flag".into());
             }
             force = true;
+        } else if arg == "--allow-ignored" {
+            if allow_ignored {
+                return Err("duplicate allow-ignored flag".into());
+            }
+            allow_ignored = true;
         } else if arg.starts_with('-') {
             return Err("unknown push-git option".into());
         } else {
@@ -37,7 +43,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         _ => return Err("push-git requires --expected=<full hash|absent>".into()),
     };
     let commit = commit.to_ascii_lowercase();
-    let body = serde_json::json!({"destination":destination,"commit":commit,"branch":branch,"expected":expected,"force":force}).to_string();
+    let body = serde_json::json!({"destination":destination,"commit":commit,"branch":branch,"expected":expected,"force":force,"allow_ignored":allow_ignored}).to_string();
     // Everything that can fail locally happens before dispatch. Once a request
     // may have been sent, always return a receipt, even for an unreadable response.
     let (server, headers) = crate::import_git::prepare(destination, token_file)?;
@@ -65,7 +71,7 @@ fn receipt(
     let value: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
     let diagnostic = |code: &str| git_locator::publish::diagnostic(code).map(str::to_owned);
     if matches!(response.status, 400 | 422) {
-        let message = value["code"]
+        let mut message = value["code"]
             .as_str()
             .and_then(diagnostic)
             .unwrap_or_else(|| {
@@ -73,6 +79,9 @@ fn receipt(
                     .unwrap()
                     .into()
             });
+        if value["code"].as_str() == Some("ignored-files") {
+            message.push_str(&ignored_listing(&value));
+        }
         return json!({"commit":commit, "branch":branch, "status":"conflict",
             "observed":null, "kind":"validation-rejected", "diagnostic":message});
     }
@@ -100,6 +109,37 @@ fn receipt(
         "diagnostic":value["code"].as_str().and_then(diagnostic)})
 }
 
+/// The tracked paths an `ignored-files` rejection names, one per line. The
+/// server is trusted to list paths but not to format them: only strings are
+/// kept, control characters are dropped, and both the count and each path's
+/// length are bounded.
+fn ignored_listing(value: &serde_json::Value) -> String {
+    const SHOWN: usize = 100;
+    const WIDTH: usize = 300;
+    let Some(paths) = value["paths"].as_array() else {
+        return String::new();
+    };
+    let total = value["total"]
+        .as_u64()
+        .unwrap_or(paths.len() as u64)
+        .max(paths.len() as u64);
+    let mut text = format!("\nIgnored files ({total}):");
+    for path in paths.iter().filter_map(|p| p.as_str()).take(SHOWN) {
+        let path: String = path
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(WIDTH)
+            .collect();
+        text.push_str("\n  ");
+        text.push_str(&path);
+    }
+    let shown = paths.iter().filter(|p| p.is_string()).count().min(SHOWN);
+    if (shown as u64) < total {
+        text.push_str(&format!("\n  ... and {} more", total - shown as u64));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +162,18 @@ mod tests {
         );
         assert_eq!(r["kind"], "validation-rejected");
         assert!(r["diagnostic"].as_str().unwrap().contains("Import"));
+        let r = receipt(
+            &h,
+            "topic",
+            response(
+                422,
+                json!({"code":"ignored-files","total":3,"paths":["a.log","dir/b\u{1b}[31m.tmp"]})
+                    .to_string(),
+            ),
+        );
+        let text = r["diagnostic"].as_str().unwrap();
+        assert!(text.contains("Ignored files (3):\n  a.log\n  dir/b[31m.tmp\n  ... and 1 more"));
+        assert!(!text.contains('\u{1b}'));
         let r = receipt(&h, "topic", response(422, "sensitive proxy text".into()));
         assert!(!r.to_string().contains("sensitive"));
         for r in [

@@ -57,6 +57,10 @@ struct Node {
     name: String,
     requested: Option<i64>,
     started: Option<i64>,
+    /// The root request's start as absolute unix ms: what every other time is
+    /// relative to. Only the root carries it, and only a server new enough to
+    /// send it.
+    origin_ms: Option<i64>,
     children: Vec<Node>,
 }
 
@@ -71,11 +75,26 @@ impl Node {
             name: value["name"].as_str().unwrap_or("(unnamed)").to_string(),
             requested: value["requested"].as_i64(),
             started: value["started"].as_i64(),
+            origin_ms: value["origin_ms"].as_i64(),
             children: value["children"]
                 .as_array()
                 .map(|kids| kids.iter().filter_map(Node::parse).collect())
                 .unwrap_or_default(),
         })
+    }
+}
+
+impl Node {
+    /// The latest instant (ms on the server's relative timeline) any node in
+    /// this tree reports having been requested or started.
+    fn latest(&self) -> i64 {
+        self.children
+            .iter()
+            .map(Node::latest)
+            .chain(self.requested)
+            .chain(self.started)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -121,14 +140,7 @@ impl Watch {
                 // display is a courtesy; the run it is watching is the point,
                 // and a server too busy to answer /status is not a reason to
                 // start complaining into the middle of someone's output.
-                let Ok(Some(json)) = fetch(&server, &arg_tree) else {
-                    continue;
-                };
-                let Some(root) = serde_json::from_str::<serde_json::Value>(&json)
-                    .ok()
-                    .as_ref()
-                    .and_then(Node::parse)
-                else {
+                let Some(root) = fetch_root(&server, &arg_tree) else {
                     continue;
                 };
                 let mut lines = Vec::new();
@@ -156,6 +168,76 @@ impl Drop for Watch {
             let _ = thread.join();
         }
     }
+}
+
+/// Follow a run that is already going, until it has no current work: `watch
+/// <hash>`. The same tree `Watch` draws under a `run`, for a run started
+/// elsewhere — an agent's, a CI job's, or one whose `run` you did not stay on.
+///
+/// Unlike `Watch` this is the whole point of the command, so it is not gated on
+/// the terminal being a tty. On one it redraws in place; off one (a log) it
+/// appends a snapshot every few seconds, with no escapes.
+///
+/// The server reports times relative to the root request, and sends the root's
+/// absolute start (`origin_ms`) with them, so elapsed times count from the start
+/// of the root trace however late we attached. Against a server that predates
+/// `origin_ms` the origin is a lower bound instead: the latest moment any node
+/// reports, ticked forward on our clock, so elapsed times can read short.
+pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
+    let tty = std::io::stderr().is_terminal();
+    let interval = if tty {
+        POLL * 2
+    } else {
+        Duration::from_secs(5)
+    };
+    let mut drawn = 0usize;
+    let mut origin: Option<(u64, i64)> = None;
+    let mut seen = false;
+    loop {
+        let Some(root) = fetch_root(server, arg_tree) else {
+            if seen {
+                eprintln!("finished: no current work under {arg_tree}");
+            } else {
+                eprintln!(
+                    "no current work under {arg_tree} (finished, or not a run on this server); \
+                     `caos-cli status --all {arg_tree}` shows what happened"
+                );
+            }
+            return Ok(());
+        };
+        seen = true;
+        // The server tells us when the root request began, so every time
+        // counts from there however late we attached. Only a server that
+        // predates the field leaves us to estimate.
+        let now_rel_ms = match root.origin_ms {
+            Some(origin_ms) => (now_us() / 1_000) as i64 - origin_ms,
+            None => {
+                let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
+                at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64
+            }
+        };
+        let mut lines = Vec::new();
+        render(&root, 0, now_rel_ms, &mut lines);
+        if tty {
+            drawn = draw(drawn, &lines);
+        } else {
+            for line in lines.iter().take(max_lines()) {
+                eprintln!("{line}");
+            }
+            eprintln!();
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// The current work tree under `arg_tree`, or None when the server has none or
+/// it could not be read.
+fn fetch_root(server: &str, arg_tree: &str) -> Option<Node> {
+    let json = fetch(server, arg_tree).ok()??;
+    serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .as_ref()
+        .and_then(Node::parse)
 }
 
 /// `GET /status/<arg_tree>`, or None when the server has nothing to show.
@@ -285,8 +367,25 @@ mod tests {
             name: name.to_string(),
             requested,
             started,
+            origin_ms: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_roots_absolute_start_is_read_from_the_root() {
+        let json =
+            serde_json::json!({"name": "t", "requested": 0, "origin_ms": 1_700_000_000_000i64});
+        assert_eq!(
+            Node::parse(&json).unwrap().origin_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            Node::parse(&serde_json::json!({"name": "t"}))
+                .unwrap()
+                .origin_ms,
+            None
+        );
     }
 
     #[test]
@@ -363,6 +462,18 @@ mod tests {
         // so this asserts the arithmetic, which is what can be wrong.
         let drawn = draw(0, &lines);
         assert_eq!(drawn, max_lines() + 1, "the capped lines plus the summary");
+    }
+
+    #[test]
+    fn the_latest_moment_is_found_anywhere_in_the_tree() {
+        // A late `watch` anchors its clock here, so a deep, recent node must
+        // win over an older root.
+        let mut root = node("test", Some(0), Some(0));
+        let mut mid = node("mid", Some(10), Some(20));
+        mid.children.push(node("leaf", Some(500), None));
+        root.children.push(mid);
+        assert_eq!(root.latest(), 500);
+        assert_eq!(node("bare", None, None).latest(), 0);
     }
 
     #[test]

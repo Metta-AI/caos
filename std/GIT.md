@@ -90,6 +90,8 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
   as `sources/<repo>/00-base-2` (see "Updating the base").
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
+- The commits inside a branch do not matter, only its net diff: branches are
+  always merged by squashing (see "Publishing"). Publish the layer as it is.
 
 ## Starting a brand-new repository
 
@@ -236,8 +238,13 @@ rather than partly installed.
 ## Publishing
 
 The conversation history has many commits (agent turns, merges). Publishing
-that as it is works (`publish_source` takes any gitlink), but squashing first
-gives each layer one clean commit and linear history.
+that as it is works (`publish_source` takes any gitlink). **Branches are
+always merged by squashing**, so the commits on a branch never reach the
+trunk: only its net diff does, and the history inside a branch does not
+matter. Do not spend effort tidying it, and never re-publish a branch just to
+clean its commits. Squashing first is still the usual choice for a stack,
+because it gives each layer one clean commit and linear history, so a reviewer
+sees one diff per layer.
 
 ### 1. Squash (optional but usual for a stack)
 
@@ -291,8 +298,10 @@ publish_source(source_tree="publish/repo/02-tests", ...,
 - `publish_source` creates no PR and does not change the source gitlink.
 - It rejects any commit whose tree contains a path matched by the commit's own
   `.gitignore` rules, **including tracked files**. It never strips files or
-  rewrites commits. Remove the files or fix the rules, then publish again.
-  (Global excludes and `.git/info/exclude` do not apply, and only the
+  rewrites commits. The rejection lists the matching paths (the first 100, and
+  a count). Remove the files or fix the rules, then publish again; if the
+  source legitimately tracks them, pass `allow_ignored=true` to skip the check
+  for that call. (Global excludes and `.git/info/exclude` do not apply, and only the
   published snapshot is checked, not earlier commits.)
 - Resolve merge conflicts and clear `.caos/conflicts` first. The endpoint does
   not scan for the ledger or for inline markers.
@@ -435,7 +444,8 @@ reach usually means the grant is missing.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
 - Ignored scratch files can ride along in a source during work, and then block
-  `publish_source`. Clean them before publishing.
+  `publish_source`, which lists them. Clean them before publishing, or pass
+  `allow_ignored=true` if they belong in the branch.
 - `bash-tool` runs over a scratch copy: declare every existing path it reads
   in `paths`. Use `read`, `grep`, `copy`, `move` and `remove` for those jobs.
 - Subagents have no file tools. Do any reading of a saved large result

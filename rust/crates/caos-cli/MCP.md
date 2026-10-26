@@ -79,7 +79,7 @@ first, so `tools/list` is a constant and a client that reads it once, or ignores
 |---|---|
 | `help(path)` | what the tool at a path does and the arguments it takes. `help()` with no path says how caos is doing in this session: the conversation and its head commit, and diagnostics. |
 | `run(path, arguments)` | run the tool at a path and wait for its output. |
-| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. |
+| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. It is `run` without the wait: `run` starts the call and waits for its ticket, and the ticket is the one `caos-cli run` prints, so `caos-cli watch` takes it. |
 | `result(ticket)` | pending, or the output, or how it failed. Asking never runs anything. |
 | `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass the hash as `in` to `read`, `ls` or `grep` to look inside it. |
 
@@ -294,6 +294,13 @@ declared.
 The declaration lands a moment after the request reaches the server, not before
 it as it did when this process wrote it, so a `Stop` in that gap sees no call.
 Claude Code backgrounds a call only after 120s, long after the step has started.
+
+`start` is the exception, because it answers at once and the model may end its turn
+right behind the ticket. So the server first runs the step with `declare-only=1`
+(the same parameters, declaring the call on the active request and running nothing)
+and only then starts the job. The `Stop` that follows sees a declared call and holds
+the request open; the job finds its call already declared. A `start` with no open
+request fails in that call, not later in the ticket.
 
 Claude Code does not expose the model's round number and does not need to: the
 declaration opens a round, the call belongs to the round that declared it, and a

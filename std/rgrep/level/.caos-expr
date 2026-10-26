@@ -1,0 +1,3 @@
+# The grep of one directory's files, as a Go worker on std/go. Run by
+# ../.caos-expr's tree-map, never on its own.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go

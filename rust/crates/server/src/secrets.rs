@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use caos_eval::{EvalHost, Origin};
 use caos_world::secrets::Reader;
 
-use crate::compute::{fact_get, fact_set, list_append_many, list_read};
+use crate::compute::{fact_get, fact_set, list_append_many, list_read, set_add_many, set_read};
 use crate::secret_store::Stored;
 use crate::{Config, HttpError};
 
@@ -110,13 +110,38 @@ impl Context {
 /// Equal oids are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one —
 /// carries the origin of what it was copied from. In front of redis, and an
 /// entry here is everything redis holds for that oid.
-static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
+///
+/// A set: [`record_origins`] and `caos_eval::with_known` test membership per
+/// fact, and against a list of tens of thousands that scan was the server's
+/// CPU. Iteration order is arbitrary, as `SMEMBERS` order already was; nothing
+/// may depend on it (see the marker in [`index_subtrees`]).
+static KNOWN_ORIGINS: Mutex<Option<HashMap<String, HashSet<Origin>>>> = Mutex::new(None);
+
+/// Facts already sent to redis for an oid that memory does not hold, by a
+/// 64-bit hash of `(oid, origin)`, so a re-index of a tree whose origins grew
+/// does not send every old fact again (141M `SADD`s in four hours on
+/// caosd-prod, nearly all repeats). A collision skips one `SADD` and so
+/// withholds one origin, which can only deny a grant, never extend one.
+static SENT: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn fact_hash(oid: &str, origin: &Origin) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    oid.hash(&mut hasher);
+    origin.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Bounds the in-memory maps; forgetting only means a later redis read.
 const MEMORY_CAP: usize = 1_000_000;
 
+// A redis SET, with a `v2` prefix. The first version was a list that took a
+// line per re-record and grew to tens of millions of entries per key, whose
+// load then dominated the server's CPU. Its keys are not read; the `indexed`
+// markers moved with it, since a marker over an empty set would claim work that
+// was never done.
 fn origins_key(oid: &str) -> String {
-    format!("caos:secrets:origins:{oid}")
+    format!("caos:secrets:origins2:{oid}")
 }
 
 fn encode_origin(origin: &Origin) -> String {
@@ -137,11 +162,11 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|map| map.get(oid).cloned())
+        .and_then(|map| map.get(oid))
     {
-        return hit;
+        return hit.iter().cloned().collect();
     }
-    let loaded: Vec<Origin> = list_read(&config.redis_addr, &origins_key(oid))
+    let loaded: Vec<Origin> = set_read(&config.redis_addr, &origins_key(oid))
         .unwrap_or_else(|e| {
             eprintln!("secrets: reading the origins of {oid}: {e}");
             Vec::new()
@@ -155,33 +180,35 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         map.clear();
     }
     let entry = map.entry(oid.to_string()).or_default();
-    for origin in loaded {
-        if !entry.contains(&origin) {
-            entry.push(origin);
-        }
-    }
-    entry.clone()
+    entry.extend(loaded);
+    entry.iter().cloned().collect()
 }
 
 /// Record each `(oid, origin)`, in redis and in memory where memory already
 /// holds that oid. An oid it does not hold is left for [`origins_of`] to load
-/// whole, so a repeat in redis costs nothing but a duplicate line.
+/// whole, so a repeat in redis is a no-op (it is a set); [`SENT`] keeps most
+/// repeats from being sent at all.
 fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
     let mut new = Vec::new();
     {
         let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
+        let mut sent_guard = SENT.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = sent_guard.get_or_insert_with(HashSet::new);
+        if sent.len() >= MEMORY_CAP {
+            sent.clear();
+        }
         for (oid, origin) in facts {
-            if let Some(known) = map.get_mut(&oid) {
-                if known.contains(&origin) {
-                    continue;
-                }
-                known.push(origin.clone());
+            let fresh = match map.get_mut(&oid) {
+                Some(known) => known.insert(origin.clone()),
+                None => sent.insert(fact_hash(&oid, &origin)),
+            };
+            if fresh {
+                new.push((origins_key(&oid), encode_origin(&origin)));
             }
-            new.push((origins_key(&oid), encode_origin(&origin)));
         }
     }
-    if let Err(e) = list_append_many(&config.redis_addr, &new) {
+    if let Err(e) = set_add_many(&config.redis_addr, &new) {
         eprintln!("secrets: recording {} origin(s): {e}", new.len());
     }
 }
@@ -193,12 +220,16 @@ static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
-    let mut marker = format!("caos:secrets:indexed:{tree}");
-    for origin in origins {
+    let mut marker = format!("caos:secrets:indexed2:{tree}");
+    // Sorted: `origins` comes out of a set, so its order is arbitrary, and a
+    // marker that depended on it would miss for the same origins.
+    let mut encoded: Vec<String> = origins.iter().map(encode_origin).collect();
+    encoded.sort_unstable();
+    for origin in &encoded {
         marker.push('\n');
-        marker.push_str(&encode_origin(origin));
+        marker.push_str(origin);
     }
-    let marker = format!("caos:secrets:indexed:{}", blob_oid(marker.as_bytes()));
+    let marker = format!("caos:secrets:indexed2:{}", blob_oid(marker.as_bytes()));
     {
         let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
         let indexed = guard.get_or_insert_with(HashSet::new);

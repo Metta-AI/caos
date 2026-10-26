@@ -1,0 +1,6 @@
+# What this test reaches for that no DEPS edge supplies (format
+# `<path> <name>`; see tests/rgrep/DEPS for what deep-deps does with these).
+../../std/tree-map tree-map
+# The image this client test runs in, with the client-repo setup as its
+# /worker: a dependency, not a harness.
+../../std/bash bash

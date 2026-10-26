@@ -11,6 +11,13 @@
 //! * `GET /run?req=<hash>` — run the ArgTree `<hash>` (`req` is the
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result.
+//! * `POST /start` (a bundled request, `POST /submit`'s body) and `POST
+//!   /start/<verb>` (a `.caos-expr` line) — start a request and return its
+//!   TICKET at once. Forming the request (a base's build, a locator's fetch)
+//!   and running it happen on the ticket's own thread, recorded under it, so
+//!   `GET /status/<ticket>` shows the evaluation as well as the run.
+//!   `GET /result/<ticket>` says how it stands and `GET /wait/<ticket>` blocks
+//!   for the answer. `/eval/<verb>` is a start followed by that wait.
 //! * `POST /trace/child` — record, under an in-flight job, that it started work
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
@@ -326,22 +333,18 @@ fn main() {
     // placement does.
     if env_or("CAOS_STORE_CHECK", "no") == "yes" {
         // This is the coordinated downtime the pack-count TODO above asks for:
-        // loose objects make the walk below slow. --keep-unreachable preserves
-        // ALL CAS objects, including unreferenced ones; plain `-a -d` would
-        // drop them.
-        run_required_git(&[
-            "-C",
-            &git_dir,
-            "repack",
-            "-a",
-            "-d",
-            "--keep-unreachable",
-            "-q",
-        ])
-        .unwrap_or_else(|error| {
-            eprintln!("fatal: repacking the object store: {error}");
-            std::process::exit(1);
-        });
+        // every push leaves a pack, and every object read costs more with each
+        // one. `--geometric=2` merges the small recent packs and keeps ALL CAS
+        // objects, including unreferenced ones (it works from the packs, never
+        // from refs; plain `-a -d` without `--keep-unreachable` would drop
+        // them). Unlike `-a`, it leaves an already-consolidated store alone, so
+        // a restart costs a fraction of a second instead of rewriting it.
+        run_required_git(&["-C", &git_dir, "repack", "--geometric=2", "-d", "-q"]).unwrap_or_else(
+            |error| {
+                eprintln!("fatal: repacking the object store: {error}");
+                std::process::exit(1);
+            },
+        );
         // Older servers accepted individual commits without their
         // dependencies. Check all objects, including unreferenced ones, before
         // trusting existence as proof of closure. Never delete history to make
@@ -854,6 +857,19 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 &params,
                 &secrets,
             )
+        }
+        // The same, for a request a client has bundled rather than spelled
+        // (`POST /submit`'s body). `/wait/<ticket>` is what `/eval` does after
+        // a start: it blocks for the ticket's answer.
+        Method::Post if path == "/start" => {
+            let secrets = secret_context(config, request)?;
+            let token = git_token(request)?;
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body)?;
+            compute::start_bundle(config, &body, &secrets, token.as_deref())
+        }
+        Method::Get if path.starts_with("/wait/") => {
+            compute::wait_ticket(config, path.trim_start_matches("/wait/"))
         }
         Method::Post if path.starts_with("/start/") => {
             let params = expression_params(request, &query)?;
