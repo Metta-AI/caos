@@ -11,8 +11,10 @@
 # gateway protects nothing the ticket does not. The way in from another machine
 # is a stock `dumbpipe listen-tcp` splicing to that port; the ticket it prints
 # (here, and in $state/iroh-hermes/ticket) is the only credential. A desktop
-# runs `dumbpipe connect-tcp --addr 127.0.0.1:<port> <ticket>` and points
-# Remote gateway at it.
+# runs tools/iroh-vhost (`--host 127.0.0.1:<port>`) and points Remote gateway
+# at the URL `iroh-vhost url <ticket>` prints. --host matters: the dashboard
+# checks the Host and Origin of a request against the loopback bind, and
+# iroh-vhost's own hostname fails that check without it.
 #
 # The flake (flake.nix, `hermes-gateway`) supplies hermes, dumbpipe, git and
 # coreutils on PATH and sets the two variables below that name store paths.
@@ -195,8 +197,17 @@ printf '%s\n' "$ticket" >"$iroh_state/ticket"
 
 echo "hermes-gateway: caos server $server; gateway on 127.0.0.1:$port" >&2
 echo "  ticket:  $ticket" >&2
-echo "  desktop: dumbpipe connect-tcp --addr 127.0.0.1:$port <ticket>," >&2
-echo "           session token '$(cat "$ws_token")'" >&2
+{
+  echo ""
+  echo "  On the desktop, start the client side:"
+  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
+  echo "      --host 127.0.0.1:$port"
+  echo "  then give Remote gateway the URL this prints:"
+  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
+  echo "      url $ticket"
+  echo "  and the session token '$(cat "$ws_token")'."
+  echo ""
+} >&2
 
 # Either member exiting means the gateway is not usable: take the other down.
 wait -n
