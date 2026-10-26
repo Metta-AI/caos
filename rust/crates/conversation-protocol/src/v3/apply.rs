@@ -20,6 +20,12 @@ pub enum Transition {
     ConversationFork {
         identity: Identity,
         title: String,
+        /// Content the fork starts with INSTEAD of its source's, when it merged
+        /// another commit in: a tree without `.caos/`, replacing every entry
+        /// outside it. The commit it came from is the fork's second parent
+        /// (`mint_with_parents`), which is what lets git find the base of the
+        /// next merge. `None` keeps the source's content, as a plain fork does.
+        content: Option<Oid>,
     },
     TitleSet {
         title: String,
@@ -185,7 +191,11 @@ pub fn apply(
                 }
             }
         }
-        Transition::ConversationFork { identity, title } => {
+        Transition::ConversationFork {
+            identity,
+            title,
+            content,
+        } => {
             let conversation = parent(store, parent_head)?;
             canonical_shape(identity, "identity")?;
             if !matches!(identity.kind, IdentityKind::Fork { .. }) {
@@ -195,6 +205,25 @@ pub fn apply(
                 return Err("conversation fork identity id must differ from its source".to_string());
             }
             validate_fork_quiescence(&conversation)?;
+            if let Some(merged) = content {
+                // Everything outside .caos/ is replaced by the merged tree's
+                // entries. .caos/ is the fork's own record, never merged.
+                let incoming = super::tree::Snapshot::new(store, merged.clone()).list("")?;
+                if incoming.iter().any(|entry| entry.name == paths::CAOS_DIR) {
+                    return Err("fork content must not contain .caos".to_string());
+                }
+                // Every one of them, including those the merge keeps: a put onto
+                // a directory the source has is refused unless that path was
+                // explicitly deleted first (`TreeBuilder`).
+                for entry in conversation.snapshot().list("")? {
+                    if entry.name != paths::CAOS_DIR {
+                        builder.delete(&entry.name);
+                    }
+                }
+                for entry in incoming {
+                    builder.put_oid(&entry.name, entry.mode, entry.oid);
+                }
+            }
             builder.put(paths::IDENTITY, Mode::Blob, identity.content_bytes());
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
         }
@@ -624,22 +653,61 @@ pub fn mint(
     kind: Kind,
     signature: &Signature,
 ) -> Result<Oid, String> {
-    if kind == Kind::ConversationRoot && parent != &super::oid::g3() {
-        return Err("conversation root must parent G3".to_string());
-    }
-    if kind != Kind::ConversationRoot && parent == &super::oid::g3() {
+    mint_with_parents(store, parent, &[], applied, kind, signature)
+}
+
+/// Mint with further parents after the spine's `parent`: the commit a fork
+/// merged its content from. The first parent is always the conversation, which
+/// is how every reader walks it; the others are there so that git can find a
+/// merge base the next time that repository's newer commit is merged in.
+///
+/// A root's parent is G3, or the commit whose tree is its content -- with the
+/// same purpose. Neither place takes a conversation commit: that would splice
+/// one conversation's history into another.
+pub fn mint_with_parents(
+    store: &mut dyn ObjectStore,
+    parent: &Oid,
+    merged: &[Oid],
+    applied: &Applied,
+    kind: Kind,
+    signature: &Signature,
+) -> Result<Oid, String> {
+    if kind == Kind::ConversationRoot {
+        if parent != &super::oid::g3() && is_conversation_commit(store, parent)? {
+            return Err(
+                "a conversation root parents G3 or the commit its content came from, \
+                 not a conversation commit"
+                    .to_string(),
+            );
+        }
+    } else if parent == &super::oid::g3() {
         return Err("only a conversation root may parent G3".to_string());
+    }
+    if !merged.is_empty() && kind != Kind::ConversationFork {
+        return Err("only a conversation fork merges another commit in".to_string());
+    }
+    for commit in merged {
+        if is_conversation_commit(store, commit)? {
+            return Err("a fork merges a content commit in, not a conversation commit".to_string());
+        }
     }
     store
         .write_commit(&CommitInfo {
             tree: applied.tree.clone(),
-            parents: vec![parent.clone()],
+            parents: std::iter::once(parent).chain(merged).cloned().collect(),
             author: signature.clone(),
             committer: signature.clone(),
             extra_headers: Vec::new(),
             message: super::events::encode(kind, &applied.events),
         })
         .map_err(String::from)
+}
+
+/// Whether a commit's message names a conversation transition, which is what
+/// makes it part of a conversation rather than content.
+pub fn is_conversation_commit(store: &dyn ObjectStore, commit: &Oid) -> Result<bool, String> {
+    let info = store.read_commit(commit).map_err(String::from)?;
+    Ok(Kind::parse_message(&info.message).is_ok())
 }
 
 pub fn inherited_signature(store: &dyn ObjectStore, parent: &Oid) -> Result<Signature, String> {

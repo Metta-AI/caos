@@ -435,7 +435,7 @@ argument-hint: <conversation-commit-hash>
 ---
 caos-conversation-command: fork $ARGUMENTS
 
-You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original.
+You are picking up work recorded in another caos conversation. This session's conversation is a FORK of commit $ARGUMENTS: it starts with that conversation's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original. The fork also merged in this session's client repo, so the tools under caos-std/ and the instructions are this session's, not the ones the earlier conversation ran with.
 ` + commandFooter,
 }
 

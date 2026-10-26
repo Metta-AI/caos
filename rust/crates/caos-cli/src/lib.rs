@@ -2049,6 +2049,7 @@ pub fn fork_conversation_in(
             owner: None,
         },
         title: title.clone(),
+        content: None,
     };
     let candidate = mint_transition(store, &from, &transition, &signature(user)?)?;
     let head_ref = refs::head_ref(id)?;

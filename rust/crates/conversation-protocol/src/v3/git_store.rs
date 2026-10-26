@@ -259,6 +259,44 @@ impl GitStore {
         }
     }
 
+    /// Fetch `commit` and its whole history from `url`, a repository other than
+    /// this store's remote: where a conversation's content comes from. The git
+    /// that runs is the locator fetch's (`git_locator::locator::fetch_command`):
+    /// the grammar's schemes only, a cleared environment, and a token carried
+    /// over https alone. The push that follows takes the history to the server,
+    /// which keeps what it did not have.
+    pub fn fetch_commit_from(
+        &self,
+        url: &str,
+        commit: &Oid,
+        token: Option<&str>,
+    ) -> Result<(), String> {
+        let mut command = git_locator::locator::fetch_command(url, token)?;
+        command.arg("-C").arg(&self.dir).args([
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-write-fetch-head",
+            url,
+            commit.as_str(),
+        ]);
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to run git: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git fetch of {commit} from {url} failed with {}",
+                output.status
+            ));
+        }
+        if !self.has_local(commit)? {
+            return Err(format!("{url} did not supply {commit}"));
+        }
+        Ok(())
+    }
+
     pub fn has_local(&self, oid: &Oid) -> Result<bool, String> {
         let object = format!("{oid}^{{object}}");
         let output = self
@@ -293,6 +331,20 @@ impl GitStore {
     }
 
     pub fn push(&self, updates: &[RefUpdate]) -> Result<(), String> {
+        self.push_with(updates, false)
+    }
+
+    /// `push`, negotiating what the remote already has instead of trusting its
+    /// advertised refs alone. For a push whose history reaches commits the
+    /// remote holds under no advertised ref -- a conversation rooted on the
+    /// commit its content came from -- this is what keeps the pack to the new
+    /// commits; a remote that cannot negotiate gets the whole history, which is
+    /// correct and merely larger.
+    pub fn push_negotiating(&self, updates: &[RefUpdate]) -> Result<(), String> {
+        self.push_with(updates, true)
+    }
+
+    fn push_with(&self, updates: &[RefUpdate], negotiate: bool) -> Result<(), String> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -300,7 +352,11 @@ impl GitStore {
             .remote
             .as_deref()
             .ok_or_else(|| "no remote".to_string())?;
-        let mut arguments = vec!["push".to_string(), "--quiet".to_string()];
+        let mut arguments = Vec::new();
+        if negotiate {
+            arguments.extend(["-c".to_string(), "push.negotiate=true".to_string()]);
+        }
+        arguments.extend(["push".to_string(), "--quiet".to_string()]);
         if updates.len() > 1 {
             arguments.push("--atomic".to_string());
         }
@@ -834,35 +890,7 @@ impl CodeOps for GitStore {
         let theirs_head = self
             .write_commit(&synthetic_head(theirs_tree, b"caos merge theirs\n"))
             .map_err(String::from)?;
-        let output = self.output(&[
-            "merge-tree",
-            "--write-tree",
-            "--name-only",
-            "--no-messages",
-            ours_head.as_str(),
-            theirs_head.as_str(),
-        ])?;
-        if !matches!(output.status.code(), Some(0 | 1)) {
-            return Err(self.output_error("git merge-tree", &output));
-        }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| "git merge-tree returned non-UTF-8 output".to_string())?;
-        let mut lines = stdout.lines();
-        let tree = lines
-            .next()
-            .ok_or_else(|| "git merge-tree returned no tree".to_string())?;
-        let tree = Oid::parse(tree, "merged tree")?;
-        if output.status.success() {
-            Ok(MergeOutcome::Merged { tree })
-        } else {
-            let mut paths: Vec<String> = lines
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect();
-            paths.sort();
-            paths.dedup();
-            Ok(MergeOutcome::Conflict { paths })
-        }
+        self.merge_tree(&ours_head, &theirs_head)
     }
 
     fn commit(
@@ -888,6 +916,51 @@ impl CodeOps for GitStore {
             "git-merge-tree/{}",
             self.git_version().unwrap_or_else(|_| "unknown".to_string())
         )
+    }
+}
+
+impl GitStore {
+    /// Merge `theirs` into `ours` as git would, from the base the two commits
+    /// share. Both must be local (`ensure_local`), with their ancestry reachable
+    /// from this store's remote: a conversation whose root parents its content
+    /// commit shares that commit's history with the repository it came from, so
+    /// git finds the base on its own, and with nothing to share it refuses.
+    pub fn merge_commits(&self, ours: &Oid, theirs: &Oid) -> Result<MergeOutcome, String> {
+        self.merge_tree(ours, theirs)
+    }
+
+    /// `git merge-tree --write-tree` of two commits: the merged tree, or the
+    /// paths that conflict.
+    fn merge_tree(&self, ours: &Oid, theirs: &Oid) -> Result<MergeOutcome, String> {
+        let output = self.output(&[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            ours.as_str(),
+            theirs.as_str(),
+        ])?;
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            return Err(self.output_error("git merge-tree", &output));
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|_| "git merge-tree returned non-UTF-8 output".to_string())?;
+        let mut lines = stdout.lines();
+        let tree = lines
+            .next()
+            .ok_or_else(|| "git merge-tree returned no tree".to_string())?;
+        let tree = Oid::parse(tree, "merged tree")?;
+        if output.status.success() {
+            Ok(MergeOutcome::Merged { tree })
+        } else {
+            let mut paths: Vec<String> = lines
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            paths.sort();
+            paths.dedup();
+            Ok(MergeOutcome::Conflict { paths })
+        }
     }
 }
 

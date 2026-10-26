@@ -232,10 +232,14 @@ tool call. A repeated event names the message id it already recorded and writes
 nothing, so a retried hook is harmless. The answer is `status` (`created`,
 `recorded`, `joined`, `held` or `nothing`) and `head`.
 
-The one thing the step cannot find is a NEW conversation's content: the base
-this checkout stands in (or a `/caos-session-start-from` names) is resolved
-and pushed here, and its tree is handed to the step. A conversation that exists
-needs none, so the base is resolved only for a session's first prompt.
+The one thing the step cannot find is a NEW conversation's content: the locator
+`--base:@@=` names (or a `/caos-session-start-from` line does) goes to the step
+as `content-locator`, and the step fetches the COMMIT it names, with its history
+(from the server when it has it, else from the repository, with the GitHub token
+`import-source` would use). A root parents that commit and starts from its tree;
+a fork merges it in (above); the push carries the history to the server. A
+conversation that exists needs none, so the locator matters only for a session's
+first prompt.
 
 A checkout therefore holds only what it fetches. Anything that reads a
 conversation's ref from the local repository must fetch it first (`git fetch
@@ -318,6 +322,21 @@ with no path. A commit, because it is immutable where a ref moves.
 does not move. There is no command that continues the SAME branch from a new
 session: a session's conversation is always the one its id derives, so nothing
 about it is kept locally.
+
+**The fork brings the session's client repo in.** The hook sends its content
+locator (`--base:@@=`, or the prompt's `/caos-session-start-from` line) with the
+fork, and the step merges that commit into the forked conversation the way git
+merges two branches: a conversation's root PARENTS the commit its content came
+from, so the conversation and the client repo share history and `git merge-tree`
+finds the base itself. The forked conversation's files that the repo changed
+since -- `flake.lock`, `.caos-expr`, the instructions -- take the repo's version;
+its own work is untouched; `.caos/` is never merged. The merged commit is the
+fork's second parent, so the next fork merges from there. A conflict refuses the
+fork, naming the files, because nobody is in the conversation yet to resolve it;
+fork from a session whose content locator is the conversation's own, or fix the
+repository first. This is how a conversation recorded against one caos is picked
+up after the client repo moved its pin: a fix deployed to caos reaches the
+conversation on its next fork, tools included.
 
 `cloud/install.go` writes the command into Claude Code's user config. The hook
 acts on a session's **first prompt** (`fork.rs`): it recognises the command and hands the commit to the step (`llm-step --record=prompt --from=<hash>`), which sets
