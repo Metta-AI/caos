@@ -485,8 +485,9 @@ def main():
             # Pushes use a separate empty remote: object transfer comes from
             # the server, including code ancestry, without a worker checkout.
             destination = f"https://localhost:{remote_port}/published.git"
-            def push(commit, branch="topic", old=None, dest=destination, force=False, **kwargs):
-                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "force":force},
+            def push(commit, branch="topic", old=None, dest=destination, force=False, allow_ignored=False, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "force":force,
+                             "allow_ignored":allow_ignored},
                             endpoint="/git/push", **kwargs)
             def remote_head(branch):
                 return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
@@ -611,7 +612,12 @@ def main():
                 git_commands.write_text("")
                 if ignored:
                     ignored_head = head
-                    assert json.loads(push(head, branch=branch, expected=422))["code"] == "ignored-files"
+                    rejection = json.loads(push(head, branch=branch, expected=422))
+                    assert rejection["code"] == "ignored-files"
+                    assert rejection["total"] == len(rejection["paths"]) >= 1, rejection
+                    assert set(rejection["paths"]) <= set(files), rejection
+                    if number == 0:
+                        assert rejection["paths"] == ["results/out"], rejection
                     assert "push" not in git_commands.read_text().splitlines()
                     assert subprocess.run(["git", "--git-dir", str(published), "show-ref",
                         "--verify", "--quiet", "refs/heads/" + branch]).returncode == 1
@@ -628,12 +634,23 @@ def main():
             assert json.loads(push(ignored_head, branch="ignore-update", old=first[0],
                                    expected=422))["code"] == "ignored-files"
             assert remote_head("ignore-update") == first[0]
+            # The override publishes the exact commit, ignored files included.
+            assert push(ignored_head, branch="ignore-allowed", allow_ignored=True)["status"] == "complete"
+            assert remote_head("ignore-allowed") == ignored_head
+            assert push(ignored_head, branch="ignore-update", old=first[0],
+                        allow_ignored=True)["status"] == "complete"
+            assert remote_head("ignore-update") == ignored_head
             if cli:
                 rejected = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
                                           "--expected=absent", env=cli_env))
                 assert rejected["kind"] == "validation-rejected"
                 assert ".gitignore" in rejected["diagnostic"]
                 assert "no push was attempted" in rejected["diagnostic"]
+                assert "Ignored files (1):\n  " in rejected["diagnostic"], rejected
+                allowed = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
+                                         "--expected=absent", "--allow-ignored", env=cli_env))
+                assert allowed["status"] == "complete", allowed
+                assert remote_head("ignore-cli") == ignored_head
             # This is a tip-tree policy, not a history scrub.
             cleaned = ignore_snapshot({"ordinary.txt": "kept"}, parent=ignored_head)
             assert push(cleaned, branch="ignore-cleaned")["status"] == "complete"

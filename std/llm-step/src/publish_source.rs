@@ -3,10 +3,11 @@ use super::*;
 use conversation_protocol::v3::publication::Outcome;
 use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
-pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. Remove those files or adjust the rules before publishing. It never strips files or rewrites commits. This does not create a PR (caos-std/github opens one) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
+pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. The rejection lists those paths. Remove them, adjust the rules, or set allow_ignored to publish them anyway. It never strips files or rewrites commits. This does not create a PR (caos-std/github opens one) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
 @param branch Destination branch name (without refs/heads/).
-@param [force] true to allow a non-fast-forward update (a force push), still leased on the observed remote head.";
+@param [force] true to allow a non-fast-forward update (a force push), still leased on the observed remote head.
+@param [allow_ignored] true to publish even though tracked files match the commit's .gitignore rules. Use it only for files you have checked and mean to publish.";
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +18,8 @@ struct Parameters {
     branch: String,
     #[serde(default, deserialize_with = "bool_or_string")]
     force: bool,
+    #[serde(default, deserialize_with = "bool_or_string")]
+    allow_ignored: bool,
 }
 
 /// A boolean as a JSON boolean or as the string a tool's arguments are: through
@@ -170,6 +173,12 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         // the first one did.
         if pending.descriptor.policy == "force" {
             command.arg("--force");
+        }
+        // Not part of the pinned descriptor: the call's input is fixed per
+        // call id, so a recovered attempt sends the same value, and it only
+        // relaxes a validation. The commit and the lease stay pinned.
+        if p.allow_ignored {
+            command.arg("--allow-ignored");
         }
         if let Some(file) = token_file {
             command.arg(format!("--github-token-file={file}"));
@@ -393,6 +402,28 @@ mod tests {
         assert_eq!(force(Value::Null), Ok(false), "absent means no force");
         assert!(force(json!("maybe")).is_err());
         assert!(force(json!(3)).is_err());
+    }
+
+    #[test]
+    fn allow_ignored_is_a_boolean_or_a_string_and_defaults_to_off() {
+        let allow = |value: Option<Value>| {
+            let mut input = json!({
+                "source-tree": "feature/01-change",
+                "repository": "https://example.invalid/r.git",
+                "branch": "feature",
+            });
+            if let Some(value) = value {
+                input["allow_ignored"] = value;
+            }
+            serde_json::from_value::<Parameters>(input)
+                .map(|p| p.allow_ignored)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(allow(None), Ok(false));
+        assert_eq!(allow(Some(json!(true))), Ok(true));
+        assert_eq!(allow(Some(json!("true"))), Ok(true));
+        assert_eq!(allow(Some(json!("false"))), Ok(false));
+        assert!(allow(Some(json!("maybe"))).is_err());
     }
 
     #[test]

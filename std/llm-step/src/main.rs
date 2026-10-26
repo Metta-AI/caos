@@ -3529,6 +3529,7 @@ fn registry(cfg: &Config) -> Result<Vec<Value>, String> {
     // Help types are what a curried arg can carry, which has no boolean; this
     // built-in reads its input as JSON, so it can take a real one.
     publish["input_schema"]["properties"]["force"]["type"] = json!("boolean");
+    publish["input_schema"]["properties"]["allow_ignored"]["type"] = json!("boolean");
     registry.push(publish);
     if cfg.run_and_update_ref_image.is_some() {
         registry.extend(subagents::declarations());
