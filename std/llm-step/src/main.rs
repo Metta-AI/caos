@@ -80,6 +80,16 @@ struct Config {
     /// its own, and no request or head to name. A call already declared under
     /// the id is not declared twice, so a retry runs it rather than failing.
     tool_call: Option<(String, Value)>,
+    /// With `tool_call`: declare the call on the active request and STOP, running
+    /// nothing.
+    ///
+    /// A harness that starts a call and answers before it finishes (`start`)
+    /// needs the declaration on the request BEFORE it answers: a turn's `Stop`
+    /// holds its request open only for a call it can see declared, so a call
+    /// still waiting to be declared when the turn ends finds the request closed.
+    /// The declaration is idempotent, so the run that follows finds the call
+    /// declared and goes on to run it.
+    declare_only: bool,
     /// With `tools_only`: a completed call whose text is longer than this many
     /// characters is also saved in the conversation, and the run's result says
     /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
