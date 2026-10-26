@@ -125,6 +125,13 @@ fn run(args: &[String]) -> Result<(), String> {
             [flag, arg_tree] if flag == "--all" => caos::cli_status(&transport()?, arg_tree, true),
             _ => Err(usage(args)),
         },
+        // `watch <arg tree hash>` — the live view `run`/`run-tool` draw while
+        // they wait, for a run you are not attached to. The hash is the one
+        // they print. Returns when the run has no current work.
+        Some("watch") => match &args[2..] {
+            [arg_tree] => caos::cli_watch(&transport()?, arg_tree),
+            _ => Err(usage(args)),
+        },
         // `secrets-init --dir=<d>` / `secrets-push --dir=<d> [--server=<url>]` — the
         // server-held store (SPEC.md, "Secrets"). No caos tree needed.
         Some("secrets-init") => caos_cli::secret_store::cli_secrets_init(&args[2..]),
