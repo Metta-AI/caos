@@ -79,6 +79,20 @@ impl Node {
     }
 }
 
+impl Node {
+    /// The latest instant (ms on the server's relative timeline) any node in
+    /// this tree reports having been requested or started.
+    fn latest(&self) -> i64 {
+        self.children
+            .iter()
+            .map(Node::latest)
+            .chain(self.requested)
+            .chain(self.started)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 /// A running display. Dropping it stops the poller and clears what it drew.
 pub(crate) struct Watch {
     /// Held only to be dropped: closing it disconnects the poller's receiver,
