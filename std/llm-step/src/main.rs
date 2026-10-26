@@ -204,7 +204,11 @@ fn run() -> Result<(), String> {
         // The caller named a call, not a request: the active one is the
         // request, and it records its own head.
         (Some(call), Some((name, arguments))) => {
-            declare_requested_call(&mut state, call, name, arguments)?
+            let declared = declare_requested_call(&mut state, call, name, arguments)?;
+            if cfg.declare_only {
+                return forward_files(state.head(), &[("status", b"declared"), ("observation", b"")]);
+            }
+            declared
         }
         _ => {
             let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
