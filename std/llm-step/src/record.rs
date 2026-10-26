@@ -64,8 +64,8 @@ pub(crate) struct Request {
     /// merges it into the conversation it forks.
     content: Option<String>,
     /// A conversation commit to FORK, for a NEW conversation: the prompt's
-    /// conversation is then made as a fork of it (settled first, if a session
-    /// died mid-turn) rather than as a root.
+    /// conversation is then made as a fork of it, as it stands, rather than as
+    /// a root.
     from: Option<Oid>,
 }
 
