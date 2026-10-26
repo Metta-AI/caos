@@ -3320,6 +3320,12 @@ fn run_request(
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
     let server = t.server_url()?;
+    // Name the run before blocking on it, so a long one can be followed from
+    // anywhere (`caos-cli watch <hash>`) — including by a caller with no
+    // terminal, which is who needs it most: an agent or a CI job. Stderr, so
+    // the result a script pipes from stdout is untouched, and printed whether
+    // or not there is a tty, unlike the live display below.
+    eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
     // Watch the work while the compute request blocks. Both `run` and
     // `run-tool` come through here, so the live display is one place rather
     // than two, and a caller that is not a person (the suite, a worker) gets
