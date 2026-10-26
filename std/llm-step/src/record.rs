@@ -299,7 +299,7 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     let (content, merged) = match &request.content {
         Some(locator) => {
             let commit = content_commit(&store, locator)?;
-            let tree = match store.merge_commits(&settled, &commit)? {
+            let tree = match store.merge_commits(from, &commit)? {
                 MergeOutcome::Merged { tree } => tree,
                 MergeOutcome::Conflict { paths } => {
                     return Err(format!(
