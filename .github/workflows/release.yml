@@ -309,3 +309,50 @@ jobs:
           }
           retry "confirm $TAG is published" published
           echo "release ready at https://github.com/$GH_REPO/releases/tag/$TAG"
+
+  # Run the caos test suite on the prod server, with the client built above.
+  #
+  # The runner does no testing itself: `caos-cli run-tool caos-test` ships this
+  # checkout's tree to the server over the `caos` git remote and the server
+  # compiles and tests it in its workers. Results are cached by content, so a
+  # push that changes nothing a test reads is a cache hit. The command prints
+  # the report and exits non-zero on a FAILED banner, which fails this job.
+  #
+  # `CAOS_TICKET` is the iroh ticket of the prod server
+  # (`sudo cat /data/caos/stack/iroh/ticket`, prod/README.md). It is the
+  # capability to run jobs there, so it is a secret. GitHub withholds secrets
+  # from fork PRs and this workflow does not run on pull_request, so only
+  # pushes to this repository reach the server.
+  test:
+    needs: client
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the client negotiates a git push of this tree with the
+      # server, and a shallow clone is not something to find out about in CI.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: caos-client-${{ needs.client.outputs.tag }}
+          path: dist
+
+      # `git` finds the `caos://` remote helper by name on PATH; the client
+      # shells out to git for every push and fetch.
+      - name: Install the client
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          install -m 0755 dist/caos-x86_64-linux "$HOME/bin/caos-cli"
+          install -m 0755 dist/git-remote-caos-x86_64-linux "$HOME/bin/git-remote-caos"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run caos-test on the prod server
+        env:
+          CAOS_TICKET: ${{ secrets.CAOS_TICKET }}
+        run: |
+          set -euo pipefail
+          test -n "$CAOS_TICKET" || { echo "secret CAOS_TICKET is not set" >&2; exit 1; }
+          git remote add caos "caos://$CAOS_TICKET"
+          caos-cli run-tool caos-test
