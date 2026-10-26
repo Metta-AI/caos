@@ -151,6 +151,64 @@ impl Drop for Watch {
     }
 }
 
+/// Follow a run that is already going, until it has no current work: `watch
+/// <hash>`. The same tree `Watch` draws under a `run`, for a run started
+/// elsewhere — an agent's, a CI job's, or one whose `run` you did not stay on.
+///
+/// Unlike `Watch` this is the whole point of the command, so it is not gated on
+/// the terminal being a tty. On one it redraws in place; off one (a log) it
+/// appends a snapshot every few seconds, with no escapes.
+///
+/// The server reports times relative to the root request and has no "now", and
+/// we did not start the run, so the origin is a lower bound: the latest moment
+/// any node reports, then ticked forward on our clock. A node's elapsed time can
+/// therefore read short by however long it has been since its last event, never
+/// long.
+pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
+    let tty = std::io::stderr().is_terminal();
+    let interval = if tty { POLL * 2 } else { Duration::from_secs(5) };
+    let mut drawn = 0usize;
+    let mut origin: Option<(u64, i64)> = None;
+    let mut seen = false;
+    loop {
+        let Some(root) = fetch_root(server, arg_tree) else {
+            if seen {
+                eprintln!("finished: no current work under {arg_tree}");
+            } else {
+                eprintln!(
+                    "no current work under {arg_tree} (finished, or not a run on this server); \
+                     `caos-cli status --all {arg_tree}` shows what happened"
+                );
+            }
+            return Ok(());
+        };
+        seen = true;
+        let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
+        let now_rel_ms = at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64;
+        let mut lines = Vec::new();
+        render(&root, 0, now_rel_ms, &mut lines);
+        if tty {
+            drawn = draw(drawn, &lines);
+        } else {
+            for line in lines.iter().take(max_lines()) {
+                eprintln!("{line}");
+            }
+            eprintln!();
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// The current work tree under `arg_tree`, or None when the server has none or
+/// it could not be read.
+fn fetch_root(server: &str, arg_tree: &str) -> Option<Node> {
+    let json = fetch(server, arg_tree).ok()??;
+    serde_json::from_str::<serde_json::Value>(&json)
+        .ok()
+        .as_ref()
+        .and_then(Node::parse)
+}
+
 /// `GET /status/<arg_tree>`, or None when the server has nothing to show.
 fn fetch(server: &str, arg_tree: &str) -> Result<Option<String>, String> {
     let body = crate::server_get(server, &format!("/status/{arg_tree}"))?;
