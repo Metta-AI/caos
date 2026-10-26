@@ -1132,7 +1132,7 @@ fn declare_requested_call(
         let view = state.conversation()?;
         let record = view.active_turn()?.ok_or_else(|| {
             format!(
-                "no active request in {:?}: call {call} arrived before the prompt that opens one",
+                "no active request in {:?}: call {call} found none open (no prompt has opened one yet, or the turn that issued the call ended and its Stop closed the request before the call was declared)",
                 state_conversation_id(state).unwrap_or_default()
             )
         })?;
