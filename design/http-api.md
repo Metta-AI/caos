@@ -141,7 +141,7 @@ Documented elsewhere; listed here so the surface is in one place.
 
 | endpoint | purpose | see |
 |---|---|---|
-| `GET /run?<query>` | run a request given as an ArgTree | SPEC "Submitting work" |
+| `GET /run?<query>` | run an ArgTree named in the query (`req=<hash>`) | SPEC "Submitting work" |
 | `POST /submit` | push a bundle holding a call's args and run it | SPEC "Submitting work" |
 | `GET /eval?root:hash=<oid>&path=<p>` or `root:@@=<locator>` | evaluate a path under `.caos-expr` | SPEC "Evaluating a path" |
 | `GET /status/<arg tree hash>[?all=1]` | trace of a run | SPEC "Tracing" |
