@@ -170,6 +170,7 @@ impl Config {
             run_and_update_ref_image,
             tools_only,
             tool_call,
+            declare_only,
             max_result_chars,
             record,
             list_tools,
