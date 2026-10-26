@@ -177,6 +177,7 @@ fn usage(args: &[String]) -> String {
          {prog} eval-path [--tree=<oid>] <path>\n  \
          {prog} get <hash> <path>\n  \
          {prog} status [--all] <arg tree hash>\n  \
+         {prog} watch <arg tree hash>\n  \
          {prog} secrets-init --dir=<d>\n  \
          {prog} secrets-push --dir=<d> [--server=<url>]"
     )
