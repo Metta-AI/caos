@@ -121,14 +121,7 @@ impl Watch {
                 // display is a courtesy; the run it is watching is the point,
                 // and a server too busy to answer /status is not a reason to
                 // start complaining into the middle of someone's output.
-                let Ok(Some(json)) = fetch(&server, &arg_tree) else {
-                    continue;
-                };
-                let Some(root) = serde_json::from_str::<serde_json::Value>(&json)
-                    .ok()
-                    .as_ref()
-                    .and_then(Node::parse)
-                else {
+                let Some(root) = fetch_root(&server, &arg_tree) else {
                     continue;
                 };
                 let mut lines = Vec::new();
