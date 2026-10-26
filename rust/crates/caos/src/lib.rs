@@ -258,6 +258,18 @@ pub fn cli_status(t: &dyn Transport, arg_tree: &str, all: bool) -> Result<(), St
     Ok(())
 }
 
+/// `watch <arg tree hash>` — follow a run until it has no current work.
+///
+/// The live display `run` and `run-tool` draw while they wait, for a run you are
+/// not blocked on: the hash they print names it. Use `status --all` for what
+/// happened once it is over.
+pub fn cli_watch(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+    if !is_hex_hash(arg_tree) {
+        return Err(format!("not an arg tree hash: {arg_tree}"));
+    }
+    watch::follow(&t.server_url()?, arg_tree)
+}
+
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
@@ -3320,6 +3332,12 @@ fn run_request(
     // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
     // at it).
     let server = t.server_url()?;
+    // Name the run before blocking on it, so a long one can be followed from
+    // anywhere (`caos-cli watch <hash>`) — including by a caller with no
+    // terminal, which is who needs it most: an agent or a CI job. Stderr, so
+    // the result a script pipes from stdout is untouched, and printed whether
+    // or not there is a tty, unlike the live display below.
+    eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
     // Watch the work while the compute request blocks. Both `run` and
     // `run-tool` come through here, so the live display is one place rather
     // than two, and a caller that is not a person (the suite, a worker) gets
