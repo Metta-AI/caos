@@ -139,6 +139,10 @@ impl Config {
             (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
             (None, None) => None,
         };
+        let declare_only = read_arg_opt("declare-only")?.is_some();
+        if declare_only && tool_call.is_none() {
+            return Err("--declare-only needs --tools-only=<call id> and --tool".to_string());
+        }
         let max_result_chars = match read_arg_opt("max-result-chars")? {
             Some(text) => text
                 .trim()
