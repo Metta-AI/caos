@@ -56,6 +56,9 @@ def main():
         root = Path(temp)
         # Record server-side Git operations without logging arguments or secrets.
         git_commands = root / "git-commands"
+        # The shim only creates this when the server runs git; the first baseline
+        # read below must not depend on the server having done so at startup.
+        git_commands.write_text("")
         git_bin = root / "git-bin"
         git_bin.mkdir()
         git_shim = git_bin / "git"
@@ -485,8 +488,9 @@ def main():
             # Pushes use a separate empty remote: object transfer comes from
             # the server, including code ancestry, without a worker checkout.
             destination = f"https://localhost:{remote_port}/published.git"
-            def push(commit, branch="topic", old=None, dest=destination, force=False, **kwargs):
-                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "force":force},
+            def push(commit, branch="topic", old=None, dest=destination, force=False, allow_ignored=False, **kwargs):
+                return call({"destination":dest, "commit":commit, "branch":branch, "expected":old, "force":force,
+                             "allow_ignored":allow_ignored},
                             endpoint="/git/push", **kwargs)
             def remote_head(branch):
                 return run("git", "--git-dir", str(published), "rev-parse", "refs/heads/" + branch)
@@ -611,7 +615,12 @@ def main():
                 git_commands.write_text("")
                 if ignored:
                     ignored_head = head
-                    assert json.loads(push(head, branch=branch, expected=422))["code"] == "ignored-files"
+                    rejection = json.loads(push(head, branch=branch, expected=422))
+                    assert rejection["code"] == "ignored-files"
+                    assert rejection["total"] == len(rejection["paths"]) >= 1, rejection
+                    assert set(rejection["paths"]) <= set(files), rejection
+                    if number == 0:
+                        assert rejection["paths"] == ["results/out"], rejection
                     assert "push" not in git_commands.read_text().splitlines()
                     assert subprocess.run(["git", "--git-dir", str(published), "show-ref",
                         "--verify", "--quiet", "refs/heads/" + branch]).returncode == 1
@@ -628,12 +637,23 @@ def main():
             assert json.loads(push(ignored_head, branch="ignore-update", old=first[0],
                                    expected=422))["code"] == "ignored-files"
             assert remote_head("ignore-update") == first[0]
+            # The override publishes the exact commit, ignored files included.
+            assert push(ignored_head, branch="ignore-allowed", allow_ignored=True)["status"] == "complete"
+            assert remote_head("ignore-allowed") == ignored_head
+            assert push(ignored_head, branch="ignore-update", old=first[0],
+                        allow_ignored=True)["status"] == "complete"
+            assert remote_head("ignore-update") == ignored_head
             if cli:
                 rejected = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
                                           "--expected=absent", env=cli_env))
                 assert rejected["kind"] == "validation-rejected"
                 assert ".gitignore" in rejected["diagnostic"]
                 assert "no push was attempted" in rejected["diagnostic"]
+                assert "Ignored files (1):\n  " in rejected["diagnostic"], rejected
+                allowed = json.loads(run(cli, "push-git", destination, ignored_head, "ignore-cli",
+                                         "--expected=absent", "--allow-ignored", env=cli_env))
+                assert allowed["status"] == "complete", allowed
+                assert remote_head("ignore-cli") == ignored_head
             # This is a tip-tree policy, not a history scrub.
             cleaned = ignore_snapshot({"ordinary.txt": "kept"}, parent=ignored_head)
             assert push(cleaned, branch="ignore-cleaned")["status"] == "complete"
@@ -703,27 +723,38 @@ def main():
             # Trusting existing OIDs requires auditing old stores at startup,
             # including orphan trees whose ordinary children are missing.
             stop(server); server = None
+            # The audit only runs with CAOS_STORE_CHECK=yes, and then it repacks
+            # first, so a loose object planted in the store is packed before the
+            # audit and can no longer be unlinked. Each refusal scenario plants
+            # its damage in a fresh copy of the store instead.
+            def damaged_store(name):
+                store = root / name
+                shutil.copytree(odb, store)
+                return store
+            def start_refused(store):
+                return subprocess.run([binary], env=dict(os.environ,
+                    SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(store),
+                    CAOS_STORE_CHECK="yes"), capture_output=True, timeout=30)
+            tree_store = damaged_store("server-broken-tree.git")
             broken_tree = b"100644 missing\0" + bytes.fromhex("3" * 40)
-            broken_tree_oid = run("git", "--git-dir", str(odb), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
-            refused = subprocess.run([binary], env=dict(os.environ,
-                SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb)), capture_output=True, timeout=30)
+            broken_tree_oid = run("git", "--git-dir", str(tree_store), "hash-object", "-t", "tree", "-w", "--stdin", input=broken_tree)
+            refused = start_refused(tree_store)
             assert refused.returncode != 0, "server trusted legacy incomplete tree"
             assert b"restore the missing objects" in refused.stderr, refused.stderr
-            assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken_tree_oid) == "tree"
-            (odb / "objects" / broken_tree_oid[:2] / broken_tree_oid[2:]).unlink()
+            assert run("git", "--git-dir", str(tree_store), "cat-file", "-t", broken_tree_oid) == "tree"
             # Upgrades cannot silently trust orphan commits either.
             legacy_parent_bytes = child_bytes.replace(b"parent " + posted_parent[0].encode() + b"\n", b"").replace(b"fixture", b"legacy parent")
-            legacy_parent = run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=legacy_parent_bytes)
+            commit_store = damaged_store("server-broken-commit.git")
+            legacy_parent = run("git", "--git-dir", str(commit_store), "hash-object", "-t", "commit", "-w", "--stdin", input=legacy_parent_bytes)
             broken_bytes = child_bytes.replace(posted_parent[0].encode(), legacy_parent.encode()).replace(b"fixture", b"legacy child")
-            broken = run("git", "--git-dir", str(odb), "hash-object", "-t", "commit", "-w", "--stdin", input=broken_bytes)
+            broken = run("git", "--git-dir", str(commit_store), "hash-object", "-t", "commit", "-w", "--stdin", input=broken_bytes)
             # A cached commit graph must not conceal a missing commit object.
-            run("git", "--git-dir", str(odb), "commit-graph", "write", "--stdin-commits", input=(broken + "\n").encode())
-            (odb / "objects" / legacy_parent[:2] / legacy_parent[2:]).unlink()
-            refused = subprocess.run([binary], env=dict(os.environ,
-                SERVER_ADDR=f"127.0.0.1:{port}", CAOS_GIT_DIR=str(odb)), capture_output=True, timeout=30)
+            run("git", "--git-dir", str(commit_store), "commit-graph", "write", "--stdin-commits", input=(broken + "\n").encode())
+            (commit_store / "objects" / legacy_parent[:2] / legacy_parent[2:]).unlink()
+            refused = start_refused(commit_store)
             assert refused.returncode != 0, "server accepted legacy incomplete history"
             assert b"restore the missing objects" in refused.stderr, refused.stderr
-            assert run("git", "--git-dir", str(odb), "cat-file", "-t", broken) == "commit"
+            assert run("git", "--git-dir", str(commit_store), "cat-file", "-t", broken) == "commit"
             print("git-import: complete history, upload ordering, quarantined imports/pushes, commit rejection, bounded validation, startup integrity, HTTPS credentials, reuse, concurrency and retry PASS")
         finally:
             stop(server)

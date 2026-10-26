@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use caos_eval::{EvalHost, Origin};
 use caos_world::secrets::Reader;
 
-use crate::compute::{fact_get, fact_set, list_append_many, list_read};
+use crate::compute::{fact_get, fact_set, list_append_many, list_read, set_add_many, set_read};
 use crate::secret_store::Stored;
 use crate::{Config, HttpError};
 
@@ -115,8 +115,13 @@ static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(N
 /// Bounds the in-memory maps; forgetting only means a later redis read.
 const MEMORY_CAP: usize = 1_000_000;
 
+// A redis SET, with a `v2` prefix. The first version was a list that took a
+// line per re-record and grew to tens of millions of entries per key, whose
+// load then dominated the server's CPU. Its keys are not read; the `indexed`
+// markers moved with it, since a marker over an empty set would claim work that
+// was never done.
 fn origins_key(oid: &str) -> String {
-    format!("caos:secrets:origins:{oid}")
+    format!("caos:secrets:origins2:{oid}")
 }
 
 fn encode_origin(origin: &Origin) -> String {
@@ -141,7 +146,7 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
     {
         return hit;
     }
-    let loaded: Vec<Origin> = list_read(&config.redis_addr, &origins_key(oid))
+    let loaded: Vec<Origin> = set_read(&config.redis_addr, &origins_key(oid))
         .unwrap_or_else(|e| {
             eprintln!("secrets: reading the origins of {oid}: {e}");
             Vec::new()
@@ -155,8 +160,9 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         map.clear();
     }
     let entry = map.entry(oid.to_string()).or_default();
+    let mut seen: HashSet<Origin> = entry.iter().cloned().collect();
     for origin in loaded {
-        if !entry.contains(&origin) {
+        if seen.insert(origin.clone()) {
             entry.push(origin);
         }
     }
@@ -165,7 +171,7 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
 
 /// Record each `(oid, origin)`, in redis and in memory where memory already
 /// holds that oid. An oid it does not hold is left for [`origins_of`] to load
-/// whole, so a repeat in redis costs nothing but a duplicate line.
+/// whole, so a repeat in redis is a no-op (it is a set).
 fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
     let mut new = Vec::new();
     {
@@ -181,7 +187,7 @@ fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
             new.push((origins_key(&oid), encode_origin(&origin)));
         }
     }
-    if let Err(e) = list_append_many(&config.redis_addr, &new) {
+    if let Err(e) = set_add_many(&config.redis_addr, &new) {
         eprintln!("secrets: recording {} origin(s): {e}", new.len());
     }
 }
@@ -193,12 +199,12 @@ static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
-    let mut marker = format!("caos:secrets:indexed:{tree}");
+    let mut marker = format!("caos:secrets:indexed2:{tree}");
     for origin in origins {
         marker.push('\n');
         marker.push_str(&encode_origin(origin));
     }
-    let marker = format!("caos:secrets:indexed:{}", blob_oid(marker.as_bytes()));
+    let marker = format!("caos:secrets:indexed2:{}", blob_oid(marker.as_bytes()));
     {
         let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
         let indexed = guard.get_or_insert_with(HashSet::new);

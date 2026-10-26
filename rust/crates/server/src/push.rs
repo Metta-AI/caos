@@ -18,7 +18,14 @@ struct Input {
     // still prevents overwriting a head the caller has not seen.
     #[serde(default)]
     force: bool,
+    // Skips the ignored-files check. The caller has been told which tracked
+    // paths match its ignore rules and chose to publish them anyway.
+    #[serde(default)]
+    allow_ignored: bool,
 }
+
+// A rejection lists at most this many paths; `total` always carries the count.
+const IGNORED_LIST_LIMIT: usize = 100;
 
 fn expected<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(d)
@@ -116,15 +123,25 @@ pub(crate) fn endpoint(
             }
         }
     }
-    if ignored_files(
-        &input.destination,
-        &config.git_dir,
-        &input.commit,
-        &locks.join(format!("{key}.check")),
-    )
-    .map_err(|_| reject("validation-failed"))?
-    {
-        return Err(reject("ignored-files"));
+    if !input.allow_ignored {
+        let ignored = ignored_files(
+            &input.destination,
+            &config.git_dir,
+            &input.commit,
+            &locks.join(format!("{key}.check")),
+        )
+        .map_err(|_| reject("validation-failed"))?;
+        if !ignored.is_empty() {
+            let paths: Vec<String> = ignored
+                .iter()
+                .take(IGNORED_LIST_LIMIT)
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect();
+            return Err(HttpError::new(
+                422,
+                json!({"code":"ignored-files","total":ignored.len(),"paths":paths}).to_string(),
+            ));
+        }
     }
     let lease = format!(
         "--force-with-lease={refname}:{}",
@@ -201,7 +218,7 @@ fn ignored_files(
     git_dir: &str,
     commit: &str,
     directory: &std::path::Path,
-) -> Result<bool, HttpError> {
+) -> Result<Vec<Vec<u8>>, HttpError> {
     use std::fs::{self, File};
     if directory.exists() {
         fs::remove_dir_all(directory)?;
@@ -245,7 +262,7 @@ fn ignored_files(
             }
         }
         if patterns.is_empty() {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         let paths = directory.join("paths");
         fs::write(&paths, patterns)?;
@@ -256,7 +273,7 @@ fn ignored_files(
         // Explicit per-directory rules exclude host/global/info/exclude policy.
         // --cached deliberately checks tracked entries too: this is a publication
         // rule, stricter than Git's ordinary admission of untracked files.
-        Ok(!run(
+        Ok(run(
             &[
                 "ls-files",
                 "--cached",
@@ -266,7 +283,10 @@ fn ignored_files(
             ],
             None,
         )?
-        .is_empty())
+        .split(|b| *b == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
     })();
     fs::remove_dir_all(directory)?;
     result
@@ -357,6 +377,17 @@ mod tests {
             !serde_json::from_value::<Input>(value.clone())
                 .unwrap()
                 .force
+        );
+        assert!(
+            !serde_json::from_value::<Input>(value.clone())
+                .unwrap()
+                .allow_ignored
+        );
+        value["allow_ignored"] = json!(true);
+        assert!(
+            serde_json::from_value::<Input>(value.clone())
+                .unwrap()
+                .allow_ignored
         );
         value["force"] = json!(true);
         assert!(serde_json::from_value::<Input>(value).unwrap().force);
