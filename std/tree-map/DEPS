@@ -1,0 +1,3 @@
+# tree-map's dependency (format `<path> <name>`, path relative to this dir): the
+# Go script worker it runs on.
+../go go
