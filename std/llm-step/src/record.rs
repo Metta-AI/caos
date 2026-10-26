@@ -326,20 +326,15 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         title: format!("fork of {}", &from.as_str()[..12]),
         content,
     };
-<<<<<<< 5f8a2ce0e90aec005f4c160e199f36bb51593e08
-    let applied = apply(&mut store, Some(&settled), &transition)?;
+    let applied = apply(&mut store, Some(from), &transition)?;
     let forked = mint_with_parents(
         &mut store,
-        &settled,
+        from,
         &merged,
         &applied,
         transition.kind(),
         &signature,
     )?;
-=======
-    let applied = apply(&mut store, Some(from), &transition)?;
-    let forked = mint(&mut store, from, &applied, transition.kind(), &signature)?;
->>>>>>> eb598e159d271351ce53dc3c551ef913e1ecb510
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
     let (claimed, _) = open_request(
         &mut state,
