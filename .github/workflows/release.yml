@@ -354,5 +354,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$CAOS_TICKET" || { echo "secret CAOS_TICKET is not set" >&2; exit 1; }
-          git remote add caos "caos://$CAOS_TICKET"
+          # The secret may hold the bare ticket or the full `caos://<ticket>`
+          # remote URL; accept both.
+          git remote add caos "caos://${CAOS_TICKET#caos://}"
           caos-cli run-tool caos-test
