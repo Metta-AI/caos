@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use caos_eval::{EvalHost, Origin};
 use caos_world::secrets::Reader;
 
-use crate::compute::{fact_get, fact_set, list_append_many, list_read};
+use crate::compute::{list_append_many, list_read, set_add_many, set_read};
 use crate::secret_store::Stored;
 use crate::{Config, HttpError};
 
@@ -110,13 +110,38 @@ impl Context {
 /// Equal oids are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one —
 /// carries the origin of what it was copied from. In front of redis, and an
 /// entry here is everything redis holds for that oid.
-static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
+///
+/// A set: [`record_origins`] and `caos_eval::with_known` test membership per
+/// fact, and against a list of tens of thousands that scan was the server's
+/// CPU. Iteration order is arbitrary, as `SMEMBERS` order already was; nothing
+/// may depend on it (see the marker in [`index_subtrees`]).
+static KNOWN_ORIGINS: Mutex<Option<HashMap<String, HashSet<Origin>>>> = Mutex::new(None);
+
+/// Facts already sent to redis for an oid that memory does not hold, by a
+/// 64-bit hash of `(oid, origin)`, so a re-index of a tree whose origins grew
+/// does not send every old fact again (141M `SADD`s in four hours on
+/// caosd-prod, nearly all repeats). A collision skips one `SADD` and so
+/// withholds one origin, which can only deny a grant, never extend one.
+static SENT: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn fact_hash(oid: &str, origin: &Origin) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    oid.hash(&mut hasher);
+    origin.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Bounds the in-memory maps; forgetting only means a later redis read.
 const MEMORY_CAP: usize = 1_000_000;
 
+// A redis SET, with a `v2` prefix. The first version was a list that took a
+// line per re-record and grew to tens of millions of entries per key, whose
+// load then dominated the server's CPU. Its keys are not read; the `indexed`
+// markers moved with it, since a marker over an empty set would claim work that
+// was never done.
 fn origins_key(oid: &str) -> String {
-    format!("caos:secrets:origins:{oid}")
+    format!("caos:secrets:origins2:{oid}")
 }
 
 fn encode_origin(origin: &Origin) -> String {
@@ -137,11 +162,11 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|map| map.get(oid).cloned())
+        .and_then(|map| map.get(oid))
     {
-        return hit;
+        return hit.iter().cloned().collect();
     }
-    let loaded: Vec<Origin> = list_read(&config.redis_addr, &origins_key(oid))
+    let loaded: Vec<Origin> = set_read(&config.redis_addr, &origins_key(oid))
         .unwrap_or_else(|e| {
             eprintln!("secrets: reading the origins of {oid}: {e}");
             Vec::new()
@@ -155,61 +180,87 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         map.clear();
     }
     let entry = map.entry(oid.to_string()).or_default();
-    for origin in loaded {
-        if !entry.contains(&origin) {
-            entry.push(origin);
-        }
-    }
-    entry.clone()
+    entry.extend(loaded);
+    entry.iter().cloned().collect()
 }
 
 /// Record each `(oid, origin)`, in redis and in memory where memory already
 /// holds that oid. An oid it does not hold is left for [`origins_of`] to load
-/// whole, so a repeat in redis costs nothing but a duplicate line.
+/// whole, so a repeat in redis is a no-op (it is a set); [`SENT`] keeps most
+/// repeats from being sent at all.
 fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
     let mut new = Vec::new();
     {
         let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
+        let mut sent_guard = SENT.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = sent_guard.get_or_insert_with(HashSet::new);
+        if sent.len() >= MEMORY_CAP {
+            sent.clear();
+        }
         for (oid, origin) in facts {
-            if let Some(known) = map.get_mut(&oid) {
-                if known.contains(&origin) {
-                    continue;
-                }
-                known.push(origin.clone());
+            let fresh = match map.get_mut(&oid) {
+                Some(known) => known.insert(origin.clone()),
+                None => sent.insert(fact_hash(&oid, &origin)),
+            };
+            if fresh {
+                new.push((origins_key(&oid), encode_origin(&origin)));
             }
-            new.push((origins_key(&oid), encode_origin(&origin)));
         }
     }
-    if let Err(e) = list_append_many(&config.redis_addr, &new) {
+    if let Err(e) = set_add_many(&config.redis_addr, &new) {
         eprintln!("secrets: recording {} origin(s): {e}", new.len());
     }
 }
 
-/// The values whose subtrees are recorded, with the origins they were recorded
-/// under. In front of a redis marker per entry.
-static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The `(tree, origin)` pairs whose subtrees are recorded, by a 64-bit hash of
+/// the pair. In front of the redis set `caos:secrets:indexed3:<tree>`, which
+/// holds the encoded origins already propagated down that tree. A collision
+/// skips one propagation, which withholds an origin and so can only deny a
+/// grant, never extend one.
+static INDEXED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn indexed_key(tree: &str) -> String {
+    format!("caos:secrets:indexed3:{tree}")
+}
 
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
+///
+/// Per `(tree, origin)`, not per tree and its whole origin set: a shared subtree
+/// gains an origin with every root that contains it, and a marker over the set
+/// missed each time, so the whole subtree was walked again for all of its
+/// (tens of thousands of) origins. Now only the origins not yet propagated are
+/// walked.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
-    let mut marker = format!("caos:secrets:indexed:{tree}");
-    for origin in origins {
-        marker.push('\n');
-        marker.push_str(&encode_origin(origin));
-    }
-    let marker = format!("caos:secrets:indexed:{}", blob_oid(marker.as_bytes()));
-    {
+    let unknown: Vec<&Origin> = {
         let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
         let indexed = guard.get_or_insert_with(HashSet::new);
         if indexed.len() >= MEMORY_CAP {
             indexed.clear();
         }
-        if !indexed.insert(marker.clone()) {
-            return Ok(());
-        }
+        origins
+            .iter()
+            .filter(|origin| indexed.insert(fact_hash(tree, origin)))
+            .collect()
+    };
+    if unknown.is_empty() {
+        return Ok(());
     }
-    if matches!(fact_get(&config.redis_addr, &marker), Ok(Some(_))) {
+    // One read of what redis holds for this tree, only when memory could not
+    // answer for some origin.
+    let done: HashSet<String> = set_read(&config.redis_addr, &indexed_key(tree))
+        .unwrap_or_else(|e| {
+            eprintln!("secrets: reading what is indexed under {tree}: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .collect();
+    let origins: Vec<&Origin> = unknown
+        .into_iter()
+        .filter(|origin| !done.contains(&encode_origin(origin)))
+        .collect();
+    if origins.is_empty() {
         return Ok(());
     }
     let repo = config.repo.to_thread_local();
@@ -236,7 +287,7 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
             } else {
                 format!("{rel}/{}", entry.filename)
             };
-            for origin in origins {
+            for origin in &origins {
                 facts.push((
                     entry.oid.to_string(),
                     Origin {
@@ -253,7 +304,11 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
         }
     }
     record_origins(config, facts);
-    if let Err(e) = fact_set(&config.redis_addr, &marker, "1") {
+    let marks: Vec<(String, String)> = origins
+        .iter()
+        .map(|origin| (indexed_key(tree), encode_origin(origin)))
+        .collect();
+    if let Err(e) = set_add_many(&config.redis_addr, &marks) {
         eprintln!("secrets: marking {tree} indexed: {e}");
     }
     Ok(())
@@ -357,9 +412,8 @@ pub(crate) fn evaluated(
         .iter()
         .filter(|secret| {
             secret.readers.iter().any(|reader| {
-                origins
-                    .iter()
-                    .any(|origin| matches(config, context, reader, origin))
+                let matcher = Matcher::new(config, context, reader);
+                origins.iter().any(|origin| matcher.matches(origin))
             })
         })
         .collect();
@@ -451,45 +505,86 @@ pub(crate) fn granted_names(
     names
 }
 
-fn matches(config: &Config, context: &Context, reader: &Reader, origin: &Origin) -> bool {
-    let outcome = match reader {
-        Reader::Locator { locator, since } => match context.pins.get(locator) {
-            Some(Some(pinned)) => match_locator(config, pinned, since.as_deref(), origin),
-            _ => Ok(false),
-        },
-        Reader::Conversation { path, conversation } => {
-            if context.conversation.as_deref() != Some(conversation.as_str()) {
-                return false;
-            }
-            match &context.head {
-                Some(head) => match_conversation(config, head, path, origin),
-                None => Ok(false),
+/// A reader, resolved once for a node's origins. A shared subtree has tens of
+/// thousands of them, and the per-origin work this used to do (parse the
+/// locator, split both paths into owned `Vec`s, rebuild the roots-cache key)
+/// was most of the server's CPU once the membership scans were gone.
+enum Matcher<'a> {
+    /// Nothing can match: no pin, another conversation, no head yet, or a
+    /// locator that could not be resolved (reported once, here).
+    Never,
+    Locator {
+        dir: Vec<String>,
+        roots: Arc<HashSet<String>>,
+    },
+    Conversation {
+        config: &'a Config,
+        head: &'a str,
+        path: &'a str,
+    },
+}
+
+impl<'a> Matcher<'a> {
+    fn new(config: &'a Config, context: &'a Context, reader: &'a Reader) -> Self {
+        match reader {
+            Reader::Locator { locator, since } => match context.pins.get(locator) {
+                Some(Some(pinned)) => {
+                    let resolved = git_locator::parse_git_ref(pinned).and_then(|git_ref| {
+                        let roots = crate::grant_history::allowed_roots(
+                            config,
+                            &git_ref,
+                            since.as_deref(),
+                        )?;
+                        let dir: Vec<String> = components(git_ref.dir.as_deref().unwrap_or(""))
+                            .map(str::to_string)
+                            .collect();
+                        Ok((dir, roots))
+                    });
+                    match resolved {
+                        Ok((dir, roots)) => Matcher::Locator { dir, roots },
+                        Err(e) => {
+                            eprintln!(
+                                "secrets: a reader could not be checked, so it grants nothing: {e}"
+                            );
+                            Matcher::Never
+                        }
+                    }
+                }
+                _ => Matcher::Never,
+            },
+            Reader::Conversation { path, conversation } => {
+                if context.conversation.as_deref() != Some(conversation.as_str()) {
+                    return Matcher::Never;
+                }
+                match &context.head {
+                    Some(head) => Matcher::Conversation { config, head, path },
+                    None => Matcher::Never,
+                }
             }
         }
-    };
-    outcome.unwrap_or_else(|e| {
-        eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
-        false
-    })
-}
-
-fn components(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect()
-}
-
-fn match_locator(
-    config: &Config,
-    locator: &str,
-    since: Option<&str>,
-    origin: &Origin,
-) -> Result<bool, String> {
-    let git_ref = git_locator::parse_git_ref(locator)?;
-    if components(git_ref.dir.as_deref().unwrap_or("")) != components(&origin.path) {
-        return Ok(false);
     }
-    Ok(crate::grant_history::allowed_roots(config, &git_ref, since)?.contains(&origin.root))
+
+    fn matches(&self, origin: &Origin) -> bool {
+        match self {
+            Matcher::Never => false,
+            Matcher::Locator { dir, roots } => {
+                components(&origin.path).eq(dir.iter().map(String::as_str))
+                    && roots.contains(&origin.root)
+            }
+            Matcher::Conversation { config, head, path } => {
+                match_conversation(config, head, path, origin).unwrap_or_else(|e| {
+                    eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
+                    false
+                })
+            }
+        }
+    }
+}
+
+/// The path's components, as a borrowing iterator so a comparison allocates
+/// nothing.
+fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|c| !c.is_empty() && *c != ".")
 }
 
 /// The tree of the conversation's head commit, or `None` with no head yet.
@@ -517,8 +612,8 @@ fn match_conversation(
     path: &str,
     origin: &Origin,
 ) -> Result<bool, String> {
-    let parts = components(path);
-    let rest = components(&origin.path);
+    let parts: Vec<&str> = components(path).collect();
+    let rest: Vec<&str> = components(&origin.path).collect();
     if rest.len() > parts.len() || parts[parts.len() - rest.len()..] != rest[..] {
         return Ok(false);
     }

@@ -2,7 +2,8 @@
 //
 // Exercises the server's HTTP surface for ONE expression line with nothing but
 // net/http: `/eval/<verb>` blocks for the answer, `/start/<verb>` returns a
-// ticket, `/result/<ticket>` reports on it. The arguments are `caos-cli run`'s,
+// ticket, `/result/<ticket>` reports on it, `/wait/<ticket>` blocks for it
+// (`/eval` is a start and a wait), and `/status/<ticket>` shows its work. The arguments are `caos-cli run`'s,
 // with the type in the parameter's name (`base:hash=…`).
 //
 // It blocks on the server from inside a worker, like every client test does
@@ -176,6 +177,25 @@ func main() {
 		w.True(code == 200 && again == ticket, "restarting a finished call minted %q", again)
 		_, now := call("GET", "/result/"+ticket, "")
 		w.True(now == state, "the answer changed from %q to %q", state, now)
+
+		w.Step("a ticket is a node of the trace, so watch and status take it")
+		// Finished, it has no current work, which is what ends a `watch`; what
+		// happened is kept, and the request it ran is one of its children.
+		code, body = call("GET", "/status/"+ticket, "")
+		w.True(code == 200 && body == "null", "a finished ticket should have no current work, got HTTP %d: %q", code, body)
+		code, body = call("GET", "/status/"+ticket+"?all=1", "")
+		w.True(code == 200 && strings.HasPrefix(body, "{") && strings.Contains(body, "children"),
+			"a finished ticket should keep its history, got HTTP %d: %q", code, body)
+
+		w.Step("run is start and then waiting: one call, one ticket, one answer")
+		// This is the call the first step ran with /eval/run.
+		code, same := call("POST", "/start/run?"+query("base:hash", hello, "msg", "hi", "salt", salt), "")
+		w.True(code == 200 && len(same) == 40, "start: HTTP %d: %q", code, same)
+		w.True(await(same, 600) == "ok "+viaExpr, "starting what /eval/run answered gave a different answer")
+		code, body = call("GET", "/wait/"+same, "")
+		w.True(code == 200 && body == viaExpr, "/wait said %q (HTTP %d), /eval/run said %q", body, code, viaExpr)
+		code, body = call("GET", "/wait/0000000000000000000000000000000000000002", "")
+		w.True(code == 404, "waiting for a ticket nobody started: expected 404, got %d: %s", code, body)
 
 		w.Step("a failed ticket reports the failure, and asking never re-dispatches")
 		code, doomed := call("POST", "/start/run?"+query("base:hash", "0000000000000000000000000000000000000001", "salt", salt), "")

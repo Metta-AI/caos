@@ -1,5 +1,31 @@
 Read ./SPEC.md
 
+# Running the tests
+
+An agent session runs them with `caos-std/caos-test`, not `cargo test` (there is
+no shell). It compiles the tree it is given inside workers and runs the unit
+tests plus every `tests/<name>`:
+
+```
+run_tool(path="caos-std/caos-test",
+         arguments={"in": "sources/caos/<layer>", "only": "git-import"})
+```
+
+- `in` is the source tree you edited. Omitting it tests the tree the tool sits
+  in, which is not your change.
+- `only` takes bare `tests/` directory names, space-separated, no `tests/`
+  prefix. Use it while iterating; run the whole suite before you finish.
+- `test-salt=<fresh value>` re-runs cached tests. Use it for anything on a push
+  path (see below).
+- `caos-std/caos-test-result` with a hash from the report prints one test's
+  full output or an inner stack log; `caos-std/read-trace` prints timings.
+- `caos-std/caos-build` runs `nix build`, which the suite does not cover (see
+  "Before committing").
+- A test you add is an entry under `tests/<name>/`; see "Tests" below.
+
+Run these, and read the pitfalls under "Before committing", before reporting a
+change done. "I could not run the tests" means you did not read this section.
+
 # Shell, under `set -euo pipefail`
 
 Every script here runs with it, and two constructs quietly break under it.
@@ -36,6 +62,17 @@ Every script here runs with it, and two constructs quietly break under it.
   pipeline reports `cmd`'s 141, so a condition that was true reads as false. The
   stack daemon's `harvest` exported nothing for that reason, with no error.
   Capture instead: `[ -n "$(cmd)" ]`.
+- **A new worker is Go, not bash.** Write it as a script on `std/go`
+  (`curry --base:@=DEEP-DEPS/go --worker1:@=worker.go`), importing `caos/w`
+  for the error policy and the worker CLI; a new test is `worker.go` on
+  `DEEP-DEPS/go` the same way (`tests/create-squashed-stack`,
+  `tests/flake-update`). The bash workers and tests in this tree predate
+  `std/go` and are not the pattern to copy. Bash is left for the interpreters'
+  own three-line `/worker` scripts (`std/bash`, `std/go`). When the image has to
+  be something else because of what it carries (nix, in `std/flake-builder` and
+  `std/flake-update`), the flake COMPILES the Go worker into it as a program of
+  `std/go/prelude` (`std/flake-update/flake.nix`) rather than falling back to a
+  shell script.
 - **A worker script only has what its image's flake lists.** `std/bash` is
   bash, coreutils, diffutils, gnugrep, findutils and jq — there is **no
   `sed`**, and no awk. `sed 's/^/  /'` in `std/caos-test/worker.sh` passed two

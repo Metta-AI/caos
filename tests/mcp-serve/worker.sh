@@ -332,6 +332,110 @@ case "$subjects" in
   *) fail "the held request was not closed before the next one opened: $subjects" ;;
 esac
 
+echo "== a started call is declared before its ticket, so the Stop right behind it holds the request ==" >&2
+# `start` answers at once and the model usually ends its turn straight after the
+# ticket, so the turn's Stop lands in the gap before a job could declare its own
+# call. A Stop that saw no declared call closed the request, and the job then
+# failed with "no active request" -- and kept failing, for its ticket is the call's
+# id. The server declares the call before it answers, so there is no gap.
+started="mcp-start-$(date +%s)-$$"
+hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$started\",\"prompt\":\"start slow\"}"
+started_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$started" | od -An -tx1 | tr -d ' \n')/head"
+send "$(jq -nc --arg session "$started" --arg path "${prefix}slow" --arg request_id "$started" \
+  '{jsonrpc:"2.0",id:40,method:"tools/call",params:{name:"start",arguments:{
+    caos_session:$session,caos_tool_use_id:"started-40",path:$path,
+    arguments:{seconds:"15","request-id":$request_id}}}}')"
+ticket_answer=$(await '"id":40' 120) || fail "start never answered"
+ticket=$(printf '%s' "$ticket_answer" | grep -oE 'ticket: [0-9a-f]{40}' | head -1 | cut -d' ' -f2)
+[ -n "$ticket" ] || fail "start returned no ticket: $ticket_answer"
+# The Stop goes in IMMEDIATELY, with nothing awaited between the ticket and it.
+hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$started\",\"last_assistant_message\":\"started it, will check back\"}"
+git fetch -q caos "+$started_ref:$started_ref"
+if [ "$(git log -1 --format=%s "$started_ref")" = request.terminal ]; then
+  fail "Stop closed a request whose started call was not yet declared"
+fi
+# The ticket still resolves to the tool's own result, polled as a model would.
+finished=""
+for poll in $(seq 41 160); do
+  send "$(jq -nc --argjson id "$poll" --arg session "$started" --arg ticket "$ticket" \
+    '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:"result",arguments:{
+      caos_session:$session,caos_tool_use_id:("started-"+($id|tostring)),ticket:$ticket}}}')"
+  polled=$(await "\"id\":$poll" 60) || fail "result never answered"
+  case "$polled" in
+    *pending:*) sleep 1 ;;
+    *) finished=$polled; break ;;
+  esac
+done
+case "$finished" in
+  *'slept 15'*) ;;
+  *) fail "a started call that outlived its turn lost its result: ${finished:-never finished}" ;;
+esac
+# Starting a call with no request open fails in the call itself, not in a ticket.
+hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$started\",\"last_assistant_message\":\"done\"}"
+send "$(jq -nc --arg session "$started" --arg path "${prefix}slow" --arg request_id "$started-late" \
+  '{jsonrpc:"2.0",id:200,method:"tools/call",params:{name:"start",arguments:{
+    caos_session:$session,caos_tool_use_id:"started-200",path:$path,
+    arguments:{seconds:"1","request-id":$request_id}}}}')"
+late=$(await '"id":200' 120) || fail "a start with no open request never answered"
+case "$late" in
+  *'found none open'*) ;;
+  *) fail "a start with no open request did not fail in the call: $late" ;;
+esac
+
+echo "== a started call is run and read back on the round that declared it ==" >&2
+# `start` declares its call and answers at once, and the model's NEXT caos call
+# declares on the round after -- while the started one has yet to run, or finish.
+# The protocol used to accept a tool completion only on the latest round, so the
+# started call's completion was refused and recording that failure ended the
+# request; every later call in the turn then found no request open. A flat
+# transcript accepts the completion on the round that declared it.
+behind="mcp-behind-$(date +%s)-$$"
+hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$behind\",\"prompt\":\"start slow, then call again\"}"
+send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_id "$behind" \
+  '{jsonrpc:"2.0",id:300,method:"tools/call",params:{name:"start",arguments:{
+    caos_session:$session,caos_tool_use_id:"behind-300",path:$path,
+    arguments:{seconds:"20","request-id":$request_id}}}}')"
+ticket_answer=$(await '"id":300' 120) || fail "start never answered"
+ticket=$(printf '%s' "$ticket_answer" | grep -oE 'ticket: [0-9a-f]{40}' | head -1 | cut -d' ' -f2)
+[ -n "$ticket" ] || fail "start returned no ticket: $ticket_answer"
+# A second call, right behind the ticket and finished long before the started one.
+send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_id "$behind-quick" \
+  '{jsonrpc:"2.0",id:301,method:"tools/call",params:{name:"run",arguments:{
+    caos_session:$session,caos_tool_use_id:"behind-301",path:$path,
+    arguments:{seconds:"0","request-id":$request_id}}}}')"
+quick=$(await '"id":301' 300) || fail "the call behind the started one never answered"
+case "$quick" in
+  *'slept 0'*) ;;
+  *) fail "the call behind the started one failed: $quick" ;;
+esac
+# The started call still finishes, and its ticket carries its result.
+finished=""
+for poll in $(seq 302 420); do
+  send "$(jq -nc --argjson id "$poll" --arg session "$behind" --arg ticket "$ticket" \
+    '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:"result",arguments:{
+      caos_session:$session,caos_tool_use_id:("behind-"+($id|tostring)),ticket:$ticket}}}')"
+  polled=$(await "\"id\":$poll" 60) || fail "result never answered"
+  case "$polled" in
+    *pending:*) sleep 1 ;;
+    *) finished=$polled; break ;;
+  esac
+done
+case "$finished" in
+  *'slept 20'*) ;;
+  *) fail "a started call lost its result once another call was declared behind it: ${finished:-never finished}" ;;
+esac
+# And the request is still usable: a third call in the same turn runs.
+send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_id "$behind-after" \
+  '{jsonrpc:"2.0",id:421,method:"tools/call",params:{name:"run",arguments:{
+    caos_session:$session,caos_tool_use_id:"behind-421",path:$path,
+    arguments:{seconds:"0","request-id":$request_id}}}}')"
+after=$(await '"id":421' 300) || fail "the call after the started one never answered"
+case "$after" in
+  *'slept 0'*) ;;
+  *) fail "the request did not survive the started call's completion: $after" ;;
+esac
+hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$behind\",\"last_assistant_message\":\"done\"}"
+
 close_server
 
 echo "== an unreachable caos server is named, not waited on ==" >&2

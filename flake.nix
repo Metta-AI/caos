@@ -3,6 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Claude Code for the watchdog's responder. nixpkgs' copy lags by weeks
+    # and the API refuses old clients for new models ("Claude Code 2.1.260
+    # does not support this model; 2.1.280 or newer is required", seen
+    # 2026-10-30); this flake tracks Anthropic's release manifest.
+    claude-code = {
+      url = "github:sadjow/claude-code-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -13,8 +21,8 @@
 
     flake-utils.url = "github:numtide/flake-utils";
 
-    # The Hermes gateway bundled into a caos stack by stack/serve under
-    # CAOS_STACK_HERMES=yes (the default). Own nixpkgs, deliberately NOT
+    # The Hermes gateway `hermes-gateway` runs (integrations/hermes/gateway),
+    # separately from any caos stack. Own nixpkgs, deliberately NOT
     # `follows`'d to this flake's -- its pinning is its own project's
     # concern, and the two never share a build.
     hermes-agent.url = "github:NousResearch/hermes-agent";
@@ -24,6 +32,7 @@
     {
       self,
       nixpkgs,
+      claude-code,
       rust-overlay,
       crane,
       flake-utils,
@@ -51,24 +60,6 @@
         # Rust workspace on every commit, so a docs-only commit would rebuild
         # everything.
         caosRev = self.rev or self.dirtyRev or "unknown";
-
-        # The commit the bundled Hermes gateway pins --llm-step to
-        # (CAOS_STACK_HERMES_REV, stack/serve): its build product carries no
-        # .git for caos-mcp-launch to rev-parse itself, so this has to be
-        # baked in at the SAME point `caosRev` is -- the only place a git
-        # rev is available at all. `caosRev`'s own "unknown" fallback would
-        # be a fetchable-looking but bogus rev here, so this falls back to
-        # "" instead (stack/serve's resolver treats empty as absent and
-        # reports why, rather than trying to fetch literal commit "unknown").
-        # `dirtyRev`'s own "-dirty" suffix is cosmetic -- the sha underneath
-        # is still a real, potentially-fetchable commit -- so it is stripped
-        # rather than carried into a `rev=` that would otherwise read as
-        # "rev must be a full-length commit sha, got \"<sha>-dirty\"".
-        caosHermesRev =
-          let
-            r = self.rev or self.dirtyRev or "";
-          in
-          if r == "" then "" else nixpkgs.lib.removeSuffix "-dirty" r;
 
         # The Linux system whose binaries the Docker images carry. We build for
         # the host's architecture (no arch-cross), so on Linux this is just the
@@ -551,46 +542,10 @@
             # own, and flock(1) to serialise the copy that precedes it —
             # several containers seed one volume (see stack/bootstrap).
             linuxPkgs.util-linux
-            # Bridges the bundled Hermes gateway to a desktop client over iroh
-            # (stack/serve's CAOS_STACK_HERMES=yes block): `dumbpipe listen-tcp`
-            # splices to the gateway's own loopback-bound port, and the client
-            # side runs the SAME stock binary with `connect-tcp`. No caos-authored
-            # protocol here on purpose -- see design/iroh-transport.md's token
-            # rationale, which does not apply to a single-operator bridge with no
-            # other identity to protect: the gateway's own auth gate is off
-            # entirely (loopback bind), so the ticket IS the only credential,
-            # same security shape a caos-authored token would have added nothing
-            # over.
-            linuxPkgs.dumbpipe
             (if pkgs.stdenv.hostPlatform.isLinux then
               linuxPkgs.docker-client.override { buildxSupport = false; composeSupport = false; }
             else
               linuxPkgs.docker-client)
-            # The bundled Hermes gateway (CAOS_STACK_HERMES=yes, the
-            # default) -- `minimal`, not `default`/`desktop`: this stack
-            # never opens a browser UI, it only ever serves the headless
-            # JSON-RPC/WebSocket backend a Desktop app attaches to remotely.
-            #
-            # `.override { extraDependencyGroups = [ "anthropic" ]; }`,
-            # NOT PLAIN `minimal`: hermes-agent's own provider SDKs (the
-            # `anthropic` PyPI package, for the Anthropic provider) are an
-            # opt-in dependency GROUP, absent from `minimal` by design —
-            # hermes-agent's own flake builds an `anthropic`-carrying
-            # `full`/`default` package for exactly this reason, with a
-            # comment that says why plainly: "lazy-install can't write to
-            # the read-only /nix/store". Confirmed the hard way: hermes's
-            # own lazy-install gate (`pm/client.py`'s `sync_venv`) refuses
-            # UNCONDITIONALLY — not fixable via `security.allow_lazy_installs`
-            # in config.yaml at all -- the moment it is not running from a
-            # venv IT manages, and a Nix-built interpreter never is one
-            # ("a Nix Python" is named explicitly in that function's own
-            # comment as one of the refused cases). `full` would also work
-            # but drags in azure/bedrock/daytona/matrix/tts-premium/etc. --
-            # nothing this stack has a use for -- so only the one group
-            # actually needed is named here, not the whole bundle.
-            (hermes-agent.packages.${linuxSystem}.minimal.override {
-              extraDependencyGroups = [ "anthropic" ];
-            })
         ];
         stackEnv = [
           "PATH=/bin"
@@ -737,9 +692,8 @@ sandbox = false''
             printf 'root:x:0:0:root:/root:/bin/bash\n' > etc/passwd
             printf 'root:x:0:\n' > etc/group
             # /usr/bin/env, for every `#!/usr/bin/env ...`-shebanged script
-            # this image runs that ISN'T caos's own -- the bundled Hermes
-            # gateway's own scripts (its `#!/usr/bin/env bash` MCP launcher)
-            # chiefly. Worker images get this for free from the
+            # this image runs that ISN'T caos's own. Worker images get this
+            # for free from the
             # `layer-additions/usr/bin/env` the flake-builder stacks on at
             # build-builtins.sh time (see AGENTS.md) -- but this image is
             # the one caosd runs DIRECTLY, with nothing stacked onto it, and
@@ -1023,22 +977,12 @@ sandbox = false''
         # `<inputs>/bin/<name>` exactly as it would in a plain build output. The
         # images keep their store basenames, which is how build-builtins maps
         # each back to its builtin (`*-caos-worker-<name>.tar.gz`).
-        #
-        # `hermes-profile` is `integrations/hermes/` (the Hermes profile
-        # distribution for the bundled gateway `stack/serve` optionally starts
-        # under CAOS_STACK_HERMES=yes) as a REAL build product, not a path into
-        # the source tree: `stack/serve` runs inside a container that has this
-        # `nix build` result and nothing else of the checkout, so the tree
-        # itself is not a thing to point at. `cp`, not a symlink -- a profile
-        # install may want to touch its own copy, and the store's is read-only.
         stackInputs =
           pname: bins:
           pkgs.runCommand pname { } ''
             mkdir -p $out/images
             ln -s ${bins}/bin $out/bin
             ${pkgs.lib.concatMapStringsSep "\n" (i: "ln -s ${i} $out/images/") builtinWorkerImages}
-            cp -r ${./integrations/hermes} $out/hermes-profile
-            chmod -R u+w $out/hermes-profile
           '';
 
         # The dev stack's control command. Subcommands:
@@ -1232,7 +1176,6 @@ sandbox = false''
             # path. It also means this command needs no `git` of its own, which
             # is why it now carries almost no runtime inputs.
             DEV_VOLUME=caos-vol-caos-dev
-            REPACK_THRESHOLD=16
 
             # Is anything alive that could be READING a server repo? Two
             # sources, and both are needed — the same pair `image-cleanup`
@@ -1256,16 +1199,12 @@ sandbox = false''
               [ -n "$running" ]
             }
 
-            # ONE container, and it decides per repo. The threshold is a bound
-            # on ONE repository's slot table, so summing two repos' packs and
-            # comparing that would repack a 1 GB store because the other one
-            # grew. Counting inside also removes the window a count-then-repack
-            # pair would leave between them.
-            #
-            # The threshold rides in as `$1` rather than being interpolated
-            # into the script text: this is a nix string containing a shell
-            # string containing a shell script, and that is two layers of
-            # quoting too many to add a third.
+            # ONE container for both repos. `--geometric=2` merges only the
+            # small recent packs and keeps unreachable objects (nearly every
+            # object here), so it is cheap enough to run on every `up` without a
+            # pack-count threshold: 0.5s for a suite's 400 packs, where `-a`
+            # rewrote the whole store (12 minutes at 8,000 packs). It is a no-op
+            # on an already-consolidated repo.
             repack_repos() {
               # Skipped rather than fatal: a person running `up` while a suite
               # is in flight wants a stack, not homework, and the next idle
@@ -1277,16 +1216,12 @@ sandbox = false''
               docker run --rm --entrypoint /bin/bash \
                 -v "$CAOS_DATA/stack:/host" -v "$DEV_VOLUME:/dev-stack" \
                 caos-stack:latest -c '
-                  limit=$1
                   for d in /host/git /dev-stack/git; do
                     [ -d "$d" ] || continue
-                    packs=$(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l)
-                    if [ "$packs" -gt "$limit" ]; then
-                      echo "==> repacking $d ($packs packs)" >&2
-                      git -C "$d" repack -adkq || exit 1
-                    fi
+                    echo "==> consolidating $d ($(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l) packs)" >&2
+                    git -C "$d" -c gc.auto=0 repack --geometric=2 -dq || exit 1
                   done
-                ' _ "$REPACK_THRESHOLD" \
+                ' \
                 || die "repacking the server repos"
             }
 
@@ -1421,37 +1356,6 @@ sandbox = false''
               iroh_publish=()
               if [ "$IROH" = yes ]; then iroh_publish=(-p 11204:11204/udp); fi
 
-              # The bundled Hermes gateway's port, published WITHOUT a host-IP
-              # prefix (matching :9090 and $REGISTRY_PORT above) -- NOT
-              # loopback-only. `caosd up` itself usually runs inside a
-              # container (agent-sandbox, say): a host-side `127.0.0.1:…`
-              # bind is scoped to loopback ONE LEVEL UP (whatever netns the
-              # docker daemon answering this `docker run` lives in), so a
-              # request arriving at THAT container's own external interface
-              # from an outer port-forward -- exactly how "reach it from
-              # outside the sandbox" gets there -- does not match loopback
-              # and is refused. The SAME reasoning that put hermes itself on
-              # 0.0.0.0 instead of its own loopback, one layer further out.
-              # Independent of the iroh relay below
-              # (CAOS_STACK_IROH_HERMES_PORT). An ARRAY for the same reason as
-              # iroh_publish above: "no port" has to be no argument, not an
-              # empty one.
-              HERMES_PORT="''${CAOS_STACK_HERMES_PORT:-9119}"
-              hermes_publish=()
-              if [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                hermes_publish=(-p "$HERMES_PORT:$HERMES_PORT")
-              fi
-
-              # The hermes-only iroh relay's own UDP port (stack/serve,
-              # CAOS_STACK_IROH_HERMES_PORT, default 11205) -- a SEPARATE
-              # endpoint from the main caos-iroh one above, so its own port,
-              # published the same way for the same reason.
-              HERMES_IROH_PORT="''${CAOS_STACK_IROH_HERMES_PORT:-11205}"
-              hermes_iroh_publish=()
-              if [ "$IROH" = yes ] && [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                hermes_iroh_publish=(-p "$HERMES_IROH_PORT:$HERMES_IROH_PORT/udp")
-              fi
-
               # WHAT GOES IN THE TICKET: exactly what the operator names,
               # and nothing else.
               #
@@ -1504,6 +1408,24 @@ sandbox = false''
                 || docker network create "$NET" >/dev/null
               docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+              # EVERY WORKER LEFT ON THIS ENGINE IS AN ORPHAN NOW. runnerd labels
+              # what it starts with its own container id, and that container is
+              # the one removed just above; no replacement will ever reap them
+              # (it reaps only EXITED containers carrying ITS id, and the id is
+              # new on every `up`). A dev-stack worker orphaned by a restart
+              # kept running for three days on caosd-prod, and
+              # `caos_containers_running` then made every later `up` skip the
+              # repack: the shared dev repo went from 1 pack to 8,583, every
+              # object read got slower with each of them, and a suite that
+              # takes 2.5 minutes took 68. Removing them is not new damage: the
+              # server they were polling is gone, so no job they hold can
+              # finish.
+              mapfile -t orphans < <(docker ps -aq --filter label=caos.runnerd.owner)
+              if [ "''${#orphans[@]}" -gt 0 ]; then
+                echo "==> removing ''${#orphans[@]} worker(s) orphaned by the stack just removed" >&2
+                docker rm -f "''${orphans[@]}" >/dev/null
+              fi
+
               # Docker creates a missing bind source as root. Create it as the
               # invoking user before repack_repos mounts it and tree staging writes it.
               mkdir -p "$CAOS_DATA/stack"
@@ -1549,7 +1471,7 @@ sandbox = false''
                 --network-alias caos-redis \
                 --cap-add SYS_ADMIN \
                 --security-opt apparmor=unconfined \
-                -p 9090:80 -p "$REGISTRY_PORT:5000" "''${iroh_publish[@]}" "''${hermes_publish[@]}" "''${hermes_iroh_publish[@]}" \
+                -p 9090:80 -p "$REGISTRY_PORT:5000" "''${iroh_publish[@]}" \
                 -v "$CAOS_DATA/stack:/state" \
                 -v caos-vol-mounted-nix:/mounted-nix \
                 -v /var/run/docker.sock:/var/run/docker.sock \
@@ -1572,13 +1494,6 @@ sandbox = false''
                 -e CAOS_STACK_IROH="$IROH" \
                 -e CAOS_STACK_IROH_ADVERTISE="$IROH_ADVERTISE" \
                 -e CAOS_IROH_RELAY="''${CAOS_IROH_RELAY:-}" \
-                -e CAOS_STACK_HERMES="''${CAOS_STACK_HERMES:-yes}" \
-                -e CAOS_STACK_HERMES_PORT="$HERMES_PORT" \
-                -e CAOS_STACK_HERMES_REV="${caosHermesRev}" \
-                -e CAOS_STACK_HERMES_OIDC_ISSUER="''${CAOS_STACK_HERMES_OIDC_ISSUER:-}" \
-                -e CAOS_STACK_HERMES_OIDC_CLIENT_ID="''${CAOS_STACK_HERMES_OIDC_CLIENT_ID:-}" \
-                -e CAOS_STACK_HERMES_OIDC_CLIENT_SECRET="''${CAOS_STACK_HERMES_OIDC_CLIENT_SECRET:-}" \
-                -e CAOS_STACK_IROH_HERMES_PORT="$HERMES_IROH_PORT" \
                 -e CAOS_STACK_RUNNER_SERVER_URL=http://caos-server \
                 -e CAOS_STACK_RUNNER_REDIS_ADDR=caos-redis:6379 \
                 -e CAOS_REGISTRY_PULL_HOST="$REGISTRY" \
@@ -1678,15 +1593,6 @@ sandbox = false''
               fi
 
               echo "==> stack up. 'caosd logs' to follow, 'caosd down' to stop." >&2
-              if [ "''${CAOS_STACK_HERMES:-yes}" = yes ]; then
-                echo "==> hermes gateway bound to 127.0.0.1:$HERMES_PORT inside the container --" >&2
-                echo "    its own login is off (loopback bind); reach it over the iroh bridge:" >&2
-                echo "    ticket in \$CAOS_DATA/stack/iroh-hermes/ticket, then on the" >&2
-                echo "    desktop: dumbpipe connect-tcp --addr 127.0.0.1:$HERMES_PORT <ticket>" >&2
-                echo "    Desktop's own Remote-gateway form still wants a Session token (its" >&2
-                echo "    Add-connection dialog always does, even when the backend needs none)" >&2
-                echo "    -- it's 'caos' (\$CAOS_DATA/stack/hermes-gateway-ws.secret) unless overridden" >&2
-              fi
               ;;
             down)
               echo "==> stopping stack (CAOS_DATA kept; 'caosd reset' wipes it)" >&2
@@ -1731,9 +1637,46 @@ sandbox = false''
             esac
           '';
         };
+
+        # `nix run .#hermes-gateway`: a Hermes gateway wired to a caos server,
+        # run on its own rather than inside `caosd` (integrations/hermes/gateway
+        # says how, and what it reads). Null where hermes-agent has no build
+        # for this system, so the outputs below simply omit it.
+        #
+        # The anthropic group is not optional: Hermes's own lazy-install
+        # refuses to write into a Nix-built interpreter, so the provider SDK has
+        # to be in the package. `full` would carry azure, bedrock, matrix and
+        # more that nothing here uses.
+        hermesGateway =
+          if hermes-agent.packages ? ${system} then
+            pkgs.writeShellApplication {
+              name = "hermes-gateway";
+              runtimeInputs = [
+                (hermes-agent.packages.${system}.minimal.override {
+                  extraDependencyGroups = [ "anthropic" ];
+                })
+                # The bridge to a desktop over iroh: `listen-tcp` here,
+                # `connect-tcp` on the client, both the stock binary.
+                pkgs.dumbpipe
+                # caos-mcp-launch's `git ls-remote`, and the script's own tools.
+                pkgs.gitMinimal
+                pkgs.coreutils
+                pkgs.gnugrep
+                pkgs.gnused
+                pkgs.gawk
+              ];
+              text = ''
+                export CAOS_HERMES_PROFILE=${./integrations/hermes}
+                export CAOS_HERMES_CLI=${caos-cli}/bin/caos-cli
+                export SSL_CERT_FILE=''${SSL_CERT_FILE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}
+                exec bash ${./integrations/hermes/gateway} "$@"
+              '';
+            }
+          else
+            null;
       in
       {
-        packages = {
+        packages = nixpkgs.lib.optionalAttrs (hermesGateway != null) { hermes-gateway = hermesGateway; } // {
           # The client a cloud container can actually exec, built for the
           # container's architecture rather than this machine's. `caosd up`
           # pushes it into caosd; see `clientForTarget`.
@@ -1758,7 +1701,22 @@ sandbox = false''
             # Bake in the flake this driver came from, so `nix run <ref>#...`
             # applies the host config from <ref> rather than from main.
             ldflags = [ "-X main.defaultFlake=path:${self}" ];
-            vendorHash = "sha256-1+bSEs1daOIaXWddfmkEOsxcyn/zBzB/0T29YGw+RCw=";
+            # NOTE: the vendor tree includes caos/w through the `replace`, so this
+            # hash moves whenever std/go/prelude changes, not only go.mod. The
+            # cache workflow builds this on every push and is what notices.
+            vendorHash = "sha256-D2Tg239wTsZ1zz7Nkj7ZidEeQ5/hRv7fRg7Qc4r09SA=";
+          };
+
+          # The watchdog-prod host's program (prod/watchdog): probes, the
+          # Datadog poller and the Claude session runner, one binary. Same
+          # shape as the deploy driver above, same caos/w error policy.
+          caos-watchdog = pkgs.buildGoModule {
+            pname = "caos-watchdog";
+            version = "0.1.0";
+            src = ./.;
+            modRoot = "prod/watchdog";
+            meta.mainProgram = "caos-watchdog";
+            vendorHash = "sha256-hpilWVREkwmhu9LczVyfYMPZuaZRtm1iNJk62n+aRO4=";
           };
 
           # `nix build` (no attr) yields the PINNED host tools: caos-cli,
@@ -1806,7 +1764,13 @@ sandbox = false''
           caosImage = builderImage;
         };
 
-        apps = {
+        apps = nixpkgs.lib.optionalAttrs (hermesGateway != null) {
+          # A Hermes gateway for a caos server, on its own (not part of caosd).
+          hermes-gateway = {
+            type = "app";
+            program = "${hermesGateway}/bin/hermes-gateway";
+          };
+        } // {
           # Bring the whole stack up in the foreground (Ctrl-C tears it down).
           caosd = {
             type = "app";
@@ -1882,6 +1846,32 @@ sandbox = false''
             caos.package = self.packages.x86_64-linux.caos-tools;
             # caos.advertiseAddress is deliberately NOT set here: it differs
             # per machine, so deploy.sh reads it off the host and layers it on.
+          }
+        ];
+      };
+
+      # The box that watches caosd-prod. Pure: `nixos-rebuild switch --flake
+      # ...#watchdog-prod` works, because the one per-fleet fact (which
+      # instance to watch) is pinned here rather than read off a host.
+      nixosConfigurations.watchdog-prod = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          "${nixpkgs}/nixos/modules/virtualisation/amazon-image.nix"
+          ./prod/watchdog/configuration.nix
+          {
+            networking.hostName = "watchdog-prod";
+            # The responder's Claude Code: see the claude-code input.
+            nixpkgs.overlays = [
+              (final: prev: { claude-code = claude-code.packages.${prev.stdenv.hostPlatform.system}.default; })
+            ];
+            caos.watchdog.package = self.packages.x86_64-linux.caos-watchdog;
+            caos.watchdog.clientTools = self.packages.x86_64-linux.caos-tools;
+            # caosd-prod, the one production server (prod/README.md).
+            caos.watchdog.targetInstance = "i-0c0aae25be3e44d8e";
+            # The run probe executes THIS checkout's std/hello on the server.
+            # A dirty tree still names its HEAD; the server fetches from
+            # GitHub, so whatever is deployed must be pushed.
+            caos.watchdog.helloRev = self.rev or (nixpkgs.lib.removeSuffix "-dirty" self.dirtyRev);
           }
         ];
       };

@@ -340,6 +340,15 @@ pub(crate) struct Node {
     reused: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<Node>,
+    /// The root request's `requested` as ABSOLUTE unix milliseconds: the instant
+    /// every other time in the response is relative to. Set on the ROOT of a
+    /// response only.
+    ///
+    /// The relative times alone cannot say how long ago the run began, so a
+    /// reader that did not start it (`caos-cli watch`) could only anchor on
+    /// whenever it attached, and every elapsed time started from zero there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin_ms: Option<i64>,
 }
 
 /// Which question `/status` is being asked.
@@ -380,16 +389,22 @@ pub(crate) fn serve(
     } else {
         View::Live
     };
-    let node = walk(
+    let baseline = baseline_of(config, arg_tree);
+    let mut node = walk(
         config,
         arg_tree,
         None,
         view,
         None,
-        baseline_of(config, arg_tree),
+        baseline,
         &mut 0,
         &mut Vec::new(),
     );
+    if let Some(root) = node.as_mut() {
+        // 0 means the root had no `requested` to anchor on (see `baseline_of`),
+        // so there is no origin to report.
+        root.origin_ms = (baseline > 0).then_some((baseline / 1000) as i64);
+    }
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
 }
@@ -648,6 +663,7 @@ fn leaf(
         out_trace: record.out_traces(),
         reused,
         children: Vec::new(),
+        origin_ms: None,
     }
 }
 

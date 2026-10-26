@@ -1,0 +1,19 @@
+# std/stack-publish (design/stack-publish.md): an entry for an OPERATION OF THE
+# STEP. `@op` says llm-step does the work in process (it owns the call's
+# lifecycle: it pins one publication per layer before anything is pushed, then
+# records each outcome), so this entry exists to give the operation a path, a
+# help and a place in `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+Publish a stack directory (std/GIT.md, "Stacks") as branches and chained pull requests, in one call. The directory holds 00-base, the layers NN-<name> (gitlinks) and a description NN-<name>.pr.md beside each layer to publish: its first line is the PR title, the rest the body. Layers without a description are not published (99-dirty); a described layer above an undescribed one is refused. 00-* is never published. Each layer's branch is its name without the number, with branch-prefix in front. Repository and trunk default to 00-base.source.json. Before anything is pushed, each layer must contain the layer below it (00-base for the first): a layer that does not is refused, naming the merge to run. Then, bottom to top: push each layer as it is (fast-forward unless force; the push is leased on the remote head observed at the start, as publish-source), find the branch's open PR or open one on the branch below (the trunk for the first), update a PR whose title or body differs from its description, and link the PRs as a GitHub stack unless link is false. The result is one line per layer (branch, commit, push outcome, PR) and the stack. A refusal or a failed push says exactly what was done and where it stopped. Does not merge layers, squash, delete branches or merge PRs.
+@param stack The stack directory, such as sources/repo.
+@param [branch-prefix] Text put before every branch name, such as malcolm/.
+@param [repository] HTTPS repository URL, without credentials. Default: the repository 00-base was imported from.
+@param [trunk] The branch the first layer's PR targets. Default: the branch 00-base was imported from, or the remote's default branch.
+@param [force] true to allow non-fast-forward pushes (a rebuilt layer), still leased on the observed remote head.
+@param [allow-ignored] true to publish layers whose tracked files match their .gitignore rules.
+@param [link] false to leave the PRs unlinked (chained bases only). Default true: linked as a GitHub stack, so merging the top merges the stack.
+@param [draft] true to open new PRs as drafts.
+@param [dry-run] true to report the layers, branches, PR titles and bases without observing or changing anything.
+@op stack-publish
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

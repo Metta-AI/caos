@@ -6,6 +6,10 @@ A machine here is a **role**, named `<daemon>-<environment>`, defined as a
 | role | module | what it runs |
 |---|---|---|
 | `caosd-prod` | `caosd/configuration.nix` | `caosd up --iroh` as a systemd unit |
+| `watchdog-prod` | `watchdog/configuration.nix` | `caos-watchdog`: probes caosd-prod, responds to its Datadog alerts |
+
+Both import `base.nix`: the EC2 base (SSM shell, amazon-init off, the dhcpcd
+guard), secrets from AWS Secrets Manager, and the Datadog agent.
 
 ## Deploying
 
@@ -64,6 +68,9 @@ advertises a private address and makes every client fall back to an iroh relay
 ## After deploying
 
 `caosd` is a systemd unit, enabled, so it comes back on its own after a reboot.
+It also comes back when the stack's container dies: the unit waits on `caos-stack`
+and fails when it exits, and `Restart=always` runs `caosd up` again 30 seconds
+later. `journalctl -u caosd` shows "the caos-stack container exited".
 
 ```sh
 systemctl status caosd          # the stack
@@ -107,6 +114,80 @@ host user running caosd, while `git/`, `redis/` and `registry/` are created by
 the stack container as root. A blanket `chown -R` looks like the fix and breaks
 the server, which then reports the repo as `fatal: not in a git directory`.
 
+## The watchdog
+
+`watchdog-prod` is a t3.small in the same account that shares none of the
+server's failure modes: no docker, no stack, no `/data`. It exists because the
+failures that matter most (a container veth swallowing the metadata route and
+killing SSM; disk or memory exhaustion) are exactly the ones a process on the
+server cannot report.
+
+Detection is Datadog's. The agent on each host reports units, disk, memory
+and containers; `caos-watchdog probe` runs every two minutes and adds three
+service checks: `caos.probe.iroh` (a real `git ls-remote caos://<ticket>`),
+`caos.probe.run` (`caos-cli run std/hello` with a fresh `--date`, so the
+server has to compute, not just answer) and `caos.probe.ssm` (an SSM
+RunCommand round trip). The two client latencies go up as gauges,
+`caos.probe.iroh.seconds` and `caos.probe.run.seconds`. The monitors over
+all of it are code in metta, `devops/tf/datadog-monitors/caos_monitors.tf`,
+tagged `service:caos`.
+
+Response is `caos-watchdog respond`, a daemon that polls those monitors.
+When any alert, it posts to Slack #proj-caos at once (no model in that path),
+waits 90 s for the rest of the storm, then runs ONE Claude Code session over
+the whole set with `watchdog/runbook/CLAUDE.md` as its instructions. The
+session reaches the host only through `caos-watchdog ssh`, which refuses
+reboots, redeploys and anything that rewrites `/data/caos/stack`; those it
+asks for in Slack. `watchdog/respond.go` has the caps: one incident at a
+time, a session only when something NEW alerts, at most 3 per incident and 8
+per day. The ledger is `/var/lib/caos-watchdog/incident.json` and
+`incidents.jsonl`; transcripts are under `sessions/`.
+
+Deploying it:
+
+```sh
+sudo nixos-rebuild switch --refresh --flake github:Metta-AI/caos#watchdog-prod
+```
+
+The instance, its IAM role (SSM on the one prod instance, read of four
+secrets, nothing that reboots) and the empty secrets are OpenTofu in metta,
+`devops/tf/caos`. The secret VALUES are set by hand once:
+
+```sh
+aws secretsmanager put-secret-value --profile caos-admin --region us-east-1 \
+  --secret-id caos/datadog-api-key --secret-string "$DD_API_KEY"
+# likewise caos/watchdog/datadog-app-key, caos/watchdog/anthropic-api-key,
+# caos/watchdog/slack-webhook
+```
+
+From a shell on the box: `caos-watchdog ssh -- <cmd>` runs a command on the
+server, `systemctl status caos-watchdog caos-watchdog-probe.timer` shows the
+two units, `journalctl -u caos-watchdog-probe` the probe results.
+
+## The binary cache
+
+Hosts never build caos. `s3://caos-nix-cache-109251245574` is a private
+binary cache in the account; both roles list it as a substituter with its
+public key (`prod/base.nix`) and read it through their instance role. The
+`release` GitHub Actions workflow fills it on every push, from the same
+build that ships the client (caos-tools, the deploy driver, the watchdog's
+system closure), so for any pushed commit a host deploy is substitution. To push by hand, for a commit CI has not
+built yet:
+
+```sh
+KEY=$(mktemp) && aws secretsmanager get-secret-value --profile caos-admin \
+  --region us-east-1 --secret-id caos/nix-cache-signing-key \
+  --query SecretString --output text > "$KEY"
+AWS_PROFILE=caos-admin nix copy \
+  --to "s3://caos-nix-cache-109251245574?region=us-east-1&secret-key=$KEY" \
+  .#nixosConfigurations.watchdog-prod.config.system.build.toplevel
+rm "$KEY"
+```
+
+Then on the host, `nixos-rebuild switch --refresh --flake
+github:Metta-AI/caos#watchdog-prod` is substitution, not compilation, and
+`deploy-caosd-prod` on the server stops rebuilding 498 crates.
+
 ## Adding a role
 
 Add `prod/<daemon>/configuration.nix` and a `nixosConfigurations.<daemon>-<env>`
@@ -114,7 +195,5 @@ entry in the root `flake.nix`, merged **outside** `flake-utils.lib.eachDefaultSy
 — `nixosConfigurations` is not per-system. Take the daemon from
 `self.packages.x86_64-linux.*` so the machine and the checkout are one revision.
 
-The EC2 base, the dhcpcd guard and the docker address-pool move in
-`caosd/configuration.nix` are all things a second host will want; extract them
-into a shared module when that host exists and shows which parts are genuinely
-common.
+Import `base.nix` for the EC2 base, secrets and Datadog; add the role's
+units to `caos.datadog.units` so the shared unit monitor covers them.

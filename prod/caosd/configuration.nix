@@ -40,10 +40,23 @@ let
       CAOS_STACK_REDIS_MAXMEM="$(${pkgs.coreutils}/bin/tr -d '[:space:]' < ${redisMaxmemFile})"
       export CAOS_STACK_REDIS_MAXMEM
     fi
-    exec ${cfg.package}/bin/caosd up --iroh
+    ${cfg.package}/bin/caosd up --iroh || exit 1
+    # `up` returns once the stack is ready and leaves its container running on
+    # its own, so nothing here noticed it die: caosd-prod sat with the server
+    # aborted and the unit still "active" for 23 hours. Say ready, then stay
+    # alive exactly as long as the container does. Its exit is this unit
+    # failing, and Restart= runs `up` again.
+    ${pkgs.systemd}/bin/systemd-notify --ready
+    ${config.virtualisation.docker.package}/bin/docker wait caos-stack > /dev/null
+    echo "caosd: the caos-stack container exited" >&2
+    exit 1
   '';
 in
 {
+  # The EC2 base (SSM, amazon-init off, the dhcpcd guard, secrets, Datadog)
+  # is shared with the watchdog host; what remains here is the stack itself.
+  imports = [ ../base.nix ];
+
   options.caos = {
     package = lib.mkOption {
       type = lib.types.package;
@@ -140,8 +153,6 @@ in
   };
 
   config = {
-    system.stateVersion = "25.11";
-
     # Refused at BUILD time, where the option is named, rather than at start
     # where the failure is a dead service on a machine that was serving.
     assertions = [
@@ -155,55 +166,21 @@ in
       }
     ];
 
-    # A flake-managed machine must NOT also be user-data-managed. The NixOS EC2
-    # image runs amazon-init on EVERY boot, which copies user-data over
-    # /etc/nixos/configuration.nix and switches to it -- silently reverting any
-    # `nixos-rebuild --flake` on the next reboot. The repo is the source of
-    # truth now, so this is off.
-    virtualisation.amazon-init.enable = false;
-
-    # Shell without opening a single inbound TCP port.
-    services.amazon-ssm-agent.enable = true;
-
-    nix.settings = {
-      experimental-features = [ "nix-command" "flakes" ];
-      trusted-users = [ "root" "@wheel" ];
-      # /nix is on the root disk while the bulk data is on cfg.dataDevice. GC
-      # when the root gets tight rather than dying with ENOSPC mid-build.
-      min-free = 10 * 1024 * 1024 * 1024;
-      max-free = 50 * 1024 * 1024 * 1024;
-
-      # How long nix may reuse its answer to "what commit is this branch at".
-      # The default is an hour, and a deploy names a BRANCH:
-      #
-      #   nix run github:Metta-AI/caos#deploy-caosd-prod
-      #
-      # so within that hour a push is invisible here and the deploy silently
-      # rebuilds the revision it already has. That does not fail — it succeeds
-      # against the wrong commit, which is worse, and it reads as a suspiciously
-      # fast deploy. Observed: the box stayed pinned to 1cff83e while the branch
-      # had moved on, until --refresh was passed.
-      #
-      # This is a deploy target that is told to fetch, not a build farm keeping
-      # an index warm, so the cost of asking again is one ls-remote against a
-      # push we are deliberately waiting for. Five seconds keeps that
-      # near-immediate while still collapsing the several lookups a single
-      # `nix run` makes.
-      tarball-ttl = 5;
+    # What Datadog watches here: the stack unit, the relay, docker under
+    # both, and the shell's only entrance. Each is a `systemd.unit.state`
+    # service check; the watchdog's monitors alert when one leaves `active`.
+    caos.datadog.units = [
+      "caosd.service"
+      "docker.service"
+      "amazon-ssm-agent.service"
+    ] ++ lib.optional cfg.relay.enable "iroh-relay.service";
+    # Container-level metrics (restarts, OOM kills, per-container CPU/memory)
+    # for the runner pool. The agent reads the socket, so it joins the group.
+    services.datadog-agent.checks.docker = {
+      init_config = { };
+      instances = [ { url = "unix://var/run/docker.sock"; } ];
     };
-
-    # Docker gives every container a host-side veth. dhcpcd treats it as an
-    # ordinary NIC, fails DHCP, and falls back to RFC3927 link-local --
-    # installing 169.254.0.0/16 on that veth, which swallows 169.254.169.254,
-    # the EC2 metadata service. SSM workers authenticate against IMDS at
-    # startup, so the box loses its only entrance the moment caos starts a
-    # container, while EC2 still reports both status checks ok. Observed as:
-    #   169.254.0.0/16 dev vethf53fd81 scope link src 169.254.23.62
-    # Two independent guards, because losing this costs the whole machine.
-    networking.dhcpcd = {
-      denyInterfaces = [ "veth*" "docker*" "br-*" "caos*" ];
-      extraConfig = "noipv4ll";
-    };
+    users.users.datadog.extraGroups = [ "docker" ];
 
     virtualisation.docker = {
       enable = true;
@@ -328,8 +305,13 @@ in
         CAOS_IROH_RELAY = cfg.relay.url;
       };
       serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
+        # `notify`, so a start still waits for the stack to be ready (as the
+        # oneshot did) and the unit stays running for as long as the container
+        # does. The script above sends the notification from a child process.
+        Type = "notify";
+        NotifyAccess = "all";
+        Restart = "always";
+        RestartSec = 30;
         User = "caos";
         Group = "caos";
         WorkingDirectory = dataDir;
@@ -338,6 +320,9 @@ in
         # A cold first run builds every std worker image before it returns.
         TimeoutStartSec = "90min";
       };
+      # A stack that cannot start is retried every RestartSec forever rather
+      # than given up on after five tries: a down server is worse than a noisy one.
+      unitConfig.StartLimitIntervalSec = 0;
     };
 
     # SO AN INTERACTIVE `caosd` FINDS THIS MACHINE'S STACK. Without it the
@@ -348,12 +333,6 @@ in
     # person holding the shell.
     environment.variables.CAOS_DATA = dataDir;
 
-    environment.systemPackages = [
-      cfg.package
-      pkgs.git
-      pkgs.tmux
-      pkgs.htop
-      pkgs.jq
-    ];
+    environment.systemPackages = [ cfg.package ];
   };
 }

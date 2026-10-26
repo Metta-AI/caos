@@ -1,0 +1,10 @@
+100644 dc461a88db9765d11c6103d44e05b48d67f3131c 1	std/llm-step/src/record.rs
+100644 193df3e245aee7f31d18deb7a8755a964f94eb04 2	std/llm-step/src/record.rs
+100644 b80733063e5d721c5769af43617fdd219bda8ad0 3	std/llm-step/src/record.rs
+
+Auto-merging rust/crates/caos-cli/MCP.md
+Auto-merging rust/crates/caos-cli/src/lib.rs
+Auto-merging rust/crates/conversation-protocol/src/v3/apply.rs
+Auto-merging rust/crates/conversation-protocol/src/v3/git_store.rs
+Auto-merging std/llm-step/src/record.rs
+CONFLICT (content): Merge conflict in std/llm-step/src/record.rs

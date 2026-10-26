@@ -683,6 +683,7 @@ Run `time result/bin/caos-cli run-tool caos-test`
 - shall listen on port 80 and respond to requests:
     - Git push/pull requests are routed to git to handle against the repo
     - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack travels alongside it, not inside the hashed tree). The result is the hash of the WorkResult
+    - Starting and waiting for work (`POST /start`, `POST /start/<verb>`, `GET /result/<ticket>`, `GET /wait/<ticket>`, `GET /eval/<verb>`) and the MCP tool server (`POST /mcp`), which drive caos over plain HTTP. See [HTTP API](spec/http-api.md)
 
 # Tracing
 
@@ -725,7 +726,7 @@ Each rendered node reports its `requested` and `started` times in milliseconds r
 - Nothing is skipped for being finished, and a completion arg tree is rendered as a CHILD of the node that promised it rather than replacing it. The shape is then the run's actual structure, which is what one run is diffed against another
 - A node whose record ended before its parent started was REUSED by this run rather than performed by it. It is marked and not descended into: its children belong to the run that did the work, and following them would splice another invocation's tree into this one
 
-While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work
+While the cli is running something with `run` or `run-tool`, it uses `/status` to show the status of the work. Both start the request and print its ticket to stderr before they block, whether or not there is a terminal, and `caos-cli watch <ticket>` shows the same live view for a run you are not attached to (an agent's or a CI job's), until the run has no current work. A run is a start whose caller waits: `POST /start` (a bundled request) and `POST /start/<verb>` (a `.caos-expr` line) return a ticket at once, the server forms the request and runs it on the ticket's own thread, and `GET /wait/<ticket>` blocks for the answer (`GET /eval/<verb>` is the two together). Forming a request evaluates things, and those evaluations are recorded under the ticket like the run itself, so `watch` and `status` show them. The ticket is a node of its own whose children are the evaluations and the request that ran; `GET /result/<ticket>` says how it stands. Off a terminal it appends a snapshot every few seconds instead of redrawing. Because `/status` reports times relative to the root request and has no clock of its own, a late `watch` can under-report a node's elapsed time, never over-report it
 
 # Building and testing caos, including inside caos
 

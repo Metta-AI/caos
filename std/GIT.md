@@ -13,9 +13,11 @@ tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
 records a child commit automatically: there is no staging and no commit step.
 `log`, `show` and `diff` are how you see history, because there is no `git` in
-the shell. Getting changes out is two separate things: `publish_source` pushes
-a commit to a branch, and `caos-std/github` does everything else on GitHub
-(open a PR, change its base, link a stack, read and answer comments).
+the shell. Getting a stack out is one call, `caos-std/stack-publish`: it
+pushes each layer's branch, opens or updates the chained PRs from the `.pr.md`
+beside each layer, and links them as a GitHub stack. Under it, `publish_source`
+pushes one commit to a branch, and `caos-std/github` is one GitHub API call,
+for what the operation does not do (read and answer comments, anything else).
 
 ## Tools at a glance
 
@@ -26,9 +28,11 @@ a commit to a branch, and `caos-std/github` does everything else on GitHub
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
 | merge another commit into a source tree | `caos-std/merge` |
-| squash a stack to one commit per layer | `caos-std/create-squashed-stack` |
-| push a commit to a GitHub branch | `publish_source` |
-| open a PR, change its base, link a stack, read and answer comments | `caos-std/github` |
+| publish a stack: push every layer, open or update its PRs, link them | `caos-std/stack-publish` |
+| bring a stack up to date with its remote before republishing | `caos-std/stack-sync` |
+| rename a layer and its `.pr.md` together | `caos-std/move-sed` |
+| push one commit to a GitHub branch | `publish_source` |
+| read and answer PR comments, anything else on GitHub | `caos-std/github` |
 
 `tool_help(path="caos-std/<name>")` prints a std tool's exact parameters.
 
@@ -40,21 +44,32 @@ separate `imports/` directory.
 
 ```text
 sources/<repo>/
-  00-base           the upstream tip you build on, exactly as imported
-  01-<layer1>       the first layer of work
-  02-<layer2>       the next layer, built on the one before it
-  99-dirty          scratch layer: the changes you would not have committed yet
+  00-base               the upstream tip you build on, exactly as imported
+  00-base.source.json   where it came from: the repository and the branch
+  01-<layer1>           the first layer of work
+  01-<layer1>.pr.md     its PR: title on the first line, body after it
+  02-<layer2>           the next layer, built on the one before it
+  02-<layer2>.pr.md
+  99-dirty              scratch layer: the changes you would not have committed yet
 ```
 
 - **`00-base`** is imported, never edited. It is the record of where you started
   and what later diffs and merges are measured against. It is not a layer: it
-  is what the first layer builds on (`onto` in a squash plan).
+  is what the first layer builds on, and the first layer's PR targets the
+  trunk, which `00-base.source.json` names.
 - **`NN-<name>`** are the layers, in order. The order comes from the names, and
-  gaps are fine (`01`, `02`, `04`).
+  gaps are fine (`01`, `02`, `04`). The name without its number is the layer's
+  branch, so renumbering a layer keeps its branch and its PR.
+- **`NN-<name>.pr.md`** beside a layer is its pull request: the first line is
+  the title (a leading `# ` is dropped), the rest the body. A layer with one
+  is published; a layer without one is not, and a described layer may not sit
+  above an undescribed one.
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
-  history grow. When the work in it is a finished chunk, `move` it to the next
-  layer name (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
-  then `copy` that layer to a fresh `99-dirty` to carry on.
+  history grow. It has no `.pr.md`, so it is never published. When the work in
+  it is a finished chunk, `move` it to the next layer name
+  (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
+  write `sources/<repo>/02-<name>.pr.md`, then `copy` that layer to a fresh
+  `99-dirty` to carry on.
 - **Make a new layer only where you would normally start a new layer of a
   stack**: per big chunk of work, a unit a reviewer would want as its own PR.
   Not per commit and not per edit; the history inside a layer already records
@@ -62,8 +77,9 @@ sources/<repo>/
 
 Importing writes the snapshot's provenance next to it as
 `sources/<repo>/00-base.source.json`. That file is not a layer. `move` renames
-the gitlink but leaves its provenance file behind under the old name, so move
-the pair together.
+the gitlink but leaves its provenance file, or a layer's `.pr.md`, behind under
+the old name; `caos-std/move-sed` renames a layer and its sidecar in one call
+(see "Renaming a layer").
 
 ## One change, one layer
 
@@ -73,11 +89,15 @@ import_source(source="https://github.com/<owner>/<repo>.git",
 copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
 ... edit sources/<repo>/99-dirty ...
 move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
-publish_source(source_tree="sources/<repo>/01-<name>",
-               repository="https://github.com/<owner>/<repo>.git",
-               branch="my-branch")
-run_tool(path="caos-std/github", arguments={...})   # open the PR
+write(file-path="sources/<repo>/01-<name>.pr.md",
+      content="<PR title>\n\n<PR body>\n")
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
+
+The last call pushes `01-<name>` to the branch `<name>` (give `branch-prefix`
+to put something in front of it), opens the PR against the branch `00-base`
+was imported from, and prints what it did. Run it again after more edits and
+it fast-forwards the branch; the PR follows.
 
 - Edit and publish a source tree (`sources/<repo>/...`), never the
   conversation root. `edit` on a bare path succeeds but changes only scratch
@@ -90,6 +110,8 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
   as `sources/<repo>/00-base-2` (see "Updating the base").
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
+- The commits inside a branch do not matter, only its net diff: branches are
+  always merged by squashing (see "Publishing"). Publish the layer as it is.
 
 ## Starting a brand-new repository
 
@@ -143,11 +165,13 @@ sources/repo/02-tests     -> B   parent A
   not, merge the earlier layer into it before doing anything else (see
   "Merging").
 - To add a layer, `copy` the latest layer to the next name and edit the copy,
-  or work in `99-dirty` and `move` it into place when the work is done.
+  or work in `99-dirty` and `move` it into place when the work is done. Write
+  its `NN-<name>.pr.md` when it is ready to publish.
 
 Every operation on a stack is made of three things: editing a layer, merging an
-earlier layer into a later one, and `copy` / `move` / `remove` on the gitlinks.
-The examples that follow use the stack shown just before them.
+earlier layer into a later one, and `copy` / `move` / `remove` on the gitlinks
+(`caos-std/move-sed` when a gitlink and its `.pr.md` move together). The
+examples that follow use the stack shown just before them.
 
 ### Merging
 
@@ -187,8 +211,23 @@ sources/repo/02-tests    -> B2  parents B, A2
 
 ### Updating the base
 
-Import the new upstream tip at a fresh path, put it at `00-base`, and merge it
-into the first layer, then each layer into the one after it:
+`caos-std/stack-sync` does all of this in one call, against the remote, and
+more: it reads the trunk's head and every published layer's branch, puts the
+trunk's head at `00-base`, adopts a branch GitHub rewrote with the same
+content (merging a stacked PR rebases the branches above it) under the layer's
+local edits, merges in a branch someone else pushed to, restacks each layer
+onto the one below, and reports a layer whose PR was merged (removing it with
+`remove-merged=true`). It pushes nothing: run `stack-publish` after it, and
+every push is a fast-forward. A merge conflict stops it at that layer and names
+the `merge` call that gives you a ledger to resolve.
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
+```
+
+By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
+merge it into the first layer, then each layer into the one after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
@@ -222,9 +261,29 @@ merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
   merge it into `02-tests` (the merge base is `A`, so the removal carries
   forward), then `remove` the `01-feature` gitlink. Do not renumber
   `02-tests`; gaps are fine.
-- **Split a layer in two:** `move` `02-tests` to `03-tests` and `01-feature`
-  to `02-y`, `copy` `00-base` to `01-x`, re-make X in `01-x`, then merge `01-x`
-  into `02-y` and `02-y` into `03-tests`.
+- **Split a layer in two:** rename `02-tests` to `03-tests` and `01-feature`
+  to `02-y` (with their `.pr.md`, see below), `copy` `00-base` to `01-x`,
+  re-make X in `01-x` and write `01-x.pr.md`, then merge `01-x` into `02-y`
+  and `02-y` into `03-tests`.
+
+### Renaming a layer
+
+A layer is two entries, the gitlink and its `.pr.md`, and `move` takes one path.
+`caos-std/move-sed` renames every entry of one directory that matches a Go
+regular expression, in one proposal, so the pair moves together and a shift
+such as `02` to `03` then `01` to `02` has no ordering problem:
+
+```text
+run_tool(path="caos-std/move-sed", arguments={
+  "dir": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
+run_tool(path="caos-std/move-sed", arguments={
+  "dir": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
+```
+
+`replacement` uses Go's `$1` / `${name}`, never sed's `\1`. The result lists
+every rename; `dry-run=true` lists them without renaming. Renumbering a layer
+does not rename its branch or its PR: the branch is the name without the
+number.
 
 ### Harvesting from subagents
 
@@ -235,102 +294,75 @@ rather than partly installed.
 
 ## Publishing
 
-The conversation history has many commits (agent turns, merges). Publishing
-that as it is works (`publish_source` takes any gitlink), but squashing first
-gives each layer one clean commit and linear history.
+The conversation history has many commits (agent turns, merges), and that is
+what gets published. **Branches are always merged by squashing**, so the
+commits on a branch never reach the trunk: only its net diff does, and the
+history inside a branch does not matter. Do not spend effort tidying it, and
+never re-publish a branch just to clean its commits.
 
-### 1. Squash (optional but usual for a stack)
-
-Write a plan file, one `key=value` per line. `onto` and `into` come once,
-before the first `layer=`:
-
-```text
-onto=sources/repo/00-base
-into=publish/repo
-layer=01-feature
-commit=sources/repo/01-feature
-message=Add the feature
-message=
-message=Why, in a body.
-layer=02-tests
-commit=sources/repo/02-tests
-message=Test the feature
-```
+### One call: `caos-std/stack-publish`
 
 ```text
-run_tool(path="caos-std/create-squashed-stack",
-         arguments={"plan": "repo.plan", "in": "<tree to run over>"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
 
-`onto` and each `commit` are a conversation path to a gitlink or a full commit
-hash. Each `layer=` block becomes `<into>/<layer>`; its `message=` lines, in
-order, are the commit message. Each squashed commit takes the tree of its
-`commit`, the parent of the previous squashed commit (or `onto`), and the
-author and committer of the original. The same plan mints the same commits, so
-republishing an unchanged stack pushes nothing new. It refuses a layer that
-does not contain the one before it (or `onto`): merge first. Pass `in` if the
-tool's own source tree is not the one you mean (the default is the tree the
-tool sits in).
-
-### 2. Push, earliest layer first
+For every layer that has a `.pr.md` beside it, earliest first, it pushes the
+layer's gitlink as it is to the branch named after the layer without its
+number (`01-parser` goes to `parser`, or `<branch-prefix>parser`), finds the
+branch's open PR or opens one with the `.pr.md`'s title and body, based on the
+branch below (the trunk for the first layer), and links the PRs as a GitHub
+stack. The result is one line per layer and one for the stack:
 
 ```text
-publish_source(source_tree="publish/repo/01-feature",
-               repository="https://github.com/<owner>/<repo>.git",
-               branch="repo-01-feature", force=true)
-publish_source(source_tree="publish/repo/02-tests", ...,
-               branch="repo-02-tests", force=true)
+repository https://github.com/owner/repo  trunk main
+01-parser  parser  3f9c2e1d0b7a  pushed (fast-forward)  PR #365 created, base main
+02-tests   tests   8b11d0aa41c2  unchanged              PR #366 unchanged
+stack 367: unchanged
 ```
 
-- A squashed commit does not descend from the one it replaces, so updating a
-  published stack always needs `force=true`. The push is still leased on the
-  exact remote head observed when the call starts: it can replace history you
-  have seen, never a change someone else pushed.
-- Without `force`, only creates and fast-forwards succeed. An unsquashed layer,
-  or a follow-up commit on a branch you already published, is a fast-forward.
-- `publish_source` creates no PR and does not change the source gitlink.
-- It rejects any commit whose tree contains a path matched by the commit's own
-  `.gitignore` rules, **including tracked files**. It never strips files or
-  rewrites commits. Remove the files or fix the rules, then publish again.
-  (Global excludes and `.git/info/exclude` do not apply, and only the
-  published snapshot is checked, not earlier commits.)
-- Resolve merge conflicts and clear `.caos/conflicts` first. The endpoint does
-  not scan for the ledger or for inline markers.
-- Test and inspect the intended PR diff (`diff`) before publishing.
-- The HTTPS URL carries no credentials. Pushes go from the server's store,
-  not from your container; nothing is checked out.
+- Before anything is pushed it checks that each layer contains the one below
+  it (`00-base` for the first). One that does not is refused with the `merge`
+  call to run. A refusal pushes nothing and says so.
+- Repository and trunk come from `00-base.source.json`; pass `repository` and
+  `trunk` when the base was imported by commit hash, or to publish elsewhere.
+- `dry-run=true` reports the layers, branches, bases and titles without
+  observing or changing anything. Use it first on a new stack.
+- The `.pr.md` is the description's home. A PR whose title or body differs is
+  updated to match, and the result says so; edit the file, not GitHub.
+- Republishing after you merged up is a fast-forward and needs no `force`. A
+  non-fast-forward push is refused unless `force=true`, and means a rebuilt
+  layer or someone else's push to the branch: look before forcing.
+- Each push is leased on the remote head observed at the start, like
+  `publish_source`, and rejects a commit whose tree contains paths matched by
+  its own `.gitignore` rules, **including tracked files** (`allow-ignored=true`
+  to publish them anyway). Resolve merge conflicts and clear `.caos/conflicts`
+  first. Test and inspect the intended PR diff (`diff`) before publishing.
+- A failed push stops the layers above it; the result says which branches
+  moved. If it was uncertain or a lease conflict, read the remote branch before
+  retrying (see "Recovering").
+- The PRs are linked as a GitHub stack on every publish (`link=false` to skip),
+  because the trunk squash-merges: merging a stacked PR merges every PR up to
+  it, while an unlinked PR retargeted after the one below merged shows the
+  lower layer's changes again. GitHub refuses to change the base BRANCH of a
+  PR while it is in a stack, so a shape change (a layer inserted or dropped)
+  is done by unstacking and recreating the stack, with a new stack number.
+  Base COMMITS follow the branches on their own: merging a new trunk tip up
+  and republishing needs no API call.
+- A repository that is not on github.com gets its branches pushed and no PRs.
 
-If a push comes back as uncertain or as a lease conflict, read the remote
-branch before retrying (see "Recovering").
+### By hand, one commit
 
-### 3. Open a PR per layer and link them
-
-`caos-std/github` is one GitHub API call: `method`, `path` under
-`https://api.github.com`, and optional JSON `body`. Every value is a string.
-The result is the status line and the body, cut if long. A run fails only when
+`publish_source(source_tree, repository, branch, force?)` pushes one gitlink's
+commit to one branch, with the same lease, fast-forward and `.gitignore` rules,
+and opens no PR. `caos-std/github` is one GitHub API call: `method`, `path`
+under `https://api.github.com`, and optional JSON `body`, every value a string;
+the result is the status line and the body, cut if long. A run fails only when
 no response came back, and a write may still have arrived, so `GET` the state
-before resending. The tool reaches only `api.github.com` and follows no
-redirects. Paths are unrestricted; the token's scope is the boundary.
-
-For each layer, earliest first:
-
-1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`
-2. If there is none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base`
-   (the trunk for the first layer, the previous layer's branch for the rest),
-   `title` and `body` taken from the layer's `message=` lines.
-3. If there is one, `PATCH` its `base` if it differs. Leave its title and
-   body alone: a person may have edited them.
-
-```text
-run_tool(path="caos-std/github", arguments={
-  "method": "POST", "path": "/repos/<owner>/<repo>/pulls",
-  "body": "{\"title\":\"Add the feature\",\"head\":\"repo-01-feature\",\"base\":\"main\",\"body\":\"Why.\"}"})
-```
-
-Then link them, earliest first:
-`POST /repos/{owner}/{repo}/stacks` with `{"pull_requests": [<numbers>]}`, or
-`POST .../stacks/{number}/add` to extend an existing stack. The chained bases
-already give a reviewable stack without the link.
+before resending. Find a branch's PR with
+`GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`, open one
+with `POST /repos/{owner}/{repo}/pulls` (`title`, `head`, `base`, `body`), and
+link PRs with `POST /repos/{owner}/{repo}/stacks` and
+`{"pull_requests": [<numbers, earliest first>]}`.
 
 ## Reading and answering PR comments
 
@@ -430,12 +462,24 @@ reach usually means the grant is missing.
   `git.md` is "no such path".
 - `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
   underscores), and the old string must occur exactly once.
-- `theirs` for `merge` is a full commit hash, not a path or a branch name.
-- `copy` and `move` refuse an existing destination; `remove` first.
+- `theirs` for `merge` is a full commit hash or the path of a source tree in
+  the conversation, never a branch name.
+- `copy` and `move` refuse an existing destination; `remove` first. `move`
+  takes one path, so a layer's `.pr.md` stays behind: rename both with
+  `caos-std/move-sed`.
+- `move-sed`'s `replacement` is Go's `$1` / `${name}`. Sed's `\1` is refused,
+  because Go would write it into the name literally.
+- `stack-publish` publishes only layers with a `.pr.md` beside them, and
+  refuses a described layer above an undescribed one. `99-dirty` has none.
+- A `caos-std/github` response for one PR is a full PR object, around 20 KB
+  with the repository embedded twice, and a response is cut at 100 KB. List
+  PRs with `head=` or a small `per_page=`, or ask GraphQL for the fields you
+  need, rather than listing every open PR of a busy repo.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
 - Ignored scratch files can ride along in a source during work, and then block
-  `publish_source`. Clean them before publishing.
+  `publish_source`, which lists them. Clean them before publishing, or pass
+  `allow_ignored=true` if they belong in the branch.
 - `bash-tool` runs over a scratch copy: declare every existing path it reads
   in `paths`. Use `read`, `grep`, `copy`, `move` and `remove` for those jobs.
 - Subagents have no file tools. Do any reading of a saved large result
@@ -444,6 +488,8 @@ reach usually means the grant is missing.
 ## Further reading (design docs in the caos repo)
 
 - `design/stacks.md` – the stack model and the full operation walk-through.
+- `design/stack-publish.md` – `stack-publish` and `move-sed`: the stack
+  directory as the specification, pins, GitHub stacks, resuming.
 - `design/agent-publish.md` – `publish_source`: leases, `force`, `.gitignore`
   rejection, uncertain results.
 - `design/agent-github.md` – import, `caos-std/github`, PRs for a stack, the

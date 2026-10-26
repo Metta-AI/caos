@@ -56,7 +56,7 @@
 //! token parses through [`parse_arg`], the one arg-type vocabulary this crate
 //! owns and the client shares.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gix::objs::tree::{Entry, EntryKind, EntryMode};
 
@@ -233,9 +233,16 @@ impl Origin {
 
 /// A node's origins: the ones its parent's imply, plus any the host knows.
 fn with_known(host: &dyn EvalHost, mut origins: Vec<Origin>, oid: &str) -> Vec<Origin> {
-    for known in host.origins_of(oid) {
-        if !origins.contains(&known) {
-            origins.push(known);
+    let known = host.origins_of(oid);
+    if known.is_empty() {
+        return origins;
+    }
+    // A set, not `contains` per entry: a shared subtree accumulates tens of
+    // thousands of origins, and the scan was quadratic in them, once per node.
+    let mut seen: HashSet<Origin> = origins.iter().cloned().collect();
+    for origin in known {
+        if seen.insert(origin.clone()) {
+            origins.push(origin);
         }
     }
     origins

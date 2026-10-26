@@ -35,8 +35,12 @@ path prints its parameters, which is the description this table abbreviates.
 | `agent-wait` | Wait for one child agent to report a terminal checkpoint, by joining its durable relay. |
 | `agent-harvest` | Apply a terminal child's content changes to the conversation, with the same atomic reconciliation as the file tools. |
 | `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
-| `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
+| `stack-publish` | Publish a stack directory in one call: push every described layer (`NN-<name>.pr.md` beside the gitlink) as a branch named without its number, find or open the chained PRs, and link them as a GitHub stack. No squashing. |
+| `stack-sync` | Bring a stack directory up to date with its remote, as `gt sync` does, without pushing: the trunk's head becomes `00-base`, a branch GitHub rewrote is adopted under the layer's edits, foreign pushes are merged in, every layer is restacked onto the one below, and merged layers are reported. Then `stack-publish` fast-forwards. |
+| `move-sed` | Rename the entries of one conversation directory by regular expression, in one proposal: a layer and its `.pr.md` move together. |
+| `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. Not part of the publishing flow (`stack-publish` pushes layers as they are). |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
+| `flake-update` | Re-lock a flake by running `nix flake update` in a worker: every input, one input, or one input pinned to a commit. Takes a tree holding flake.nix and flake.lock; returns the new flake.lock. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says
@@ -45,7 +49,7 @@ what each one does about that.
 ### Git advice: [GIT.md](GIT.md)
 
 For anything involving git or GitHub — importing a repo, merging, stacks,
-squashing, `publish_source`, opening and linking PRs with `github` — read
+publishing a stack with `publish-stack`, `publish_source`, PRs and `github` — read
 [`GIT.md`](GIT.md) first.
 
 ### Before you reach for the shell
@@ -117,11 +121,18 @@ Not callable: these are what the tools and the build graph are made OF. An
 expression names them (`--base:@=DEEP-DEPS/<name>`), and `caos-build` or the
 test suite exercises them.
 
+Workers have the network. Every worker container runs on the compute network:
+it reaches the caos server over HTTP, `llm-client` posts to
+`api.anthropic.com`, `flake-builder` fetches flake inputs and pushes to the
+registry, and `go` ships a CA bundle so a script's own HTTPS request verifies.
+Where a worker is offline, that is the build's choice (`cargo` below), never a
+property of the container. A tool that has to fetch something can.
+
 | entry | one line |
 |---|---|
-| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
-| `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. |
-| `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry, no network. |
+| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. Not the default for a new worker: that is `go`, below. Bash remains for the interpreters' own `/worker` scripts and for glue that only sequences other programs. |
+| `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. A script imports `caos/w`: an error policy (`Main`, `Check`, `Must`, `True`) and the worker CLI (`Caos`, `Get`, `Read`, `Put`, `Hash`, `Exists`), so a script does not define its own. |
+| `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry. It builds `--offline` by choice, so a missing dep fails instead of being fetched; the container has the network. |
 | `rustc` | The worker factory that turns a Rust project into a runnable worker; part of the seeded core. |
 | `runner` | The pooled interpreter every compiled worker is curried onto; part of the seeded core. |
 | `deep-deps` | Mounts each directory's `DEPS` at `DEEP-DEPS/<name>`, which is what lets a subtree name things outside itself. |
@@ -131,9 +142,10 @@ test suite exercises them.
 | `llm-step` | The agent harness: one turn of a conversation, and the registry of tools it offers a model. |
 | `llm-client` | The Anthropic API client `llm-step` posts through. |
 | `llm-call` | A single model call as an entry, for an expression that wants one without a conversation. |
-| `rgrep` | The search worker behind the step's `grep` tool. |
+| `tree-map` | Runs a worker (its `run` arg) over every directory of a tree and returns a sparse tree of the results, same shape as the input, one cached job per directory. Other args are forwarded to the worker. `rgrep` is built on it. |
+| `rgrep` | The search worker behind the step's `grep` tool: `tree-map` over a Go grep of one directory (`rgrep/level`). |
 | `run-and-update-ref` | The async worker: one binary, two stages, behind `run_async` and the subagent tools. |
 | `actor` | The actor wrapper: runs an inner `(state, message) -> (state', reply)` request against state on a Git branch, publishing by moving the branch with a compare-and-swap ([`actor/README.md`](actor/README.md)); a Go program on `std/go`. |
 | `hello` | The smallest possible entry, used by `tests/hello` and by hand when something is deeply broken. |
-| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and no network. |
+| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and never call the API. |
 | `llm-test` / `llm-test-tool` | Fixtures the llm tests drive: a test harness entry and a tool for it to call. |

@@ -23,8 +23,8 @@ For each tool call:
    its provenance, and the tool result:
 
    ```text
-   imports/repo/main              gitlink -> H
-   imports/repo/main.source.json  provenance
+   sources/repo/00-base              gitlink -> H
+   sources/repo/00-base.source.json  provenance
    ```
 
 The destination and provenance path must both be unused. An import creates
@@ -89,18 +89,23 @@ for the repositories the agent works on.
 
 ### PRs for a stack
 
-After squashing and pushing the stack ([stacks.md](stacks.md), "Publishing"),
-for each layer, bottom first:
+`caos-std/stack-publish` does this for a whole stack directory in one call,
+pushes included ([stack-publish.md](stack-publish.md)). By hand, for each
+layer, bottom first:
 
 1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
 2. If none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base` (the trunk,
-   or the branch below) and a `title` and `body` from the layer's `message=`
-   lines. If one, `PATCH` its `base` when it differs, and leave its title and
-   body, which a person may have edited.
+   or the branch below) and the layer's `title` and `body`. If one, `PATCH`
+   what differs.
 
 Then link them with `POST /repos/{owner}/{repo}/stacks` and
 `{"pull_requests": [<numbers, bottom first>]}`, or `.../stacks/{number}/add` to
-extend a stack. The chained bases already make a reviewable stack without it.
+extend a stack. GitHub refuses to change the base BRANCH of a PR that is in a
+stack (`422`), so a shape change goes through `.../stacks/{number}/unstack`
+first; base commits follow the branches on their own. The link matters for
+merging: the trunk squash-merges, so merging the bottom PR alone would leave
+the next one showing the bottom's changes again, and merging through the stack
+merges every PR up to the one asked for.
 
 ### Removing `/pr`
 

@@ -1,0 +1,2 @@
+# This tool's worker image (format `<path> <name>`): the program runs on std/go.
+../go go

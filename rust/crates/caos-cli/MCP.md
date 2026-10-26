@@ -79,7 +79,7 @@ first, so `tools/list` is a constant and a client that reads it once, or ignores
 |---|---|
 | `help(path)` | what the tool at a path does and the arguments it takes. `help()` with no path says how caos is doing in this session: the conversation and its head commit, and diagnostics. |
 | `run(path, arguments)` | run the tool at a path and wait for its output. |
-| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. |
+| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. It is `run` without the wait: `run` starts the call and waits for its ticket, and the ticket is the one `caos-cli run` prints, so `caos-cli watch` takes it. |
 | `result(ticket)` | pending, or the output, or how it failed. Asking never runs anything. |
 | `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass the hash as `in` to `read`, `ls` or `grep` to look inside it. |
 
@@ -102,7 +102,7 @@ the session then ran somewhere caos had not been told about.
 
 Each call is ONE request to the server: `run` is `POST /eval/run` of `llm-step` in its
 tools-only mode, `start` is `POST /start/run`, `result` is `GET /result/<ticket>`
-(HTTP API, `/eval/<verb>`). The step declares the call on the conversation's active
+(see [HTTP API](../../../spec/http-api.md)). The step declares the call on the conversation's active
 request, runs the tool, and answers with the call's own record, so this client neither
 writes the conversation nor reads it back. The tools run exactly as they run in a turn
 the step drives itself, and a tool reads and behaves one way whether a model meets it
@@ -299,9 +299,23 @@ The declaration lands a moment after the request reaches the server, not before
 it as it did when this process wrote it, so a `Stop` in that gap sees no call.
 Claude Code backgrounds a call only after 120s, long after the step has started.
 
+`start` is the exception, because it answers at once and the model may end its turn
+right behind the ticket. So the server first runs the step with `declare-only=1`
+(the same parameters, declaring the call on the active request and running nothing)
+and only then starts the job. The `Stop` that follows sees a declared call and holds
+the request open; the job finds its call already declared. A `start` with no open
+request fails in that call, not later in the ticket.
+
 Claude Code does not expose the model's round number and does not need to: the
 declaration opens a round, the call belongs to the round that declared it, and a
 `tool_use_id` is unique for the whole session.
+
+The step drives, completes and reads back each tools-only call on the round that
+declared it, not on the request's latest round. The two differ exactly when a
+backgrounded `start` is still running while the model's next call opens a round
+behind it; the started call then completes on its own, earlier round. Nothing
+gates a tool transition on which round is current -- a tool is a recorded fact --
+so completing a call on an earlier round is accepted like any other.
 
 **Tool execution is serial**, matching `llm-step`'s single queue. The tool server
 reads and handles one JSON-RPC request at a time, so a batch of parallel calls
@@ -347,15 +361,13 @@ model's context. Its first line is a `caos-conversation-command:` marker, which
 is what the hook finds if Claude Code passes it the command's expansion rather
 than the `/name <hash>` that was typed.
 
-**An incomplete head is used as it is.** A session that died mid-turn leaves a
-running request, and perhaps calls that started and never finished. The protocol
-refuses to fork such a conversation, so `settle` first appends commits that close
-it the way `llm-step` does for a cancelled turn: each open call completes as
-`cancelled` (its observation says the session ended before it finished), and the
-request ends `interrupted`. Nothing is rewritten, and these commits land on the
-NEW branch, so the original is not touched. A pending publication is not settled
-— it is a fact about a remote — and the protocol refuses that fork with its own
-message.
+**An incomplete head is forked as it is.** A session that died mid-turn leaves a
+running request, and perhaps calls that started and never finished. A conversation
+is a flat transcript, so the fork copies it unchanged: an unfinished call is a
+`tool_use` with no `tool_result`, which a reader renders as unfinished and a
+resuming driver decides what to do with. The protocol used to refuse such a fork,
+so the source had to be "settled" first — each open call completed as `cancelled`,
+the request ended `interrupted` — before it could be forked; that step is gone.
 
 ## Not yet done
 

@@ -37,25 +37,108 @@ on:
 
 permissions:
   contents: write
+  # For the nix cache push below: GitHub OIDC assumes a role in the caos AWS
+  # account (metta: devops/tf/caos/ci.tf). No AWS credential is stored here.
+  id-token: write
 
 jobs:
   client:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.stage.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
       # `nix build .#caos-cli` is the same build a developer runs; nothing about
       # the artifact is release-specific.
       #
-      # No general nix cache. magic-nix-cache now requires a FlakeHub account
-      # and failed with "Unable to authenticate to FlakeHub", caching nothing;
-      # cache.nixos.org already serves everything the client build needs, since
-      # those derivations are stock nixpkgs.
+      # THE NIX STORE IS CACHED, because cache.nixos.org does not have what
+      # takes the time. The toolchain and the C libraries are stock nixpkgs and
+      # come from there, but the workspace's ~176 crates are compiled by crane
+      # into a derivation of our own, and with an empty store that compile is
+      # nearly six of the job's minutes.
+      #
+      # magic-nix-cache is not the answer: it now requires a FlakeHub account
+      # and failed with "Unable to authenticate to FlakeHub", caching nothing.
+      # cache-nix-action saves the store through actions/cache instead. It names
+      # nixbuild/nix-quick-install-action as the installer it is used with, with
+      # the two nix.conf settings below: without `keep-outputs` and
+      # `keep-env-derivations` its pre-save garbage collection drops the build
+      # inputs, which are the whole point.
+      #
+      # THE KEY HOLDS THE INPUTS OF THE DEPENDENCY BUILD, NOT THE SOURCE. Edits
+      # to the workspace crates do not change it, so an ordinary push is an exact
+      # hit that restores the store and saves nothing. A change to a lockfile or
+      # a .nix file makes a new key: the newest older entry restores through the
+      # prefix, only what changed is rebuilt, and the result is saved under the
+      # new key. GitHub keeps a branch's own caches and its default branch's, so
+      # a branch's first run reads main's.
+      #
+      # `gc-max-store-size-linux` trims the store before it is saved. A repository
+      # holds 10GB of caches in all and evicts the least recently used.
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
 
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/Cargo.lock', '**/*.nix') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
 
-      - name: Build the client
-        run: nix build .#caos-cli
+      # ONE build feeds two consumers: the release assets below, and the
+      # hosts' binary cache. The hosts in prod/ (caosd-prod, watchdog-prod)
+      # never build caos -- the watchdog is a t3.small that cannot compile
+      # the workspace, and the server should not spend its deploy rebuilding
+      # 498 crates -- so every push also pushes the signed closures to the
+      # private S3 cache both hosts list as a substituter (prod/base.nix;
+      # the bucket and roles are metta's devops/tf/caos). A deploy then
+      # only fetches. caos-tools contains the caos-cli the release ships,
+      # plus git-remote-caos and caos-iroh; the deploy driver and the
+      # watchdog's whole system closure (so even its first boot from a bare
+      # AMI is a download) ride along. caosd-prod's own system closure is
+      # not built here: it takes a per-machine advertise address the driver
+      # reads off the host (prod/README.md), so its toplevel is impure, and
+      # caos-tools is nearly all of it anyway.
+      #
+      # The cache is read as well as written, so a branch does not rebuild
+      # what main already pushed, and content addressing means a branch
+      # cannot displace main's paths.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::109251245574:role/caos-github-nix-cache
+          aws-region: us-east-1
+
+      - name: Build
+        env:
+          CACHE: s3://caos-nix-cache-109251245574?region=us-east-1
+        run: |
+          set -euo pipefail
+          nix build --no-link --print-out-paths \
+            --option extra-substituters "$CACHE" \
+            --option extra-trusted-public-keys caos-cache-1:3BSj35RzBLAtUyTlJlLO3xa9b7uYFtIJIx17Jri8lPs= \
+            .#caos-cli .#caos-tools .#deploy-caosd-prod \
+            .#nixosConfigurations.watchdog-prod.config.system.build.toplevel \
+            | tee paths
+          # `result` is what the staging step below reads.
+          nix build .#caos-cli
+
+      # The signing key touches disk for the length of one command and is
+      # removed whether or not the push succeeds. Nothing prints it.
+      - name: Push to the nix cache
+        env:
+          CACHE: s3://caos-nix-cache-109251245574?region=us-east-1
+        run: |
+          set -euo pipefail
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          aws secretsmanager get-secret-value --secret-id caos/nix-cache-signing-key \
+            --query SecretString --output text > "$key"
+          # shellcheck disable=SC2046
+          nix copy --to "$CACHE&secret-key=$key" $(cat paths)
+          echo "pushed:"; cat paths
 
       # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
       # the real binary elsewhere in the store. The wrapper is not distributable
@@ -307,3 +390,50 @@ jobs:
           }
           retry "confirm $TAG is published" published
           echo "release ready at https://github.com/$GH_REPO/releases/tag/$TAG"
+
+  # Run the caos test suite on the prod server, with the client built above.
+  #
+  # The runner does no testing itself: `caos-cli run-tool caos-test` ships this
+  # checkout's tree to the server over the `caos` git remote and the server
+  # compiles and tests it in its workers. Results are cached by content, so a
+  # push that changes nothing a test reads is a cache hit. The command prints
+  # the report and exits non-zero on a FAILED banner, which fails this job.
+  #
+  # `CAOS_TICKET` is the iroh ticket of the prod server
+  # (`sudo cat /data/caos/stack/iroh/ticket`, prod/README.md). It is the
+  # capability to run jobs there, so it is a secret. GitHub withholds secrets
+  # from fork PRs and this workflow does not run on pull_request, so only
+  # pushes to this repository reach the server.
+  test:
+    needs: client
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the client negotiates a git push of this tree with the
+      # server, and a shallow clone is not something to find out about in CI.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: caos-client-${{ needs.client.outputs.tag }}
+          path: dist
+
+      # `git` finds the `caos://` remote helper by name on PATH; the client
+      # shells out to git for every push and fetch.
+      - name: Install the client
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          install -m 0755 dist/caos-x86_64-linux "$HOME/bin/caos-cli"
+          install -m 0755 dist/git-remote-caos-x86_64-linux "$HOME/bin/git-remote-caos"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run caos-test on the prod server
+        env:
+          CAOS_TICKET: ${{ secrets.CAOS_TICKET }}
+        run: |
+          set -euo pipefail
+          test -n "$CAOS_TICKET" || { echo "secret CAOS_TICKET is not set" >&2; exit 1; }
+          git remote add caos "caos://$CAOS_TICKET"
+          caos-cli run-tool caos-test
