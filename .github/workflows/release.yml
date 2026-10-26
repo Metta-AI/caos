@@ -41,6 +41,8 @@ permissions:
 jobs:
   client:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.stage.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
