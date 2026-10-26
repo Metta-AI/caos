@@ -14,7 +14,7 @@ conversation="${test_run_id}-tools"
 
 `CAOS_SALT` controls caching; it is not a state namespace.
 
-The git-import suite entry runs a private HTTPS Git remote and a separate
+The git-import suite entry (currently disabled, see `tests-disabled/README.md`) runs a private HTTPS Git remote and a separate
 server, checking exact-commit imports, authentication, complete history,
 incremental transfers and retries. It also checks leased pushes, lost replies,
 concurrent updates, code-history preservation and publication guards. It needs no external service.
