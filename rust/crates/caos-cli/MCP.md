@@ -102,7 +102,7 @@ the session then ran somewhere caos had not been told about.
 
 Each call is ONE request to the server: `run` is `POST /eval/run` of `llm-step` in its
 tools-only mode, `start` is `POST /start/run`, `result` is `GET /result/<ticket>`
-(HTTP API, `/eval/<verb>`). The step declares the call on the conversation's active
+(see [HTTP API](../../../design/http-api.md)). The step declares the call on the conversation's active
 request, runs the tool, and answers with the call's own record, so this client neither
 writes the conversation nor reads it back. The tools run exactly as they run in a turn
 the step drives itself, and a tool reads and behaves one way whether a model meets it
