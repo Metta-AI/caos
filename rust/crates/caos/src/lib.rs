@@ -258,6 +258,18 @@ pub fn cli_status(t: &dyn Transport, arg_tree: &str, all: bool) -> Result<(), St
     Ok(())
 }
 
+/// `watch <arg tree hash>` — follow a run until it has no current work.
+///
+/// The live display `run` and `run-tool` draw while they wait, for a run you are
+/// not blocked on: the hash they print names it. Use `status --all` for what
+/// happened once it is over.
+pub fn cli_watch(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
+    if !is_hex_hash(arg_tree) {
+        return Err(format!("not an arg tree hash: {arg_tree}"));
+    }
+    watch::follow(&t.server_url()?, arg_tree)
+}
+
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
 pub const SERVER_ENV: &str = "CAOS_SERVER_URL";
 
