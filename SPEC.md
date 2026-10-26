@@ -683,7 +683,7 @@ Run `time result/bin/caos-cli run-tool caos-test`
 - shall listen on port 80 and respond to requests:
     - Git push/pull requests are routed to git to handle against the repo
     - WorkRequests as described below. The input is the hash of the ArgTree as a git tree (the stack travels alongside it, not inside the hashed tree). The result is the hash of the WorkResult
-    - Expression lines (`/eval/<verb>`, `/start/<verb>`, `/result/<ticket>`) and the MCP tool server (`POST /mcp`), which drive caos over plain HTTP. See [HTTP API](spec/http-api.md)
+    - Starting and waiting for work (`POST /start`, `POST /start/<verb>`, `GET /result/<ticket>`, `GET /wait/<ticket>`, `GET /eval/<verb>`) and the MCP tool server (`POST /mcp`), which drive caos over plain HTTP. See [HTTP API](spec/http-api.md)
 
 # Tracing
 
