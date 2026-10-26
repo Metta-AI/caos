@@ -431,6 +431,18 @@ mod tests {
     }
 
     #[test]
+    fn the_latest_moment_is_found_anywhere_in_the_tree() {
+        // A late `watch` anchors its clock here, so a deep, recent node must
+        // win over an older root.
+        let mut root = node("test", Some(0), Some(0));
+        let mut mid = node("mid", Some(10), Some(20));
+        mid.children.push(node("leaf", Some(500), None));
+        root.children.push(mid);
+        assert_eq!(root.latest(), 500);
+        assert_eq!(node("bare", None, None).latest(), 0);
+    }
+
+    #[test]
     fn an_absent_terminal_starts_no_thread() {
         // `cargo test` captures stderr, so this exercises the real branch.
         let watch = Watch::start("http://example.invalid", &"a".repeat(40));
