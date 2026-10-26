@@ -180,7 +180,11 @@ impl Drop for Watch {
 /// long.
 pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
     let tty = std::io::stderr().is_terminal();
-    let interval = if tty { POLL * 2 } else { Duration::from_secs(5) };
+    let interval = if tty {
+        POLL * 2
+    } else {
+        Duration::from_secs(5)
+    };
     let mut drawn = 0usize;
     let mut origin: Option<(u64, i64)> = None;
     let mut seen = false;
