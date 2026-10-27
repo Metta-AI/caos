@@ -1,0 +1,8 @@
+# std/tree-map: run a worker over every directory of a tree and assemble the
+# results into a sparse tree of the same shape. See worker.go.
+#
+# A Go worker on std/go, named by a local deep-deps mount (declared in DEPS).
+# It is a GENERIC image: a caller binds the per-directory worker as `--run`.
+#
+#   curry --base:@=DEEP-DEPS/tree-map --run:@=DEEP-DEPS/<per-directory worker>
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go
