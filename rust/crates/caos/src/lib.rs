@@ -3327,23 +3327,33 @@ fn run_request(
     kvs: &[String],
     secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    let arg_tree = prepare_request(t, base, cas, kvs, secrets)?;
-    // Trigger compute; the server runs the container and returns the result's
-    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
-    // at it).
     let server = t.server_url()?;
+    if cas.is_some() {
+        // A worker forms its ArgTree itself (its base is resolved, its secrets
+        // its job's) and runs that directly.
+        let arg_tree = prepare_request(t, base, cas, kvs, secrets)?;
+        eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
+        let _watch = watch::Watch::start(&server, &arg_tree);
+        return request_compute(&server, &arg_tree, secrets);
+    }
+    // A client's run is a start whose caller stays: bundle the request, hand it
+    // over, and wait for the ticket. The server forms the request and runs it,
+    // and the trace sees both; the result is the "<type> <hash>" it answers with
+    // (and, for a top-level run, it pins refs/caos/res/<argTreeHash> at it).
+    let ticket = start_request(t, base, kvs, secrets)?;
     // Name the run before blocking on it, so a long one can be followed from
-    // anywhere (`caos-cli watch <hash>`) — including by a caller with no
+    // anywhere (`caos-cli watch <ticket>`) — including by a caller with no
     // terminal, which is who needs it most: an agent or a CI job. Stderr, so
     // the result a script pipes from stdout is untouched, and printed whether
     // or not there is a tty, unlike the live display below.
-    eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
-    // Watch the work while the compute request blocks. Both `run` and
-    // `run-tool` come through here, so the live display is one place rather
-    // than two, and a caller that is not a person (the suite, a worker) gets
-    // nothing started on its behalf — see `watch::Watch::start`.
-    let _watch = watch::Watch::start(&server, &arg_tree);
-    request_compute(&server, &arg_tree, secrets)
+    eprintln!("ticket {ticket} (follow with: caos-cli watch {ticket})");
+    // Watch the work while the wait blocks. Both `run` and `run-tool` come
+    // through here, so the live display is one place rather than two, and a
+    // caller that is not a person (the suite, a worker) gets nothing started on
+    // its behalf — see `watch::Watch::start`.
+    let _watch = watch::Watch::start(&server, &ticket);
+    // No secrets: the grant was decided when the request was started.
+    request_compute_url(&server, &format!("/wait/{ticket}"), &Secrets::default())
 }
 
 /// Everything in [`run_request`] up to (and including) getting the ArgTree onto
