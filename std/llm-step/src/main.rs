@@ -80,6 +80,16 @@ struct Config {
     /// its own, and no request or head to name. A call already declared under
     /// the id is not declared twice, so a retry runs it rather than failing.
     tool_call: Option<(String, Value)>,
+    /// With `tool_call`: declare the call on the active request and STOP, running
+    /// nothing.
+    ///
+    /// A harness that starts a call and answers before it finishes (`start`)
+    /// needs the declaration on the request BEFORE it answers: a turn's `Stop`
+    /// holds its request open only for a call it can see declared, so a call
+    /// still waiting to be declared when the turn ends finds the request closed.
+    /// The declaration is idempotent, so the run that follows finds the call
+    /// declared and goes on to run it.
+    declare_only: bool,
     /// With `tools_only`: a completed call whose text is longer than this many
     /// characters is also saved in the conversation, and the run's result says
     /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
@@ -129,6 +139,10 @@ impl Config {
             (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
             (None, None) => None,
         };
+        let declare_only = read_arg_opt("declare-only")?.is_some();
+        if declare_only && tool_call.is_none() {
+            return Err("--declare-only needs --tools-only=<call id> and --tool".to_string());
+        }
         let max_result_chars = match read_arg_opt("max-result-chars")? {
             Some(text) => text
                 .trim()
@@ -156,6 +170,7 @@ impl Config {
             run_and_update_ref_image,
             tools_only,
             tool_call,
+            declare_only,
             max_result_chars,
             record,
             list_tools,
@@ -189,7 +204,11 @@ fn run() -> Result<(), String> {
         // The caller named a call, not a request: the active one is the
         // request, and it records its own head.
         (Some(call), Some((name, arguments))) => {
-            declare_requested_call(&mut state, call, name, arguments)?
+            let declared = declare_requested_call(&mut state, call, name, arguments)?;
+            if cfg.declare_only {
+                return forward_files(state.head(), &[("status", b"declared"), ("observation", b"")]);
+            }
+            declared
         }
         _ => {
             let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
@@ -1113,7 +1132,7 @@ fn declare_requested_call(
         let view = state.conversation()?;
         let record = view.active_turn()?.ok_or_else(|| {
             format!(
-                "no active request in {:?}: call {call} arrived before the prompt that opens one",
+                "no active request in {:?}: call {call} found none open (no prompt has opened one yet, or the turn that issued the call ended and its Stop closed the request before the call was declared)",
                 state_conversation_id(state).unwrap_or_default()
             )
         })?;
