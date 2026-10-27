@@ -365,7 +365,7 @@ fn evaluate_locator(
         return raw_root(config, locator, &git_ref, &root);
     }
     let dir = git_ref.dir.as_deref().unwrap_or("");
-    let result = evaluate(config, &root.to_string(), dir, secrets)
+    let result = evaluate(config, &root.to_string(), dir, secrets, parent)
         .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
     if let Some((_, hash)) = result.split_once(' ') {
         crate::secrets::record_mount(
