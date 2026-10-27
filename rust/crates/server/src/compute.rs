@@ -261,6 +261,7 @@ fn walk(
     root: &str,
     path: &str,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::{Entry, EntryKind};
 
