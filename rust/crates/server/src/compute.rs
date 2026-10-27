@@ -404,8 +404,7 @@ pub(crate) fn submit(
 }
 
 fn parse_bundle_body(body: &[u8]) -> Result<serde_json::Value, HttpError> {
-    serde_json::from_slice(body)
-        .map_err(|e| HttpError::new(400, format!("body is not JSON: {e}")))
+    serde_json::from_slice(body).map_err(|e| HttpError::new(400, format!("body is not JSON: {e}")))
 }
 
 /// Form the request a `/submit` body states: its ArgTree, and the names of the
