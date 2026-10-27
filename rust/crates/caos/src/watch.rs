@@ -357,8 +357,16 @@ mod tests {
             name: name.to_string(),
             requested,
             started,
+            now: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_servers_clock_is_read_from_the_root() {
+        let json = serde_json::json!({"name": "t", "requested": 0, "now": 4200});
+        assert_eq!(Node::parse(&json).unwrap().now, Some(4200));
+        assert_eq!(Node::parse(&serde_json::json!({"name": "t"})).unwrap().now, None);
     }
 
     #[test]
