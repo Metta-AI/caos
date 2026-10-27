@@ -35,8 +35,6 @@ jq -n --arg s "$spawn_img" --arg w "$wait_img" --arg h "$harvest_img" --arg a "$
   {type:"tool_use",id:"toolu_async",name:"run_tool",input:{path:"tools/run-async",arguments:{request:$request}}},
   {type:"tool_use",id:"toolu_spawn",name:"run_tool",input:{path:"tools/agent-spawn",arguments:{prompt:$prompt}}}],
   stop_reason:"tool_use"}' > /tmp/stub/response-1.json
-mkfifo /tmp/stub/response-2.json /tmp/stub/response-3.json /tmp/stub/response-4.json \
-  /tmp/stub/response-5.json /tmp/stub/response-6.json
 start_stub /tmp/stub
 
 new_llm_conversation llm-subagent-path "$STUB_PORT" "$ws" \
@@ -44,49 +42,80 @@ new_llm_conversation llm-subagent-path "$STUB_PORT" "$ws" \
 LLM_TEST_USERNAME=Alice
 admit_turn "delegate a focused edit"
 request1=$request
+
+# The parent and the child share one stub and race for its next reply, so no reply can
+# be tied to a request NUMBER. Each is tied to what the request SAYS instead (std/llm-stub,
+# "rules"), and all of them are written before the turn starts. The test then only waits
+# for the turn: nothing polls for a request, and the order the two agents arrive in does
+# not matter.
+#
+# The parent's wait and harvest calls name the child. Its id is derived from the durable
+# spawn call (the parent conversation, the request, round 0 and the tool id), so it is
+# known here, before the child exists.
+child_id=$($TOOL child-id --parent "$conv" --request "$request1" --round 0 \
+  --tool toolu_spawn) || fail "deriving the child id"
+child_id=${child_id#child }
+[ -n "$child_id" ] || fail "the child id is empty"
+
+# rule NAME RESPONSE [NEEDLE | !NEEDLE]...: answer a request whose body has every NEEDLE
+# and none of the !NEEDLEs. Rules are tried in name order, so the most specific is first.
+rule() {
+  local name=$1 response=$2 needle
+  shift 2
+  mkdir -p "/tmp/stub/rules/$name"
+  printf '%s\n' "$response" > "/tmp/stub/rules/$name/response.json"
+  : > "/tmp/stub/rules/$name/contains"
+  : > "/tmp/stub/rules/$name/lacks"
+  for needle in "$@"; do
+    case "$needle" in
+      '!'*) printf '%s\n' "${needle#!}" >> "/tmp/stub/rules/$name/lacks" ;;
+      *) printf '%s\n' "$needle" >> "/tmp/stub/rules/$name/contains" ;;
+    esac
+  done
+}
+run_tool_call() {
+  printf '{"content":[{"id":"%s","input":{"path":"%s","arguments":{"child":"%s"}},"name":"run_tool","type":"tool_use"}],"stop_reason":"tool_use"}' \
+    "$1" "$2" "$child_id"
+}
+CHILD_SYSTEM='You are a focused subagent'
+
+# The child (the only conversation with that system prompt): after its write, report;
+# before it, write.
+rule 01-child-reports \
+  '{"content":[{"text":"child done","type":"text"}],"stop_reason":"end_turn"}' \
+  "$CHILD_SYSTEM" '"tool_use_id":"toolu_child_write"'
+rule 02-child-writes \
+  '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","file-path":"main/child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
+  "$CHILD_SYSTEM"
+# The parent, furthest along first: after harvest, report; after wait, harvest; and
+# otherwise (after the first batch) wait.
+rule 03-parent-reports \
+  '{"content":[{"text":"parent done","type":"text"}],"stop_reason":"end_turn"}' \
+  '"tool_use_id":"toolu_harvest"'
+rule 04-parent-harvests "$(run_tool_call toolu_harvest tools/agent-harvest)" \
+  '"tool_use_id":"toolu_wait"'
+rule 05-parent-waits "$(run_tool_call toolu_wait tools/agent-wait)"
+
+# On any failure below, say what the stub saw and what the conversation looks like.
+diagnose_failure() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "--- llm-stub log ---" >&2
+    cat /tmp/stub/log >&2 || true
+    dump_conversation "$conversation_ref" "$request1" || true
+  fi
+  llm_test_cleanup
+}
+trap diagnose_failure EXIT
+
 start_turn
+wait_turn 600 || fail "the parent turn never reached a terminal event"
 
-# The parent and the child race for the next model slot; the stub is sequential, so each
-# blocked request is read and its FIFO released with the answer belonging to that
-# conversation: the child writes and then reports, the parent waits, harvests, reports.
-child_writes=0
-child_reports=0
-parent_waits=0
-parent_harvests=0
-parent_reports=0
-for request_number in 2 3 4 5 6; do
-  if ! wait_for_file "/tmp/stub/request-$request_number.json"; then
-    dump_conversation "$conversation_ref" "$request1"
-    fail "parent/child API request $request_number never arrived"
-  fi
-  response="/tmp/stub/response-$request_number.json"
-  if jq -e '.system | contains("You are a focused subagent")' "/tmp/stub/request-$request_number.json" >/dev/null; then
-    if [ "$child_writes" -eq 0 ]; then
-      printf '%s\n' '{"content":[{"id":"toolu_child_write","input":{"content":"written by child\n","file-path":"main/child-output.txt"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' > "$response"
-      child_writes=1
-    else
-      printf '%s\n' '{"content":[{"text":"child done","type":"text"}],"stop_reason":"end_turn"}' > "$response"
-      child_reports=1
-    fi
-  elif grep -qF '"tool_use_id":"toolu_harvest"' "/tmp/stub/request-$request_number.json"; then
-    printf '%s\n' '{"content":[{"text":"parent done","type":"text"}],"stop_reason":"end_turn"}' > "$response"
-    parent_reports=1
-  elif grep -qF '"tool_use_id":"toolu_wait"' "/tmp/stub/request-$request_number.json"; then
-    printf '{"content":[{"id":"toolu_harvest","input":{"path":"tools/agent-harvest","arguments":{"child":"%s"}},"name":"run_tool","type":"tool_use"}],"stop_reason":"tool_use"}\n' "$child_id" > "$response"
-    parent_harvests=1
-  else
-    wait_head=$(remote_tip "$conversation_ref") || fail "the parent could not read the conversation head"
-    child_id=$($TOOL children --repo /tmp/repo --head "$wait_head" | jq -r '.id')
-    child_id=${child_id%%$'\n'*}
-    [ -n "$child_id" ] || fail "the parent could not find the child"
-    printf '{"content":[{"id":"toolu_wait","input":{"path":"tools/agent-wait","arguments":{"child":"%s"}},"name":"run_tool","type":"tool_use"}],"stop_reason":"tool_use"}\n' "$child_id" > "$response"
-    parent_waits=1
-  fi
+stage "each scripted reply was used exactly once"
+for name in 01-child-reports 02-child-writes 03-parent-reports 04-parent-harvests 05-parent-waits; do
+  used=$(grep -cF "rule $name" /tmp/stub/log || true)
+  [ "$used" = 1 ] || fail "rule $name answered $used requests, not 1"
 done
-[ "$child_writes$child_reports$parent_waits$parent_harvests$parent_reports" = 11111 ] \
-  || fail "the race did not play out: $child_writes$child_reports$parent_waits$parent_harvests$parent_reports"
-
-wait_turn || fail "the parent turn never reached a terminal event"
 head1=$head
 $TOOL tools --repo /tmp/repo --head "$head1" --request "$request1" > /tmp/parent-tools.jsonl
 
@@ -102,6 +131,7 @@ stage "spawn made the child, wait joined its relay, harvest applied its file"
 $TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" --round 0 --id toolu_spawn > /tmp/spawn-observation.json
 child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
 [ "${#child}" -gt 10 ] || fail "spawn returned no child id: $(cat /tmp/spawn-observation.json)"
+[ "$child" = "$child_id" ] || fail "spawn made child $child, not the derived $child_id"
 $TOOL children --repo /tmp/repo --head "$head1" > /tmp/children.jsonl
 relay=$(jq -r --arg child "$child" 'select(.id == $child) | .relay' /tmp/children.jsonl)
 assert_oid "$relay" "child relay"
