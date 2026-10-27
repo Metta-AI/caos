@@ -508,25 +508,15 @@ fn flat_arg_tree(
 /// `POST /sub-run`, which starts this same pipeline with the launching job's
 /// existing stack and secret store.
 pub(crate) fn run(
-    config: &Config,
+    config: &std::sync::Arc<Config>,
     query: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
     let arg_tree = parse_arg_tree(query)?;
-    // An HTTP run is by definition top-level: the run stack (cycle detection)
-    // exists only inside the server, threaded through promise sub-runs.
-    let result = run_work_request(
-        config,
-        &WorkRequest {
-            arg_tree: &arg_tree,
-            stack: &[],
-            secrets,
-        },
-    );
     // Top-level publication is part of `run_work_request`: a flight owner pins
     // before releasing its ownership, and waiters receive that combined
     // compute-and-publication outcome.
-    let result = result?;
+    let result = run_recorded(config, &arg_tree, secrets)?;
     Ok(format!("{result}\n").into_bytes())
 }
 
