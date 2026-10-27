@@ -110,7 +110,27 @@ impl Context {
 /// Equal oids are equal content, so a copy — a `DEEP-DEPS/<name>` mount is one —
 /// carries the origin of what it was copied from. In front of redis, and an
 /// entry here is everything redis holds for that oid.
-static KNOWN_ORIGINS: Mutex<Option<HashMap<String, Vec<Origin>>>> = Mutex::new(None);
+///
+/// A set: [`record_origins`] and `caos_eval::with_known` test membership per
+/// fact, and against a list of tens of thousands that scan was the server's
+/// CPU. Iteration order is arbitrary, as `SMEMBERS` order already was; nothing
+/// may depend on it (see the marker in [`index_subtrees`]).
+static KNOWN_ORIGINS: Mutex<Option<HashMap<String, HashSet<Origin>>>> = Mutex::new(None);
+
+/// Facts already sent to redis for an oid that memory does not hold, by a
+/// 64-bit hash of `(oid, origin)`, so a re-index of a tree whose origins grew
+/// does not send every old fact again (141M `SADD`s in four hours on
+/// caosd-prod, nearly all repeats). A collision skips one `SADD` and so
+/// withholds one origin, which can only deny a grant, never extend one.
+static SENT: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn fact_hash(oid: &str, origin: &Origin) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    oid.hash(&mut hasher);
+    origin.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Bounds the in-memory maps; forgetting only means a later redis read.
 const MEMORY_CAP: usize = 1_000_000;
@@ -142,9 +162,9 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|map| map.get(oid).cloned())
+        .and_then(|map| map.get(oid))
     {
-        return hit;
+        return hit.iter().cloned().collect();
     }
     let loaded: Vec<Origin> = set_read(&config.redis_addr, &origins_key(oid))
         .unwrap_or_else(|e| {
@@ -160,31 +180,32 @@ pub(crate) fn origins_of(config: &Config, oid: &str) -> Vec<Origin> {
         map.clear();
     }
     let entry = map.entry(oid.to_string()).or_default();
-    let mut seen: HashSet<Origin> = entry.iter().cloned().collect();
-    for origin in loaded {
-        if seen.insert(origin.clone()) {
-            entry.push(origin);
-        }
-    }
-    entry.clone()
+    entry.extend(loaded);
+    entry.iter().cloned().collect()
 }
 
 /// Record each `(oid, origin)`, in redis and in memory where memory already
 /// holds that oid. An oid it does not hold is left for [`origins_of`] to load
-/// whole, so a repeat in redis is a no-op (it is a set).
+/// whole, so a repeat in redis is a no-op (it is a set); [`SENT`] keeps most
+/// repeats from being sent at all.
 fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
     let mut new = Vec::new();
     {
         let mut guard = KNOWN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
+        let mut sent_guard = SENT.lock().unwrap_or_else(|e| e.into_inner());
+        let sent = sent_guard.get_or_insert_with(HashSet::new);
+        if sent.len() >= MEMORY_CAP {
+            sent.clear();
+        }
         for (oid, origin) in facts {
-            if let Some(known) = map.get_mut(&oid) {
-                if known.contains(&origin) {
-                    continue;
-                }
-                known.push(origin.clone());
+            let fresh = match map.get_mut(&oid) {
+                Some(known) => known.insert(origin.clone()),
+                None => sent.insert(fact_hash(&oid, &origin)),
+            };
+            if fresh {
+                new.push((origins_key(&oid), encode_origin(&origin)));
             }
-            new.push((origins_key(&oid), encode_origin(&origin)));
         }
     }
     if let Err(e) = set_add_many(&config.redis_addr, &new) {
@@ -200,9 +221,13 @@ static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 /// `(T, P)` of `tree` itself.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
     let mut marker = format!("caos:secrets:indexed2:{tree}");
-    for origin in origins {
+    // Sorted: `origins` comes out of a set, so its order is arbitrary, and a
+    // marker that depended on it would miss for the same origins.
+    let mut encoded: Vec<String> = origins.iter().map(encode_origin).collect();
+    encoded.sort_unstable();
+    for origin in &encoded {
         marker.push('\n');
-        marker.push_str(&encode_origin(origin));
+        marker.push_str(origin);
     }
     let marker = format!("caos:secrets:indexed2:{}", blob_oid(marker.as_bytes()));
     {
