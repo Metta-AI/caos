@@ -855,6 +855,12 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 &secrets,
             )
         }
+        // `/run`'s counterpart that does not wait: the same formed request, run
+        // the same way, named by the same ArgTree hash.
+        Method::Post if path == "/start" => {
+            let secrets = secret_context(config, request)?;
+            compute::start(config, &query, &secrets)
+        }
         Method::Post if path.starts_with("/start/") => {
             let params = expression_params(request, &query)?;
             let secrets = secret_context(config, request)?;
