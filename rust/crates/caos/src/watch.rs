@@ -57,9 +57,10 @@ struct Node {
     name: String,
     requested: Option<i64>,
     started: Option<i64>,
-    /// The server's clock when it answered, on the same timeline. Only the root
-    /// carries it, and only a server new enough to send it.
-    now: Option<i64>,
+    /// The root request's start as absolute unix ms: what every other time is
+    /// relative to. Only the root carries it, and only a server new enough to
+    /// send it.
+    origin_ms: Option<i64>,
     children: Vec<Node>,
 }
 
