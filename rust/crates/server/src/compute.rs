@@ -489,7 +489,7 @@ fn form_bundle(
     let salt = json["salt"].as_str().unwrap_or("");
     let arg_tree = form_arg_tree(config, &image, call, salt)?;
     let granted = crate::secrets::granted_names(config, secrets, &args_entries(config, &arg_tree)?);
-    Ok(format!("tree {arg_tree}\ngranted {}\n", granted.join(" ")).into_bytes())
+    Ok((arg_tree, granted.join(" ")))
 }
 
 /// A formed ArgTree's `base` and its other entries; `None` for anything else.
