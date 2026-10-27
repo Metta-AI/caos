@@ -720,12 +720,7 @@ fn resolve_command_args(
         base.ok_or_else(|| format!("eval-path: `{verb}` needs a --base:<type>=<image> arg"))?;
     let image_ref = eval_expr_base(host, input_tree, bty, bval, env, vars)?;
     let entries = eval_expr_args(host, input_tree, &arg_toks, env, vars)?;
-
-    if verb == "curry" {
-        let oid = build_curry(host, &image_ref, entries)?;
-        return Ok(("tree".to_string(), oid.to_string()));
-    }
-    host.dispatch(&image_ref, entries)
+    Ok((image_ref, entries))
 }
 
 /// Resolve a command's `--base` arg to an image ref string, dispatched on its
