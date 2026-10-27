@@ -74,6 +74,7 @@ impl Node {
             name: value["name"].as_str().unwrap_or("(unnamed)").to_string(),
             requested: value["requested"].as_i64(),
             started: value["started"].as_i64(),
+            now: value["now"].as_i64(),
             children: value["children"]
                 .as_array()
                 .map(|kids| kids.iter().filter_map(Node::parse).collect())
