@@ -2992,8 +2992,8 @@ fn hex_val(b: u8) -> Option<u8> {
 /// name (`caos_eval::eval_line` says so).
 struct Expression {
     verb: String,
-    /// `--name[:type]=value`, sorted, so two spellings of one call are one
-    /// ticket.
+    /// `--name[:type]=value`, sorted, so two spellings of one call form one
+    /// request.
     args: Vec<String>,
     salt: String,
 }
