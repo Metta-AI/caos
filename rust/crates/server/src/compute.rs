@@ -289,10 +289,11 @@ fn walk(
 
     // No salt and no stack: an eval is deterministic in its inputs, and this is
     // a top-level resolution with no ancestors. `parent` is only a trace label
-    // here (no `then`, so no pool inheritance reads it), so the continuation
-    // names itself.
+    // here (no `then`, so no pool inheritance reads it): the asking request's
+    // ticket when there is one, else the continuation names itself.
     let cont = cont.to_string();
-    let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], secrets)?;
+    let (result, _caught) =
+        resolve_promise(config, parent.unwrap_or(&cont), &cont, "", &[], secrets)?;
     Ok(result)
 }
 
