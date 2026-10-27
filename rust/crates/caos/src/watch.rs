@@ -205,8 +205,16 @@ pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
             return Ok(());
         };
         seen = true;
-        let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
-        let now_rel_ms = at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64;
+        // The server says where "now" is on the root's timeline, so every
+        // time counts from the root request however late we attached. Only a
+        // server that predates the field leaves us to estimate.
+        let now_rel_ms = match root.now {
+            Some(now) => now,
+            None => {
+                let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
+                at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64
+            }
+        };
         let mut lines = Vec::new();
         render(&root, 0, now_rel_ms, &mut lines);
         if tty {
