@@ -3396,7 +3396,7 @@ fn bundle_request(
     base: &Base,
     kvs: &[String],
     secrets: &Secrets,
-) -> Result<(String, Vec<(&'static str, String)>), String> {
+) -> Result<(String, RequestHeaders), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let mut locators = serde_json::Map::new();
