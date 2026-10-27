@@ -79,7 +79,7 @@ first, so `tools/list` is a constant and a client that reads it once, or ignores
 |---|---|
 | `help(path)` | what the tool at a path does and the arguments it takes. `help()` with no path says how caos is doing in this session: the conversation and its head commit, and diagnostics. |
 | `run(path, arguments)` | run the tool at a path and wait for its output. |
-| `start(path, arguments)` | begin the same call and return a ticket. The same call always has the same ticket, and starting one that has finished does not run it again. |
+| `start(path, arguments)` | begin the same call and return a ticket. The ticket is the request's ArgTree hash, the same one `caos-cli run` prints, so `caos-cli watch` and `caos-cli status` take it. The same call always has the same ticket, and starting one that has finished does not run it again. `run` and `start` are one operation that differs only in the wait. |
 | `result(ticket)` | pending, or the output, or how it failed. Asking never runs anything. |
 | `eval-path(path)` | evaluate a path and return the hash of what it produces (`caos-std` exists only this way). Pass the hash as `in` to `read`, `ls` or `grep` to look inside it. |
 
