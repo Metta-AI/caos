@@ -57,6 +57,9 @@ struct Node {
     name: String,
     requested: Option<i64>,
     started: Option<i64>,
+    /// The server's clock when it answered, on the same timeline. Only the root
+    /// carries it, and only a server new enough to send it.
+    now: Option<i64>,
     children: Vec<Node>,
 }
 
