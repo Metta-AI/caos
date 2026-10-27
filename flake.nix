@@ -1167,7 +1167,6 @@ sandbox = false''
             # path. It also means this command needs no `git` of its own, which
             # is why it now carries almost no runtime inputs.
             DEV_VOLUME=caos-vol-caos-dev
-            REPACK_THRESHOLD=16
 
             # Is anything alive that could be READING a server repo? Two
             # sources, and both are needed — the same pair `image-cleanup`
@@ -1191,16 +1190,12 @@ sandbox = false''
               [ -n "$running" ]
             }
 
-            # ONE container, and it decides per repo. The threshold is a bound
-            # on ONE repository's slot table, so summing two repos' packs and
-            # comparing that would repack a 1 GB store because the other one
-            # grew. Counting inside also removes the window a count-then-repack
-            # pair would leave between them.
-            #
-            # The threshold rides in as `$1` rather than being interpolated
-            # into the script text: this is a nix string containing a shell
-            # string containing a shell script, and that is two layers of
-            # quoting too many to add a third.
+            # ONE container for both repos. `--geometric=2` merges only the
+            # small recent packs and keeps unreachable objects (nearly every
+            # object here), so it is cheap enough to run on every `up` without a
+            # pack-count threshold: 0.5s for a suite's 400 packs, where `-a`
+            # rewrote the whole store (12 minutes at 8,000 packs). It is a no-op
+            # on an already-consolidated repo.
             repack_repos() {
               # Skipped rather than fatal: a person running `up` while a suite
               # is in flight wants a stack, not homework, and the next idle
@@ -1212,16 +1207,12 @@ sandbox = false''
               docker run --rm --entrypoint /bin/bash \
                 -v "$CAOS_DATA/stack:/host" -v "$DEV_VOLUME:/dev-stack" \
                 caos-stack:latest -c '
-                  limit=$1
                   for d in /host/git /dev-stack/git; do
                     [ -d "$d" ] || continue
-                    packs=$(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l)
-                    if [ "$packs" -gt "$limit" ]; then
-                      echo "==> repacking $d ($packs packs)" >&2
-                      git -C "$d" repack -adkq || exit 1
-                    fi
+                    echo "==> consolidating $d ($(ls "$d"/objects/pack/*.pack 2>/dev/null | wc -l) packs)" >&2
+                    git -C "$d" -c gc.auto=0 repack --geometric=2 -dq || exit 1
                   done
-                ' _ "$REPACK_THRESHOLD" \
+                ' \
                 || die "repacking the server repos"
             }
 
@@ -1407,6 +1398,24 @@ sandbox = false''
               docker network inspect "$NET" >/dev/null 2>&1 \
                 || docker network create "$NET" >/dev/null
               docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+              # EVERY WORKER LEFT ON THIS ENGINE IS AN ORPHAN NOW. runnerd labels
+              # what it starts with its own container id, and that container is
+              # the one removed just above; no replacement will ever reap them
+              # (it reaps only EXITED containers carrying ITS id, and the id is
+              # new on every `up`). A dev-stack worker orphaned by a restart
+              # kept running for three days on caosd-prod, and
+              # `caos_containers_running` then made every later `up` skip the
+              # repack: the shared dev repo went from 1 pack to 8,583, every
+              # object read got slower with each of them, and a suite that
+              # takes 2.5 minutes took 68. Removing them is not new damage: the
+              # server they were polling is gone, so no job they hold can
+              # finish.
+              mapfile -t orphans < <(docker ps -aq --filter label=caos.runnerd.owner)
+              if [ "''${#orphans[@]}" -gt 0 ]; then
+                echo "==> removing ''${#orphans[@]} worker(s) orphaned by the stack just removed" >&2
+                docker rm -f "''${orphans[@]}" >/dev/null
+              fi
 
               # Docker creates a missing bind source as root. Create it as the
               # invoking user before repack_repos mounts it and tree staging writes it.
