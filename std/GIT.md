@@ -236,8 +236,13 @@ rather than partly installed.
 ## Publishing
 
 The conversation history has many commits (agent turns, merges). Publishing
-that as it is works (`publish_source` takes any gitlink), but squashing first
-gives each layer one clean commit and linear history.
+that as it is works (`publish_source` takes any gitlink). **Branches are
+always merged by squashing**, so the commits on a branch never reach the
+trunk: only its net diff does, and the history inside a branch does not
+matter. Do not spend effort tidying it, and never re-publish a branch just to
+clean its commits. Squashing first is still the usual choice for a stack,
+because it gives each layer one clean commit and linear history, so a reviewer
+sees one diff per layer.
 
 ### 1. Squash (optional but usual for a stack)
 
