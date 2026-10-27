@@ -389,16 +389,20 @@ pub(crate) fn serve(
     } else {
         View::Live
     };
-    let node = walk(
+    let baseline = baseline_of(config, arg_tree);
+    let mut node = walk(
         config,
         arg_tree,
         None,
         view,
         None,
-        baseline_of(config, arg_tree),
+        baseline,
         &mut 0,
         &mut Vec::new(),
     );
+    if let Some(root) = node.as_mut() {
+        root.now = Some(rebase(now_us(), baseline));
+    }
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
 }
