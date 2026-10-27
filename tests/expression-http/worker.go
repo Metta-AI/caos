@@ -5,7 +5,7 @@
 // ticket, `/result/<ticket>` reports on it. The arguments are `caos-cli run`'s,
 // with the type in the parameter's name (`base:hash=…`). The ticket IS the
 // request's ArgTree hash, so it is also what `/run`, `/start?req=` and
-// `/status` take."}
+// `/status` take.
 //
 // It blocks on the server from inside a worker, like every client test does
 // (`caos-cli run` in dev/cli-test blocks the same way), so under a contended
