@@ -228,11 +228,17 @@ fn eval_in_tree(
 /// tree, the path, and whatever a grant could depend on
 /// ([`crate::secrets::Context::walk_key`]). A cached result needs nothing
 /// replayed: the walk's grant records are kept in redis too.
+///
+/// `parent` is the trace node the walk's dispatches are recorded under -- the
+/// ticket of the request that asked, so what it had to evaluate shows up in
+/// that request's trace. `None` names the walk's own continuation, which no
+/// one reads. A memo hit does no work and records nothing, as for any reuse.
 fn evaluate(
     config: &Config,
     root: &str,
     path: &str,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     // Content-addressed by storing it, so the redis key is fixed-length.
     let identity = match secrets.walk_key() {
