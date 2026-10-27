@@ -90,6 +90,8 @@ run_tool(path="caos-std/github", arguments={...})   # open the PR
   as `sources/<repo>/00-base-2` (see "Updating the base").
 - Read the imported repo's own `AGENTS.md` / `CLAUDE.md` before editing: they
   govern that code.
+- The commits inside a branch do not matter, only its net diff: branches are
+  always merged by squashing (see "Publishing"). Publish the layer as it is.
 
 ## Starting a brand-new repository
 
