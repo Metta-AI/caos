@@ -128,6 +128,10 @@ func main() {
 		code, viaRun := call("GET", "/run?req="+req, "")
 		w.True(code == 200, "/run?req=%s: HTTP %d: %s", req, code, viaRun)
 		w.True(viaExpr == viaRun, "/eval/run said %q but /run said %q", viaExpr, viaRun)
+		// A request that was RUN, not started, is asked after the same way: its
+		// name is its ArgTree hash whichever door it came in by.
+		_, ran := call("GET", "/result/"+req, "")
+		w.True(ran == "ok "+viaRun, "/result/%s said %q after a run that answered %q", req, ran, viaRun)
 		text := blobText(strings.TrimPrefix(viaExpr, "blob "))
 		w.True(strings.Contains(text, "msg = hi"), "hello did not report the argument: %q", text)
 		fmt.Fprintf(os.Stderr, "  ok: %s\n", viaExpr)
