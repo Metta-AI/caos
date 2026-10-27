@@ -356,6 +356,7 @@ fn evaluate_locator(
     locator: &str,
     token: Option<&str>,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
     let root = crate::locator::resolve_root(config, &git_ref, token)
