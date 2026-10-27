@@ -3179,11 +3179,137 @@ impl Drop for TicketGuard {
     }
 }
 
-/// `POST /start/<verb>` — begin an evaluation and return its ticket at once.
-/// Starting the same call again returns the same ticket: while it runs it
-/// joins it, and once it has succeeded it is already answered. A FAILED one is
-/// started afresh, because a failure is not an answer (the same rule the
-/// result cache keeps).
+/// Take `arg_tree` to run, and note it as pending where `GET /result/<arg tree>`
+/// reads. `None` when there is nothing to take: it is already running in this
+/// process (the caller joins it), or it has already succeeded. A FAILED one is
+/// taken afresh, because a failure is not an answer (the same rule the result
+/// cache keeps).
+fn admit(
+    config: &std::sync::Arc<Config>,
+    arg_tree: &str,
+) -> Result<Option<TicketGuard>, HttpError> {
+    let key = ticket_key(config, arg_tree);
+    // Held across the read so two arrivals cannot both take it.
+    let mut live = live_tickets().lock().unwrap();
+    if live.contains(arg_tree) {
+        return Ok(None);
+    }
+    if let Ok(Some(state)) = cache_get(&config.redis_addr, &key) {
+        if state.starts_with("ok ") {
+            return Ok(None);
+        }
+    }
+    cache_set(&config.redis_addr, &key, "pending")
+        .map_err(|e| HttpError::new(500, format!("cannot record request {arg_tree}: {e}")))?;
+    live.insert(arg_tree.to_string());
+    Ok(Some(TicketGuard {
+        config: std::sync::Arc::clone(config),
+        ticket: arg_tree.to_string(),
+        outcome: None,
+    }))
+}
+
+/// What a finished run is recorded as, in the form `GET /result` answers.
+fn outcome_state(outcome: &Result<String, HttpError>) -> String {
+    match outcome {
+        Ok(result) => format!("ok {result}"),
+        Err(e) => format!("failed {} {}", e.status(), e.message()),
+    }
+}
+
+/// Run the formed request `arg_tree` as a top-level run and wait for its
+/// `"<type> <hash>"`, noting its state for `GET /result/<arg tree>` on the way.
+///
+/// This is the ONE way an external caller's request runs. `GET /run`,
+/// `/eval/run` and (on a thread of its own) [`start_recorded`] all come through
+/// it, so what a request does, what `watch` and `status` show of it, and what
+/// `result` says of it do not depend on which door it came in by or whether the
+/// caller waited.
+fn run_recorded(
+    config: &std::sync::Arc<Config>,
+    arg_tree: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let guard = admit(config, arg_tree)?;
+    // An HTTP run is by definition top-level: the run stack (cycle detection)
+    // exists only inside the server, threaded through promise sub-runs.
+    let outcome = run_work_request(
+        config,
+        &WorkRequest {
+            arg_tree,
+            stack: &[],
+            secrets,
+        },
+    );
+    if let Some(guard) = guard {
+        guard.finish(outcome_state(&outcome));
+    }
+    outcome
+}
+
+/// [`run_recorded`] without the wait: the same run, on a thread of its own.
+/// Starting what is already running joins it; starting what has succeeded finds
+/// it answered.
+fn start_recorded(
+    config: &std::sync::Arc<Config>,
+    arg_tree: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<(), HttpError> {
+    let Some(guard) = admit(config, arg_tree)? else {
+        return Ok(());
+    };
+    let secrets = secrets.clone();
+    let owned = arg_tree.to_string();
+    let spawned = std::thread::Builder::new()
+        .name(format!("request-{arg_tree}"))
+        .spawn(move || {
+            let outcome = run_work_request(
+                &guard.config,
+                &WorkRequest {
+                    arg_tree: &owned,
+                    stack: &[],
+                    secrets: &secrets,
+                },
+            );
+            guard.finish(outcome_state(&outcome));
+        });
+    if let Err(e) = spawned {
+        // The closure, and the guard in it, are gone: the guard's drop has
+        // already recorded the failure and released the request.
+        return Err(HttpError::new(
+            500,
+            format!("cannot start request {arg_tree}: {e}"),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /start?req=<ArgTree>` — the counterpart of `GET /run?req=<ArgTree>`
+/// that does not wait: start the formed request and return its name, which is
+/// the ArgTree hash itself. Ask for its state with `GET /result/<ArgTree>`,
+/// follow it with `GET /status/<ArgTree>`.
+pub(crate) fn start(
+    config: &std::sync::Arc<Config>,
+    query: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<Vec<u8>, HttpError> {
+    let arg_tree = parse_arg_tree(query)?;
+    // A request that is not there is the caller's mistake, said now rather than
+    // as a failure someone has to poll for.
+    read_arg_tree(config, &arg_tree)?;
+    start_recorded(config, &arg_tree, secrets)?;
+    Ok(format!("{arg_tree}\n").into_bytes())
+}
+
+/// `POST /start/<verb>` — form the line's request, start it, and return its
+/// name at once. The name is the request's ArgTree hash, the same one
+/// `/eval/run` and `caos-cli run` work under, so `result`, `watch` and `status`
+/// take it as they take theirs. The same call is the same request: starting it
+/// again joins it while it runs, and finds it answered once it has succeeded.
+///
+/// Forming evaluates what the line names (a base's build, a locator's fetch),
+/// as it does for `run`, so a cold one is slow here as it is there; what `start`
+/// does not wait for is the run.
 pub(crate) fn start_expression(
     config: &std::sync::Arc<Config>,
     verb: &str,
@@ -3191,47 +3317,18 @@ pub(crate) fn start_expression(
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
     let expression = parse_expression(verb, params)?;
-    let ticket = ticket_of(config, &expression, secrets)?;
-    let key = ticket_key(config, &ticket);
-    {
-        // Held across the read so two arrivals cannot both start it.
-        let mut live = live_tickets().lock().unwrap();
-        if live.contains(&ticket) {
-            return Ok(format!("{ticket}\n").into_bytes());
-        }
-        if let Ok(Some(state)) = cache_get(&config.redis_addr, &key) {
-            if state.starts_with("ok ") {
-                return Ok(format!("{ticket}\n").into_bytes());
-            }
-        }
-        cache_set(&config.redis_addr, &key, "pending")
-            .map_err(|e| HttpError::new(500, format!("cannot record ticket {ticket}: {e}")))?;
-        live.insert(ticket.clone());
-    }
-    let secrets = secrets.clone();
-    let guard = TicketGuard {
-        config: std::sync::Arc::clone(config),
-        ticket: ticket.clone(),
-        outcome: None,
-    };
-    let spawned = std::thread::Builder::new()
-        .name(format!("ticket-{ticket}"))
-        .spawn(move || {
-            let outcome = eval_expression(&guard.config, &expression, &guard.ticket, &secrets);
-            guard.finish(match outcome {
-                Ok(result) => format!("ok {result}"),
-                Err(e) => format!("failed {} {}", e.status(), e.message()),
-            });
-        });
-    if let Err(e) = spawned {
-        // The closure, and the guard in it, are gone: the guard's drop has
-        // already recorded the failure and released the ticket.
+    if expression.verb != "run" {
         return Err(HttpError::new(
-            500,
-            format!("cannot start ticket {ticket}: {e}"),
+            400,
+            format!(
+                "/start/{verb}: only `run` has work to start; `curry` forms a tree \
+                 and runs nothing, so use /eval/curry"
+            ),
         ));
     }
-    Ok(format!("{ticket}\n").into_bytes())
+    let arg_tree = form_expression(config, &expression, secrets)?;
+    start_recorded(config, &arg_tree, secrets)?;
+    Ok(format!("{arg_tree}\n").into_bytes())
 }
 
 /// `GET /result/<ticket>` — `pending`, `ok <kind> <hash>`, or
