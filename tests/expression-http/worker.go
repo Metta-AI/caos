@@ -2,7 +2,8 @@
 //
 // Exercises the server's HTTP surface for ONE expression line with nothing but
 // net/http: `/eval/<verb>` blocks for the answer, `/start/<verb>` returns a
-// ticket, `/result/<ticket>` reports on it. The arguments are `caos-cli run`'s,
+// ticket, `/result/<ticket>` reports on it, `/wait/<ticket>` blocks for it
+// (`/eval` is a start and a wait), and `/status/<ticket>` shows its work. The arguments are `caos-cli run`'s,
 // with the type in the parameter's name (`base:hash=…`).
 //
 // It blocks on the server from inside a worker, like every client test does
