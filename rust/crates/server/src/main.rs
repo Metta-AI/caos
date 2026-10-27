@@ -11,6 +11,12 @@
 //! * `GET /run?req=<hash>` — run the ArgTree `<hash>` (`req` is the
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result.
+//! * `POST /start?req=<hash>` — the same run without the wait: starts it and
+//!   returns `<hash>`. `GET /result/<hash>` says how it stands (`pending`,
+//!   `ok <kind> <hash>`, `failed …`) and `GET /status/<hash>` shows its work.
+//!   `/start/<verb>` and `/eval/<verb>` do the same from a `.caos-expr` line,
+//!   forming the ArgTree first; a request is named by its ArgTree hash
+//!   whichever door it came in by.
 //! * `POST /trace/child` — record, under an in-flight job, that it started work
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
