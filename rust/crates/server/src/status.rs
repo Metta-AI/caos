@@ -340,15 +340,15 @@ pub(crate) struct Node {
     reused: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<Node>,
-    /// The server's clock when this was read, same units as `requested`. Set on
-    /// the ROOT of a response only.
+    /// The root request's `requested` as ABSOLUTE unix milliseconds: the instant
+    /// every other time in the response is relative to. Set on the ROOT of a
+    /// response only.
     ///
-    /// Without it a reader that did not start the run (`caos-cli watch`) has no
-    /// way to place "now" on the relative timeline, and can only guess from the
-    /// latest event — so every elapsed time starts from zero at the moment it
-    /// attaches instead of counting from the root request.
+    /// The relative times alone cannot say how long ago the run began, so a
+    /// reader that did not start it (`caos-cli watch`) could only anchor on
+    /// whenever it attached, and every elapsed time started from zero there.
     #[serde(skip_serializing_if = "Option::is_none")]
-    now: Option<i64>,
+    origin_ms: Option<i64>,
 }
 
 /// Which question `/status` is being asked.
