@@ -3064,40 +3064,75 @@ fn expression_id(
         .map_err(|e| HttpError::new(500, e))
 }
 
-fn eval_expression(
-    config: &Config,
-    expression: &Expression,
-    ticket: &str,
-    secrets: &crate::secrets::Context,
-) -> Result<String, HttpError> {
-    let host = ServerEvalHost {
+/// The host a line is resolved against: the server's own, with no stack and the
+/// line's salt.
+fn line_host<'a>(
+    config: &'a Config,
+    expression: &'a Expression,
+    parent: &'a str,
+    secrets: &'a crate::secrets::Context,
+) -> ServerEvalHost<'a> {
+    ServerEvalHost {
         config,
         salt: &expression.salt,
         stack: &[],
         secrets,
-        parent: ticket,
+        parent,
         eval_path: "",
         dispatches: std::sync::atomic::AtomicUsize::new(0),
-    };
+    }
+}
+
+/// Evaluate a `curry` line: it forms a tree and runs nothing, so there is no
+/// work to wait for or to start.
+fn curry_expression(
+    config: &Config,
+    expression: &Expression,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let id = expression_id(config, expression, secrets)?;
+    let host = line_host(config, expression, &id, secrets);
     let args: Vec<&str> = expression.args.iter().map(String::as_str).collect();
     caos_eval::eval_line(&host, &expression.verb, &args)
         .map(|(kind, hash)| format!("{kind} {hash}"))
         .map_err(|e| HttpError::new(500, e))
 }
 
-/// `GET|POST /eval/<verb>` — evaluate the line and block for the answer,
-/// `<kind> <hash>`. `run` is what `caos-cli run` does; `curry` forms the
-/// ArgTree and runs nothing.
-pub(crate) fn eval_expression_endpoint(
+/// Form the request a `run` line states, and run nothing: the ArgTree its base
+/// and args make. Everything that needs evaluating (a base's build, a locator's
+/// fetch) is evaluated here, on the server, exactly as `POST /submit` does for
+/// a client's bundle -- so a line and a bundle that state one call form one
+/// ArgTree, and `run` and `start` can name it by that hash.
+fn form_expression(
     config: &Config,
+    expression: &Expression,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let id = expression_id(config, expression, secrets)?;
+    let host = line_host(config, expression, &id, secrets);
+    let args: Vec<&str> = expression.args.iter().map(String::as_str).collect();
+    let (image, entries) =
+        caos_eval::form_line(&host, &args).map_err(|e| HttpError::new(500, e))?;
+    form_arg_tree(config, &image, entries, &expression.salt)
+}
+
+/// `GET|POST /eval/<verb>` — evaluate the line and block for the answer,
+/// `<kind> <hash>`. `run` forms the request and runs it, the same as
+/// `/start/run` followed by waiting; `curry` forms the ArgTree and runs
+/// nothing.
+pub(crate) fn eval_expression_endpoint(
+    config: &std::sync::Arc<Config>,
     verb: &str,
     params: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
     let expression = parse_expression(verb, params)?;
-    let ticket = ticket_of(config, &expression, secrets)?;
-    eval_expression(config, &expression, &ticket, secrets)
-        .map(|result| format!("{result}\n").into_bytes())
+    if expression.verb == "curry" {
+        return curry_expression(config, &expression, secrets)
+            .map(|result| format!("{result}\n").into_bytes());
+    }
+    let arg_tree = form_expression(config, &expression, secrets)?;
+    run_recorded(config, &arg_tree, secrets).map(|result| format!("{result}\n").into_bytes())
 }
 
 /// Evaluations running in THIS process. A ticket recorded `pending` that is not
