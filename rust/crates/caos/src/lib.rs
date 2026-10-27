@@ -3373,14 +3373,16 @@ fn prepare_request(
     submit_request(t, base, kvs, secrets).map(|(arg_tree, _)| arg_tree)
 }
 
-/// `POST /submit`: one push of a bundle holding the call's args (and the tree
-/// a path base is evaluated in), then one call.
-fn submit_request(
+/// Bundle a request for the server: one push of a tree holding the call's args
+/// (and the tree a path base is evaluated in), and the body that names it. This
+/// is ALL the client does for a request -- it ingests what only it can read and
+/// hands the rest over; every evaluation is the server's.
+fn bundle_request(
     t: &dyn Transport,
     base: &Base,
     kvs: &[String],
     secrets: &Secrets,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, Vec<(&'static str, String)>), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let mut locators = serde_json::Map::new();
