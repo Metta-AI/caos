@@ -855,6 +855,19 @@ fn route(config: &Arc<Config>, request: &mut Request) -> Result<Vec<u8>, HttpErr
                 &secrets,
             )
         }
+        // The same, for a request a client has bundled rather than spelled
+        // (`POST /submit`'s body). `/wait/<ticket>` is what `/eval` does after
+        // a start: it blocks for the ticket's answer.
+        Method::Post if path == "/start" => {
+            let secrets = secret_context(config, request)?;
+            let token = git_token(request)?;
+            let mut body = Vec::new();
+            request.as_reader().read_to_end(&mut body)?;
+            compute::start_bundle(config, &body, &secrets, token.as_deref())
+        }
+        Method::Get if path.starts_with("/wait/") => {
+            compute::wait_ticket(config, path.trim_start_matches("/wait/"))
+        }
         Method::Post if path.starts_with("/start/") => {
             let params = expression_params(request, &query)?;
             let secrets = secret_context(config, request)?;
