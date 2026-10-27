@@ -3432,6 +3432,50 @@ fn bundle_request(
     .to_string();
     let mut headers = secrets.headers();
     headers.push(("content-type", "application/json".to_string()));
+    Ok((body, headers))
+}
+
+/// `POST /start`: the bundle, started rather than formed. The server answers at
+/// once with the request's ticket and does the rest on the ticket's own thread
+/// -- forming the request, running it -- so none of that happens here or holds
+/// this call up.
+fn start_request(
+    t: &dyn Transport,
+    base: &Base,
+    kvs: &[String],
+    secrets: &Secrets,
+) -> Result<String, String> {
+    let (body, headers) = bundle_request(t, base, kvs, secrets)?;
+    let answer = server_call(
+        &t.server_url()?,
+        &ServerRequest {
+            method: "POST",
+            path: "/start",
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(60),
+        },
+    )?;
+    let ticket = String::from_utf8(answer)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?
+        .trim()
+        .to_string();
+    if !is_hex_hash(&ticket) {
+        return Err(format!("server returned a malformed ticket: {ticket:?}"));
+    }
+    Ok(ticket)
+}
+
+/// `POST /submit`: the bundle, formed into its ArgTree and nothing run. The
+/// answer is the ArgTree and the names of the secrets a run of it would be
+/// given.
+fn submit_request(
+    t: &dyn Transport,
+    base: &Base,
+    kvs: &[String],
+    secrets: &Secrets,
+) -> Result<(String, Vec<String>), String> {
+    let (body, headers) = bundle_request(t, base, kvs, secrets)?;
     let answer = server_call(
         &t.server_url()?,
         &ServerRequest {
