@@ -258,16 +258,17 @@ pub fn cli_status(t: &dyn Transport, arg_tree: &str, all: bool) -> Result<(), St
     Ok(())
 }
 
-/// `watch <arg tree hash>` — follow a run until it has no current work.
+/// `watch <ticket>` — follow a run until it has no current work.
 ///
 /// The live display `run` and `run-tool` draw while they wait, for a run you are
-/// not blocked on: the hash they print names it. Use `status --all` for what
-/// happened once it is over.
-pub fn cli_watch(t: &dyn Transport, arg_tree: &str) -> Result<(), String> {
-    if !is_hex_hash(arg_tree) {
-        return Err(format!("not an arg tree hash: {arg_tree}"));
+/// not blocked on: the ticket they print names it, and so does the one an
+/// agent's `start` returns. (An ArgTree hash names a request formed and run
+/// directly.) Use `status --all` for what happened once it is over.
+pub fn cli_watch(t: &dyn Transport, ticket: &str) -> Result<(), String> {
+    if !is_hex_hash(ticket) {
+        return Err(format!("not a ticket: {ticket}"));
     }
-    watch::follow(&t.server_url()?, arg_tree)
+    watch::follow(&t.server_url()?, ticket)
 }
 
 /// Base URL of the caos server (storage + compute), e.g. `http://caos-server`.
@@ -3327,23 +3328,33 @@ fn run_request(
     kvs: &[String],
     secrets: &Secrets,
 ) -> Result<(String, String), String> {
-    let arg_tree = prepare_request(t, base, cas, kvs, secrets)?;
-    // Trigger compute; the server runs the container and returns the result's
-    // "<type> <hash>" (and, for a top-level run, pins refs/caos/res/<argTreeHash>
-    // at it).
     let server = t.server_url()?;
+    if cas.is_some() {
+        // A worker forms its ArgTree itself (its base is resolved, its secrets
+        // its job's) and runs that directly.
+        let arg_tree = prepare_request(t, base, cas, kvs, secrets)?;
+        eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
+        let _watch = watch::Watch::start(&server, &arg_tree);
+        return request_compute(&server, &arg_tree, secrets);
+    }
+    // A client's run is a start whose caller stays: bundle the request, hand it
+    // over, and wait for the ticket. The server forms the request and runs it,
+    // and the trace sees both; the result is the "<type> <hash>" it answers with
+    // (and, for a top-level run, it pins refs/caos/res/<argTreeHash> at it).
+    let ticket = start_request(t, base, kvs, secrets)?;
     // Name the run before blocking on it, so a long one can be followed from
-    // anywhere (`caos-cli watch <hash>`) — including by a caller with no
+    // anywhere (`caos-cli watch <ticket>`) — including by a caller with no
     // terminal, which is who needs it most: an agent or a CI job. Stderr, so
     // the result a script pipes from stdout is untouched, and printed whether
     // or not there is a tty, unlike the live display below.
-    eprintln!("arg-tree {arg_tree} (follow with: caos-cli watch {arg_tree})");
-    // Watch the work while the compute request blocks. Both `run` and
-    // `run-tool` come through here, so the live display is one place rather
-    // than two, and a caller that is not a person (the suite, a worker) gets
-    // nothing started on its behalf — see `watch::Watch::start`.
-    let _watch = watch::Watch::start(&server, &arg_tree);
-    request_compute(&server, &arg_tree, secrets)
+    eprintln!("ticket {ticket} (follow with: caos-cli watch {ticket})");
+    // Watch the work while the wait blocks. Both `run` and `run-tool` come
+    // through here, so the live display is one place rather than two, and a
+    // caller that is not a person (the suite, a worker) gets nothing started on
+    // its behalf — see `watch::Watch::start`.
+    let _watch = watch::Watch::start(&server, &ticket);
+    // No secrets: the grant was decided when the request was started.
+    request_compute_url(&server, &format!("/wait/{ticket}"), &Secrets::default())
 }
 
 /// Everything in [`run_request`] up to (and including) getting the ArgTree onto
@@ -3373,14 +3384,19 @@ fn prepare_request(
     submit_request(t, base, kvs, secrets).map(|(arg_tree, _)| arg_tree)
 }
 
-/// `POST /submit`: one push of a bundle holding the call's args (and the tree
-/// a path base is evaluated in), then one call.
-fn submit_request(
+/// A request's HTTP headers: its secrets, and the content type.
+type RequestHeaders = Vec<(&'static str, String)>;
+
+/// Bundle a request for the server: one push of a tree holding the call's args
+/// (and the tree a path base is evaluated in), and the body that names it. This
+/// is ALL the client does for a request -- it ingests what only it can read and
+/// hands the rest over; every evaluation is the server's.
+fn bundle_request(
     t: &dyn Transport,
     base: &Base,
     kvs: &[String],
     secrets: &Secrets,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<(String, RequestHeaders), String> {
     use gix::objs::tree::{Entry, EntryKind};
 
     let mut locators = serde_json::Map::new();
@@ -3430,6 +3446,50 @@ fn submit_request(
     .to_string();
     let mut headers = secrets.headers();
     headers.push(("content-type", "application/json".to_string()));
+    Ok((body, headers))
+}
+
+/// `POST /start`: the bundle, started rather than formed. The server answers at
+/// once with the request's ticket and does the rest on the ticket's own thread
+/// -- forming the request, running it -- so none of that happens here or holds
+/// this call up.
+fn start_request(
+    t: &dyn Transport,
+    base: &Base,
+    kvs: &[String],
+    secrets: &Secrets,
+) -> Result<String, String> {
+    let (body, headers) = bundle_request(t, base, kvs, secrets)?;
+    let answer = server_call(
+        &t.server_url()?,
+        &ServerRequest {
+            method: "POST",
+            path: "/start",
+            headers: &headers,
+            body: Some(body.as_bytes()),
+            timeout_secs: Some(60),
+        },
+    )?;
+    let ticket = String::from_utf8(answer)
+        .map_err(|e| format!("server returned invalid UTF-8: {e}"))?
+        .trim()
+        .to_string();
+    if !is_hex_hash(&ticket) {
+        return Err(format!("server returned a malformed ticket: {ticket:?}"));
+    }
+    Ok(ticket)
+}
+
+/// `POST /submit`: the bundle, formed into its ArgTree and nothing run. The
+/// answer is the ArgTree and the names of the secrets a run of it would be
+/// given.
+fn submit_request(
+    t: &dyn Transport,
+    base: &Base,
+    kvs: &[String],
+    secrets: &Secrets,
+) -> Result<(String, Vec<String>), String> {
+    let (body, headers) = bundle_request(t, base, kvs, secrets)?;
     let answer = server_call(
         &t.server_url()?,
         &ServerRequest {
