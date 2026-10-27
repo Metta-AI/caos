@@ -221,7 +221,7 @@ fn eval_in_tree(
     path: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    evaluate(config, root, path, secrets).map(String::into_bytes)
+    evaluate(config, root, path, secrets, None).map(String::into_bytes)
 }
 
 /// Walk `root` down to `path`, returning `"<kind> <hash>"`, memoized on the
