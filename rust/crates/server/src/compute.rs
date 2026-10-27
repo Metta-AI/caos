@@ -3119,16 +3119,37 @@ fn eval_expression(
 /// `GET|POST /eval/<verb>` — evaluate the line and block for the answer,
 /// `<kind> <hash>`. `run` is what `caos-cli run` does; `curry` forms the
 /// ArgTree and runs nothing.
+///
+/// This is `/start/<verb>` and then waiting for the ticket: the same ticket,
+/// the same evaluation on the same thread, the same trace. A run is a start
+/// whose caller stays.
 pub(crate) fn eval_expression_endpoint(
-    config: &Config,
+    config: &std::sync::Arc<Config>,
     verb: &str,
     params: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    let expression = parse_expression(verb, params)?;
-    let ticket = ticket_of(config, &expression, secrets)?;
-    eval_expression(config, &expression, &ticket, secrets)
-        .map(|result| format!("{result}\n").into_bytes())
+    let ticket = begin_expression(config, verb, params, secrets)?;
+    wait_ticket(config, &ticket)
+}
+
+/// `GET /wait/<ticket>` — block until the ticket has an answer, and give it as
+/// `/eval` does: `<kind> <hash>`, or the failure the ticket recorded. Nothing is
+/// dispatched: it reads what `GET /result/<ticket>` reads until that stops
+/// saying `pending`.
+pub(crate) fn wait_ticket(config: &Config, ticket: &str) -> Result<Vec<u8>, HttpError> {
+    loop {
+        let state = expression_result(config, ticket)?;
+        let state = String::from_utf8_lossy(&state).trim().to_string();
+        if let Some(answer) = state.strip_prefix("ok ") {
+            return Ok(format!("{answer}\n").into_bytes());
+        }
+        if let Some(failure) = state.strip_prefix("failed ") {
+            let (status, message) = failure.split_once(' ').unwrap_or((failure, ""));
+            return Err(HttpError::new(status.parse().unwrap_or(500), message));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Evaluations running in THIS process. A ticket recorded `pending` that is not
