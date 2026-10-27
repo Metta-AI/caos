@@ -640,6 +640,22 @@ pub fn eval_line(
     verb: &str,
     args: &[&str],
 ) -> Result<(String, String), String> {
+    refuse_local_paths(args)?;
+    eval_command_args(host, "", verb, args, &HashMap::new(), false)
+}
+
+/// Form ONE `run` line's request without running it: the image it names and the
+/// entries of its call, ready for the host to assemble into an ArgTree. This is
+/// [`eval_line`] up to, and not including, the dispatch -- the same resolution
+/// of the base and every arg, so a caller that forms the request and then runs
+/// it gets exactly what `eval_line` would have computed.
+pub fn form_line(host: &dyn EvalHost, args: &[&str]) -> Result<(String, Vec<Entry>), String> {
+    refuse_local_paths(args)?;
+    resolve_command_args(host, "", "run", args, &HashMap::new(), false)
+}
+
+/// An HTTP line has no local tree, so `:@=` has nothing to name.
+fn refuse_local_paths(args: &[&str]) -> Result<(), String> {
     for &arg in args {
         if let (name, ArgType::Path, _) = parse_arg(arg)? {
             return Err(format!(
@@ -648,7 +664,7 @@ pub fn eval_line(
             ));
         }
     }
-    eval_command_args(host, "", verb, args, &HashMap::new(), false)
+    Ok(())
 }
 
 /// [`eval_command`]'s body over split tokens. `vars` says whether a value
