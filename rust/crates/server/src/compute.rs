@@ -250,7 +250,7 @@ fn evaluate(
     if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
         return Ok(result);
     }
-    let result = walk(config, root, path, secrets)?;
+    let result = walk(config, root, path, secrets, parent)?;
     let _ = cache_set(&config.redis_addr, &key, &result);
     Ok(result)
 }
