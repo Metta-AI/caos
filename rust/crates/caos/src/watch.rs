@@ -178,11 +178,11 @@ impl Drop for Watch {
 /// the terminal being a tty. On one it redraws in place; off one (a log) it
 /// appends a snapshot every few seconds, with no escapes.
 ///
-/// The server reports times relative to the root request and has no "now", and
-/// we did not start the run, so the origin is a lower bound: the latest moment
-/// any node reports, then ticked forward on our clock. A node's elapsed time can
-/// therefore read short by however long it has been since its last event, never
-/// long.
+/// The server reports times relative to the root request, and sends the root's
+/// absolute start (`origin_ms`) with them, so elapsed times count from the start
+/// of the root trace however late we attached. Against a server that predates
+/// `origin_ms` the origin is a lower bound instead: the latest moment any node
+/// reports, ticked forward on our clock, so elapsed times can read short.
 pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
     let tty = std::io::stderr().is_terminal();
     let interval = if tty {
