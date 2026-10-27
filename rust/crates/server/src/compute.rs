@@ -3324,13 +3324,25 @@ pub(crate) fn start_expression(
 /// `GET /result/<ticket>` — `pending`, `ok <kind> <hash>`, or
 /// `failed <status> <message>`. It only reads: asking never dispatches work,
 /// which is what lets a caller poll without risk of re-running a failure.
+///
+/// The ticket is the request's ArgTree hash, so a request that was run rather
+/// than started has one too: it has no recorded state, but if its answer is in
+/// the result cache that is the answer.
 pub(crate) fn expression_result(config: &Config, ticket: &str) -> Result<Vec<u8>, HttpError> {
     if ticket.len() != 40 || !ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(HttpError::new(400, format!("invalid ticket: {ticket:?}")));
     }
-    let state = cache_get(&config.redis_addr, &ticket_key(config, ticket))
-        .map_err(|e| HttpError::new(500, format!("cannot read ticket {ticket}: {e}")))?
-        .ok_or_else(|| HttpError::new(404, format!("unknown ticket {ticket}")))?;
+    let read = |key: String| {
+        cache_get(&config.redis_addr, &key)
+            .map_err(|e| HttpError::new(500, format!("cannot read ticket {ticket}: {e}")))
+    };
+    let state = match read(ticket_key(config, ticket))? {
+        Some(state) => state,
+        None => match read(result_key(config, ticket))? {
+            Some(result) => format!("ok {result}"),
+            None => return Err(HttpError::new(404, format!("unknown ticket {ticket}"))),
+        },
+    };
     let state = if state == "pending" && !live_tickets().lock().unwrap().contains(ticket) {
         "failed 500 the server restarted before this finished; start it again".to_string()
     } else {
