@@ -11,6 +11,13 @@
 //! * `GET /run?req=<hash>` — run the ArgTree `<hash>` (`req` is the
 //!   query param's historical name; its value is the ArgTree hash) and return
 //!   the hash of its result.
+//! * `POST /start` (a bundled request, `POST /submit`'s body) and `POST
+//!   /start/<verb>` (a `.caos-expr` line) — start a request and return its
+//!   TICKET at once. Forming the request (a base's build, a locator's fetch)
+//!   and running it happen on the ticket's own thread, recorded under it, so
+//!   `GET /status/<ticket>` shows the evaluation as well as the run.
+//!   `GET /result/<ticket>` says how it stands and `GET /wait/<ticket>` blocks
+//!   for the answer. `/eval/<verb>` is a start followed by that wait.
 //! * `POST /trace/child` — record, under an in-flight job, that it started work
 //!   on another stack, so a reader descends into it (`status`).
 //! * `POST /sub-run` — admit an exact detached child under an in-flight job's
