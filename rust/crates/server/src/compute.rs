@@ -398,9 +398,29 @@ pub(crate) fn submit(
     secrets: &crate::secrets::Context,
     token: Option<&str>,
 ) -> Result<Vec<u8>, HttpError> {
+    let json = parse_bundle_body(body)?;
+    let (arg_tree, granted) = form_bundle(config, &json, secrets, token, None)?;
+    Ok(format!("tree {arg_tree}\ngranted {granted}\n").into_bytes())
+}
+
+fn parse_bundle_body(body: &[u8]) -> Result<serde_json::Value, HttpError> {
+    serde_json::from_slice(body)
+        .map_err(|e| HttpError::new(400, format!("body is not JSON: {e}")))
+}
+
+/// Form the request a `/submit` body states: its ArgTree, and the names of the
+/// secrets a run of it would be given. This is where everything that needs
+/// evaluating is evaluated, for `POST /submit` (which answers with the result)
+/// and for a started bundle (which does it on the ticket's own thread, with
+/// `parent` the ticket, so the evaluation is part of that ticket's trace).
+fn form_bundle(
+    config: &Config,
+    json: &serde_json::Value,
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+    parent: Option<&str>,
+) -> Result<(String, String), HttpError> {
     let bad = |message: String| HttpError::new(400, message);
-    let json: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| bad(format!("body is not JSON: {e}")))?;
     let text = |value: &serde_json::Value, what: &str| {
         value
             .as_str()
