@@ -657,6 +657,7 @@ fn leaf(
         out_trace: record.out_traces(),
         reused,
         children: Vec::new(),
+        now: None,
     }
 }
 
