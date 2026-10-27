@@ -326,22 +326,18 @@ fn main() {
     // placement does.
     if env_or("CAOS_STORE_CHECK", "no") == "yes" {
         // This is the coordinated downtime the pack-count TODO above asks for:
-        // loose objects make the walk below slow. --keep-unreachable preserves
-        // ALL CAS objects, including unreferenced ones; plain `-a -d` would
-        // drop them.
-        run_required_git(&[
-            "-C",
-            &git_dir,
-            "repack",
-            "-a",
-            "-d",
-            "--keep-unreachable",
-            "-q",
-        ])
-        .unwrap_or_else(|error| {
-            eprintln!("fatal: repacking the object store: {error}");
-            std::process::exit(1);
-        });
+        // every push leaves a pack, and every object read costs more with each
+        // one. `--geometric=2` merges the small recent packs and keeps ALL CAS
+        // objects, including unreferenced ones (it works from the packs, never
+        // from refs; plain `-a -d` without `--keep-unreachable` would drop
+        // them). Unlike `-a`, it leaves an already-consolidated store alone, so
+        // a restart costs a fraction of a second instead of rewriting it.
+        run_required_git(&["-C", &git_dir, "repack", "--geometric=2", "-d", "-q"]).unwrap_or_else(
+            |error| {
+                eprintln!("fatal: repacking the object store: {error}");
+                std::process::exit(1);
+            },
+        );
         // Older servers accepted individual commits without their
         // dependencies. Check all objects, including unreferenced ones, before
         // trusting existence as proof of closure. Never delete history to make
