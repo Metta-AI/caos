@@ -474,7 +474,8 @@ fn form_bundle(
     if let Some(locators) = json["locators"].as_object() {
         for (name, locator) in locators {
             let locator = text(locator, "a locator")?;
-            let (kind, hash) = kind_hash(evaluate_locator(config, &locator, token, secrets)?)?;
+            let (kind, hash) =
+                kind_hash(evaluate_locator(config, &locator, token, secrets, parent)?)?;
             let oid = gix::ObjectId::from_hex(hash.as_bytes())
                 .map_err(|_| HttpError::new(500, format!("{hash:?} is not an object id")))?;
             call.push(named_entry(name, caos_eval::mode_of_kind(&kind), oid));
