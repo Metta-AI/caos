@@ -367,7 +367,7 @@ mod tests {
             name: name.to_string(),
             requested,
             started,
-            now: None,
+            origin_ms: None,
             children: Vec::new(),
         }
     }
