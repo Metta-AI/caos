@@ -455,7 +455,14 @@ fn form_bundle(
             .1
         }
         Some("locator") => {
-            kind_hash(evaluate_locator(config, &base_value, token, secrets, parent)?)?.1
+            kind_hash(evaluate_locator(
+                config,
+                &base_value,
+                token,
+                secrets,
+                parent,
+            )?)?
+            .1
         }
         Some("hash") => base_value,
         Some("docker") => format!("docker://{base_value}"),
