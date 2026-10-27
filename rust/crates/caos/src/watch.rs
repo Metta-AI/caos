@@ -206,11 +206,11 @@ pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
             return Ok(());
         };
         seen = true;
-        // The server says where "now" is on the root's timeline, so every
-        // time counts from the root request however late we attached. Only a
-        // server that predates the field leaves us to estimate.
-        let now_rel_ms = match root.now {
-            Some(now) => now,
+        // The server tells us when the root request began, so every time
+        // counts from there however late we attached. Only a server that
+        // predates the field leaves us to estimate.
+        let now_rel_ms = match root.origin_ms {
+            Some(origin_ms) => (now_us() / 1_000) as i64 - origin_ms,
             None => {
                 let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
                 at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64
