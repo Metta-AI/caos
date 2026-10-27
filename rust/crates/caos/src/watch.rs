@@ -57,6 +57,10 @@ struct Node {
     name: String,
     requested: Option<i64>,
     started: Option<i64>,
+    /// The root request's start as absolute unix ms: what every other time is
+    /// relative to. Only the root carries it, and only a server new enough to
+    /// send it.
+    origin_ms: Option<i64>,
     children: Vec<Node>,
 }
 
@@ -71,6 +75,7 @@ impl Node {
             name: value["name"].as_str().unwrap_or("(unnamed)").to_string(),
             requested: value["requested"].as_i64(),
             started: value["started"].as_i64(),
+            origin_ms: value["origin_ms"].as_i64(),
             children: value["children"]
                 .as_array()
                 .map(|kids| kids.iter().filter_map(Node::parse).collect())
@@ -173,11 +178,11 @@ impl Drop for Watch {
 /// the terminal being a tty. On one it redraws in place; off one (a log) it
 /// appends a snapshot every few seconds, with no escapes.
 ///
-/// The server reports times relative to the root request and has no "now", and
-/// we did not start the run, so the origin is a lower bound: the latest moment
-/// any node reports, then ticked forward on our clock. A node's elapsed time can
-/// therefore read short by however long it has been since its last event, never
-/// long.
+/// The server reports times relative to the root request, and sends the root's
+/// absolute start (`origin_ms`) with them, so elapsed times count from the start
+/// of the root trace however late we attached. Against a server that predates
+/// `origin_ms` the origin is a lower bound instead: the latest moment any node
+/// reports, ticked forward on our clock, so elapsed times can read short.
 pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
     let tty = std::io::stderr().is_terminal();
     let interval = if tty {
@@ -201,8 +206,16 @@ pub(crate) fn follow(server: &str, arg_tree: &str) -> Result<(), String> {
             return Ok(());
         };
         seen = true;
-        let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
-        let now_rel_ms = at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64;
+        // The server tells us when the root request began, so every time
+        // counts from there however late we attached. Only a server that
+        // predates the field leaves us to estimate.
+        let now_rel_ms = match root.origin_ms {
+            Some(origin_ms) => (now_us() / 1_000) as i64 - origin_ms,
+            None => {
+                let (at_us, at_rel) = *origin.get_or_insert_with(|| (now_us(), root.latest()));
+                at_rel + (now_us().saturating_sub(at_us) / 1_000) as i64
+            }
+        };
         let mut lines = Vec::new();
         render(&root, 0, now_rel_ms, &mut lines);
         if tty {
@@ -354,8 +367,25 @@ mod tests {
             name: name.to_string(),
             requested,
             started,
+            origin_ms: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_roots_absolute_start_is_read_from_the_root() {
+        let json =
+            serde_json::json!({"name": "t", "requested": 0, "origin_ms": 1_700_000_000_000i64});
+        assert_eq!(
+            Node::parse(&json).unwrap().origin_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            Node::parse(&serde_json::json!({"name": "t"}))
+                .unwrap()
+                .origin_ms,
+            None
+        );
     }
 
     #[test]

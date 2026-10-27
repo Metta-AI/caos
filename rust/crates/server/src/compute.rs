@@ -2863,6 +2863,35 @@ pub(crate) fn list_append_many(addr: &str, pairs: &[(String, String)]) -> Result
     Ok(())
 }
 
+/// `SADD key member` for every pair, over one connection. A set, not a list,
+/// where a repeat must be free: the secrets origin index re-records the same
+/// fact on every re-index, and as list lines they grew to 25M entries per key.
+pub(crate) fn set_add_many(addr: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut stream = redis_connect(addr)?;
+    let mut buf = Vec::new();
+    for (key, member) in pairs {
+        buf.extend_from_slice(&resp_command(&["SADD", key, member]));
+    }
+    stream.write_all(&buf).map_err(|e| format!("write: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    for _ in pairs {
+        read_integer_reply(&mut reader)?;
+    }
+    Ok(())
+}
+
+/// `SMEMBERS key` — every member of the set, in no particular order.
+pub(crate) fn set_read(addr: &str, key: &str) -> Result<Vec<String>, String> {
+    let mut stream = redis_connect(addr)?;
+    stream
+        .write_all(&resp_command(&["SMEMBERS", key]))
+        .map_err(|e| format!("write: {e}"))?;
+    read_array_reply(&mut BufReader::new(stream))
+}
+
 /// `GET key`, in the result cache's namespace-free keyspace — for facts about
 /// content that hold for every build.
 pub(crate) fn fact_get(addr: &str, key: &str) -> Result<Option<String>, String> {

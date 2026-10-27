@@ -185,19 +185,37 @@ mkdir -p "$engine_store/store" "$engine_store/run"
 command -v podman >/dev/null 2>&1 || fail "no podman in this image"
 [ -e /dev/fuse ] || fail "no /dev/fuse — the image must declare CAOS_GRANT_DEVICES"
 
-# NO REPACK HERE, and this is the one place it is tempting. The shared repo
-# accumulates one pack per push and gix's object store has a fixed 32 slots, so
-# something must consolidate it — but a repack REWRITES the object store, and
-# every other dev stack's server is holding that same repo open as a
-# `gix::ThreadSafeRepository`. Doing it here was safe only while one stack
-# existed at a time; with two it is a live peer's request thread panicking and
-# answering a body-less 500, which is the exact failure `gc.auto 0` and its two
-# companions exist to prevent (crates/server/src/main.rs).
+# CONSOLIDATE THE SHARED REPO, but only when no peer can be reading it. The
+# repo gains one pack per push (a suite adds ~400), and every object read costs
+# more with each of them: at 8,000 packs the dev stack's server sat at 900% CPU
+# and the same suite went from 2.5 minutes to over an hour. gix's object store
+# is opened by every dev stack's server, and a repack REWRITES it, so doing it
+# with a peer alive is that peer's request thread panicking into a body-less 500
+# (the failure `gc.auto 0` exists to prevent, crates/server/src/main.rs).
 #
-# `caosd up` does it instead, for this repo AND the host's, after it has removed
-# the stack and checked no worker is running. That is the one moment nothing can
-# be reading. If the pack count climbs here, the fix is an idle `caosd up`, not
-# a repack from inside a stack that has peers.
+# So the lock is the proof. Every stack holds $state/.users.lock SHARED for as
+# long as anything it started is alive (the fd is inherited by serve and its
+# children), and takes it EXCLUSIVE, without waiting, only to repack: success
+# means no other stack is up. Failure is fine and silent; the next stack that
+# starts alone does it.
+#
+# `--geometric=2`, not `-a`: it merges only the small recent packs, leaving the
+# big one alone, so a suite's worth is 0.5s where `-a` rewrites the whole repo
+# (12 min at 8,000 packs, 3-9 min at any size). It keeps unreachable objects,
+# which nearly every object here is, because it works from the packs and never
+# walks refs; 285,609 objects before and after, measured. It also packs loose
+# objects. No bitmaps or multi-pack-index come out of it, and neither is wanted:
+# gix's multi-pack-index path compares every pack's path against every other's
+# on each refresh and was slower than the 8,000 packs it replaced.
+exec 8>"$state/.users.lock"
+if flock -xn 8; then
+  if [ -d "$state/git/objects/pack" ]; then
+    phase "consolidating $state/git: no other stack is using it"
+    git -C "$state/git" -c gc.auto=0 repack --geometric=2 -dq \
+      || fail "repacking $state/git"
+  fi
+fi
+flock -s 8
 
 # ---- serve -----------------------------------------------------------------
 #

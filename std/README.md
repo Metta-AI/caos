@@ -120,7 +120,7 @@ test suite exercises them.
 | entry | one line |
 |---|---|
 | `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
-| `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. |
+| `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. A script imports `caos/w`: an error policy (`Main`, `Check`, `Must`, `True`) and the worker CLI (`Caos`, `Get`, `Read`, `Put`, `Hash`, `Exists`), so a script does not define its own. |
 | `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry, no network. |
 | `rustc` | The worker factory that turns a Rust project into a runnable worker; part of the seeded core. |
 | `runner` | The pooled interpreter every compiled worker is curried onto; part of the seeded core. |
@@ -131,7 +131,8 @@ test suite exercises them.
 | `llm-step` | The agent harness: one turn of a conversation, and the registry of tools it offers a model. |
 | `llm-client` | The Anthropic API client `llm-step` posts through. |
 | `llm-call` | A single model call as an entry, for an expression that wants one without a conversation. |
-| `rgrep` | The search worker behind the step's `grep` tool. |
+| `tree-map` | Runs a worker (its `run` arg) over every directory of a tree and returns a sparse tree of the results, same shape as the input, one cached job per directory. Other args are forwarded to the worker. `rgrep` is built on it. |
+| `rgrep` | The search worker behind the step's `grep` tool: `tree-map` over a Go grep of one directory (`rgrep/level`). |
 | `run-and-update-ref` | The async worker: one binary, two stages, behind `run_async` and the subagent tools. |
 | `actor` | The actor wrapper: runs an inner `(state, message) -> (state', reply)` request against state on a Git branch, publishing by moving the branch with a compare-and-swap ([`actor/README.md`](actor/README.md)); a Go program on `std/go`. |
 | `hello` | The smallest possible entry, used by `tests/hello` and by hand when something is deeply broken. |

@@ -295,6 +295,13 @@ The declaration lands a moment after the request reaches the server, not before
 it as it did when this process wrote it, so a `Stop` in that gap sees no call.
 Claude Code backgrounds a call only after 120s, long after the step has started.
 
+`start` is the exception, because it answers at once and the model may end its turn
+right behind the ticket. So the server first runs the step with `declare-only=1`
+(the same parameters, declaring the call on the active request and running nothing)
+and only then starts the job. The `Stop` that follows sees a declared call and holds
+the request open; the job finds its call already declared. A `start` with no open
+request fails in that call, not later in the ticket.
+
 Claude Code does not expose the model's round number and does not need to: the
 declaration opens a round, the call belongs to the round that declared it, and a
 `tool_use_id` is unique for the whole session.
