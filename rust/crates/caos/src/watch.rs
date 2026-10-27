@@ -373,10 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn the_servers_clock_is_read_from_the_root() {
-        let json = serde_json::json!({"name": "t", "requested": 0, "now": 4200});
-        assert_eq!(Node::parse(&json).unwrap().now, Some(4200));
-        assert_eq!(Node::parse(&serde_json::json!({"name": "t"})).unwrap().now, None);
+    fn the_roots_absolute_start_is_read_from_the_root() {
+        let json = serde_json::json!({"name": "t", "requested": 0, "origin_ms": 1_700_000_000_000i64});
+        assert_eq!(Node::parse(&json).unwrap().origin_ms, Some(1_700_000_000_000));
+        assert_eq!(Node::parse(&serde_json::json!({"name": "t"})).unwrap().origin_ms, None);
     }
 
     #[test]
