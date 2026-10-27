@@ -3278,7 +3278,11 @@ fn bundle_ticket(
     }
     let locators: std::collections::BTreeMap<String, String> = json["locators"]
         .as_object()
-        .map(|map| map.iter().map(|(name, value)| (name.clone(), text(value))).collect())
+        .map(|map| {
+            map.iter()
+                .map(|(name, value)| (name.clone(), text(value)))
+                .collect()
+        })
         .unwrap_or_default();
     let canonical = serde_json::json!([
         "bundle",
