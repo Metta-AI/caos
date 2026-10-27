@@ -183,6 +183,21 @@ func main() {
 		_, now := call("GET", "/result/"+ticket, "")
 		w.True(now == state, "the answer changed from %q to %q", state, now)
 
+		w.Step("the ticket is the request's ArgTree, so every door takes it")
+		// Run and start differ only in the wait. The ticket /start/run returned
+		// is the ArgTree /run takes, and the one /status reads; and /start takes
+		// an ArgTree of its own, as /run does.
+		code, viaTicket := call("GET", "/run?req="+ticket, "")
+		w.True(code == 200, "/run?req=<ticket>: HTTP %d: %s", code, viaTicket)
+		w.True("ok "+viaTicket == state, "/run of the ticket said %q but its result is %q", viaTicket, state)
+		code, body = call("GET", "/status/"+ticket+"?all=1", "")
+		w.True(code == 200 && strings.HasPrefix(body, "{"), "/status of the ticket: HTTP %d: %q", code, body)
+		code, body = call("POST", "/start?req="+req, "")
+		w.True(code == 200 && body == req, "POST /start?req=%s should answer with it, got HTTP %d: %q", req, code, body)
+		w.True(await(req, 600) == "ok "+viaRun, "a request started by its ArgTree did not answer as it did when run")
+		code, body = call("POST", "/start?req=0000000000000000000000000000000000000003", "")
+		w.True(code >= 400, "starting an ArgTree nobody formed: expected a refusal, got HTTP %d: %s", code, body)
+
 		w.Step("a failed ticket reports the failure, and asking never re-dispatches")
 		code, doomed := call("POST", "/start/run?"+query("base:hash", "0000000000000000000000000000000000000001", "salt", salt), "")
 		w.True(code == 200, "start of a doomed call: HTTP %d: %s", code, doomed)
