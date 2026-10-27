@@ -3040,13 +3040,15 @@ fn parse_expression(verb: &str, params: &str) -> Result<Expression, HttpError> {
     })
 }
 
-/// The name of an evaluation, derived from its content: the git blob oid of its
-/// canonical form. Everything the answer depends on is in it — the verb, the
-/// salt, the args (which are content: a pinned locator, an oid, a literal) and
-/// the secret scope, whose readers change what a `curry` evaluates to. So the
-/// same call always has the same ticket, and `GET /status/<ticket>` reads its
-/// trace.
-fn ticket_of(
+/// A name for forming one expression line, derived from its content: the git
+/// blob oid of its canonical form (the verb, the salt, the secret scope, whose
+/// readers change what a `curry` evaluates to, and the args).
+///
+/// It is NOT the request's identity -- that is the ArgTree the line forms, which
+/// is what `run` and `start` hand back. It only labels the trace of whatever the
+/// forming had to evaluate on the way (a locator's fetch, a base's build), which
+/// happens before the ArgTree exists to hang it on.
+fn expression_id(
     config: &Config,
     expression: &Expression,
     secrets: &crate::secrets::Context,
