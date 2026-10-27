@@ -678,6 +678,24 @@ fn eval_command_args(
     env: &HashMap<String, (String, String)>,
     vars: bool,
 ) -> Result<(String, String), String> {
+    let (image_ref, entries) = resolve_command_args(host, input_tree, verb, tokens, env, vars)?;
+    if verb == "curry" {
+        let oid = build_curry(host, &image_ref, entries)?;
+        return Ok(("tree".to_string(), oid.to_string()));
+    }
+    host.dispatch(&image_ref, entries)
+}
+
+/// A command's image and call entries, resolved but not yet acted on: what both
+/// `run` (dispatch it) and `curry` (bind it) start from.
+fn resolve_command_args(
+    host: &dyn EvalHost,
+    input_tree: &str,
+    verb: &str,
+    tokens: &[&str],
+    env: &HashMap<String, (String, String)>,
+    vars: bool,
+) -> Result<(String, Vec<Entry>), String> {
     if verb != "run" && verb != "curry" {
         return Err(format!(
             "eval-path: expected `run` or `curry`, got {verb:?}"
