@@ -3207,34 +3207,129 @@ pub(crate) fn start_expression(
     params: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
+    let ticket = begin_expression(config, verb, params, secrets)?;
+    Ok(format!("{ticket}\n").into_bytes())
+}
+
+/// Start the line `verb` and `params` state, and return its ticket.
+fn begin_expression(
+    config: &std::sync::Arc<Config>,
+    verb: &str,
+    params: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
     let expression = parse_expression(verb, params)?;
     let ticket = ticket_of(config, &expression, secrets)?;
-    let key = ticket_key(config, &ticket);
+    let secrets = secrets.clone();
+    start_work(config, &ticket, move |config, ticket| {
+        eval_expression(config, &expression, ticket, &secrets)
+    })?;
+    Ok(ticket)
+}
+
+/// `POST /start` — the same as `/start/<verb>` for a request a client has
+/// bundled rather than spelled: the body is `POST /submit`'s, and so is the
+/// meaning. The ticket comes back at once; forming the request (a base's build,
+/// a locator's fetch) and running it both happen on the ticket's thread, where
+/// the trace sees them. A client that wants to wait asks `GET /wait/<ticket>`.
+pub(crate) fn start_bundle(
+    config: &std::sync::Arc<Config>,
+    body: &[u8],
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    let json = parse_bundle_body(body)?;
+    let ticket = bundle_ticket(config, &json, secrets)?;
+    let (secrets, token) = (secrets.clone(), token.map(str::to_string));
+    start_work(config, &ticket, move |config, ticket| {
+        let (arg_tree, _granted) =
+            form_bundle(config, &json, &secrets, token.as_deref(), Some(ticket))?;
+        crate::status::child(config, ticket, "request", "request", &arg_tree);
+        // A ticket's run is top-level, whichever way it was started.
+        run_work_request(
+            config,
+            &WorkRequest {
+                arg_tree: &arg_tree,
+                stack: &[],
+                secrets: &secrets,
+            },
+        )
+    })?;
+    Ok(format!("{ticket}\n").into_bytes())
+}
+
+/// The name of a bundled request, derived from its content as an expression's
+/// is: the bundle the client pushed (which holds the args, and the tree a path
+/// base is in), the base, the locators, the salt, and the secret scope.
+fn bundle_ticket(
+    config: &Config,
+    json: &serde_json::Value,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+    if json["bundle"].as_str().is_none() {
+        return Err(HttpError::new(400, "bundle must be a string"));
+    }
+    let locators: std::collections::BTreeMap<String, String> = json["locators"]
+        .as_object()
+        .map(|map| map.iter().map(|(name, value)| (name.clone(), text(value))).collect())
+        .unwrap_or_default();
+    let canonical = serde_json::json!([
+        "bundle",
+        text(&json["salt"]),
+        secrets.walk_key().unwrap_or_default(),
+        text(&json["bundle"]),
+        text(&json["base"]["type"]),
+        text(&json["base"]["value"]),
+        locators,
+    ]);
+    store_git_blob(config, canonical.to_string().as_bytes())
+        .map(|id| id.to_string())
+        .map_err(|e| HttpError::new(500, e))
+}
+
+/// Run `work` under `ticket` on a thread of its own, and note on the ticket's
+/// trace that it was requested, started and ended. Starting what is already
+/// running joins it, and what has succeeded is already answered; a FAILED one
+/// is started afresh, because a failure is not an answer (the same rule the
+/// result cache keeps).
+///
+/// The trace events are what let `watch` and `status` take a ticket: the ticket
+/// is a node like any other, and whatever `work` dispatches or evaluates is
+/// recorded under it as its children.
+fn start_work(
+    config: &std::sync::Arc<Config>,
+    ticket: &str,
+    work: impl FnOnce(&std::sync::Arc<Config>, &str) -> Result<String, HttpError> + Send + 'static,
+) -> Result<(), HttpError> {
+    let key = ticket_key(config, ticket);
     {
         // Held across the read so two arrivals cannot both start it.
         let mut live = live_tickets().lock().unwrap();
-        if live.contains(&ticket) {
-            return Ok(format!("{ticket}\n").into_bytes());
+        if live.contains(ticket) {
+            return Ok(());
         }
         if let Ok(Some(state)) = cache_get(&config.redis_addr, &key) {
             if state.starts_with("ok ") {
-                return Ok(format!("{ticket}\n").into_bytes());
+                return Ok(());
             }
         }
         cache_set(&config.redis_addr, &key, "pending")
             .map_err(|e| HttpError::new(500, format!("cannot record ticket {ticket}: {e}")))?;
-        live.insert(ticket.clone());
+        live.insert(ticket.to_string());
     }
-    let secrets = secrets.clone();
     let guard = TicketGuard {
         config: std::sync::Arc::clone(config),
-        ticket: ticket.clone(),
+        ticket: ticket.to_string(),
         outcome: None,
     };
     let spawned = std::thread::Builder::new()
         .name(format!("ticket-{ticket}"))
         .spawn(move || {
-            let outcome = eval_expression(&guard.config, &expression, &guard.ticket, &secrets);
+            crate::status::requested(&guard.config, &guard.ticket);
+            crate::status::started(&guard.config, &guard.ticket);
+            let outcome = work(&guard.config, &guard.ticket);
+            crate::status::ended(&guard.config, &guard.ticket, outcome.is_ok());
             guard.finish(match outcome {
                 Ok(result) => format!("ok {result}"),
                 Err(e) => format!("failed {} {}", e.status(), e.message()),
@@ -3248,7 +3343,7 @@ pub(crate) fn start_expression(
             format!("cannot start ticket {ticket}: {e}"),
         ));
     }
-    Ok(format!("{ticket}\n").into_bytes())
+    Ok(())
 }
 
 /// `GET /result/<ticket>` — `pending`, `ok <kind> <hash>`, or
