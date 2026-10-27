@@ -401,7 +401,9 @@ pub(crate) fn serve(
         &mut Vec::new(),
     );
     if let Some(root) = node.as_mut() {
-        root.now = Some(rebase(now_us(), baseline));
+        // 0 means the root had no `requested` to anchor on (see `baseline_of`),
+        // so there is no origin to report.
+        root.origin_ms = (baseline > 0).then_some((baseline / 1000) as i64);
     }
     serde_json::to_vec(&node)
         .map_err(|e| crate::HttpError::new(500, format!("encoding status: {e}")))
