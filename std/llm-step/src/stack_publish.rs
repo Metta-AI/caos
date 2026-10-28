@@ -609,7 +609,7 @@ impl Github {
         Ok((response.status_code, value))
     }
 
-    fn expect(
+    pub(super) fn expect(
         &self,
         method: &str,
         path: &str,
