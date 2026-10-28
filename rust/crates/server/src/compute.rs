@@ -2892,17 +2892,6 @@ pub(crate) fn set_read(addr: &str, key: &str) -> Result<Vec<String>, String> {
     read_array_reply(&mut BufReader::new(stream))
 }
 
-/// `GET key`, in the result cache's namespace-free keyspace — for facts about
-/// content that hold for every build.
-pub(crate) fn fact_get(addr: &str, key: &str) -> Result<Option<String>, String> {
-    cache_get(addr, key)
-}
-
-/// `SET key value`, the counterpart of [`fact_get`].
-pub(crate) fn fact_set(addr: &str, key: &str, value: &str) -> Result<(), String> {
-    cache_set(addr, key, value)
-}
-
 /// `LRANGE key 0 -1` — the whole list, in insertion order.
 pub(crate) fn list_read(addr: &str, key: &str) -> Result<Vec<String>, String> {
     let mut stream = redis_connect(addr)?;

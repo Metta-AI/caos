@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use caos_eval::{EvalHost, Origin};
 use caos_world::secrets::Reader;
 
-use crate::compute::{fact_get, fact_set, list_append_many, list_read, set_add_many, set_read};
+use crate::compute::{list_append_many, list_read, set_add_many, set_read};
 use crate::secret_store::Stored;
 use crate::{Config, HttpError};
 
@@ -213,34 +213,54 @@ fn record_origins(config: &Config, facts: Vec<(String, Origin)>) {
     }
 }
 
-/// The values whose subtrees are recorded, with the origins they were recorded
-/// under. In front of a redis marker per entry.
-static INDEXED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The `(tree, origin)` pairs whose subtrees are recorded, by a 64-bit hash of
+/// the pair. In front of the redis set `caos:secrets:indexed3:<tree>`, which
+/// holds the encoded origins already propagated down that tree. A collision
+/// skips one propagation, which withholds an origin and so can only deny a
+/// grant, never extend one.
+static INDEXED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn indexed_key(tree: &str) -> String {
+    format!("caos:secrets:indexed3:{tree}")
+}
 
 /// Record `(T, P/q)` for every subtree at `q` under `tree`, for each origin
 /// `(T, P)` of `tree` itself.
+///
+/// Per `(tree, origin)`, not per tree and its whole origin set: a shared subtree
+/// gains an origin with every root that contains it, and a marker over the set
+/// missed each time, so the whole subtree was walked again for all of its
+/// (tens of thousands of) origins. Now only the origins not yet propagated are
+/// walked.
 fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(), String> {
-    let mut marker = format!("caos:secrets:indexed2:{tree}");
-    // Sorted: `origins` comes out of a set, so its order is arbitrary, and a
-    // marker that depended on it would miss for the same origins.
-    let mut encoded: Vec<String> = origins.iter().map(encode_origin).collect();
-    encoded.sort_unstable();
-    for origin in &encoded {
-        marker.push('\n');
-        marker.push_str(origin);
-    }
-    let marker = format!("caos:secrets:indexed2:{}", blob_oid(marker.as_bytes()));
-    {
+    let unknown: Vec<&Origin> = {
         let mut guard = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
         let indexed = guard.get_or_insert_with(HashSet::new);
         if indexed.len() >= MEMORY_CAP {
             indexed.clear();
         }
-        if !indexed.insert(marker.clone()) {
-            return Ok(());
-        }
+        origins
+            .iter()
+            .filter(|origin| indexed.insert(fact_hash(tree, origin)))
+            .collect()
+    };
+    if unknown.is_empty() {
+        return Ok(());
     }
-    if matches!(fact_get(&config.redis_addr, &marker), Ok(Some(_))) {
+    // One read of what redis holds for this tree, only when memory could not
+    // answer for some origin.
+    let done: HashSet<String> = set_read(&config.redis_addr, &indexed_key(tree))
+        .unwrap_or_else(|e| {
+            eprintln!("secrets: reading what is indexed under {tree}: {e}");
+            Vec::new()
+        })
+        .into_iter()
+        .collect();
+    let origins: Vec<&Origin> = unknown
+        .into_iter()
+        .filter(|origin| !done.contains(&encode_origin(origin)))
+        .collect();
+    if origins.is_empty() {
         return Ok(());
     }
     let repo = config.repo.to_thread_local();
@@ -267,7 +287,7 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
             } else {
                 format!("{rel}/{}", entry.filename)
             };
-            for origin in origins {
+            for origin in &origins {
                 facts.push((
                     entry.oid.to_string(),
                     Origin {
@@ -284,7 +304,11 @@ fn index_subtrees(config: &Config, tree: &str, origins: &[Origin]) -> Result<(),
         }
     }
     record_origins(config, facts);
-    if let Err(e) = fact_set(&config.redis_addr, &marker, "1") {
+    let marks: Vec<(String, String)> = origins
+        .iter()
+        .map(|origin| (indexed_key(tree), encode_origin(origin)))
+        .collect();
+    if let Err(e) = set_add_many(&config.redis_addr, &marks) {
         eprintln!("secrets: marking {tree} indexed: {e}");
     }
     Ok(())
