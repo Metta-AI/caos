@@ -13,9 +13,11 @@ tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
 records a child commit automatically: there is no staging and no commit step.
 `log`, `show` and `diff` are how you see history, because there is no `git` in
-the shell. Getting changes out is two separate things: `publish_source` pushes
-a commit to a branch, and `caos-std/github` does everything else on GitHub
-(open a PR, change its base, link a stack, read and answer comments).
+the shell. Getting a stack out is one call, `caos-std/publish-stack`: it
+pushes each layer's branch, opens or updates the chained PRs from the `.pr.md`
+beside each layer, and links them as a GitHub stack. Under it, `publish_source`
+pushes one commit to a branch, and `caos-std/github` is one GitHub API call,
+for what the operation does not do (read and answer comments, anything else).
 
 ## Tools at a glance
 
