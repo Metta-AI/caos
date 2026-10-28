@@ -23,8 +23,8 @@ For each tool call:
    its provenance, and the tool result:
 
    ```text
-   imports/repo/main              gitlink -> H
-   imports/repo/main.source.json  provenance
+   sources/repo/00-base              gitlink -> H
+   sources/repo/00-base.source.json  provenance
    ```
 
 The destination and provenance path must both be unused. An import creates
