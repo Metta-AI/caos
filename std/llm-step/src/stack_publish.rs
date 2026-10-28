@@ -1,5 +1,5 @@
 //! Publish a stack directory as branches and chained pull requests in one
-//! operation (design/publish-stack.md). Every layer's push is a pinned
+//! operation (design/stack-publish.md). Every layer's push is a pinned
 //! publication exactly like `publish_source`'s, and all of them are pinned
 //! together, with the plan, before the first push: a resumed attempt sends what
 //! the first one planned and nothing newer. The GitHub steps are reads before
@@ -57,7 +57,7 @@ fn blank(value: Option<String>) -> Option<String> {
 
 fn parameters(call: &Call) -> Result<Parameters, String> {
     let mut p: Parameters = serde_json::from_value(call.input.clone())
-        .map_err(|error| format!("invalid publish-stack arguments: {error}"))?;
+        .map_err(|error| format!("invalid stack-publish arguments: {error}"))?;
     p.stack = p.stack.trim().trim_matches('/').to_string();
     if p.stack.is_empty() {
         return Err("stack must name a directory, such as sources/repo".into());
@@ -365,7 +365,7 @@ fn dry_run_report(plan: &Plan) -> String {
 
 pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
-        "{}/publish-stack.json",
+        "{}/stack-publish.json",
         paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
     )
 }
@@ -382,11 +382,11 @@ fn pinned(
         return Ok(None);
     }
     let value: Value = serde_json::from_slice(&view.payload(&pin_path(site))?)
-        .map_err(|_| "invalid publish-stack pin")?;
+        .map_err(|_| "invalid stack-publish pin")?;
     let plan: Plan =
-        serde_json::from_value(value["plan"].clone()).map_err(|_| "invalid publish-stack pin")?;
+        serde_json::from_value(value["plan"].clone()).map_err(|_| "invalid stack-publish pin")?;
     let ids: Vec<String> = serde_json::from_value(value["publications"].clone())
-        .map_err(|_| "invalid publish-stack pin")?;
+        .map_err(|_| "invalid stack-publish pin")?;
     let records = ids
         .iter()
         .map(|id| {
@@ -431,7 +431,7 @@ fn pin_all(
             .collect();
         transitions.push(Transition::ToolStart {
             record: tool,
-            payloads: vec![("publish-stack.json".into(), payload.clone())],
+            payloads: vec![("stack-publish.json".into(), payload.clone())],
         });
         let expected = state.head().clone();
         if matches!(
@@ -508,7 +508,7 @@ fn complete(
             return Ok(());
         }
     }
-    Err("conversation kept moving while completing publish-stack".into())
+    Err("conversation kept moving while completing stack-publish".into())
 }
 
 /// The owner and repository of a github.com HTTPS URL, or None for any other
@@ -585,7 +585,7 @@ impl Github {
         let mut request = minreq::Request::new(verb, url)
             .with_header("Accept", "application/vnd.github+json")
         .with_header("X-GitHub-Api-Version", "2022-11-28")
-        .with_header("User-Agent", "caos-publish-stack")
+        .with_header("User-Agent", "caos-stack-publish")
         .with_timeout(60);
         if let Some(token) = &self.token {
             request = request.with_header("Authorization", format!("Bearer {token}"));
@@ -900,7 +900,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 Err(error) => {
                     return site.fail(
                         state,
-                        &format!("publish-stack refused; nothing was pushed: {error}"),
+                        &format!("stack-publish refused; nothing was pushed: {error}"),
                     )
                 }
             };
