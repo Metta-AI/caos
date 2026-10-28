@@ -202,7 +202,7 @@ impl Config {
 }
 
 fn run() -> Result<(), String> {
-    let cfg = Config::read()?;
+    let mut cfg = Config::read()?;
     if cfg.list_tools {
         return list_tools(&cfg);
     }
