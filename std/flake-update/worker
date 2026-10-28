@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# std/flake-update: re-lock a flake by running nix itself, and return the new
+# flake.lock. The tree in `in` supplies flake.nix and (usually) flake.lock;
+# nothing else in it is read. Three shapes, the ones `nix flake update` has:
+#
+#   (no other arg)              every input moves to its tip
+#   --input=<name>              that input alone moves to its tip
+#   --input=<name> --rev=<sha>  that input is pinned to the commit
+#
+# The pin goes through `--override-input` with a flake reference built from
+# the input's `original` in flake.lock (a github: or git+ reference), and the
+# lock then gets that original back: the result is what `nix flake update
+# <input>` would have written had the commit been the tip, not a lock whose
+# original disagrees with flake.nix (which nix would re-resolve on its next
+# read). A lock's `locked.rev` is always SOME commit of its original; this
+# chooses which.
+#
+# The result is the flake.lock alone, a blob. The caller writes it where it
+# belongs and keeps whatever else repeats the pin in step (a caos client
+# repo's .caos-expr names the rev twice; std/flake-input-loader refuses a
+# mismatch).
+set -euo pipefail
+
+# nix resolves $HOME; the worker runs as root in a minimal container where a
+# uid-0 lookup can fail, so set it to the world-writable /tmp it owns.
+export HOME=/tmp
+fail() { echo "FLAKE UPDATE FAIL: $*" >&2; exit 1; }
+
+# `in` may be a tree or a commit (a source tree in the conversation): resolve
+# to the tree either way, fetch one level, then the two files it needs.
+root=/cas/flake-root
+caos resolve "$(caos hash /cas/args/in)" . "$root" || fail "resolving in"
+caos get "$root" || fail "reading in"
+[ -d "$root" ] || fail "in is not a tree"
+[ -e "$root/flake.nix" ] || fail "no flake.nix in the tree"
+mkdir /tmp/ws
+caos get "$root/flake.nix" || fail "reading flake.nix"
+cp -L "$root/flake.nix" /tmp/ws/
+if [ -e "$root/flake.lock" ]; then
+  caos get "$root/flake.lock" || fail "reading flake.lock"
+  cp -L "$root/flake.lock" /tmp/ws/
+fi
+
+# Args are lazy placeholders: fetch before reading, absent means unset.
+input=
+if caos get /cas/args/input 2>/dev/null; then input=$(cat /cas/args/input); fi
+rev=
+if caos get /cas/args/rev 2>/dev/null; then rev=$(cat /cas/args/rev); fi
+[ -z "$rev" ] || [ -n "$input" ] || fail "rev needs input: which input is pinned to $rev?"
+
+# Single-user nix as root in a container: no build users, no sandbox. Nothing
+# is built here, but nix checks the settings all the same.
+nixf() {
+  nix --extra-experimental-features "nix-command flakes" \
+    --option build-users-group "" --option sandbox false "$@"
+}
+
+cd /tmp/ws
+if [ -n "$rev" ]; then
+  [ -e flake.lock ] || fail "pinning $input needs a flake.lock to read its reference from"
+  # The input's node and its `original`: what flake.nix said, as the lock
+  # recorded it. A `follows` input has no original of its own.
+  node=$(jq -r --arg i "$input" '
+    .nodes.root.inputs[$i] // error("no input \($i) in flake.lock")
+    | if type == "string" then . else error("input \($i) follows \(join("/")); pin that input instead") end
+  ' flake.lock) || fail "finding $input in flake.lock"
+  orig=$(jq -c --arg n "$node" '.nodes[$n].original' flake.lock) || fail "reading the original of $input"
+  ref=$(jq -rn --argjson o "$orig" --arg i "$input" '
+    $o | if .type == "github" then "github:\(.owner)/\(.repo)"
+         elif .type == "git" then "git+\(.url)"
+         else error("input \($i) is a \(.type) reference; only github and git can be pinned to a commit") end
+  ') || fail "forming the reference of $input"
+  case "$ref" in
+    github:*) ref="$ref/$rev" ;;
+    *\?*)     ref="$ref&rev=$rev" ;;
+    *)        ref="$ref?rev=$rev" ;;
+  esac
+  echo "flake-update: pinning $input to $ref" >&2
+  nixf flake update "$input" --override-input "$input" "$ref" \
+    || fail "nix flake update $input --override-input $input $ref"
+  got=$(jq -r --arg n "$node" '.nodes[$n].locked.rev' flake.lock)
+  [ "$got" = "$rev" ] || fail "nix locked $input at $got, not $rev"
+  jq --arg n "$node" --argjson o "$orig" '.nodes[$n].original = $o' flake.lock > flake.lock.new \
+    || fail "restoring the original of $input"
+  mv flake.lock.new flake.lock
+elif [ -n "$input" ]; then
+  nixf flake update "$input" || fail "nix flake update $input"
+else
+  nixf flake update || fail "nix flake update"
+fi
+
+[ -s flake.lock ] || fail "nix left no flake.lock"
+caos put /tmp/ws/flake.lock /cas/out
