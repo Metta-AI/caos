@@ -1,7 +1,8 @@
-# std/flake-update: `nix flake update`, as a tool (see ./worker). This directory
-# is a flake (flake.nix + worker; the lock is DEPped from the repo root), so its
-# image is the flake-builder applied to it, named by a LOCAL deep-deps mount as
-# std/bash does. THE HELP IS BOUND HERE, so the tool describes itself.
+# std/flake-update: `nix flake update`, as a tool (see ./worker.go). This
+# directory is a flake (flake.nix + worker.go; the lock and std/go's prelude are
+# DEPped), so its image is the flake-builder applied to it, named by a LOCAL
+# deep-deps mount as std/bash does. THE HELP IS BOUND HERE, so the tool
+# describes itself.
 #
 # Why a tool at all: a session has no nix, and the hashes a flake.lock carries
 # (narHash, lastModified) are nix's to compute. Without this, an agent moving a
