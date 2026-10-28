@@ -76,8 +76,9 @@ sources/<repo>/
 
 Importing writes the snapshot's provenance next to it as
 `sources/<repo>/00-base.source.json`. That file is not a layer. `move` renames
-the gitlink but leaves its provenance file behind under the old name, so move
-the pair together.
+the gitlink but leaves its provenance file, or a layer's `.pr.md`, behind under
+the old name; `caos-std/move-sed` renames a layer and its sidecar in one call
+(see "Renaming a layer").
 
 ## One change, one layer
 
