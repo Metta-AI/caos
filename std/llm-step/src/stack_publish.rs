@@ -527,10 +527,10 @@ pub(super) fn github_repo(repository: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
-struct Github {
-    owner: String,
-    repo: String,
-    token: Option<String>,
+pub(super) struct Github {
+    pub owner: String,
+    pub repo: String,
+    pub token: Option<String>,
 }
 
 /// A pull request's membership in a GitHub stack: the stack's number, this
