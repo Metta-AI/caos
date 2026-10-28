@@ -775,7 +775,9 @@ fn round_state_at(
             name: call.name.clone(),
         })
         .collect();
-    if projection != record.calls {
+    // `record.calls` projects the LATEST round's declaration only; an earlier
+    // round is checked against nothing but its own transcript entry.
+    if declaring_round + 1 == record.round && projection != record.calls {
         return Err(format!(
             "request {} calls do not match transcript ordinal {ordinal}",
             record.id
