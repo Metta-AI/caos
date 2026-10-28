@@ -1376,6 +1376,7 @@ fn run_op(
         ("import-source", _) => import_source::execute(state, site).map(|()| true),
         ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
         ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
+        ("stack-sync", _) => stack_sync::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
