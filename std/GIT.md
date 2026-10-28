@@ -28,9 +28,10 @@ for what the operation does not do (read and answer comments, anything else).
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
 | merge another commit into a source tree | `caos-std/merge` |
-| squash a stack to one commit per layer | `caos-std/create-squashed-stack` |
-| push a commit to a GitHub branch | `publish_source` |
-| open a PR, change its base, link a stack, read and answer comments | `caos-std/github` |
+| publish a stack: push every layer, open or update its PRs, link them | `caos-std/publish-stack` |
+| rename a layer and its `.pr.md` together | `caos-std/move-sed` |
+| push one commit to a GitHub branch | `publish_source` |
+| read and answer PR comments, anything else on GitHub | `caos-std/github` |
 
 `tool_help(path="caos-std/<name>")` prints a std tool's exact parameters.
 
