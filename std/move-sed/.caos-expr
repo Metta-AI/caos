@@ -1,0 +1,32 @@
+# The `move-sed` tool (design/publish-stack.md, "move-sed"): the std/go worker
+# image with this directory's program curried onto it, plus the `help` it is
+# described by. A writer run on the conversation: `@in` hands it the
+# conversation tree, and it proposes that tree with one directory's entries
+# renamed.
+HELP=<<END
+Rename the entries of ONE conversation directory by regular expression, in one
+atomic proposal: a layer and its sidecar files (01-feature, 01-feature.pr.md)
+move together, and a shift such as 02 to 03 and 01 to 02 in the same call has
+no ordering problem.
+
+`pattern` is a Go regular expression (RE2), matched anywhere in each entry's
+name as sed's `s` does; anchor it with ^ and $ to match a whole name.
+`replacement` is Go's template syntax: $1 or ${1} for a group, never sed's \1,
+which is refused because Go would write it into the name literally.
+
+  pattern=^01-feature(\..+)?$   replacement=02-y$1
+
+renames 01-feature to 02-y and 01-feature.pr.md to 02-y.pr.md. Entries the
+pattern does not match are untouched. Refused before anything changes: no
+entry matches, two entries would get one name, a new name is empty or
+contains a slash, or a destination exists and is not itself being renamed.
+Only the conversation tree: a directory inside a source tree is refused (for
+files inside code, use move). The result lists every rename, old to new.
+@param [dir] Conversation directory whose entries to rename, such as sources/repo. Omit, or pass `.`, for the conversation root.
+@param pattern Go regular expression matched against each entry name.
+@param replacement The new name, with $1 or ${name} standing for the pattern's groups.
+@param [dry-run] true to list the renames without making them.
+@writer
+@in
+END
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
