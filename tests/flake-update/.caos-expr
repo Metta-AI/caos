@@ -1,0 +1,7 @@
+# tests/flake-update, as an ENTRY (design/caos-expr.md, Phase 3): evaluating
+# this directory yields the test's ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST. Every assertion is about a run's RESULT, and dispatching a run
+# is what a worker does with `curry` + `run-then`. `update` resolves to the
+# built tool; `flake` is the fixture it re-locks (flake.nix alone, no lock).
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --update:@=DEEP-DEPS/flake-update --flake:@=flake
