@@ -245,9 +245,29 @@ merge(source-tree="sources/repo/02-tests",   theirs="<B>", merge-base="<A>")
   merge it into `02-tests` (the merge base is `A`, so the removal carries
   forward), then `remove` the `01-feature` gitlink. Do not renumber
   `02-tests`; gaps are fine.
-- **Split a layer in two:** `move` `02-tests` to `03-tests` and `01-feature`
-  to `02-y`, `copy` `00-base` to `01-x`, re-make X in `01-x`, then merge `01-x`
-  into `02-y` and `02-y` into `03-tests`.
+- **Split a layer in two:** rename `02-tests` to `03-tests` and `01-feature`
+  to `02-y` (with their `.pr.md`, see below), `copy` `00-base` to `01-x`,
+  re-make X in `01-x` and write `01-x.pr.md`, then merge `01-x` into `02-y`
+  and `02-y` into `03-tests`.
+
+### Renaming a layer
+
+A layer is two entries, the gitlink and its `.pr.md`, and `move` takes one path.
+`caos-std/move-sed` renames every entry of one directory that matches a Go
+regular expression, in one proposal, so the pair moves together and a shift
+such as `02` to `03` then `01` to `02` has no ordering problem:
+
+```text
+run_tool(path="caos-std/move-sed", arguments={
+  "dir": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
+run_tool(path="caos-std/move-sed", arguments={
+  "dir": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
+```
+
+`replacement` uses Go's `$1` / `${name}`, never sed's `\1`. The result lists
+every rename; `dry-run=true` lists them without renaming. Renumbering a layer
+does not rename its branch or its PR: the branch is the name without the
+number.
 
 ### Harvesting from subagents
 
