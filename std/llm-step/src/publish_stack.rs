@@ -875,7 +875,10 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         Ok(p) => p,
         Err(error) => return site.fail(state, &error),
     };
-    let (plan, records) = match pinned(&state.conversation()?, site)? {
+    // Bound before the match: a temporary in the scrutinee would hold the
+    // conversation borrowed through every arm, and the arms write to it.
+    let already = pinned(&state.conversation()?, site)?;
+    let (plan, records) = match already {
         Some(pinned) => pinned,
         None => {
             // Everything that reads the conversation, before anything that
