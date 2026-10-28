@@ -278,70 +278,75 @@ rather than partly installed.
 
 ## Publishing
 
-The conversation history has many commits (agent turns, merges). Publishing
-that as it is works (`publish_source` takes any gitlink). **Branches are
-always merged by squashing**, so the commits on a branch never reach the
-trunk: only its net diff does, and the history inside a branch does not
-matter. Do not spend effort tidying it, and never re-publish a branch just to
-clean its commits.
+The conversation history has many commits (agent turns, merges), and that is
+what gets published. **Branches are always merged by squashing**, so the
+commits on a branch never reach the trunk: only its net diff does, and the
+history inside a branch does not matter. Do not spend effort tidying it, and
+never re-publish a branch just to clean its commits.
 
-### 1. Push, earliest layer first
+### One call: `caos-std/publish-stack`
 
 ```text
-publish_source(source_tree="publish/repo/01-feature",
-               repository="https://github.com/<owner>/<repo>.git",
-               branch="repo-01-feature", force=true)
-publish_source(source_tree="publish/repo/02-tests", ...,
-               branch="repo-02-tests", force=true)
+run_tool(path="caos-std/publish-stack", arguments={"stack": "sources/<repo>"})
 ```
 
-- Without `force`, only creates and fast-forwards succeed. An unsquashed layer,
-  or a follow-up commit on a branch you already published, is a fast-forward.
-- `publish_source` creates no PR and does not change the source gitlink.
-- It rejects any commit whose tree contains a path matched by the commit's own
-  `.gitignore` rules, **including tracked files**. It never strips files or
-  rewrites commits. The rejection lists the matching paths (the first 100, and
-  a count). Remove the files or fix the rules, then publish again; if the
-  source legitimately tracks them, pass `allow_ignored=true` to skip the check
-  for that call. (Global excludes and `.git/info/exclude` do not apply, and only the
-  published snapshot is checked, not earlier commits.)
-- Resolve merge conflicts and clear `.caos/conflicts` first. The endpoint does
-  not scan for the ledger or for inline markers.
-- Test and inspect the intended PR diff (`diff`) before publishing.
-- The HTTPS URL carries no credentials. Pushes go from the server's store,
-  not from your container; nothing is checked out.
+For every layer that has a `.pr.md` beside it, earliest first, it pushes the
+layer's gitlink as it is to the branch named after the layer without its
+number (`01-parser` goes to `parser`, or `<branch-prefix>parser`), finds the
+branch's open PR or opens one with the `.pr.md`'s title and body, based on the
+branch below (the trunk for the first layer), and links the PRs as a GitHub
+stack. The result is one line per layer and one for the stack:
 
-If a push comes back as uncertain or as a lease conflict, read the remote
-branch before retrying (see "Recovering").
+```text
+repository https://github.com/owner/repo  trunk main
+01-parser  parser  3f9c2e1d0b7a  pushed (fast-forward)  PR #365 created, base main
+02-tests   tests   8b11d0aa41c2  unchanged              PR #366 unchanged
+stack 367: unchanged
+```
 
-### 2. Open a PR per layer and link them
+- Before anything is pushed it checks that each layer contains the one below
+  it (`00-base` for the first). One that does not is refused with the `merge`
+  call to run. A refusal pushes nothing and says so.
+- Repository and trunk come from `00-base.source.json`; pass `repository` and
+  `trunk` when the base was imported by commit hash, or to publish elsewhere.
+- `dry-run=true` reports the layers, branches, bases and titles without
+  observing or changing anything. Use it first on a new stack.
+- The `.pr.md` is the description's home. A PR whose title or body differs is
+  updated to match, and the result says so; edit the file, not GitHub.
+- Republishing after you merged up is a fast-forward and needs no `force`. A
+  non-fast-forward push is refused unless `force=true`, and means a rebuilt
+  layer or someone else's push to the branch: look before forcing.
+- Each push is leased on the remote head observed at the start, like
+  `publish_source`, and rejects a commit whose tree contains paths matched by
+  its own `.gitignore` rules, **including tracked files** (`allow-ignored=true`
+  to publish them anyway). Resolve merge conflicts and clear `.caos/conflicts`
+  first. Test and inspect the intended PR diff (`diff`) before publishing.
+- A failed push stops the layers above it; the result says which branches
+  moved. If it was uncertain or a lease conflict, read the remote branch before
+  retrying (see "Recovering").
+- The PRs are linked as a GitHub stack on every publish (`link=false` to skip),
+  because the trunk squash-merges: merging a stacked PR merges every PR up to
+  it, while an unlinked PR retargeted after the one below merged shows the
+  lower layer's changes again. GitHub refuses to change the base BRANCH of a
+  PR while it is in a stack, so a shape change (a layer inserted or dropped)
+  is done by unstacking and recreating the stack, with a new stack number.
+  Base COMMITS follow the branches on their own: merging a new trunk tip up
+  and republishing needs no API call.
+- A repository that is not on github.com gets its branches pushed and no PRs.
 
-`caos-std/github` is one GitHub API call: `method`, `path` under
-`https://api.github.com`, and optional JSON `body`. Every value is a string.
-The result is the status line and the body, cut if long. A run fails only when
+### By hand, one commit
+
+`publish_source(source_tree, repository, branch, force?)` pushes one gitlink's
+commit to one branch, with the same lease, fast-forward and `.gitignore` rules,
+and opens no PR. `caos-std/github` is one GitHub API call: `method`, `path`
+under `https://api.github.com`, and optional JSON `body`, every value a string;
+the result is the status line and the body, cut if long. A run fails only when
 no response came back, and a write may still have arrived, so `GET` the state
-before resending. The tool reaches only `api.github.com` and follows no
-redirects. Paths are unrestricted; the token's scope is the boundary.
-
-For each layer, earliest first:
-
-1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`
-2. If there is none, `POST /repos/{owner}/{repo}/pulls` with `head`, `base`
-   (the trunk for the first layer, the previous layer's branch for the rest),
-   `title` and `body` taken from the layer's `message=` lines.
-3. If there is one, `PATCH` its `base` if it differs. Leave its title and
-   body alone: a person may have edited them.
-
-```text
-run_tool(path="caos-std/github", arguments={
-  "method": "POST", "path": "/repos/<owner>/<repo>/pulls",
-  "body": "{\"title\":\"Add the feature\",\"head\":\"repo-01-feature\",\"base\":\"main\",\"body\":\"Why.\"}"})
-```
-
-Then link them, earliest first:
-`POST /repos/{owner}/{repo}/stacks` with `{"pull_requests": [<numbers>]}`, or
-`POST .../stacks/{number}/add` to extend an existing stack. The chained bases
-already give a reviewable stack without the link.
+before resending. Find a branch's PR with
+`GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`, open one
+with `POST /repos/{owner}/{repo}/pulls` (`title`, `head`, `base`, `body`), and
+link PRs with `POST /repos/{owner}/{repo}/stacks` and
+`{"pull_requests": [<numbers, earliest first>]}`.
 
 ## Reading and answering PR comments
 
