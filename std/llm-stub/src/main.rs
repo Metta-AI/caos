@@ -10,6 +10,17 @@
 //!
 //! Requests are handled sequentially — the step loop is sequential by design,
 //! so ordering is deterministic.
+//!
+//! A test whose requests arrive in an order it cannot know (a parent and a
+//! child agent sharing one stub) scripts REPLIES BY REQUEST instead. When
+//! `<dir>/response-<i>.json` is absent, the first rule under `<dir>/rules/`
+//! that matches the request body answers it. A rule is a directory
+//! `rules/<name>/` holding `response.json`, an optional `contains` file and an
+//! optional `lacks` file, one needle per line (blank lines are ignored). It
+//! matches when every `contains` needle occurs in the raw request body and no
+//! `lacks` needle does. Rules are tried in name order, so number them and put
+//! the most specific first. The test writes them all before it starts the
+//! turn, so it never has to watch for a request.
 
 use std::process::ExitCode;
 
@@ -50,18 +61,26 @@ fn run() -> Result<(), String> {
         std::fs::write(format!("{dir}/request-{round}.json"), &body)
             .map_err(|e| format!("recording request {round}: {e}"))?;
 
-        let response = match std::fs::read(format!("{dir}/response-{round}.json")) {
-            Ok(scripted) => {
+        let scripted = std::fs::read(format!("{dir}/response-{round}.json"))
+            .ok()
+            .or_else(|| {
+                let (name, scripted) = match_rule(&dir, &body)?;
+                eprintln!("llm-stub: round {round}: rule {name}");
+                Some(scripted)
+            });
+        let response = match scripted {
+            Some(scripted) => {
                 eprintln!("llm-stub: round {round}: {} bytes", scripted.len());
                 tiny_http::Response::from_data(scripted).with_header(
                     tiny_http::Header::from_bytes("content-type", "application/json")
                         .expect("static header"),
                 )
             }
-            Err(_) => {
+            None => {
                 eprintln!("llm-stub: round {round}: UNSCRIPTED");
                 tiny_http::Response::from_data(
-                    format!("llm-stub: no response-{round}.json scripted").into_bytes(),
+                    format!("llm-stub: no response-{round}.json scripted and no rule matched")
+                        .into_bytes(),
                 )
                 .with_status_code(500)
             }
@@ -71,4 +90,33 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("responding to request {round}: {e}"))?;
     }
     Ok(())
+}
+
+/// The first rule under `<dir>/rules/` that matches the raw request body, with
+/// its name and its `response.json`. See the module doc for the rule format.
+fn match_rule(dir: &str, body: &[u8]) -> Option<(String, Vec<u8>)> {
+    let body = String::from_utf8_lossy(body);
+    let mut names: Vec<String> = std::fs::read_dir(format!("{dir}/rules"))
+        .ok()?
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let rule = format!("{dir}/rules/{name}");
+        let needles = |file: &str| -> Vec<String> {
+            std::fs::read_to_string(format!("{rule}/{file}"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let matches = needles("contains").iter().all(|n| body.contains(n.as_str()))
+            && !needles("lacks").iter().any(|n| body.contains(n.as_str()));
+        if !matches {
+            return None;
+        }
+        let response = std::fs::read(format!("{rule}/response.json")).ok()?;
+        Some((name, response))
+    })
 }
