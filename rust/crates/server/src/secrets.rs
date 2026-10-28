@@ -388,9 +388,8 @@ pub(crate) fn evaluated(
         .iter()
         .filter(|secret| {
             secret.readers.iter().any(|reader| {
-                origins
-                    .iter()
-                    .any(|origin| matches(config, context, reader, origin))
+                let matcher = Matcher::new(config, context, reader);
+                origins.iter().any(|origin| matcher.matches(origin))
             })
         })
         .collect();
@@ -482,45 +481,86 @@ pub(crate) fn granted_names(
     names
 }
 
-fn matches(config: &Config, context: &Context, reader: &Reader, origin: &Origin) -> bool {
-    let outcome = match reader {
-        Reader::Locator { locator, since } => match context.pins.get(locator) {
-            Some(Some(pinned)) => match_locator(config, pinned, since.as_deref(), origin),
-            _ => Ok(false),
-        },
-        Reader::Conversation { path, conversation } => {
-            if context.conversation.as_deref() != Some(conversation.as_str()) {
-                return false;
-            }
-            match &context.head {
-                Some(head) => match_conversation(config, head, path, origin),
-                None => Ok(false),
+/// A reader, resolved once for a node's origins. A shared subtree has tens of
+/// thousands of them, and the per-origin work this used to do (parse the
+/// locator, split both paths into owned `Vec`s, rebuild the roots-cache key)
+/// was most of the server's CPU once the membership scans were gone.
+enum Matcher<'a> {
+    /// Nothing can match: no pin, another conversation, no head yet, or a
+    /// locator that could not be resolved (reported once, here).
+    Never,
+    Locator {
+        dir: Vec<String>,
+        roots: Arc<HashSet<String>>,
+    },
+    Conversation {
+        config: &'a Config,
+        head: &'a str,
+        path: &'a str,
+    },
+}
+
+impl<'a> Matcher<'a> {
+    fn new(config: &'a Config, context: &'a Context, reader: &'a Reader) -> Self {
+        match reader {
+            Reader::Locator { locator, since } => match context.pins.get(locator) {
+                Some(Some(pinned)) => {
+                    let resolved = git_locator::parse_git_ref(pinned).and_then(|git_ref| {
+                        let roots = crate::grant_history::allowed_roots(
+                            config,
+                            &git_ref,
+                            since.as_deref(),
+                        )?;
+                        let dir: Vec<String> = components(git_ref.dir.as_deref().unwrap_or(""))
+                            .map(str::to_string)
+                            .collect();
+                        Ok((dir, roots))
+                    });
+                    match resolved {
+                        Ok((dir, roots)) => Matcher::Locator { dir, roots },
+                        Err(e) => {
+                            eprintln!(
+                                "secrets: a reader could not be checked, so it grants nothing: {e}"
+                            );
+                            Matcher::Never
+                        }
+                    }
+                }
+                _ => Matcher::Never,
+            },
+            Reader::Conversation { path, conversation } => {
+                if context.conversation.as_deref() != Some(conversation.as_str()) {
+                    return Matcher::Never;
+                }
+                match &context.head {
+                    Some(head) => Matcher::Conversation { config, head, path },
+                    None => Matcher::Never,
+                }
             }
         }
-    };
-    outcome.unwrap_or_else(|e| {
-        eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
-        false
-    })
-}
-
-fn components(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect()
-}
-
-fn match_locator(
-    config: &Config,
-    locator: &str,
-    since: Option<&str>,
-    origin: &Origin,
-) -> Result<bool, String> {
-    let git_ref = git_locator::parse_git_ref(locator)?;
-    if components(git_ref.dir.as_deref().unwrap_or("")) != components(&origin.path) {
-        return Ok(false);
     }
-    Ok(crate::grant_history::allowed_roots(config, &git_ref, since)?.contains(&origin.root))
+
+    fn matches(&self, origin: &Origin) -> bool {
+        match self {
+            Matcher::Never => false,
+            Matcher::Locator { dir, roots } => {
+                components(&origin.path).eq(dir.iter().map(String::as_str))
+                    && roots.contains(&origin.root)
+            }
+            Matcher::Conversation { config, head, path } => {
+                match_conversation(config, head, path, origin).unwrap_or_else(|e| {
+                    eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
+                    false
+                })
+            }
+        }
+    }
+}
+
+/// The path's components, as a borrowing iterator so a comparison allocates
+/// nothing.
+fn components(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|c| !c.is_empty() && *c != ".")
 }
 
 /// The tree of the conversation's head commit, or `None` with no head yet.
@@ -548,8 +588,8 @@ fn match_conversation(
     path: &str,
     origin: &Origin,
 ) -> Result<bool, String> {
-    let parts = components(path);
-    let rest = components(&origin.path);
+    let parts: Vec<&str> = components(path).collect();
+    let rest: Vec<&str> = components(&origin.path).collect();
     if rest.len() > parts.len() || parts[parts.len() - rest.len()..] != rest[..] {
         return Ok(false);
     }
