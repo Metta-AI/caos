@@ -89,8 +89,8 @@ for the repositories the agent works on.
 
 ### PRs for a stack
 
-`caos-std/publish-stack` does this for a whole stack directory in one call,
-pushes included ([publish-stack.md](publish-stack.md)). By hand, for each
+`caos-std/stack-publish` does this for a whole stack directory in one call,
+pushes included ([stack-publish.md](stack-publish.md)). By hand, for each
 layer, bottom first:
 
 1. `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open`.
