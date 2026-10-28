@@ -568,7 +568,7 @@ fn pr_from(value: &Value) -> Option<Pr> {
 }
 
 impl Github {
-    fn repo_path(&self, rest: &str) -> String {
+    pub(super) fn repo_path(&self, rest: &str) -> String {
         format!("/repos/{}/{}{rest}", self.owner, self.repo)
     }
 
