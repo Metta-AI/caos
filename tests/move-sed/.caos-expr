@@ -1,0 +1,6 @@
+# tests/move-sed, as an ENTRY: evaluating this directory yields the test's
+# ARG TREE, which dev/run-test then runs.
+#
+# A WORKER TEST, like tests/create-squashed-stack: std/move-sed is the subject,
+# and the fixture conversation is built with `caos put`, so no client is needed.
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --tool:@=DEEP-DEPS/move-sed
