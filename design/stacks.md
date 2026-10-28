@@ -18,9 +18,10 @@ mystack/02-tests    -> B   parent A
 
 - They are understood to descend directly from each other, in that order. If they don't, merges from parents (lower-numbered layers) into children (higher-numbered) may be necessary.
 
-- Agents can start a new stack doing something like the following:
+- Agents can start a new stack doing something like the following, where
+  `mystack/00-base` is the gitlink `import_source` wrote (std/GIT.md keeps the
+  base and the layers together under `sources/<repo>/`):
   ```sh
-  cp -a imports/repo/main mystack/00-base  # assuming this is a gitlink file
   cp -a mystack/00-base mystack/01-feature
   ```
 
