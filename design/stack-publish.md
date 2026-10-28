@@ -1,4 +1,4 @@
-# Publishing a stack in one call: `publish-stack`, and `move-sed`
+# Publishing a stack in one call: `stack-publish`, and `move-sed`
 
 A stack (stacks.md) is a folder of sibling gitlinks, `sources/<repo>/`, with
 the upstream tip at `00-base` and one layer per `NN-<name>`. Getting it onto
@@ -8,14 +8,14 @@ link the PRs as a stack. Measured on a two-layer stack, that was nine ordered
 tool calls for the first publish and five to seven for every republish, each
 PR response around 20 KB of JSON, and three traps along the way: `force`
 forgotten, a duplicate PR opened because the lookup was skipped, and GitHub's
-refusal to retarget a PR that is already in a stack. `publish-stack` is that
+refusal to retarget a PR that is already in a stack. `stack-publish` is that
 recipe as one operation. `move-sed` is the renaming tool that keeps a layer
 and its description together when the stack changes shape.
 
 ## No squashing
 
 Branches are merged into the trunk by squashing, so the commits inside a
-branch never reach it: only the branch's net diff does. `publish-stack`
+branch never reach it: only the branch's net diff does. `stack-publish`
 therefore pushes each layer's gitlink exactly as it is, merge commits and
 "Edit source tree" commits included. Two things follow:
 
@@ -75,14 +75,14 @@ which is the squashing this design does without.
 
 ## The operation
 
-`publish-stack` is an operation of the step (`@op`, SPEC "CaosTools"), like
+`stack-publish` is an operation of the step (`@op`, SPEC "CaosTools"), like
 `publish-source`, and for the same reason: a publication is pinned in the
 conversation before any remote write (agent-publish.md), and only the step
-writes conversation records. Its entry is `std/publish-stack`, reached as
-`caos-std/publish-stack`; the work is `std/llm-step/src/publish_stack.rs`.
+writes conversation records. Its entry is `std/stack-publish`, reached as
+`caos-std/stack-publish`; the work is `std/llm-step/src/publish_stack.rs`.
 
 ```text
-run_tool(path="caos-std/publish-stack", arguments={
+run_tool(path="caos-std/stack-publish", arguments={
   "stack": "sources/repo",           # the stack directory
   "branch-prefix": "malcolm/",      # optional
   "repository": "https://...",      # optional: default from 00-base.source.json
@@ -162,7 +162,7 @@ preview and may change; everything about it is in one place, the stack step.
 
 ### Resuming
 
-A started call carries its pin (`publish-stack.json` in the call's payload
+A started call carries its pin (`stack-publish.json` in the call's payload
 directory: the stack's layers, branches and the publication ids, in order).
 A resumed attempt re-reads the publications: a Pending one is pushed exactly
 as pinned, a terminal one is not sent again. The GitHub steps are repeated
@@ -222,9 +222,9 @@ layers is one call per layer; stacks are short.
 
 ## Tests
 
-- `tests/publish-stack`: llm-step's real tool loop with a scripted model,
+- `tests/stack-publish`: llm-step's real tool loop with a scripted model,
   the shape of `tests/chat-squash-publish`. It builds a stack with
-  descriptions in a conversation and calls `caos-std/publish-stack` against
+  descriptions in a conversation and calls `caos-std/stack-publish` against
   a `.invalid` repository, so no push happens: the call must get through
   every check and stop at reading the remote; a stack with a described layer
   above an undescribed one, and one whose upper layer lacks the lower, must
