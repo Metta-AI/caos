@@ -350,6 +350,24 @@ impl GitStore {
         Oid::parse_line(&output.stdout, "resolved revision")
     }
 
+    /// Whether `ancestor` is `descendant` or reachable from it. Both are
+    /// fetched first if the store lacks them, as `ancestor_revision` does.
+    pub fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, String> {
+        self.ensure_local(descendant)?;
+        self.ensure_local(ancestor)?;
+        let output = self.output(&[
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(self.output_error("git merge-base --is-ancestor", &output)),
+        }
+    }
+
     /// Read history using the same local object store as reconciliation.
     /// Paths are literal, and external diff/textconv programs are disabled.
     pub fn history(
