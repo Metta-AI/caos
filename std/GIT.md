@@ -211,8 +211,23 @@ sources/repo/02-tests    -> B2  parents B, A2
 
 ### Updating the base
 
-Import the new upstream tip at a fresh path, put it at `00-base`, and merge it
-into the first layer, then each layer into the one after it:
+`caos-std/stack-sync` does all of this in one call, against the remote, and
+more: it reads the trunk's head and every published layer's branch, puts the
+trunk's head at `00-base`, adopts a branch GitHub rewrote with the same
+content (merging a stacked PR rebases the branches above it) under the layer's
+local edits, merges in a branch someone else pushed to, restacks each layer
+onto the one below, and reports a layer whose PR was merged (removing it with
+`remove-merged=true`). It pushes nothing: run `stack-publish` after it, and
+every push is a fast-forward. A merge conflict stops it at that layer and names
+the `merge` call that gives you a ledger to resolve.
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
+```
+
+By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
+merge it into the first layer, then each layer into the one after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
