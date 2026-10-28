@@ -39,9 +39,11 @@ the EVALUATED tree, so to see what is there: eval-path(\"caos-std\"), then run \
 caos-std/read with file-path README.md and `in` set to that hash. Call help on a tool \
 before you use one you have not used.
 
-To work on code in caos, import it with import-source into a fresh path under imports/, \
-copy it where you will change it, edit it with the file tools, and publish-source to push \
-the result. Tools that act on a source tree take its path as `source-tree`.";
+To work on code in caos, import it with import-source into sources/<repo>/00-base, copy \
+that to sources/<repo>/99-dirty, edit the copy with the file tools, move it to a layer \
+sources/<repo>/NN-<name> with a NN-<name>.pr.md beside it, and publish-stack to push the \
+stack and open its PRs (std/GIT.md). Tools that act on a source tree take its path as \
+`source-tree`.";
 
 pub fn initialize(params: &Value) -> Value {
     let requested = params
