@@ -143,5 +143,5 @@ property of the container. A tool that has to fetch something can.
 | `run-and-update-ref` | The async worker: one binary, two stages, behind `run_async` and the subagent tools. |
 | `actor` | The actor wrapper: runs an inner `(state, message) -> (state', reply)` request against state on a Git branch, publishing by moving the branch with a compare-and-swap ([`actor/README.md`](actor/README.md)); a Go program on `std/go`. |
 | `hello` | The smallest possible entry, used by `tests/hello` and by hand when something is deeply broken. |
-| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and no network. |
+| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and never call the API. |
 | `llm-test` / `llm-test-tool` | Fixtures the llm tests drive: a test harness entry and a tool for it to call. |
