@@ -582,38 +582,13 @@ pub fn apply(
     })
 }
 
-fn validate_fork_quiescence(conversation: &Conversation<'_>) -> Result<(), String> {
-    if conversation.active_turn()?.is_some() {
-        return Err("cannot fork a conversation with an active or cancelling request".to_string());
-    }
-    for request in conversation.turn_ids()? {
-        let record = conversation
-            .turn(&request)?
-            .ok_or_else(|| format!("request {request} disappeared"))?;
-        for round in 0..record.round {
-            if conversation
-                .tools(&request, round)?
-                .into_iter()
-                .any(|tool| !tool.is_terminal())
-            {
-                return Err("cannot fork a conversation with a started tool".to_string());
-            }
-        }
-    }
-    if conversation
-        .async_tasks()?
-        .into_iter()
-        .any(|task| task.status == TaskStatus::Pending)
-    {
-        return Err("cannot fork a conversation with a nonterminal async task".to_string());
-    }
-    if conversation
-        .publications()?
-        .into_iter()
-        .any(|publication| publication.status == PublicationStatus::Pending)
-    {
-        return Err("cannot fork a conversation with a nonterminal publication".to_string());
-    }
+fn validate_fork_quiescence(_conversation: &Conversation<'_>) -> Result<(), String> {
+    // A conversation is a flat transcript; a fork copies it as it stands, with
+    // no outstanding-work check. A call that started and never finished is just
+    // a tool_use with no tool_result, which a reader renders as unfinished and a
+    // resuming driver decides what to do with. (Formerly refused an active
+    // request, a started tool, or a pending async task or publication, which is
+    // why a session that died mid-turn had to be "settled" before it could fork.)
     Ok(())
 }
 
