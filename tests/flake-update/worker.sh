@@ -26,7 +26,7 @@ next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
 
 # The lock entry every flake pinning this commit of nix-systems/default carries.
 PIN=da67096a3b9bf56a91d16901293e51ba5b49a27e
-PIN_NAR=sha256-b+uqzj+Wa6xgMS9aNbX4I+sXeb5biPDi39VgvSFqFvU=
+PIN_NAR=sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=
 
 case "$stage" in
 
