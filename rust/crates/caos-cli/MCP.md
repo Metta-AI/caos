@@ -335,15 +335,13 @@ model's context. Its first line is a `caos-conversation-command:` marker, which
 is what the hook finds if Claude Code passes it the command's expansion rather
 than the `/name <hash>` that was typed.
 
-**An incomplete head is used as it is.** A session that died mid-turn leaves a
-running request, and perhaps calls that started and never finished. The protocol
-refuses to fork such a conversation, so `settle` first appends commits that close
-it the way `llm-step` does for a cancelled turn: each open call completes as
-`cancelled` (its observation says the session ended before it finished), and the
-request ends `interrupted`. Nothing is rewritten, and these commits land on the
-NEW branch, so the original is not touched. A pending publication is not settled
-— it is a fact about a remote — and the protocol refuses that fork with its own
-message.
+**An incomplete head is forked as it is.** A session that died mid-turn leaves a
+running request, and perhaps calls that started and never finished. A conversation
+is a flat transcript, so the fork copies it unchanged: an unfinished call is a
+`tool_use` with no `tool_result`, which a reader renders as unfinished and a
+resuming driver decides what to do with. The protocol used to refuse such a fork,
+so the source had to be "settled" first — each open call completed as `cancelled`,
+the request ended `interrupted` — before it could be forked; that step is gone.
 
 ## Not yet done
 
