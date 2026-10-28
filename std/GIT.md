@@ -88,11 +88,15 @@ import_source(source="https://github.com/<owner>/<repo>.git",
 copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
 ... edit sources/<repo>/99-dirty ...
 move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
-publish_source(source_tree="sources/<repo>/01-<name>",
-               repository="https://github.com/<owner>/<repo>.git",
-               branch="my-branch")
-run_tool(path="caos-std/github", arguments={...})   # open the PR
+write(file-path="sources/<repo>/01-<name>.pr.md",
+      content="<PR title>\n\n<PR body>\n")
+run_tool(path="caos-std/publish-stack", arguments={"stack": "sources/<repo>"})
 ```
+
+The last call pushes `01-<name>` to the branch `<name>` (give `branch-prefix`
+to put something in front of it), opens the PR against the branch `00-base`
+was imported from, and prints what it did. Run it again after more edits and
+it fast-forwards the branch; the PR follows.
 
 - Edit and publish a source tree (`sources/<repo>/...`), never the
   conversation root. `edit` on a bare path succeeds but changes only scratch
