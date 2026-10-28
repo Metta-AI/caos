@@ -1222,11 +1222,33 @@ fn declare_requested_call(
         let expected = state.head().clone();
         match state.try_append_at(&expected, transition)? {
             progress::TryAppend::Appended(_) => {
-                return Ok((record.id, record.request_head));
+                return Ok((record.id, record.request_head, record.round));
             }
             progress::TryAppend::HeadChanged(_) => continue,
         }
     }
+}
+
+/// The round of `record` whose assistant declaration carries the call, if one
+/// does. It reads the declarations, not `tool.start` records: a call `start`
+/// declared that nothing has run yet is the request's all the same, on whatever
+/// round declared it, and must not be declared a second time on a later one.
+fn declared_round(
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+    call: &str,
+) -> Result<Option<u64>, String> {
+    last_matching(view, |_, entry| {
+        if entry.role != Role::Assistant || entry.request.as_ref() != Some(&record.id) {
+            return None;
+        }
+        let declares = entry
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::ToolUse { id, .. } if id.as_str() == call));
+        declares.then_some(entry.round)
+    })
+    .map(Option::flatten)
 }
 
 /// The result of a tools-only run: the call's own record, so a caller with only
