@@ -400,7 +400,8 @@ reach usually means the grant is missing.
   `git.md` is "no such path".
 - `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
   underscores), and the old string must occur exactly once.
-- `theirs` for `merge` is a full commit hash, not a path or a branch name.
+- `theirs` for `merge` is a full commit hash or the path of a source tree in
+  the conversation, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
