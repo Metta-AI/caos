@@ -1990,7 +1990,7 @@ fn launch_resolved_tool(
     id: &str,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
-    let current = round_state(&state.conversation()?, &record)?;
+    let current = working_round(cfg, &state.conversation()?, &record)?;
     if current.declaring_round != round {
         return resume(cfg, state, request, request_head);
     }
