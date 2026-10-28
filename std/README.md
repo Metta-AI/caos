@@ -117,6 +117,13 @@ Not callable: these are what the tools and the build graph are made OF. An
 expression names them (`--base:@=DEEP-DEPS/<name>`), and `caos-build` or the
 test suite exercises them.
 
+Workers have the network. Every worker container runs on the compute network:
+it reaches the caos server over HTTP, `llm-client` posts to
+`api.anthropic.com`, `flake-builder` fetches flake inputs and pushes to the
+registry, and `go` ships a CA bundle so a script's own HTTPS request verifies.
+Where a worker is offline, that is the build's choice (`cargo` below), never a
+property of the container. A tool that has to fetch something can.
+
 | entry | one line |
 |---|---|
 | `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
