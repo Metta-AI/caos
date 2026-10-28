@@ -126,7 +126,7 @@ pub(super) struct Stack {
 /// Read the stack directory: `00-base`, the layers in name order, and each
 /// layer's description. Refused: a layer-named entry that is not a gitlink, a
 /// description with no layer, and a described layer above an undescribed one.
-fn read_stack(view: &Conversation<'_>, dir: &str) -> Result<Stack, String> {
+pub(super) fn read_stack(view: &Conversation<'_>, dir: &str) -> Result<Stack, String> {
     let entries = view
         .snapshot()
         .list(dir)
