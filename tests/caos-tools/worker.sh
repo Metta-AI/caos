@@ -30,6 +30,15 @@
 # instead of the second.
 set -euo pipefail
 
+# DISABLED: flaky under load. The one turn makes about 19 tool calls, each its own
+# sub-run, and `wait_turn` (std/llm-test/worker-common.sh) gives up after 120s; it
+# failed at 130s on CI. Its replies are already scripted up front, so this needs a
+# way to wait without a clock, not a new design. See tests/README.md, "Disabling a
+# test"; delete this block to re-enable it.
+echo "caos-tools: SKIPPED (disabled)" > /tmp/report
+caos put /tmp/report /cas/out
+exit 0
+
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
 # shellcheck disable=SC1090
 source /cas/args/common

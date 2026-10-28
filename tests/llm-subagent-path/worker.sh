@@ -2,6 +2,15 @@
 # shellcheck disable=SC1090,SC1091,SC2034,SC2154
 set -euo pipefail
 
+# DISABLED: flaky under load. The parent and child agents race for the stub's next
+# reply, so this test answers each request by hand and polls for request-N.json for
+# 60s (`wait_for_file`); on CI request 2 never arrived. To come back, script the
+# replies by request instead of by arrival order. See tests/README.md, "Disabling a
+# test"; delete this block to re-enable it.
+echo "llm-subagent-path: SKIPPED (disabled)" > /tmp/report
+caos put /tmp/report /cas/out
+exit 0
+
 caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1; }
 source /cas/args/common
 
