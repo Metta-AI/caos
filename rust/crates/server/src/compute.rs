@@ -221,18 +221,24 @@ fn eval_in_tree(
     path: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    evaluate(config, root, path, secrets).map(String::into_bytes)
+    evaluate(config, root, path, secrets, None).map(String::into_bytes)
 }
 
 /// Walk `root` down to `path`, returning `"<kind> <hash>"`, memoized on the
 /// tree, the path, and whatever a grant could depend on
 /// ([`crate::secrets::Context::walk_key`]). A cached result needs nothing
 /// replayed: the walk's grant records are kept in redis too.
+///
+/// `parent` is the trace node the walk's dispatches are recorded under -- the
+/// ticket of the request that asked, so what it had to evaluate shows up in
+/// that request's trace. `None` names the walk's own continuation, which no
+/// one reads. A memo hit does no work and records nothing, as for any reuse.
 fn evaluate(
     config: &Config,
     root: &str,
     path: &str,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     // Content-addressed by storing it, so the redis key is fixed-length.
     let identity = match secrets.walk_key() {
@@ -244,7 +250,7 @@ fn evaluate(
     if let Ok(Some(result)) = cache_get(&config.redis_addr, &key) {
         return Ok(result);
     }
-    let result = walk(config, root, path, secrets)?;
+    let result = walk(config, root, path, secrets, parent)?;
     let _ = cache_set(&config.redis_addr, &key, &result);
     Ok(result)
 }
@@ -255,6 +261,7 @@ fn walk(
     root: &str,
     path: &str,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     use gix::objs::tree::{Entry, EntryKind};
 
@@ -282,10 +289,11 @@ fn walk(
 
     // No salt and no stack: an eval is deterministic in its inputs, and this is
     // a top-level resolution with no ancestors. `parent` is only a trace label
-    // here (no `then`, so no pool inheritance reads it), so the continuation
-    // names itself.
+    // here (no `then`, so no pool inheritance reads it): the asking request's
+    // ticket when there is one, else the continuation names itself.
     let cont = cont.to_string();
-    let (result, _caught) = resolve_promise(config, &cont, &cont, "", &[], secrets)?;
+    let (result, _caught) =
+        resolve_promise(config, parent.unwrap_or(&cont), &cont, "", &[], secrets)?;
     Ok(result)
 }
 
@@ -348,6 +356,7 @@ fn evaluate_locator(
     locator: &str,
     token: Option<&str>,
     secrets: &crate::secrets::Context,
+    parent: Option<&str>,
 ) -> Result<String, HttpError> {
     let git_ref = git_locator::parse_git_ref(locator).map_err(|e| HttpError::new(400, e))?;
     let root = crate::locator::resolve_root(config, &git_ref, token)
@@ -356,7 +365,7 @@ fn evaluate_locator(
         return raw_root(config, locator, &git_ref, &root);
     }
     let dir = git_ref.dir.as_deref().unwrap_or("");
-    let result = evaluate(config, &root.to_string(), dir, secrets)
+    let result = evaluate(config, &root.to_string(), dir, secrets, parent)
         .map_err(|e| HttpError::new(e.status(), format!("git ref {locator:?}: {}", e.message())))?;
     if let Some((_, hash)) = result.split_once(' ') {
         crate::secrets::record_mount(
@@ -389,9 +398,28 @@ pub(crate) fn submit(
     secrets: &crate::secrets::Context,
     token: Option<&str>,
 ) -> Result<Vec<u8>, HttpError> {
+    let json = parse_bundle_body(body)?;
+    let (arg_tree, granted) = form_bundle(config, &json, secrets, token, None)?;
+    Ok(format!("tree {arg_tree}\ngranted {granted}\n").into_bytes())
+}
+
+fn parse_bundle_body(body: &[u8]) -> Result<serde_json::Value, HttpError> {
+    serde_json::from_slice(body).map_err(|e| HttpError::new(400, format!("body is not JSON: {e}")))
+}
+
+/// Form the request a `/submit` body states: its ArgTree, and the names of the
+/// secrets a run of it would be given. This is where everything that needs
+/// evaluating is evaluated, for `POST /submit` (which answers with the result)
+/// and for a started bundle (which does it on the ticket's own thread, with
+/// `parent` the ticket, so the evaluation is part of that ticket's trace).
+fn form_bundle(
+    config: &Config,
+    json: &serde_json::Value,
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+    parent: Option<&str>,
+) -> Result<(String, String), HttpError> {
     let bad = |message: String| HttpError::new(400, message);
-    let json: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| bad(format!("body is not JSON: {e}")))?;
     let text = |value: &serde_json::Value, what: &str| {
         value
             .as_str()
@@ -422,10 +450,20 @@ pub(crate) fn submit(
                 &root.oid.to_string(),
                 &base_value,
                 secrets,
+                parent,
             )?)?
             .1
         }
-        Some("locator") => kind_hash(evaluate_locator(config, &base_value, token, secrets)?)?.1,
+        Some("locator") => {
+            kind_hash(evaluate_locator(
+                config,
+                &base_value,
+                token,
+                secrets,
+                parent,
+            )?)?
+            .1
+        }
         Some("hash") => base_value,
         Some("docker") => format!("docker://{base_value}"),
         other => return Err(bad(format!("unknown base type {other:?}"))),
@@ -442,7 +480,8 @@ pub(crate) fn submit(
     if let Some(locators) = json["locators"].as_object() {
         for (name, locator) in locators {
             let locator = text(locator, "a locator")?;
-            let (kind, hash) = kind_hash(evaluate_locator(config, &locator, token, secrets)?)?;
+            let (kind, hash) =
+                kind_hash(evaluate_locator(config, &locator, token, secrets, parent)?)?;
             let oid = gix::ObjectId::from_hex(hash.as_bytes())
                 .map_err(|_| HttpError::new(500, format!("{hash:?} is not an object id")))?;
             call.push(named_entry(name, caos_eval::mode_of_kind(&kind), oid));
@@ -456,7 +495,7 @@ pub(crate) fn submit(
     let salt = json["salt"].as_str().unwrap_or("");
     let arg_tree = form_arg_tree(config, &image, call, salt)?;
     let granted = crate::secrets::granted_names(config, secrets, &args_entries(config, &arg_tree)?);
-    Ok(format!("tree {arg_tree}\ngranted {}\n", granted.join(" ")).into_bytes())
+    Ok((arg_tree, granted.join(" ")))
 }
 
 /// A formed ArgTree's `base` and its other entries; `None` for anything else.
@@ -3104,16 +3143,37 @@ fn eval_expression(
 /// `GET|POST /eval/<verb>` — evaluate the line and block for the answer,
 /// `<kind> <hash>`. `run` is what `caos-cli run` does; `curry` forms the
 /// ArgTree and runs nothing.
+///
+/// This is `/start/<verb>` and then waiting for the ticket: the same ticket,
+/// the same evaluation on the same thread, the same trace. A run is a start
+/// whose caller stays.
 pub(crate) fn eval_expression_endpoint(
-    config: &Config,
+    config: &std::sync::Arc<Config>,
     verb: &str,
     params: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
-    let expression = parse_expression(verb, params)?;
-    let ticket = ticket_of(config, &expression, secrets)?;
-    eval_expression(config, &expression, &ticket, secrets)
-        .map(|result| format!("{result}\n").into_bytes())
+    let ticket = begin_expression(config, verb, params, secrets)?;
+    wait_ticket(config, &ticket)
+}
+
+/// `GET /wait/<ticket>` — block until the ticket has an answer, and give it as
+/// `/eval` does: `<kind> <hash>`, or the failure the ticket recorded. Nothing is
+/// dispatched: it reads what `GET /result/<ticket>` reads until that stops
+/// saying `pending`.
+pub(crate) fn wait_ticket(config: &Config, ticket: &str) -> Result<Vec<u8>, HttpError> {
+    loop {
+        let state = expression_result(config, ticket)?;
+        let state = String::from_utf8_lossy(&state).trim().to_string();
+        if let Some(answer) = state.strip_prefix("ok ") {
+            return Ok(format!("{answer}\n").into_bytes());
+        }
+        if let Some(failure) = state.strip_prefix("failed ") {
+            let (status, message) = failure.split_once(' ').unwrap_or((failure, ""));
+            return Err(HttpError::new(status.parse().unwrap_or(500), message));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Evaluations running in THIS process. A ticket recorded `pending` that is not
@@ -3171,34 +3231,133 @@ pub(crate) fn start_expression(
     params: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<Vec<u8>, HttpError> {
+    let ticket = begin_expression(config, verb, params, secrets)?;
+    Ok(format!("{ticket}\n").into_bytes())
+}
+
+/// Start the line `verb` and `params` state, and return its ticket.
+fn begin_expression(
+    config: &std::sync::Arc<Config>,
+    verb: &str,
+    params: &str,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
     let expression = parse_expression(verb, params)?;
     let ticket = ticket_of(config, &expression, secrets)?;
-    let key = ticket_key(config, &ticket);
+    let secrets = secrets.clone();
+    start_work(config, &ticket, move |config, ticket| {
+        eval_expression(config, &expression, ticket, &secrets)
+    })?;
+    Ok(ticket)
+}
+
+/// `POST /start` — the same as `/start/<verb>` for a request a client has
+/// bundled rather than spelled: the body is `POST /submit`'s, and so is the
+/// meaning. The ticket comes back at once; forming the request (a base's build,
+/// a locator's fetch) and running it both happen on the ticket's thread, where
+/// the trace sees them. A client that wants to wait asks `GET /wait/<ticket>`.
+pub(crate) fn start_bundle(
+    config: &std::sync::Arc<Config>,
+    body: &[u8],
+    secrets: &crate::secrets::Context,
+    token: Option<&str>,
+) -> Result<Vec<u8>, HttpError> {
+    let json = parse_bundle_body(body)?;
+    let ticket = bundle_ticket(config, &json, secrets)?;
+    let (secrets, token) = (secrets.clone(), token.map(str::to_string));
+    start_work(config, &ticket, move |config, ticket| {
+        let (arg_tree, _granted) =
+            form_bundle(config, &json, &secrets, token.as_deref(), Some(ticket))?;
+        crate::status::child(config, ticket, "request", "request", &arg_tree);
+        // A ticket's run is top-level, whichever way it was started.
+        run_work_request(
+            config,
+            &WorkRequest {
+                arg_tree: &arg_tree,
+                stack: &[],
+                secrets: &secrets,
+            },
+        )
+    })?;
+    Ok(format!("{ticket}\n").into_bytes())
+}
+
+/// The name of a bundled request, derived from its content as an expression's
+/// is: the bundle the client pushed (which holds the args, and the tree a path
+/// base is in), the base, the locators, the salt, and the secret scope.
+fn bundle_ticket(
+    config: &Config,
+    json: &serde_json::Value,
+    secrets: &crate::secrets::Context,
+) -> Result<String, HttpError> {
+    let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+    if json["bundle"].as_str().is_none() {
+        return Err(HttpError::new(400, "bundle must be a string"));
+    }
+    let locators: std::collections::BTreeMap<String, String> = json["locators"]
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .map(|(name, value)| (name.clone(), text(value)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let canonical = serde_json::json!([
+        "bundle",
+        text(&json["salt"]),
+        secrets.walk_key().unwrap_or_default(),
+        text(&json["bundle"]),
+        text(&json["base"]["type"]),
+        text(&json["base"]["value"]),
+        locators,
+    ]);
+    store_git_blob(config, canonical.to_string().as_bytes())
+        .map(|id| id.to_string())
+        .map_err(|e| HttpError::new(500, e))
+}
+
+/// Run `work` under `ticket` on a thread of its own, and note on the ticket's
+/// trace that it was requested, started and ended. Starting what is already
+/// running joins it, and what has succeeded is already answered; a FAILED one
+/// is started afresh, because a failure is not an answer (the same rule the
+/// result cache keeps).
+///
+/// The trace events are what let `watch` and `status` take a ticket: the ticket
+/// is a node like any other, and whatever `work` dispatches or evaluates is
+/// recorded under it as its children.
+fn start_work(
+    config: &std::sync::Arc<Config>,
+    ticket: &str,
+    work: impl FnOnce(&std::sync::Arc<Config>, &str) -> Result<String, HttpError> + Send + 'static,
+) -> Result<(), HttpError> {
+    let key = ticket_key(config, ticket);
     {
         // Held across the read so two arrivals cannot both start it.
         let mut live = live_tickets().lock().unwrap();
-        if live.contains(&ticket) {
-            return Ok(format!("{ticket}\n").into_bytes());
+        if live.contains(ticket) {
+            return Ok(());
         }
         if let Ok(Some(state)) = cache_get(&config.redis_addr, &key) {
             if state.starts_with("ok ") {
-                return Ok(format!("{ticket}\n").into_bytes());
+                return Ok(());
             }
         }
         cache_set(&config.redis_addr, &key, "pending")
             .map_err(|e| HttpError::new(500, format!("cannot record ticket {ticket}: {e}")))?;
-        live.insert(ticket.clone());
+        live.insert(ticket.to_string());
     }
-    let secrets = secrets.clone();
     let guard = TicketGuard {
         config: std::sync::Arc::clone(config),
-        ticket: ticket.clone(),
+        ticket: ticket.to_string(),
         outcome: None,
     };
     let spawned = std::thread::Builder::new()
         .name(format!("ticket-{ticket}"))
         .spawn(move || {
-            let outcome = eval_expression(&guard.config, &expression, &guard.ticket, &secrets);
+            crate::status::requested(&guard.config, &guard.ticket);
+            crate::status::started(&guard.config, &guard.ticket);
+            let outcome = work(&guard.config, &guard.ticket);
+            crate::status::ended(&guard.config, &guard.ticket, outcome.is_ok());
             guard.finish(match outcome {
                 Ok(result) => format!("ok {result}"),
                 Err(e) => format!("failed {} {}", e.status(), e.message()),
@@ -3212,7 +3371,7 @@ pub(crate) fn start_expression(
             format!("cannot start ticket {ticket}: {e}"),
         ));
     }
-    Ok(format!("{ticket}\n").into_bytes())
+    Ok(())
 }
 
 /// `GET /result/<ticket>` — `pending`, `ok <kind> <hash>`, or
