@@ -521,8 +521,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conversation_protocol::v3::tree::TreeBuilder;
-    use conversation_protocol::v3::CommitInfo;
+    use conversation_protocol::v3::tree::{CommitInfo, TreeBuilder};
 
     fn scratch_store(name: &str) -> GitStore {
         let dir = std::env::temp_dir().join(format!("stack-sync-{name}-{}", std::process::id()));
