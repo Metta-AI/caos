@@ -448,7 +448,13 @@ reach usually means the grant is missing.
   underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
   the conversation, never a branch name.
-- `copy` and `move` refuse an existing destination; `remove` first.
+- `copy` and `move` refuse an existing destination; `remove` first. `move`
+  takes one path, so a layer's `.pr.md` stays behind: rename both with
+  `caos-std/move-sed`.
+- `move-sed`'s `replacement` is Go's `$1` / `${name}`. Sed's `\1` is refused,
+  because Go would write it into the name literally.
+- `publish-stack` publishes only layers with a `.pr.md` beside them, and
+  refuses a described layer above an undescribed one. `99-dirty` has none.
 - A `caos-std/github` response for one PR is a full PR object, around 20 KB
   with the repository embedded twice, and a response is cut at 100 KB. List
   PRs with `head=` or a small `per_page=`, or ask GraphQL for the fields you
