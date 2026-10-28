@@ -434,10 +434,7 @@ fn pending_call_target(
 ) -> Result<Option<(String, Oid)>, String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round_state = round_state(&view, &record)?;
-    if round_state.declaring_round != round {
-        return Ok(None);
-    }
+    let round_state = round_state_at(&view, &record, round)?;
     let Some(call) = round_state.pending.iter().find(|call| call.id == id) else {
         return Ok(None);
     };
