@@ -1374,7 +1374,7 @@ fn run_op(
     match (op, started) {
         ("import-source", _) => import_source::execute(state, site).map(|()| true),
         ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
-        ("publish-stack", _) => stack_publish::execute(state, site).map(|()| true),
+        ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
@@ -1426,7 +1426,7 @@ fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<String> {
     } else if view.payload(&publish_source::pin_path(site)).is_ok() {
         Some("publish-source".to_string())
     } else if view.payload(&stack_publish::pin_path(site)).is_ok() {
-        Some("publish-stack".to_string())
+        Some("stack-publish".to_string())
     } else {
         None
     }
