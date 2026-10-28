@@ -306,6 +306,13 @@ Claude Code does not expose the model's round number and does not need to: the
 declaration opens a round, the call belongs to the round that declared it, and a
 `tool_use_id` is unique for the whole session.
 
+The step drives, completes and reads back each tools-only call on the round that
+declared it, not on the request's latest round. The two differ exactly when a
+backgrounded `start` is still running while the model's next call opens a round
+behind it; the started call then completes on its own, earlier round. Nothing
+gates a tool transition on which round is current -- a tool is a recorded fact --
+so completing a call on an earlier round is accepted like any other.
+
 **Tool execution is serial**, matching `llm-step`'s single queue. The tool server
 reads and handles one JSON-RPC request at a time, so a batch of parallel calls
 from the model executes one after another, each starting from the head the
