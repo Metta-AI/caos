@@ -155,6 +155,17 @@ mystack/02-y        -> A2  parents A, X1
 mystack/03-tests    -> B2  parents B, A2
 ```
 
+## Syncing with the remote
+
+`caos-std/stack-sync` does the "Updating the base" moves above against the
+remote in one call, the way `gt sync` does, and more: it reads the trunk's
+head and every published branch, puts the trunk's head at `00-base`, adopts a
+branch GitHub rewrote (merging a stacked PR rebases the branches above it) under
+the layer's local edits, merges in a branch someone else pushed to, restacks
+each layer onto the one below, and reports layers whose PR was merged. It
+pushes nothing; `stack-publish` then fast-forwards every branch
+([stack-publish.md](stack-publish.md), "stack-sync").
+
 ## Renaming layers
 
 A layer is two entries, the gitlink and its `NN-<name>.pr.md` description
