@@ -1,0 +1,6 @@
+# flake-update's dependencies (format `<path> <name>`, path relative to this
+# dir): the flake-builder that builds this flake into an image, named as a
+# LOCAL dep (mounted at DEEP-DEPS/flake-builder by deepening) rather than /std,
+# and the ONE flake.lock at the repo root, placed by the builder (`--lock`).
+../flake-builder flake-builder
+../../flake.lock flake.lock
