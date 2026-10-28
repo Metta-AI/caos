@@ -576,13 +576,14 @@ impl Github {
     /// status is an answer, and `expect` decides which ones are good.
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(i32, Value), String> {
         let url = format!("{API}{path}");
-        let mut request = match method {
-            "GET" => minreq::get(&url),
-            "POST" => minreq::post(&url),
-            "PATCH" => minreq::patch(&url),
+        let verb = match method {
+            "GET" => minreq::Method::Get,
+            "POST" => minreq::Method::Post,
+            "PATCH" => minreq::Method::Patch,
             other => return Err(format!("unsupported GitHub method {other}")),
-        }
-        .with_header("Accept", "application/vnd.github+json")
+        };
+        let mut request = minreq::Request::new(verb, url)
+            .with_header("Accept", "application/vnd.github+json")
         .with_header("X-GitHub-Api-Version", "2022-11-28")
         .with_header("User-Agent", "caos-publish-stack")
         .with_timeout(60);
