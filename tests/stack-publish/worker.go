@@ -1,7 +1,7 @@
-// tests/publish-stack — design/publish-stack.md's operation, run through
+// tests/stack-publish — design/stack-publish.md's operation, run through
 // llm-step's real tool loop with a scripted model, in one turn: build stacks
 // with the shell, write their .pr.md descriptions, then call
-// caos-std/publish-stack on each.
+// caos-std/stack-publish on each.
 //
 // The repository is a `.invalid` host, so no push happens: the good stack
 // must get through every check and stop at reading the remote, and say that
@@ -34,7 +34,7 @@ const (
 	stub = "/tmp/stub"
 	tool = "/tmp/llm-test-tool"
 
-	invalid = "https://caos-publish-stack.invalid/repo.git"
+	invalid = "https://caos-stack-publish.invalid/repo.git"
 )
 
 func run(name string, args ...string) string {
@@ -144,10 +144,10 @@ func write(id, path, content string) map[string]any {
 	return use(id, "write", map[string]any{"file-path": path, "content": content})
 }
 
-// publish is one publish-stack call, reached by path like any std tool. Its
+// publish is one stack-publish call, reached by path like any std tool. Its
 // arguments are strings, like every tool's.
 func publish(id string, args map[string]any) map[string]any {
-	return use(id, "run_tool", map[string]any{"path": "tools/publish-stack", "arguments": args})
+	return use(id, "run_tool", map[string]any{"path": "tools/stack-publish", "arguments": args})
 }
 
 // seen is what the model was shown for a call: request n's tool result for id,
@@ -214,7 +214,7 @@ func main() {
 		base := caos("put-commit", "/tmp/base-commit", "/cas/base")
 
 		port := startStub()
-		conv := fmt.Sprintf("%d-%d-publish-stack", time.Now().UnixNano(), rand.Int())
+		conv := fmt.Sprintf("%d-%d-stack-publish", time.Now().UnixNano(), rand.Int())
 		w.Must(os.WriteFile("/tmp/system.txt", []byte("You are a coding agent."), 0o644))
 		caos("put", "/tmp/system.txt", "/cas/system")
 		llm := caos("curry", "--base:hash="+caos("hash", "/cas/args/llm-step"), "--system:@=/cas/system",
@@ -222,12 +222,12 @@ func main() {
 
 		// The tools, staged the way chat-tools-mixed stages its shell: a folder
 		// whose .caos-expr names the image by hash. An agent reaches the same
-		// images at caos-std/bash-tool and caos-std/publish-stack.
+		// images at caos-std/bash-tool and caos-std/stack-publish.
 		title1 := "Add the feature (" + salt + ")"
 		title2 := "Test the feature (" + salt + ")"
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
-			write("tu_px", "tools/publish-stack/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/publish-stack")),
+			write("tu_px", "tools/stack-publish/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/stack-publish")),
 			// The good stack: each layer copied from the one below, then edited,
 			// so each descends from the one below; 99-dirty on top, undescribed.
 			shell("tu_l1", "mkdir -p mystack && cp -a main mystack/00-base && cp -a main mystack/01-feature && echo feature > mystack/01-feature/feature.txt", "main"))
@@ -281,7 +281,7 @@ func main() {
 
 		w.Step("a dry run reports the plan")
 		dry := seen(4, "tu_dry")
-		note("publish-stack dry-run, as the model saw it:\n%s", dry)
+		note("stack-publish dry-run, as the model saw it:\n%s", dry)
 		w.True(!strings.HasPrefix(dry, "ERROR:"), "the dry run was refused: %s", dry)
 		says("dry run", dry, "dry run", "repository "+invalid, "trunk main",
 			"01-feature  feature  ", "  base main  PR title: "+title1,
@@ -292,7 +292,7 @@ func main() {
 
 		w.Step("a publish gets through every check and stops at the remote")
 		pub := seen(4, "tu_pub")
-		note("publish-stack against an unreachable remote: %s", pub)
+		note("stack-publish against an unreachable remote: %s", pub)
 		w.True(strings.HasPrefix(pub, "ERROR:"), "an unreachable remote was not an error: %s", pub)
 		says("publish", pub, "remote branch lookup failed", "for branch feature", "nothing was pushed")
 
@@ -308,7 +308,7 @@ func main() {
 			{"tu_orphan", []string{"orphan/03-c.pr.md describes no layer"}},
 			{"tu_bare", []string{"no layer in bare has a .pr.md description"}},
 			{"tu_nowhere", []string{"stack nowhere"}},
-			{"tu_badarg", []string{"invalid publish-stack arguments", "squash"}},
+			{"tu_badarg", []string{"invalid stack-publish arguments", "squash"}},
 		} {
 			out := seen(4, c.id)
 			note("%s: %s", c.id, out)
@@ -317,6 +317,6 @@ func main() {
 			says(c.id, out, c.says...)
 		}
 
-		w.Report(narration.String() + "publish-stack: ALL PASS\n")
+		w.Report(narration.String() + "stack-publish: ALL PASS\n")
 	})
 }
