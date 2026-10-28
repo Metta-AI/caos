@@ -400,8 +400,13 @@ reach usually means the grant is missing.
   `git.md` is "no such path".
 - `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
   underscores), and the old string must occur exactly once.
-- `theirs` for `merge` is a full commit hash, not a path or a branch name.
+- `theirs` for `merge` is a full commit hash or the path of a source tree in
+  the conversation, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first.
+- A `caos-std/github` response for one PR is a full PR object, around 20 KB
+  with the repository embedded twice, and a response is cut at 100 KB. List
+  PRs with `head=` or a small `per_page=`, or ask GraphQL for the fields you
+  need, rather than listing every open PR of a busy repo.
 - An import is an unchanged snapshot. It never merges into or advances
   another source tree.
 - Ignored scratch files can ride along in a source during work, and then block
