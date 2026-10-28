@@ -117,11 +117,18 @@ Not callable: these are what the tools and the build graph are made OF. An
 expression names them (`--base:@=DEEP-DEPS/<name>`), and `caos-build` or the
 test suite exercises them.
 
+Workers have the network. Every worker container runs on the compute network:
+it reaches the caos server over HTTP, `llm-client` posts to
+`api.anthropic.com`, `flake-builder` fetches flake inputs and pushes to the
+registry, and `go` ships a CA bundle so a script's own HTTPS request verifies.
+Where a worker is offline, that is the build's choice (`cargo` below), never a
+property of the container. A tool that has to fetch something can.
+
 | entry | one line |
 |---|---|
 | `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
 | `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. A script imports `caos/w`: an error policy (`Main`, `Check`, `Must`, `True`) and the worker CLI (`Caos`, `Get`, `Read`, `Put`, `Hash`, `Exists`), so a script does not define its own. |
-| `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry, no network. |
+| `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry. It builds `--offline` by choice, so a missing dep fails instead of being fetched; the container has the network. |
 | `rustc` | The worker factory that turns a Rust project into a runnable worker; part of the seeded core. |
 | `runner` | The pooled interpreter every compiled worker is curried onto; part of the seeded core. |
 | `deep-deps` | Mounts each directory's `DEPS` at `DEEP-DEPS/<name>`, which is what lets a subtree name things outside itself. |
@@ -136,5 +143,5 @@ test suite exercises them.
 | `run-and-update-ref` | The async worker: one binary, two stages, behind `run_async` and the subagent tools. |
 | `actor` | The actor wrapper: runs an inner `(state, message) -> (state', reply)` request against state on a Git branch, publishing by moving the branch with a compare-and-swap ([`actor/README.md`](actor/README.md)); a Go program on `std/go`. |
 | `hello` | The smallest possible entry, used by `tests/hello` and by hand when something is deeply broken. |
-| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and no network. |
+| `llm-stub` | A scripted stand-in for the model, so `tests/llm-*` run with no API key and never call the API. |
 | `llm-test` / `llm-test-tool` | Fixtures the llm tests drive: a test harness entry and a tool for it to call. |
