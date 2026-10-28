@@ -3,14 +3,11 @@
 # prompt: the new session gets its OWN conversation, whose history is <hash>'s;
 # the original does not move.
 #
-# A head left open (a session that died mid-turn) is used as it is: the
-# protocol refuses to fork a running request, so the hook closes it as new
-# commits on top, and the record says so.
+# A head left open (a session that died mid-turn) is forked as it is: a
+# conversation is a flat transcript, so the fork copies it unchanged, open
+# request and all, and the record shows the fork landing straight on top.
 #
-# Driven through `caos mcp hook` only -- no tool server, no model. What that
-# leaves untested is the closing of a CALL a dead session left running or
-# declared; the request-only case below covers `settle`'s path through the
-# terminal, and the call paths are what `llm-step`'s `drain` already does.
+# Driven through `caos mcp hook` only -- no tool server, no model.
 set -euo pipefail
 
 # The hook's diag journal lives under $HOME/.cache, and the worker's HOME
