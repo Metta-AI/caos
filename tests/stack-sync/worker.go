@@ -1,16 +1,13 @@
-// tests/publish-stack — design/publish-stack.md's operation, run through
-// llm-step's real tool loop with a scripted model, in one turn: build stacks
-// with the shell, write their .pr.md descriptions, then call
-// caos-std/publish-stack on each.
+// tests/stack-sync — design/stack-publish.md's stack-sync operation, run
+// through llm-step's real tool loop with a scripted model, in one turn: build
+// a stack with the shell, write its .pr.md descriptions, then call
+// caos-std/stack-sync on it.
 //
-// The repository is a `.invalid` host, so no push happens: the good stack
-// must get through every check and stop at reading the remote, and say that
-// nothing was pushed. A dry run must report the plan: the layers, their
-// branches with and without a prefix, the chained bases, the titles, and not
-// the undescribed 99-dirty. The refusals (a described layer above an
-// undescribed one, a layer that does not contain the one below it, a
-// description with no layer, a stack with no descriptions, no trunk, no such
-// directory) must come before the remote is read.
+// The repository is a `.invalid` host, so the remote cannot be read: the sync
+// must get through every check, stop at reading the trunk, and change
+// nothing. The refusals (no trunk, no such directory, an unknown argument)
+// must come before the remote is read. The merge logic itself has unit tests
+// in llm-step (stack_sync.rs) over a real git store.
 package main
 
 import (
@@ -34,7 +31,7 @@ const (
 	stub = "/tmp/stub"
 	tool = "/tmp/llm-test-tool"
 
-	invalid = "https://caos-publish-stack.invalid/repo.git"
+	invalid = "https://caos-stack-sync.invalid/repo.git"
 )
 
 func run(name string, args ...string) string {
@@ -66,8 +63,6 @@ func fields(out string) map[string]string {
 
 var narration strings.Builder
 
-// note keeps a line of what the model saw as this test's narration, so a pass
-// prints the operation's actual output.
 func note(format string, a ...any) {
 	line := fmt.Sprintf(format, a...)
 	narration.WriteString(line + "\n")
@@ -95,8 +90,7 @@ func stubHost() string {
 	return ""
 }
 
-// startStub starts llm-stub on a free port and returns the port. The stub
-// answers request N with stub/response-N.json and records it as request-N.json.
+// startStub starts llm-stub on a free port and returns the port.
 func startStub() int {
 	w.Must(os.MkdirAll(stub, 0o755))
 	install("stub", "llm-stub", "/tmp/llm-stub")
@@ -144,10 +138,8 @@ func write(id, path, content string) map[string]any {
 	return use(id, "write", map[string]any{"file-path": path, "content": content})
 }
 
-// publish is one publish-stack call, reached by path like any std tool. Its
-// arguments are strings, like every tool's.
-func publish(id string, args map[string]any) map[string]any {
-	return use(id, "run_tool", map[string]any{"path": "tools/publish-stack", "arguments": args})
+func sync(id string, args map[string]any) map[string]any {
+	return use(id, "run_tool", map[string]any{"path": "tools/stack-sync", "arguments": args})
 }
 
 // seen is what the model was shown for a call: request n's tool result for id,
@@ -187,11 +179,14 @@ func seen(n int, id string) string {
 	return ""
 }
 
-// says checks that a result carries every phrase, failing with the whole text.
 func says(claim, out string, phrases ...string) {
 	for _, p := range phrases {
 		w.True(strings.Contains(out, p), "%s: does not say %q:\n%s", claim, p, out)
 	}
+}
+
+func sourceTree(head, name string) string {
+	return fields(run(tool, "source-tree", "--repo", repo, "--head", head, "--name", name))["commit"]
 }
 
 func main() {
@@ -214,87 +209,56 @@ func main() {
 		base := caos("put-commit", "/tmp/base-commit", "/cas/base")
 
 		port := startStub()
-		conv := fmt.Sprintf("%d-%d-publish-stack", time.Now().UnixNano(), rand.Int())
+		conv := fmt.Sprintf("%d-%d-stack-sync", time.Now().UnixNano(), rand.Int())
 		w.Must(os.WriteFile("/tmp/system.txt", []byte("You are a coding agent."), 0o644))
 		caos("put", "/tmp/system.txt", "/cas/system")
 		llm := caos("curry", "--base:hash="+caos("hash", "/cas/args/llm-step"), "--system:@=/cas/system",
 			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--conversation="+conv)
 
-		// The tools, staged the way chat-tools-mixed stages its shell: a folder
-		// whose .caos-expr names the image by hash. An agent reaches the same
-		// images at caos-std/bash-tool and caos-std/publish-stack.
-		title1 := "Add the feature (" + salt + ")"
-		title2 := "Test the feature (" + salt + ")"
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
-			write("tu_px", "tools/publish-stack/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/publish-stack")),
-			// The good stack: each layer copied from the one below, then edited,
-			// so each descends from the one below; 99-dirty on top, undescribed.
+			write("tu_sx", "tools/stack-sync/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/stack-sync")),
 			shell("tu_l1", "mkdir -p mystack && cp -a main mystack/00-base && cp -a main mystack/01-feature && echo feature > mystack/01-feature/feature.txt", "main"))
 		respond(2,
-			shell("tu_l2", "cp -a mystack/01-feature mystack/02-tests && echo tests > mystack/02-tests/tests.txt && cp -a mystack/02-tests mystack/99-dirty && echo scratch > mystack/99-dirty/scratch.txt", "mystack"),
-			write("tu_d1", "mystack/01-feature.pr.md", title1+"\n\nWhy it exists,\nover two lines.\n"),
-			write("tu_d2", "mystack/02-tests.pr.md", "# "+title2+"\n"),
-			// The refusals' stacks. `gap`: a described layer above an undescribed
-			// one. `unmerged`: 02-b from main, not from 01-a. `orphan`: a
-			// description with no gitlink. `bare`: no descriptions at all.
-			shell("tu_l3", "for s in gap unmerged orphan bare; do mkdir -p $s && cp -a main $s/00-base && cp -a main $s/01-a && echo a > $s/01-a/a.txt; done"+
-				" && cp -a gap/01-a gap/02-b && echo b > gap/02-b/b.txt"+
-				" && cp -a main unmerged/02-b && echo b > unmerged/02-b/b.txt", "main"),
-			write("tu_d3", "gap/02-b.pr.md", "B\n"),
-			write("tu_d4", "unmerged/01-a.pr.md", "A\n"),
-			write("tu_d5", "unmerged/02-b.pr.md", "B\n"),
-			write("tu_d6", "orphan/01-a.pr.md", "A\n"),
-			write("tu_d7", "orphan/03-c.pr.md", "C\n"))
+			shell("tu_l2", "cp -a mystack/01-feature mystack/02-tests && echo tests > mystack/02-tests/tests.txt && cp -a mystack/02-tests mystack/99-dirty", "mystack"),
+			write("tu_d1", "mystack/01-feature.pr.md", "Add the feature ("+salt+")\n"),
+			write("tu_d2", "mystack/02-tests.pr.md", "Test the feature ("+salt+")\n"))
 		respond(3,
-			publish("tu_dry", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
-			publish("tu_prefix", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true", "branch-prefix": "me/"}),
-			publish("tu_pub", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main"}),
-			publish("tu_notrunk", map[string]any{"stack": "mystack", "repository": invalid}),
-			publish("tu_norepo", map[string]any{"stack": "mystack", "trunk": "main"}),
-			publish("tu_gap", map[string]any{"stack": "gap", "repository": invalid, "trunk": "main"}),
-			publish("tu_unmerged", map[string]any{"stack": "unmerged", "repository": invalid, "trunk": "main"}),
-			publish("tu_orphan", map[string]any{"stack": "orphan", "repository": invalid, "trunk": "main"}),
-			publish("tu_bare", map[string]any{"stack": "bare", "repository": invalid, "trunk": "main"}),
-			publish("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
-			publish("tu_badarg", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "squash": "true"}))
-		respond(4, map[string]any{"type": "text", "text": "published"})
+			sync("tu_sync", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main"}),
+			sync("tu_dry", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "dry-run": "true"}),
+			sync("tu_notrunk", map[string]any{"stack": "mystack", "repository": invalid}),
+			sync("tu_nowhere", map[string]any{"stack": "nowhere", "repository": invalid, "trunk": "main"}),
+			sync("tu_badarg", map[string]any{"stack": "mystack", "repository": invalid, "trunk": "main", "force": "true"}),
+			use("tu_ls", "ls", map[string]any{"path": "mystack"}))
+		respond(4, map[string]any{"type": "text", "text": "synced"})
 
 		w.Step("the turn")
 		admitted := fields(run(tool, "turn", "--repo", repo, "--id", conv, "--user", "tester", "--title", conv,
-			"--actor", "tester", "--text", "build stacks and publish them",
+			"--actor", "tester", "--text", "build a stack and sync it",
 			"--secret-hash", caos("hash", "/cas/args/secret-hash"), "--model", "test-model",
 			"--configuration", llm, "--source-tree", "main="+base))
 		caos("sub-run", admitted["request"])
 		done := fields(run(tool, "wait-terminal", "--repo", repo, "--ref", admitted["ref"],
 			"--request", admitted["request"], "--timeout-secs", "240"))
 		w.True(done["status"] == "idle", "the turn ended with status %q", done["status"])
+		head := done["head"]
 
-		w.Step("the stacks were built")
+		w.Step("the stack was built")
 		for _, c := range []struct {
 			n  int
 			id string
-		}{{2, "tu_l1"}, {3, "tu_l2"}, {3, "tu_d1"}, {3, "tu_d2"}, {3, "tu_l3"}, {3, "tu_d3"}, {3, "tu_d7"}} {
+		}{{2, "tu_l1"}, {3, "tu_l2"}, {3, "tu_d1"}, {3, "tu_d2"}} {
 			out := seen(c.n, c.id)
 			w.True(!strings.HasPrefix(out, "ERROR:"), "call %s failed: %s", c.id, out)
 		}
 
-		w.Step("a dry run reports the plan")
-		dry := seen(4, "tu_dry")
-		note("publish-stack dry-run, as the model saw it:\n%s", dry)
-		w.True(!strings.HasPrefix(dry, "ERROR:"), "the dry run was refused: %s", dry)
-		says("dry run", dry, "dry run", "repository "+invalid, "trunk main",
-			"01-feature  feature  ", "  base main  PR title: "+title1,
-			"02-tests  tests  ", "  base feature  PR title: "+title2)
-		w.True(!strings.Contains(dry, "99-dirty"), "the undescribed 99-dirty was planned: %s", dry)
-		prefixed := seen(4, "tu_prefix")
-		says("prefixed dry run", prefixed, "01-feature  me/feature  ", "  base main  ", "02-tests  me/tests  ", "  base me/feature  ")
-
-		w.Step("a publish gets through every check and stops at the remote")
-		pub := seen(4, "tu_pub")
-		note("publish-stack against an unreachable remote: %s", pub)
-		w.True(strings.HasPrefix(pub, "ERROR:"), "an unreachable remote was not an error: %s", pub)
-		says("publish", pub, "remote branch lookup failed", "for branch feature", "nothing was pushed")
+		w.Step("a sync gets through every check and stops at the remote, changing nothing")
+		for _, id := range []string{"tu_sync", "tu_dry"} {
+			out := seen(4, id)
+			note("%s: %s", id, out)
+			w.True(strings.HasPrefix(out, "ERROR:"), "%s: an unreachable remote was not an error: %s", id, out)
+			says(id, out, "remote branch lookup failed", "for the trunk main", "nothing changed")
+		}
 
 		w.Step("refusals, each before the remote is read")
 		for _, c := range []struct {
@@ -302,13 +266,8 @@ func main() {
 			says []string
 		}{
 			{"tu_notrunk", []string{"no trunk", "pass trunk"}},
-			{"tu_norepo", []string{"no repository", "pass repository"}},
-			{"tu_gap", []string{"gap/02-b has a description but gap/01-a below it has none", "gap/01-a.pr.md"}},
-			{"tu_unmerged", []string{"unmerged/02-b does not contain unmerged/01-a", "caos-std/merge", `"theirs": "unmerged/01-a"`}},
-			{"tu_orphan", []string{"orphan/03-c.pr.md describes no layer"}},
-			{"tu_bare", []string{"no layer in bare has a .pr.md description"}},
 			{"tu_nowhere", []string{"stack nowhere"}},
-			{"tu_badarg", []string{"invalid publish-stack arguments", "squash"}},
+			{"tu_badarg", []string{"invalid stack-sync arguments", "force"}},
 		} {
 			out := seen(4, c.id)
 			note("%s: %s", c.id, out)
@@ -317,6 +276,11 @@ func main() {
 			says(c.id, out, c.says...)
 		}
 
-		w.Report(narration.String() + "publish-stack: ALL PASS\n")
+		w.Step("the stack is as it was")
+		listing := seen(4, "tu_ls")
+		says("ls", listing, "00-base/", "01-feature/", "01-feature.pr.md", "02-tests/", "02-tests.pr.md", "99-dirty/")
+		w.True(sourceTree(head, "mystack/00-base") == base, "00-base moved although the remote could not be read")
+
+		w.Report(narration.String() + "stack-sync: ALL PASS\n")
 	})
 }
