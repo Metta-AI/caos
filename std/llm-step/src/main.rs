@@ -478,7 +478,7 @@ fn resume(
         if current.status != TurnStatus::Running {
             continue;
         }
-        let round = round_state(&state.conversation()?, &current)?;
+        let round = working_round(cfg, &state.conversation()?, &current)?;
         if !round.pending.is_empty() {
             continue;
         }
