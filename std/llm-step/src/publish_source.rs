@@ -195,7 +195,7 @@ pub(super) fn send(
         // Not part of the pinned descriptor: the call's input is fixed per
         // call id, so a recovered attempt sends the same value, and it only
         // relaxes a validation. The commit and the lease stay pinned.
-        if p.allow_ignored {
+        if allow_ignored {
             command.arg("--allow-ignored");
         }
         if let Some(file) = token_file {
