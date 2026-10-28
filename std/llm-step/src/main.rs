@@ -1425,6 +1425,8 @@ fn started_op(view: &Conversation<'_>, site: &CallSite<'_>) -> Option<String> {
         Some("import-source".to_string())
     } else if view.payload(&publish_source::pin_path(site)).is_ok() {
         Some("publish-source".to_string())
+    } else if view.payload(&publish_stack::pin_path(site)).is_ok() {
+        Some("publish-stack".to_string())
     } else {
         None
     }
