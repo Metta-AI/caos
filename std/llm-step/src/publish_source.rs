@@ -151,9 +151,25 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     if pending.status != PublicationStatus::Pending {
         return finish(state, site, &pending, None);
     }
-    // An attempt that pinned this intent may send it, including concurrent
-    // attempts that joined the identical transition. The exact lease makes
-    // those pushes converge. Recovery never obtains a fresh source or lease.
+    let outcome = send(&pending, &p.branch, p.allow_ignored, token_file, observe)?;
+    finish(state, site, &pending, Some(outcome))
+}
+
+/// Send a pinned publication: `caos push-git` with exactly the commit and lease
+/// the record pinned, then reconcile what came back against the remote. Any
+/// attempt that holds the pin may send it, including concurrent attempts that
+/// joined the identical transition: the exact lease makes those pushes
+/// converge, and recovery never obtains a fresh source or lease. `branch` and
+/// `allow_ignored` come from the call's input, which is fixed per call id, so
+/// a recovered attempt sends the same values. `publish_stack` sends one of
+/// these per layer.
+pub(super) fn send(
+    pending: &PublicationRecord,
+    branch: &str,
+    allow_ignored: bool,
+    token_file: Option<&str>,
+    observe: impl FnOnce() -> Result<Option<Oid>, String>,
+) -> Result<Outcome, String> {
     let outcome = {
         let mut command = std::process::Command::new("caos");
         command
