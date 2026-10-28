@@ -37,6 +37,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
+| `flake-update` | Re-lock a flake by running `nix flake update` in a worker: every input, one input, or one input pinned to a commit. Takes a tree holding flake.nix and flake.lock; returns the new flake.lock. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says
