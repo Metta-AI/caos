@@ -1181,12 +1181,8 @@ fn declare_requested_call(
                 state_conversation_id(state).unwrap_or_default()
             )
         })?;
-        let mut declared = record.calls.iter().any(|declared| declared.id == call);
-        for round in 0..record.round {
-            declared |= view.tool(&record.id, round, call)?.is_some();
-        }
-        if declared {
-            return Ok((record.id, record.request_head));
+        if let Some(round) = declared_round(&view, &record, call)? {
+            return Ok((record.id, record.request_head, round));
         }
         if record.status == TurnStatus::Queued {
             // Nobody has claimed the request yet; the step does, as it does
