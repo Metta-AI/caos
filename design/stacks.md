@@ -158,7 +158,7 @@ mystack/03-tests    -> B2  parents B, A2
 ## Renaming layers
 
 A layer is two entries, the gitlink and its `NN-<name>.pr.md` description
-(publish-stack.md), and `00-base` has its `.source.json`. `caos-std/move-sed`
+(stack-publish.md), and `00-base` has its `.source.json`. `caos-std/move-sed`
 renames the entries of one directory by regular expression in ONE proposal, so
 the pair moves together and a shift has no ordering problem:
 
@@ -172,8 +172,8 @@ without its number.
 
 ## Publishing
 
-`caos-std/publish-stack` publishes the whole folder in one call
-([publish-stack.md](publish-stack.md)): every layer that has a `.pr.md`
+`caos-std/stack-publish` publishes the whole folder in one call
+([stack-publish.md](stack-publish.md)): every layer that has a `.pr.md`
 beside it is pushed as it is to a branch named after it without the number,
 its PR is found or opened on the branch below (the trunk for the first), and
 the PRs are linked as a GitHub stack. Nothing is squashed: the trunk
@@ -181,7 +181,7 @@ squash-merges, so the commits inside a branch never reach it, and a republish
 after merging up is a fast-forward.
 
 ```text
-run_tool(path="caos-std/publish-stack", arguments={"stack": "mystack"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "mystack"})
 ```
 
 What follows is the older, by-hand flow. `create-squashed-stack` still exists
