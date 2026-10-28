@@ -6,6 +6,7 @@ mod import_source;
 mod progress;
 mod publish_source;
 mod stack_publish;
+mod stack_sync;
 mod record;
 mod settle;
 mod source_trees;
