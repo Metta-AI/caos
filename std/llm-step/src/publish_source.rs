@@ -228,7 +228,7 @@ pub(super) fn send(
                         value["diagnostic"].as_str().map(str::to_owned),
                         observed,
                     );
-                    reconcile(&pending, outcome, observe)
+                    reconcile(pending, outcome, observe)
                 }
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
