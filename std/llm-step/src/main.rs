@@ -2631,13 +2631,7 @@ fn declaration_message(
     round: u64,
 ) -> Result<String, String> {
     let record = require_request(view, request)?;
-    let state = round_state(view, &record)?;
-    if state.declaring_round != round {
-        return Err(format!(
-            "request {request} no longer has declaring round {round}"
-        ));
-    }
-    Ok(state.declaration_message)
+    Ok(round_state_at(view, &record, round)?.declaration_message)
 }
 
 fn observation_path(record: &CallRecord) -> String {
