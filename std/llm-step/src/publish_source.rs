@@ -177,7 +177,7 @@ pub(super) fn send(
                 "push-git",
                 &pending.repository,
                 pending.planned_head.as_str(),
-                &p.branch,
+                branch,
             ])
             .arg(format!(
                 "--expected={}",
