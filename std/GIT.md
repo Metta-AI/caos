@@ -472,6 +472,8 @@ reach usually means the grant is missing.
 ## Further reading (design docs in the caos repo)
 
 - `design/stacks.md` – the stack model and the full operation walk-through.
+- `design/publish-stack.md` – `publish-stack` and `move-sed`: the stack
+  directory as the specification, pins, GitHub stacks, resuming.
 - `design/agent-publish.md` – `publish_source`: leases, `force`, `.gitignore`
   rejection, uncertain results.
 - `design/agent-github.md` – import, `caos-std/github`, PRs for a stack, the
