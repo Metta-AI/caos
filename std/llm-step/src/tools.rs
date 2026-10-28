@@ -1346,7 +1346,7 @@ fn resolve_failure(rooted: bool, relative: &str, stderr: &str) -> String {
         format!(
             "{relative} is not in the conversation tree. Check the path first: `ls` its \
              parent, and note an import lives where `import_source` put it (e.g. \
-             imports/<repo>/<revision>). Only if an expression produces it (a mount \
+             sources/<repo>/00-base). Only if an expression produces it (a mount \
              such as caos-std/ exists only in the evaluated tree) call eval_path with \
              that path or a parent of it, then pass the hash it prints as `root` with \
              the rest of the path."
