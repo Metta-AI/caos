@@ -164,11 +164,13 @@ sources/repo/02-tests     -> B   parent A
   not, merge the earlier layer into it before doing anything else (see
   "Merging").
 - To add a layer, `copy` the latest layer to the next name and edit the copy,
-  or work in `99-dirty` and `move` it into place when the work is done.
+  or work in `99-dirty` and `move` it into place when the work is done. Write
+  its `NN-<name>.pr.md` when it is ready to publish.
 
 Every operation on a stack is made of three things: editing a layer, merging an
-earlier layer into a later one, and `copy` / `move` / `remove` on the gitlinks.
-The examples that follow use the stack shown just before them.
+earlier layer into a later one, and `copy` / `move` / `remove` on the gitlinks
+(`caos-std/move-sed` when a gitlink and its `.pr.md` move together). The
+examples that follow use the stack shown just before them.
 
 ### Merging
 
