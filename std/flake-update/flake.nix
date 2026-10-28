@@ -39,7 +39,9 @@
             vendorHash = "sha256-VCQFQiZLnz7QJhFWiXzolP+HkrIz7/qDYfoHNJ0x5No=";
             subPackages = [ "." ];
             # Static: nothing in this image is a libc to find at run time.
-            CGO_ENABLED = 0;
+            # Under `env`, where buildGoModule keeps it; a plain attribute
+            # collides with its default.
+            env.CGO_ENABLED = 0;
           };
           # The module is `caos`, so its main package builds as bin/caos.
           workerRoot = pkgs.runCommand "caos-worker-flake-update-root" { } ''
