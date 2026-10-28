@@ -463,7 +463,7 @@ fn resume(
             TurnStatus::Running => {}
         }
 
-        let round = round_state(&state.conversation()?, &record)?;
+        let round = working_round(cfg, &state.conversation()?, &record)?;
         if let Some(call) = round.pending.first() {
             if drive_call(cfg, state, request, &round, call)? {
                 continue;
