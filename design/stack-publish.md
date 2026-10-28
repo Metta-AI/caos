@@ -182,6 +182,75 @@ pushes and the report costs a few reads.
   `publish-source`: fast-forward unless `force`, `.gitignore` check unless
   `allow-ignored`, a `.caos/conflicts` ledger is the agent's to clear first.
 
+## `stack-sync`: bringing the stack up to date with the remote
+
+Merging a stacked PR is not the end of the stack's life, it is the common
+case: GitHub squash-merges the bottom PR onto the trunk and REWRITES every
+branch above it, rebasing each onto the new trunk and retargeting the next PR.
+The conversation's layers still hold the old history, so the next
+`stack-publish` would be a non-fast-forward at every layer, and forcing it
+would undo GitHub's rebase and show the merged layer's changes again in the PR
+above. Something has to bring the conversation up to date first. `stack-sync`
+is that, the way `gt sync` is for a Graphite checkout. It is an operation of
+the step too (`std/stack-sync`, `std/llm-step/src/stack_sync.rs`): it reads
+the remote and mints merge commits in the conversation's store, then moves
+the stack's gitlinks in one append. It pushes nothing.
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={
+  "stack": "sources/repo",
+  "branch-prefix": "malcolm/",       # the same value stack-publish is given
+  "remove-merged": "true",          # optional: drop layers whose PR merged
+  "dry-run": "true"})               # optional: report, change nothing
+```
+
+Bottom to top:
+
+1. **The trunk.** Its head T is read (`ls-remote`). If `00-base` is not T, T
+   is imported and becomes `00-base`; `00-base.source.json` gets the new commit
+   and observation time.
+2. **Each layer**, in name order. A described layer has a branch; its remote
+   head R is read.
+   - R absent: not published yet. R equal to the layer's tip: in sync. R an
+     ancestor of the tip: local edits are ahead, and publishing will
+     fast-forward. Nothing to do in any of these.
+   - Otherwise the branch was rewritten or pushed to. R is imported. If the
+     tip, or a first-parent ancestor of it, has R's exact tree, R is a rewrite
+     of that commit (GitHub's rebase after a merge, when the trunk did not
+     move otherwise): it is adopted. With no local edits the layer simply
+     becomes R; with edits, a merge from that ancestor puts the edits on top
+     of R, with parents [tip, R], so the layer now descends from R. If no
+     ancestor has R's tree (the trunk moved too, so the rebased tree carries
+     other changes, or someone pushed real changes), the layer and R are
+     merged from their common ancestor. Identical changes on both sides merge
+     cleanly, which is what a rebase plus a moved trunk produces; a real
+     conflict stops the sync here (below).
+   - A layer whose PR is merged is reported, and with `remove-merged=true`
+     removed with its `.pr.md`. Left in place it is harmless: the trunk holds
+     its content, and restacking it merges the same changes.
+   - **Restack.** If the layer does not contain the layer below it (or the new
+     `00-base`), the one below is merged in from their common ancestor. The
+     undescribed layers on top (`99-dirty`) are restacked too.
+3. **Apply.** Every minted commit is pushed to the server's store, then the
+   gitlinks (and the provenance file, and any removals) change in the same
+   append that completes the call, so a sync is all or nothing.
+
+A conflict, in an adoption, a remote merge or a restack, stops the sync at
+that layer. The layers below it are applied; the ones above are not touched.
+The report names the `caos-std/merge` call that reproduces the merge with a
+conflict ledger (`merge` takes a full commit hash, and the remote head is
+imported by then), so the agent resolves it and runs `stack-sync` again.
+
+After a sync every layer descends from its branch's remote head, so
+`stack-publish` pushes fast-forwards, and the PRs' diffs are right: a layer
+above a merged one contains the squash commit through the adopted rebase, so
+its merge base with the trunk is that commit, not the old trunk.
+
+`stack-sync` needs no pin. It writes nothing remote, and its one conversation
+write is the completing append; an attempt that dies before it leaves
+unreferenced commits in the store and nothing else, and the next attempt
+recomputes everything.
+
 ## `move-sed`: renaming a layer and its description together
 
 `copy`, `move` and `remove` act on one path, and a layer is two: the gitlink
