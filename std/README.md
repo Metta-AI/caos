@@ -120,7 +120,7 @@ test suite exercises them.
 
 | entry | one line |
 |---|---|
-| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
+| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. Not the default for a new worker: that is `go`, below. Bash remains for the interpreters' own `/worker` scripts and for glue that only sequences other programs. |
 | `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. A script imports `caos/w`: an error policy (`Main`, `Check`, `Must`, `True`) and the worker CLI (`Caos`, `Get`, `Read`, `Put`, `Hash`, `Exists`), so a script does not define its own. |
 | `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry, no network. |
 | `rustc` | The worker factory that turns a Rust project into a runnable worker; part of the seeded core. |
