@@ -70,7 +70,7 @@ up:
 
 ```sh
 rm -rf mystack/00-base
-cp -a imports/repo/main-H2 mystack/00-base
+cp -a mystack/00-base-2 mystack/00-base   # the fresh import of the new tip
 ```
 
 ```text
