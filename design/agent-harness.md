@@ -173,10 +173,13 @@ Tool classes:
 - **Compute tools** (bash, build, test, search): run-then sub-runs. Input
   includes the source tree **with `.caos/` stripped** — tools never see
   transcripts, and tool cache keys stay identical to real source trees.
-  No network in tool images; only the llm-step image has egress. (Not yet
-  enforced: both workers currently run as `curry(runner, bin)` in the shared
-  runner pool, whose containers all sit on the compute network — a per-image
-  egress fence is future work.)
+  Tool images have the network, as every worker does: a container is launched
+  on the compute network, reaches the server over HTTP, and nothing fences
+  egress per image. (An earlier draft of this bullet said "no network in tool
+  images; only llm-step has egress" and called the fence future work. The
+  fence was never built, but the sentence kept being quoted as a fact about
+  workers. Where a worker is offline, as `std/cargo` is, that is the build's
+  own choice: `AGENTS.md`, "Workers".)
 
 **The whole tree is never materialized — by any tool, ever.** No FUSE, no
 "fetch everything" escape hatch. Every tool is either *bounded* or
