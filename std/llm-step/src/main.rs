@@ -3457,7 +3457,7 @@ fn record_failure(
         if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
             return Ok(());
         }
-        let round = round_state(&state.conversation()?, &record)?;
+        let round = working_round(cfg, &state.conversation()?, &record)?;
         if let Some(call) = round.pending.first() {
             let text = format!("the request stopped before this tool completed: {error}");
             let block = error_block(&call.id, &text);
