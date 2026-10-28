@@ -6,7 +6,6 @@ mod import_source;
 mod progress;
 mod publish_source;
 mod record;
-mod settle;
 mod source_trees;
 mod subagents;
 mod timing;
