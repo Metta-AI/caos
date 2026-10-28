@@ -189,7 +189,7 @@ fn read_stack(view: &Conversation<'_>, dir: &str) -> Result<Stack, String> {
     let mut undescribed: Option<&str> = None;
     for layer in &layers {
         match (&layer.description, undescribed) {
-            (None, _) => undescribed = Some(&layer.name),
+            (None, _) => undescribed = Some(layer.name.as_str()),
             (Some(_), Some(below)) => {
                 return Err(format!(
                     "{dir}/{} has a description but {dir}/{below} below it has none, so its PR would have no branch to target. Write {dir}/{below}.pr.md, or take {below} out of the stack.",
