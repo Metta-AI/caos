@@ -89,6 +89,17 @@ struct Config {
     /// The declaration is idempotent, so the run that follows finds the call
     /// declared and goes on to run it.
     declare_only: bool,
+    /// With `tools_only`: the round of the request that declares the call, once
+    /// `declare_requested_call` has found or made the declaration.
+    ///
+    /// A step that drives the model works on the request's LATEST round: it
+    /// finishes a round before opening the next. A harness that drives the model
+    /// itself (Claude Code, through `caos mcp`) does not. `start` declares a call
+    /// and answers at once, and the model's next call declares on the round
+    /// after, while the started one has yet to run or finish. So a tools-only run
+    /// drives, completes and reads back ITS call on the round that declared it,
+    /// whatever the latest round has since become.
+    tool_round: Option<u64>,
     /// With `tools_only`: a completed call whose text is longer than this many
     /// characters is also saved in the conversation, and the run's result says
     /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
