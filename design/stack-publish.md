@@ -1,4 +1,4 @@
-# Publishing a stack in one call: `stack-publish`, and `move-sed`
+# Publishing a stack in one call: `stack-publish`, `stack-sync` and `move-sed`
 
 A stack (stacks.md) is a folder of sibling gitlinks, `sources/<repo>/`, with
 the upstream tip at `00-base` and one layer per `NN-<name>`. Getting it onto
