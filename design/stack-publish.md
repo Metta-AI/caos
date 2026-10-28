@@ -1,4 +1,4 @@
-# Publishing a stack in one call: `publish-stack`, and `move-sed`
+# Publishing a stack in one call: `stack-publish`, `stack-sync` and `move-sed`
 
 A stack (stacks.md) is a folder of sibling gitlinks, `sources/<repo>/`, with
 the upstream tip at `00-base` and one layer per `NN-<name>`. Getting it onto
@@ -8,14 +8,14 @@ link the PRs as a stack. Measured on a two-layer stack, that was nine ordered
 tool calls for the first publish and five to seven for every republish, each
 PR response around 20 KB of JSON, and three traps along the way: `force`
 forgotten, a duplicate PR opened because the lookup was skipped, and GitHub's
-refusal to retarget a PR that is already in a stack. `publish-stack` is that
+refusal to retarget a PR that is already in a stack. `stack-publish` is that
 recipe as one operation. `move-sed` is the renaming tool that keeps a layer
 and its description together when the stack changes shape.
 
 ## No squashing
 
 Branches are merged into the trunk by squashing, so the commits inside a
-branch never reach it: only the branch's net diff does. `publish-stack`
+branch never reach it: only the branch's net diff does. `stack-publish`
 therefore pushes each layer's gitlink exactly as it is, merge commits and
 "Edit source tree" commits included. Two things follow:
 
@@ -75,14 +75,14 @@ which is the squashing this design does without.
 
 ## The operation
 
-`publish-stack` is an operation of the step (`@op`, SPEC "CaosTools"), like
+`stack-publish` is an operation of the step (`@op`, SPEC "CaosTools"), like
 `publish-source`, and for the same reason: a publication is pinned in the
 conversation before any remote write (agent-publish.md), and only the step
-writes conversation records. Its entry is `std/publish-stack`, reached as
-`caos-std/publish-stack`; the work is `std/llm-step/src/publish_stack.rs`.
+writes conversation records. Its entry is `std/stack-publish`, reached as
+`caos-std/stack-publish`; the work is `std/llm-step/src/stack_publish.rs`.
 
 ```text
-run_tool(path="caos-std/publish-stack", arguments={
+run_tool(path="caos-std/stack-publish", arguments={
   "stack": "sources/repo",           # the stack directory
   "branch-prefix": "malcolm/",      # optional
   "repository": "https://...",      # optional: default from 00-base.source.json
@@ -162,7 +162,7 @@ preview and may change; everything about it is in one place, the stack step.
 
 ### Resuming
 
-A started call carries its pin (`publish-stack.json` in the call's payload
+A started call carries its pin (`stack-publish.json` in the call's payload
 directory: the stack's layers, branches and the publication ids, in order).
 A resumed attempt re-reads the publications: a Pending one is pushed exactly
 as pinned, a terminal one is not sent again. The GitHub steps are repeated
@@ -181,6 +181,75 @@ pushes and the report costs a few reads.
 - Publish to a remote it cannot lease on. The pushes have the same guards as
   `publish-source`: fast-forward unless `force`, `.gitignore` check unless
   `allow-ignored`, a `.caos/conflicts` ledger is the agent's to clear first.
+
+## `stack-sync`: bringing the stack up to date with the remote
+
+Merging a stacked PR is not the end of the stack's life, it is the common
+case: GitHub squash-merges the bottom PR onto the trunk and REWRITES every
+branch above it, rebasing each onto the new trunk and retargeting the next PR.
+The conversation's layers still hold the old history, so the next
+`stack-publish` would be a non-fast-forward at every layer, and forcing it
+would undo GitHub's rebase and show the merged layer's changes again in the PR
+above. Something has to bring the conversation up to date first. `stack-sync`
+is that, the way `gt sync` is for a Graphite checkout. It is an operation of
+the step too (`std/stack-sync`, `std/llm-step/src/stack_sync.rs`): it reads
+the remote and mints merge commits in the conversation's store, then moves
+the stack's gitlinks in one append. It pushes nothing.
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={
+  "stack": "sources/repo",
+  "branch-prefix": "malcolm/",       # the same value stack-publish is given
+  "remove-merged": "true",          # optional: drop layers whose PR merged
+  "dry-run": "true"})               # optional: report, change nothing
+```
+
+Bottom to top:
+
+1. **The trunk.** Its head T is read (`ls-remote`). If `00-base` is not T, T
+   is imported and becomes `00-base`; `00-base.source.json` gets the new commit
+   and observation time.
+2. **Each layer**, in name order. A described layer has a branch; its remote
+   head R is read.
+   - R absent: not published yet. R equal to the layer's tip: in sync. R an
+     ancestor of the tip: local edits are ahead, and publishing will
+     fast-forward. Nothing to do in any of these.
+   - Otherwise the branch was rewritten or pushed to. R is imported. If the
+     tip, or a first-parent ancestor of it, has R's exact tree, R is a rewrite
+     of that commit (GitHub's rebase after a merge, when the trunk did not
+     move otherwise): it is adopted. With no local edits the layer simply
+     becomes R; with edits, a merge from that ancestor puts the edits on top
+     of R, with parents [tip, R], so the layer now descends from R. If no
+     ancestor has R's tree (the trunk moved too, so the rebased tree carries
+     other changes, or someone pushed real changes), the layer and R are
+     merged from their common ancestor. Identical changes on both sides merge
+     cleanly, which is what a rebase plus a moved trunk produces; a real
+     conflict stops the sync here (below).
+   - A layer whose PR is merged is reported, and with `remove-merged=true`
+     removed with its `.pr.md`. Left in place it is harmless: the trunk holds
+     its content, and restacking it merges the same changes.
+   - **Restack.** If the layer does not contain the layer below it (or the new
+     `00-base`), the one below is merged in from their common ancestor. The
+     undescribed layers on top (`99-dirty`) are restacked too.
+3. **Apply.** Every minted commit is pushed to the server's store, then the
+   gitlinks (and the provenance file, and any removals) change in the same
+   append that completes the call, so a sync is all or nothing.
+
+A conflict, in an adoption, a remote merge or a restack, stops the sync at
+that layer. The layers below it are applied; the ones above are not touched.
+The report names the `caos-std/merge` call that reproduces the merge with a
+conflict ledger (`merge` takes a full commit hash, and the remote head is
+imported by then), so the agent resolves it and runs `stack-sync` again.
+
+After a sync every layer descends from its branch's remote head, so
+`stack-publish` pushes fast-forwards, and the PRs' diffs are right: a layer
+above a merged one contains the squash commit through the adopted rebase, so
+its merge base with the trunk is that commit, not the old trunk.
+
+`stack-sync` needs no pin. It writes nothing remote, and its one conversation
+write is the completing append; an attempt that dies before it leaves
+unreferenced commits in the store and nothing else, and the next attempt
+recomputes everything.
 
 ## `move-sed`: renaming a layer and its description together
 
@@ -222,9 +291,9 @@ layers is one call per layer; stacks are short.
 
 ## Tests
 
-- `tests/publish-stack`: llm-step's real tool loop with a scripted model,
+- `tests/stack-publish`: llm-step's real tool loop with a scripted model,
   the shape of `tests/chat-squash-publish`. It builds a stack with
-  descriptions in a conversation and calls `caos-std/publish-stack` against
+  descriptions in a conversation and calls `caos-std/stack-publish` against
   a `.invalid` repository, so no push happens: the call must get through
   every check and stop at reading the remote; a stack with a described layer
   above an undescribed one, and one whose upper layer lacks the lower, must
@@ -232,7 +301,7 @@ layers is one call per layer; stacks are short.
 - `tests/move-sed`: a worker test over a fixture conversation, the shape of
   `tests/create-squashed-stack`: a success is checked by the exact tree it
   proposes, a refusal by an unchanged proposal and its message.
-- Unit tests in `publish_stack.rs` for the pure parts: reading a stack
+- Unit tests in `stack_publish.rs` for the pure parts: reading a stack
   directory, parsing a description, branch names, the GitHub stack
   reconciliation decision.
 

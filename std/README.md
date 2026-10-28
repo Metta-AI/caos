@@ -35,9 +35,10 @@ path prints its parameters, which is the description this table abbreviates.
 | `agent-wait` | Wait for one child agent to report a terminal checkpoint, by joining its durable relay. |
 | `agent-harvest` | Apply a terminal child's content changes to the conversation, with the same atomic reconciliation as the file tools. |
 | `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
-| `publish-stack` | Publish a stack directory in one call: push every described layer (`NN-<name>.pr.md` beside the gitlink) as a branch named without its number, find or open the chained PRs, and link them as a GitHub stack. No squashing. |
+| `stack-publish` | Publish a stack directory in one call: push every described layer (`NN-<name>.pr.md` beside the gitlink) as a branch named without its number, find or open the chained PRs, and link them as a GitHub stack. No squashing. |
+| `stack-sync` | Bring a stack directory up to date with its remote, as `gt sync` does, without pushing: the trunk's head becomes `00-base`, a branch GitHub rewrote is adopted under the layer's edits, foreign pushes are merged in, every layer is restacked onto the one below, and merged layers are reported. Then `stack-publish` fast-forwards. |
 | `move-sed` | Rename the entries of one conversation directory by regular expression, in one proposal: a layer and its `.pr.md` move together. |
-| `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. Not part of the publishing flow (`publish-stack` pushes layers as they are). |
+| `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. Not part of the publishing flow (`stack-publish` pushes layers as they are). |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
 | `flake-update` | Re-lock a flake by running `nix flake update` in a worker: every input, one input, or one input pinned to a commit. Takes a tree holding flake.nix and flake.lock; returns the new flake.lock. |
 

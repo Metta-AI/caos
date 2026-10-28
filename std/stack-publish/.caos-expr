@@ -1,4 +1,4 @@
-# std/publish-stack (design/publish-stack.md): an entry for an OPERATION OF THE
+# std/stack-publish (design/stack-publish.md): an entry for an OPERATION OF THE
 # STEP. `@op` says llm-step does the work in process (it owns the call's
 # lifecycle: it pins one publication per layer before anything is pushed, then
 # records each outcome), so this entry exists to give the operation a path, a
@@ -14,6 +14,6 @@ Publish a stack directory (std/GIT.md, "Stacks") as branches and chained pull re
 @param [link] false to leave the PRs unlinked (chained bases only). Default true: linked as a GitHub stack, so merging the top merges the stack.
 @param [draft] true to open new PRs as drafts.
 @param [dry-run] true to report the layers, branches, PR titles and bases without observing or changing anything.
-@op publish-stack
+@op stack-publish
 END
 curry --base:@=DEEP-DEPS/llm-step --help=$HELP
