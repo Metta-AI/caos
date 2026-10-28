@@ -1172,7 +1172,7 @@ fn declare_requested_call(
     call: &str,
     name: &str,
     arguments: &Value,
-) -> Result<(Oid, Oid), String> {
+) -> Result<(Oid, Oid, u64), String> {
     loop {
         let view = state.conversation()?;
         let record = view.active_turn()?.ok_or_else(|| {
