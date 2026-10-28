@@ -5,6 +5,7 @@ mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod publish_stack;
 mod record;
 mod settle;
 mod source_trees;
