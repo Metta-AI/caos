@@ -2,4 +2,4 @@
 # `<path> <name>`; see tests/rgrep/DEPS for what deep-deps does with these).
 ../../std/flake-update flake-update
 # The image this worker test runs in: a dependency, not a harness.
-../../std/bash bash
+../../std/go go
