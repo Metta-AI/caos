@@ -49,7 +49,7 @@ what each one does about that.
 ### Git advice: [GIT.md](GIT.md)
 
 For anything involving git or GitHub — importing a repo, merging, stacks,
-squashing, `publish_source`, opening and linking PRs with `github` — read
+publishing a stack with `publish-stack`, `publish_source`, PRs and `github` — read
 [`GIT.md`](GIT.md) first.
 
 ### Before you reach for the shell
