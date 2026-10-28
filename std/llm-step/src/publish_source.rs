@@ -236,7 +236,7 @@ pub(super) fn send(
                     Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
                     None,
                 ),
-                _ => recovered(&pending, observe()),
+                _ => recovered(pending, observe()),
             },
         }
     };
