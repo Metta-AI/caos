@@ -13,7 +13,7 @@ tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
 records a child commit automatically: there is no staging and no commit step.
 `log`, `show` and `diff` are how you see history, because there is no `git` in
-the shell. Getting a stack out is one call, `caos-std/publish-stack`: it
+the shell. Getting a stack out is one call, `caos-std/stack-publish`: it
 pushes each layer's branch, opens or updates the chained PRs from the `.pr.md`
 beside each layer, and links them as a GitHub stack. Under it, `publish_source`
 pushes one commit to a branch, and `caos-std/github` is one GitHub API call,
@@ -28,7 +28,8 @@ for what the operation does not do (read and answer comments, anything else).
 | change files | `write`, `edit` |
 | see history and changes | `log`, `show`, `diff` |
 | merge another commit into a source tree | `caos-std/merge` |
-| publish a stack: push every layer, open or update its PRs, link them | `caos-std/publish-stack` |
+| publish a stack: push every layer, open or update its PRs, link them | `caos-std/stack-publish` |
+| bring a stack up to date with its remote before republishing | `caos-std/stack-sync` |
 | rename a layer and its `.pr.md` together | `caos-std/move-sed` |
 | push one commit to a GitHub branch | `publish_source` |
 | read and answer PR comments, anything else on GitHub | `caos-std/github` |
@@ -90,7 +91,7 @@ copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
 move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
 write(file-path="sources/<repo>/01-<name>.pr.md",
       content="<PR title>\n\n<PR body>\n")
-run_tool(path="caos-std/publish-stack", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
 
 The last call pushes `01-<name>` to the branch `<name>` (give `branch-prefix`
@@ -210,8 +211,23 @@ sources/repo/02-tests    -> B2  parents B, A2
 
 ### Updating the base
 
-Import the new upstream tip at a fresh path, put it at `00-base`, and merge it
-into the first layer, then each layer into the one after it:
+`caos-std/stack-sync` does all of this in one call, against the remote, and
+more: it reads the trunk's head and every published layer's branch, puts the
+trunk's head at `00-base`, adopts a branch GitHub rewrote with the same
+content (merging a stacked PR rebases the branches above it) under the layer's
+local edits, merges in a branch someone else pushed to, restacks each layer
+onto the one below, and reports a layer whose PR was merged (removing it with
+`remove-merged=true`). It pushes nothing: run `stack-publish` after it, and
+every push is a fast-forward. A merge conflict stops it at that layer and names
+the `merge` call that gives you a ledger to resolve.
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/repo"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/repo"})
+```
+
+By hand: import the new upstream tip at a fresh path, put it at `00-base`, and
+merge it into the first layer, then each layer into the one after it:
 
 ```text
 import_source(source=..., revision="main", into="sources/repo/00-base-2")
@@ -284,10 +300,10 @@ commits on a branch never reach the trunk: only its net diff does, and the
 history inside a branch does not matter. Do not spend effort tidying it, and
 never re-publish a branch just to clean its commits.
 
-### One call: `caos-std/publish-stack`
+### One call: `caos-std/stack-publish`
 
 ```text
-run_tool(path="caos-std/publish-stack", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
 
 For every layer that has a `.pr.md` beside it, earliest first, it pushes the
@@ -453,7 +469,7 @@ reach usually means the grant is missing.
   `caos-std/move-sed`.
 - `move-sed`'s `replacement` is Go's `$1` / `${name}`. Sed's `\1` is refused,
   because Go would write it into the name literally.
-- `publish-stack` publishes only layers with a `.pr.md` beside them, and
+- `stack-publish` publishes only layers with a `.pr.md` beside them, and
   refuses a described layer above an undescribed one. `99-dirty` has none.
 - A `caos-std/github` response for one PR is a full PR object, around 20 KB
   with the repository embedded twice, and a response is cut at 100 KB. List
@@ -472,7 +488,7 @@ reach usually means the grant is missing.
 ## Further reading (design docs in the caos repo)
 
 - `design/stacks.md` – the stack model and the full operation walk-through.
-- `design/publish-stack.md` – `publish-stack` and `move-sed`: the stack
+- `design/stack-publish.md` – `stack-publish` and `move-sed`: the stack
   directory as the specification, pins, GitHub stacks, resuming.
 - `design/agent-publish.md` – `publish_source`: leases, `force`, `.gitignore`
   rejection, uncertain results.
