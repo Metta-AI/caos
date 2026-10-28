@@ -779,11 +779,7 @@ pub(super) fn plan_stack(prs: &[(u64, Option<StackRef>)]) -> StackPlan {
 }
 
 /// Link the PRs as a GitHub stack, or bring the one they are in up to date.
-fn link_stack(
-    github: &Github,
-    plan: &Plan,
-    prs: &[(u64, Option<StackRef>, Option<String>)],
-) -> Result<String, String> {
+fn link_stack(github: &Github, plan: &Plan, prs: &[PrState]) -> Result<String, String> {
     let numbers: Vec<u64> = prs.iter().map(|(number, _, _)| *number).collect();
     let deferred: Vec<(u64, String)> = prs
         .iter()
