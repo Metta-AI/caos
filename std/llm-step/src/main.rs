@@ -688,6 +688,8 @@ fn close_pending_call(
     Ok(())
 }
 
+/// The request's LATEST round: the one a step that drives the model works on,
+/// since it finishes a round before it opens the next.
 fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundState, String> {
     if record.round == 0 {
         if !record.calls.is_empty() {
@@ -699,7 +701,37 @@ fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundStat
             pending: Vec::new(),
         });
     }
-    let declaring_round = record.round - 1;
+    round_state_at(view, record, record.round - 1)
+}
+
+/// The round a tools-only run works on: the one that declares its call
+/// (`Config::tool_round`), or the latest while none has been found.
+fn working_round(
+    cfg: &Config,
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+) -> Result<RoundState, String> {
+    match cfg.tool_round {
+        Some(round) => round_state_at(view, record, round),
+        None => round_state(view, record),
+    }
+}
+
+/// One round of a request: the calls its assistant declaration made, and which
+/// of them have not finished. Any round the request has had, not only the
+/// latest: a call `start` declared is run and read back on its own round after
+/// the harness's next call has opened another (`Config::tool_round`).
+fn round_state_at(
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+    declaring_round: u64,
+) -> Result<RoundState, String> {
+    if declaring_round >= record.round {
+        return Err(format!(
+            "request {} has no round {declaring_round}: it has declared {} round(s)",
+            record.id, record.round
+        ));
+    }
     let mut declaration = None;
     for ordinal in (0..view.transcript_len()?).rev() {
         let (_, entry) = view
