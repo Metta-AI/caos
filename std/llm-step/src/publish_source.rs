@@ -240,7 +240,7 @@ pub(super) fn send(
             },
         }
     };
-    finish(state, site, &pending, Some(outcome))
+    Ok(outcome)
 }
 
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {
