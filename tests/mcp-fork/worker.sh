@@ -90,9 +90,14 @@ g="resume-g-$stamp"
 prompt "$g" "/fork-caos-conversation $head_b" >/dev/null
 head_g=$(head_of "cc/$g")
 [ -n "$head_g" ] || fail "an open head could not be forked"
+# No settle: the fork lands straight on the open head, whose newest commit is
+# b's own request.claim. (It used to insert a request.terminal before forking.)
 case "$(subjects "$head_g")" in
-  *"conversation.fork request.terminal "*) ;;
-  *) fail "the open request was not closed before the fork: $(subjects "$head_g")" ;;
+  *"conversation.fork request.claim "*) ;;
+  *) fail "the fork did not land directly on the open head: $(subjects "$head_g")" ;;
+esac
+case "$(subjects "$head_g")" in
+  *request.terminal*) fail "forking an open head should not settle it: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
 
