@@ -43,21 +43,32 @@ separate `imports/` directory.
 
 ```text
 sources/<repo>/
-  00-base           the upstream tip you build on, exactly as imported
-  01-<layer1>       the first layer of work
-  02-<layer2>       the next layer, built on the one before it
-  99-dirty          scratch layer: the changes you would not have committed yet
+  00-base               the upstream tip you build on, exactly as imported
+  00-base.source.json   where it came from: the repository and the branch
+  01-<layer1>           the first layer of work
+  01-<layer1>.pr.md     its PR: title on the first line, body after it
+  02-<layer2>           the next layer, built on the one before it
+  02-<layer2>.pr.md
+  99-dirty              scratch layer: the changes you would not have committed yet
 ```
 
 - **`00-base`** is imported, never edited. It is the record of where you started
   and what later diffs and merges are measured against. It is not a layer: it
-  is what the first layer builds on (`onto` in a squash plan).
+  is what the first layer builds on, and the first layer's PR targets the
+  trunk, which `00-base.source.json` names.
 - **`NN-<name>`** are the layers, in order. The order comes from the names, and
-  gaps are fine (`01`, `02`, `04`).
+  gaps are fine (`01`, `02`, `04`). The name without its number is the layer's
+  branch, so renumbering a layer keeps its branch and its PR.
+- **`NN-<name>.pr.md`** beside a layer is its pull request: the first line is
+  the title (a leading `# ` is dropped), the rest the body. A layer with one
+  is published; a layer without one is not, and a described layer may not sit
+  above an undescribed one.
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
-  history grow. When the work in it is a finished chunk, `move` it to the next
-  layer name (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
-  then `copy` that layer to a fresh `99-dirty` to carry on.
+  history grow. It has no `.pr.md`, so it is never published. When the work in
+  it is a finished chunk, `move` it to the next layer name
+  (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
+  write `sources/<repo>/02-<name>.pr.md`, then `copy` that layer to a fresh
+  `99-dirty` to carry on.
 - **Make a new layer only where you would normally start a new layer of a
   stack**: per big chunk of work, a unit a reviewer would want as its own PR.
   Not per commit and not per edit; the history inside a layer already records
