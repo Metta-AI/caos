@@ -1,8 +1,8 @@
-# tests/publish-stack, as an ENTRY: evaluating this directory yields the test's
+# tests/stack-publish, as an ENTRY: evaluating this directory yields the test's
 # ARG TREE, which dev/run-test then runs.
 #
-# A WORKER TEST: design/publish-stack.md's operation, run through llm-step's
+# A WORKER TEST: design/stack-publish.md's operation, run through llm-step's
 # real tool loop with a scripted model. It runs on std/go, which std/caos-test
 # grants the mock model key, so this test's ArgTree carries the `secret-hash`
 # llm-step's admission names.
-curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --bash-tool:@=DEEP-DEPS/bash-tool --publish-stack:@=DEEP-DEPS/publish-stack --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool
+curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --bash-tool:@=DEEP-DEPS/bash-tool --stack-publish:@=DEEP-DEPS/stack-publish --llm-step:@=DEEP-DEPS/llm-step --stub:@=DEEP-DEPS/llm-stub --tool:@=DEEP-DEPS/llm-test-tool
