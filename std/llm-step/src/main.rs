@@ -181,6 +181,7 @@ impl Config {
             tools_only,
             tool_call,
             declare_only,
+            tool_round: None,
             max_result_chars,
             record,
             list_tools,
