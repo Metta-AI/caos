@@ -642,6 +642,10 @@ fn normalize(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
 }
 
+/// A layer's PR after `pull_requests`: its number, the GitHub stack it is in,
+/// and the base branch it still needs, when a stack membership deferred that.
+type PrState = (u64, Option<StackRef>, Option<String>);
+
 /// Find or open each layer's PR, bottom to top, and bring its text and base in
 /// line with the plan. A base change for a PR that is in a GitHub stack is
 /// deferred to the stack step, which has to unstack it first. Appends each
@@ -650,7 +654,7 @@ fn pull_requests(
     github: &Github,
     plan: &Plan,
     lines: &mut [String],
-) -> Result<Vec<(u64, Option<StackRef>, Option<String>)>, String> {
+) -> Result<Vec<PrState>, String> {
     let mut out = Vec::new();
     for (i, layer) in plan.layers.iter().enumerate() {
         let found = github.expect(
