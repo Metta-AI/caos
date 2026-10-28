@@ -512,13 +512,14 @@ fn resume(
 /// race, or that named a call from another round, would otherwise be handed a
 /// result with nothing of its own in it.
 fn require_completed_call(
+    cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
     call: &str,
 ) -> Result<(), String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round = round_state(&view, &record)?.declaring_round;
+    let round = working_round(cfg, &view, &record)?.declaring_round;
     match view.tool(request, round, call)? {
         Some(tool) if tool.is_terminal() => Ok(()),
         Some(tool) => Err(format!(
