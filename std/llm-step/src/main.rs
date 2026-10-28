@@ -1222,7 +1222,7 @@ fn forward_tool_result(
 ) -> Result<(), String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round = round_state(&view, &record)?.declaring_round;
+    let round = working_round(cfg, &view, &record)?.declaring_round;
     let tool = view
         .tool(request, round, call)?
         .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
