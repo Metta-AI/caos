@@ -242,44 +242,9 @@ that as it is works (`publish_source` takes any gitlink). **Branches are
 always merged by squashing**, so the commits on a branch never reach the
 trunk: only its net diff does, and the history inside a branch does not
 matter. Do not spend effort tidying it, and never re-publish a branch just to
-clean its commits. Squashing first is still the usual choice for a stack,
-because it gives each layer one clean commit and linear history, so a reviewer
-sees one diff per layer.
+clean its commits.
 
-### 1. Squash (optional but usual for a stack)
-
-Write a plan file, one `key=value` per line. `onto` and `into` come once,
-before the first `layer=`:
-
-```text
-onto=sources/repo/00-base
-into=publish/repo
-layer=01-feature
-commit=sources/repo/01-feature
-message=Add the feature
-message=
-message=Why, in a body.
-layer=02-tests
-commit=sources/repo/02-tests
-message=Test the feature
-```
-
-```text
-run_tool(path="caos-std/create-squashed-stack",
-         arguments={"plan": "repo.plan", "in": "<tree to run over>"})
-```
-
-`onto` and each `commit` are a conversation path to a gitlink or a full commit
-hash. Each `layer=` block becomes `<into>/<layer>`; its `message=` lines, in
-order, are the commit message. Each squashed commit takes the tree of its
-`commit`, the parent of the previous squashed commit (or `onto`), and the
-author and committer of the original. The same plan mints the same commits, so
-republishing an unchanged stack pushes nothing new. It refuses a layer that
-does not contain the one before it (or `onto`): merge first. Pass `in` if the
-tool's own source tree is not the one you mean (the default is the tree the
-tool sits in).
-
-### 2. Push, earliest layer first
+### 1. Push, earliest layer first
 
 ```text
 publish_source(source_tree="publish/repo/01-feature",
@@ -289,10 +254,6 @@ publish_source(source_tree="publish/repo/02-tests", ...,
                branch="repo-02-tests", force=true)
 ```
 
-- A squashed commit does not descend from the one it replaces, so updating a
-  published stack always needs `force=true`. The push is still leased on the
-  exact remote head observed when the call starts: it can replace history you
-  have seen, never a change someone else pushed.
 - Without `force`, only creates and fast-forwards succeed. An unsquashed layer,
   or a follow-up commit on a branch you already published, is a fast-forward.
 - `publish_source` creates no PR and does not change the source gitlink.
@@ -312,7 +273,7 @@ publish_source(source_tree="publish/repo/02-tests", ...,
 If a push comes back as uncertain or as a lease conflict, read the remote
 branch before retrying (see "Recovering").
 
-### 3. Open a PR per layer and link them
+### 2. Open a PR per layer and link them
 
 `caos-std/github` is one GitHub API call: `method`, `path` under
 `https://api.github.com`, and optional JSON `body`. Every value is a string.
