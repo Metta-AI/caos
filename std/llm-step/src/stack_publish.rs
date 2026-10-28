@@ -210,7 +210,7 @@ pub(super) struct Provenance {
     pub default_branch: Option<String>,
 }
 
-fn provenance(view: &Conversation<'_>, dir: &str) -> Result<Provenance, String> {
+pub(super) fn provenance(view: &Conversation<'_>, dir: &str) -> Result<Provenance, String> {
     let path = format!("{dir}/00-base.source.json");
     let Some(bytes) = view.snapshot().read(&path)? else {
         return Ok(Provenance::default());
