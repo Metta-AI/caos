@@ -79,7 +79,7 @@ which is the squashing this design does without.
 `publish-source`, and for the same reason: a publication is pinned in the
 conversation before any remote write (agent-publish.md), and only the step
 writes conversation records. Its entry is `std/stack-publish`, reached as
-`caos-std/stack-publish`; the work is `std/llm-step/src/publish_stack.rs`.
+`caos-std/stack-publish`; the work is `std/llm-step/src/stack_publish.rs`.
 
 ```text
 run_tool(path="caos-std/stack-publish", arguments={
@@ -232,7 +232,7 @@ layers is one call per layer; stacks are short.
 - `tests/move-sed`: a worker test over a fixture conversation, the shape of
   `tests/create-squashed-stack`: a success is checked by the exact tree it
   proposes, a refusal by an unchanged proposal and its message.
-- Unit tests in `publish_stack.rs` for the pure parts: reading a stack
+- Unit tests in `stack_publish.rs` for the pure parts: reading a stack
   directory, parsing a description, branch names, the GitHub stack
   reconciliation decision.
 
