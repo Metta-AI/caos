@@ -4,4 +4,4 @@
 ../../std/bash-tool bash-tool
 ../../std/llm-stub llm-stub
 ../../std/llm-test-tool llm-test-tool
-../../std/publish-stack publish-stack
+../../std/stack-publish stack-publish
