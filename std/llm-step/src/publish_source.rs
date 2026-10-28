@@ -24,7 +24,9 @@ struct Parameters {
 
 /// A boolean as a JSON boolean or as the string a tool's arguments are: through
 /// `run_tool` every argument is a string, and `force` is declared like the rest.
-fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+pub(super) fn bool_or_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
     use serde::de::Error;
     match <Value as serde::Deserialize>::deserialize(deserializer)? {
         Value::Bool(value) => Ok(value),
