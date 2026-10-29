@@ -23,6 +23,13 @@ The llm-import entry exercises agent-driven importing in an empty conversation,
 including provenance, readable history, occupied destinations, and invalid
 sources. Pinning and replay are also covered by llm-step's unit tests.
 
+# Writing a test
+
+A new test is a Go worker: `worker.go` curried onto `DEEP-DEPS/go`, importing
+`caos/w`, staged with `curry` + `run-then` as `tests/create-squashed-stack` and
+`tests/flake-update` are. The `worker.sh` tests predate `std/go`; do not copy
+them for a new one.
+
 # Disabling a test
 
 Disable a test by making its worker return early. Do not move or delete it.

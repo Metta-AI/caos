@@ -1,0 +1,17 @@
+# std/flake-update: `nix flake update`, as a tool (see ./worker.go). This
+# directory is a flake (flake.nix + worker.go; the lock and std/go's prelude are
+# DEPped), so its image is the flake-builder applied to it, named by a LOCAL
+# deep-deps mount as std/bash does. THE HELP IS BOUND HERE, so the tool
+# describes itself.
+#
+# Why a tool at all: a session has no nix, and the hashes a flake.lock carries
+# (narHash, lastModified) are nix's to compute. Without this, an agent moving a
+# pin either hand-edits the lock wrong or reimplements nix's locking.
+HELP=<<END
+Re-lock a flake the way `nix flake update` does, by running nix, and return the new flake.lock as a blob. `in` is a tree (a source tree will do) holding flake.nix and, usually, flake.lock; nothing else in it is read. With no other argument every input moves to its current tip. `input` limits the update to that one input. `rev` with `input` pins the input to that commit instead of its tip: the flake reference comes from the input's `original` in flake.lock (a github: or git+ reference), and the lock keeps that original, so the result is what `nix flake update` would have written had the commit been the tip. The result is the lock alone: `write` it over the tree's flake.lock, then update whatever else repeats the pin (a caos client repo's .caos-expr names the same rev twice, and std/flake-input-loader refuses a mismatch). Inputs must be fetchable without credentials.
+@param {string} [input] The one input to update; every other input keeps its lock.
+@param {string} [rev] With `input`: the full commit hash to pin it to.
+@in
+END
+IMAGE=run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
+curry --base=$IMAGE --help=$HELP

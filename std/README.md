@@ -37,6 +37,7 @@ path prints its parameters, which is the description this table abbreviates.
 | `run-async` | Start or inspect an already-built request (an ArgTree hash) in the background; repeating it reads the same durable task. |
 | `create-squashed-stack` | Squash a stack to one commit per layer, as a plan file says, and write them to a folder of gitlinks for publishing. |
 | `github` | Call the GitHub API with the granted token: find, open and update PRs, link a stack. One run is one API call. |
+| `flake-update` | Re-lock a flake by running `nix flake update` in a worker: every input, one input, or one input pinned to a commit. Takes a tree holding flake.nix and flake.lock; returns the new flake.lock. |
 
 A tool's INPUT is the source tree its path lies in, so a tool reached at
 `caos-std/<name>` operates on the conversation's own files. `tool_help` says
@@ -126,7 +127,7 @@ property of the container. A tool that has to fetch something can.
 
 | entry | one line |
 |---|---|
-| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. |
+| `bash` | The script worker: shell plus coreutils, `/worker` runs the `worker1` script curried onto it. Not the default for a new worker: that is `go`, below. Bash remains for the interpreters' own `/worker` scripts and for glue that only sequences other programs. |
 | `go` | The Go script worker: `/worker` `go run`s `worker1` against a primed build cache. A script imports `caos/w`: an error policy (`Main`, `Check`, `Must`, `True`) and the worker CLI (`Caos`, `Get`, `Read`, `Put`, `Hash`, `Exists`), so a script does not define its own. |
 | `cargo` | The cargo worker: pinned toolchain, baked dependencies, vendored registry. It builds `--offline` by choice, so a missing dep fails instead of being fetched; the container has the network. |
 | `rustc` | The worker factory that turns a Rust project into a runnable worker; part of the seeded core. |
