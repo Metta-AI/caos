@@ -1,8 +1,11 @@
 # Promise chains: constant native stack — design note
 
-**Status:** proposed. Nothing here is implemented. The stopgap that is in
-(64 MiB stacks and a self-restarting `caosd`, #370) moves the limit and does not
-remove it.
+**Status:** implemented, in `rust/crates/server/src/compute.rs`
+(`run_work_request`, `run_hop`, `PendingHop`, `Chain`). The 64 MiB thread stacks
+of the stopgap (#370) are dropped with it: request, ticket and map-child threads
+are back on Rust's default 2 MiB, which is what the chain test runs against. The
+self-restarting `caosd` from #370 stays. See "What was built" at the end for
+where the implementation departs from the design below.
 
 Read [map-then.md](map-then.md) first: it defines promises, continuations and
 the `then` step this note changes how the server runs.
@@ -89,7 +92,8 @@ work, and move it from the native stack to a `Vec` on the heap.
 Replace `stack: &[String]` with a persistent parent-pointer list (an `Arc` cons
 list), together with a `HashSet` of the ArgTrees on the chain. Appending a hop is
 O(1), nothing is copied, and the cycle check is a set lookup. The part of the
-walk `park_would_deadlock` needs becomes a walk of the list.
+walk `park_would_deadlock` needs becomes a walk of the list. (Built as segments
+rather than a set per hop; see "What was built".)
 
 ### Alternative: grow the stack on demand
 
@@ -141,5 +145,45 @@ lines, then the abort.
 
 ## Non-goals
 
-- Raising `EVAL_STACK_BYTES` again as the fix.
+- Raising the thread stack again as the fix.
 - A depth limit that fails long sessions, unless the maintainers ask for one.
+
+## What was built
+
+The design above, with these specifics:
+
+- **The loop is `run_work_request` itself.** Every caller still calls it with
+  one ArgTree and gets the chain's result. Inside, `run_hop` does one hop (cache
+  lookup, cycle check, flight claim, dispatch, middle step) and returns either
+  the hop's outcome or `Continue { next, hop }`: the `then` request
+  `resolve_promise` formed and recorded (`status::continuation`), plus a
+  `PendingHop` holding the hop's ArgTree, cache key, flight owner and `caught`
+  flag. `resolve_promise` returns `Resolved::Next` for a `then` and
+  `Resolved::Done` otherwise; it never runs a `then`. When some hop completes,
+  `PendingHop::finish` runs for each pending hop innermost first: cache store
+  (unless that hop caught), `status::ended`, then `FlightOwner::finish_with`,
+  which publishes a top-level result and broadcasts to waiters. Each hop
+  receives the outcome the hop after it produced, so a publication failure
+  propagates exactly as it did through nested frames. A panic drops the
+  `Vec<PendingHop>`, and each owner's `Drop` broadcasts owner loss, as before.
+- **Middle steps still nest natively.** A `run`, `map` child, exact `request`
+  or `eval` dispatch is a nested `run_work_request`, which runs its own loop.
+  Native depth is therefore the nesting of middle steps, which program structure
+  bounds, not the number of turns.
+- **The chain is segmented, not a cons list with a `HashSet` per hop.** No
+  persistent-collection crate is vendored, and a `HashSet` copied per hop is the
+  O(n) the design rules out. Each loop owns one `Segment` (the hops it has run,
+  in order, plus an index), shared behind an `Arc<Mutex<_>>`. A `Chain` is a
+  parent-pointer list of `ChainLink { segment, cutoff, parent }`: the first
+  `cutoff` hops of that segment, on top of the parent chain. Hop k's children,
+  and hop k+1, get `base.extended(segment, k + 1)`, one small allocation.
+  Membership is one hash lookup per link, and the number of links is the native
+  nesting depth. `Chain::to_vec` walks everything, and is used only to print a
+  cycle. Lock order is `flights`, `parked`, then segments; a segment is
+  otherwise locked only by its own loop's append.
+- **Tests** are two new stages of `tests/run-then`: `chain.sh`, a worker whose
+  `then` is itself with `--n` one lower, run 500 deep (the old pipeline aborted
+  the server at about 150 hops on a 2 MiB stack); and `then-cycle.sh`, whose
+  third hop is its first hop's request again, expecting the cycle error to name
+  both hops. Each hop is a container, so the chain is hundreds, not the 20,000
+  the proposal above sized for a 64 MiB stack.

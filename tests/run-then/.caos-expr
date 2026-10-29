@@ -9,4 +9,4 @@
 # fail uncaught dies with it. The uncaught path is one level down: dispatch the
 # driver that does the uncaught run-then, and CATCH that dispatch. The error
 # text is the proof and the subject is unchanged.
-curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --num:@=in.txt --double:@=double.sh --combine:@=combine.sh --driver:@=driver.sh --outer:@=outer.sh --checks:@=checks.sh --boom:@=boom.sh --catcher:@=catcher.sh --cycle:@=cycle.sh
+curry --base:@=DEEP-DEPS/bash --worker1:@=worker.sh --bash:@=DEEP-DEPS/bash --num:@=in.txt --double:@=double.sh --combine:@=combine.sh --driver:@=driver.sh --outer:@=outer.sh --checks:@=checks.sh --boom:@=boom.sh --catcher:@=catcher.sh --cycle:@=cycle.sh --chain:@=chain.sh --then-cycle:@=then-cycle.sh

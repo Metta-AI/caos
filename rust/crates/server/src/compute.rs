@@ -1,7 +1,7 @@
 //! Compute: the `/run` pipeline.
 //!
 //! A **WorkRequest** (`SPEC.md`) is an **ArgTree** to run plus runtime context
-//! (an ancestor `stack` for cycle detection) that is
+//! (an ancestor `chain` for cycle detection) that is
 //! NOT part of the cache key. The ArgTree is a content-addressed git tree, so its
 //! hash *is* the cache key with nothing keyed alongside it: the worker image,
 //! and cache-busting `salt` ride inside it under
@@ -31,7 +31,7 @@ use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -78,18 +78,127 @@ const META_SUFFIX: &str = ".caosmeta";
 /// Disambiguates temp dirs created across handler threads.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The hops one [`run_work_request`] loop has run, in order: the record a chain
+/// of `then`s leaves behind as it goes. Shared with the chains handed to those
+/// hops' children, which read it; only the loop appends.
+#[derive(Default)]
+struct Segment {
+    order: Vec<String>,
+    /// Each hop's position in `order`, for O(1) membership.
+    index: HashMap<String, usize>,
+}
+
+impl Segment {
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Append a hop. Returns the new length: the cutoff that includes it.
+    fn push(&mut self, arg_tree: &str) -> usize {
+        self.index.insert(arg_tree.to_string(), self.order.len());
+        self.order.push(arg_tree.to_string());
+        self.order.len()
+    }
+}
+
+/// One link of a [`Chain`]: the first `cutoff` hops of `segment`, on top of
+/// `parent`.
+struct ChainLink {
+    segment: Arc<Mutex<Segment>>,
+    cutoff: usize,
+    parent: Option<Arc<ChainLink>>,
+}
+
+/// A request's ancestors — the ArgTrees whose completion awaits it — for
+/// run-cycle detection and the waits-for walk. Empty means top-level.
+///
+/// PERSISTENT, AND O(1) TO EXTEND. The nested pipeline carried a `Vec<String>`
+/// copied and grown at every hop, so a chain of n hops kept about n²/2 strings
+/// alive and checked membership with an O(n) scan (design/promise-chains.md,
+/// "A second cost"). A chain is now a parent-pointer list of links, each naming
+/// a prefix of one loop's [`Segment`]: extending it for a hop's children is one
+/// small allocation, nothing is copied, and membership is one hash lookup per
+/// link. The number of links is the native nesting depth (a `run` inside a
+/// `map` inside ...), not the chain's length: every `then` hop of one loop
+/// lands in the same segment, under a cutoff one higher.
+#[derive(Clone, Default)]
+struct Chain {
+    head: Option<Arc<ChainLink>>,
+}
+
+impl Chain {
+    /// No ancestors: a top-level request.
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    /// This chain plus the first `cutoff` hops of `segment`. With `cutoff` 0 it
+    /// is this chain, so a link always holds at least one hop and `is_empty`
+    /// stays a test of `head`.
+    fn extended(&self, segment: &Arc<Mutex<Segment>>, cutoff: usize) -> Chain {
+        if cutoff == 0 {
+            return self.clone();
+        }
+        Chain {
+            head: Some(Arc::new(ChainLink {
+                segment: Arc::clone(segment),
+                cutoff,
+                parent: self.head.clone(),
+            })),
+        }
+    }
+
+    fn contains(&self, arg_tree: &str) -> bool {
+        self.links().any(|link| {
+            link.segment
+                .lock()
+                .expect("segment lock")
+                .index
+                .get(arg_tree)
+                .is_some_and(|&at| at < link.cutoff)
+        })
+    }
+
+    /// Every ancestor, outermost first. Linear in the chain: for a cycle's
+    /// error listing, not for the hot path.
+    fn to_vec(&self) -> Vec<String> {
+        let links: Vec<&ChainLink> = self.links().collect();
+        let mut ancestors = Vec::new();
+        for link in links.into_iter().rev() {
+            let segment = link.segment.lock().expect("segment lock");
+            ancestors.extend_from_slice(&segment.order[..link.cutoff]);
+        }
+        ancestors
+    }
+
+    /// The links, innermost first.
+    fn links(&self) -> impl Iterator<Item = &ChainLink> + '_ {
+        std::iter::successors(self.head.as_deref(), |link| link.parent.as_deref())
+    }
+
+    /// A chain of exactly these hops, outermost first.
+    #[cfg(test)]
+    fn of(hops: &[&str]) -> Chain {
+        let mut segment = Segment::default();
+        for hop in hops {
+            segment.push(hop);
+        }
+        Chain::default().extended(&Arc::new(Mutex::new(segment)), hops.len())
+    }
+}
+
 /// A **WorkRequest** (per `SPEC.md`): an `ArgTree` to run, plus the runtime
-/// context that is deliberately NOT part of its cache key — the ancestor `stack`
+/// context that is deliberately NOT part of its cache key — the ancestor `chain`
 /// (run-cycle detection). Only `arg_tree` is hashed and
-/// cached; `stack` rides alongside it. The ArgTree carries the
+/// cached; `chain` rides alongside it. The ArgTree carries the
 /// worker image and salt under reserved entries, so its hash *is* the whole
 /// cache key (`SPEC.md`: "The ArgTree is the cache key").
 #[derive(Clone, Copy)]
 struct WorkRequest<'a> {
     /// The ArgTree hash — the request's identity and cache key.
     arg_tree: &'a str,
-    /// Ancestor ArgTree hashes (empty = top-level), for run-cycle detection.
-    stack: &'a [String],
+    /// Ancestor ArgTrees (empty = top-level), for run-cycle detection.
+    chain: &'a Chain,
     /// The secrets the run carries as ephemeral context (design/secrets.md):
     /// matched + injected at every dispatch, threaded into promise sub-runs.
     /// NOT part of the ArgTree or the cache key.
@@ -287,14 +396,20 @@ fn walk(
     )
     .map_err(|e| HttpError::new(500, e))?;
 
-    // No salt and no stack: an eval is deterministic in its inputs, and this is
+    // No salt and no chain: an eval is deterministic in its inputs, and this is
     // a top-level resolution with no ancestors. `parent` is only a trace label
     // here (no `then`, so no pool inheritance reads it): the asking request's
     // ticket when there is one, else the continuation names itself.
     let cont = cont.to_string();
-    let (result, _caught) =
-        resolve_promise(config, parent.unwrap_or(&cont), &cont, "", &[], secrets)?;
-    Ok(result)
+    let top = Chain::default();
+    match resolve_promise(config, parent.unwrap_or(&cont), &cont, "", &top, secrets)? {
+        Resolved::Done { result, .. } => Ok(result),
+        // The continuation built above has no `then`, so there is no next hop.
+        Resolved::Next { arg_tree, .. } => Err(HttpError::new(
+            500,
+            format!("eval continuation {cont} produced a then request {arg_tree}"),
+        )),
+    }
 }
 
 /// A `raw=1` locator's answer: the pinned commit's own tree (or the subtree its
@@ -558,7 +673,7 @@ pub(crate) fn run(
         config,
         &WorkRequest {
             arg_tree: &arg_tree,
-            stack: &[],
+            chain: &Chain::default(),
             secrets,
         },
     );
@@ -586,11 +701,6 @@ fn parse_arg_tree(query: &str) -> Result<String, HttpError> {
     Ok(arg_tree)
 }
 
-/// Run WorkRequest `request` (its ArgTree, with `request.stack` the chain of
-/// ancestor ArgTree hashes — empty = top-level), returning the fully-resolved
-/// `"<type> <hash>"`. The whole pipeline behind both `GET /run` and promise
-/// sub-runs: cache lookup → run-cycle detection → the container run → promise
-/// resolution → cache store → top-level result publication.
 /// The redis key an ArgTree's result is cached under.
 ///
 /// Unprefixed when no namespace is configured, so a deployment that sets nothing
@@ -603,19 +713,152 @@ fn result_key(config: &Config, arg_tree: &str) -> String {
     }
 }
 
+/// Run WorkRequest `request` (its ArgTree, with `request.chain` its ancestor
+/// ArgTrees — empty = top-level), returning the fully-resolved
+/// `"<type> <hash>"`. The whole pipeline behind both `GET /run` and promise
+/// sub-runs: cache lookup → run-cycle detection → the container run → promise
+/// resolution → cache store → top-level result publication.
+///
+/// A CHAIN RUNS AS A LOOP, NOT AS RECURSION. A worker whose continuation has a
+/// `then` makes this request's result its `then` request's result, and that
+/// request may promise again: an agent loop is one such hop per turn, so the
+/// chain is as long as the session. Each hop used to be a native frame of this
+/// thread (`resolve_promise` → `run_image` → here), about 13 KB, and a long
+/// session overflowed the thread and aborted the server
+/// (design/promise-chains.md). Now each hop is one iteration of [`run_hop`]: a
+/// hop whose worker left a `then` is parked on the heap as a [`PendingHop`] and
+/// the loop moves on to the `then` request. The first hop that comes to a value
+/// — a plain result, a cache hit, a joined flight, an error — ends the loop, and
+/// every pending hop then finishes with that outcome, innermost first, which is
+/// the order the recursion unwound in. Native depth no longer depends on chain
+/// length. A middle step (`run`, `map`, `request`, `eval`) still nests natively,
+/// and the chain it starts runs in a loop of its own.
 fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, HttpError> {
     let WorkRequest {
         arg_tree,
-        stack,
-        secrets: _,
+        chain,
+        secrets,
     } = *request;
+    // This chain's hops, in order. The children of hop k (and hop k+1, its
+    // `then`) see hops 0..=k as ancestors, through this one shared record.
+    let segment = Arc::new(Mutex::new(Segment::default()));
+    let mut pending: Vec<PendingHop> = Vec::new();
+    let mut arg_tree = arg_tree.to_string();
+    let mut outcome = loop {
+        match run_hop(config, &arg_tree, chain, &segment, secrets) {
+            HopStep::Complete(outcome) => break outcome,
+            HopStep::Continue { next, hop } => {
+                pending.push(hop);
+                arg_tree = next;
+            }
+        }
+    };
+    // A hop's result is by definition its `then`'s result, so each pending hop
+    // receives the outcome of the hop after it — a publication failure there
+    // included — and does the post-work the nested version did on its way up.
+    while let Some(hop) = pending.pop() {
+        outcome = hop.finish(config, outcome);
+    }
+    outcome.map_err(|(status, msg)| HttpError::new(status, msg))
+}
+
+/// What one hop came to, as the loop in [`run_work_request`] sees it.
+enum HopStep {
+    /// The hop has its outcome, post-work included, and so does the chain:
+    /// every pending hop finishes with it.
+    Complete(Outcome),
+    /// The hop's worker left a `then`. Its result is `next`'s, so it waits on
+    /// the heap while the loop runs `next`.
+    Continue { next: String, hop: PendingHop },
+}
+
+/// A hop whose worker ran and left a `then`: what it still has to do once the
+/// chain's result is known. Holding its flight owner here keeps identical
+/// arrivals parked on it, as the nested frame did; a hop dropped unfinished (a
+/// panic) still broadcasts owner loss, through [`FlightOwner`]'s Drop.
+struct PendingHop {
+    arg_tree: String,
+    /// Its result-cache key.
+    key: String,
+    /// `None` for a cycle-breaking duplicate (`FlightDisposition::Run(None)`).
+    owner: Option<FlightOwner>,
+    /// Whether this hop's OWN middle step caught a failure, which keeps its
+    /// result out of the cache (see [`resolve_promise`]).
+    caught: bool,
+}
+
+impl PendingHop {
+    /// The hop's post-work, given the chain's outcome: cache the result under
+    /// this hop's key (unless its middle step caught), close its trace node,
+    /// publish and release its flight. Returns the outcome the hop before it
+    /// receives: a publication failure here is that hop's failure too.
+    fn finish(self, config: &Config, outcome: Outcome) -> Outcome {
+        let arg_tree = &self.arg_tree;
+        if let Ok(result) = &outcome {
+            // Cache the (resolved) result for next time (best-effort) — unless a
+            // `catch` folded a sub-run failure into it. A failed sub-run is
+            // deliberately never cached; memoizing the parent that swallowed it
+            // would reintroduce exactly the memoized red that rule exists to
+            // prevent, and make it unretryable.
+            if self.caught {
+                eprintln!(
+                    "ran worker: arg_tree={arg_tree} -> {result} (not cached: caught a failure)"
+                );
+            } else {
+                match cache_set(&config.redis_addr, &self.key, result) {
+                    Ok(()) => eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cached)"),
+                    Err(e) => eprintln!(
+                        "ran worker: arg_tree={arg_tree} -> {result} (cache store failed: {e})"
+                    ),
+                }
+            }
+        }
+        // `ended` however the hop leaves — continuation resolution included,
+        // which is why it is here and not at the container's exit. A promise's
+        // children are started after the worker has exited, so an `ended` that
+        // stopped at the container would place every child after its parent's
+        // end and make the reader call all of them evicted-and-rerun.
+        crate::status::ended(config, arg_tree, outcome.is_ok());
+        match self.owner {
+            // Any top-level participant marks the shared flight for publication,
+            // even when its executor entered as a promise sub-run. The owner
+            // keeps the flight fenced until that publication finishes.
+            Some(owner) => {
+                owner.finish_with(outcome, |result| pin_result(config, arg_tree, result))
+            }
+            // The only ownerless executor is a cycle-breaking sub-run: an
+            // external request has no ancestors, so it can never take the
+            // unsafe path.
+            None => outcome,
+        }
+    }
+}
+
+/// One hop of a chain: everything the pipeline does for one ArgTree up to the
+/// point where its result is known, or deferred to its `then`. `base` is the
+/// chain [`run_work_request`] was entered with; this hop's own ancestors are
+/// `base` plus the hops already in `segment`.
+fn run_hop(
+    config: &Config,
+    arg_tree: &str,
+    base: &Chain,
+    segment: &Arc<Mutex<Segment>>,
+    secrets: &crate::secrets::Context,
+) -> HopStep {
+    let fail = |e: HttpError| (e.status(), e.message().to_string());
+    let depth = segment.lock().expect("segment lock").len();
+    let chain = base.extended(segment, depth);
+
     // Unpack the ArgTree's reserved worker `base` (an embedded tree for a git
     // image, a ref blob for `docker://`) and cache-busting `salt`. Both are part
     // of the ArgTree — hence part of the cache key — and inherited by any
     // promise sub-runs this request leaves behind.
-    let (image, salt) = read_arg_tree(config, arg_tree)?;
+    let (image, salt) = match read_arg_tree(config, arg_tree) {
+        Ok(read) => read,
+        Err(e) => return HopStep::Complete(Err(fail(e))),
+    };
     if image.is_empty() {
-        return Err(HttpError::new(400, "request has empty image"));
+        return HopStep::Complete(Err((400, "request has empty image".to_string())));
     }
 
     // The ArgTree hash is the cache key (it captures image, salt and every
@@ -625,32 +868,33 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
     // the final result "<type> <hash>" — a promise is resolved before it's cached,
     // so a hit never re-resolves. A hit skips image conversion and the container
     // run. Redis is best-effort: a lookup error just means we run uncached.
-    let key = &result_key(config, arg_tree);
-    match cache_get(&config.redis_addr, key) {
+    let key = result_key(config, arg_tree);
+    match cache_get(&config.redis_addr, &key) {
         Ok(Some(result)) => {
             eprintln!("cache hit: arg_tree={arg_tree} -> {result}");
-            let outcome = complete_cache_hit(arg_tree, stack, result, |result| {
+            return HopStep::Complete(complete_cache_hit(arg_tree, &chain, result, |result| {
                 pin_result(config, arg_tree, result)
-            });
-            return outcome.map_err(|(status, msg)| HttpError::new(status, msg));
+            }));
         }
         Ok(None) => eprintln!("cache miss: arg_tree={arg_tree} (image={image}); running worker"),
         Err(e) => eprintln!("cache lookup failed ({e}); running worker: arg_tree={arg_tree}"),
     }
 
-    // Re-entering an ArgTree already on the stack has no fixpoint — fail, listing
-    // the cycle. (A cache hit can't be on the stack: a cyclic computation never
+    // Re-entering an ArgTree already on the chain has no fixpoint — fail, listing
+    // the cycle. (A cache hit can't be on the chain: a cyclic computation never
     // completes, so it never caches, which is why checking only on a miss is
-    // sound.) The ArgTree hash is exactly this frame's identity.
-    if let Some(pos) = stack.iter().position(|f| f == arg_tree) {
-        let mut cycle: Vec<&str> = stack[pos..].iter().map(String::as_str).collect();
+    // sound.) The ArgTree hash is exactly this hop's identity.
+    if chain.contains(arg_tree) {
+        let ancestors = chain.to_vec();
+        let pos = ancestors
+            .iter()
+            .position(|f| f == arg_tree)
+            .expect("an ArgTree the chain contains is among its ancestors");
+        let mut cycle: Vec<&str> = ancestors[pos..].iter().map(String::as_str).collect();
         cycle.push(arg_tree);
         let listing = cycle.join("\n  -> ");
         eprintln!("run cycle detected:\n  {listing}");
-        return Err(HttpError::new(
-            400,
-            format!("run cycle detected:\n  {listing}"),
-        ));
+        return HopStep::Complete(Err((400, format!("run cycle detected:\n  {listing}"))));
     }
 
     // Single-flight: identical concurrent requests share one run. A diamond
@@ -670,10 +914,9 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
     // errors cleanly. An owner guard clears and broadcasts if its thread
     // unwinds; a waiter never promotes itself merely because a valid run is
     // slow, since duplicate execution may repeat external side effects.
-    let (outcome, owner) = match claim_flight_after_miss(arg_tree, stack, || {
-        cache_get(&config.redis_addr, key)
-    }) {
-        FlightDisposition::Run(owner) => (run_dispatch(config, request, &image, &salt, key), owner),
+    let reread = || cache_get(&config.redis_addr, &key);
+    let owner = match claim_flight_after_miss(arg_tree, &chain, reread) {
+        FlightDisposition::Run(owner) => owner,
         FlightDisposition::Complete {
             outcome,
             cache_hit,
@@ -688,145 +931,128 @@ fn run_work_request(config: &Config, request: &WorkRequest) -> Result<String, Ht
             if cache_hit {
                 eprintln!("cache hit after claiming the flight: arg_tree={arg_tree}");
             }
-            (outcome, owner)
+            let outcome = match owner {
+                // Any top-level participant marks the shared flight for
+                // publication, even when its executor entered as a promise
+                // sub-run. The owner keeps the flight fenced until that
+                // publication finishes.
+                Some(owner) => {
+                    owner.finish_with(outcome, |result| pin_result(config, arg_tree, result))
+                }
+                // A waiter receives the owner's already-published outcome.
+                None => outcome,
+            };
+            return HopStep::Complete(outcome);
         }
     };
-    let outcome = match owner {
-        // Any top-level participant marks the shared flight for publication,
-        // even when its executor entered as a promise sub-run. The owner keeps
-        // the flight fenced until that publication finishes.
-        Some(owner) => owner.finish_with(outcome, |result| pin_result(config, arg_tree, result)),
-        // A waiter receives the owner's already-published outcome. The only
-        // ownerless executor is a cycle-breaking sub-run: an external request
-        // has no ancestors, so it can never take the unsafe path.
-        None => outcome,
+
+    // This arrival RUNS the work, and only this path is traced (SPEC.md
+    // "Tracing"): a cache hit and a single-flight waiter record nothing. That is
+    // what makes the reader's inference sound — a child whose record ended
+    // before its parent started was reused rather than re-run, and it would not
+    // be if every consumer appended. `requested` before anything else; `ended`
+    // is the hop's finish, continuation resolution included.
+    crate::status::requested(config, arg_tree);
+    // Promise sub-runs — and the `then` hop after this one — see this
+    // computation as an ancestor.
+    let cutoff = segment.lock().expect("segment lock").push(arg_tree);
+    let children = base.extended(segment, cutoff);
+    let mut hop = PendingHop {
+        arg_tree: arg_tree.to_string(),
+        key,
+        owner,
+        caught: false,
     };
-    outcome.map_err(|(status, msg)| HttpError::new(status, msg))
+
+    let resolved = dispatch_worker(config, arg_tree, &image, &children, secrets).and_then(
+        |result| match result.split_once(' ') {
+            // A promise is not a value: the worker exited leaving a map-then
+            // continuation behind. Resolve it — the container (and its slot)
+            // are already gone.
+            Some((PROMISE_KIND, cont)) => {
+                eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
+                resolve_promise(config, arg_tree, cont, &salt, &children, secrets).map_err(fail)
+            }
+            _ => Ok(Resolved::Done {
+                result,
+                caught: false,
+            }),
+        },
+    );
+    match resolved {
+        Ok(Resolved::Next {
+            arg_tree: next,
+            caught,
+        }) => {
+            hop.caught = caught;
+            HopStep::Continue { next, hop }
+        }
+        Ok(Resolved::Done { result, caught }) => {
+            hop.caught = caught;
+            HopStep::Complete(hop.finish(config, Ok(result)))
+        }
+        Err(error) => HopStep::Complete(hop.finish(config, Err(error))),
+    }
 }
 
-/// The dispatch + promise-resolution + cache-store tail of [`run_work_request`],
-/// factored out so single-flight can broadcast its outcome. The error type is
-/// `(status, message)` — a plain-data [`HttpError`] that can be cloned to every
-/// waiter.
-///
-/// This is also the whole of the traced path (SPEC.md "Tracing"): only an
-/// arrival that actually RUNS the work gets here, so a cache hit and a
-/// single-flight waiter record nothing. That is what makes the reader's
-/// inference sound — a child whose record ended before its parent started was
-/// reused rather than re-run, and it would not be if every consumer appended.
-fn run_dispatch(
+/// Run the worker of `arg_tree` through the runner rendezvous: resolve the image
+/// to a docker-pullable ref (always sent — a warm runner that pinned the image
+/// ignores it, and conversion is Redis-cached, so re-resolving is a lookup),
+/// read the ArgTree's top level (what runners' required args match against),
+/// and hand the job to a polling runner. The dispatch blocks this server thread
+/// until a runner posts the result; capacity is runner-side (the set of parked
+/// polls), so there's no server-side slot to hold. Returns what the worker
+/// posted, `"<type> <hash>"` — or `"promise <hash>"`, which the caller resolves.
+/// `children` is the ancestry a sub-run the worker starts sees. The error type
+/// is `(status, message)` — a plain-data [`HttpError`] that can be cloned to
+/// every waiter.
+fn dispatch_worker(
     config: &Config,
-    request: &WorkRequest,
+    arg_tree: &str,
     image: &str,
-    salt: &str,
-    key: &str,
+    children: &Chain,
+    secrets: &crate::secrets::Context,
 ) -> Result<String, (u16, String)> {
-    // `requested` before anything else, `ended` however we leave — including
-    // the continuation resolution inside, which is why this wraps the whole
-    // body rather than sitting beside the runner dispatch. A promise's children
-    // are started after the worker has exited, so an `ended` that stopped at
-    // the container would place every child after its parent's end and make
-    // the reader call all of them evicted-and-rerun.
-    crate::status::requested(config, request.arg_tree);
-    let outcome = run_dispatch_inner(config, request, image, salt, key);
-    crate::status::ended(config, request.arg_tree, outcome.is_ok());
-    outcome
-}
-
-fn run_dispatch_inner(
-    config: &Config,
-    request: &WorkRequest,
-    image: &str,
-    salt: &str,
-    key: &str,
-) -> Result<String, (u16, String)> {
-    let WorkRequest {
-        arg_tree,
-        stack,
-        secrets,
-    } = *request;
     let fail = |e: HttpError| (e.status(), e.message().to_string());
-
-    // Promise sub-runs see this computation as an ancestor.
-    let mut child_stack: Vec<String> = stack.to_vec();
-    child_stack.push(arg_tree.to_string());
-
-    // Run the worker through the runner rendezvous: resolve the image to a
-    // docker-pullable ref (always sent — a warm runner that pinned the image
-    // ignores it, and conversion is Redis-cached, so re-resolving is a lookup),
-    // read the ArgTree's top level (what runners' required args match
-    // against), and hand the job to a polling runner. The dispatch blocks this
-    // server thread until a runner posts the result; capacity is runner-side
-    // (the set of parked polls), so there's no server-side slot to hold.
-    let result = {
-        let image_ref = resolve_image(config, image).map_err(fail)?;
-        let arg_entries = args_entries(config, arg_tree).map_err(fail)?;
-        // Whether this job SAYS it is answered by a seeder, which it does by
-        // carrying `required-pool=seeded` — the same arg that keeps the generic
-        // pool away from it (`runner::matches`). It used to be sniffed from the
-        // image being a `docker://seeded…` sentinel, which named only three of
-        // the five seeded entries: `cargo`'s image is the flake-builder delta
-        // and `flake-builder`'s own is a plain sentinel, so a cargo job whose
-        // key had drifted looked like ordinary work. It was then handed to a
-        // generic runner, which really tried to `nix build` a flake that
-        // deliberately exposes no `caosImage` — a failure naming nix, three
-        // layers from the stale key that caused it.
-        let seeded = arg_entries
-            .get(caos_world::REQUIRED_POOL_ARG)
-            .is_some_and(|oid| *oid == crate::runner::pool_oid(caos_world::SEEDED_POOL));
-        // Find the secrets this job's identity is entitled to (SPEC, "Secrets"):
-        // those of every image evaluation granted that ours contains. They ride
-        // out of band in the job payload — never in the ArgTree, so never in the
-        // cache key — and the container runner drops them at `/secret/<name>`.
-        // Read from `arg_entries` before dispatch takes ownership of it.
-        let granted = crate::secrets::grant(config, secrets, &arg_entries);
-        crate::runner::dispatch(
-            arg_tree,
-            arg_entries,
-            &image_ref,
-            seeded,
-            granted,
-            |sub_request| start_sub_run(config, sub_request, &child_stack, secrets),
-            |note| match note {
-                crate::runner::Note::Started => crate::status::started(config, arg_tree),
-                crate::runner::Note::OutTrace(oid) => {
-                    crate::status::out_trace(config, arg_tree, &oid)
-                }
-            },
-        )
-        .map_err(fail)?
-    };
+    let image_ref = resolve_image(config, image).map_err(fail)?;
+    let arg_entries = args_entries(config, arg_tree).map_err(fail)?;
+    // Whether this job SAYS it is answered by a seeder, which it does by
+    // carrying `required-pool=seeded` — the same arg that keeps the generic
+    // pool away from it (`runner::matches`). It used to be sniffed from the
+    // image being a `docker://seeded…` sentinel, which named only three of
+    // the five seeded entries: `cargo`'s image is the flake-builder delta
+    // and `flake-builder`'s own is a plain sentinel, so a cargo job whose
+    // key had drifted looked like ordinary work. It was then handed to a
+    // generic runner, which really tried to `nix build` a flake that
+    // deliberately exposes no `caosImage` — a failure naming nix, three
+    // layers from the stale key that caused it.
+    let seeded = arg_entries
+        .get(caos_world::REQUIRED_POOL_ARG)
+        .is_some_and(|oid| *oid == crate::runner::pool_oid(caos_world::SEEDED_POOL));
+    // Find the secrets this job's identity is entitled to (SPEC, "Secrets"):
+    // those of every image evaluation granted that ours contains. They ride
+    // out of band in the job payload — never in the ArgTree, so never in the
+    // cache key — and the container runner drops them at `/secret/<name>`.
+    // Read from `arg_entries` before dispatch takes ownership of it.
+    let granted = crate::secrets::grant(config, secrets, &arg_entries);
+    let result = crate::runner::dispatch(
+        arg_tree,
+        arg_entries,
+        &image_ref,
+        seeded,
+        granted,
+        |sub_request| start_sub_run(config, sub_request, children, secrets),
+        |note| match note {
+            crate::runner::Note::Started => crate::status::started(config, arg_tree),
+            crate::runner::Note::OutTrace(oid) => crate::status::out_trace(config, arg_tree, &oid),
+        },
+    )
+    .map_err(fail)?;
 
     if result_hash(&result).is_empty() {
         eprintln!("worker produced no result on stdout: arg_tree={arg_tree}");
         return Err((500, "worker produced no result on stdout".to_string()));
     }
-
-    // A promise is not a value: the worker exited leaving a map-then continuation
-    // behind. Resolve it — the container (and its slot) are already gone.
-    let (result, caught) = match result.split_once(' ') {
-        Some((PROMISE_KIND, cont)) => {
-            eprintln!("resolving promise: arg_tree={arg_tree} -> continuation {cont}");
-            resolve_promise(config, arg_tree, cont, salt, &child_stack, secrets).map_err(fail)?
-        }
-        _ => (result, false),
-    };
-
-    // Cache the (resolved) result for next time (best-effort) — unless a `catch`
-    // folded a sub-run failure into it. A failed sub-run is deliberately never
-    // cached; memoizing the parent that swallowed it would reintroduce exactly
-    // the memoized red that rule exists to prevent, and make it unretryable.
-    if caught {
-        eprintln!("ran worker: arg_tree={arg_tree} -> {result} (not cached: caught a failure)");
-    } else {
-        match cache_set(&config.redis_addr, key, &result) {
-            Ok(()) => eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cached)"),
-            Err(e) => {
-                eprintln!("ran worker: arg_tree={arg_tree} -> {result} (cache store failed: {e})")
-            }
-        }
-    }
-
     Ok(result)
 }
 
@@ -838,7 +1064,7 @@ fn run_dispatch_inner(
 fn start_sub_run(
     config: &Config,
     arg_tree: &str,
-    stack: &[String],
+    chain: &Chain,
     secrets: &crate::secrets::Context,
 ) -> Result<(), HttpError> {
     let (image, _) = read_arg_tree(config, arg_tree)?;
@@ -848,14 +1074,14 @@ fn start_sub_run(
 
     let config = config.clone();
     let arg_tree = arg_tree.to_string();
-    let stack = stack.to_vec();
+    let chain = chain.clone();
     let secrets = secrets.clone();
     std::thread::spawn(move || {
         let result = run_work_request(
             &config,
             &WorkRequest {
                 arg_tree: &arg_tree,
-                stack: &stack,
+                chain: &chain,
                 secrets: &secrets,
             },
         );
@@ -885,12 +1111,12 @@ fn flights() -> &'static Mutex<HashMap<String, FlightEntry>> {
     FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// One parked waiter: its ancestor stack, and the ArgTree it waits on — an
+/// One parked waiter: its ancestor chain, and the ArgTree it waits on — an
 /// edge of the waits-for graph `park_would_deadlock` walks. The ID prevents a
 /// delayed guard from removing an identical edge belonging to a later flight.
 struct ParkedEdge {
     id: u64,
-    stack: Vec<String>,
+    chain: Chain,
     target: String,
 }
 
@@ -910,23 +1136,27 @@ fn parked() -> &'static Mutex<ParkedState> {
     })
 }
 
-/// Would parking a waiter (ancestry `stack`) on in-flight `arg_tree` close a wait
+/// Would parking a waiter (ancestry `chain`) on in-flight `arg_tree` close a wait
 /// cycle? True iff `arg_tree`'s in-progress subtree — reached transitively through
 /// parked waiters (a waiter whose ancestry contains a frontier ArgTree descends
 /// from it, so the frontier ArgTree's completion awaits the waiter's target) —
 /// contains one of OUR ancestors: that ancestor's completion awaits us, so
 /// waiting on `arg_tree` would deadlock.
-fn park_would_deadlock(arg_tree: &str, stack: &[String]) -> bool {
+///
+/// Lock order: `flights` (held by the caller), then `parked`, then each chain's
+/// segments inside `Chain::contains`. A segment is otherwise locked only by the
+/// loop appending to it, which holds nothing else.
+fn park_would_deadlock(arg_tree: &str, chain: &Chain) -> bool {
     let parked = parked().lock().expect("parked lock");
     let mut frontier: Vec<String> = vec![arg_tree.to_string()];
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert(arg_tree.to_string());
     while let Some(cur) = frontier.pop() {
-        if stack.contains(&cur) {
+        if chain.contains(&cur) {
             return true;
         }
         for edge in &parked.edges {
-            if edge.stack.contains(&cur) && seen.insert(edge.target.clone()) {
+            if edge.chain.contains(&cur) && seen.insert(edge.target.clone()) {
                 frontier.push(edge.target.clone());
             }
         }
@@ -966,10 +1196,10 @@ enum FlightDisposition {
 /// re-read before repeating possibly effectful work.
 fn claim_flight_after_miss(
     arg_tree: &str,
-    stack: &[String],
+    chain: &Chain,
     reread_cache: impl FnOnce() -> Result<Option<String>, String>,
 ) -> FlightDisposition {
-    match join_flight(arg_tree, stack) {
+    match join_flight(arg_tree, chain) {
         Flight::Owner(owner) => match reread_cache() {
             Ok(Some(result)) => {
                 eprintln!("cache hit after single-flight claim: arg_tree={arg_tree} -> {result}");
@@ -1029,14 +1259,14 @@ fn claim_flight_after_miss(
 /// not need.
 fn complete_cache_hit(
     arg_tree: &str,
-    stack: &[String],
+    chain: &Chain,
     result: String,
     publish: impl FnOnce(&str) -> Result<(), HttpError>,
 ) -> Outcome {
-    if !stack.is_empty() {
+    if !chain.is_empty() {
         return Ok(result);
     }
-    match join_flight(arg_tree, stack) {
+    match join_flight(arg_tree, chain) {
         Flight::Owner(owner) => owner.finish_with(Ok(result), publish),
         Flight::Waiter(rx, guard) => wait_for_flight(arg_tree, rx, guard),
         Flight::Unsafe => Err((
@@ -1133,14 +1363,14 @@ impl Drop for ParkGuard {
     }
 }
 
-fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
+fn join_flight(arg_tree: &str, chain: &Chain) -> Flight {
     let mut table = flights().lock().expect("flights lock");
     match table.get_mut(arg_tree) {
         Some(flight) => {
             // The waits-for check runs under the flights lock, so a
             // concurrent park can't slip in between the check and the edge
             // registration.
-            if park_would_deadlock(arg_tree, stack) {
+            if park_would_deadlock(arg_tree, chain) {
                 return Flight::Unsafe;
             }
             let (tx, rx) = mpsc::channel();
@@ -1153,7 +1383,7 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                     .expect("parked waiter ID space exhausted");
                 parked.edges.push(ParkedEdge {
                     id,
-                    stack: stack.to_vec(),
+                    chain: chain.clone(),
                     target: arg_tree.to_string(),
                 });
                 id
@@ -1162,7 +1392,7 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
             // An external request may join a flight whose executor is a
             // promise sub-run. Record its need here so that executor publishes
             // before waking it.
-            if stack.is_empty() {
+            if chain.is_empty() {
                 flight.publish_result = true;
             }
             Flight::Waiter(rx, ParkGuard { id })
@@ -1172,7 +1402,7 @@ fn join_flight(arg_tree: &str, stack: &[String]) -> Flight {
                 arg_tree.to_string(),
                 FlightEntry {
                     waiters: Vec::new(),
-                    publish_result: stack.is_empty(),
+                    publish_result: chain.is_empty(),
                 },
             );
             Flight::Owner(FlightOwner {
@@ -1254,7 +1484,7 @@ fn broadcast(waiters: Vec<mpsc::Sender<Outcome>>, outcome: &Outcome) {
 struct ServerEvalHost<'a> {
     config: &'a Config,
     salt: &'a str,
-    stack: &'a [String],
+    chain: &'a Chain,
     secrets: &'a crate::secrets::Context,
     /// The promising ArgTree whose continuation this walk is, and the path it
     /// was asked to evaluate — together the name under which each dispatch is
@@ -1373,7 +1603,7 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
             image,
             entries,
             self.salt,
-            self.stack,
+            self.chain,
             self.secrets,
             |arg_tree| {
                 crate::status::child(
@@ -1394,6 +1624,16 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
     }
 }
 
+/// What resolving a continuation came to.
+enum Resolved {
+    /// The continuation had no `then`: the middle step's own result is the
+    /// promising request's result.
+    Done { result: String, caught: bool },
+    /// The continuation's `then`, formed and recorded but not run: the
+    /// promising request's result is this request's result.
+    Next { arg_tree: String, caught: bool },
+}
+
 /// Resolve a continuation — either `{in, map?|run?|then?, catch?}` or
 /// `{request, then?, catch?}`. `request` is a tree entry naming an already
 /// complete ArgTree, executed unchanged; `map`/`run`/`then` are blobs naming
@@ -1412,9 +1652,13 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
 /// 5. `then` receives the available args: `--in` for the image forms, plus
 ///    `--children`/`--result`; the exact-request form passes only `--result`.
 ///
-/// Every sub-run goes through [`run_work_request`], so promises nest arbitrarily (a map
-/// child, a `run`, or a `then` may itself promise) and each sub-run gets its
-/// own memoization and cycle detection (via `stack`).
+/// Every middle-step sub-run goes through [`run_work_request`], so promises nest
+/// arbitrarily (a map child or a `run` may itself promise) and each sub-run gets
+/// its own memoization and cycle detection (via `chain`). The `then` is the one
+/// step NOT run here: its result is the promising request's result, so it is
+/// handed back as [`Resolved::Next`] for the loop in [`run_work_request`] to run
+/// as the chain's next hop — the recursion that grew with the chain's length
+/// (design/promise-chains.md).
 ///
 /// **`catch`** (a marker blob, `run`, `request` or `eval`) makes a failing middle step a
 /// value `then` receives as `--error=<blob>`, exactly where `--result` would
@@ -1425,20 +1669,20 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
 /// would have to say WHICH child failed and what the surviving siblings'
 /// results mean, so catch remains single-valued (`run`, `request` or `eval`).
 ///
-/// The bool in the return says a catch fired. It rides out to [`run_dispatch`]
-/// so the enclosing request is NOT memoized: sub-run failures are uncached by
-/// design (`design/cargo-workers.md`), and folding one into a cached parent
-/// result would launder it into a permanent answer — a retry would replay the
-/// failure without re-running anything. `then`'s own request still caches
+/// `caught` in the return says a catch fired. It rides out to
+/// [`PendingHop::finish`] so the enclosing request is NOT memoized: sub-run
+/// failures are uncached by design (`design/cargo-workers.md`), and folding one
+/// into a cached parent result would launder it into a permanent answer — a
+/// retry would replay the failure without re-running anything. `then`'s own request still caches
 /// normally; the error blob is in its ArgTree, so same error in, same out.
 fn resolve_promise(
     config: &Config,
     parent: &str,
     cont: &str,
     salt: &str,
-    stack: &[String],
+    chain: &Chain,
     secrets: &crate::secrets::Context,
-) -> Result<(String, bool), HttpError> {
+) -> Result<Resolved, HttpError> {
     use gix::objs::tree::EntryKind;
 
     let mut input: Option<gix::objs::tree::Entry> = None;
@@ -1538,38 +1782,33 @@ fn resolve_promise(
                 for _ in 0..width {
                     let (kids, next, slots) = (&kids, &next, &slots);
                     let img = img.as_str();
-                    std::thread::Builder::new()
-                        .stack_size(EVAL_STACK_BYTES)
-                        .spawn_scoped(scope, move || loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(kid) = kids.get(i) else { return };
-                            let outcome = (|| {
-                                let arg = named_entry("in", kid.mode, kid.oid);
-                                let result = run_image(
-                                    config,
-                                    img,
-                                    vec![arg],
-                                    salt,
-                                    stack,
-                                    secrets,
-                                    // The map entry's own name — which for the
-                                    // test suite is the test name, and is the
-                                    // only thing that gives a 29-way fan-out
-                                    // readable nodes. A `help` lookup cannot:
-                                    // children are curried from `base`, not
-                                    // from the tool's own ArgTree, so the
-                                    // tool's help is not in their lineage.
-                                    |arg_tree| {
-                                        crate::status::child(
-                                            config, parent, "map", &kid.name, arg_tree,
-                                        )
-                                    },
-                                )?;
-                                result_entry(&kid.name, &result)
-                            })();
-                            *slots[i].lock().expect("map result slot") = Some(outcome);
-                        })
-                        .expect("spawning a map thread");
+                    scope.spawn(move || loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(kid) = kids.get(i) else { return };
+                        let outcome = (|| {
+                            let arg = named_entry("in", kid.mode, kid.oid);
+                            let result = run_image(
+                                config,
+                                img,
+                                vec![arg],
+                                salt,
+                                chain,
+                                secrets,
+                                // The map entry's own name — which for the
+                                // test suite is the test name, and is the
+                                // only thing that gives a 29-way fan-out
+                                // readable nodes. A `help` lookup cannot:
+                                // children are curried from `base`, not
+                                // from the tool's own ArgTree, so the
+                                // tool's help is not in their lineage.
+                                |arg_tree| {
+                                    crate::status::child(config, parent, "map", &kid.name, arg_tree)
+                                },
+                            )?;
+                            result_entry(&kid.name, &result)
+                        })();
+                        *slots[i].lock().expect("map result slot") = Some(outcome);
+                    });
                 }
             });
             let results: Vec<Result<gix::objs::tree::Entry, HttpError>> = slots
@@ -1606,7 +1845,7 @@ fn resolve_promise(
                 img,
                 vec![input.clone()],
                 salt,
-                stack,
+                chain,
                 secrets,
                 |arg_tree| crate::status::child(config, parent, "run", "run", arg_tree),
             ),
@@ -1623,7 +1862,7 @@ fn resolve_promise(
                 config,
                 &WorkRequest {
                     arg_tree,
-                    stack,
+                    chain,
                     secrets,
                 },
             ),
@@ -1633,13 +1872,13 @@ fn resolve_promise(
         let input = input.as_ref().expect("validated input");
         // Walk `.caos-expr` from `in`'s root down to `path`, on THIS request
         // thread — its own `run`s dispatch through `run_image`, so cycle
-        // detection, memoization and secret grants all ride the same `stack`/
+        // detection, memoization and secret grants all ride the same `chain`/
         // `secrets`, and the object built is byte-identical to a client
         // `eval-path`. `catch` turns a failed walk into `--error`, like `run`.
         let host = ServerEvalHost {
             config,
             salt,
-            stack,
+            chain,
             secrets,
             parent,
             eval_path: path,
@@ -1704,28 +1943,23 @@ fn resolve_promise(
             // the child it needs in one bounded pool, which is the deadlock the
             // pools exist to prevent.
             args.extend(inherited_pool_entries(config, parent)?);
-            Ok((
-                run_image(
-                    config,
-                    &img,
-                    args,
-                    salt,
-                    stack,
-                    secrets,
-                    // The handler's ArgTree is the one thing in a continuation
-                    // that is NOT derivable: its extra arg is the middle step's
-                    // RESULT (the `children` tree, `--result`, or a caught
-                    // `--error`), which no amount of replaying the continuation
-                    // can produce.
-                    |arg_tree| crate::status::continuation(config, parent, kind, Some(arg_tree)),
-                )?,
-                caught,
-            ))
+            // The handler is formed here and RUN BY THE CALLER'S LOOP, never on
+            // this thread: its result is the promising request's result, and it
+            // may promise again, so running it here is the recursion that grew
+            // with the chain's length (design/promise-chains.md). What this
+            // forms is byte-identical to the request `run_image` would have run.
+            let arg_tree = form_arg_tree(config, &img, args, salt)?;
+            // The handler's ArgTree is the one thing in a continuation that is
+            // NOT derivable: its extra arg is the middle step's RESULT (the
+            // `children` tree, `--result`, or a caught `--error`), which no
+            // amount of replaying the continuation can produce.
+            crate::status::continuation(config, parent, kind, Some(&arg_tree));
+            Ok(Resolved::Next { arg_tree, caught })
         }
         // No `then`: the middle step's own result is the request's result.
         (None, Some((_, result, _))) => {
             crate::status::continuation(config, parent, kind, None);
-            Ok((result, caught))
+            Ok(Resolved::Done { result, caught })
         }
         // Unreachable — the presence check above requires some step.
         (None, None) => Err(HttpError::new(
@@ -1878,7 +2112,7 @@ fn run_image(
     image_ref: &str,
     call_args: Vec<gix::objs::tree::Entry>,
     salt: &str,
-    stack: &[String],
+    chain: &Chain,
     secrets: &crate::secrets::Context,
     record: impl FnOnce(&str),
 ) -> Result<String, HttpError> {
@@ -1888,7 +2122,7 @@ fn run_image(
         config,
         &WorkRequest {
             arg_tree: &arg_tree,
-            stack,
+            chain,
             secrets,
         },
     )
@@ -3130,10 +3364,11 @@ fn eval_expression(
     ticket: &str,
     secrets: &crate::secrets::Context,
 ) -> Result<String, HttpError> {
+    let top = Chain::default();
     let host = ServerEvalHost {
         config,
         salt: &expression.salt,
-        stack: &[],
+        chain: &top,
         secrets,
         parent: ticket,
         eval_path: "",
@@ -3279,7 +3514,7 @@ pub(crate) fn start_bundle(
             config,
             &WorkRequest {
                 arg_tree: &arg_tree,
-                stack: &[],
+                chain: &Chain::default(),
                 secrets: &secrets,
             },
         )
@@ -3321,14 +3556,6 @@ fn bundle_ticket(
         .map_err(|e| HttpError::new(500, e))
 }
 
-/// Stack for a thread that evaluates: a request, a ticket, a map child. Rust's
-/// default is 2 MiB, and the evaluator recurses by the depth of the tree it
-/// walks. A ticket thread overflowed it on caosd-prod, which aborts the whole
-/// server (`fatal runtime error: stack overflow`) and took the stack down for a
-/// day. The stack is virtual memory, mapped lazily, so a generous bound costs
-/// nothing until a walk needs it.
-pub(crate) const EVAL_STACK_BYTES: usize = 64 * 1024 * 1024;
-
 /// Run `work` under `ticket` on a thread of its own, and note on the ticket's
 /// trace that it was requested, started and ended. Starting what is already
 /// running joins it, and what has succeeded is already answered; a FAILED one
@@ -3366,7 +3593,6 @@ fn start_work(
     };
     let spawned = std::thread::Builder::new()
         .name(format!("ticket-{ticket}"))
-        .stack_size(EVAL_STACK_BYTES)
         .spawn(move || {
             crate::status::requested(&guard.config, &guard.ticket);
             crate::status::started(&guard.config, &guard.ticket);
@@ -3461,6 +3687,35 @@ mod expression_tests {
 }
 
 #[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    #[test]
+    fn a_chain_is_prefixes_of_its_loops_segments() {
+        let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let outer = Arc::new(Mutex::new(Segment::default()));
+        let cutoff = outer.lock().unwrap().push(&a);
+        let children_of_a = Chain::default().extended(&outer, cutoff);
+        // The outer loop moves on past the cutoff a's children were given.
+        outer.lock().unwrap().push(&b);
+        let inner = Arc::new(Mutex::new(Segment::default()));
+        let cutoff = inner.lock().unwrap().push(&c);
+        let chain = children_of_a.extended(&inner, cutoff);
+
+        assert!(Chain::default().is_empty());
+        assert!(Chain::default().extended(&inner, 0).is_empty());
+        assert!(!chain.is_empty());
+        assert!(chain.contains(&a));
+        assert!(
+            !chain.contains(&b),
+            "a later hop of the outer loop is not an ancestor of a's children"
+        );
+        assert!(chain.contains(&c));
+        assert_eq!(chain.to_vec(), vec![a, c]);
+    }
+}
+
+#[cfg(test)]
 mod single_flight_tests {
     use super::*;
 
@@ -3480,7 +3735,7 @@ mod single_flight_tests {
     fn top_level_cache_hit_waits_for_an_existing_flights_outcome() {
         let request = "0".repeat(40);
         let ancestor = "b".repeat(40);
-        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let owner = match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
@@ -3491,7 +3746,7 @@ mod single_flight_tests {
         let stale_cache = format!("tree {}", "c".repeat(40));
         let request_for_hit = request.clone();
         let cache_hit = std::thread::spawn(move || {
-            complete_cache_hit(&request_for_hit, &[], stale_cache, |_| {
+            complete_cache_hit(&request_for_hit, &Chain::default(), stale_cache, |_| {
                 panic!("cache-hit waiter attempted to publish")
             })
         });
@@ -3525,11 +3780,11 @@ mod single_flight_tests {
     #[test]
     fn waiter_receives_the_owners_outcome() {
         let request = "d".repeat(40);
-        let owner = match join_flight(&request, &[]) {
+        let owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (rx, guard) = match join_flight(&request, &[]) {
+        let (rx, guard) = match join_flight(&request, &Chain::default()) {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("second arrival did not wait"),
         };
@@ -3545,11 +3800,11 @@ mod single_flight_tests {
         let ancestor = "4".repeat(40);
         // Promise resolution may be the executor even though an external run
         // joins later and is the participant that requires durable publication.
-        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let owner = match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (rx, guard) = match join_flight(&request, &[]) {
+        let (rx, guard) = match join_flight(&request, &Chain::default()) {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("second arrival did not wait"),
         };
@@ -3561,7 +3816,7 @@ mod single_flight_tests {
         let caught_failure = format!("tree {}", "6".repeat(40));
         let mut published = None;
         let outcome = owner.finish_with(Ok(caught_failure.clone()), |result| {
-            let (late_rx, late_guard) = match join_flight(&request, &[]) {
+            let (late_rx, late_guard) = match join_flight(&request, &Chain::default()) {
                 Flight::Waiter(rx, guard) => (rx, guard),
                 _ => panic!("flight was released before result publication"),
             };
@@ -3580,7 +3835,7 @@ mod single_flight_tests {
 
         // Only after publication completes may the retry become owner and
         // replace that result with its successful outcome.
-        let successor = match join_flight(&request, &[]) {
+        let successor = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("published flight did not admit a successor"),
         };
@@ -3597,11 +3852,11 @@ mod single_flight_tests {
     fn publication_failure_is_broadcast_before_a_retry_can_own() {
         let request = "3".repeat(40);
         let ancestor = "2".repeat(40);
-        let owner = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let owner = match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (rx, guard) = match join_flight(&request, &[]) {
+        let (rx, guard) = match join_flight(&request, &Chain::default()) {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("external arrival did not wait"),
         };
@@ -3613,7 +3868,7 @@ mod single_flight_tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
         drop(guard);
 
-        let replacement = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let replacement = match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
             Flight::Owner(owner) => owner,
             _ => panic!("publication failure did not release the flight"),
         };
@@ -3623,7 +3878,7 @@ mod single_flight_tests {
     #[test]
     fn a_stale_cache_miss_rereads_after_becoming_owner() {
         let request = "9".repeat(40);
-        let first_owner = match join_flight(&request, &[]) {
+        let first_owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
@@ -3637,10 +3892,10 @@ mod single_flight_tests {
         first_owner.finish(&Ok(cached_result.clone()));
 
         let mut reread_saw_new_owner = false;
-        let disposition = claim_flight_after_miss(&request, &[], || {
+        let disposition = claim_flight_after_miss(&request, &Chain::default(), || {
             // The re-read happens only after this stale arrival has claimed a
             // new flight, so another arrival must observe it as a waiter.
-            match join_flight(&request, &[]) {
+            match join_flight(&request, &Chain::default()) {
                 Flight::Waiter(rx, guard) => {
                     reread_saw_new_owner = true;
                     drop(rx);
@@ -3670,7 +3925,7 @@ mod single_flight_tests {
             }
         }
 
-        let replacement = match join_flight(&request, &[]) {
+        let replacement = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("cache-filled flight was not released"),
         };
@@ -3680,11 +3935,11 @@ mod single_flight_tests {
     #[test]
     fn losing_an_owner_wakes_waiters_and_allows_a_new_owner() {
         let request = "e".repeat(40);
-        let owner = match join_flight(&request, &[]) {
+        let owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (rx, guard) = match join_flight(&request, &[]) {
+        let (rx, guard) = match join_flight(&request, &Chain::default()) {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("second arrival did not wait"),
         };
@@ -3697,7 +3952,7 @@ mod single_flight_tests {
         assert!(error.1.contains("owner"), "{}", error.1);
         drop(guard);
 
-        let replacement = match join_flight(&request, &[]) {
+        let replacement = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("proven owner loss did not release the flight"),
         };
@@ -3708,17 +3963,17 @@ mod single_flight_tests {
     fn completed_flight_removes_wait_edges_before_waiters_wake() {
         let request = "f".repeat(40);
         let ancestor = "1".repeat(40);
-        let owner = match join_flight(&request, &[]) {
+        let owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (rx, guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let (rx, guard) = match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("second arrival did not wait"),
         };
         assert!(park_would_deadlock(
             &ancestor,
-            std::slice::from_ref(&request)
+            &Chain::of(&[request.as_str()])
         ));
 
         let outcome = Ok(format!("blob {}", "b".repeat(40)));
@@ -3728,7 +3983,7 @@ mod single_flight_tests {
         // itself, rather than waiter scheduling, owns removal of the edge.
         assert!(!park_would_deadlock(
             &ancestor,
-            std::slice::from_ref(&request)
+            &Chain::of(&[request.as_str()])
         ));
         assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), outcome);
         drop(guard);
@@ -3738,29 +3993,30 @@ mod single_flight_tests {
     fn old_waiter_guard_cannot_remove_a_new_flights_edge() {
         let request = "a".repeat(40);
         let ancestor = "2".repeat(40);
-        let first_owner = match join_flight(&request, &[]) {
+        let first_owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("first arrival was not the owner"),
         };
-        let (first_rx, first_guard) = match join_flight(&request, std::slice::from_ref(&ancestor)) {
+        let (first_rx, first_guard) = match join_flight(&request, &Chain::of(&[ancestor.as_str()]))
+        {
             Flight::Waiter(rx, guard) => (rx, guard),
             _ => panic!("second arrival did not wait"),
         };
         let first_outcome = Ok(format!("blob {}", "c".repeat(40)));
         first_owner.finish(&first_outcome);
 
-        let second_owner = match join_flight(&request, &[]) {
+        let second_owner = match join_flight(&request, &Chain::default()) {
             Flight::Owner(owner) => owner,
             _ => panic!("completed flight did not admit a new owner"),
         };
-        let (second_rx, second_guard) = match join_flight(&request, std::slice::from_ref(&ancestor))
-        {
-            Flight::Waiter(rx, guard) => (rx, guard),
-            _ => panic!("new flight's second arrival did not wait"),
-        };
+        let (second_rx, second_guard) =
+            match join_flight(&request, &Chain::of(&[ancestor.as_str()])) {
+                Flight::Waiter(rx, guard) => (rx, guard),
+                _ => panic!("new flight's second arrival did not wait"),
+            };
         assert!(park_would_deadlock(
             &ancestor,
-            std::slice::from_ref(&request)
+            &Chain::of(&[request.as_str()])
         ));
 
         // The first guard is deliberately late. Its edge was already cleared
@@ -3769,7 +4025,7 @@ mod single_flight_tests {
         drop(first_guard);
         assert!(park_would_deadlock(
             &ancestor,
-            std::slice::from_ref(&request)
+            &Chain::of(&[request.as_str()])
         ));
 
         let second_outcome = Ok(format!("blob {}", "d".repeat(40)));

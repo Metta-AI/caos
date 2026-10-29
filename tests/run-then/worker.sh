@@ -7,8 +7,11 @@
 # position, client-side flag validation, run-cycle detection, and `--catch` — a
 # failing run delivered to `then` as --error instead of failing the request,
 # with the uncaught case asserted alongside it so the default cannot drift.
+# Then the chain cases: a long chain of `then`s, which the server must run in
+# constant native stack (design/promise-chains.md), and a `then` that returns to
+# an earlier hop's request, which is a run cycle.
 #
-# EIGHT STAGES: no run can be waited on, so each assertion is the `then` of the
+# TEN STAGES: no run can be waited on, so each assertion is the `then` of the
 # run it is about. The timings the old version printed are gone with the
 # blocking calls that made them meaningful.
 #
@@ -29,7 +32,13 @@ next() { local s=$1; shift; caos curry --base:@=/cas/args/base \
   --bash:@=/cas/args/bash --num:@=/cas/args/num --double:@=/cas/args/double \
   --combine:@=/cas/args/combine --driver:@=/cas/args/driver \
   --outer:@=/cas/args/outer --checks:@=/cas/args/checks --boom:@=/cas/args/boom \
-  --catcher:@=/cas/args/catcher --cycle:@=/cas/args/cycle "$@"; }
+  --catcher:@=/cas/args/catcher --cycle:@=/cas/args/cycle --chain:@=/cas/args/chain \
+  --then-cycle:@=/cas/args/then-cycle "$@"; }
+
+# Hops in the chain test. The server's request thread has Rust's default 2 MiB
+# stack, and a hop used to cost about 13 KB of it: the old pipeline aborted the
+# server at around 150. Well past that, so the test fails the way the bug did.
+chain_len=500
 
 # A bash worker running one of this test's fixture scripts.
 fixture() { local w=$1; shift; caos curry --base:@=/cas/args/bash --worker1:@="/cas/args/$w" "$@"; }
@@ -139,6 +148,37 @@ cycled)
   grep -q "run cycle detected" /cas/args/error \
     || fail "no cycle reported; got: $(cat /cas/args/error)"
   echo "  ok: run failed with a run-cycle error" >&2
+
+  echo "== a chain of $chain_len thens runs in constant native stack ==" >&2
+  # chain.sh promises a `then` that is itself with --n one lower, down to zero.
+  # Each hop is a distinct request and a container of its own; the server used
+  # to hold a native frame per hop, and died at about 150 of them.
+  caos run-then /cas/args/num \
+    --run:hash="$(fixture chain --n="$chain_len")" \
+    --then:hash="$(next chained)"
+  ;;
+
+chained)
+  [ "$(result_text)" = "bottom in=21" ] \
+    || fail "chain: expected 'bottom in=21', got: $(result_text)"
+  echo "  ok: $chain_len hops of then came back as one result" >&2
+
+  echo "== a then that returns to an earlier hop's request is a cycle ==" >&2
+  # then-cycle.sh alternates --n between 0 and 1, so its third hop is the first
+  # hop's request again: a cycle closed through `then`, not through `run`.
+  caos run-then /cas/args/num --run:hash="$(fixture then-cycle --n=0)" \
+    --then:hash="$(next then-cycled)" --catch
+  ;;
+
+then-cycled)
+  [ -e /cas/args/error ] || fail "expected the then-cycle to fail"
+  caos get /cas/args/error
+  grep -q "run cycle detected" /cas/args/error \
+    || fail "no cycle reported; got: $(cat /cas/args/error)"
+  # The listing walks the chain from the repeated hop: A -> B -> A, two arrows.
+  [ "$(grep -c -- '->' /cas/args/error)" -ge 2 ] \
+    || fail "cycle listing names fewer than two hops: $(cat /cas/args/error)"
+  echo "  ok: the then-chain failed with a run-cycle error naming both hops" >&2
 
   printf 'run-then: ALL PASS\n' > /tmp/report
   cat /tmp/report >&2

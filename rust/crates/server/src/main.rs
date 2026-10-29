@@ -395,15 +395,12 @@ fn main() {
     // compute::resolve_promise).
     for request in server.incoming_requests() {
         let config = Arc::clone(&config);
-        std::thread::Builder::new()
-            .stack_size(compute::EVAL_STACK_BYTES)
-            .spawn(move || {
-                if let Err(err) = handle(config, request) {
-                    // Only reachable if writing the response itself fails.
-                    eprintln!("failed to send response: {err}");
-                }
-            })
-            .expect("spawning a request thread");
+        std::thread::spawn(move || {
+            if let Err(err) = handle(config, request) {
+                // Only reachable if writing the response itself fails.
+                eprintln!("failed to send response: {err}");
+            }
+        });
     }
 }
 
