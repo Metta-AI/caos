@@ -1695,6 +1695,18 @@ sandbox = false''
             vendorHash = "sha256-1+bSEs1daOIaXWddfmkEOsxcyn/zBzB/0T29YGw+RCw=";
           };
 
+          # The watchdog-prod host's program (prod/watchdog): probes, the
+          # Datadog poller and the Claude session runner, one binary. Same
+          # shape as the deploy driver above, same caos/w error policy.
+          caos-watchdog = pkgs.buildGoModule {
+            pname = "caos-watchdog";
+            version = "0.1.0";
+            src = ./.;
+            modRoot = "prod/watchdog";
+            meta.mainProgram = "caos-watchdog";
+            vendorHash = "sha256-hpilWVREkwmhu9LczVyfYMPZuaZRtm1iNJk62n+aRO4=";
+          };
+
           # `nix build` (no attr) yields the PINNED host tools: caos-cli,
           # caos, caosd, and (on Linux) caos-runnerd in one result/bin. This is the
           # explicit build step — its `caosd` bakes the exact server/runnerd/
@@ -1822,6 +1834,24 @@ sandbox = false''
             caos.package = self.packages.x86_64-linux.caos-tools;
             # caos.advertiseAddress is deliberately NOT set here: it differs
             # per machine, so deploy.sh reads it off the host and layers it on.
+          }
+        ];
+      };
+
+      # The box that watches caosd-prod. Pure: `nixos-rebuild switch --flake
+      # ...#watchdog-prod` works, because the one per-fleet fact (which
+      # instance to watch) is pinned here rather than read off a host.
+      nixosConfigurations.watchdog-prod = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          "${nixpkgs}/nixos/modules/virtualisation/amazon-image.nix"
+          ./prod/watchdog/configuration.nix
+          {
+            networking.hostName = "watchdog-prod";
+            caos.watchdog.package = self.packages.x86_64-linux.caos-watchdog;
+            caos.watchdog.clientTools = self.packages.x86_64-linux.caos-tools;
+            # caosd-prod, the one production server (prod/README.md).
+            caos.watchdog.targetInstance = "i-0c0aae25be3e44d8e";
           }
         ];
       };
