@@ -64,6 +64,9 @@ advertises a private address and makes every client fall back to an iroh relay
 ## After deploying
 
 `caosd` is a systemd unit, enabled, so it comes back on its own after a reboot.
+It also comes back when the stack's container dies: the unit waits on `caos-stack`
+and fails when it exits, and `Restart=always` runs `caosd up` again 30 seconds
+later. `journalctl -u caosd` shows "the caos-stack container exited".
 
 ```sh
 systemctl status caosd          # the stack
