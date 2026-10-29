@@ -40,7 +40,16 @@ let
       CAOS_STACK_REDIS_MAXMEM="$(${pkgs.coreutils}/bin/tr -d '[:space:]' < ${redisMaxmemFile})"
       export CAOS_STACK_REDIS_MAXMEM
     fi
-    exec ${cfg.package}/bin/caosd up --iroh
+    ${cfg.package}/bin/caosd up --iroh || exit 1
+    # `up` returns once the stack is ready and leaves its container running on
+    # its own, so nothing here noticed it die: caosd-prod sat with the server
+    # aborted and the unit still "active" for 23 hours. Say ready, then stay
+    # alive exactly as long as the container does. Its exit is this unit
+    # failing, and Restart= runs `up` again.
+    ${pkgs.systemd}/bin/systemd-notify --ready
+    ${config.virtualisation.docker.package}/bin/docker wait caos-stack > /dev/null
+    echo "caosd: the caos-stack container exited" >&2
+    exit 1
   '';
 in
 {
@@ -328,8 +337,13 @@ in
         CAOS_IROH_RELAY = cfg.relay.url;
       };
       serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
+        # `notify`, so a start still waits for the stack to be ready (as the
+        # oneshot did) and the unit stays running for as long as the container
+        # does. The script above sends the notification from a child process.
+        Type = "notify";
+        NotifyAccess = "all";
+        Restart = "always";
+        RestartSec = 30;
         User = "caos";
         Group = "caos";
         WorkingDirectory = dataDir;
@@ -338,6 +352,9 @@ in
         # A cold first run builds every std worker image before it returns.
         TimeoutStartSec = "90min";
       };
+      # A stack that cannot start is retried every RestartSec forever rather
+      # than given up on after five tries: a down server is worse than a noisy one.
+      unitConfig.StartLimitIntervalSec = 0;
     };
 
     # SO AN INTERACTIVE `caosd` FINDS THIS MACHINE'S STACK. Without it the

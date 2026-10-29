@@ -1538,33 +1538,38 @@ fn resolve_promise(
                 for _ in 0..width {
                     let (kids, next, slots) = (&kids, &next, &slots);
                     let img = img.as_str();
-                    scope.spawn(move || loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(kid) = kids.get(i) else { return };
-                        let outcome = (|| {
-                            let arg = named_entry("in", kid.mode, kid.oid);
-                            let result = run_image(
-                                config,
-                                img,
-                                vec![arg],
-                                salt,
-                                stack,
-                                secrets,
-                                // The map entry's own name — which for the
-                                // test suite is the test name, and is the
-                                // only thing that gives a 29-way fan-out
-                                // readable nodes. A `help` lookup cannot:
-                                // children are curried from `base`, not
-                                // from the tool's own ArgTree, so the
-                                // tool's help is not in their lineage.
-                                |arg_tree| {
-                                    crate::status::child(config, parent, "map", &kid.name, arg_tree)
-                                },
-                            )?;
-                            result_entry(&kid.name, &result)
-                        })();
-                        *slots[i].lock().expect("map result slot") = Some(outcome);
-                    });
+                    std::thread::Builder::new()
+                        .stack_size(EVAL_STACK_BYTES)
+                        .spawn_scoped(scope, move || loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(kid) = kids.get(i) else { return };
+                            let outcome = (|| {
+                                let arg = named_entry("in", kid.mode, kid.oid);
+                                let result = run_image(
+                                    config,
+                                    img,
+                                    vec![arg],
+                                    salt,
+                                    stack,
+                                    secrets,
+                                    // The map entry's own name — which for the
+                                    // test suite is the test name, and is the
+                                    // only thing that gives a 29-way fan-out
+                                    // readable nodes. A `help` lookup cannot:
+                                    // children are curried from `base`, not
+                                    // from the tool's own ArgTree, so the
+                                    // tool's help is not in their lineage.
+                                    |arg_tree| {
+                                        crate::status::child(
+                                            config, parent, "map", &kid.name, arg_tree,
+                                        )
+                                    },
+                                )?;
+                                result_entry(&kid.name, &result)
+                            })();
+                            *slots[i].lock().expect("map result slot") = Some(outcome);
+                        })
+                        .expect("spawning a map thread");
                 }
             });
             let results: Vec<Result<gix::objs::tree::Entry, HttpError>> = slots
@@ -3316,6 +3321,14 @@ fn bundle_ticket(
         .map_err(|e| HttpError::new(500, e))
 }
 
+/// Stack for a thread that evaluates: a request, a ticket, a map child. Rust's
+/// default is 2 MiB, and the evaluator recurses by the depth of the tree it
+/// walks. A ticket thread overflowed it on caosd-prod, which aborts the whole
+/// server (`fatal runtime error: stack overflow`) and took the stack down for a
+/// day. The stack is virtual memory, mapped lazily, so a generous bound costs
+/// nothing until a walk needs it.
+pub(crate) const EVAL_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 /// Run `work` under `ticket` on a thread of its own, and note on the ticket's
 /// trace that it was requested, started and ended. Starting what is already
 /// running joins it, and what has succeeded is already answered; a FAILED one
@@ -3353,6 +3366,7 @@ fn start_work(
     };
     let spawned = std::thread::Builder::new()
         .name(format!("ticket-{ticket}"))
+        .stack_size(EVAL_STACK_BYTES)
         .spawn(move || {
             crate::status::requested(&guard.config, &guard.ticket);
             crate::status::started(&guard.config, &guard.ticket);
