@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Bash(caos-watchdog ssh:*)",
+      "Bash(caos-watchdog notify:*)",
+      "Bash(caos-watchdog ticket:*)",
+      "Bash(git ls-remote:*)",
+      "Bash(aws ec2 describe-instance-status:*)",
+      "Bash(aws ec2 describe-instances:*)",
+      "Bash(aws ssm describe-instance-information:*)",
+      "Bash(aws ssm list-command-invocations:*)",
+      "Bash(aws ssm get-command-invocation:*)",
+      "Bash(date:*)",
+      "Bash(sleep:*)",
+      "Read(./**)",
+      "Glob(./**)",
+      "Grep(./**)"
+    ],
+    "deny": [
+      "Bash(aws ec2 reboot-instances:*)",
+      "Bash(aws ec2 stop-instances:*)",
+      "Bash(aws ec2 terminate-instances:*)",
+      "Bash(aws ssm start-session:*)",
+      "Bash(aws ssm send-command:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(nix:*)",
+      "Bash(sudo:*)",
+      "Write",
+      "Edit",
+      "WebFetch",
+      "WebSearch",
+      "Agent"
+    ]
+  },
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
