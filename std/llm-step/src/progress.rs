@@ -508,9 +508,8 @@ fn retarget_transcript_transition(
     mut transition: Transition,
 ) -> Result<Transition, String> {
     let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
-    match &mut transition {
-        Transition::MessageAppend { entry, payloads } => retarget_entry(entry, payloads, ordinal),
-        _ => {}
+    if let Transition::MessageAppend { entry, payloads } = &mut transition {
+        retarget_entry(entry, payloads, ordinal);
     }
     Ok(transition)
 }
