@@ -162,15 +162,16 @@ fn title(prompt: &str) -> String {
     }
 }
 
-fn user_entry(conversation: &str, request: &Request, joining: Option<Oid>) -> TranscriptEntry {
+/// The transcript entry this event writes: the prompt, the closing message or
+/// the failure, authored by the harness's actor.
+fn entry(conversation: &str, request: &Request, role: Role) -> TranscriptEntry {
     TranscriptEntry {
         message_id: request.message_id.clone(),
         conversation: conversation.to_string(),
-        role: Role::User,
+        role,
         actor: request.actor.clone(),
-        request: joining,
-        round: None,
-        model: None,
+        model: (role == Role::Assistant && !request.model.is_empty())
+            .then(|| request.model.clone()),
         blocks: vec![Block::Text {
             text: request.text.clone(),
         }],
@@ -179,56 +180,20 @@ fn user_entry(conversation: &str, request: &Request, joining: Option<Oid>) -> Tr
     }
 }
 
-/// The transitions that open a request on top of `parent`, minted and not yet
-/// pushed: the prompt, its admission and its claim. The request is identified by
-/// the commit of the prompt that opened it -- unique, content-addressed, and
-/// known before the admission that names it is written.
-fn open_request(
-    state: &mut State,
+/// The prompt, minted on top of `parent` and not yet pushed.
+fn mint_prompt(
+    store: &mut GitStore,
     parent: &Oid,
     conversation: &str,
     request: &Request,
-    configuration: &str,
     signature: &Signature,
-) -> Result<(Oid, Option<u64>), String> {
+) -> Result<Oid, String> {
     let transition = Transition::MessageAppend {
-        entry: user_entry(conversation, request, None),
+        entry: entry(conversation, request, Role::User),
         payloads: Vec::new(),
     };
-    let appended = apply(state.store_mut(), Some(parent), &transition)?;
-    let ordinal = appended.ordinal;
-    let message = mint(
-        state.store_mut(),
-        parent,
-        &appended,
-        transition.kind(),
-        signature,
-    )?;
-    let record = TurnRecord {
-        id: message.clone(),
-        request_head: message.clone(),
-        model: request.model.clone(),
-        configuration: configuration.to_string(),
-        round: 0,
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    };
-    let admission = inherited_signature(state.store(), &message)?;
-    let admitted = mint_detached(state, &message, &Transition::TurnAdmit { record }, &admission)?;
-    let claimed = mint_detached(
-        state,
-        &admitted,
-        &Transition::TurnClaim {
-            request: message,
-            latest_message: request.message_id.clone(),
-        },
-        &admission,
-    )?;
-    Ok((claimed, ordinal))
+    let applied = apply(store, Some(parent), &transition)?;
+    mint(store, parent, &applied, transition.kind(), signature)
 }
 
 /// The commit a content locator names, in `store` with its history. The server
@@ -263,14 +228,6 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
-/// The step as a conversation's configured worker: this image with the
-/// conversation bound, which is what the request records as its configuration.
-fn configuration(conversation: &str) -> Result<String, String> {
-    let image = cas_hash(&arg("base"))?;
-    caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
-}
-
-/// Make the conversation as a FORK of `from`, with its first prompt: the fork,
 /// then the prompt's request, pushed together with the creator's membership
 /// refs. `None` when the conversation exists, so the caller records onto it.
 ///
@@ -333,14 +290,7 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         &signature,
     )?;
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
-    let (claimed, _) = open_request(
-        &mut state,
-        &forked,
-        conversation,
-        request,
-        &configuration(conversation)?,
-        &signature,
-    )?;
+    let claimed = mint_prompt(state.store_mut(), &forked, conversation, request, &signature)?;
     let active = conversation_protocol::v3::refs::active_membership_ref(&request.actor, conversation)?;
     let archived =
         conversation_protocol::v3::refs::archived_membership_ref(&request.actor, conversation)?;
@@ -411,15 +361,7 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
     // The chain is minted in a State whose head is the root, so it can use the
     // same helpers as a conversation that exists; only the push differs.
     let mut state = State::from_store(store, refname.clone(), root.clone())?;
-    let (claimed, _) = open_request(
-        &mut state,
-        &root,
-        conversation,
-        request,
-        &configuration(conversation)?,
-        &signature,
-    )?;
-    // Negotiated, as for a fork: the root's parent and its history may be on
+    let claimed = mint_prompt(state.store_mut(), &root, conversation, request, &signature)?;
     // the server under no advertised ref.
     let pushed = state.store().push_negotiating(&[RefUpdate {
         refname: refname.clone(),
@@ -440,165 +382,17 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
 }
 
 fn prompt(conversation: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
-    for _ in 0..progress::MAX_APPEND_ATTEMPTS {
-        state.reload()?;
-        let view = state.conversation()?;
-        if message_ordinal(&view, &request.message_id)?.is_some() {
-            return Ok("recorded");
-        }
-        // A request a stop left open for a backgrounded call. While that call
-        // runs, the prompt joins its request, as a prompt typed into a running
-        // tui turn does; once it has finished the request has nothing left to
-        // wait for and closes, and the prompt opens a request of its own.
-        let held = match view.active_turn()? {
-            Some(active) => {
-                let running = outstanding_call(&view, &active)?.is_some();
-                Some((active.id, running))
-            }
-            None => None,
-        };
-        drop(view);
-        let expected = state.head().clone();
-        let signature = inherited_signature(state.store(), &expected)?;
-        let mut parent = expected.clone();
-        if let Some((active, running)) = held {
-            if running {
-                let joined = Transition::TurnInterject {
-                    request: active.clone(),
-                    entry: user_entry(conversation, request, Some(active)),
-                    payloads: Vec::new(),
-                };
-                match state.try_append_at(&expected, joined)? {
-                    TryAppend::Appended(_) => return Ok("joined"),
-                    TryAppend::HeadChanged(_) => continue,
-                }
-            }
-            parent = mint_detached(
-                state,
-                &parent,
-                &Transition::TurnTerminal {
-                    request: active,
-                    outcome: TurnOutcome::Idle {
-                        result: None,
-                        interrupted: false,
-                    },
-                },
-                &signature,
-            )?;
-        }
-        let (claimed, ordinal) = open_request(
-            state,
-            &parent,
-            conversation,
-            request,
-            &configuration(conversation)?,
-            &signature,
-        )?;
-        match state.push_chain(&expected, claimed, ordinal)? {
-            TryAppend::Appended(_) => return Ok("recorded"),
-            TryAppend::HeadChanged(_) => continue,
-        }
-    }
-    Err(format!(
-        "conversation {conversation:?} kept changing while its prompt was recorded"
-    ))
+    append(conversation, state, request, Role::User, "prompt")
 }
 
-/// A call of `request` that has not finished, if there is one: one that started
-/// and has no result yet, or one the current round declared that has not
-/// started. A call is recorded in the round BEFORE `request.round`, which is the
-/// one its declaration opened.
-pub(crate) fn outstanding_call(
-    view: &Conversation<'_>,
-    request: &TurnRecord,
-) -> Result<Option<String>, String> {
-    for round in 0..request.round {
-        if let Some(call) = view
-            .tools(&request.id, round)?
-            .into_iter()
-            .find(|call| call.status == CallStatus::Started)
-        {
-            return Ok(Some(call.id));
-        }
-    }
-    let Some(declaring) = request.round.checked_sub(1) else {
-        return Ok(None);
-    };
-    for call in &request.calls {
-        if view.tool(&request.id, declaring, &call.id)?.is_none() {
-            return Ok(Some(call.id.clone()));
-        }
-    }
-    Ok(None)
-}
-
+/// The message that ended a turn. A harness that moved a call to the background
+/// ends its turn with that call still running; its result is a fact recorded
+/// whenever it arrives, so nothing here waits for it or keeps anything open.
 fn stop(conversation: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
-    for _ in 0..progress::MAX_APPEND_ATTEMPTS {
-        state.reload()?;
-        let view = state.conversation()?;
-        if message_ordinal(&view, &request.message_id)?.is_some() {
-            return Ok("recorded");
-        }
-        // Nothing to close. A stop for a turn that opened no request is not an
-        // error: an interrupted session can leave one behind.
-        let Some(active) = view.active_turn()? else {
-            return Ok("nothing");
-        };
-        // A harness ends a turn with a call still running when it has moved that
-        // call to the background, and delivers the result in a later turn. Only
-        // a RUNNING request accepts the call's completion, so the request stays
-        // open for it and the next prompt closes it. The closing message is not
-        // recorded either: its `model.complete` would open a new round, and the
-        // step checks a finishing call against the round current AT THE FINISH,
-        // so it would fail the call as undeclared.
-        if outstanding_call(&view, &active)?.is_some() {
-            return Ok("held");
-        }
-        let ordinal = view.transcript_len()?;
-        drop(view);
-
-        let mut transitions = Vec::new();
-        let mut result = None;
-        if !request.text.trim().is_empty() {
-            transitions.push(Transition::ModelComplete {
-                request: active.id.clone(),
-                entry: TranscriptEntry {
-                    message_id: request.message_id.clone(),
-                    conversation: conversation.to_string(),
-                    role: Role::Assistant,
-                    actor: request.actor.clone(),
-                    request: Some(active.id.clone()),
-                    round: Some(active.round),
-                    model: Some(active.model.clone()),
-                    blocks: vec![Block::Text {
-                        text: request.text.clone(),
-                    }],
-                    proposal: None,
-                    source_tree_resolution: None,
-                },
-                payloads: Vec::new(),
-                calls: Vec::new(),
-            });
-            // The turn's result is that message, by path -- what a reader shows
-            // for the turn, and the same thing the step names for its own.
-            result = Some(paths::transcript_entry_path(ordinal, &request.message_id));
-        }
-        transitions.push(Transition::TurnTerminal {
-            request: active.id,
-            outcome: TurnOutcome::Idle {
-                result,
-                interrupted: false,
-            },
-        });
-        let expected = state.head().clone();
-        match state.try_append_many_at(&expected, transitions)? {
-            TryAppend::Appended(_) => return Ok("recorded"),
-            TryAppend::HeadChanged(_) => continue,
-        }
+    if request.text.trim().is_empty() {
+        return Ok("nothing");
     }
-    Err(format!(
-        "conversation {conversation:?} kept changing while its stop was recorded"
-    ))
+    append(conversation, state, request, Role::Assistant, "stop")
 }
 
 fn failure(
@@ -606,56 +400,33 @@ fn failure(
     state: &mut State,
     request: &Request,
 ) -> Result<&'static str, String> {
+    append(conversation, state, request, Role::System, "failure")
+}
+
+/// Append the event's entry, once: a repeat finds its message id already there.
+fn append(
+    conversation: &str,
+    state: &mut State,
+    request: &Request,
+    role: Role,
+    what: &str,
+) -> Result<&'static str, String> {
     for _ in 0..progress::MAX_APPEND_ATTEMPTS {
         state.reload()?;
-        let view = state.conversation()?;
-        if message_ordinal(&view, &request.message_id)?.is_some() {
+        if message_ordinal(&state.conversation()?, &request.message_id)?.is_some() {
             return Ok("recorded");
         }
-        let Some(active) = view.active_turn()? else {
-            return Ok("nothing");
-        };
-        let ordinal = view.transcript_len()?;
-        // A backgrounded call still has its result to deliver, as in `stop`, so
-        // the failure is recorded but the request is left running for it.
-        let holding = outstanding_call(&view, &active)?.is_some();
-        drop(view);
-
-        // The outcome names a TRANSCRIPT ENTRY, not the text: `apply` validates
-        // it as a path, and a reader follows it to the failure. So the message
-        // is recorded first and the terminal points at it.
-        let mut transitions = vec![Transition::MessageAppend {
-            entry: TranscriptEntry {
-                message_id: request.message_id.clone(),
-                conversation: conversation.to_string(),
-                role: Role::System,
-                actor: request.actor.clone(),
-                request: Some(active.id.clone()),
-                round: Some(active.round),
-                model: None,
-                blocks: vec![Block::Text {
-                    text: request.text.clone(),
-                }],
-                proposal: None,
-                source_tree_resolution: None,
-            },
-            payloads: Vec::new(),
-        }];
-        if !holding {
-            transitions.push(Transition::TurnTerminal {
-                request: active.id,
-                outcome: TurnOutcome::Failed {
-                    error: paths::transcript_entry_path(ordinal, &request.message_id),
-                },
-            });
-        }
         let expected = state.head().clone();
-        match state.try_append_many_at(&expected, transitions)? {
+        let transition = Transition::MessageAppend {
+            entry: entry(conversation, request, role),
+            payloads: Vec::new(),
+        };
+        match state.try_append_at(&expected, transition)? {
             TryAppend::Appended(_) => return Ok("recorded"),
             TryAppend::HeadChanged(_) => continue,
         }
     }
     Err(format!(
-        "conversation {conversation:?} kept changing while its failure was recorded"
+        "conversation {conversation:?} kept changing while its {what} was recorded"
     ))
 }
