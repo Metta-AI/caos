@@ -974,12 +974,6 @@ where
     P: FnMut(),
 {
     let parent_view = Conversation::open(store, parent)?;
-    let active = parent_view.active_turn()?;
-    if active.is_none() && !start_turn {
-        return Err(format!(
-            "conversation {id:?} is no longer active; submit again to start a new turn"
-        ));
-    }
     let mut proposal_record = None;
     let mut resolution = None;
     let mut conflict = None;
@@ -1025,70 +1019,36 @@ where
         });
         resolution = Some(reconciled);
     }
-    let request_for_entry = active.as_ref().map(|record| record.id.clone());
     let entry = user_entry(
         id,
         username,
         message_id,
         message,
-        request_for_entry,
         proposal_record,
         resolution,
     );
-    let transition = match &active {
-        Some(active) => Transition::TurnInterject {
-            request: active.id.clone(),
-            entry,
-            payloads: Vec::new(),
-        },
-        None => Transition::MessageAppend {
-            entry,
-            payloads: Vec::new(),
-        },
+    let transition = Transition::MessageAppend {
+        entry,
+        payloads: Vec::new(),
     };
     let message_commit = mint_transition(store, parent, &transition, signature)?;
-    if conflict.is_some() || active.is_some() {
+    if conflict.is_some() || !start_turn {
         return Ok(MessageCandidate {
             message: message_commit.clone(),
             head: message_commit,
-            request: active.map(|record| record.id),
+            request: None,
             conflict,
         });
     }
 
+    // The request that answers this message is prepared, not recorded: the
+    // caller runs it, and is the only one that knows it is running.
     on_preparing();
     let prepared = prepare(t, options, id, message_commit.as_str())?;
-    let request = oid(&prepared.request, "prepared request")?;
-    let view = Conversation::open(store, &message_commit)?;
-    let record = TurnRecord {
-        id: request.clone(),
-        request_head: message_commit.clone(),
-
-        model: options
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-        configuration: prepared.configuration,
-        round: 0,
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    };
-    drop(view);
-    let admission_signature = inherited_signature(store, &message_commit)?;
-    let admitted = mint_transition(
-        store,
-        &message_commit,
-        &Transition::TurnAdmit { record },
-        &admission_signature,
-    )?;
     Ok(MessageCandidate {
-        message: message_commit,
-        head: admitted,
-        request: Some(request),
+        message: message_commit.clone(),
+        head: message_commit,
+        request: Some(oid(&prepared.request, "prepared request")?),
         conflict: None,
     })
 }
