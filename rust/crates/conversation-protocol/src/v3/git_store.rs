@@ -906,21 +906,7 @@ impl CodeOps for GitStore {
         let base_commit = self.read_commit(base).map_err(String::from)?;
         let ours_tree = self.tree_of(ours)?;
         let theirs_tree = self.tree_of(theirs)?;
-        let synthetic_head = |tree: Oid, message: &[u8]| CommitInfo {
-            tree,
-            parents: vec![base.clone()],
-            author: base_commit.author.clone(),
-            committer: base_commit.committer.clone(),
-            extra_headers: Vec::new(),
-            message: message.to_vec(),
-        };
-        let ours_head = self
-            .write_commit(&synthetic_head(ours_tree, b"caos merge ours\n"))
-            .map_err(String::from)?;
-        let theirs_head = self
-            .write_commit(&synthetic_head(theirs_tree, b"caos merge theirs\n"))
-            .map_err(String::from)?;
-        self.merge_tree(&ours_head, &theirs_head)
+        self.merge_over(base, &base_commit, ours_tree, theirs_tree)
     }
 
     fn commit(
@@ -957,6 +943,57 @@ impl GitStore {
     /// git finds the base on its own, and with nothing to share it refuses.
     pub fn merge_commits(&self, ours: &Oid, theirs: &Oid) -> Result<MergeOutcome, String> {
         self.merge_tree(ours, theirs)
+    }
+
+    /// Merge `theirs` into `ours` from `base_tree` rather than from a base
+    /// their histories share: for two commits git finds no base for, such as a
+    /// conversation rooted on G3 and a commit of the repository its content was
+    /// seeded from. The base is a parentless synthetic commit of that tree.
+    pub fn merge_commits_over(
+        &mut self,
+        base_tree: &Oid,
+        ours: &Oid,
+        theirs: &Oid,
+    ) -> Result<MergeOutcome, String> {
+        let ours_commit = self.read_commit(ours).map_err(String::from)?;
+        let theirs_tree = self.tree_of(theirs)?;
+        let base_commit = CommitInfo {
+            tree: base_tree.clone(),
+            parents: Vec::new(),
+            author: ours_commit.author.clone(),
+            committer: ours_commit.committer.clone(),
+            extra_headers: Vec::new(),
+            message: b"caos merge base\n".to_vec(),
+        };
+        let base = self.write_commit(&base_commit).map_err(String::from)?;
+        self.merge_over(&base, &base_commit, ours_commit.tree, theirs_tree)
+    }
+
+    /// Merge two trees as children of the commit `base`, whose content is
+    /// `base_commit`: each becomes a synthetic head on it, so git merges them
+    /// from exactly that base.
+    fn merge_over(
+        &mut self,
+        base: &Oid,
+        base_commit: &CommitInfo,
+        ours_tree: Oid,
+        theirs_tree: Oid,
+    ) -> Result<MergeOutcome, String> {
+        let synthetic_head = |tree: Oid, message: &[u8]| CommitInfo {
+            tree,
+            parents: vec![base.clone()],
+            author: base_commit.author.clone(),
+            committer: base_commit.committer.clone(),
+            extra_headers: Vec::new(),
+            message: message.to_vec(),
+        };
+        let ours_head = self
+            .write_commit(&synthetic_head(ours_tree, b"caos merge ours\n"))
+            .map_err(String::from)?;
+        let theirs_head = self
+            .write_commit(&synthetic_head(theirs_tree, b"caos merge theirs\n"))
+            .map_err(String::from)?;
+        self.merge_tree(&ours_head, &theirs_head)
     }
 
     /// `git merge-tree --write-tree` of two commits: the merged tree, or the
@@ -1718,6 +1755,50 @@ mod tests {
         let head = golden(&mut store);
         let validated = validate_spine(&store, &head, &mut HashSet::new()).expect("validate spine");
         assert!(!validated.is_empty());
+    }
+
+    #[test]
+    fn merge_commits_over_an_explicit_base_merges_unrelated_histories() {
+        let directory = TestDirectory::new("merge-over");
+        let repository = directory.child("repository");
+        init(&repository, false);
+        let mut store = GitStore::open(&repository, None).expect("open git store");
+        // The tree both sides were seeded from, recorded in neither history: a
+        // conversation rooted on G3 and the repository its content came from.
+        let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
+        let base_tree = update_tree(&mut store, Some(&base_tree), "kept.txt", b"kept\n");
+        let ours_tree = update_tree(&mut store, Some(&base_tree), "ours.txt", b"ours\n");
+        let ours = write_commit(&mut store, &ours_tree, &[], "ours\n");
+        let theirs_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"theirs\n");
+        let theirs = write_commit(&mut store, &theirs_tree, &[], "theirs\n");
+        assert_eq!(store.merge_base(&ours, &theirs).unwrap(), None);
+        assert!(store.merge_commits(&ours, &theirs).is_err());
+
+        let merged = match store
+            .merge_commits_over(&base_tree, &ours, &theirs)
+            .unwrap()
+        {
+            MergeOutcome::Merged { tree } => tree,
+            MergeOutcome::Conflict { paths } => panic!("unexpected conflict: {paths:?}"),
+        };
+        let snapshot = Snapshot::new(&store, merged);
+        assert_eq!(snapshot.read("ours.txt").unwrap(), Some(b"ours\n".to_vec()));
+        assert_eq!(
+            snapshot.read("shared.txt").unwrap(),
+            Some(b"theirs\n".to_vec())
+        );
+        assert_eq!(snapshot.read("kept.txt").unwrap(), Some(b"kept\n".to_vec()));
+
+        let conflict_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"ours\n");
+        let conflict = write_commit(&mut store, &conflict_tree, &[], "conflict\n");
+        assert_eq!(
+            store
+                .merge_commits_over(&base_tree, &conflict, &theirs)
+                .unwrap(),
+            MergeOutcome::Conflict {
+                paths: vec!["shared.txt".to_string()]
+            }
+        );
     }
 
     #[test]

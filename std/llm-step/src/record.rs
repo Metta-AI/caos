@@ -228,6 +228,37 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
+<<<<<<< 47613a3f150ad3b41c52fad178f75c5f1432a613
+=======
+/// The step as a conversation's configured worker: this image with the
+/// conversation bound, which is what the request records as its configuration.
+fn configuration(conversation: &str) -> Result<String, String> {
+    let image = cas_hash(&arg("base"))?;
+    caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
+}
+
+/// The tree a conversation's content was seeded from: its root's tree, found by
+/// following first parents from `head`, without the conversation's own .caos/.
+fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
+    let mut current = head.clone();
+    loop {
+        let info = store.read_commit(&current).map_err(String::from)?;
+        use conversation_protocol::v3::Kind as CommitKind;
+        if CommitKind::parse_message(&info.message)? == CommitKind::ConversationRoot {
+            let mut tree = TreeBuilder::from(Some(info.tree));
+            tree.delete(paths::CAOS_DIR);
+            return Ok(tree.build(store)?);
+        }
+        current = info
+            .parents
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("{current} has no parent before its conversation's root"))?;
+    }
+}
+
+/// Make the conversation as a FORK of `from`, with its first prompt: the fork,
+>>>>>>> ff94dd738ef778cc4ed9e2c3a80cf89f0f3fae37
 /// then the prompt's request, pushed together with the creator's membership
 /// refs. `None` when the conversation exists, so the caller records onto it.
 ///
@@ -250,10 +281,21 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     // root's parent gives them. .caos/ is the fork's own record and stays as the
     // source left it. A conflict refuses the fork, naming the files: nobody is
     // in the conversation yet to resolve it.
+    //
+    // A conversation made before roots parented their content commit is rooted
+    // on G3 and shares no history with that repository, so git finds no base.
+    // Its root's content, without .caos/, is the tree it was seeded from, and
+    // the fork merges from that instead.
     let (content, merged) = match &request.content {
         Some(locator) => {
             let commit = content_commit(&store, locator)?;
-            let tree = match store.merge_commits(from, &commit)? {
+            let outcome = if store.merge_base(from, &commit)?.is_some() {
+                store.merge_commits(from, &commit)?
+            } else {
+                let base = seed_tree(&mut store, from)?;
+                store.merge_commits_over(&base, from, &commit)?
+            };
+            let tree = match outcome {
                 MergeOutcome::Merged { tree } => tree,
                 MergeOutcome::Conflict { paths } => {
                     return Err(format!(
