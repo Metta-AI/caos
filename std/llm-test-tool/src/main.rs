@@ -134,6 +134,7 @@ enum ToolCommand {
         started_tool: Option<String>,
     },
 }
+
 #[derive(Debug)]
 struct ToolError {
     code: u8,
