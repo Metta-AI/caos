@@ -6,7 +6,7 @@ mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
-mod stack_merge;
+mod stack_merge_to_master;
 mod stack_publish;
 mod stack_sync;
 mod record;
