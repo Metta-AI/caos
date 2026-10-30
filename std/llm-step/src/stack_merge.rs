@@ -164,22 +164,22 @@ fn await_base(github: &Github, number: u64, trunk: &str) -> Result<Pr, String> {
         if pr.merged || pr.base == trunk {
             return Ok(pr);
         }
-        if !pr.stacked {
-            github.expect(
-                "PATCH",
-                &github.repo_path(&format!("/pulls/{number}")),
-                Some(&json!({"base": trunk})),
-                &[200],
-            )?;
-            continue;
-        }
         if Instant::now() >= deadline {
             return Err(format!(
                 "PR #{number} still targets {} two minutes after the layer below merged: GitHub has not retargeted it at {trunk} yet. Run stack-merge again in a minute; the layers below are merged.",
                 pr.base
             ));
         }
-        sleep(Duration::from_secs(3));
+        if pr.stacked {
+            sleep(Duration::from_secs(3));
+            continue;
+        }
+        github.expect(
+            "PATCH",
+            &github.repo_path(&format!("/pulls/{number}")),
+            Some(&json!({"base": trunk})),
+            &[200],
+        )?;
     }
 }
 
