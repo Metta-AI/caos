@@ -41,7 +41,6 @@ new_llm_conversation llm-subagent-path "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 LLM_TEST_USERNAME=Alice
 admit_turn "delegate a focused edit"
-request1=$request
 
 # The parent and the child share one stub and race for its next reply, so no reply can
 # be tied to a request NUMBER. Each is tied to what the request SAYS instead (std/llm-stub,
@@ -50,7 +49,7 @@ request1=$request
 # not matter.
 #
 # The parent's wait and harvest calls name the child. Its id is derived from the durable
-# spawn call (the parent conversation, the request, round 0 and the tool id), so it is
+# spawn call (the parent conversation and the call id), so it is
 # known here, before the child exists.
 child_id=$($TOOL child-id --parent "$conv" \
   --tool toolu_spawn) || fail "deriving the child id"
