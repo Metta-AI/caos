@@ -275,8 +275,8 @@ resumed session extends the same conversation.
 
 **A call is one request to the server.** `POST /eval/run` of the step, as a
 form: `base:hash` (the step), `conversation`, `tools-only=<tool_use_id>`, `tool`
-and `arguments` (JSON). The step declares the call on the conversation's active
-request as the model's own — v3 accepts no tool that no message declared — and
+and `arguments` (JSON). The step declares the call -- an assistant message carrying
+its `tool_use`, unless one already does -- and
 runs it, recording starting it and completing it. The answer is the call's own
 record, a tree of `status`, `observation` and `conversation`, so this process
 writes nothing and reads nothing back from the conversation. The protocol's first
@@ -286,27 +286,14 @@ that dies mid-call leaves a record that it was attempted. Each call is its own
 ArgTree because its id is in it, and a retry of the same call finds it already
 declared.
 
-The declaration lands a moment after the request reaches the server, not before
-it as it did when this process wrote it, so a `Stop` in that gap sees no call.
-Claude Code backgrounds a call only after 120s, long after the step has started.
+`start` answers with a ticket at once, and the job declares and runs the call
+whenever it gets there. The model may end its turn first; that changes nothing
+for the call.
 
-`start` is the exception, because it answers at once and the model may end its turn
-right behind the ticket. So the server first runs the step with `declare-only=1`
-(the same parameters, declaring the call on the active request and running nothing)
-and only then starts the job. The `Stop` that follows sees a declared call and holds
-the request open; the job finds its call already declared. A `start` with no open
-request fails in that call, not later in the ticket.
-
-Claude Code does not expose the model's round number and does not need to: the
-declaration opens a round, the call belongs to the round that declared it, and a
-`tool_use_id` is unique for the whole session.
-
-The step drives, completes and reads back each tools-only call on the round that
-declared it, not on the request's latest round. The two differ exactly when a
-backgrounded `start` is still running while the model's next call opens a round
-behind it; the started call then completes on its own, earlier round. Nothing
-gates a tool transition on which round is current -- a tool is a recorded fact --
-so completing a call on an earlier round is accepted like any other.
+Claude Code does not expose the model's round number and does not need to: a
+call is keyed by its `tool_use_id`, which is unique for the whole session, and
+the step reads back each call by that id, wherever in the transcript it was
+declared.
 
 **Tool execution is serial**, matching `llm-step`'s single queue. The tool server
 reads and handles one JSON-RPC request at a time, so a batch of parallel calls
