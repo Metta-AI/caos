@@ -14,8 +14,8 @@
 //! that reads it once or ignores `tools/list_changed` is correct, not stale.
 //!
 //! A call is `llm-step` in its tools-only mode, evaluated by the server the way
-//! `POST /eval/run` evaluates anything: the step declares the call on the
-//! conversation's active request, runs it, and answers with the call's record.
+//! `POST /eval/run` evaluates anything: the step declares the call (an assistant
+//! message carrying its `tool_use`), runs it, and answers with the call's record.
 //! Nothing here writes a conversation.
 //!
 //! WHAT A REQUEST CARRIES, as headers, because a request is all a stateless
