@@ -49,9 +49,7 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
     }
     p.branch_prefix = blank(p.branch_prefix);
     if p.stack.is_none() && p.repository.is_none() {
-        return Err(
-            "pass repository, or stack to take the repository from its 00-base.source.json".into(),
-        );
+        return Err("pass repository, or stack to take it from 00-base.source.json".into());
     }
     Ok(p)
 }
