@@ -714,14 +714,12 @@ struct TurnInput {
     actor: String,
     text: String,
     secret_hash: Oid,
-    model: String,
     configuration: Oid,
 }
 
 struct DeclareInput {
     repo: PathBuf,
     head: Option<Oid>,
-    request: Oid,
     actor: String,
     id: String,
     tool: String,
@@ -729,55 +727,40 @@ struct DeclareInput {
     refname: Option<String>,
 }
 
-/// Record a tool call the way a harness that drives the model itself does:
-/// claim the request if it is still queued, then one `model.complete` naming
-/// the call and carrying its arguments. Nothing runs -- the call is left
-/// PENDING, for a tools-only step to drain.
-fn declare(input: DeclareInput) -> Result<(), ToolError> {
-    let mut store = open(&input.repo)?;
-    let head = match input.head {
+/// The conversation head a command works at: `--head`, or what `--ref` names.
+fn resolve_head(
+    store: &GitStore,
+    head: Option<Oid>,
+    refname: Option<&String>,
+    command: &str,
+) -> Result<Oid, ToolError> {
+    match head {
         Some(head) => {
             store.ensure_local(&head)?;
-            head
+            Ok(head)
         }
         None => {
-            let refname = input
-                .refname
-                .as_ref()
-                .ok_or_else(|| ToolError::new("declare needs either --head or --ref"))?;
+            let refname = refname.ok_or_else(|| {
+                ToolError::new(format!("{command} needs either --head or --ref"))
+            })?;
             store
                 .fetch_ref(refname)?
-                .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))?
+                .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))
         }
-    };
+    }
+}
+
+/// Record a tool call the way a harness that drives the model itself does: an
+/// assistant message naming the call and carrying its arguments. Nothing runs --
+/// the call is left PENDING, for a tools-only step to run.
+fn declare(input: DeclareInput) -> Result<(), ToolError> {
+    let mut store = open(&input.repo)?;
+    let head = resolve_head(&store, input.head, input.refname.as_ref(), "declare")?;
     let arguments: serde_json::Value = serde_json::from_str(&input.input)
         .map_err(|error| ToolError::new(format!("parsing --input as JSON: {error}")))?;
 
     let view = Conversation::open(&store, &head)?;
     let conversation = view.identity()?.id;
-    let record = view
-        .turn(&input.request)?
-        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?;
-    let latest_message = newest_user_message(&view)?;
-    drop(view);
-
-    let mut at = head.clone();
-    if record.status == TurnStatus::Queued {
-        at = append(
-            &mut store,
-            &at,
-            Transition::TurnClaim {
-                request: input.request.clone(),
-                latest_message,
-            },
-        )?;
-    }
-
-    let view = Conversation::open(&store, &at)?;
-    let round = view
-        .turn(&input.request)?
-        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?
-        .round;
     let ordinal = view.transcript_len()?;
     drop(view);
 
@@ -789,12 +772,10 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
         conversation,
         role: Role::Assistant,
         actor: input.actor,
-        request: Some(input.request.clone()),
-        round: Some(round),
         model: Some("test-model".to_string()),
         blocks: vec![Block::ToolUse {
-            id: input.id.clone(),
-            name: input.tool.clone(),
+            id: input.id,
+            name: input.tool,
             arguments: format!("{dir}/{payload_name}"),
         }],
         proposal: None,
@@ -802,22 +783,16 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
     };
     let new = append(
         &mut store,
-        &at,
-        Transition::ModelComplete {
-            request: input.request.clone(),
+        &head,
+        Transition::MessageAppend {
             entry,
             payloads: vec![(payload_name, canonical_payload_bytes(&arguments)?)],
-            calls: vec![DeclaredCall {
-                id: input.id,
-                name: input.tool,
-            }],
         },
     )?;
     if let Some(refname) = input.refname {
         push_with_lease(&store, refname, &head, &new)?;
     }
     println!("head {new}");
-    println!("round {round}");
     println!("message {message_id}");
     Ok(())
 }
@@ -833,18 +808,6 @@ fn canonical_payload_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ToolErr
         ));
     }
     Ok(wrapped[PREFIX.len()..wrapped.len() - 2].to_vec())
-}
-
-fn newest_user_message(view: &Conversation<'_>) -> Result<String, ToolError> {
-    for ordinal in (0..view.transcript_len()?).rev() {
-        let (_, entry) = view
-            .transcript_entry(ordinal)?
-            .ok_or_else(|| ToolError::new(format!("missing transcript ordinal {ordinal}")))?;
-        if entry.role == Role::User {
-            return Ok(entry.message_id);
-        }
-    }
-    Err(ToolError::new("the request has no user message"))
 }
 
 struct RequestTreeEntry {
