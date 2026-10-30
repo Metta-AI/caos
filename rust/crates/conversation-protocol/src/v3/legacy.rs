@@ -229,10 +229,7 @@ fn v5_calls(
 
 /// The v5 transcript, in order: each entry without the fields this format
 /// dropped or a new root could not validate, with its payloads.
-fn v5_transcript(
-    store: &dyn ObjectStore,
-    tree: &Oid,
-) -> Result<Vec<Entry>, String> {
+fn v5_transcript(store: &dyn ObjectStore, tree: &Oid) -> Result<Vec<Entry>, String> {
     let snapshot = Snapshot::new(store, tree.clone());
     if snapshot.entry(paths::TRANSCRIPT_DIR)?.is_none() {
         return Ok(Vec::new());
