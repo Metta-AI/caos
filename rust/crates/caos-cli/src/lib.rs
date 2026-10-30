@@ -21,7 +21,7 @@ use caos::{
     run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
 };
 use conversation_protocol::v3::apply::{
-    apply, client_signature, inherited_signature, mint, Transition,
+    apply, client_signature, mint, Transition,
 };
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
@@ -1081,25 +1081,28 @@ fn repair_creation_membership(
     }
 }
 
-pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
+/// Interrupt whatever is driving the conversation: append the interruption. A
+/// driver that sees it after the prompt it answers stops, leaving the calls it
+/// had not finished closed as cancelled. Nothing is recorded twice: an
+/// interruption that is already the newest entry is left as it is.
+pub fn interrupt_conversation(t: &GitTransport, id: &str) -> Result<String, String> {
     let refname = refs::head_ref(id)?;
+    let username = resolve_username(t, None)?;
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_turn()? else {
-            let newest = view.latest_turn()?;
-            if newest.is_some_and(|record| {
-                matches!(record.status, TurnStatus::Cancelling | TurnStatus::Idle)
-            }) {
+        if let Some(last) = view.transcript_len()?.checked_sub(1) {
+            if view
+                .transcript_entry(last)?
+                .is_some_and(|(_, entry)| entry.is_interrupt())
+            {
                 return Ok(Step::Done(head.to_string()));
             }
-            return Err(format!("conversation {id:?} has no active request"));
-        };
-        if matches!(request.status, TurnStatus::Cancelling | TurnStatus::Idle) {
-            return Ok(Step::Done(head.to_string()));
         }
-        Ok(Step::Mint(Transition::TurnEscape {
-            request: request.id,
-            reason: None,
+        let mut entry = system_entry(id, caos::fresh_entropy()?, INTERRUPT_TEXT.to_string());
+        entry.actor = username.clone();
+        Ok(Step::Mint(Transition::MessageAppend {
+            entry,
+            payloads: Vec::new(),
         }))
     })
 }
