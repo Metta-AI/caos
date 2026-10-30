@@ -134,7 +134,6 @@ fork_p=$(git log --first-parent --format='%H %s' "$head_p" \
   || fail "the fork does not carry the client repository's files"
 git grep -q "a G3-rooted conversation" "$head_p" -- .caos/transcript \
   || fail "the fork lost the source's transcript"
-: "$base_arg"
 
 echo "== a prompt with no server is refused, naming what is missing ==" >&2
 # Exit 2 is the one status with which Claude Code blocks the prompt and shows the
