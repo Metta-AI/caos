@@ -74,6 +74,30 @@ in
   config = {
     system.stateVersion = "25.11";
 
+    # nixpkgs at this pin cannot build datadog-agent: integrations-core
+    # names each check by its directory suffix (pname "checks-base") while
+    # the wheel it installs is "datadog-checks-base", and the python
+    # metadata-check hook, new in this nixpkgs, refuses the mismatch:
+    #   PackageNotFoundError: No package metadata was found for checks-base
+    # Upstream bug in pkgs/tools/networking/dd-agent/integrations-core.nix.
+    # Until it is fixed there, build the integrations with that one check
+    # off. The attrset update (not overrideScope) keeps every other python
+    # package the cached one.
+    nixpkgs.overlays = [
+      (final: prev: {
+        datadog-integrations-core =
+          extras:
+          final.callPackage "${prev.path}/pkgs/tools/networking/dd-agent/integrations-core.nix" {
+            extraIntegrations = extras;
+            python3Packages = final.python3Packages // {
+              buildPythonPackage =
+                args: final.python3Packages.buildPythonPackage (args // { dontCheckPythonMetadata = true; });
+            };
+          };
+        datadog-agent = prev.datadog-agent.override { pythonPackages = final.datadog-integrations-core { }; };
+      })
+    ];
+
     # A flake-managed machine must NOT also be user-data-managed. The NixOS EC2
     # image runs amazon-init on EVERY boot, which copies user-data over
     # /etc/nixos/configuration.nix and switches to it -- silently reverting any
