@@ -37,6 +37,9 @@ on:
 
 permissions:
   contents: write
+  # For the nix cache push below: GitHub OIDC assumes a role in the caos AWS
+  # account (metta: devops/tf/caos/ci.tf). No AWS credential is stored here.
+  id-token: write
 
 jobs:
   client:
@@ -85,8 +88,57 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
-      - name: Build the client
-        run: nix build .#caos-cli
+      # ONE build feeds two consumers: the release assets below, and the
+      # hosts' binary cache. The hosts in prod/ (caosd-prod, watchdog-prod)
+      # never build caos -- the watchdog is a t3.small that cannot compile
+      # the workspace, and the server should not spend its deploy rebuilding
+      # 498 crates -- so every push also pushes the signed closures to the
+      # private S3 cache both hosts list as a substituter (prod/base.nix;
+      # the bucket and roles are metta's devops/tf/caos). A deploy then
+      # only fetches. caos-tools contains the caos-cli the release ships,
+      # plus git-remote-caos and caos-iroh; the deploy driver and the
+      # watchdog's whole system closure (so even its first boot from a bare
+      # AMI is a download) ride along. caosd-prod's own system closure is
+      # not built here: it takes a per-machine advertise address the driver
+      # reads off the host (prod/README.md), so its toplevel is impure, and
+      # caos-tools is nearly all of it anyway.
+      #
+      # The cache is read as well as written, so a branch does not rebuild
+      # what main already pushed, and content addressing means a branch
+      # cannot displace main's paths.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::109251245574:role/caos-github-nix-cache
+          aws-region: us-east-1
+
+      - name: Build
+        env:
+          CACHE: s3://caos-nix-cache-109251245574?region=us-east-1
+        run: |
+          set -euo pipefail
+          nix build --no-link --print-out-paths \
+            --option extra-substituters "$CACHE" \
+            --option extra-trusted-public-keys caos-cache-1:3BSj35RzBLAtUyTlJlLO3xa9b7uYFtIJIx17Jri8lPs= \
+            .#caos-cli .#caos-tools .#deploy-caosd-prod \
+            .#nixosConfigurations.watchdog-prod.config.system.build.toplevel \
+            | tee paths
+          # `result` is what the staging step below reads.
+          nix build .#caos-cli
+
+      # The signing key touches disk for the length of one command and is
+      # removed whether or not the push succeeds. Nothing prints it.
+      - name: Push to the nix cache
+        env:
+          CACHE: s3://caos-nix-cache-109251245574?region=us-east-1
+        run: |
+          set -euo pipefail
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          aws secretsmanager get-secret-value --secret-id caos/nix-cache-signing-key \
+            --query SecretString --output text > "$key"
+          # shellcheck disable=SC2046
+          nix copy --to "$CACHE&secret-key=$key" $(cat paths)
+          echo "pushed:"; cat paths
 
       # `result/bin/caos-cli` is a WRAPPER script that sets CAOS_REV and execs
       # the real binary elsewhere in the store. The wrapper is not distributable

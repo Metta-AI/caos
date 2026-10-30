@@ -169,9 +169,9 @@ two units, `journalctl -u caos-watchdog-probe` the probe results.
 Hosts never build caos. `s3://caos-nix-cache-109251245574` is a private
 binary cache in the account; both roles list it as a substituter with its
 public key (`prod/base.nix`) and read it through their instance role. The
-`cache` GitHub Actions workflow fills it on every push (caos-tools, the
-deploy driver, the watchdog's system closure), so for any pushed commit a
-host deploy is substitution. To push by hand, for a commit CI has not
+`release` GitHub Actions workflow fills it on every push, from the same
+build that ships the client (caos-tools, the deploy driver, the watchdog's
+system closure), so for any pushed commit a host deploy is substitution. To push by hand, for a commit CI has not
 built yet:
 
 ```sh
