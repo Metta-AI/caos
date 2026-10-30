@@ -630,7 +630,6 @@ pub fn create_conversation(
 
 struct PreparedRequest {
     request: String,
-    configuration: String,
 }
 
 fn prepare_queued_request_detail(
@@ -660,10 +659,7 @@ fn prepare_queued_request_detail(
             invoked_as()
         ));
     }
-    Ok(PreparedRequest {
-        request,
-        configuration,
-    })
+    Ok(PreparedRequest { request })
 }
 
 struct SubmittedMessage {
@@ -675,7 +671,7 @@ struct SubmitMessagePolicy<'a> {
     require_absent: bool,
     proposal: Option<&'a str>,
     proposal_base: Option<&'a str>,
-    admit_when_idle: bool,
+    start_turn: bool,
 }
 
 fn submit_line_message(
@@ -694,7 +690,7 @@ fn submit_line_message(
             require_absent,
             proposal: None,
             proposal_base: None,
-            admit_when_idle: true,
+            start_turn: true,
         },
         prepare_queued_request_detail,
         || {},
@@ -719,7 +715,7 @@ pub fn submit_interjection(
             require_absent: false,
             proposal: human_tree,
             proposal_base,
-            admit_when_idle: false,
+            start_turn: false,
         },
         prepare_queued_request_detail,
         || {},
@@ -764,7 +760,7 @@ fn submit_message_detailed(
             require_absent: false,
             proposal,
             proposal_base,
-            admit_when_idle: true,
+            start_turn: true,
         },
         prepare_queued_request_detail,
         on_preparing,
@@ -795,14 +791,11 @@ where
             require_absent,
             proposal,
             proposal_base,
-            admit_when_idle: true,
+            start_turn: true,
         },
         move |t, options, id, head| {
             let request = prepare(t, options, id, head)?;
-            Ok(PreparedRequest {
-                configuration: format!("test-{request}"),
-                request,
-            })
+            Ok(PreparedRequest { request })
         },
         || {},
     )
@@ -868,7 +861,7 @@ where
             &parent,
             policy.proposal,
             policy.proposal_base,
-            policy.admit_when_idle,
+            policy.start_turn,
             &mut prepare,
             &mut on_preparing,
         )?;
@@ -972,7 +965,7 @@ fn build_message_candidate<F, P>(
     parent: &Oid,
     proposal: Option<&str>,
     proposal_base: Option<&str>,
-    admit_when_idle: bool,
+    start_turn: bool,
     prepare: &mut F,
     on_preparing: &mut P,
 ) -> Result<MessageCandidate, String>
@@ -982,7 +975,7 @@ where
 {
     let parent_view = Conversation::open(store, parent)?;
     let active = parent_view.active_turn()?;
-    if active.is_none() && !admit_when_idle {
+    if active.is_none() && !start_turn {
         return Err(format!(
             "conversation {id:?} is no longer active; submit again to start a new turn"
         ));
