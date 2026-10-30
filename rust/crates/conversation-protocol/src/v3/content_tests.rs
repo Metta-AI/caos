@@ -38,7 +38,12 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
     // more than that.
     assert!(view.tool("async-call").unwrap().is_none());
     let last = view.transcript_len().unwrap() - 1;
-    assert!(view.transcript_entry(last).unwrap().unwrap().1.is_interrupt());
+    assert!(view
+        .transcript_entry(last)
+        .unwrap()
+        .unwrap()
+        .1
+        .is_interrupt());
     let fork_view = Conversation::open(&store, &fork).unwrap();
     assert_eq!(
         fork_view.reference_start("main").unwrap(),
