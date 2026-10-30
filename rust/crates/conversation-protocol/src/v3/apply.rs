@@ -217,17 +217,12 @@ pub fn apply(
         Transition::ToolStart { record, payloads } => {
             let conversation = parent(store, parent_head)?;
             canonical_shape(record, "tool")?;
-            let request = require_request_running_or_cancelling(&conversation, &record.request)?;
             if record.status != CallStatus::Started {
                 return Err("tool.start requires started status".to_string());
             }
-            if conversation
-                .tool(&record.request, record.round, &record.id)?
-                .is_some()
-            {
+            if conversation.tool(&record.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", record.id));
             }
-            validate_current_call(&request, record)?;
             validate_tool_source_tree(&conversation, record)?;
             validate_new_tool_payloads(&conversation, record, payloads)?;
             put_tool_payloads(&mut events, record, payloads)?;
