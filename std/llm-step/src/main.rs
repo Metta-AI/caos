@@ -3920,12 +3920,11 @@ mod tests {
         )
         .unwrap();
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
-        assert!(
-            round_state(&view, &require_request(&view, &golden.request).unwrap())
-                .unwrap()
-                .pending
-                .is_empty()
-        );
+        assert!(declaration_of(&view, "first")
+            .unwrap()
+            .unwrap()
+            .pending
+            .is_empty());
         let messages = context_messages(&view).unwrap();
         assert_eq!(
             messages[0],
