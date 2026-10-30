@@ -149,8 +149,21 @@ pub fn migrate_v5(
             },
             payloads: Vec::new(),
         },
+        signature,
     )?;
     Ok(head)
+}
+
+/// Apply `transition` on `head` and move `head` to the commit it mints.
+fn append(
+    store: &mut dyn ObjectStore,
+    head: &mut Oid,
+    transition: Transition,
+    signature: &Signature,
+) -> Result<(), String> {
+    let applied = apply(store, Some(head), &transition)?;
+    *head = mint(store, head, &applied, transition.kind(), signature)?;
+    Ok(())
 }
 
 /// The kind on a commit message's first line, in any format.
