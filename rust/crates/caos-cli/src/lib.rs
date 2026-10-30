@@ -1924,23 +1924,34 @@ pub fn fork_conversation_in(
     let title = validate_conversation_title(title)?.to_string();
     let from = oid(from, "fork source")?;
     store.ensure_local(&from)?;
-    let source = Conversation::open(&*store, &from)?;
-    let source_identity = source.identity()?;
-    if source_identity.id == id {
+    // A v5 conversation cannot be read as it stands, so it is carried over into
+    // a new root instead of forked (`legacy`).
+    let v5 = legacy::is_v5(&*store, &from)?;
+    let source_id = if v5 {
+        legacy::v5_id(&*store, &from)?
+    } else {
+        Conversation::open(&*store, &from)?.identity()?.id
+    };
+    if source_id == id {
         return Err("fork id must differ from its source conversation".to_string());
     }
-    let transition = Transition::ConversationFork {
-        identity: Identity {
-            id: id.to_string(),
-            kind: IdentityKind::Fork {
-                source: from.clone(),
+    let candidate = if v5 {
+        let parent = ensure_genesis(store)?;
+        legacy::migrate_v5(store, &from, id, &title, None, &parent, &signature(user)?)?
+    } else {
+        let transition = Transition::ConversationFork {
+            identity: Identity {
+                id: id.to_string(),
+                kind: IdentityKind::Fork {
+                    source: from.clone(),
+                },
+                owner: None,
             },
-            owner: None,
-        },
-        title: title.clone(),
-        content: None,
+            title: title.clone(),
+            content: None,
+        };
+        mint_transition(store, &from, &transition, &signature(user)?)?
     };
-    let candidate = mint_transition(store, &from, &transition, &signature(user)?)?;
     let head_ref = refs::head_ref(id)?;
     let active = refs::active_membership_ref(user, id)?;
     let archived = refs::archived_membership_ref(user, id)?;
