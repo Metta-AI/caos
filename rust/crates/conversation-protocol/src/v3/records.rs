@@ -7,7 +7,7 @@ use serde_json::Value;
 use super::canonical::canonical_object;
 use super::canonical::{canonical_bytes, parse_canonical};
 use super::oid::Oid;
-use super::paths::{self, validate_tree_path, MAX_JSON_INT};
+use super::paths::{self, validate_tree_path};
 
 #[cfg(test)]
 fn obj(fields: &[(&str, Value)]) -> Value {
@@ -443,8 +443,6 @@ impl_record!(FilesOutcome, validate);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawCallRecord", into = "RawCallRecord")]
 pub struct CallRecord {
-    pub request: Oid,
-    pub round: u64,
     pub id: String,
     pub name: String,
     pub declaration_message: String,
@@ -464,8 +462,6 @@ pub struct CallRecord {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCallRecord {
-    request: Oid,
-    round: u64,
     id: String,
     name: String,
     declaration_message: String,
@@ -518,8 +514,6 @@ impl TryFrom<RawCallRecord> for CallRecord {
             )
         };
         let record = CallRecord {
-            request: raw.request,
-            round: raw.round,
             id: raw.id,
             name: raw.name,
             declaration_message: raw.declaration_message,
@@ -541,8 +535,6 @@ impl From<CallRecord> for RawCallRecord {
     fn from(record: CallRecord) -> Self {
         let terminal = record.status != CallStatus::Started;
         RawCallRecord {
-            request: record.request,
-            round: record.round,
             id: record.id,
             name: record.name,
             declaration_message: record.declaration_message,
@@ -560,9 +552,6 @@ impl From<CallRecord> for RawCallRecord {
 
 impl CallRecord {
     fn validate(&self) -> Result<(), String> {
-        if self.round > MAX_JSON_INT {
-            return Err("tool round exceeds the maximum JSON integer".to_string());
-        }
         if let Some(source_tree_name) = &self.source_tree_name {
             paths::validate_source_tree_name(source_tree_name)?;
         }
@@ -663,8 +652,6 @@ impl_record!(AsyncRecord, validate);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnIntent {
-    pub request: Oid,
-    pub round: u64,
     pub tool: String,
     pub prompt: String,
     pub model: String,
@@ -862,9 +849,6 @@ impl_record!(PublicationRecord);
 
 impl Owner {
     fn validate(&self) -> Result<(), String> {
-        if self.round > MAX_JSON_INT {
-            return Err("owner round exceeds the maximum JSON integer".to_string());
-        }
         Ok(())
     }
 }
@@ -927,9 +911,6 @@ impl SourceTreeResolution {
 
 impl TranscriptEntry {
     fn validate(&self) -> Result<(), String> {
-        if self.round.is_some_and(|round| round > MAX_JSON_INT) {
-            return Err("transcript round exceeds the maximum JSON integer".to_string());
-        }
         for block in &self.blocks {
             block.validate()?;
         }
@@ -980,9 +961,6 @@ impl AsyncRecord {
 
 impl SpawnIntent {
     fn validate(&self) -> Result<(), String> {
-        if self.round > MAX_JSON_INT {
-            return Err("spawn intent round exceeds the maximum JSON integer".to_string());
-        }
         path(&self.prompt, "spawn prompt path")?;
         if self.configuration.is_empty() {
             return Err("spawn configuration must not be empty".to_string());
@@ -1031,11 +1009,6 @@ impl Evidence {
         }
         Ok(())
     }
-}
-
-pub fn parse_active_turn(bytes: &[u8]) -> Result<Oid, String> {
-    Oid::parse_line(bytes, "source tree sha")
-        .map_err(|error| format!("invalid active request: {error}"))
 }
 
 #[cfg(test)]
