@@ -66,37 +66,15 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &signature,
     );
 
-    let request = oid('1');
-    let request_head = head.clone();
     commit(
         store,
         &mut head,
-        Transition::TurnAdmit {
-            record: request_record(request.clone(), request_head),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnClaim {
-            request: request.clone(),
-            latest_message: "user-0".to_string(),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnInterject {
-            request: request.clone(),
+        Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "interjection-1".to_string(),
                 conversation: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
-                request: Some(request.clone()),
-                round: Some(0),
                 model: None,
                 blocks: vec![Block::Text {
                     text: "Adopt this checkout".to_string(),
@@ -115,40 +93,26 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         },
         &signature,
     );
-    let first_calls = vec![
-        DeclaredCall {
-            id: "read-call".to_string(),
-            name: "read".to_string(),
-        },
-        DeclaredCall {
-            id: "bash-call".to_string(),
-            name: "bash".to_string(),
-        },
-    ];
     let model_applied = commit(
         store,
         &mut head,
-        model_complete(
-            &request,
-            0,
+        assistant_message(
             2,
             "assistant-1",
-            &first_calls,
+            &[("read-call", "read"), ("bash-call", "bash")],
             "golden-conversation",
         ),
         &signature,
     );
     let read_observation = format!(
         "{}/observation",
-        paths::call_payload_dir(request.as_str(), 0, "read-call")
+        paths::call_payload_dir("read-call")
     );
     commit(
         store,
         &mut head,
         Transition::ToolComplete {
             record: CallRecord {
-                request: request.clone(),
-                round: 0,
                 id: "read-call".to_string(),
                 name: "read".to_string(),
                 declaration_message: "assistant-1".to_string(),
@@ -170,8 +134,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &signature,
     );
     let started_bash = CallRecord {
-        request: request.clone(),
-        round: 0,
         id: "bash-call".to_string(),
         name: "bash".to_string(),
         declaration_message: "assistant-1".to_string(),
@@ -195,7 +157,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     );
     let bash_observation = format!(
         "{}/observation",
-        paths::call_payload_dir(request.as_str(), 0, "bash-call")
+        paths::call_payload_dir("bash-call")
     );
     commit(
         store,
@@ -254,11 +216,9 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         ids::child_id("golden-conversation", &request, 1, "spawn-call").expect("derive child id");
     let spawn_observation = format!(
         "{}/observation",
-        paths::call_payload_dir(request.as_str(), 1, "spawn-call")
+        paths::call_payload_dir("spawn-call")
     );
     let spawn_tool = CallRecord {
-        request: request.clone(),
-        round: 1,
         id: "spawn-call".to_string(),
         name: "spawn_agent".to_string(),
         declaration_message: "assistant-2".to_string(),
@@ -277,11 +237,8 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     let child = ChildRecord {
         id: child_id.clone(),
         initial_head: head.clone(),
-        request: request.clone(),
         relay: oid('3'),
         spawn_intent: SpawnIntent {
-            request: request.clone(),
-            round: 1,
             tool: "spawn-call".to_string(),
             prompt: ".caos/tools/prompt".to_string(),
             model: "model".to_string(),
@@ -320,7 +277,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         store,
         &mut head,
         Transition::TurnInterject {
-            request: request.clone(),
             entry: TranscriptEntry {
                 message_id: "interjection-3".to_string(),
                 conversation: "golden-conversation".to_string(),
@@ -370,7 +326,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         store,
         &mut head,
         Transition::TurnTerminal {
-            request: request.clone(),
             outcome: TurnOutcome::Idle {
                 result: None,
                 interrupted: false,
@@ -558,7 +513,6 @@ fn request_record(id: Oid, request_head: Oid) -> TurnRecord {
 
         model: "model".to_string(),
         configuration: configuration(),
-        round: 0,
         calls: Vec::new(),
         interjections: Vec::new(),
         status: TurnStatus::Queued,
@@ -593,7 +547,6 @@ fn model_complete(
         payloads.push((name, b"{}".to_vec()));
     }
     Transition::ModelComplete {
-        request: request.clone(),
         entry: TranscriptEntry {
             message_id: message_id.to_string(),
             conversation: conversation.to_string(),
