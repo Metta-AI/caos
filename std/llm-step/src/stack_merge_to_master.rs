@@ -1,5 +1,5 @@
 //! Merge a stack's pull requests, bottom to top, each squashed with its
-//! `.pr.md` as the commit message (design/stack-publish.md, "stack-merge").
+//! `.pr.md` as the commit message (design/stack-publish.md, "stack-merge-to-master").
 //! Everything is read before anything is merged: each layer to merge must have
 //! an open pull request whose head is the layer's commit, and CI on every one
 //! of those heads must be passing unless `force`. Then each PR is merged with
@@ -46,7 +46,7 @@ fn blank(value: Option<String>) -> Option<String> {
 
 fn parameters(call: &Call) -> Result<Parameters, String> {
     let mut p: Parameters = serde_json::from_value(call.input.clone())
-        .map_err(|error| format!("invalid stack-merge arguments: {error}"))?;
+        .map_err(|error| format!("invalid stack-merge-to-master arguments: {error}"))?;
     p.stack = p.stack.trim().trim_matches('/').to_string();
     if p.stack.is_empty() {
         return Err("stack must name a directory, such as sources/repo".into());
@@ -174,7 +174,7 @@ fn await_base(github: &Github, number: u64, trunk: &str) -> Result<Pr, String> {
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "PR #{number} still targets {} two minutes after the layer below merged: GitHub has not retargeted it at {trunk} yet. Run stack-merge again in a minute; the layers below are merged.",
+                "PR #{number} still targets {} two minutes after the layer below merged: GitHub has not retargeted it at {trunk} yet. Run stack-merge-to-master again in a minute; the layers below are merged.",
                 pr.base
             ));
         }
@@ -219,7 +219,7 @@ fn await_merge(github: &Github, number: u64, started: Value) -> Result<String, S
             }
             "enqueued" => {
                 return Err(format!(
-                    "PR #{number} was added to the merge queue, which merges it on its own schedule with the repository's default commit message. Run stack-merge again once it has merged, for the layers above."
+                    "PR #{number} was added to the merge queue, which merges it on its own schedule with the repository's default commit message. Run stack-merge-to-master again once it has merged, for the layers above."
                 ))
             }
             _ => {}
@@ -250,7 +250,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         Err(error) => return site.fail(state, &error),
     };
     let dir = p.stack.clone();
-    let refused = |error: String| format!("stack-merge refused; nothing was merged: {error}");
+    let refused = |error: String| format!("stack-merge-to-master refused; nothing was merged: {error}");
     // Everything that reads the conversation, before anything reaches the remote.
     let read = {
         let view = state.conversation()?;
@@ -393,7 +393,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             text.push('\n');
         }
         text.push_str(&format!(
-            "FAILED: stack-merge refused; nothing was merged: CI is not passing on {}. Wait for it or fix it (caos-std/ci-status reads one branch), or pass force=true to merge anyway.\n",
+            "FAILED: stack-merge-to-master refused; nothing was merged: CI is not passing on {}. Wait for it or fix it (caos-std/ci-status reads one branch), or pass force=true to merge anyway.\n",
             blockers.join("; ")
         ));
         return site.complete(state, result_block(&site.call.id, &text, true), None, None, None);
