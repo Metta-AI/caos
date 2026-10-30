@@ -411,7 +411,10 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             text.push('\n');
         }
         if !blockers.is_empty() {
-            text.push_str(&format!("force=true: CI is not passing on {}.\n", blockers.join("; ")));
+            text.push_str(&format!(
+                "force=true: CI is not passing on {}.\n",
+                blockers.join("; ")
+            ));
         }
         return site.complete(state, result_block(&site.call.id, &text, false), None, None, None);
     }
