@@ -1774,7 +1774,10 @@ mod tests {
         assert_eq!(store.merge_base(&ours, &theirs).unwrap(), None);
         assert!(store.merge_commits(&ours, &theirs).is_err());
 
-        let merged = match store.merge_commits_over(&base_tree, &ours, &theirs).unwrap() {
+        let merged = match store
+            .merge_commits_over(&base_tree, &ours, &theirs)
+            .unwrap()
+        {
             MergeOutcome::Merged { tree } => tree,
             MergeOutcome::Conflict { paths } => panic!("unexpected conflict: {paths:?}"),
         };
