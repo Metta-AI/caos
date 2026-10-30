@@ -942,18 +942,11 @@ fn declare_requested_call(
 ///   blob's hash, on two lines. `observation` is still the whole of it; deciding
 ///   what a reader is shown instead is the caller's.
 /// - `conversation`: the conversation as it now stands.
-fn forward_tool_result(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    call: &str,
-) -> Result<(), String> {
+fn forward_tool_result(cfg: &Config, state: &mut progress::State, call: &str) -> Result<(), String> {
     let view = state.conversation()?;
-    let record = require_request(&view, request)?;
-    let round = working_round(cfg, &view, &record)?.declaring_round;
     let tool = view
-        .tool(request, round, call)?
-        .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
+        .tool(call)?
+        .ok_or_else(|| format!("no call {call} is recorded"))?;
     let (status, observation) = match &tool.result {
         Some(ToolResult::Complete { observation, .. }) => ("complete", view.payload(observation)?),
         Some(ToolResult::Failed { error }) => ("failed", view.payload(error)?),
