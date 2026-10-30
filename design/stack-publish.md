@@ -381,8 +381,8 @@ layers is one call per layer; stacks are short.
 
 ## Open
 
-- Merging through the stack API after review, and deleting the branches of
-  merged layers, are the next operations in this family.
+- Merging after review is `stack-merge-to-master`. Deleting the branches of
+  merged layers is the next operation in this family.
 - Secret grant: the operation runs in `llm-step`, which already holds the
   `github-token` reader, so no new grant is needed. A tool that did this
   work as a separate worker would need its own.
