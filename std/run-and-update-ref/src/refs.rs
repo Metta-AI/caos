@@ -255,7 +255,7 @@ mod tests {
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::{
         AsyncRecord, Block, Identity, IdentityKind, MemoryStore, Mode, Role, TranscriptEntry,
-        TreeBuilder, TurnRecord,
+        TreeBuilder,
     };
 
     use super::*;
@@ -402,7 +402,24 @@ mod tests {
         builder.build(store).unwrap()
     }
 
-    fn child_request_history(interrupted: Option<bool>) -> (MemoryStore, Oid, Oid) {
+    fn entry(message_id: &str, role: Role, text: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            message_id: message_id.to_string(),
+            conversation: "subagent-test".to_string(),
+            role,
+            actor: "owner".to_string(),
+            model: None,
+            blocks: vec![Block::Text {
+                text: text.to_string(),
+            }],
+            proposal: None,
+            source_tree_resolution: None,
+        }
+    }
+
+    /// A child that was prompted, answered, and then (when `interrupted`) was
+    /// interrupted.
+    fn child_history(interrupted: bool) -> (MemoryStore, Oid) {
         let mut store = MemoryStore::new();
         let genesis = ensure_genesis(&mut store).unwrap();
         let root = Transition::ConversationRoot {
@@ -422,70 +439,28 @@ mod tests {
         };
         let applied = apply(&mut store, None, &root).unwrap();
         let mut head = mint(&mut store, &genesis, &applied, root.kind(), &signature()).unwrap();
-        head = commit_transition(
-            &mut store,
-            &head,
-            &Transition::MessageAppend {
-                entry: TranscriptEntry {
-                    message_id: "prompt".to_string(),
-                    conversation: "subagent-test".to_string(),
-                    role: Role::User,
-                    actor: "owner".to_string(),
-                    request: None,
-                    round: None,
-                    model: None,
-                    blocks: vec![Block::Text {
-                        text: "work".to_string(),
-                    }],
-                    proposal: None,
-                    source_tree_resolution: None,
-                },
-                payloads: Vec::new(),
-            },
-        );
-        let request = oid('7');
-
-        head = commit_transition(
-            &mut store,
-            &head,
-            &Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request.clone(),
-                    request_head: head.clone(),
-                    model: "model".to_string(),
-                    configuration: "configuration".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            },
-        );
-        head = commit_transition(
-            &mut store,
-            &head,
-            &Transition::TurnClaim {
-                request: request.clone(),
-                latest_message: "prompt".to_string(),
-            },
-        );
-        if let Some(interrupted) = interrupted {
+        let mut entries = vec![
+            entry("prompt", Role::User, "work"),
+            entry("answer", Role::Assistant, "done"),
+        ];
+        if interrupted {
+            entries.push(entry(
+                "interrupt",
+                Role::System,
+                conversation_protocol::v3::INTERRUPT_TEXT,
+            ));
+        }
+        for entry in entries {
             head = commit_transition(
                 &mut store,
                 &head,
-                &Transition::TurnTerminal {
-                    request: request.clone(),
-                    outcome: TurnOutcome::Idle {
-                        result: None,
-                        interrupted,
-                    },
+                &Transition::MessageAppend {
+                    entry,
+                    payloads: Vec::new(),
                 },
             );
         }
-        (store, head, request)
+        (store, head)
     }
 
     fn task_record(store: &FakeStore, task: &Oid) -> AsyncRecord {
@@ -498,21 +473,22 @@ mod tests {
 
     #[test]
     fn child_terminal_facts_derive_status() {
-        for (interrupted, expected) in
-            [(false, TaskStatus::Complete), (true, TaskStatus::Cancelled)]
-        {
-            let (store, head, request) = child_request_history(Some(interrupted));
-            let status = terminal_facts(&store, &head, &request).unwrap();
-            assert_eq!(status, expected);
+        for (interrupted, status, expected) in [
+            (false, "complete", TaskStatus::Complete),
+            (true, "complete", TaskStatus::Cancelled),
+            (false, "failed", TaskStatus::Failed),
+        ] {
+            let (store, head) = child_history(interrupted);
+            assert_eq!(terminal_facts(&store, &head, status).unwrap(), expected);
         }
     }
 
     #[test]
-    fn child_checkpoint_refuses_a_nonterminal_request() {
-        let (store, head, request) = child_request_history(None);
+    fn child_checkpoint_refuses_an_unknown_status() {
+        let (store, head) = child_history(false);
         assert_eq!(
-            terminal_facts(&store, &head, &request).unwrap_err(),
-            "child request not terminal"
+            terminal_facts(&store, &head, "pending").unwrap_err(),
+            "invalid child status \"pending\""
         );
     }
 
