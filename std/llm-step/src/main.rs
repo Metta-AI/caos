@@ -4081,60 +4081,101 @@ mod tests {
     }
 
     #[test]
-    fn queued_escape_is_the_request_terminal_head() {
-        let mut store = MemoryStore::new();
-        let root = root_with(&mut store, BTreeMap::new()).unwrap();
-        let user = append_memory(
-            &mut store,
-            &root,
-            Transition::MessageAppend {
-                entry: test_entry(
-                    USER_ID,
-                    Role::User,
-                    vec![Block::Text {
-                        text: "stop".to_string(),
-                    }],
-                ),
-                payloads: Vec::new(),
-            },
-        )
-        .unwrap();
-        let request = test_oid('d');
-
-        let admitted = append_memory(
-            &mut store,
-            &user,
-            Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request.clone(),
-                    request_head: user.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-config".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            },
-        )
-        .unwrap();
-        let escaped = append_memory(
-            &mut store,
-            &admitted,
-            Transition::TurnEscape {
-                request: request.clone(),
-                reason: Some("escape".to_string()),
-            },
-        )
-        .unwrap();
+    fn turn_state_is_read_from_the_transcript() {
+        let mut golden = golden_two_calls().unwrap();
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        let turn = Turn {
+            request: golden.request.clone(),
+            prompt: Some(0),
+        };
+        // The prompt's answer declared calls, so it is not the answer yet.
+        assert!(!answered(&view, 0).unwrap());
+        assert!(!interrupted(&view, &turn).unwrap());
+        // Neither call has a record: the model is shown each as unfinished.
+        let messages = context_messages(&view).unwrap();
         assert_eq!(
-            terminal_head_in(&store, &escaped, &request).unwrap(),
-            escaped
+            messages[2],
+            message(
+                "user",
+                json!([
+                    error_block("first", "this call did not finish"),
+                    error_block("second", "this call did not finish")
+                ])
+            )
         );
+
+        let mut append = |id: &str, role: Role, text: &str| {
+            golden.head = append_memory(
+                &mut golden.store,
+                &golden.head,
+                Transition::MessageAppend {
+                    entry: test_entry(
+                        id,
+                        role,
+                        vec![Block::Text {
+                            text: text.to_string(),
+                        }],
+                    ),
+                    payloads: Vec::new(),
+                },
+            )
+            .unwrap();
+            golden.head.clone()
+        };
+        let mut answer = |head: &Oid, ordinal: u64, store: &mut MemoryStore| {
+            let id = format!("{ordinal:032}");
+            append_memory(
+                store,
+                head,
+                Transition::MessageAppend {
+                    entry: TranscriptEntry {
+                        message_id: id.clone(),
+                        conversation: CONVERSATION.to_string(),
+                        role: Role::Assistant,
+                        actor: "test-model".to_string(),
+                        model: Some("test-model".to_string()),
+                        blocks: vec![Block::Text {
+                            text: "done".to_string(),
+                        }],
+                        proposal: None,
+                        source_tree_resolution: None,
+                    },
+                    payloads: vec![(
+                        "response.json".to_string(),
+                        canonical_payload_bytes(&json!([{"type":"text","text":"done"}]))
+                            .unwrap(),
+                    )],
+                },
+            )
+            .unwrap()
+        };
+        // A system notice does not answer a prompt.
+        let noticed = append("33333333333333333333333333333333", Role::System, "notice");
+        let view = Conversation::open(&golden.store, &noticed).unwrap();
+        assert!(!answered(&view, 0).unwrap());
+        // A message with no call does, until a newer prompt arrives.
+        let answered_head = answer(&noticed, 3, &mut golden.store);
+        let view = Conversation::open(&golden.store, &answered_head).unwrap();
+        assert!(answered(&view, 0).unwrap());
+        golden.head = answered_head;
+        let prompted = append("44444444444444444444444444444444", Role::User, "and more");
+        let view = Conversation::open(&golden.store, &prompted).unwrap();
+        assert!(!answered(&view, 0).unwrap());
+        // An interruption after the prompt stops the turn; one before it does not.
+        let stopped = append(
+            "55555555555555555555555555555555",
+            Role::System,
+            conversation_protocol::v3::INTERRUPT_TEXT,
+        );
+        let view = Conversation::open(&golden.store, &stopped).unwrap();
+        assert!(interrupted(&view, &turn).unwrap());
+        let later = Turn {
+            request: golden.request.clone(),
+            prompt: Some(6),
+        };
+        let resumed = append("66666666666666666666666666666666", Role::User, "go on");
+        let view = Conversation::open(&golden.store, &resumed).unwrap();
+        assert!(!interrupted(&view, &later).unwrap());
     }
 
     #[test]
