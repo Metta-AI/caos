@@ -3881,8 +3881,9 @@ mod tests {
         .unwrap();
         golden.head = append_memory(&mut golden.store, &golden.head, first).unwrap();
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
-        let request = require_request(&view, &golden.request).unwrap();
-        assert_eq!(round_state(&view, &request).unwrap().pending.len(), 1);
+        let pending = declaration_of(&view, "second").unwrap().unwrap().pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "second");
         assert_eq!(context_messages(&view).unwrap().len(), 2);
 
         let second_block = json!({
@@ -3942,9 +3943,8 @@ mod tests {
         let mut golden = golden_two_calls().unwrap();
         loop {
             let view = Conversation::open(&golden.store, &golden.head).unwrap();
-            let request = require_request(&view, &golden.request).unwrap();
-            let round = round_state(&view, &request).unwrap();
-            let Some(call) = round.pending.first() else {
+            let declaration = declaration_of(&view, "first").unwrap().unwrap();
+            let Some(call) = declaration.pending.first() else {
                 break;
             };
             let reason = "interrupted before this tool ran";
@@ -3963,7 +3963,7 @@ mod tests {
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
         for id in ["first", "second"] {
             assert_eq!(
-                view.tool(&golden.request, 0, id).unwrap().unwrap().status,
+                view.tool(id).unwrap().unwrap().status,
                 CallStatus::Cancelled
             );
         }
