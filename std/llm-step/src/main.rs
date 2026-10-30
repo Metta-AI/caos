@@ -1646,6 +1646,7 @@ fn launch_resolved_tool(
     let Some(call) = current.pending.iter().find(|call| call.id == id).cloned() else {
         return resume(cfg, state, turn);
     };
+    let target = resolve_target(&state.conversation()?, &call)?;
     let (name, current_input) = match target {
         Target::SourceTree { name, commit } => (Some(name), commit),
         Target::Files => (None, state.head().clone()),
@@ -1783,8 +1784,6 @@ fn launch_resolved_tool(
         }
     };
     let started = CallRecord {
-        request: request.clone(),
-        round,
         id: id.to_string(),
         name: call.name.clone(),
         declaration_message: current.message_id,
