@@ -11,6 +11,7 @@ use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
     AsyncRecord, Block, CallStatus, Identity, IdentityKind, Role, TaskStatus, TranscriptEntry,
+    INTERRUPT_TEXT,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -1424,8 +1425,6 @@ mod tests {
             "hello".to_string(),
             "--secret-hash".to_string(),
             "e".repeat(40),
-            "--model".to_string(),
-            "test-model".to_string(),
             "--configuration".to_string(),
             "f".repeat(40),
             "--source-tree".to_string(),
