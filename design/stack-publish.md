@@ -251,6 +251,80 @@ write is the completing append; an attempt that dies before it leaves
 unreferenced commits in the store and nothing else, and the next attempt
 recomputes everything.
 
+## `stack-merge-to-master`: merging the stack, with its descriptions as the commits
+
+The trunk squash-merges, and what a squash commit says is up to whoever
+merges. GitHub's default for a squash is the PR title plus the messages of
+every commit in the branch, which for a caos layer is a column of "Edit
+source tree". The PR page lets a person edit that for one PR; merging a
+whole stack from the page offers no editor at all, so the repository's
+default is what lands. The repository can be set to use the PR title and
+description (std/GIT.md, "The repository's squash setting"), but a merge
+that sets its own message does not depend on any setting.
+`stack-merge-to-master` is that merge. It is an operation of the step
+(`std/stack-merge-to-master`, `std/llm-step/src/stack_merge_to_master.rs`)
+because llm-step already holds the `github-token` reader and the code that
+reads a stack directory.
+
+```text
+run_tool(path="caos-std/stack-merge-to-master", arguments={
+  "stack": "sources/repo",
+  "up-to": "02-tests",              # optional: the top layer; default all
+  "branch-prefix": "malcolm/",      # the value stack-publish was given
+  "force": "true",                  # optional: merge although CI is not green
+  "dry-run": "true"})               # optional: read and report, merge nothing
+```
+
+1. **Read, refusing before anything merges.** The stack and its
+   descriptions as `stack-publish` reads them; the layers selected (every
+   described layer up to `up-to`); for each, its branch's open PR. A layer
+   with no open PR whose branch has a merged one is already merged and is
+   skipped; one with neither is refused (publish first). A draft is refused.
+   A PR whose head is not the layer's commit is refused: the merge must land
+   what the stack holds and what was reviewed, and the fix is `stack-sync`
+   then `stack-publish`. Then the checks on every head, as `ci-status` reads
+   them: anything failing or unfinished refuses the whole merge unless
+   `force`.
+2. **Merge bottom to top.** For each PR: wait until its base is the trunk
+   (GitHub retargets a stacked PR itself once the one below merges; an
+   unlinked one is retargeted with a `PATCH`), then
+   `PUT /pulls/{n}/merge-async` with `merge_method: squash`,
+   `merge_action: direct_merge`, `sha` set to the head just read, and
+   `commit_title` / `commit_message` from the `.pr.md` (the title gets
+   ` (#n)`, as GitHub writes it). The asynchronous endpoint is the only one
+   that merges a PR in a GitHub stack; merging PR k through it would merge
+   every PR below it too, with default messages, which is why the loop goes
+   one PR at a time from the bottom. The result is polled at
+   `GET /pulls/{n}/merge-async/{uuid}` until it is `merged` or `failed`.
+3. **Stop at the first failure.** The layers below it are merged, the ones
+   above are not touched, and a second run skips the merged ones and carries
+   on. A repository with a merge queue answers `enqueued`, which merges on
+   the queue's schedule with the repository's default message; that is
+   reported and stops the loop.
+
+The name says where the stack goes. `merge` alone already means the
+three-way merge of `caos-std/merge`, which `stack-sync` and the restacking
+moves use. The trunk is whatever `00-base` was imported from.
+
+CI is read only before the first merge. After PR k merges, GitHub rebases
+the branches above it and CI runs again on the new heads; the operation does
+not wait for that, because the content it merges is what was checked, and
+waiting would make a three-layer merge take three CI runs. The checks that
+matter for the trunk are its own, after the merge.
+
+## `ci-status`: what CI says about a branch
+
+`std/ci-status` (`std/llm-step/src/ci_status.rs`) reads, for a branch, a
+commit, or a stack layer (by name, with `stack`), the head commit's check
+runs (`GET /commits/{sha}/check-runs`, paged) and commit statuses
+(`GET /commits/{sha}/status`), prints each with its state and link, and
+gives a verdict: FAILING if any failed (a completed run whose conclusion is
+not success, neutral or skipped; a status of failure or error), else pending
+if any has not finished, else passing; `no checks` when there are none,
+which does not block a merge. `stack-merge-to-master` gates on the same
+verdict. It is a step operation only for the token: a worker of its own
+would need its own secret grant.
+
 ## `move-sed`: renaming a layer and its description together
 
 `copy`, `move` and `remove` act on one path, and a layer is two: the gitlink
