@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
     deny_unknown_fields
 )]
 pub enum Event {
-    Request(TurnRecord),
     Tool(CallRecord),
     Async(AsyncRecord),
     Child(ChildRecord),
@@ -42,9 +41,6 @@ pub fn decode(bytes: &[u8]) -> Result<(Kind, Vec<Event>), String> {
         serde_json::from_value(parse_canonical(&bytes[split + 2..])?).map_err(|e| e.to_string())?;
     for event in &body.events {
         match event {
-            Event::Request(r) => {
-                TurnRecord::from_value(&r.to_value())?;
-            }
             Event::Tool(r) => {
                 CallRecord::from_value(&r.to_value())?;
             }
