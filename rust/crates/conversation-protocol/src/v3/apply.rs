@@ -234,10 +234,8 @@ pub fn apply(
             files,
         } => {
             let conversation = parent(store, parent_head)?;
-            let request = require_request_running_or_cancelling(&conversation, &record.request)?;
             validate_tool_completion(
                 &conversation,
-                &request,
                 record,
                 payloads,
                 files,
