@@ -370,6 +370,71 @@ with `POST /repos/{owner}/{repo}/pulls` (`title`, `head`, `base`, `body`), and
 link PRs with `POST /repos/{owner}/{repo}/stacks` and
 `{"pull_requests": [<numbers, earliest first>]}`.
 
+## Merging a stack
+
+Merge a reviewed stack with `caos-std/stack-merge-to-master`, never by hand
+through `caos-std/github` or by asking someone to press the button:
+
+```text
+run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>", "dry-run": "true"})
+run_tool(path="caos-std/stack-merge-to-master", arguments={"stack": "sources/<repo>"})
+run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remove-merged": "true"})
+```
+
+- It merges the described layers' PRs into the trunk (the branch `00-base`
+  was imported from, whatever it is called), bottom to top, one at a time,
+  each squashed with its `.pr.md` as the commit message: the title plus
+  ` (#<number>)`, then the body. `up-to` names the top layer to merge (`02`,
+  `02-tests` or `tests`); the ones below it merge too.
+- Before anything merges it refuses unless every selected layer has an open
+  PR whose head is the layer's commit (run `stack-sync` and `stack-publish`
+  first) and CI on each of those heads is passing. A failing or unfinished
+  check refuses the whole merge; `force=true` merges anyway. `dry-run=true`
+  reads the PRs and checks and says what it would do.
+- Each PR is merged with GitHub's asynchronous merge, after GitHub has
+  pointed it at the trunk, which it does itself for a linked stack once the
+  PR below merges. A failure stops it there: the layers below are merged, the
+  ones above are untouched, and running it again carries on.
+- `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
+  name, a commit, or with `stack` a layer (`02-tests` or `tests`).
+
+### The repository's squash setting
+
+`stack-merge-to-master` sets the commit message itself, so it does not depend
+on the repository. A merge from GitHub's page does: **merging a whole stack
+from the web UI offers no message editor at all**, so the repository default
+is what lands. GitHub's own default ("commit title or PR title" plus "commit
+messages") makes that a list of every "Edit source tree" commit in the
+branch, because caos pushes layers unsquashed.
+
+So set each repository a stack is published to to **PR title and
+description**: Settings, General, Pull Requests, "Allow squash merging",
+default message "Pull request title and description". By API, with an admin
+token:
+
+```text
+run_tool(path="caos-std/github", arguments={"method": "PATCH",
+  "path": "/repos/<owner>/<repo>",
+  "body": "{\"squash_merge_commit_title\":\"PR_TITLE\",\"squash_merge_commit_message\":\"PR_BODY\"}"})
+```
+
+Check it with GraphQL: `repository(owner, name) { squashMergeCommitTitle
+squashMergeCommitMessage }` should read `PR_TITLE` and `PR_BODY`.
+Metta-AI/caos has been set this way since 2026-10-30. If someone asks why a
+squash commit on the trunk is a list of "Edit source tree" lines, this
+setting is the answer, or the PR was merged some way that bypassed it.
+
+### Why not Graphite
+
+Graphite only knows a stack that its own CLI submitted (`gt track`, `gt
+submit`), and has no public API, so stacks published from caos show in it
+as separate PRs. Making them Graphite stacks would need a checkout and `gt
+submit`, which force-pushes and so fights `stack-publish`'s leased
+fast-forwards. GitHub's own stacks plus `stack-merge-to-master` cover what
+Graphite's merge would give.
+
 ## Reading and answering PR comments
 
 Nothing tells you when someone comments. Fetch the comments yourself each time
