@@ -1428,19 +1428,6 @@ fn load_at(
     })
 }
 
-fn failure_reason(snapshot: &ConversationSnapshot) -> String {
-    snapshot.error.clone().unwrap_or_else(|| {
-        let status = match snapshot.status {
-            TurnStatus::Queued => "queued",
-            TurnStatus::Running => "running",
-            TurnStatus::Cancelling => "cancelling",
-            TurnStatus::Idle => "idle",
-            TurnStatus::Failed => "failed",
-        };
-        format!("conversation request ended {status}")
-    })
-}
-
 pub fn invite_user_to_conversation(
     t: &GitTransport,
     user: &str,
