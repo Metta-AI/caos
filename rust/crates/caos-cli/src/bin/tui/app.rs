@@ -3888,7 +3888,7 @@ mod tests {
     use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
-        Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry, TurnRecord,
+        Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry,
         TurnStatus,
     };
     use conversation_protocol::v3::refs;
@@ -4027,8 +4027,6 @@ mod tests {
                 conversation: id.to_string(),
                 role: Role::User,
                 actor: username.to_string(),
-                request: None,
-                round: None,
                 model: None,
                 blocks: vec![Block::Text {
                     text: message.to_string(),
@@ -4038,28 +4036,10 @@ mod tests {
             },
             payloads: Vec::new(),
         };
-        let mut head = mint_test_transition(&mut store, &root, &message_transition);
+        let head = mint_test_transition(&mut store, &root, &message_transition);
+        // The request a local turn would run for it. Nothing records it: a
+        // conversation keeps no turn state.
         let request = queued.then(|| "b".repeat(40));
-        if let Some(request) = request.as_deref() {
-            let request = Oid::parse(request, "test request").unwrap();
-
-            let admission = Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request,
-                    request_head: head.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-configuration".to_string(),
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            };
-            head = mint_test_transition(&mut store, &head, &admission);
-        }
         store
             .push(&[RefUpdate {
                 refname: refs::head_ref(id).unwrap(),
