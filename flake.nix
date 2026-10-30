@@ -3,6 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Claude Code for the watchdog's responder. nixpkgs' copy lags by weeks
+    # and the API refuses old clients for new models ("Claude Code 2.1.260
+    # does not support this model; 2.1.280 or newer is required", seen
+    # 2026-10-30); this flake tracks Anthropic's release manifest.
+    claude-code = {
+      url = "github:sadjow/claude-code-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -24,6 +32,7 @@
     {
       self,
       nixpkgs,
+      claude-code,
       rust-overlay,
       crane,
       flake-utils,
@@ -1851,6 +1860,10 @@ sandbox = false''
           ./prod/watchdog/configuration.nix
           {
             networking.hostName = "watchdog-prod";
+            # The responder's Claude Code: see the claude-code input.
+            nixpkgs.overlays = [
+              (final: prev: { claude-code = claude-code.packages.${prev.stdenv.hostPlatform.system}.default; })
+            ];
             caos.watchdog.package = self.packages.x86_64-linux.caos-watchdog;
             caos.watchdog.clientTools = self.packages.x86_64-linux.caos-tools;
             # caosd-prod, the one production server (prod/README.md).
