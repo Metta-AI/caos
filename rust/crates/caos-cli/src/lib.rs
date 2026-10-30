@@ -2668,6 +2668,14 @@ fn run_line_client(
     }
 }
 
+/// Run the request that answers a message, to its end.
+fn run_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
+    oid(request, "request")?;
+    let secrets = conversation_secrets(id)?;
+    let server = t.server_url()?;
+    compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
+}
+
 fn run_line_turn(
     t: &GitTransport,
     options: &TurnOptions,
@@ -2680,7 +2688,7 @@ fn run_line_turn(
         .map_err(|error| (error, false))?;
     (|| {
         if let Some(request) = request {
-            resume_request(t, id, &request)?;
+            run_request(t, id, &request)?;
         }
         let load = conversation_load(t, id)?
             .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
