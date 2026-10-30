@@ -1673,7 +1673,7 @@ mod tests {
             "Title"
         );
         assert!(encode_title("").is_err());
-        assert!(parse_active_turn(b"aaaa\n").is_err());
+        assert!(encode_title("bad\n").is_err());
         assert!(Owner::from_value(&obj(&[("unknown", Value::Null)])).is_err());
         assert!(Evidence::from_value(&obj(&[("kind", value_str("push-success"))])).is_ok());
     }
