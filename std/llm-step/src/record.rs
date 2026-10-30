@@ -239,11 +239,13 @@ fn configuration(conversation: &str) -> Result<String, String> {
     caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
 }
 
-/// Make the conversation as a FORK of `from`, with its first prompt: the source
-/// settled (a session that died mid-turn left work open, which the protocol will
-/// not fork), the fork, then the prompt's request, pushed together with the
-/// creator's membership refs. `None` when the conversation exists, so the caller
-/// records onto it.
+/// Make the conversation as a FORK of `from`, with its first prompt: the fork,
+/// then the prompt's request, pushed together with the creator's membership
+/// refs. `None` when the conversation exists, so the caller records onto it.
+///
+/// `from` is forked as it stands. A conversation is a flat transcript, so a
+/// source that died mid-turn needs no settling first; its unfinished calls are
+/// tool_use blocks with no result, carried into the fork as they are.
 fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Option<State>, String> {
     let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
     let mut store = State::scratch_store()?;
@@ -254,7 +256,6 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     if Conversation::open(&store, from)?.identity()?.id == conversation {
         return Err("a fork's id must differ from its source conversation".to_string());
     }
-    let settled = crate::settle::settle(&mut store, from)?;
     let signature = signature(&request.actor)?;
     let transition = Transition::ConversationFork {
         identity: Identity {
@@ -266,8 +267,8 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         },
         title: format!("fork of {}", &from.as_str()[..12]),
     };
-    let applied = apply(&mut store, Some(&settled), &transition)?;
-    let forked = mint(&mut store, &settled, &applied, transition.kind(), &signature)?;
+    let applied = apply(&mut store, Some(from), &transition)?;
+    let forked = mint(&mut store, from, &applied, transition.kind(), &signature)?;
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
     let (claimed, _) = open_request(
         &mut state,

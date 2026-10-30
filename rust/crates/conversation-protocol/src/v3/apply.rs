@@ -582,38 +582,13 @@ pub fn apply(
     })
 }
 
-fn validate_fork_quiescence(conversation: &Conversation<'_>) -> Result<(), String> {
-    if conversation.active_turn()?.is_some() {
-        return Err("cannot fork a conversation with an active or cancelling request".to_string());
-    }
-    for request in conversation.turn_ids()? {
-        let record = conversation
-            .turn(&request)?
-            .ok_or_else(|| format!("request {request} disappeared"))?;
-        for round in 0..record.round {
-            if conversation
-                .tools(&request, round)?
-                .into_iter()
-                .any(|tool| !tool.is_terminal())
-            {
-                return Err("cannot fork a conversation with a started tool".to_string());
-            }
-        }
-    }
-    if conversation
-        .async_tasks()?
-        .into_iter()
-        .any(|task| task.status == TaskStatus::Pending)
-    {
-        return Err("cannot fork a conversation with a nonterminal async task".to_string());
-    }
-    if conversation
-        .publications()?
-        .into_iter()
-        .any(|publication| publication.status == PublicationStatus::Pending)
-    {
-        return Err("cannot fork a conversation with a nonterminal publication".to_string());
-    }
+fn validate_fork_quiescence(_conversation: &Conversation<'_>) -> Result<(), String> {
+    // A conversation is a flat transcript; a fork copies it as it stands, with
+    // no outstanding-work check. A call that started and never finished is just
+    // a tool_use with no tool_result, which a reader renders as unfinished and a
+    // resuming driver decides what to do with. (Formerly refused an active
+    // request, a started tool, or a pending async task or publication, which is
+    // why a session that died mid-turn had to be "settled" before it could fork.)
     Ok(())
 }
 
@@ -827,12 +802,12 @@ fn validate_tool_source_tree(
     Ok(())
 }
 
-fn validate_current_call(request: &TurnRecord, record: &CallRecord) -> Result<(), String> {
-    if record.round.checked_add(1) != Some(request.round)
-        || !request.calls.iter().any(|call| call.id == record.id)
-    {
-        return Err("tool not declared by the current round".to_string());
-    }
+fn validate_current_call(_request: &TurnRecord, _record: &CallRecord) -> Result<(), String> {
+    // Flat transcript: a tool call is a recorded fact, not gated by which round
+    // is current. A harness that backgrounds a slow call and opens a new round
+    // behind it completes the slow one on the round that declared it, which is
+    // no longer the latest. (Formerly required the call to be in the latest
+    // round's declaration, which failed exactly that case and ended the request.)
     Ok(())
 }
 

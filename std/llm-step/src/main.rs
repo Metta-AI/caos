@@ -8,7 +8,6 @@ mod publish_source;
 mod stack_publish;
 mod stack_sync;
 mod record;
-mod settle;
 mod source_trees;
 mod subagents;
 mod timing;
@@ -92,6 +91,17 @@ struct Config {
     /// The declaration is idempotent, so the run that follows finds the call
     /// declared and goes on to run it.
     declare_only: bool,
+    /// With `tools_only`: the round of the request that declares the call, once
+    /// `declare_requested_call` has found or made the declaration.
+    ///
+    /// A step that drives the model works on the request's LATEST round: it
+    /// finishes a round before opening the next. A harness that drives the model
+    /// itself (Claude Code, through `caos mcp`) does not. `start` declares a call
+    /// and answers at once, and the model's next call declares on the round
+    /// after, while the started one has yet to run or finish. So a tools-only run
+    /// drives, completes and reads back ITS call on the round that declared it,
+    /// whatever the latest round has since become.
+    tool_round: Option<u64>,
     /// With `tools_only`: a completed call whose text is longer than this many
     /// characters is also saved in the conversation, and the run's result says
     /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
@@ -173,6 +183,7 @@ impl Config {
             tools_only,
             tool_call,
             declare_only,
+            tool_round: None,
             max_result_chars,
             record,
             list_tools,
@@ -193,7 +204,7 @@ impl Config {
 }
 
 fn run() -> Result<(), String> {
-    let cfg = Config::read()?;
+    let mut cfg = Config::read()?;
     if cfg.list_tools {
         return list_tools(&cfg);
     }
@@ -206,11 +217,15 @@ fn run() -> Result<(), String> {
         // The caller named a call, not a request: the active one is the
         // request, and it records its own head.
         (Some(call), Some((name, arguments))) => {
-            let declared = declare_requested_call(&mut state, call, name, arguments)?;
+            let (request, request_head, round) =
+                declare_requested_call(&mut state, call, name, arguments)?;
             if cfg.declare_only {
                 return forward_files(state.head(), &[("status", b"declared"), ("observation", b"")]);
             }
-            declared
+            // Work on the round that declares this call, which is the latest only
+            // until the harness's next call declares on another.
+            cfg.tool_round = Some(round);
+            (request, request_head)
         }
         _ => {
             let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
@@ -421,10 +436,7 @@ fn pending_call_target(
 ) -> Result<Option<(String, Oid)>, String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round_state = round_state(&view, &record)?;
-    if round_state.declaring_round != round {
-        return Ok(None);
-    }
+    let round_state = round_state_at(&view, &record, round)?;
     let Some(call) = round_state.pending.iter().find(|call| call.id == id) else {
         return Ok(None);
     };
@@ -453,7 +465,7 @@ fn resume(
             TurnStatus::Running => {}
         }
 
-        let round = round_state(&state.conversation()?, &record)?;
+        let round = working_round(cfg, &state.conversation()?, &record)?;
         if let Some(call) = round.pending.first() {
             if drive_call(cfg, state, request, &round, call)? {
                 continue;
@@ -468,7 +480,7 @@ fn resume(
         if current.status != TurnStatus::Running {
             continue;
         }
-        let round = round_state(&state.conversation()?, &current)?;
+        let round = working_round(cfg, &state.conversation()?, &current)?;
         if !round.pending.is_empty() {
             continue;
         }
@@ -476,7 +488,7 @@ fn resume(
         // run is finished, and leaves the request RUNNING for the next call.
         // Its result is the conversation as it now stands, not a terminal one.
         if let Some(call) = &cfg.tools_only {
-            require_completed_call(state, request, call)?;
+            require_completed_call(cfg, state, request, call)?;
             return forward_tool_result(cfg, state, request, call);
         }
         let messages = context_messages(&state.conversation()?)?;
@@ -502,13 +514,14 @@ fn resume(
 /// race, or that named a call from another round, would otherwise be handed a
 /// result with nothing of its own in it.
 fn require_completed_call(
+    cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
     call: &str,
 ) -> Result<(), String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round = round_state(&view, &record)?.declaring_round;
+    let round = working_round(cfg, &view, &record)?.declaring_round;
     match view.tool(request, round, call)? {
         Some(tool) if tool.is_terminal() => Ok(()),
         Some(tool) => Err(format!(
@@ -677,6 +690,8 @@ fn close_pending_call(
     Ok(())
 }
 
+/// The request's LATEST round: the one a step that drives the model works on,
+/// since it finishes a round before it opens the next.
 fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundState, String> {
     if record.round == 0 {
         if !record.calls.is_empty() {
@@ -688,7 +703,37 @@ fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundStat
             pending: Vec::new(),
         });
     }
-    let declaring_round = record.round - 1;
+    round_state_at(view, record, record.round - 1)
+}
+
+/// The round a tools-only run works on: the one that declares its call
+/// (`Config::tool_round`), or the latest while none has been found.
+fn working_round(
+    cfg: &Config,
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+) -> Result<RoundState, String> {
+    match cfg.tool_round {
+        Some(round) => round_state_at(view, record, round),
+        None => round_state(view, record),
+    }
+}
+
+/// One round of a request: the calls its assistant declaration made, and which
+/// of them have not finished. Any round the request has had, not only the
+/// latest: a call `start` declared is run and read back on its own round after
+/// the harness's next call has opened another (`Config::tool_round`).
+fn round_state_at(
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+    declaring_round: u64,
+) -> Result<RoundState, String> {
+    if declaring_round >= record.round {
+        return Err(format!(
+            "request {} has no round {declaring_round}: it has declared {} round(s)",
+            record.id, record.round
+        ));
+    }
     let mut declaration = None;
     for ordinal in (0..view.transcript_len()?).rev() {
         let (_, entry) = view
@@ -732,7 +777,9 @@ fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundStat
             name: call.name.clone(),
         })
         .collect();
-    if projection != record.calls {
+    // `record.calls` projects the LATEST round's declaration only; an earlier
+    // round is checked against nothing but its own transcript entry.
+    if declaring_round + 1 == record.round && projection != record.calls {
         return Err(format!(
             "request {} calls do not match transcript ordinal {ordinal}",
             record.id
@@ -1129,7 +1176,7 @@ fn declare_requested_call(
     call: &str,
     name: &str,
     arguments: &Value,
-) -> Result<(Oid, Oid), String> {
+) -> Result<(Oid, Oid, u64), String> {
     loop {
         let view = state.conversation()?;
         let record = view.active_turn()?.ok_or_else(|| {
@@ -1138,12 +1185,8 @@ fn declare_requested_call(
                 state_conversation_id(state).unwrap_or_default()
             )
         })?;
-        let mut declared = record.calls.iter().any(|declared| declared.id == call);
-        for round in 0..record.round {
-            declared |= view.tool(&record.id, round, call)?.is_some();
-        }
-        if declared {
-            return Ok((record.id, record.request_head));
+        if let Some(round) = declared_round(&view, &record, call)? {
+            return Ok((record.id, record.request_head, round));
         }
         if record.status == TurnStatus::Queued {
             // Nobody has claimed the request yet; the step does, as it does
@@ -1183,11 +1226,33 @@ fn declare_requested_call(
         let expected = state.head().clone();
         match state.try_append_at(&expected, transition)? {
             progress::TryAppend::Appended(_) => {
-                return Ok((record.id, record.request_head));
+                return Ok((record.id, record.request_head, record.round));
             }
             progress::TryAppend::HeadChanged(_) => continue,
         }
     }
+}
+
+/// The round of `record` whose assistant declaration carries the call, if one
+/// does. It reads the declarations, not `tool.start` records: a call `start`
+/// declared that nothing has run yet is the request's all the same, on whatever
+/// round declared it, and must not be declared a second time on a later one.
+fn declared_round(
+    view: &Conversation<'_>,
+    record: &TurnRecord,
+    call: &str,
+) -> Result<Option<u64>, String> {
+    last_matching(view, |_, entry| {
+        if entry.role != Role::Assistant || entry.request.as_ref() != Some(&record.id) {
+            return None;
+        }
+        let declares = entry
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::ToolUse { id, .. } if id.as_str() == call));
+        declares.then_some(entry.round)
+    })
+    .map(Option::flatten)
 }
 
 /// The result of a tools-only run: the call's own record, so a caller with only
@@ -1211,7 +1276,7 @@ fn forward_tool_result(
 ) -> Result<(), String> {
     let view = state.conversation()?;
     let record = require_request(&view, request)?;
-    let round = round_state(&view, &record)?.declaring_round;
+    let round = working_round(cfg, &view, &record)?.declaring_round;
     let tool = view
         .tool(request, round, call)?
         .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
@@ -1933,7 +1998,7 @@ fn launch_resolved_tool(
     id: &str,
 ) -> Result<(), String> {
     let record = require_request(&state.conversation()?, request)?;
-    let current = round_state(&state.conversation()?, &record)?;
+    let current = working_round(cfg, &state.conversation()?, &record)?;
     if current.declaring_round != round {
         return resume(cfg, state, request, request_head);
     }
@@ -2574,13 +2639,7 @@ fn declaration_message(
     round: u64,
 ) -> Result<String, String> {
     let record = require_request(view, request)?;
-    let state = round_state(view, &record)?;
-    if state.declaring_round != round {
-        return Err(format!(
-            "request {request} no longer has declaring round {round}"
-        ));
-    }
-    Ok(state.declaration_message)
+    Ok(round_state_at(view, &record, round)?.declaration_message)
 }
 
 fn observation_path(record: &CallRecord) -> String {
@@ -3406,7 +3465,7 @@ fn record_failure(
         if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
             return Ok(());
         }
-        let round = round_state(&state.conversation()?, &record)?;
+        let round = working_round(cfg, &state.conversation()?, &record)?;
         if let Some(call) = round.pending.first() {
             let text = format!("the request stopped before this tool completed: {error}");
             let block = error_block(&call.id, &text);

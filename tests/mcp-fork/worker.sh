@@ -3,14 +3,11 @@
 # prompt: the new session gets its OWN conversation, whose history is <hash>'s;
 # the original does not move.
 #
-# A head left open (a session that died mid-turn) is used as it is: the
-# protocol refuses to fork a running request, so the hook closes it as new
-# commits on top, and the record says so.
+# A head left open (a session that died mid-turn) is forked as it is: a
+# conversation is a flat transcript, so the fork copies it unchanged, open
+# request and all, and the record shows the fork landing straight on top.
 #
-# Driven through `caos mcp hook` only -- no tool server, no model. What that
-# leaves untested is the closing of a CALL a dead session left running or
-# declared; the request-only case below covers `settle`'s path through the
-# terminal, and the call paths are what `llm-step`'s `drain` already does.
+# Driven through `caos mcp hook` only -- no tool server, no model.
 set -euo pipefail
 
 # The hook's diag journal lives under $HOME/.cache, and the worker's HOME
@@ -93,9 +90,14 @@ g="resume-g-$stamp"
 prompt "$g" "/fork-caos-conversation $head_b" >/dev/null
 head_g=$(head_of "cc/$g")
 [ -n "$head_g" ] || fail "an open head could not be forked"
+# No settle: the fork lands straight on the open head, whose newest commit is
+# b's own request.claim. (It used to insert a request.terminal before forking.)
 case "$(subjects "$head_g")" in
-  *"conversation.fork request.terminal "*) ;;
-  *) fail "the open request was not closed before the fork: $(subjects "$head_g")" ;;
+  *"conversation.fork request.claim "*) ;;
+  *) fail "the fork did not land directly on the open head: $(subjects "$head_g")" ;;
+esac
+case "$(subjects "$head_g")" in
+  *request.terminal*) fail "forking an open head should not settle it: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
 
