@@ -374,13 +374,11 @@ case "$late" in
   *) fail "a start after the turn's Stop was refused: $late" ;;
 esac
 
-echo "== a started call is run and read back on the round that declared it ==" >&2
-# `start` declares its call and answers at once, and the model's NEXT caos call
-# declares on the round after -- while the started one has yet to run, or finish.
-# The protocol used to accept a tool completion only on the latest round, so the
-# started call's completion was refused and recording that failure ended the
-# request; every later call in the turn then found no request open. A flat
-# transcript accepts the completion on the round that declared it.
+echo "== a started call is read back by its id after another call is declared behind it ==" >&2
+# `start` answers at once, and the model's NEXT caos call is declared while the
+# started one has yet to run, or finish. The started call is keyed by its id, so
+# its completion lands wherever it does in the transcript, and every later call
+# runs as before.
 behind="mcp-behind-$(date +%s)-$$"
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$behind\",\"prompt\":\"start slow, then call again\"}"
 send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_id "$behind" \
@@ -416,7 +414,7 @@ case "$finished" in
   *'slept 20'*) ;;
   *) fail "a started call lost its result once another call was declared behind it: ${finished:-never finished}" ;;
 esac
-# And the request is still usable: a third call in the same turn runs.
+# And the session runs on: a third call in the same turn runs.
 send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_id "$behind-after" \
   '{jsonrpc:"2.0",id:421,method:"tools/call",params:{name:"run",arguments:{
     caos_session:$session,caos_tool_use_id:"behind-421",path:$path,
@@ -424,7 +422,7 @@ send "$(jq -nc --arg session "$behind" --arg path "${prefix}slow" --arg request_
 after=$(await '"id":421' 300) || fail "the call after the started one never answered"
 case "$after" in
   *'slept 0'*) ;;
-  *) fail "the request did not survive the started call's completion: $after" ;;
+  *) fail "a call after the started one's completion failed: $after" ;;
 esac
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$behind\",\"last_assistant_message\":\"done\"}"
 
