@@ -68,7 +68,10 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
 /// The described layers to merge, bottom first, up to and including `up_to`:
 /// a layer's name (`02-tests`), its number (`02`) or its name without the
 /// number (`tests`). None selects every described layer.
-pub(super) fn select<'a>(layers: &'a [Layer], up_to: Option<&str>) -> Result<Vec<&'a Layer>, String> {
+pub(super) fn select<'a>(
+    layers: &'a [Layer],
+    up_to: Option<&str>,
+) -> Result<Vec<&'a Layer>, String> {
     let top = match up_to {
         None => layers.len(),
         Some(up_to) => {
