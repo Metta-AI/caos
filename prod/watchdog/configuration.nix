@@ -20,11 +20,10 @@
 #    monitors and runs a Claude Code session over them. prod/watchdog/
 #    respond.go has the rules; runbook/CLAUDE.md is what the session reads.
 #
-# The responder's reach is two secrets and one IAM role. The role (metta:
-# devops/tf/caos) may run SSM commands on the one prod instance, mint an
-# identity token for Anthropic, and read the secrets; it may not reboot, stop
-# or launch anything. Reboots are a human's, asked for in Slack. There is no
-# Anthropic API key: the box authenticates to Anthropic as its IAM role.
+# The responder's reach is three secrets and one IAM role. The role (metta:
+# devops/tf/caos) may run SSM commands on the one prod instance and read the
+# secrets; it may not reboot, stop or launch anything. Reboots are a human's,
+# asked for in Slack.
 
 {
   config,
@@ -45,14 +44,6 @@ let
     CAOS_WATCHDOG_RUNBOOK = "${runbook}";
     CAOS_WATCHDOG_MODEL = cfg.model;
     CAOS_WATCHDOG_HELLO_REV = cfg.helloRev;
-    # Workload Identity Federation: with these four set and no
-    # ANTHROPIC_API_KEY anywhere, Claude Code exchanges the identity token
-    # the responder writes to ANTHROPIC_IDENTITY_TOKEN_FILE for a short-lived
-    # Anthropic token. There is no static Anthropic credential on this box.
-    ANTHROPIC_ORGANIZATION_ID = cfg.anthropic.organizationId;
-    ANTHROPIC_WORKSPACE_ID = cfg.anthropic.workspaceId;
-    ANTHROPIC_SERVICE_ACCOUNT_ID = cfg.anthropic.serviceAccountId;
-    ANTHROPIC_FEDERATION_RULE_ID = cfg.anthropic.federationRuleId;
   };
   runbook = pkgs.runCommand "caos-watchdog-runbook" { } ''
     mkdir -p $out
@@ -95,32 +86,6 @@ in
         must be pushed to GitHub for the server to fetch it.
       '';
     };
-    anthropic = {
-      organizationId = lib.mkOption {
-        type = lib.types.str;
-        description = "ANTHROPIC_ORGANIZATION_ID: the Anthropic organization (a UUID).";
-      };
-      workspaceId = lib.mkOption {
-        type = lib.types.str;
-        description = "ANTHROPIC_WORKSPACE_ID: the workspace the minted token is scoped to (wrkspc_...).";
-      };
-      serviceAccountId = lib.mkOption {
-        type = lib.types.str;
-        description = "ANTHROPIC_SERVICE_ACCOUNT_ID: the service account the responder acts as (svac_...).";
-      };
-      federationRuleId = lib.mkOption {
-        type = lib.types.str;
-        description = ''
-          ANTHROPIC_FEDERATION_RULE_ID: the rule (fdrl_...) that maps this
-          box's IAM role to that service account. The rule matches
-          sub = arn:aws:iam::<account>:role/caos-watchdog and
-          aud = https://api.anthropic.com on a token the box mints with
-          `aws sts get-web-identity-token`; see respond.go identityToken.
-          None of these four ids is a secret, which is why they are here and
-          not in Secrets Manager: the credential is the instance role.
-        '';
-      };
-    };
   };
 
   config = {
@@ -138,6 +103,10 @@ in
     caos.secrets = {
       datadog-app-key = {
         secretId = "caos/watchdog/datadog-app-key";
+        group = "caos-watchdog";
+      };
+      anthropic-api-key = {
+        secretId = "caos/watchdog/anthropic-api-key";
         group = "caos-watchdog";
       };
       slack-webhook = {

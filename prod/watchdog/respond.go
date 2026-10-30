@@ -263,20 +263,9 @@ func session(c conf, inc *incident, current []alert) run {
 		"--max-turns", fmt.Sprint(maxTurns),
 		"--permission-mode", "dontAsk")
 	cmd.Dir = workspace
-	// No API key anywhere in this process: Claude authenticates by Workload
-	// Identity Federation. The four ANTHROPIC_* ids arrive in the unit's
-	// environment (configuration.nix) and are inherited; the identity token
-	// is minted here, from the instance role, and refreshed while the
-	// session runs. ANTHROPIC_API_KEY would silently win over all of it, so
-	// its absence is asserted rather than assumed.
-	_, keySet := os.LookupEnv("ANTHROPIC_API_KEY")
-	w.True(!keySet, "ANTHROPIC_API_KEY is set; it would shadow workload identity federation")
-	tokenFile := c.stateDir + "/identity-token"
-	stopRefresh := identityToken(c, tokenFile)
-	defer stopRefresh()
 	cmd.Env = append(os.Environ(),
 		"HOME="+c.stateDir,
-		"ANTHROPIC_IDENTITY_TOKEN_FILE="+tokenFile,
+		"ANTHROPIC_API_KEY="+c.secret("anthropic-api-key"),
 		"DISABLE_AUTOUPDATER=1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 	)
@@ -331,38 +320,4 @@ func tail(s string, n int) string {
 		return s
 	}
 	return "…" + s[len(s)-n:]
-}
-
-// identityToken writes a fresh AWS-signed OIDC token for the Anthropic
-// audience to path and keeps it fresh until the returned stop function is
-// called. The SDK inside Claude Code exchanges the file's contents for an
-// Anthropic access token and re-reads the file at every refresh; each token
-// carries a jti and may be exchanged once, so the file must hold a NEW token
-// by the time a refresh comes round. Minting every 10 minutes against a
-// 1-hour token lifetime keeps the file well ahead of that schedule.
-func identityToken(c conf, path string) (stop func()) {
-	mint := func() {
-		out := c.aws("sts", "get-web-identity-token",
-			"--audience", "https://api.anthropic.com",
-			"--signing-algorithm", "RS256",
-			"--duration-seconds", "3600",
-			"--query", "WebIdentityToken", "--output", "text")
-		w.Must(os.WriteFile(path+".tmp", []byte(strings.TrimSpace(out)), 0o600))
-		w.Must(os.Rename(path+".tmp", path))
-	}
-	mint()
-	quit := make(chan struct{})
-	go func() {
-		t := time.NewTicker(10 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-t.C:
-				mint()
-			case <-quit:
-				return
-			}
-		}
-	}()
-	return func() { close(quit) }
 }

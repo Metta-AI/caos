@@ -1856,8 +1856,6 @@ sandbox = false''
             # A dirty tree still names its HEAD; the server fetches from
             # GitHub, so whatever is deployed must be pushed.
             caos.watchdog.helloRev = self.rev or (nixpkgs.lib.removeSuffix "-dirty" self.dirtyRev);
-            # From the Claude Console's Workload identity page (prod/README.md).
-            caos.watchdog.anthropic = import ./prod/watchdog/anthropic.nix;
           }
         ];
       };

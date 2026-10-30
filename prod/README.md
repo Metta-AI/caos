@@ -149,24 +149,16 @@ Deploying it:
 sudo nixos-rebuild switch --refresh --flake github:Metta-AI/caos#watchdog-prod
 ```
 
-The instance, its IAM role (SSM on the one prod instance, read of three
-secrets, an STS identity token for Anthropic, nothing that reboots) and the
-empty secrets are OpenTofu in metta, `devops/tf/caos`. The secret VALUES are
-set by hand once:
+The instance, its IAM role (SSM on the one prod instance, read of four
+secrets, nothing that reboots) and the empty secrets are OpenTofu in metta,
+`devops/tf/caos`. The secret VALUES are set by hand once:
 
 ```sh
 aws secretsmanager put-secret-value --profile caos-admin --region us-east-1 \
   --secret-id caos/datadog-api-key --secret-string "$DD_API_KEY"
-# likewise caos/watchdog/datadog-app-key, caos/watchdog/slack-webhook
+# likewise caos/watchdog/datadog-app-key, caos/watchdog/anthropic-api-key,
+# caos/watchdog/slack-webhook
 ```
-
-There is no Anthropic API key. The box authenticates to Anthropic as its IAM
-role through Workload Identity Federation: before a session the responder
-mints an AWS-signed OIDC token (`aws sts get-web-identity-token`, audience
-`https://api.anthropic.com`) and Claude Code exchanges it for a short-lived
-Anthropic token. The Anthropic side (issuer, service account, rule) is set
-up once in the Claude Console; its four non-secret ids live in
-`watchdog/anthropic.nix`.
 
 From a shell on the box: `caos-watchdog ssh -- <cmd>` runs a command on the
 server, `systemctl status caos-watchdog caos-watchdog-probe.timer` shows the
