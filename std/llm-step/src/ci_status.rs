@@ -278,7 +278,9 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     let Some((owner, repo)) = github_repo(&repository) else {
         return site.fail(
             state,
-            &format!("ci-status: {repository} is not on github.com, which is where check runs are read"),
+            &format!(
+                "ci-status: {repository} is not on github.com, which is where check runs are read"
+            ),
         );
     };
     let github = Github {
