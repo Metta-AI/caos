@@ -81,7 +81,7 @@ done
 
 wait_turn || fail "the parent spawn turn never reached a terminal event"
 head1=$head
-$TOOL tools --repo /tmp/repo --head "$head1" --request "$request1" > /tmp/parent-tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head1" > /tmp/parent-tools.jsonl
 spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
 [ -n "$spawn_record" ] || fail "spawn_agent has no tool record"
 [ "$(jq -r '.name' <<<"$spawn_record")" = spawn_agent ] \
@@ -90,15 +90,14 @@ spawn_record=$(jq -c 'select(.id == "toolu_spawn")' /tmp/parent-tools.jsonl)
   || fail "spawn tool record is not complete"
 
 
-$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
-  --round 0 --id toolu_spawn > /tmp/spawn-observation.json
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --id toolu_spawn > /tmp/spawn-observation.json
 child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
 child_hex=${child#subagent-}
 if [ "$child" = "$child_hex" ] || [ "${#child_hex}" -ne 64 ]; then
   fail "spawn returned invalid child id: $child"
 fi
 case "$child_hex" in *[!0-9a-f]*) fail "spawn returned invalid child id: $child" ;; esac
-expected_child=$($TOOL child-id --parent "$conv" --request "$request1" --round 0 \
+expected_child=$($TOOL child-id --parent "$conv" --round 0 \
   --tool toolu_spawn) || fail "recomputing child id"
 expected_child=${expected_child#child }
 [ "$child" = "$expected_child" ] || fail "child id is not derived from the durable call"
@@ -120,8 +119,7 @@ wait_record=$(jq -c 'select(.id == "toolu_wait")' /tmp/parent-tools.jsonl)
   || fail "wait_agent did not complete"
 [ "$(jq -r '.task' <<<"$wait_record")" = "$relay" ] \
   || fail "wait_agent did not join the child's relay"
-$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" \
-  --round 1 --id toolu_wait > /tmp/wait-observation.json
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --id toolu_wait > /tmp/wait-observation.json
 [ "$(jq -r '.child' /tmp/wait-observation.json)" = "$child" ] \
   || fail "wait_agent observation names the wrong child"
 [ "$(jq -r '.status' /tmp/wait-observation.json)" = completed ] \
@@ -151,8 +149,8 @@ git merge-base --is-ancestor "$initial_head" "$child_tip" \
   || fail "child ref does not descend from its recorded initial head"
 initial_kinds=$($TOOL parents --repo /tmp/repo --head "$initial_head" --validate \
   | while read -r _ kind; do printf '%s\n' "$kind"; done | paste -sd,)
-[ "$initial_kinds" = request.admit,message.append,conversation.root ] \
-  || fail "child initial chain is not admit -> prompt -> root: $initial_kinds"
+[ "$initial_kinds" = message.append,conversation.root ] \
+  || fail "child initial chain is not prompt -> root: $initial_kinds"
 record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 [ "$(jq -r '.id' /tmp/child-identity.json)" = "$child" ] \
   || fail "child root identity id is wrong"
@@ -230,7 +228,7 @@ fetch_code "$parent_after" "fetching harvested parent source_tree"
   || fail "harvested parent tree lacks the child's file"
 [ "$(git show "$head2:memories/child.md")" = "remember this" ] \
   || fail "harvest omitted ordinary conversation content"
-$TOOL tools --repo /tmp/repo --head "$head2" --request "$request2" \
+$TOOL tools --repo /tmp/repo --head "$head2" \
   | jq -e 'select(.id == "toolu_harvest") | .files_outcome.applied | index("memories/child.md") != null' >/dev/null \
   || fail "harvest did not use file application"
 
@@ -245,12 +243,12 @@ while read -r oid kind; do
     subagent.spawn) spawn_count=$((spawn_count + 1)) ;;
     subagent.terminal) terminal_count=$((terminal_count + 1)) ;;
     tool.complete)
-      if git show -s --format=%b "$oid" | jq -e --arg request "$request2" \
-          '.events[] | select(.event == "tool" and .value.request == $request and .value.id == "toolu_harvest")' >/dev/null; then
+      if git show -s --format=%b "$oid" | jq -e \
+          '.events[] | select(.event == "tool" and .value.id == "toolu_harvest")' >/dev/null; then
         harvest_complete_count=$((harvest_complete_count + 1))
       fi
       ;;
-    message.append|request.admit|request.claim|model.complete|request.terminal|tool.start|files.apply) ;;
+    message.append|tool.start|files.apply) ;;
     *) fail "unexpected parent event $kind while child ran" ;;
   esac
 done < <($TOOL parents --repo /tmp/repo --head "$head2" \
