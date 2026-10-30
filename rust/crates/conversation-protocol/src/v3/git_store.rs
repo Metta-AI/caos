@@ -1758,6 +1758,47 @@ mod tests {
     }
 
     #[test]
+    fn merge_commits_over_an_explicit_base_merges_unrelated_histories() {
+        let directory = TestDirectory::new("merge-over");
+        let repository = directory.child("repository");
+        init(&repository, false);
+        let mut store = GitStore::open(&repository, None).expect("open git store");
+        // The tree both sides were seeded from, recorded in neither history: a
+        // conversation rooted on G3 and the repository its content came from.
+        let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
+        let base_tree = update_tree(&mut store, Some(&base_tree), "kept.txt", b"kept\n");
+        let ours_tree = update_tree(&mut store, Some(&base_tree), "ours.txt", b"ours\n");
+        let ours = write_commit(&mut store, &ours_tree, &[], "ours\n");
+        let theirs_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"theirs\n");
+        let theirs = write_commit(&mut store, &theirs_tree, &[], "theirs\n");
+        assert_eq!(store.merge_base(&ours, &theirs).unwrap(), None);
+        assert!(store.merge_commits(&ours, &theirs).is_err());
+
+        let merged = match store.merge_commits_over(&base_tree, &ours, &theirs).unwrap() {
+            MergeOutcome::Merged { tree } => tree,
+            MergeOutcome::Conflict { paths } => panic!("unexpected conflict: {paths:?}"),
+        };
+        let snapshot = Snapshot::new(&store, merged);
+        assert_eq!(snapshot.read("ours.txt").unwrap(), Some(b"ours\n".to_vec()));
+        assert_eq!(
+            snapshot.read("shared.txt").unwrap(),
+            Some(b"theirs\n".to_vec())
+        );
+        assert_eq!(snapshot.read("kept.txt").unwrap(), Some(b"kept\n".to_vec()));
+
+        let conflict_tree = update_tree(&mut store, Some(&base_tree), "shared.txt", b"ours\n");
+        let conflict = write_commit(&mut store, &conflict_tree, &[], "conflict\n");
+        assert_eq!(
+            store
+                .merge_commits_over(&base_tree, &conflict, &theirs)
+                .unwrap(),
+            MergeOutcome::Conflict {
+                paths: vec!["shared.txt".to_string()]
+            }
+        );
+    }
+
+    #[test]
     fn code_ops_over_real_history() {
         let directory = TestDirectory::new("code-ops");
         let repository = directory.child("repository");
