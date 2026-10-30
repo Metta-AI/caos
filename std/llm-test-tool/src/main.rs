@@ -1460,8 +1460,6 @@ mod tests {
             "/repo".to_string(),
             "--head".to_string(),
             "a".repeat(40),
-            "--request".to_string(),
-            "b".repeat(40),
             "--started-tool".to_string(),
             "toolu_01".to_string(),
         ])
@@ -1469,7 +1467,7 @@ mod tests {
         assert!(matches!(
             command,
             ToolCommand::Parents {
-                started_tool: Some((_, ref id)),
+                started_tool: Some(ref id),
                 ..
             } if id == "toolu_01"
         ));
