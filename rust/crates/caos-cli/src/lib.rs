@@ -3554,9 +3554,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .replay;
-        assert_eq!(replay.turns.len(), 3);
+        assert_eq!(replay.turns.len(), 4);
         assert_eq!(replay.turns[0].commit, first_message);
         assert_eq!(replay.turns[1].commit, active_head.to_string());
+        assert_eq!(replay.turns[2].message, INTERRUPT_TEXT);
         assert_eq!(
             replay
                 .turns
@@ -3564,7 +3565,7 @@ mod tests {
                 .map(|turn| &turn.commit)
                 .collect::<HashSet<_>>()
                 .len(),
-            3
+            4
         );
 
         std::fs::write(transport.work_dir().join("other"), "other\n").unwrap();
