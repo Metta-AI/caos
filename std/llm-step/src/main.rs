@@ -3354,14 +3354,12 @@ fn client_key() -> Result<String, String> {
 fn self_curry(
     wc: Option<&str>,
     request: &Oid,
-    round: u64,
     current_id: &str,
     extras: &[(&str, Arg<'_>)],
 ) -> Result<String, String> {
     const MANAGED: &[&str] = &[
         "wc",
         "run",
-        "round",
         "base-head",
         "current-id",
         "current-tool",
@@ -3383,14 +3381,12 @@ fn self_curry(
         .copied()
         .filter(|name| Path::new(&arg(name)).exists())
         .collect();
-    let round = round.to_string();
     let mut bindings = Vec::new();
     if let Some(wc) = wc {
         bindings.push(("wc", Arg::Path(wc)));
     }
     bindings.extend([
         ("run", Arg::Lit(request.as_str())),
-        ("round", Arg::Lit(round.as_str())),
         ("current-id", Arg::Lit(current_id)),
     ]);
     bindings.extend_from_slice(extras);
