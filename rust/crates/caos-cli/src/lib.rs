@@ -1188,9 +1188,8 @@ fn replay_from(
     let conversation_id = conversation.identity()?.id;
     let mut has_own_user_messages = false;
     let mut turns = Vec::new();
-    let mut request_order = Vec::new();
-    let mut assistant_entries: HashMap<(Oid, u64), TranscriptEntry> = HashMap::new();
-    for (_, _, entry) in transcript {
+    let mut declarations = Vec::new();
+    for (ordinal, _, entry) in transcript {
         has_own_user_messages |= entry.role == Role::User && entry.conversation == conversation_id;
         if let (Some(request), Some(round)) = (&entry.request, entry.round) {
             if entry.role == Role::Assistant {
