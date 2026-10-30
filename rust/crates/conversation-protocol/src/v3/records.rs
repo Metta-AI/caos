@@ -143,8 +143,7 @@ pub enum IdentityKind {
 pub struct Owner {
     pub parent: String,
     pub parent_head: Oid,
-    pub request: Oid,
-    pub round: u64,
+    /// The id of the parent's call that spawned this conversation.
     pub tool: String,
 }
 
