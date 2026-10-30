@@ -3822,22 +3822,26 @@ mod tests {
             None,
             |_, _, _, candidate| {
                 calls.set(calls.get() + 1);
-                *stale.borrow_mut() = candidate.to_string();
-                submit_message_inner_with(
-                    &transport,
-                    &options,
-                    "race",
-                    "winner",
-                    false,
-                    None,
-                    None,
-                    |_, _, _, _| Ok("b".repeat(40)),
-                )?;
+                // The winner lands while the loser's first candidate is being
+                // prepared; the loser's retry is prepared again, on top of it.
+                if calls.get() == 1 {
+                    *stale.borrow_mut() = candidate.to_string();
+                    submit_message_inner_with(
+                        &transport,
+                        &options,
+                        "race",
+                        "winner",
+                        false,
+                        None,
+                        None,
+                        |_, _, _, _| Ok("b".repeat(40)),
+                    )?;
+                }
                 Ok("c".repeat(40))
             },
         )
         .unwrap();
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 2);
         let load = conversation_load(&transport, "race").unwrap().unwrap();
         assert_eq!(
             load.replay
