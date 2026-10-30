@@ -3710,8 +3710,6 @@ mod tests {
             conversation: CONVERSATION.to_string(),
             role,
             actor: "test".to_string(),
-            request: None,
-            round: None,
             model: None,
             blocks,
             proposal: None,
@@ -3741,35 +3739,6 @@ mod tests {
             },
         )?;
         let request = Oid::parse(&"a".repeat(40), "request")?;
-
-        let admitted = append_memory(
-            &mut store,
-            &user,
-            Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request.clone(),
-                    request_head: user.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-config".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            },
-        )?;
-        let claimed = append_memory(
-            &mut store,
-            &admitted,
-            Transition::TurnClaim {
-                request: request.clone(),
-                latest_message: USER_ID.to_string(),
-            },
-        )?;
         let first_args = format!(
             "{}/args-first.json",
             paths::transcript_payload_dir(1, ASSISTANT_ID)
@@ -3785,16 +3754,13 @@ mod tests {
         ];
         let head = append_memory(
             &mut store,
-            &claimed,
-            Transition::ModelComplete {
-                request: request.clone(),
+            &user,
+            Transition::MessageAppend {
                 entry: TranscriptEntry {
                     message_id: ASSISTANT_ID.to_string(),
                     conversation: CONVERSATION.to_string(),
                     role: Role::Assistant,
                     actor: "test-model".to_string(),
-                    request: Some(request.clone()),
-                    round: Some(0),
                     model: Some("test-model".to_string()),
                     blocks: vec![
                         Block::Text {
@@ -3859,7 +3825,7 @@ mod tests {
             name: name.to_string(),
             input: Value::Null,
         };
-        let stub = CallSite::at(request, 0, &call, ASSISTANT_ID).stub(None);
+        let stub = CallSite::at(request, &call, ASSISTANT_ID).stub(None);
         let record = completed_record(&stub, result, None);
         tool_complete_transition(record, &block, Vec::new())
     }
@@ -3916,7 +3882,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::call_payload_dir(golden.request.as_str(), 0, "first")
+                    paths::call_payload_dir("first")
                 ),
                 proposal: None,
             },
@@ -3939,7 +3905,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::call_payload_dir(golden.request.as_str(), 0, "second")
+                    paths::call_payload_dir("second")
                 ),
                 proposal: None,
             },
@@ -4451,7 +4417,7 @@ mod tests {
                 name: "import_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let first = json!({"commit":"a".repeat(40)});
             let second = json!({"commit":"b".repeat(40)});
             let mut record = site.stub(None);
@@ -4517,7 +4483,7 @@ mod tests {
                 name: "publish_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let store = ImportStore {
                 objects: golden.store,
                 head: golden.head.clone(),
@@ -4671,7 +4637,7 @@ mod tests {
                 name: "import_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let provenance = json!({"repository":"https://example.com/repo.git","commit":imported});
             import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
                 .unwrap();
@@ -4680,7 +4646,7 @@ mod tests {
                 .unwrap();
             assert_eq!(*state.head(), head, "replay added another transition");
             let view = state.conversation().unwrap();
-            let record = view.tool(&golden.request, 0, "first").unwrap().unwrap();
+            let record = view.tool("first").unwrap().unwrap();
             let block: Value =
                 serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
             if let Some(path) = race_path {
