@@ -1,7 +1,7 @@
 # std/ci-status (design/stack-publish.md, "ci-status"): an entry for an
 # OPERATION OF THE STEP. It reads GitHub and writes nothing, but `@op` keeps it
 # in llm-step, which already holds the github-token reader: a worker of its own
-# would need its own secret grant, and stack-merge reads the same thing before
+# would need its own secret grant, and stack-merge-to-master reads the same thing before
 # it merges. This entry exists to give the operation a path, a help and a place
 # in `tool_help`/`run_tool`. The image it curries is never run.
 HELP=<<END
