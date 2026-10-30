@@ -515,7 +515,7 @@ mod tests {
         }
     }
 
-    fn names(selected: &[&Layer]) -> Vec<&str> {
+    fn names<'a>(selected: &[&'a Layer]) -> Vec<&'a str> {
         selected.iter().map(|layer| layer.name.as_str()).collect()
     }
 
