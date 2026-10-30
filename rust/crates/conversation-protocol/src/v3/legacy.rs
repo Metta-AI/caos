@@ -551,6 +551,8 @@ mod tests {
         );
         assert_eq!(view.payload(&observation).unwrap(), b"\"kept\"".to_vec());
         let (_, _, note) = &transcript[2];
-        assert!(matches!(&note.blocks[..], [Block::Text { text }] if text.contains(source.as_str())));
+        assert!(
+            matches!(&note.blocks[..], [Block::Text { text }] if text.contains(source.as_str()))
+        );
     }
 }
