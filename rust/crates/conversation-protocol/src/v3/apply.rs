@@ -504,10 +504,6 @@ fn canonical_shape<T: Record + PartialEq>(record: &T, what: &str) -> Result<(), 
     Ok(())
 }
 
-fn put_request(events: &mut Vec<Event>, record: &TurnRecord) {
-    events.push(Event::Request(record.clone()));
-}
-
 fn put_tool(events: &mut Vec<Event>, record: &CallRecord) {
     events.push(Event::Tool(record.clone()));
 }
@@ -616,27 +612,6 @@ fn validate_entry_resolution(
     Ok(())
 }
 
-fn require_active(conversation: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
-    let active = conversation
-        .active_turn()?
-        .ok_or_else(|| "there is no active request".to_string())?;
-    if active.id != *request {
-        return Err(format!("active request is {}, not {request}", active.id));
-    }
-    Ok(active)
-}
-
-fn require_request_running_or_cancelling(
-    conversation: &Conversation<'_>,
-    request: &Oid,
-) -> Result<TurnRecord, String> {
-    let record = require_active(conversation, request)?;
-    if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-        return Err("tool transition requires running or cancelling request".to_string());
-    }
-    Ok(record)
-}
-
 fn validate_tool_source_tree(
     conversation: &Conversation<'_>,
     record: &CallRecord,
@@ -662,19 +637,9 @@ fn validate_tool_source_tree(
     Ok(())
 }
 
-fn validate_current_call(_request: &TurnRecord, _record: &CallRecord) -> Result<(), String> {
-    // Flat transcript: a tool call is a recorded fact, not gated by which round
-    // is current. A harness that backgrounds a slow call and opens a new round
-    // behind it completes the slow one on the round that declared it, which is
-    // no longer the latest. (Formerly required the call to be in the latest
-    // round's declaration, which failed exactly that case and ended the request.)
-    Ok(())
-}
-
 #[allow(clippy::type_complexity)]
 fn validate_tool_completion(
     conversation: &Conversation<'_>,
-    request: &TurnRecord,
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
     files: &[(String, Option<(Mode, Vec<u8>)>)],
@@ -685,7 +650,7 @@ fn validate_tool_completion(
     if record.status == CallStatus::Started {
         return Err("tool.complete requires a terminal status".to_string());
     }
-    let existing = conversation.tool(&record.request, record.round, &record.id)?;
+    let existing = conversation.tool(&record.id)?;
     if let Some(started) = &existing {
         if started.status != CallStatus::Started {
             return Err("tool.complete requires an absent or started tool record".to_string());
@@ -704,7 +669,6 @@ fn validate_tool_completion(
         }
     }
     if existing.is_none() {
-        validate_current_call(request, record)?;
         validate_tool_source_tree(conversation, record)?;
     }
     let result = record
@@ -777,7 +741,7 @@ fn put_tool_payloads(
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<BTreeSet<String>, String> {
-    let dir = paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+    let dir = paths::call_payload_dir(&record.id);
     let mut paths = BTreeSet::new();
     for (name, bytes) in payloads {
         super::paths::validate_component(name)?;
@@ -798,7 +762,7 @@ fn validate_new_tool_payloads(
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let dir = paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+    let dir = paths::call_payload_dir(&record.id);
     for (name, _) in payloads {
         paths::validate_component(name)?;
         let path = format!("{dir}/{name}");
