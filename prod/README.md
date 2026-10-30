@@ -168,8 +168,11 @@ two units, `journalctl -u caos-watchdog-probe` the probe results.
 
 Hosts never build caos. `s3://caos-nix-cache-109251245574` is a private
 binary cache in the account; both roles list it as a substituter with its
-public key (`prod/base.nix`) and read it through their instance role. A
-deploy therefore builds elsewhere and pushes first:
+public key (`prod/base.nix`) and read it through their instance role. The
+`release` GitHub Actions workflow fills it on every push, from the same
+build that ships the client (caos-tools, the deploy driver, the watchdog's
+system closure), so for any pushed commit a host deploy is substitution. To push by hand, for a commit CI has not
+built yet:
 
 ```sh
 KEY=$(mktemp) && aws secretsmanager get-secret-value --profile caos-admin \
@@ -182,9 +185,8 @@ rm "$KEY"
 ```
 
 Then on the host, `nixos-rebuild switch --refresh --flake
-github:Metta-AI/caos#watchdog-prod` is substitution, not compilation. Push
-`.#caos-tools` the same way before `deploy-caosd-prod` and the server's
-deploy stops rebuilding 498 crates.
+github:Metta-AI/caos#watchdog-prod` is substitution, not compilation, and
+`deploy-caosd-prod` on the server stops rebuilding 498 crates.
 
 ## Adding a role
 
