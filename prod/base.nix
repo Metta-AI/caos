@@ -226,6 +226,14 @@ in
         init_config = { };
         instances = [ { unit_names = cfg.datadog.units; } ];
       };
+      # The agent serves its expvar debug endpoint on 127.0.0.1:5000 by
+      # default. caosd publishes the stack's registry on 0.0.0.0:5000, and a
+      # listener on the loopback is enough for docker's port binding to fail
+      # with "address already in use". On 2026-10-30 the agent won the race
+      # after a switch, caosd could not start, and the server was down for
+      # 12 minutes. The stack owns 80, 5000, 9090 and 11204 here; the
+      # agent's other ports (5001 cmd, 8125 dogstatsd) do not collide.
+      extraConfig.expvar_port = 5010;
     };
     users.users.datadog.extraGroups = [ "systemd-journal" ];
     systemd.services.datadog-agent = {
