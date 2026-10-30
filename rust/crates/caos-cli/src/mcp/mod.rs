@@ -598,19 +598,20 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("hook payload has no string {key}"))
 }
 
-/// The assistant's closing message, and the end of the request it answered.
+/// The assistant's closing message. A call still running in the background is
+/// unaffected: its result is recorded whenever it arrives.
 fn on_stop(config: &Config, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let recorded = record_event(config, &id, "stop", &[("text", message)])?;
-    if recorded.status == "held" {
-        eprintln!(
-            "caos mcp hook: a call is still running; leaving its request open for the result"
-        );
-    }
+    let recorded = record_event(
+        config,
+        &id,
+        "stop",
+        &[("text", message), ("model", CLAUDE_CODE_MODEL)],
+    )?;
     announce(&format!("caos head {}", recorded.head))
 }
 
