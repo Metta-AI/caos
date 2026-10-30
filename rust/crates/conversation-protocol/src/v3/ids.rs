@@ -16,11 +16,9 @@ pub fn protocol_id(tag: &str, fields: &Value) -> Result<String, String> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
-pub fn child_id(parent: &str, request: &Oid, round: u64, tool: &str) -> Result<String, String> {
+pub fn child_id(parent: &str, tool: &str) -> Result<String, String> {
     let fields = canonical_object(&[
         ("parent", Value::String(parent.to_string())),
-        ("request", Value::String(request.as_str().to_string())),
-        ("round", Value::from(round)),
         ("tool", Value::String(tool.to_string())),
     ]);
     Ok(format!("subagent-{}", protocol_id("subagent", &fields)?))

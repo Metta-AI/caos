@@ -104,18 +104,10 @@ pub fn transcript_payload_dir(ordinal: u64, message_id: &str) -> String {
     format!("{TRANSCRIPT_DIR}/{ordinal:012}-{message_id}")
 }
 
-pub fn call_record_path(request: &str, round: u64, tool_id: &str) -> String {
-    format!(
-        "{CALLS_DIR}/{request}/{round:04}/{}.json",
-        admit_external_id(tool_id)
-    )
-}
-
-pub fn call_payload_dir(request: &str, round: u64, tool_id: &str) -> String {
-    format!(
-        "{CALLS_DIR}/{request}/{round:04}/{}",
-        admit_external_id(tool_id)
-    )
+/// Where a call's payloads live: under its id alone, which is unique within a
+/// conversation (a model's `tool_use` id, or the harness's).
+pub fn call_payload_dir(tool_id: &str) -> String {
+    format!("{CALLS_DIR}/{}", admit_external_id(tool_id))
 }
 
 pub fn files_path(relative: &str) -> String {
