@@ -177,7 +177,6 @@ pub struct SourceTreeDiff {
     pub patch: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 /// A conversation as its head stands. Whether a turn is running is not here:
 /// a conversation records facts, not the state of whatever drives it, so a
 /// process knows it is running a turn only because it is the one running it.
