@@ -59,7 +59,7 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
 pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/publication.json",
-        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+        paths::call_payload_dir(&site.call.id)
     )
 }
 
@@ -68,7 +68,7 @@ fn pinned(
     site: &CallSite<'_>,
 ) -> Result<Option<PublicationRecord>, String> {
     if view
-        .tool(site.request, site.round, &site.call.id)?
+        .tool(&site.call.id)?
         .is_none()
     {
         return Ok(None);
@@ -247,7 +247,7 @@ pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<Stri
     ids::protocol_id(
         "external-tool",
         &json!({
-            "conversation":conversation, "request":site.request, "round":site.round, "call":site.call.id
+            "conversation":conversation, "call":site.call.id
         }),
     )
 }
@@ -303,7 +303,7 @@ pub(super) fn pin<S: progress::RefStore>(
         state.reload()?;
         let view = state.conversation()?;
         if view
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(None);
@@ -346,7 +346,7 @@ pub(super) fn finish<S: progress::RefStore>(
         state.reload()?;
         let view = state.conversation()?;
         if view
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(());

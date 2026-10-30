@@ -20,16 +20,12 @@ use caos::{
     compute_client_request_with_secrets, curry_client_object, eval_cli_image_arg,
     run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
 };
-use conversation_protocol::v3::apply::{
-    apply, client_signature, inherited_signature, mint, Transition,
-};
+use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
-pub use conversation_protocol::v3::records::TurnStatus;
 use conversation_protocol::v3::records::{
     Block, Identity, IdentityKind, Proposal, PublicationStatus, Role, SourceTreeResolution,
-    ToolResult as ProtocolToolResult, TranscriptEntry, TurnOutcome as ProtocolTurnOutcome,
-    TurnRecord,
+    ToolResult as ProtocolToolResult, TranscriptEntry, INTERRUPT_TEXT,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -39,6 +35,8 @@ use conversation_protocol::v3::{reconcile, GitStore, ObjectStore, Oid, RefUpdate
 use conversation_protocol::v3::Kind;
 
 const MAX_APPEND_ATTEMPTS: usize = 32;
+/// Who the step records its own failure messages as (`std/llm-step`).
+const STEP_ACTOR: &str = "llm-step";
 const MAX_FETCH_REFS: usize = 200;
 pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
@@ -136,16 +134,12 @@ pub enum TurnEvent {
     },
     Status(String),
     ToolCall {
-        request: String,
-        round: u64,
         tool_use_id: String,
         name: String,
         summary: String,
         step_commit: String,
     },
     ToolResult {
-        request: String,
-        round: u64,
         tool_use_id: String,
         is_error: bool,
         content: String,
@@ -183,14 +177,19 @@ pub struct SourceTreeDiff {
     pub patch: String,
 }
 
+/// A conversation as its head stands. Whether a turn is running is not here:
+/// a conversation records facts, not the state of whatever drives it, so a
+/// process knows it is running a turn only because it is the one running it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSnapshot {
     pub id: String,
     pub head: String,
     pub title: String,
-    pub status: TurnStatus,
-    pub request: Option<String>,
+    /// The latest turn was interrupted: an interruption is the newest entry,
+    /// background notices aside.
     pub interrupted: bool,
+    /// The latest turn failed: the step's failure message is the newest entry,
+    /// background notices aside.
     pub error: Option<String>,
 }
 
@@ -403,8 +402,6 @@ fn system_entry(id: &str, message_id: String, text: String) -> TranscriptEntry {
         conversation: id.to_string(),
         role: Role::System,
         actor: "caos".to_string(),
-        request: None,
-        round: None,
         model: None,
         blocks: vec![Block::Text { text }],
         proposal: None,
@@ -417,7 +414,6 @@ fn user_entry(
     username: &str,
     message_id: &str,
     message: &str,
-    request: Option<Oid>,
     proposal: Option<Proposal>,
     source_tree_resolution: Option<SourceTreeResolution>,
 ) -> TranscriptEntry {
@@ -426,8 +422,6 @@ fn user_entry(
         conversation: id.to_string(),
         role: Role::User,
         actor: username.to_string(),
-        request,
-        round: None,
         model: None,
         blocks: vec![Block::Text {
             text: message.to_string(),
@@ -636,7 +630,6 @@ pub fn create_conversation(
 
 struct PreparedRequest {
     request: String,
-    configuration: String,
 }
 
 fn prepare_queued_request_detail(
@@ -666,10 +659,7 @@ fn prepare_queued_request_detail(
             invoked_as()
         ));
     }
-    Ok(PreparedRequest {
-        request,
-        configuration,
-    })
+    Ok(PreparedRequest { request })
 }
 
 struct SubmittedMessage {
@@ -681,7 +671,7 @@ struct SubmitMessagePolicy<'a> {
     require_absent: bool,
     proposal: Option<&'a str>,
     proposal_base: Option<&'a str>,
-    admit_when_idle: bool,
+    start_turn: bool,
 }
 
 fn submit_line_message(
@@ -700,7 +690,7 @@ fn submit_line_message(
             require_absent,
             proposal: None,
             proposal_base: None,
-            admit_when_idle: true,
+            start_turn: true,
         },
         prepare_queued_request_detail,
         || {},
@@ -725,7 +715,7 @@ pub fn submit_interjection(
             require_absent: false,
             proposal: human_tree,
             proposal_base,
-            admit_when_idle: false,
+            start_turn: false,
         },
         prepare_queued_request_detail,
         || {},
@@ -770,7 +760,7 @@ fn submit_message_detailed(
             require_absent: false,
             proposal,
             proposal_base,
-            admit_when_idle: true,
+            start_turn: true,
         },
         prepare_queued_request_detail,
         on_preparing,
@@ -801,14 +791,11 @@ where
             require_absent,
             proposal,
             proposal_base,
-            admit_when_idle: true,
+            start_turn: true,
         },
         move |t, options, id, head| {
             let request = prepare(t, options, id, head)?;
-            Ok(PreparedRequest {
-                configuration: format!("test-{request}"),
-                request,
-            })
+            Ok(PreparedRequest { request })
         },
         || {},
     )
@@ -874,7 +861,7 @@ where
             &parent,
             policy.proposal,
             policy.proposal_base,
-            policy.admit_when_idle,
+            policy.start_turn,
             &mut prepare,
             &mut on_preparing,
         )?;
@@ -978,7 +965,7 @@ fn build_message_candidate<F, P>(
     parent: &Oid,
     proposal: Option<&str>,
     proposal_base: Option<&str>,
-    admit_when_idle: bool,
+    start_turn: bool,
     prepare: &mut F,
     on_preparing: &mut P,
 ) -> Result<MessageCandidate, String>
@@ -987,12 +974,6 @@ where
     P: FnMut(),
 {
     let parent_view = Conversation::open(store, parent)?;
-    let active = parent_view.active_turn()?;
-    if active.is_none() && !admit_when_idle {
-        return Err(format!(
-            "conversation {id:?} is no longer active; submit again to start a new turn"
-        ));
-    }
     let mut proposal_record = None;
     let mut resolution = None;
     let mut conflict = None;
@@ -1038,70 +1019,36 @@ where
         });
         resolution = Some(reconciled);
     }
-    let request_for_entry = active.as_ref().map(|record| record.id.clone());
     let entry = user_entry(
         id,
         username,
         message_id,
         message,
-        request_for_entry,
         proposal_record,
         resolution,
     );
-    let transition = match &active {
-        Some(active) => Transition::TurnInterject {
-            request: active.id.clone(),
-            entry,
-            payloads: Vec::new(),
-        },
-        None => Transition::MessageAppend {
-            entry,
-            payloads: Vec::new(),
-        },
+    let transition = Transition::MessageAppend {
+        entry,
+        payloads: Vec::new(),
     };
     let message_commit = mint_transition(store, parent, &transition, signature)?;
-    if conflict.is_some() || active.is_some() {
+    if conflict.is_some() || !start_turn {
         return Ok(MessageCandidate {
             message: message_commit.clone(),
             head: message_commit,
-            request: active.map(|record| record.id),
+            request: None,
             conflict,
         });
     }
 
+    // The request that answers this message is prepared, not recorded: the
+    // caller runs it, and is the only one that knows it is running.
     on_preparing();
     let prepared = prepare(t, options, id, message_commit.as_str())?;
-    let request = oid(&prepared.request, "prepared request")?;
-    let view = Conversation::open(store, &message_commit)?;
-    let record = TurnRecord {
-        id: request.clone(),
-        request_head: message_commit.clone(),
-
-        model: options
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-        configuration: prepared.configuration,
-        round: 0,
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    };
-    drop(view);
-    let admission_signature = inherited_signature(store, &message_commit)?;
-    let admitted = mint_transition(
-        store,
-        &message_commit,
-        &Transition::TurnAdmit { record },
-        &admission_signature,
-    )?;
     Ok(MessageCandidate {
-        message: message_commit,
-        head: admitted,
-        request: Some(request),
+        message: message_commit.clone(),
+        head: message_commit,
+        request: Some(oid(&prepared.request, "prepared request")?),
         conflict: None,
     })
 }
@@ -1134,25 +1081,28 @@ fn repair_creation_membership(
     }
 }
 
-pub fn interrupt_request(t: &GitTransport, id: &str) -> Result<String, String> {
+/// Interrupt whatever is driving the conversation: append the interruption. A
+/// driver that sees it after the prompt it answers stops, leaving the calls it
+/// had not finished closed as cancelled. Nothing is recorded twice: an
+/// interruption that is already the newest entry is left as it is.
+pub fn interrupt_conversation(t: &GitTransport, id: &str) -> Result<String, String> {
     let refname = refs::head_ref(id)?;
+    let username = resolve_username(t, None)?;
     append_transition(t, id, &refname, "interrupting", |store, head| {
         let view = Conversation::open(store, head)?;
-        let Some(request) = view.active_turn()? else {
-            let newest = view.latest_turn()?;
-            if newest.is_some_and(|record| {
-                matches!(record.status, TurnStatus::Cancelling | TurnStatus::Idle)
-            }) {
+        if let Some(last) = view.transcript_len()?.checked_sub(1) {
+            if view
+                .transcript_entry(last)?
+                .is_some_and(|(_, entry)| entry.is_interrupt())
+            {
                 return Ok(Step::Done(head.to_string()));
             }
-            return Err(format!("conversation {id:?} has no active request"));
-        };
-        if matches!(request.status, TurnStatus::Cancelling | TurnStatus::Idle) {
-            return Ok(Step::Done(head.to_string()));
         }
-        Ok(Step::Mint(Transition::TurnEscape {
-            request: request.id,
-            reason: None,
+        let mut entry = system_entry(id, caos::fresh_entropy()?, INTERRUPT_TEXT.to_string());
+        entry.actor = username.clone();
+        Ok(Step::Mint(Transition::MessageAppend {
+            entry,
+            payloads: Vec::new(),
         }))
     })
 }
@@ -1198,53 +1148,33 @@ fn snapshot_from(
     id: &str,
     head: &Oid,
 ) -> Result<ConversationSnapshot, String> {
-    let active = conversation.active_turn()?;
-    let newest = if active.is_none() {
-        conversation.latest_turn()?
-    } else {
-        None
-    };
-    let record = active.as_ref().or(newest.as_ref());
-    let status = record
-        .map(|record| record.status)
-        .unwrap_or(TurnStatus::Idle);
-    let interrupted = active.is_none()
-        && matches!(
-            newest.as_ref().and_then(|record| record.outcome.as_ref()),
-            Some(ProtocolTurnOutcome::Idle {
-                interrupted: true,
-                ..
-            })
-        );
-    let error = match record.and_then(|record| record.outcome.as_ref()) {
-        Some(ProtocolTurnOutcome::Failed { error }) => {
-            transcript_text_at_path(conversation, error.as_str())?
+    // How the latest turn ended, read off its newest entry: background notices
+    // (system messages caos writes) come after a turn without ending it.
+    let mut interrupted = false;
+    let mut error = None;
+    for ordinal in (0..conversation.transcript_len()?).rev() {
+        let Some((_, entry)) = conversation.transcript_entry(ordinal)? else {
+            return Err(format!("missing transcript ordinal {ordinal}"));
+        };
+        if entry.role != Role::System {
+            break;
         }
-        _ => None,
-    };
+        if entry.is_interrupt() {
+            interrupted = true;
+            break;
+        }
+        if entry.actor == STEP_ACTOR {
+            error = Some(text_blocks(&entry.blocks));
+            break;
+        }
+    }
     Ok(ConversationSnapshot {
         id: id.to_string(),
         head: head.to_string(),
         title: conversation.title()?,
-        status,
-        request: active.as_ref().map(|record| record.id.to_string()),
         interrupted,
         error,
     })
-}
-
-fn transcript_text_at_path(
-    conversation: &Conversation<'_>,
-    path: &str,
-) -> Result<Option<String>, String> {
-    let (ordinal, message_id) = paths::parse_transcript_entry_path(path)?;
-    let Some((found_id, entry)) = conversation.transcript_entry(ordinal)? else {
-        return Err(format!("request outcome entry {path} is absent"));
-    };
-    if found_id != message_id {
-        return Err(format!("request outcome entry {path} has a mismatched id"));
-    }
-    Ok(Some(text_blocks(&entry.blocks)))
 }
 
 fn replay_from(
@@ -1256,19 +1186,11 @@ fn replay_from(
     let conversation_id = conversation.identity()?.id;
     let mut has_own_user_messages = false;
     let mut turns = Vec::new();
-    let mut request_order = Vec::new();
-    let mut assistant_entries: HashMap<(Oid, u64), TranscriptEntry> = HashMap::new();
-    for (_, _, entry) in transcript {
+    let mut declarations = Vec::new();
+    for (ordinal, _, entry) in transcript {
         has_own_user_messages |= entry.role == Role::User && entry.conversation == conversation_id;
-        if let (Some(request), Some(round)) = (&entry.request, entry.round) {
-            if entry.role == Role::Assistant {
-                assistant_entries.insert((request.clone(), round), entry.clone());
-            }
-        }
-        if let Some(request) = &entry.request {
-            if !request_order.contains(request) {
-                request_order.push(request.clone());
-            }
+        if entry.role == Role::Assistant && entry.tool_uses().next().is_some() {
+            declarations.push((ordinal, entry.clone()));
         }
         let message = text_blocks(&entry.blocks);
         let (author, role) = match entry.role {
@@ -1312,61 +1234,41 @@ fn replay_from(
     }
 
     let mut activity = Vec::new();
-    for request in request_order {
-        let Some(record) = conversation.turn(&request)? else {
-            return Err(format!("transcript names missing request {request}"));
-        };
-        for round in 0..record.round {
-            let Some(assistant) = assistant_entries.get(&(request.clone(), round)) else {
-                return Err(format!(
-                    "request {request} round {round} has no assistant entry"
-                ));
-            };
-            for (call_id, call_name, arguments_path) in
-                assistant.blocks.iter().filter_map(|block| match block {
-                    Block::ToolUse {
-                        id,
-                        name,
-                        arguments,
-                    } => Some((id, name, arguments)),
-                    _ => None,
-                })
-            {
-                let args = serde_json::from_slice::<Value>(&conversation.payload(arguments_path)?)
-                    .map_err(|error| format!("parsing tool arguments: {error}"))?;
-                activity.push(TurnEvent::ToolCall {
-                    request: request.to_string(),
-                    round,
-                    tool_use_id: call_id.clone(),
-                    name: call_name.clone(),
-                    summary: {
-                        let text = tool_call_summary(call_name, &args);
-                        match conversation
-                            .tool(&request, round, call_id)?
-                            .and_then(|tool| tool.source_tree_name)
-                        {
-                            Some(name) if conversation.source_tree_names()?.len() > 1 => {
-                                format!("[{name}] {text}")
-                            }
-                            _ => text,
+    for (ordinal, assistant) in declarations {
+        let step_commit = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| turns.get(ordinal))
+            .map(|turn| turn.commit.clone())
+            .unwrap_or_default();
+        for (call_id, call_name, arguments_path) in assistant.tool_uses() {
+            let args = serde_json::from_slice::<Value>(&conversation.payload(arguments_path)?)
+                .map_err(|error| format!("parsing tool arguments: {error}"))?;
+            let tool = conversation.tool(call_id)?;
+            activity.push(TurnEvent::ToolCall {
+                tool_use_id: call_id.to_string(),
+                name: call_name.to_string(),
+                summary: {
+                    let text = tool_call_summary(call_name, &args);
+                    match tool
+                        .as_ref()
+                        .and_then(|tool| tool.source_tree_name.as_ref())
+                    {
+                        Some(name) if conversation.source_tree_names()?.len() > 1 => {
+                            format!("[{name}] {text}")
                         }
-                    },
-                    step_commit: request.to_string(),
-                });
-                if let Some(tool) = conversation.tool(&request, round, call_id)? {
-                    if tool.is_terminal() {
-                        let (is_error, content) =
-                            protocol_tool_result(conversation, tool.result.as_ref())?;
-                        activity.push(TurnEvent::ToolResult {
-                            request: request.to_string(),
-                            round,
-                            tool_use_id: call_id.clone(),
-                            is_error,
-                            content,
-                            step_commit: request.to_string(),
-                        });
+                        _ => text,
                     }
-                }
+                },
+                step_commit: step_commit.clone(),
+            });
+            if let Some(tool) = tool.filter(|tool| tool.is_terminal()) {
+                let (is_error, content) = protocol_tool_result(conversation, tool.result.as_ref())?;
+                activity.push(TurnEvent::ToolResult {
+                    tool_use_id: call_id.to_string(),
+                    is_error,
+                    content,
+                    step_commit: step_commit.clone(),
+                });
             }
         }
     }
@@ -1523,19 +1425,6 @@ fn load_at(
             source_trees
         },
         publications: publication_summaries(&conversation)?,
-    })
-}
-
-fn failure_reason(snapshot: &ConversationSnapshot) -> String {
-    snapshot.error.clone().unwrap_or_else(|| {
-        let status = match snapshot.status {
-            TurnStatus::Queued => "queued",
-            TurnStatus::Running => "running",
-            TurnStatus::Cancelling => "cancelling",
-            TurnStatus::Idle => "idle",
-            TurnStatus::Failed => "failed",
-        };
-        format!("conversation request ended {status}")
     })
 }
 
@@ -2297,20 +2186,11 @@ pub fn ensure_conversation_secret() -> Result<(), String> {
     Ok(())
 }
 
-fn request_is_active(status: TurnStatus) -> bool {
-    matches!(
-        status,
-        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
-    )
-}
-
-pub fn resume_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
-    oid(request, "request")?;
-    let secrets = conversation_secrets(id)?;
-    let server = t.server_url()?;
-    compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
-}
-
+/// Send a message and run the turn that answers it, to its end.
+///
+/// The turn is this process's: it runs the request the message was prepared
+/// with and is done when that request is. The conversation is watched only to
+/// report progress; nothing in it says whether the turn is running.
 #[allow(clippy::too_many_arguments)]
 pub fn run_chat_turn(
     t: &GitTransport,
@@ -2339,71 +2219,48 @@ pub fn run_chat_turn(
             elapsed_secs: started.elapsed().as_secs_f64(),
         });
     }
-    let request = match submitted.request {
-        Some(request) => Some(request),
-        None => conversation_snapshot(t, id)?
-            .filter(|snapshot| request_is_active(snapshot.status))
-            .and_then(|snapshot| snapshot.request),
-    };
-    let mut request_result = None;
-    if let Some(request) = request {
-        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
-        emit(TurnEvent::Status("waiting for agent".to_string()));
-        let secrets = conversation_secrets(id)?;
-        let server = t.server_url()?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result =
-                compute_client_request_with_secrets(&server, &request, &secrets).map(|_| ());
-            let _ = tx.send(result);
-        });
-        request_result = Some(rx);
-    } else {
-        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
-        emit(TurnEvent::Status("joined active turn".to_string()));
-    }
-    let mut snapshot =
-        conversation_snapshot(t, id)?.ok_or_else(|| format!("conversation {id:?} disappeared"))?;
-    let mut last_head = String::new();
+    let request = submitted
+        .request
+        .ok_or_else(|| "the message was saved but no turn was prepared for it".to_string())?;
+    emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+    emit(TurnEvent::Status("agent running".to_string()));
+    let secrets = conversation_secrets(id)?;
+    let server = t.server_url()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = compute_client_request_with_secrets(&server, &request, &secrets).map(|_| ());
+        let _ = tx.send(result);
+    });
+    let mut last_head = conversation_head(t, id)?.unwrap_or_default();
     loop {
-        if snapshot.head != last_head {
-            last_head = snapshot.head.clone();
-            emit(TurnEvent::Status(match snapshot.status {
-                TurnStatus::Queued => "queued".to_string(),
-                TurnStatus::Running => "agent running".to_string(),
-                TurnStatus::Cancelling => "cancelling".to_string(),
-                TurnStatus::Idle => "idle".to_string(),
-                TurnStatus::Failed => "failed".to_string(),
-            }));
-        }
-        match snapshot.status {
-            TurnStatus::Idle => {
-                return Ok(TurnOutcome {
-                    conversation: id.to_string(),
-                    short_commit: short_hash(&snapshot.head).to_string(),
-                    commit: snapshot.head,
-                    interrupted: snapshot.interrupted,
-                })
+        let finished = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err("agent request watcher disconnected".to_string())
             }
-            TurnStatus::Failed => return Err(failure_reason(&snapshot)),
-            _ => {}
-        }
-        if let Some(rx) = &request_result {
-            match rx.try_recv() {
-                Ok(Err(error)) => return Err(error),
-                Ok(Ok(())) => request_result = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("agent request watcher disconnected".to_string())
-                }
+        };
+        if let Some(result) = finished {
+            let snapshot = conversation_snapshot(t, id)?
+                .ok_or_else(|| format!("conversation {id:?} disappeared"))?;
+            // The step's own failure message says why better than the run's
+            // error does, when it got as far as writing one.
+            if let Err(error) = result {
+                return Err(snapshot.error.unwrap_or(error));
             }
+            return Ok(TurnOutcome {
+                conversation: id.to_string(),
+                short_commit: short_hash(&snapshot.head).to_string(),
+                commit: snapshot.head,
+                interrupted: snapshot.interrupted,
+            });
         }
         std::thread::sleep(Duration::from_millis(250));
         let head =
             conversation_head(t, id)?.ok_or_else(|| format!("conversation {id:?} disappeared"))?;
-        if head != snapshot.head {
-            snapshot = conversation_snapshot(t, id)?
-                .ok_or_else(|| format!("conversation {id:?} disappeared"))?;
+        if head != last_head {
+            last_head = head;
+            emit(TurnEvent::Status("agent running".to_string()));
         }
     }
 }
@@ -2811,6 +2668,14 @@ fn run_line_client(
     }
 }
 
+/// Run the request that answers a message, to its end.
+fn run_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
+    oid(request, "request")?;
+    let secrets = conversation_secrets(id)?;
+    let server = t.server_url()?;
+    compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
+}
+
 fn run_line_turn(
     t: &GitTransport,
     options: &TurnOptions,
@@ -2823,7 +2688,9 @@ fn run_line_turn(
         .map_err(|error| (error, false))?;
     (|| {
         if let Some(request) = request {
-            resume_request(t, id, &request)?;
+            // Nothing records which request answers a message, so say it.
+            eprintln!("[request {request}]");
+            run_request(t, id, &request)?;
         }
         let load = conversation_load(t, id)?
             .ok_or_else(|| format!("conversation {id:?} disappeared after its request"))?;
@@ -2999,7 +2866,6 @@ mod tests {
             |_, _, _, _| Ok(base.to_string()),
         )
         .unwrap();
-        interrupt_request(transport, id).unwrap();
     }
 
     #[test]
@@ -3112,7 +2978,6 @@ mod tests {
             |_, _, _, _| Ok(base.clone()),
         )
         .unwrap();
-        interrupt_request(&transport, "empty").unwrap();
         fixture_reference(&transport, "empty", "code", Some(&base)).unwrap();
         assert_eq!(
             conversation_load(&transport, "empty")
@@ -3601,12 +3466,12 @@ mod tests {
         std::fs::write(&ref_lock, "another reader").unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         std::fs::remove_file(ref_lock).unwrap();
-        assert_eq!(load.snapshot.status, TurnStatus::Queued);
         assert_eq!(load.replay.turns[0].message, "hello");
         assert_eq!(load.source_trees[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
         let store = open_store(&transport).unwrap();
-        let first_message = store.read_commit(&head).unwrap().parents[0].to_string();
+        // The head is the message itself: nothing is recorded but the fact.
+        let first_message = head.to_string();
         assert_eq!(load.replay.turns[0].commit, first_message);
         assert!(validate_spine(&store, &head, &mut HashSet::new()).is_ok());
         let mut cursor = head.clone();
@@ -3643,6 +3508,8 @@ mod tests {
             .unwrap()
             .is_none());
 
+        // Every message is answered by a request of its own, prepared when it is
+        // sent; whether another is still running is the sender's to know.
         let prepared_calls = std::cell::Cell::new(0);
         let next_request = submit_message_inner_with(
             &transport,
@@ -3660,21 +3527,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(next_request, base);
-        assert_eq!(prepared_calls.get(), 0);
+        assert_eq!(prepared_calls.get(), 1);
         let store = open_store(&transport).unwrap();
         let (_, active_head) = fetch_head(&transport, &store, "talk-1").unwrap().unwrap();
-        assert_eq!(
-            Conversation::open(&store, &active_head)
-                .unwrap()
-                .active_turn()
-                .unwrap()
-                .unwrap()
-                .interjections
-                .len(),
-            1
-        );
 
-        interrupt_request(&transport, "talk-1").unwrap();
+        interrupt_conversation(&transport, "talk-1").unwrap();
         assert!(
             conversation_snapshot(&transport, "talk-1")
                 .unwrap()
@@ -3699,9 +3556,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .replay;
-        assert_eq!(replay.turns.len(), 3);
+        assert_eq!(replay.turns.len(), 4);
         assert_eq!(replay.turns[0].commit, first_message);
         assert_eq!(replay.turns[1].commit, active_head.to_string());
+        assert_eq!(replay.turns[2].message, INTERRUPT_TEXT);
         assert_eq!(
             replay
                 .turns
@@ -3709,10 +3567,9 @@ mod tests {
                 .map(|turn| &turn.commit)
                 .collect::<HashSet<_>>()
                 .len(),
-            3
+            4
         );
 
-        interrupt_request(&transport, "talk-1").unwrap();
         std::fs::write(transport.work_dir().join("other"), "other\n").unwrap();
         git(transport.work_dir(), &["add", "other"]);
         git(transport.work_dir(), &["commit", "--quiet", "-m", "other"]);
@@ -3740,7 +3597,6 @@ mod tests {
             |_, _, _, _| Ok("a".repeat(40)),
         )
         .unwrap();
-        interrupt_request(&transport, "proposal-talk").unwrap();
 
         let ours = commit_file(&transport, &base, "ours\n", "ours");
         let theirs = commit_file(&transport, &base, "theirs\n", "theirs");
@@ -3770,7 +3626,6 @@ mod tests {
             Some(SourceTreeResolution::Direct { .. })
         ));
         drop(conversation);
-        interrupt_request(&transport, "proposal-talk").unwrap();
 
         let error = submit_message_inner_with(
             &transport,
@@ -3810,7 +3665,7 @@ mod tests {
     }
 
     #[test]
-    fn active_request_proposals_move_directly_and_record_conflicts() {
+    fn interjection_proposals_move_directly_and_record_conflicts() {
         let (root, transport, base) = fixture("active-proposal");
         let options = options(&transport);
         let request = "a".repeat(40);
@@ -3828,18 +3683,16 @@ mod tests {
 
         let ours = commit_file(&transport, &base, "ours\n", "ours");
         let theirs = commit_file(&transport, &base, "theirs\n", "theirs");
-        let interjected_request = submit_message_inner_with(
+        // An interjection is only a message: nothing is prepared to answer it.
+        submit_interjection(
             &transport,
             &options,
             "proposal-talk",
             "use ours",
-            false,
             Some(&ours),
             Some(&base),
-            |_, _, _, _| panic!("interjections do not prepare a request"),
         )
         .unwrap();
-        assert_eq!(interjected_request.as_deref(), Some(request.as_str()));
 
         let store = open_store(&transport).unwrap();
         let (_, direct_head) = fetch_head(&transport, &store, "proposal-talk")
@@ -3908,12 +3761,11 @@ mod tests {
         )
         .unwrap();
         let active_source = conversation_head(&transport, "source").unwrap().unwrap();
-        // A conversation is a flat transcript, so it forks as it stands, even
-        // with a request still open (it used to be refused until interrupted).
+        // A conversation is a flat transcript, so it forks as it stands, with its
+        // prompt still unanswered.
         assert!(
             fork_conversation(&transport, "Alice", "forked-active", "Fork", &active_source).is_ok()
         );
-        interrupt_request(&transport, "source").unwrap();
         let source = conversation_head(&transport, "source").unwrap().unwrap();
         let fork = fork_conversation(&transport, "Alice", "forked", "Fork", &source).unwrap();
         let store = open_store(&transport).unwrap();
@@ -3959,7 +3811,6 @@ mod tests {
             |_, _, _, _| Ok("a".repeat(40)),
         )
         .unwrap();
-        interrupt_request(&transport, "race").unwrap();
 
         let stale = std::cell::RefCell::new(String::new());
         let calls = std::cell::Cell::new(0);
@@ -3973,22 +3824,26 @@ mod tests {
             None,
             |_, _, _, candidate| {
                 calls.set(calls.get() + 1);
-                *stale.borrow_mut() = candidate.to_string();
-                submit_message_inner_with(
-                    &transport,
-                    &options,
-                    "race",
-                    "winner",
-                    false,
-                    None,
-                    None,
-                    |_, _, _, _| Ok("b".repeat(40)),
-                )?;
+                // The winner lands while the loser's first candidate is being
+                // prepared; the loser's retry is prepared again, on top of it.
+                if calls.get() == 1 {
+                    *stale.borrow_mut() = candidate.to_string();
+                    submit_message_inner_with(
+                        &transport,
+                        &options,
+                        "race",
+                        "winner",
+                        false,
+                        None,
+                        None,
+                        |_, _, _, _| Ok("b".repeat(40)),
+                    )?;
+                }
                 Ok("c".repeat(40))
             },
         )
         .unwrap();
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 2);
         let load = conversation_load(&transport, "race").unwrap().unwrap();
         assert_eq!(
             load.replay

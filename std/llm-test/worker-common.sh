@@ -165,7 +165,7 @@ admit_turn() {
   username=${LLM_TEST_USERNAME:-tester}
   turn_args=(turn --repo /tmp/repo --id "$conv" --user "$username" --title "$conv"
     --actor "$username" --text "$message" --secret-hash "$LLM_TEST_SECRET_HASH"
-    --model test-model --configuration "$llm")
+    --configuration "$llm")
   if [ "$LLM_TEST_NEW_CONVERSATION" -eq 1 ]; then
     if [ -n "$LLM_TEST_ROOT_WORKSPACE" ]; then
       turn_args+=(--source-tree "main=$LLM_TEST_ROOT_WORKSPACE")
@@ -188,8 +188,7 @@ admit_turn() {
   [ -n "$parsed_ref" ] || fail "the turn helper did not report the conversation ref"
   admitted=$parsed_head
   request=$parsed_request
-  # The head the request was ADMITTED at, which is what a dispatch has to pass
-  # as `--head` -- llm-step checks it against the record and refuses any other.
+  # The prompt the request answers: the head it was prepared with (`--head`).
   human=$parsed_human
   conversation_ref=$parsed_ref
   head=$admitted
@@ -215,8 +214,8 @@ remote_tip() {
 dump_conversation() {
   local parent_ref=$1 parent_request=$2 parent_tip payload child_id child_ref child_tip child_request
   echo "--- diagnostics: parent and child state ---" >&2; parent_tip=$(remote_tip "$parent_ref") || parent_tip=""
-  $TOOL fetch --repo /tmp/repo --ref "$parent_ref" >&2 || true; $TOOL request --repo /tmp/repo --head "$parent_tip" --id "$parent_request" >&2 || true
-  $TOOL tools --repo /tmp/repo --head "$parent_tip" --request "$parent_request" > /tmp/parent-tools.jsonl 2>&2 || true; cat /tmp/parent-tools.jsonl >&2 || true
+  $TOOL fetch --repo /tmp/repo --ref "$parent_ref" >&2 || true;
+  $TOOL tools --repo /tmp/repo --head "$parent_tip" > /tmp/parent-tools.jsonl 2>&2 || true; cat /tmp/parent-tools.jsonl >&2 || true
   echo "--- parent tool observations ---" >&2; jq -r '.result.observation // .result.error // empty' /tmp/parent-tools.jsonl 2>/dev/null | while read -r payload; do echo "[$payload]" >&2; $TOOL read --repo /tmp/repo --head "$parent_tip" --path "$payload" >&2 || true; echo >&2; done || true
   echo "--- parent transcript ---" >&2; $TOOL transcript --repo /tmp/repo --head "$parent_tip" >&2 || true
   echo "--- parent run trace ---" >&2; curl -s "$CAOS_SERVER_URL/status/$parent_request?all=1" 2>/dev/null | head -c 6000 >&2 || true; echo >&2
@@ -225,7 +224,7 @@ dump_conversation() {
     child_ref=$($TOOL ref --id "$child_id") || child_ref=""; child_ref=${child_ref#ref }
     child_tip=$($TOOL fetch --repo /tmp/repo --ref "$child_ref" 2>&2) || child_tip=""; child_tip=${child_tip#head }
     echo "child ref $child_ref tip ${child_tip:-absent}" >&2
-    if [ -n "$child_tip" ]; then $TOOL request --repo /tmp/repo --head "$child_tip" >&2 || true; $TOOL transcript --repo /tmp/repo --head "$child_tip" >&2 || true; fi
+    if [ -n "$child_tip" ]; then $TOOL transcript --repo /tmp/repo --head "$child_tip" >&2 || true; fi
     child_request=$(jq -r '.request' /tmp/children.jsonl 2>/dev/null | head -1) || true
     echo "--- child run trace ---" >&2; curl -s "$CAOS_SERVER_URL/status/$child_request?all=1" 2>/dev/null | head -c 6000 >&2 || true; echo >&2
   fi

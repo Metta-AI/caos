@@ -356,28 +356,6 @@ impl<S: RefStore> State<S> {
         self.try_append_many_at(expected, vec![transition])
     }
 
-    /// Move the ref from `expected` to `candidate`, a commit the caller minted
-    /// itself on [`State::store_mut`]. For a chain whose later transitions name
-    /// an earlier commit (a request is identified by the message that opened
-    /// it), which [`State::try_append_many_at`] cannot express because it hides
-    /// the commits it mints. Same compare-and-swap, and the same recovery from
-    /// an ambiguous push.
-    pub fn push_chain(
-        &mut self,
-        expected: &Oid,
-        candidate: Oid,
-        ordinal: Option<u64>,
-    ) -> Result<TryAppend, String> {
-        if &self.head != expected {
-            return Ok(TryAppend::HeadChanged(self.head.clone()));
-        }
-        let pushed = self
-            .store
-            .push_ref_value(&self.refname, Some(expected), Some(&candidate));
-        crate::timing::phase("push chain");
-        self.finish_append(expected, candidate, ordinal, pushed)
-    }
-
     pub fn try_append_pair_at(
         &mut self,
         expected: &Oid,
@@ -488,18 +466,15 @@ impl<S: RefStore> State<S> {
                 view.async_task(&record.task)?.as_ref() == Some(record)
             }
             Transition::ToolStart { record, payloads } => {
-                let directory =
-                    paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
-                view.tool(&record.request, record.round, &record.id)?
-                    .as_ref()
+                let directory = paths::call_payload_dir(&record.id);
+                view.tool(&record.id)?.as_ref()
                     == Some(record)
                     && payloads.iter().all(|(name, bytes)| {
                         view.payload(&format!("{directory}/{name}")).as_ref() == Ok(bytes)
                     })
             }
             Transition::ToolComplete { record, .. } => {
-                view.tool(&record.request, record.round, &record.id)?
-                    .as_ref()
+                view.tool(&record.id)?.as_ref()
                     == Some(record)
             }
             _ => false,
@@ -522,9 +497,7 @@ fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
 
 fn transition_entry(transition: &Transition) -> Option<&TranscriptEntry> {
     match transition {
-        Transition::MessageAppend { entry, .. } | Transition::ModelComplete { entry, .. } => {
-            Some(entry)
-        }
+        Transition::MessageAppend { entry, .. } => Some(entry),
         _ => None,
     }
 }
@@ -535,15 +508,8 @@ fn retarget_transcript_transition(
     mut transition: Transition,
 ) -> Result<Transition, String> {
     let ordinal = Conversation::open_tree(store, parent_tree)?.transcript_len()?;
-    match &mut transition {
-        Transition::MessageAppend { entry, payloads }
-        | Transition::TurnInterject {
-            entry, payloads, ..
-        }
-        | Transition::ModelComplete {
-            entry, payloads, ..
-        } => retarget_entry(entry, payloads, ordinal),
-        _ => {}
+    if let Transition::MessageAppend { entry, payloads } = &mut transition {
+        retarget_entry(entry, payloads, ordinal);
     }
     Ok(transition)
 }
@@ -649,8 +615,6 @@ mod tests {
             conversation: "conversation".to_string(),
             role: conversation_protocol::v3::Role::System,
             actor: "test".to_string(),
-            request: None,
-            round: None,
             model: None,
             blocks: vec![Block::Text {
                 text: text.to_string(),

@@ -203,17 +203,15 @@ follows, with the step (`X-Caos-Step`) as the `base` and the arguments
 | MCP tool | HTTP equivalent |
 |---|---|
 | `run` | `POST /eval/run` of the step; blocks |
-| `start` | `POST /eval/run` of the same call with `declare-only=1`, then `POST /start/run`; the answer text carries the ticket |
+| `start` | `POST /start/run` of the same call; the answer text carries the ticket |
 | `result` | `GET /result/<ticket>` |
 | `help`, `eval-path` | `/eval/run` of the step's `tool_help` / `eval_path` |
 
-`start` declares the call on the conversation's active request **before** it
-answers. The ticket goes back at once and the model may end its turn right
-behind it; the turn's end holds the request open only for a call already
-declared. So a `start` with no open request fails in that call, not later inside
-the ticket. The ticket is the same one `run` of that call would have used, so
-starting a call that has finished does not run it again (`declare-only` is a
-parameter, so the declaring call has a ticket of its own).
+`start` answers with the ticket at once; the job declares the call and runs it.
+The model may end its turn first, which closes nothing the call needs: a
+conversation records facts, not turns. The ticket is the same one `run` of that
+call would have used, so starting a call that has finished does not run it
+again.
 
 `help` with no `path` reports on the connection (conversation, head commit,
 diagnostics) and needs no tool run. A tool that cannot run at all is a JSON-RPC

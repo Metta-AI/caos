@@ -93,7 +93,6 @@ pub fn child_request(
         "merge-refs",
         "wc",
         "run",
-        "round",
         "base-head",
         "current-id",
         "current-tool",

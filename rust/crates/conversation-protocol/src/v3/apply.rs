@@ -34,32 +34,6 @@ pub enum Transition {
         entry: TranscriptEntry,
         payloads: Vec<(String, Vec<u8>)>,
     },
-    TurnAdmit {
-        record: TurnRecord,
-    },
-    TurnClaim {
-        request: Oid,
-        latest_message: String,
-    },
-    TurnInterject {
-        request: Oid,
-        entry: TranscriptEntry,
-        payloads: Vec<(String, Vec<u8>)>,
-    },
-    TurnEscape {
-        request: Oid,
-        reason: Option<String>,
-    },
-    TurnTerminal {
-        request: Oid,
-        outcome: TurnOutcome,
-    },
-    ModelComplete {
-        request: Oid,
-        entry: TranscriptEntry,
-        payloads: Vec<(String, Vec<u8>)>,
-        calls: Vec<DeclaredCall>,
-    },
     ToolStart {
         record: CallRecord,
         payloads: Vec<(String, Vec<u8>)>,
@@ -116,12 +90,6 @@ impl Transition {
             Transition::ConversationFork { .. } => Kind::ConversationFork,
             Transition::TitleSet { .. } => Kind::MetadataTitleSet,
             Transition::MessageAppend { .. } => Kind::MessageAppend,
-            Transition::TurnAdmit { .. } => Kind::TurnAdmit,
-            Transition::TurnClaim { .. } => Kind::TurnClaim,
-            Transition::TurnInterject { .. } => Kind::TurnInterject,
-            Transition::TurnEscape { .. } => Kind::TurnEscape,
-            Transition::TurnTerminal { .. } => Kind::TurnTerminal,
-            Transition::ModelComplete { .. } => Kind::ModelComplete,
             Transition::ToolStart { .. } => Kind::ToolStart,
             Transition::ToolComplete { .. } => Kind::ToolComplete,
             Transition::AsyncStart { .. } => Kind::AsyncStart,
@@ -236,186 +204,25 @@ pub fn apply(
         }
         Transition::MessageAppend { entry, payloads } => {
             let conversation = parent(store, parent_head)?;
-            if !matches!(entry.role, Role::User | Role::System) {
-                return Err("message.append requires a user or system entry".to_string());
+            if entry.role == Role::Assistant {
+                validate_declared_calls(&conversation, entry)?;
+            } else if entry.tool_uses().next().is_some() {
+                return Err("only an assistant message declares tool calls".to_string());
             }
             let next = conversation.transcript_len()?;
             validate_entry_resolution(&conversation, entry, &mut builder)?;
             put_transcript(&mut builder, next, entry, payloads)?;
-            ordinal = Some(next);
-        }
-        Transition::TurnAdmit { record } => {
-            let conversation = parent(store, parent_head)?;
-            canonical_shape(record, "request")?;
-            if conversation.active_turn()?.is_some() {
-                return Err("cannot admit a request while another request is active".to_string());
-            }
-            if conversation.turn(&record.id)?.is_some() {
-                return Err(format!("request {} already exists", record.id));
-            }
-            if record.status != TurnStatus::Queued
-                || record.round != 0
-                || !record.calls.is_empty()
-                || !record.interjections.is_empty()
-            {
-                return Err(
-                    "admitted request must be queued at round zero with no calls or interjections"
-                        .to_string(),
-                );
-            }
-            put_request(&mut events, record);
-        }
-        Transition::TurnClaim {
-            request,
-            latest_message,
-        } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_active(&conversation, request)?;
-            if record.status != TurnStatus::Queued {
-                return Err("request claim requires queued status".to_string());
-            }
-            paths::validate_protocol_id_component(latest_message)?;
-            record.status = TurnStatus::Running;
-            record.latest_message = Some(latest_message.clone());
-            put_request(&mut events, &record);
-        }
-        Transition::TurnInterject {
-            request,
-            entry,
-            payloads,
-        } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_active(&conversation, request)?;
-            if !matches!(
-                record.status,
-                TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
-            ) {
-                return Err("request interject requires an active request status".to_string());
-            }
-            if entry.role != Role::User {
-                return Err("request interject requires a user entry".to_string());
-            }
-            let next = conversation.transcript_len()?;
-            validate_entry_resolution(&conversation, entry, &mut builder)?;
-            put_transcript(&mut builder, next, entry, payloads)?;
-            record.interjections.push(entry.message_id.clone());
-            if matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-                record.latest_message = Some(entry.message_id.clone());
-            }
-            put_request(&mut events, &record);
-            ordinal = Some(next);
-        }
-        Transition::TurnEscape { request, reason } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_active(&conversation, request)?;
-            match record.status {
-                TurnStatus::Queued => {
-                    record.status = TurnStatus::Idle;
-                    record.escape_reason = reason.clone();
-                    record.outcome = Some(TurnOutcome::Idle {
-                        result: None,
-                        interrupted: true,
-                    });
-                }
-                TurnStatus::Running => {
-                    record.status = TurnStatus::Cancelling;
-                    record.escape_reason = reason.clone();
-                }
-                _ => return Err("request escape requires queued or running status".to_string()),
-            }
-            put_request(&mut events, &record);
-        }
-        Transition::TurnTerminal { request, outcome } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_active(&conversation, request)?;
-            if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-                return Err("request terminal requires running or cancelling status".to_string());
-            }
-            if record.status == TurnStatus::Cancelling && record.round != 0 {
-                for call in &record.calls {
-                    let tool = conversation.tool(&record.id, record.round - 1, &call.id)?;
-                    if !tool.is_some_and(|tool| tool.is_terminal()) {
-                        return Err(
-                            "cancelling request terminated with an outstanding call".to_string()
-                        );
-                    }
-                }
-            }
-            record.status = match outcome {
-                TurnOutcome::Idle {
-                    result: Some(path), ..
-                } => {
-                    validate_caos_path(path, "request result path")?;
-                    TurnStatus::Idle
-                }
-                TurnOutcome::Idle { .. } => TurnStatus::Idle,
-                TurnOutcome::Failed { error } => {
-                    validate_caos_path(error, "request error path")?;
-                    record.escape_reason = None;
-                    TurnStatus::Failed
-                }
-            };
-            record.latest_message = None;
-            record.outcome = Some(outcome.clone());
-            put_request(&mut events, &record);
-        }
-        Transition::ModelComplete {
-            request,
-            entry,
-            payloads,
-            calls,
-        } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_active(&conversation, request)?;
-            if record.status != TurnStatus::Running {
-                return Err("model.complete requires running request status".to_string());
-            }
-            if entry.role != Role::Assistant
-                || entry.request.as_ref() != Some(request)
-                || entry.round != Some(record.round)
-            {
-                return Err("model.complete entry has wrong role, request, or round".to_string());
-            }
-            let declared_ids: Vec<String> = calls.iter().map(|call| call.id.clone()).collect();
-            let block_ids: Vec<DeclaredCall> = entry
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    Block::ToolUse { id, name, .. } => Some(DeclaredCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            paths::validate_unique(&declared_ids, "declared call id")?;
-            if *calls != block_ids {
-                return Err("model.complete calls do not match tool_use blocks".to_string());
-            }
-            let next = conversation.transcript_len()?;
-            put_transcript(&mut builder, next, entry, payloads)?;
-            if record.round == paths::MAX_JSON_INT {
-                return Err("request round exceeds the maximum JSON integer".to_string());
-            }
-            record.round += 1;
-            record.calls = calls.clone();
-            put_request(&mut events, &record);
             ordinal = Some(next);
         }
         Transition::ToolStart { record, payloads } => {
             let conversation = parent(store, parent_head)?;
             canonical_shape(record, "tool")?;
-            let request = require_request_running_or_cancelling(&conversation, &record.request)?;
             if record.status != CallStatus::Started {
                 return Err("tool.start requires started status".to_string());
             }
-            if conversation
-                .tool(&record.request, record.round, &record.id)?
-                .is_some()
-            {
+            if conversation.tool(&record.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", record.id));
             }
-            validate_current_call(&request, record)?;
             validate_tool_source_tree(&conversation, record)?;
             validate_new_tool_payloads(&conversation, record, payloads)?;
             put_tool_payloads(&mut events, record, payloads)?;
@@ -427,10 +234,8 @@ pub fn apply(
             files,
         } => {
             let conversation = parent(store, parent_head)?;
-            let request = require_request_running_or_cancelling(&conversation, &record.request)?;
             validate_tool_completion(
                 &conversation,
-                &request,
                 record,
                 payloads,
                 files,
@@ -471,13 +276,9 @@ pub fn apply(
             child,
         } => {
             let conversation = parent(store, parent_head)?;
-            let request = require_request_running_or_cancelling(&conversation, &tool.request)?;
             canonical_shape(tool, "tool")?;
             canonical_shape(child, "child")?;
-            if conversation
-                .tool(&tool.request, tool.round, &tool.id)?
-                .is_some()
-            {
+            if conversation.tool(&tool.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", tool.id));
             }
             let Some(ToolResult::Complete {
@@ -504,25 +305,16 @@ pub fn apply(
             if child.status != TaskStatus::Pending {
                 return Err("subagent spawn requires a running child".to_string());
             }
-            let expected = ids::child_id(
-                &conversation.identity()?.id,
-                &tool.request,
-                tool.round,
-                &tool.id,
-            )?;
+            let expected = ids::child_id(&conversation.identity()?.id, &tool.id)?;
             if child.id != expected {
                 return Err(format!(
                     "subagent child id mismatch: got {:?}, expected {expected:?}",
                     child.id
                 ));
             }
-            if child.spawn_intent.request != tool.request
-                || child.spawn_intent.round != tool.round
-                || child.spawn_intent.tool != tool.id
-            {
+            if child.spawn_intent.tool != tool.id {
                 return Err("subagent spawn intent does not match tool".to_string());
             }
-            validate_current_call(&request, tool)?;
             if conversation.child(&child.id)?.is_some() {
                 return Err(format!("subagent {:?} already exists", child.id));
             }
@@ -712,10 +504,6 @@ fn canonical_shape<T: Record + PartialEq>(record: &T, what: &str) -> Result<(), 
     Ok(())
 }
 
-fn put_request(events: &mut Vec<Event>, record: &TurnRecord) {
-    events.push(Event::Request(record.clone()));
-}
-
 fn put_tool(events: &mut Vec<Event>, record: &CallRecord) {
     events.push(Event::Tool(record.clone()));
 }
@@ -792,6 +580,23 @@ fn validate_entry_payloads(
     Ok(())
 }
 
+/// An assistant message's `tool_use` ids are the ids its calls are recorded
+/// under, so they are unique: within the message, and against every call the
+/// conversation has already recorded.
+fn validate_declared_calls(
+    conversation: &Conversation<'_>,
+    entry: &TranscriptEntry,
+) -> Result<(), String> {
+    let ids: Vec<String> = entry.tool_uses().map(|(id, _, _)| id.to_string()).collect();
+    paths::validate_unique(&ids, "declared call id")?;
+    for id in &ids {
+        if conversation.tool(id)?.is_some() {
+            return Err(format!("call {id:?} is already recorded"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_entry_resolution(
     conversation: &Conversation<'_>,
     entry: &TranscriptEntry,
@@ -824,27 +629,6 @@ fn validate_entry_resolution(
     Ok(())
 }
 
-fn require_active(conversation: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
-    let active = conversation
-        .active_turn()?
-        .ok_or_else(|| "there is no active request".to_string())?;
-    if active.id != *request {
-        return Err(format!("active request is {}, not {request}", active.id));
-    }
-    Ok(active)
-}
-
-fn require_request_running_or_cancelling(
-    conversation: &Conversation<'_>,
-    request: &Oid,
-) -> Result<TurnRecord, String> {
-    let record = require_active(conversation, request)?;
-    if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-        return Err("tool transition requires running or cancelling request".to_string());
-    }
-    Ok(record)
-}
-
 fn validate_tool_source_tree(
     conversation: &Conversation<'_>,
     record: &CallRecord,
@@ -870,19 +654,9 @@ fn validate_tool_source_tree(
     Ok(())
 }
 
-fn validate_current_call(_request: &TurnRecord, _record: &CallRecord) -> Result<(), String> {
-    // Flat transcript: a tool call is a recorded fact, not gated by which round
-    // is current. A harness that backgrounds a slow call and opens a new round
-    // behind it completes the slow one on the round that declared it, which is
-    // no longer the latest. (Formerly required the call to be in the latest
-    // round's declaration, which failed exactly that case and ended the request.)
-    Ok(())
-}
-
 #[allow(clippy::type_complexity)]
 fn validate_tool_completion(
     conversation: &Conversation<'_>,
-    request: &TurnRecord,
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
     files: &[(String, Option<(Mode, Vec<u8>)>)],
@@ -893,7 +667,7 @@ fn validate_tool_completion(
     if record.status == CallStatus::Started {
         return Err("tool.complete requires a terminal status".to_string());
     }
-    let existing = conversation.tool(&record.request, record.round, &record.id)?;
+    let existing = conversation.tool(&record.id)?;
     if let Some(started) = &existing {
         if started.status != CallStatus::Started {
             return Err("tool.complete requires an absent or started tool record".to_string());
@@ -912,7 +686,6 @@ fn validate_tool_completion(
         }
     }
     if existing.is_none() {
-        validate_current_call(request, record)?;
         validate_tool_source_tree(conversation, record)?;
     }
     let result = record
@@ -985,7 +758,7 @@ fn put_tool_payloads(
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<BTreeSet<String>, String> {
-    let dir = paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+    let dir = paths::call_payload_dir(&record.id);
     let mut paths = BTreeSet::new();
     for (name, bytes) in payloads {
         super::paths::validate_component(name)?;
@@ -1006,7 +779,7 @@ fn validate_new_tool_payloads(
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let dir = paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+    let dir = paths::call_payload_dir(&record.id);
     for (name, _) in payloads {
         paths::validate_component(name)?;
         let path = format!("{dir}/{name}");
@@ -1062,12 +835,4 @@ fn require_child(conversation: &Conversation<'_>, child: &str) -> Result<ChildRe
     conversation
         .child(child)?
         .ok_or_else(|| format!("subagent {child:?} does not exist"))
-}
-
-fn validate_caos_path(value: &str, what: &str) -> Result<(), String> {
-    paths::validate_tree_path(value)?;
-    if !value.starts_with(".caos/") {
-        return Err(format!("{what} must start with .caos/, got {value:?}"));
-    }
-    Ok(())
 }

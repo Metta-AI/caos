@@ -1,4 +1,14 @@
 //! The agent turn driver for the v3 conversation protocol.
+//!
+//! A conversation is a flat transcript of facts: prompts, assistant messages,
+//! tool calls and their results. The driver keeps no turn state in it, and
+//! derives what to do from the transcript every time it looks: the latest
+//! assistant message's `tool_use` blocks with no terminal record are the calls
+//! still to run; once there are none, an assistant message with no `tool_use`
+//! after the prompt (and no newer prompt after that) means the turn is done;
+//! otherwise the model is called and its message appended. A round is only a
+//! message's position, and "running" is a fact about this process, not about
+//! the conversation.
 
 mod async_work;
 mod githist;
@@ -13,7 +23,7 @@ mod subagents;
 mod timing;
 mod tools;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -27,9 +37,8 @@ use conversation_protocol::v3::paths;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
     reconcile, validate_spine, AsyncRecord, Block, CallRecord, CallStatus, ChildRecord, CodeOps,
-    DeclaredCall, FilesOutcome, Identity, IdentityKind, Mode, ObjectStore, Oid, Owner, Role,
-    SourceTreeResolution, SpawnIntent, TaskStatus, ToolResult, TranscriptEntry, TurnOutcome,
-    TurnRecord, TurnStatus,
+    FilesOutcome, Identity, IdentityKind, Mode, ObjectStore, Oid, Owner, Role,
+    SourceTreeResolution, SpawnIntent, TaskStatus, ToolResult, TranscriptEntry,
 };
 use llm_client::{post_messages, DEFAULT_BASE_URL};
 use serde_json::{json, Value};
@@ -41,8 +50,6 @@ use worker_common::{
 
 const MAX_TOKENS: u64 = 64000;
 const MAX_CONTINUATIONS: u32 = 8;
-const MAX_SPINE_WALK: usize = 4096;
-static VALID_ADMISSIONS: OnceLock<Mutex<HashSet<(Oid, Oid)>>> = OnceLock::new();
 
 fn main() -> std::process::ExitCode {
     timing::start();
@@ -57,51 +64,26 @@ struct Config {
     system: String,
     grep_image: Option<String>,
     run_and_update_ref_image: Option<String>,
-    /// Drain this request's declared calls and STOP -- do not call the model,
-    /// do not terminate the request.
+    /// Run one call and STOP -- do not call the model.
     ///
     /// For a harness that drives the model ITSELF and wants only the tools:
-    /// `caos mcp` records the call Claude Code is about to make, runs this to
-    /// execute it, and hands the observation back. Without it the step would
-    /// answer a model that already answered.
+    /// `caos mcp` hands over the call Claude Code is making, this runs it, and
+    /// the observation goes back. Without it the step would answer a model that
+    /// already answered.
     ///
-    /// Distinct from `Cancelling`/`drain`, which CANCELS pending calls rather
-    /// than running them, and ends the request.
-    ///
-    /// The value is the id of the call the run was made FOR, checked against
-    /// the record once the queue is empty. It also separates one dispatch from
-    /// the next: every other argument is the same for every call of a request,
-    /// so without it a second call would name the first's ArgTree and be
-    /// answered from the memo.
+    /// The value is the id of the call. It is the call's identity in the
+    /// conversation (a call is keyed by its id alone), and it separates one
+    /// dispatch from the next: every other argument is the same for every call of
+    /// a session, so without it a second call would name the first's ArgTree and
+    /// be answered from the memo.
     tools_only: Option<String>,
     /// With `tools_only`: the call to run, as a tool name and its arguments,
-    /// instead of one a harness declared beforehand. The step declares it on
-    /// the conversation's active request (as the request's own model) and then
-    /// runs it, so a caller needs only this ArgTree -- no conversation access of
-    /// its own, and no request or head to name. A call already declared under
-    /// the id is not declared twice, so a retry runs it rather than failing.
+    /// instead of one a harness declared beforehand. The step declares it -- an
+    /// assistant message carrying the `tool_use` -- and then runs it, so a caller
+    /// needs only this ArgTree, with no conversation access of its own. A call
+    /// already declared under the id is not declared twice, so a retry runs it
+    /// rather than failing.
     tool_call: Option<(String, Value)>,
-    /// With `tool_call`: declare the call on the active request and STOP, running
-    /// nothing.
-    ///
-    /// A harness that starts a call and answers before it finishes (`start`)
-    /// needs the declaration on the request BEFORE it answers: a turn's `Stop`
-    /// holds its request open only for a call it can see declared, so a call
-    /// still waiting to be declared when the turn ends finds the request closed.
-    /// The declaration is idempotent, so the run that follows finds the call
-    /// declared and goes on to run it.
-    declare_only: bool,
-    /// With `tools_only`: the round of the request that declares the call, once
-    /// `declare_requested_call` has found or made the declaration.
-    ///
-    /// A step that drives the model works on the request's LATEST round: it
-    /// finishes a round before opening the next. A harness that drives the model
-    /// itself (Claude Code, through `caos mcp`) does not. `start` declares a call
-    /// and answers at once, and the model's next call declares on the round
-    /// after, while the started one has yet to run or finish. So a tools-only run
-    /// drives, completes and reads back ITS call on the round that declared it,
-    /// whatever the latest round has since become.
-    tool_round: Option<u64>,
     /// With `tools_only`: a completed call whose text is longer than this many
     /// characters is also saved in the conversation, and the run's result says
     /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
@@ -151,10 +133,6 @@ impl Config {
             (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
             (None, None) => None,
         };
-        let declare_only = read_arg_opt("declare-only")?.is_some();
-        if declare_only && tool_call.is_none() {
-            return Err("--declare-only needs --tools-only=<call id> and --tool".to_string());
-        }
         let max_result_chars = match read_arg_opt("max-result-chars")? {
             Some(text) => text
                 .trim()
@@ -182,8 +160,6 @@ impl Config {
             run_and_update_ref_image,
             tools_only,
             tool_call,
-            declare_only,
-            tool_round: None,
             max_result_chars,
             record,
             list_tools,
@@ -203,8 +179,20 @@ impl Config {
     }
 }
 
+/// What this run of the step is doing: its own identity, and the prompt it
+/// answers. Nothing of it is in the conversation.
+struct Turn {
+    /// The step's own request, the ArgTree its callbacks are curried with
+    /// (`run`), so that a callback is the same run picking up where it left off.
+    request: Oid,
+    /// The transcript ordinal of the prompt this step answers: the last entry of
+    /// the commit it was asked about (`head`). `None` for a tools-only run, which
+    /// answers nothing and runs one call.
+    prompt: Option<u64>,
+}
+
 fn run() -> Result<(), String> {
-    let mut cfg = Config::read()?;
+    let cfg = Config::read()?;
     if cfg.list_tools {
         return list_tools(&cfg);
     }
@@ -213,125 +201,62 @@ fn run() -> Result<(), String> {
     }
     let mut state = progress::State::open(&cfg.conversation)?;
     timing::phase("state.open");
-    let (request, request_head) = match (&cfg.tools_only, &cfg.tool_call) {
-        // The caller named a call, not a request: the active one is the
-        // request, and it records its own head.
+    let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+    let request = Oid::parse(&run_text, "conversation request")?;
+    let prompt = match (&cfg.tools_only, &cfg.tool_call) {
         (Some(call), Some((name, arguments))) => {
-            let (request, request_head, round) =
-                declare_requested_call(&mut state, call, name, arguments)?;
-            if cfg.declare_only {
-                return forward_files(state.head(), &[("status", b"declared"), ("observation", b"")]);
-            }
-            // Work on the round that declares this call, which is the latest only
-            // until the harness's next call declares on another.
-            cfg.tool_round = Some(round);
-            (request, request_head)
+            declare_requested_call(&mut state, call, name, arguments)?;
+            None
         }
-        _ => {
-            let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
-            (
-                Oid::parse(&run_text, "conversation request")?,
-                Oid::parse(&cas_hash(&arg("head"))?, "request head")?,
-            )
+        // A call a harness declared beforehand.
+        (Some(_), None) => None,
+        (None, _) => {
+            let head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
+            Some(admit(&mut state, &head)?)
         }
     };
+    let turn = Turn { request, prompt };
     let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
-        callback(&cfg, &mut state, &request, &request_head)
+        callback(&cfg, &mut state, &turn)
     } else {
-        start(&cfg, &mut state, &request, &request_head)
+        start(&cfg, &mut state, &turn)
     };
     if let Err(error) = &outcome {
-        if let Err(record_error) = record_failure(&cfg, &mut state, &request, error) {
+        if let Err(record_error) = record_failure(&cfg, &mut state, &turn, error) {
             eprintln!("llm-step: additionally failed to record failure: {record_error}");
         }
     }
     outcome
 }
 
-fn start(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-) -> Result<(), String> {
-    loop {
-        validate_admission(state, request, request_head)?;
-        let record = require_request(&state.conversation()?, request)?;
-        match record.status {
-            TurnStatus::Queued => {
-                let latest_message = newest_user_message(&state.conversation()?)?;
-                let expected = state.head().clone();
-                match state.try_append_at(
-                    &expected,
-                    Transition::TurnClaim {
-                        request: request.clone(),
-                        latest_message,
-                    },
-                )? {
-                    progress::TryAppend::Appended(_) => break,
-                    progress::TryAppend::HeadChanged(_) => continue,
-                }
-            }
-            TurnStatus::Running => break,
-            TurnStatus::Cancelling => return drain(state, request),
-            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
-        }
-    }
+fn start(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
     reconcile_background_tasks(state)?;
     announce_background_tasks(&cfg.conversation, state)?;
-    resume(cfg, state, request, request_head)
+    resume(cfg, state, turn)
 }
 
-fn validate_admission(
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-) -> Result<(), String> {
-    let key = (request.clone(), state.head().clone());
-    {
-        let validated = VALID_ADMISSIONS
-            .get_or_init(Default::default)
-            .lock()
-            .map_err(|_| "admission validation cache is poisoned".to_string())?;
-        if validated.contains(&key) {
-            return Ok(());
-        }
-    }
-    let view = state.conversation()?;
-    let identity = view.identity()?;
+/// Check that `head`, the commit the step was asked to answer, is on this
+/// conversation's spine, and say where its prompt is: the last entry it holds.
+fn admit(state: &mut progress::State, head: &Oid) -> Result<u64, String> {
+    let identity = state.conversation()?.identity()?;
     if identity.id != state_conversation_id(state)? {
         return Err(format!(
             "conversation identity {:?} does not match its ref",
             identity.id
         ));
     }
-    let record = require_request(&view, request)?;
-    if record.request_head != *request_head {
-        return Err(format!(
-            "request {request} records head {}, not {request_head}",
-            record.request_head
-        ));
+    if !state.store().is_ancestor(head, state.head())? {
+        return Err(format!("request head {head} is not on the conversation spine"));
     }
-    if !state.store().is_ancestor(request_head, state.head())? {
-        return Err(format!(
-            "request head {request_head} is not on the conversation spine"
-        ));
-    }
-    VALID_ADMISSIONS
-        .get_or_init(Default::default)
-        .lock()
-        .map_err(|_| "admission validation cache is poisoned".to_string())?
-        .insert(key);
-    Ok(())
+    state
+        .conversation_at(head)?
+        .transcript_len()?
+        .checked_sub(1)
+        .ok_or_else(|| format!("request head {head} holds no prompt to answer"))
 }
 
 fn state_conversation_id(state: &progress::State) -> Result<String, String> {
     conversation_protocol::v3::refs::parse_head_ref(state.refname())
-}
-
-fn require_request(view: &Conversation<'_>, request: &Oid) -> Result<TurnRecord, String> {
-    view.turn(request)?
-        .ok_or_else(|| format!("conversation has no request record for {request}"))
 }
 
 fn last_matching<T>(
@@ -349,27 +274,7 @@ fn last_matching<T>(
     Ok(None)
 }
 
-fn newest_user_message(view: &Conversation<'_>) -> Result<String, String> {
-    last_matching(view, |_, entry| {
-        (entry.role == Role::User).then_some(entry.message_id)
-    })?
-    .ok_or_else(|| "request has no user message in the transcript".to_string())
-}
-
-fn callback(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-) -> Result<(), String> {
-    validate_admission(state, request, request_head)?;
-    let status = require_request(&state.conversation()?, request)?.status;
-    if matches!(status, TurnStatus::Idle | TurnStatus::Failed) {
-        return finish_from_terminal(state, request);
-    }
-    let round = read_arg("round")?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid continuation round: {error}"))?;
+fn callback(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
     let id = read_arg("current-id")?;
     let tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
     timing::phase(&format!("tool wait {tool}"));
@@ -382,7 +287,7 @@ fn callback(
     if tool == tools::EVAL_PATH || read_arg_opt("tool-lookup")?.is_some() {
         if Path::new(&arg("error")).exists() {
             let mut error = read_arg("error")?;
-            let target = pending_call_target(state, request, round, &id)?;
+            let target = pending_call_target(state, &id)?;
             if let Some(path) = read_arg_opt("tool-lookup")? {
                 let path = target
                     .as_ref()
@@ -390,24 +295,24 @@ fn callback(
                 error = format!("{path}: {error}");
             }
             let block = failed_run_block(&id, &tool, &error);
-            let declaration = declaration_message(&state.conversation()?, request, round)?;
+            let declaration = declaration_message(&state.conversation()?, &id)?;
             let call = Call {
                 id,
                 name: tool,
                 input: Value::Null,
             };
-            CallSite::at(request, round, &call, &declaration).failed(state, &block, target)?;
-            return resume(cfg, state, request, request_head);
+            CallSite::at(&turn.request, &call, &declaration).failed(state, &block, target)?;
+            return resume(cfg, state, turn);
         }
-        return launch_resolved_tool(cfg, state, request, request_head, round, &id);
+        return launch_resolved_tool(cfg, state, turn, &id);
     }
 
     let record = state
         .conversation()?
-        .tool(request, round, &id)?
-        .ok_or_else(|| format!("callback for {request}/{round}/{id} has no tool.start"))?;
+        .tool(&id)?
+        .ok_or_else(|| format!("callback for call {id} has no tool.start"))?;
     if record.is_terminal() {
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     if record.name != tool {
         return Err(format!(
@@ -419,25 +324,21 @@ fn callback(
         let error = read_arg("error")?;
         let block = failed_run_block(&id, &tool, &error);
         complete_started_failed(state, &record, &block)?;
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
 
     let (mut block, proposal) = callback_result(state, &record)?;
     append_trace_key(&mut block, &record);
     complete_compute(state, &record, block, proposal)?;
-    resume(cfg, state, request, request_head)
+    resume(cfg, state, turn)
 }
 
-fn pending_call_target(
-    state: &progress::State,
-    request: &Oid,
-    round: u64,
-    id: &str,
-) -> Result<Option<(String, Oid)>, String> {
+fn pending_call_target(state: &progress::State, id: &str) -> Result<Option<(String, Oid)>, String> {
     let view = state.conversation()?;
-    let record = require_request(&view, request)?;
-    let round_state = round_state_at(&view, &record, round)?;
-    let Some(call) = round_state.pending.iter().find(|call| call.id == id) else {
+    let Some(declaration) = declaration_of(&view, id)? else {
+        return Ok(None);
+    };
+    let Some(call) = declaration.pending.iter().find(|call| call.id == id) else {
         return Ok(None);
     };
     Ok(match resolve_target(&view, call)? {
@@ -446,91 +347,98 @@ fn pending_call_target(
     })
 }
 
-fn resume(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-) -> Result<(), String> {
+fn resume(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
     loop {
         if !state.take_fresh_after_append() {
             state.reload()?;
         }
-        validate_admission(state, request, request_head)?;
-        let record = require_request(&state.conversation()?, request)?;
-        match record.status {
-            TurnStatus::Cancelling => return drain(state, request),
-            TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
-            TurnStatus::Queued => return start(cfg, state, request, request_head),
-            TurnStatus::Running => {}
+        if interrupted(&state.conversation()?, turn)? {
+            return drain(cfg, state, turn);
         }
-
-        let round = working_round(cfg, &state.conversation()?, &record)?;
-        if let Some(call) = round.pending.first() {
-            if drive_call(cfg, state, request, &round, call)? {
-                continue;
+        if let Some(declaration) = working_declaration(cfg, &state.conversation()?)? {
+            if let Some(call) = declaration.pending.first() {
+                if drive_call(cfg, state, &turn.request, &declaration, call)? {
+                    continue;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
 
         reconcile_background_tasks(state)?;
         announce_background_tasks(&cfg.conversation, state)?;
         state.reload()?;
-        let current = require_request(&state.conversation()?, request)?;
-        if current.status != TurnStatus::Running {
+        let view = state.conversation()?;
+        if interrupted(&view, turn)?
+            || working_declaration(cfg, &view)?
+                .is_some_and(|declaration| !declaration.pending.is_empty())
+        {
             continue;
         }
-        let round = working_round(cfg, &state.conversation()?, &current)?;
-        if !round.pending.is_empty() {
-            continue;
-        }
-        // The queue is empty. A step would answer the model here; a tools-only
-        // run is finished, and leaves the request RUNNING for the next call.
-        // Its result is the conversation as it now stands, not a terminal one.
+        drop(view);
+        // Nothing left to run. A tools-only run is finished, and its result is
+        // its call's own record.
         if let Some(call) = &cfg.tools_only {
-            require_completed_call(cfg, state, request, call)?;
-            return forward_tool_result(cfg, state, request, call);
+            require_completed_call(state, call)?;
+            return forward_tool_result(cfg, state, call);
+        }
+        let prompt = turn
+            .prompt
+            .ok_or("a step that answers the model needs a prompt")?;
+        if answered(&state.conversation()?, prompt)? {
+            reconcile_background_tasks(state)?;
+            return forward_result(state.head());
         }
         let messages = context_messages(&state.conversation()?)?;
         let source_trees = source_tree_paths(state)?;
         let previous = state.head().clone();
-        return llm_round(
-            cfg,
-            state,
-            request,
-            request_head,
-            messages,
-            &source_trees,
-            &previous,
-            current.round,
-        );
+        // Appended or not -- the transcript may have moved under the model, a
+        // prompt or an interruption arriving -- the next look decides.
+        llm_round(cfg, state, messages, &source_trees, &previous)?;
     }
+}
+
+/// Whether someone interrupted this turn: an interruption after its prompt.
+fn interrupted(view: &Conversation<'_>, turn: &Turn) -> Result<bool, String> {
+    let Some(prompt) = turn.prompt else {
+        return Ok(false);
+    };
+    for ordinal in (prompt + 1..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        if entry.is_interrupt() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the prompt at `prompt` has its answer: the newest assistant message
+/// after it declares no call, and no newer prompt came after that message.
+fn answered(view: &Conversation<'_>, prompt: u64) -> Result<bool, String> {
+    for ordinal in (prompt + 1..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        match entry.role {
+            Role::User => return Ok(false),
+            Role::Assistant => return Ok(entry.tool_uses().next().is_none()),
+            Role::System => {}
+        }
+    }
+    Ok(false)
 }
 
 /// Check that the call a tools-only run was dispatched for actually ran.
 ///
-/// The run drains whatever is pending, so an empty queue is not on its own
-/// evidence that this call was among it -- a caller whose declaration lost a
-/// race, or that named a call from another round, would otherwise be handed a
-/// result with nothing of its own in it.
-fn require_completed_call(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    call: &str,
-) -> Result<(), String> {
-    let view = state.conversation()?;
-    let record = require_request(&view, request)?;
-    let round = working_round(cfg, &view, &record)?.declaring_round;
-    match view.tool(request, round, call)? {
+/// An empty queue is not on its own evidence that this call was among it -- a
+/// caller whose declaration lost a race would otherwise be handed a result with
+/// nothing of its own in it.
+fn require_completed_call(state: &mut progress::State, call: &str) -> Result<(), String> {
+    match state.conversation()?.tool(call)? {
         Some(tool) if tool.is_terminal() => Ok(()),
-        Some(tool) => Err(format!(
-            "call {call} of request {request} is {:?}, not complete",
-            tool.status
-        )),
-        None => Err(format!(
-            "request {request} round {round} declares no call {call}"
-        )),
+        Some(tool) => Err(format!("call {call} is {:?}, not complete", tool.status)),
+        None => Err(format!("no call {call} is recorded")),
     }
 }
 
@@ -547,33 +455,28 @@ impl Call {
     }
 }
 
-struct RoundState {
-    declaring_round: u64,
-    declaration_message: String,
+/// An assistant message that declared calls, and those of them that have not
+/// finished: declared with no record, or started with no result.
+struct Declaration {
+    message_id: String,
     pending: Vec<Call>,
 }
 
 struct CallSite<'a> {
+    /// The step's own request, which its callbacks are curried with.
     request: &'a Oid,
-    round: u64,
     call: &'a Call,
     declaration: &'a str,
 }
 
 impl<'a> CallSite<'a> {
-    fn new(request: &'a Oid, round: &'a RoundState, call: &'a Call) -> Self {
-        Self::at(
-            request,
-            round.declaring_round,
-            call,
-            &round.declaration_message,
-        )
+    fn new(request: &'a Oid, declaration: &'a Declaration, call: &'a Call) -> Self {
+        Self::at(request, call, &declaration.message_id)
     }
 
-    fn at(request: &'a Oid, round: u64, call: &'a Call, declaration: &'a str) -> Self {
+    fn at(request: &'a Oid, call: &'a Call, declaration: &'a str) -> Self {
         Self {
             request,
-            round,
             call,
             declaration,
         }
@@ -585,8 +488,6 @@ impl<'a> CallSite<'a> {
             None => (None, None),
         };
         CallRecord {
-            request: self.request.clone(),
-            round: self.round,
             id: self.call.id.clone(),
             name: self.call.name.clone(),
             declaration_message: self.declaration.to_string(),
@@ -658,14 +559,12 @@ impl<'a> CallSite<'a> {
 fn close_pending_call(
     state: &mut progress::State,
     request: &Oid,
-    round: &RoundState,
+    declaration: &Declaration,
     call: &Call,
     block: &Value,
     result: impl FnOnce(&CallRecord) -> ToolResult,
 ) -> Result<(), String> {
-    let existing = state
-        .conversation()?
-        .tool(request, round.declaring_round, &call.id)?;
+    let existing = state.conversation()?.tool(&call.id)?;
     let target = existing
         .as_ref()
         .and_then(|record| {
@@ -680,7 +579,8 @@ fn close_pending_call(
                 Target::Files => None,
             },
         );
-    let stub = existing.unwrap_or_else(|| CallSite::new(request, round, call).stub(target));
+    let stub =
+        existing.unwrap_or_else(|| CallSite::new(request, declaration, call).stub(target));
     let record = completed_record(&stub, result(&stub), None);
     let expected = state.head().clone();
     let _ = state.try_append_at(
@@ -690,113 +590,62 @@ fn close_pending_call(
     Ok(())
 }
 
-/// The request's LATEST round: the one a step that drives the model works on,
-/// since it finishes a round before it opens the next.
-fn round_state(view: &Conversation<'_>, record: &TurnRecord) -> Result<RoundState, String> {
-    if record.round == 0 {
-        if !record.calls.is_empty() {
-            return Err("round-zero request carries declared calls".to_string());
-        }
-        return Ok(RoundState {
-            declaring_round: 0,
-            declaration_message: String::new(),
-            pending: Vec::new(),
-        });
-    }
-    round_state_at(view, record, record.round - 1)
-}
-
-/// The round a tools-only run works on: the one that declares its call
-/// (`Config::tool_round`), or the latest while none has been found.
-fn working_round(
+/// The declaration this run works on. A step that drives the model works on
+/// the LATEST assistant message, since it finishes one message's calls before
+/// it asks for the next. A tools-only run works on its own call, wherever it was
+/// declared: a harness that drives the model itself (Claude Code, through
+/// `caos mcp`) can move a slow call to the background and declare more calls
+/// while it runs.
+fn working_declaration(
     cfg: &Config,
     view: &Conversation<'_>,
-    record: &TurnRecord,
-) -> Result<RoundState, String> {
-    match cfg.tool_round {
-        Some(round) => round_state_at(view, record, round),
-        None => round_state(view, record),
+) -> Result<Option<Declaration>, String> {
+    if let Some(call) = &cfg.tools_only {
+        return Ok(declaration_of(view, call)?.map(|mut declaration| {
+            declaration.pending.retain(|pending| pending.id == *call);
+            declaration
+        }));
     }
+    last_matching(view, |ordinal, entry| {
+        (entry.role == Role::Assistant).then_some((ordinal, entry))
+    })?
+    .map(|(_, entry)| declaration(view, entry))
+    .transpose()
 }
 
-/// One round of a request: the calls its assistant declaration made, and which
-/// of them have not finished. Any round the request has had, not only the
-/// latest: a call `start` declared is run and read back on its own round after
-/// the harness's next call has opened another (`Config::tool_round`).
-fn round_state_at(
-    view: &Conversation<'_>,
-    record: &TurnRecord,
-    declaring_round: u64,
-) -> Result<RoundState, String> {
-    if declaring_round >= record.round {
-        return Err(format!(
-            "request {} has no round {declaring_round}: it has declared {} round(s)",
-            record.id, record.round
-        ));
-    }
-    let mut declaration = None;
-    for ordinal in (0..view.transcript_len()?).rev() {
-        let (_, entry) = view
-            .transcript_entry(ordinal)?
-            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
-        if entry.role == Role::Assistant
-            && entry.request.as_ref() == Some(&record.id)
-            && entry.round == Some(declaring_round)
-        {
-            declaration = Some((ordinal, entry));
-            break;
-        }
-    }
-    let (ordinal, entry) = declaration.ok_or_else(|| {
-        format!(
-            "request {} round {declaring_round} has no assistant declaration",
-            record.id
-        )
-    })?;
-    let mut calls = Vec::new();
-    for block in &entry.blocks {
-        if let Block::ToolUse {
-            id,
-            name,
-            arguments,
-        } = block
-        {
-            let input = serde_json::from_slice(&view.payload(arguments)?)
-                .map_err(|error| format!("parsing tool arguments {arguments}: {error}"))?;
-            calls.push(Call {
-                id: id.clone(),
-                name: name.clone(),
-                input,
-            });
-        }
-    }
-    let projection: Vec<DeclaredCall> = calls
-        .iter()
-        .map(|call| DeclaredCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
-        })
-        .collect();
-    // `record.calls` projects the LATEST round's declaration only; an earlier
-    // round is checked against nothing but its own transcript entry.
-    if declaring_round + 1 == record.round && projection != record.calls {
-        return Err(format!(
-            "request {} calls do not match transcript ordinal {ordinal}",
-            record.id
-        ));
-    }
+/// The declaration that carries call `id`, if a message declared it.
+fn declaration_of(view: &Conversation<'_>, id: &str) -> Result<Option<Declaration>, String> {
+    last_matching(view, |_, entry| {
+        (entry.role == Role::Assistant && entry.tool_uses().any(|(call, _, _)| call == id))
+            .then_some(entry)
+    })?
+    .map(|entry| declaration(view, entry))
+    .transpose()
+}
+
+fn declaration_message(view: &Conversation<'_>, id: &str) -> Result<String, String> {
+    declaration_of(view, id)?
+        .map(|declaration| declaration.message_id)
+        .ok_or_else(|| format!("no message declares call {id}"))
+}
+
+/// The calls an assistant message declared, and which of them have not finished.
+fn declaration(view: &Conversation<'_>, entry: TranscriptEntry) -> Result<Declaration, String> {
     let mut pending = Vec::new();
-    for call in calls {
-        if !view
-            .tool(&record.id, declaring_round, &call.id)?
-            .is_some_and(|tool| tool.is_terminal())
-        {
-            pending.push(call);
+    for (id, name, arguments) in entry.tool_uses() {
+        if view.tool(id)?.is_some_and(|tool| tool.is_terminal()) {
+            continue;
         }
+        let input = serde_json::from_slice(&view.payload(arguments)?)
+            .map_err(|error| format!("parsing tool arguments {arguments}: {error}"))?;
+        pending.push(Call {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        });
     }
-    Ok(RoundState {
-        declaring_round,
-        declaration_message: entry.message_id,
+    Ok(Declaration {
+        message_id: entry.message_id,
         pending,
     })
 }
@@ -832,44 +681,27 @@ fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
                     .cloned()
                     .ok_or_else(|| format!("{response_path} is not a JSON array"))?;
                 messages.push(message("assistant", Value::Array(blocks)));
-                let calls: Vec<(&str, &str)> = entry
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        Block::ToolUse { id, .. } => Some((
-                            entry.request.as_ref().map(Oid::as_str).unwrap_or_default(),
-                            id.as_str(),
-                        )),
-                        _ => None,
-                    })
-                    .collect();
-                if calls.is_empty() {
-                    continue;
-                }
-                let request = entry.request.as_ref().ok_or_else(|| {
-                    format!("assistant entry {} has no request", entry.message_id)
-                })?;
-                let round = entry
-                    .round
-                    .ok_or_else(|| format!("assistant entry {} has no round", entry.message_id))?;
+                // Every `tool_use` is answered, in declaration order. A call that
+                // never finished -- its turn was interrupted, or the process
+                // driving it died -- is answered as such, so the model reads a
+                // well-formed history.
                 let mut results = Vec::new();
-                for (_, id) in calls {
-                    let Some(tool) = view.tool(request, round, id)? else {
-                        return Ok(messages);
+                for (id, _, _) in entry.tool_uses() {
+                    let finished = view.tool(id)?.filter(CallRecord::is_terminal);
+                    let Some(tool) = finished else {
+                        results.push(error_block(id, "this call did not finish"));
+                        continue;
                     };
-                    if !tool.is_terminal() {
-                        return Ok(messages);
-                    }
-                    let observation = format!(
-                        "{}/observation.json",
-                        paths::call_payload_dir(request.as_str(), round, id)
-                    );
+                    let observation =
+                        format!("{}/observation.json", paths::call_payload_dir(id));
                     let observation: Value =
                         serde_json::from_slice(&view.payload(&observation)?)
                             .map_err(|error| format!("parsing {observation}: {error}"))?;
                     results.push(render_tool_observation(view, &tool, observation)?);
                 }
-                messages.push(message("user", Value::Array(results)));
+                if !results.is_empty() {
+                    messages.push(message("user", Value::Array(results)));
+                }
             }
         }
     }
@@ -905,16 +737,15 @@ fn render_tool_observation(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Ask the model for the next message and append it on top of `previous`. A
+/// message that lands on a moved head is not appended: the transcript changed
+/// under the model, and the caller looks again.
 fn llm_round(
     cfg: &Config,
     state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
     messages: Vec<Value>,
     source_trees: &[String],
     previous: &Oid,
-    round: u64,
 ) -> Result<(), String> {
     let body = json!({
         "model": cfg.model,
@@ -978,133 +809,43 @@ fn llm_round(
             "LLM round ended with stop_reason {stop:?} (only end_turn and tool_use are handled; the turn fails here by design for now)"
         ));
     }
-
-    let (transition, message_id) = model_transition(
-        cfg,
-        state,
-        request,
-        round,
-        &blocks,
-        durable.as_deref().unwrap_or(&[]),
-    )?;
-    if stop == "end_turn" {
-        let ordinal = state.conversation()?.transcript_len()?;
-        let result = paths::transcript_entry_path(ordinal, &message_id);
-        return terminate_end_turn(
-            cfg,
-            state,
-            EndTurn {
-                request,
-                request_head,
-                expected: previous,
-                round,
-                model_complete: transition,
-                result,
-            },
-        );
-    }
-    match state.try_append_at(previous, transition)? {
-        progress::TryAppend::Appended(_) => resume(cfg, state, request, request_head),
-        progress::TryAppend::HeadChanged(_) => {
-            record_response_after_escape(cfg, state, request, request_head, round)
-        }
-    }
+    let transition = model_transition(cfg, state, &blocks, durable.as_deref().unwrap_or(&[]))?;
+    let _ = state.try_append_at(previous, transition)?;
+    Ok(())
 }
 
 fn append_max_tokens_prefill(messages: &mut Vec<Value>, blocks: Vec<Value>) {
     messages.push(message("assistant", Value::Array(blocks)));
 }
 
-struct EndTurn<'a> {
-    request: &'a Oid,
-    request_head: &'a Oid,
-    expected: &'a Oid,
-    round: u64,
-    model_complete: Transition,
-    result: String,
-}
-
-fn terminate_end_turn(
-    cfg: &Config,
-    state: &mut progress::State,
-    end: EndTurn<'_>,
-) -> Result<(), String> {
-    let EndTurn {
-        request,
-        request_head,
-        expected,
-        round,
-        model_complete,
-        result,
-    } = end;
-    state.reload()?;
-    if state.head() != expected {
-        return record_response_after_escape(cfg, state, request, request_head, round);
-    }
-    match require_request(&state.conversation()?, request)?.status {
-        TurnStatus::Cancelling => return drain(state, request),
-        TurnStatus::Idle | TurnStatus::Failed => return finish_from_terminal(state, request),
-        TurnStatus::Queued => {
-            return Err(format!(
-                "request {request} returned to queued after model completion"
-            ))
-        }
-        TurnStatus::Running => {}
-    }
-    let terminal = Transition::TurnTerminal {
-        request: request.clone(),
-        outcome: TurnOutcome::Idle {
-            result: Some(result),
-            interrupted: false,
-        },
-    };
-    match state.try_append_pair_at(expected, model_complete, terminal)? {
-        progress::TryAppend::Appended(terminal) => {
-            if terminal.ordinal.is_none() {
-                return Err("model.complete did not append a transcript entry".to_string());
-            }
-            reconcile_background_tasks(state)?;
-            forward_result(&terminal.commit)
-        }
-        progress::TryAppend::HeadChanged(_) => {
-            record_response_after_escape(cfg, state, request, request_head, round)
-        }
-    }
-}
-
 fn model_transition(
     cfg: &Config,
     state: &progress::State,
-    request: &Oid,
-    round: u64,
     blocks: &[Value],
     calls: &[Value],
-) -> Result<(Transition, String), String> {
+) -> Result<Transition, String> {
     model_transition_by(
         &cfg.conversation,
         &cfg.model,
-        &cfg.model,
+        Some(&cfg.model),
         state,
-        request,
-        round,
         blocks,
         calls,
     )
 }
 
-/// [`model_transition`] with the author and model named, for a caller whose
-/// model is not this step's: a harness that answers the model itself.
-#[allow(clippy::too_many_arguments)]
+/// The assistant message for a model's response: its text, and a `tool_use`
+/// block per call with the call's arguments as a payload. With the author and
+/// model named, for a caller whose model is not this step's: a harness that
+/// answers the model itself.
 fn model_transition_by(
     conversation: &str,
     actor: &str,
-    model: &str,
+    model: Option<&str>,
     state: &progress::State,
-    request: &Oid,
-    round: u64,
     blocks: &[Value],
     calls: &[Value],
-) -> Result<(Transition, String), String> {
+) -> Result<Transition, String> {
     let message_id = client_key()?;
     let ordinal = state.conversation()?.transcript_len()?;
     let dir = paths::transcript_payload_dir(ordinal, &message_id);
@@ -1117,7 +858,6 @@ fn model_transition_by(
     if !text.is_empty() {
         entry_blocks.push(Block::Text { text });
     }
-    let mut declared = Vec::new();
     for call in calls {
         let raw_id = call["id"]
             .as_str()
@@ -1136,123 +876,58 @@ fn model_transition_by(
             name: name.to_string(),
             arguments: format!("{dir}/{payload_name}"),
         });
-        declared.push(DeclaredCall {
-            id: raw_id.to_string(),
-            name: name.to_string(),
-        });
     }
-    let entry = TranscriptEntry {
-        message_id: message_id.clone(),
-        conversation: conversation.to_string(),
-        role: Role::Assistant,
-        actor: actor.to_string(),
-        request: Some(request.clone()),
-        round: Some(round),
-        model: Some(model.to_string()),
-        blocks: entry_blocks,
-        proposal: None,
-        source_tree_resolution: None,
-    };
-    Ok((
-        Transition::ModelComplete {
-            request: request.clone(),
-            entry,
-            payloads,
-            calls: declared,
+    Ok(Transition::MessageAppend {
+        entry: TranscriptEntry {
+            message_id,
+            conversation: conversation.to_string(),
+            role: Role::Assistant,
+            actor: actor.to_string(),
+            model: model.map(str::to_string),
+            blocks: entry_blocks,
+            proposal: None,
+            source_tree_resolution: None,
         },
-        message_id,
-    ))
+        payloads,
+    })
 }
 
-/// Declare `call` on the conversation's active request, unless something
-/// already has, and return that request and the head it was admitted at.
+/// Declare `call` -- an assistant message carrying its `tool_use` -- unless a
+/// message already has.
 ///
-/// This is the half of a tool call a harness that drives the model itself used
-/// to do from its own checkout: record the model's `tool_use` so the protocol
-/// accepts a tool that a message declared (`validate_current_call`). It is
-/// authored by the request's own model, as the harness's declaration was.
+/// This is the half of a tool call a harness that drives the model itself
+/// cannot record for itself: the model's `tool_use`, which the call's result
+/// answers. It is authored by the newest prompt's actor, as the harness's own
+/// declaration was, and names no model: the harness does not say which.
 fn declare_requested_call(
     state: &mut progress::State,
     call: &str,
     name: &str,
     arguments: &Value,
-) -> Result<(Oid, Oid, u64), String> {
+) -> Result<(), String> {
     loop {
         let view = state.conversation()?;
-        let record = view.active_turn()?.ok_or_else(|| {
-            format!(
-                "no active request in {:?}: call {call} found none open (no prompt has opened one yet, or the turn that issued the call ended and its Stop closed the request before the call was declared)",
-                state_conversation_id(state).unwrap_or_default()
-            )
-        })?;
-        if let Some(round) = declared_round(&view, &record, call)? {
-            return Ok((record.id, record.request_head, round));
-        }
-        if record.status == TurnStatus::Queued {
-            // Nobody has claimed the request yet; the step does, as it does
-            // before it answers a model.
-            let latest_message = newest_user_message(&view)?;
-            drop(view);
-            let expected = state.head().clone();
-            state.try_append_at(
-                &expected,
-                Transition::TurnClaim {
-                    request: record.id.clone(),
-                    latest_message,
-                },
-            )?;
-            continue;
-        }
-        if record.status != TurnStatus::Running {
-            return Err(format!(
-                "cannot declare call {call} on a request that is {:?}",
-                record.status
-            ));
+        if declaration_of(&view, call)?.is_some() {
+            return Ok(());
         }
         let actor = newest_user_actor(&view)?;
         drop(view);
         let blocks = [json!({"type": "tool_use", "id": call, "name": name, "input": arguments})];
         let calls = [json!({"id": call, "name": name, "args": arguments})];
-        let (transition, _) = model_transition_by(
+        let transition = model_transition_by(
             &state_conversation_id(state)?,
             &actor,
-            &record.model,
+            None,
             state,
-            &record.id,
-            record.round,
             &blocks,
             &calls,
         )?;
         let expected = state.head().clone();
         match state.try_append_at(&expected, transition)? {
-            progress::TryAppend::Appended(_) => {
-                return Ok((record.id, record.request_head, record.round));
-            }
+            progress::TryAppend::Appended(_) => return Ok(()),
             progress::TryAppend::HeadChanged(_) => continue,
         }
     }
-}
-
-/// The round of `record` whose assistant declaration carries the call, if one
-/// does. It reads the declarations, not `tool.start` records: a call `start`
-/// declared that nothing has run yet is the request's all the same, on whatever
-/// round declared it, and must not be declared a second time on a later one.
-fn declared_round(
-    view: &Conversation<'_>,
-    record: &TurnRecord,
-    call: &str,
-) -> Result<Option<u64>, String> {
-    last_matching(view, |_, entry| {
-        if entry.role != Role::Assistant || entry.request.as_ref() != Some(&record.id) {
-            return None;
-        }
-        let declares = entry
-            .blocks
-            .iter()
-            .any(|block| matches!(block, Block::ToolUse { id, .. } if id.as_str() == call));
-        declares.then_some(entry.round)
-    })
-    .map(Option::flatten)
 }
 
 /// The result of a tools-only run: the call's own record, so a caller with only
@@ -1268,18 +943,11 @@ fn declared_round(
 ///   blob's hash, on two lines. `observation` is still the whole of it; deciding
 ///   what a reader is shown instead is the caller's.
 /// - `conversation`: the conversation as it now stands.
-fn forward_tool_result(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    call: &str,
-) -> Result<(), String> {
+fn forward_tool_result(cfg: &Config, state: &mut progress::State, call: &str) -> Result<(), String> {
     let view = state.conversation()?;
-    let record = require_request(&view, request)?;
-    let round = working_round(cfg, &view, &record)?.declaring_round;
     let tool = view
-        .tool(request, round, call)?
-        .ok_or_else(|| format!("request {request} round {round} declares no call {call}"))?;
+        .tool(call)?
+        .ok_or_else(|| format!("no call {call} is recorded"))?;
     let (status, observation) = match &tool.result {
         Some(ToolResult::Complete { observation, .. }) => ("complete", view.payload(observation)?),
         Some(ToolResult::Failed { error }) => ("failed", view.payload(error)?),
@@ -1384,24 +1052,6 @@ fn forward_files(head: &Oid, files: &[(&str, &[u8])]) -> Result<(), String> {
     caos(["put", path(&dir), "/cas/out"])
 }
 
-fn record_response_after_escape(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-    round: u64,
-) -> Result<(), String> {
-    let record = require_request(&state.conversation()?, request)?;
-    if record.status == TurnStatus::Cancelling && record.round == round {
-        // The shared v3 transition contract currently admits model.complete
-        // only while a request is Running. Once request.escape has changed the
-        // status to Cancelling there is no legal transition that can retain an
-        // assistant response, so finish the required cancellation drain.
-        return drain(state, request);
-    }
-    resume(cfg, state, request, request_head)
-}
-
 #[derive(Clone, Debug)]
 enum Target {
     SourceTree { name: String, commit: Oid },
@@ -1447,7 +1097,7 @@ fn run_op(
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
         ("agent-wait", None) => wait_agent_call(state, site),
         ("agent-wait", Some(record)) => {
-            dispatch_wait_started(state, site.request, site.round, site.call, record)?;
+            dispatch_wait_started(state, site.request, site.call, record)?;
             Ok(false)
         }
         (other, _) => site
@@ -1473,7 +1123,7 @@ fn op_marker(call: &Call, op: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
 fn op_marker_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/op.json",
-        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+        paths::call_payload_dir(&site.call.id)
     )
 }
 
@@ -1503,18 +1153,18 @@ fn drive_call(
     cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
-    round: &RoundState,
+    declaration: &Declaration,
     call: &Call,
 ) -> Result<bool, String> {
-    let site = CallSite::new(request, round, call);
+    let site = CallSite::new(request, declaration, call);
     if let Some(existing) = state
         .conversation()?
-        .tool(request, round.declaring_round, &call.id)?
+        .tool(&call.id)?
     {
         if existing.status == CallStatus::Started {
             if existing.name == "run_tool" {
                 let inner = op_call(call);
-                let op_site = CallSite::new(request, round, &inner);
+                let op_site = CallSite::new(request, declaration, &inner);
                 let op = started_op(&state.conversation()?, &op_site);
                 if let Some(op) = op {
                     return run_op(cfg, &op, state, &op_site, Some(&existing));
@@ -1529,9 +1179,9 @@ fn drive_call(
                 return Ok(true);
             }
             if existing.name == subagents::WAIT_TOOL {
-                dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
+                dispatch_wait_started(state, request, call, &existing)?;
             } else {
-                dispatch_started(state, request, round.declaring_round, call, &existing)?;
+                dispatch_started(state, request, call, &existing)?;
             }
             return Ok(false);
         }
@@ -1610,7 +1260,6 @@ fn drive_call(
         &wc,
         conversation.as_str(),
         request,
-        round,
     )? {
         Prepared::Result(block) => {
             site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
@@ -1619,11 +1268,9 @@ fn drive_call(
         Prepared::Evaluation => Ok(false),
         Prepared::Task(task) => {
             let record = CallRecord {
-                request: request.clone(),
-                round: round.declaring_round,
                 id: call.id.clone(),
                 name: call.name.clone(),
-                declaration_message: round.declaration_message.clone(),
+                declaration_message: declaration.message_id.clone(),
                 source_tree_name: name,
                 input_commit: Some(commit),
                 status: CallStatus::Started,
@@ -1643,7 +1290,7 @@ fn drive_call(
             )? {
                 progress::TryAppend::HeadChanged(_) => Ok(true),
                 progress::TryAppend::Appended(_) => {
-                    dispatch_started(state, request, round.declaring_round, call, &record)?;
+                    dispatch_started(state, request, call, &record)?;
                     Ok(false)
                 }
             }
@@ -1841,7 +1488,6 @@ fn prepare_compute(
     // resolves against, which is not the source tree the tool runs in.
     conversation: &str,
     request: &Oid,
-    round: &RoundState,
 ) -> Result<Prepared, String> {
     let clean = call_without_source_tree(call);
     match call.name.as_str() {
@@ -1850,7 +1496,6 @@ fn prepare_compute(
             let me = self_curry(
                 Some(wc),
                 request,
-                round.declaring_round,
                 &call.id,
                 &[
                     ("current-tool", Arg::Lit(&call.name)),
@@ -1910,7 +1555,7 @@ fn prepare_compute(
             if !relative.is_empty() {
                 extras.push(("tool-lookup", Arg::Lit(&relative)));
             }
-            let me = self_curry(Some(wc), request, round.declaring_round, &call.id, &extras)?;
+            let me = self_curry(Some(wc), request, &call.id, &extras)?;
             eval_then_catching(&start, &relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
@@ -1992,22 +1637,16 @@ fn prepared_request(
 fn launch_resolved_tool(
     cfg: &Config,
     state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-    round: u64,
+    turn: &Turn,
     id: &str,
 ) -> Result<(), String> {
-    let record = require_request(&state.conversation()?, request)?;
-    let current = working_round(cfg, &state.conversation()?, &record)?;
-    if current.declaring_round != round {
-        return resume(cfg, state, request, request_head);
-    }
-    let call = current
-        .pending
-        .iter()
-        .find(|call| call.id == id)
-        .cloned()
-        .ok_or("resolved tool is no longer pending")?;
+    // The call this evaluation was for, if nothing has finished it since.
+    let Some(current) = declaration_of(&state.conversation()?, id)? else {
+        return Err(format!("resolved tool {id} has no declaration"));
+    };
+    let Some(call) = current.pending.iter().find(|call| call.id == id).cloned() else {
+        return resume(cfg, state, turn);
+    };
     let target = resolve_target(&state.conversation()?, &call)?;
     let (name, current_input) = match target {
         Target::SourceTree { name, commit } => (Some(name), commit),
@@ -2015,7 +1654,7 @@ fn launch_resolved_tool(
     };
     let commit = Oid::parse(&cas_hash(&arg("wc"))?, "tool lookup input commit")?;
     if current_input != commit {
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     // `eval_path` asked for the evaluated object's IDENTITY, not for a tool, so
     // it answers here -- ahead of `materialize_source_tree`, which this answer
@@ -2024,7 +1663,7 @@ fn launch_resolved_tool(
     if call.name == tools::EVAL_PATH {
         let result = arg("result");
         let report = tools::eval_path_report(&cas_kind(&result)?, &cas_hash(&result)?);
-        let site = CallSite::at(request, round, &call, &current.declaration_message);
+        let site = CallSite::at(&turn.request, &call, &current.message_id);
         site.complete(
             state,
             result_block(id, &report, false),
@@ -2032,12 +1671,12 @@ fn launch_resolved_tool(
             None,
             None,
         )?;
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
-    let site = CallSite::at(request, round, &call, &current.declaration_message);
+    let site = CallSite::at(&turn.request, &call, &current.message_id);
     let tool = match tools::evaluated_tool(&image, call.input["path"].as_str().unwrap_or(&relative))
     {
         Ok(tool) => tool,
@@ -2047,7 +1686,7 @@ fn launch_resolved_tool(
                 &error_block(id, &error),
                 name.map(|name| (name, commit)),
             )?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     if call.name == "tool_help" {
@@ -2057,15 +1696,15 @@ fn launch_resolved_tool(
             false,
         );
         site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     // An operation of the step: the entry gave it a path and a help, and the step
     // does the work here, in process.
     if let Some(op) = tool.op.as_deref() {
         let inner = op_call(&call);
-        let op_site = CallSite::at(request, round, &inner, &current.declaration_message);
+        let op_site = CallSite::at(&turn.request, &inner, &current.message_id);
         return if run_op(cfg, op, state, &op_site, None)? {
-            resume(cfg, state, request, request_head)
+            resume(cfg, state, turn)
         } else {
             Ok(())
         };
@@ -2097,7 +1736,7 @@ fn launch_resolved_tool(
                     &error_block(id, &why),
                     name.map(|name| (name, commit)),
                 )?;
-                return resume(cfg, state, request, request_head);
+                return resume(cfg, state, turn);
             }
         },
     };
@@ -2106,7 +1745,7 @@ fn launch_resolved_tool(
         Ok(bound) => bound,
         Err(block) => {
             site.failed(state, &block, name.map(|name| (name, commit)))?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     let tool_tree = cas_hash(&image)?;
@@ -2136,21 +1775,19 @@ fn launch_resolved_tool(
     let task = match task {
         Ok(task) => task,
         Err(error) => {
-            let site = CallSite::at(request, round, &call, &current.declaration_message);
+            let site = CallSite::at(&turn.request, &call, &current.message_id);
             site.failed(
                 state,
                 &error_block(id, &error),
                 source_tree_name.map(|name| (name, commit)),
             )?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     let started = CallRecord {
-        request: request.clone(),
-        round,
         id: id.to_string(),
         name: call.name.clone(),
-        declaration_message: current.declaration_message,
+        declaration_message: current.message_id,
         source_tree_name,
         input_commit: Some(commit),
         status: CallStatus::Started,
@@ -2168,9 +1805,9 @@ fn launch_resolved_tool(
             record: started.clone(),
         },
     )? {
-        progress::TryAppend::HeadChanged(_) => resume(cfg, state, request, request_head),
+        progress::TryAppend::HeadChanged(_) => resume(cfg, state, turn),
         progress::TryAppend::Appended(_) => {
-            dispatch_started(state, request, round, &call, &started)
+            dispatch_started(state, &turn.request, &call, &started)
         }
     }
 }
@@ -2178,7 +1815,6 @@ fn launch_resolved_tool(
 fn dispatch_started(
     state: &mut progress::State,
     request: &Oid,
-    round: u64,
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
@@ -2209,7 +1845,7 @@ fn dispatch_started(
         scope_storage = prefix;
         extras.push(("scope", Arg::Lit(&scope_storage)));
     }
-    let me = self_curry(Some(&wc), request, round, &call.id, &extras)?;
+    let me = self_curry(Some(&wc), request, &call.id, &extras)?;
     let task = record.task.as_ref().ok_or("started tool has no task")?;
     let dispatched = run_request_then_catching(task.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
@@ -2255,7 +1891,6 @@ fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, S
 fn dispatch_wait_started(
     state: &mut progress::State,
     request: &Oid,
-    round: u64,
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
@@ -2283,7 +1918,7 @@ fn dispatch_wait_started(
     if call.name == "run_tool" {
         extras.push(("op", Arg::Lit("agent-wait")));
     }
-    let me = self_curry(None, request, round, &call.id, &extras)?;
+    let me = self_curry(None, request, &call.id, &extras)?;
     let dispatched = run_request_then_catching(relay.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
     dispatched.map_err(|error| format!("joining subagent relay {relay}: {error}"))
@@ -2442,7 +2077,7 @@ fn complete_compute(
         state.reload()?;
         if state
             .conversation()?
-            .tool(&started.request, started.round, &started.id)?
+            .tool(&started.id)?
             .is_some_and(|record| record.is_terminal())
         {
             return Ok(());
@@ -2633,19 +2268,10 @@ fn complete_started_failed(
     Ok(())
 }
 
-fn declaration_message(
-    view: &Conversation<'_>,
-    request: &Oid,
-    round: u64,
-) -> Result<String, String> {
-    let record = require_request(view, request)?;
-    Ok(round_state_at(view, &record, round)?.declaration_message)
-}
-
 fn observation_path(record: &CallRecord) -> String {
     format!(
         "{}/observation.json",
-        paths::call_payload_dir(record.request.as_str(), record.round, &record.id)
+        paths::call_payload_dir(&record.id)
     )
 }
 
@@ -2748,7 +2374,6 @@ fn spawn_agent_call(
     state: &mut progress::State,
     site: &CallSite<'_>,
 ) -> Result<bool, String> {
-    let request = site.request;
     let call = site.call;
     let prompt = match subagents::required_string(&call.value(), "prompt", subagents::SPAWN_TOOL) {
         Ok(prompt) => prompt.to_string(),
@@ -2773,9 +2398,9 @@ fn spawn_agent_call(
     let parent_id = parent_view.identity()?.id;
     let actor = newest_user_actor(&parent_view)?;
 
-    let prompt_path = tool_arguments_path(&parent_view, request, site.round, &call.id)?;
+    let prompt_path = tool_arguments_path(&parent_view, &call.id)?;
     drop(parent_view);
-    let child_id = ids::child_id(&parent_id, request, site.round, &call.id)?;
+    let child_id = ids::child_id(&parent_id, &call.id)?;
     let signature = inherited_signature(state.store(), &parent_head)?;
     let genesis = conversation_protocol::v3::oid::ensure_genesis(state.store_mut())?;
     let view = state.conversation()?;
@@ -2807,8 +2432,6 @@ fn spawn_agent_call(
             owner: Some(Owner {
                 parent: parent_id,
                 parent_head: parent_head.clone(),
-                request: request.clone(),
-                round: site.round,
                 tool: call.id.clone(),
             }),
         },
@@ -2830,8 +2453,6 @@ fn spawn_agent_call(
             conversation: child_id.clone(),
             role: Role::User,
             actor,
-            request: None,
-            round: None,
             model: None,
             blocks: vec![Block::Text {
                 text: prompt.clone(),
@@ -2846,23 +2467,8 @@ fn spawn_agent_call(
     let (configuration, child_request) =
         subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
 
-    let admit = Transition::TurnAdmit {
-        record: TurnRecord {
-            id: child_request.clone(),
-            request_head: prompt_head.clone(),
-
-            model: cfg.model.clone(),
-            configuration: configuration.to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        },
-    };
-    let initial_head = mint_detached(state, &prompt_head, &admit, &signature)?;
+    // The child's first commit is its prompt: the request it runs answers it.
+    let initial_head = prompt_head.clone();
     validate_spine(state.store(), &initial_head, &mut HashSet::new()).map_err(String::from)?;
     let relay = subagents::prepare_relay(
         &child_request,
@@ -2887,8 +2493,6 @@ fn spawn_agent_call(
         request: child_request.clone(),
         relay: relay.clone(),
         spawn_intent: SpawnIntent {
-            request: request.clone(),
-            round: site.round,
             tool: call.id.clone(),
             prompt: prompt_path,
             model: cfg.model.clone(),
@@ -2944,29 +2548,17 @@ fn newest_user_actor(view: &Conversation<'_>) -> Result<String, String> {
     .ok_or_else(|| "request has no user actor in the transcript".to_string())
 }
 
-fn tool_arguments_path(
-    view: &Conversation<'_>,
-    request: &Oid,
-    round: u64,
-    tool: &str,
-) -> Result<String, String> {
+fn tool_arguments_path(view: &Conversation<'_>, tool: &str) -> Result<String, String> {
     last_matching(view, |_, entry| {
-        if entry.role != Role::Assistant
-            || entry.request.as_ref() != Some(request)
-            || entry.round != Some(round)
-        {
+        if entry.role != Role::Assistant {
             return None;
         }
-        entry.blocks.into_iter().find_map(|block| {
-            if let Block::ToolUse { id, arguments, .. } = block {
-                if id == tool {
-                    return Some(arguments);
-                }
-            }
-            None
-        })
+        entry
+            .tool_uses()
+            .find(|(id, _, _)| *id == tool)
+            .map(|(_, _, arguments)| arguments.to_string())
     })?
-    .ok_or_else(|| format!("declared tool {request}/{round}/{tool} has no argument payload"))
+    .ok_or_else(|| format!("declared call {tool} has no argument payload"))
 }
 
 fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<bool, String> {
@@ -2984,8 +2576,6 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     };
     validate_child_relay(state, &child)?;
     let started = CallRecord {
-        request: site.request.clone(),
-        round: site.round,
         id: call.id.clone(),
         name: call.name.clone(),
         declaration_message: site.declaration.to_string(),
@@ -3008,7 +2598,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     )? {
         progress::TryAppend::HeadChanged(_) => Ok(true),
         progress::TryAppend::Appended(_) => {
-            dispatch_wait_started(state, site.request, site.round, call, &started)?;
+            dispatch_wait_started(state, site.request, call, &started)?;
             Ok(false)
         }
     }
@@ -3332,8 +2922,6 @@ fn background_notice(conversation_id: &str, message_id: String, text: String) ->
         conversation: conversation_id.to_string(),
         role: Role::System,
         actor: "caos".to_string(),
-        request: None,
-        round: None,
         model: None,
         blocks: vec![Block::Text { text }],
         proposal: None,
@@ -3410,29 +2998,23 @@ fn child_status_text(status: TaskStatus) -> &'static str {
     }
 }
 
-fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
+/// Someone interrupted the turn: stop. The calls the latest message declared
+/// that have not finished are closed as cancelled, so the transcript the next
+/// turn reads back answers every `tool_use`; then the step is done.
+fn drain(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
     loop {
         state.reload()?;
-        let record = require_request(&state.conversation()?, request)?;
-        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
-            return finish_from_terminal(state, request);
-        }
-        let round = round_state(&state.conversation()?, &record)?;
-        let Some(call) = round.pending.first() else {
-            let result = newest_assistant_path(&state.conversation()?, request)?;
-            let terminal = state.append(Transition::TurnTerminal {
-                request: request.clone(),
-                outcome: TurnOutcome::Idle {
-                    result,
-                    interrupted: true,
-                },
-            })?;
+        let declaration = working_declaration(cfg, &state.conversation()?)?;
+        let Some((declaration, call)) = declaration
+            .as_ref()
+            .and_then(|declaration| Some((declaration, declaration.pending.first()?)))
+        else {
             reconcile_background_tasks(state)?;
-            return forward_result(&terminal.commit);
+            return forward_result(state.head());
         };
         let reason = "interrupted before this tool ran";
         let block = error_block(&call.id, reason);
-        close_pending_call(state, request, &round, call, &block, |_| {
+        close_pending_call(state, &turn.request, declaration, call, &block, |_| {
             ToolResult::Cancelled {
                 reason: reason.to_string(),
             }
@@ -3440,51 +3022,40 @@ fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
     }
 }
 
-fn newest_assistant_path(view: &Conversation<'_>, request: &Oid) -> Result<Option<String>, String> {
-    last_matching(view, |ordinal, entry| {
-        (entry.role == Role::Assistant && entry.request.as_ref() == Some(request))
-            .then(|| paths::transcript_entry_path(ordinal, &entry.message_id))
-    })
-}
-
+/// The step failed. Every call it was running is closed as failed, so nothing
+/// is left waiting for a result that will not come, and a step that answers a
+/// prompt says why in the transcript. A tools-only run leaves that to its
+/// harness, which reports the failure of its own call.
 fn record_failure(
     cfg: &Config,
     state: &mut progress::State,
-    request: &Oid,
+    turn: &Turn,
     error: &str,
 ) -> Result<(), String> {
     loop {
         state.reload()?;
-        let Some(record) = state.conversation()?.turn(request)? else {
-            return Ok(());
+        let declaration = working_declaration(cfg, &state.conversation()?)?;
+        let Some((declaration, call)) = declaration
+            .as_ref()
+            .and_then(|declaration| Some((declaration, declaration.pending.first()?)))
+        else {
+            break;
         };
-        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
-            reconcile_background_tasks(state)?;
-            return Ok(());
-        }
-        if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-            return Ok(());
-        }
-        let round = working_round(cfg, &state.conversation()?, &record)?;
-        if let Some(call) = round.pending.first() {
-            let text = format!("the request stopped before this tool completed: {error}");
-            let block = error_block(&call.id, &text);
-            close_pending_call(state, request, &round, call, &block, |stub| {
-                ToolResult::Failed {
-                    error: observation_path(stub),
-                }
-            })?;
-            continue;
-        }
-        let message_id = client_key()?;
-        let appended = state.append(Transition::MessageAppend {
+        let text = format!("the turn stopped before this tool completed: {error}");
+        let block = error_block(&call.id, &text);
+        close_pending_call(state, &turn.request, declaration, call, &block, |stub| {
+            ToolResult::Failed {
+                error: observation_path(stub),
+            }
+        })?;
+    }
+    if cfg.tools_only.is_none() {
+        state.append(Transition::MessageAppend {
             entry: TranscriptEntry {
-                message_id: message_id.clone(),
+                message_id: client_key()?,
                 conversation: cfg.conversation.clone(),
                 role: Role::System,
                 actor: "llm-step".to_string(),
-                request: Some(request.clone()),
-                round: Some(record.round),
                 model: None,
                 blocks: vec![Block::Text {
                     text: error.to_string(),
@@ -3494,89 +3065,8 @@ fn record_failure(
             },
             payloads: Vec::new(),
         })?;
-        let ordinal = appended
-            .ordinal
-            .ok_or("failure message did not append a transcript entry")?;
-        state.append(Transition::TurnTerminal {
-            request: request.clone(),
-            outcome: TurnOutcome::Failed {
-                error: paths::transcript_entry_path(ordinal, &message_id),
-            },
-        })?;
-        reconcile_background_tasks(state)?;
-        return Ok(());
     }
-}
-
-fn finish_from_terminal(state: &mut progress::State, request: &Oid) -> Result<(), String> {
-    let terminal = terminal_head(state, request)?;
-    let outcome = require_request(&state.conversation_at(&terminal)?, request)?.outcome;
-    let failure = match outcome {
-        Some(TurnOutcome::Idle { .. }) => None,
-        Some(TurnOutcome::Failed { error }) => {
-            let view = state.conversation_at(&terminal)?;
-            let (ordinal, message_id) = paths::parse_transcript_entry_path(&error)?;
-            let (_, entry) = view
-                .transcript_entry(ordinal)?
-                .ok_or_else(|| format!("request error entry {error} does not exist"))?;
-            if entry.message_id != message_id {
-                return Err(format!(
-                    "request error entry {error} has the wrong message id"
-                ));
-            }
-            Some(
-                entry
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        Block::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-                    .trim_end()
-                    .to_string(),
-            )
-        }
-        None => {
-            return Err(format!(
-                "request {request} has terminal status but no outcome"
-            ))
-        }
-    };
-    reconcile_background_tasks(state)?;
-    match failure {
-        Some(error) => Err(error),
-        None => forward_result(&terminal),
-    }
-}
-
-fn terminal_head(state: &progress::State, request: &Oid) -> Result<Oid, String> {
-    terminal_head_in(state.store(), state.head(), request)
-}
-
-fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Result<Oid, String> {
-    let mut current = head.clone();
-    let mut child = Conversation::open(store, &current)?.turn(request)?;
-    for _ in 0..MAX_SPINE_WALK {
-        let info = store.read_commit(&current).map_err(String::from)?;
-        let Some(parent) = info.parents.first() else {
-            break;
-        };
-        let parent_record = Conversation::open(store, parent)?.turn(request)?;
-        let became_terminal = child.as_ref().is_some_and(|record| {
-            matches!(record.status, TurnStatus::Idle | TurnStatus::Failed)
-                && !parent_record.as_ref().is_some_and(|parent| {
-                    matches!(parent.status, TurnStatus::Idle | TurnStatus::Failed)
-                })
-        });
-        if became_terminal {
-            return Ok(current);
-        }
-        current = parent.clone();
-        child = parent_record;
-    }
-    Err(format!("request {request} has no request.terminal commit"))
+    reconcile_background_tasks(state)
 }
 
 fn forward_result(terminal: &Oid) -> Result<(), String> {
@@ -3865,14 +3355,12 @@ fn client_key() -> Result<String, String> {
 fn self_curry(
     wc: Option<&str>,
     request: &Oid,
-    round: u64,
     current_id: &str,
     extras: &[(&str, Arg<'_>)],
 ) -> Result<String, String> {
     const MANAGED: &[&str] = &[
         "wc",
         "run",
-        "round",
         "base-head",
         "current-id",
         "current-tool",
@@ -3894,14 +3382,12 @@ fn self_curry(
         .copied()
         .filter(|name| Path::new(&arg(name)).exists())
         .collect();
-    let round = round.to_string();
     let mut bindings = Vec::new();
     if let Some(wc) = wc {
         bindings.push(("wc", Arg::Path(wc)));
     }
     bindings.extend([
         ("run", Arg::Lit(request.as_str())),
-        ("round", Arg::Lit(round.as_str())),
         ("current-id", Arg::Lit(current_id)),
     ]);
     bindings.extend_from_slice(extras);
@@ -4224,8 +3710,6 @@ mod tests {
             conversation: CONVERSATION.to_string(),
             role,
             actor: "test".to_string(),
-            request: None,
-            round: None,
             model: None,
             blocks,
             proposal: None,
@@ -4255,35 +3739,6 @@ mod tests {
             },
         )?;
         let request = Oid::parse(&"a".repeat(40), "request")?;
-
-        let admitted = append_memory(
-            &mut store,
-            &user,
-            Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request.clone(),
-                    request_head: user.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-config".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            },
-        )?;
-        let claimed = append_memory(
-            &mut store,
-            &admitted,
-            Transition::TurnClaim {
-                request: request.clone(),
-                latest_message: USER_ID.to_string(),
-            },
-        )?;
         let first_args = format!(
             "{}/args-first.json",
             paths::transcript_payload_dir(1, ASSISTANT_ID)
@@ -4299,16 +3754,13 @@ mod tests {
         ];
         let head = append_memory(
             &mut store,
-            &claimed,
-            Transition::ModelComplete {
-                request: request.clone(),
+            &user,
+            Transition::MessageAppend {
                 entry: TranscriptEntry {
                     message_id: ASSISTANT_ID.to_string(),
                     conversation: CONVERSATION.to_string(),
                     role: Role::Assistant,
                     actor: "test-model".to_string(),
-                    request: Some(request.clone()),
-                    round: Some(0),
                     model: Some("test-model".to_string()),
                     blocks: vec![
                         Block::Text {
@@ -4342,16 +3794,6 @@ mod tests {
                         canonical_bytes(&json!({"path":"files"}))?,
                     ),
                 ],
-                calls: vec![
-                    DeclaredCall {
-                        id: "first".to_string(),
-                        name: first_name.to_string(),
-                    },
-                    DeclaredCall {
-                        id: "second".to_string(),
-                        name: "ls".to_string(),
-                    },
-                ],
             },
         )?;
         Ok(Golden {
@@ -4373,7 +3815,7 @@ mod tests {
             name: name.to_string(),
             input: Value::Null,
         };
-        let stub = CallSite::at(request, 0, &call, ASSISTANT_ID).stub(None);
+        let stub = CallSite::at(request, &call, ASSISTANT_ID).stub(None);
         let record = completed_record(&stub, result, None);
         tool_complete_transition(record, &block, Vec::new())
     }
@@ -4430,7 +3872,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::call_payload_dir(golden.request.as_str(), 0, "first")
+                    paths::call_payload_dir("first")
                 ),
                 proposal: None,
             },
@@ -4439,9 +3881,22 @@ mod tests {
         .unwrap();
         golden.head = append_memory(&mut golden.store, &golden.head, first).unwrap();
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
-        let request = require_request(&view, &golden.request).unwrap();
-        assert_eq!(round_state(&view, &request).unwrap().pending.len(), 1);
-        assert_eq!(context_messages(&view).unwrap().len(), 2);
+        let pending = declaration_of(&view, "second").unwrap().unwrap().pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "second");
+        // The unfinished call is answered as unfinished, not cut from the context.
+        let messages = context_messages(&view).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[2],
+            message(
+                "user",
+                json!([
+                    first_block.clone(),
+                    error_block("second", "this call did not finish")
+                ])
+            )
+        );
 
         let second_block = json!({
             "type":"tool_result", "tool_use_id":"second", "content":"two"
@@ -4453,7 +3908,7 @@ mod tests {
             ToolResult::Complete {
                 observation: format!(
                     "{}/observation.json",
-                    paths::call_payload_dir(golden.request.as_str(), 0, "second")
+                    paths::call_payload_dir("second")
                 ),
                 proposal: None,
             },
@@ -4477,12 +3932,11 @@ mod tests {
         )
         .unwrap();
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
-        assert!(
-            round_state(&view, &require_request(&view, &golden.request).unwrap())
-                .unwrap()
-                .pending
-                .is_empty()
-        );
+        assert!(declaration_of(&view, "first")
+            .unwrap()
+            .unwrap()
+            .pending
+            .is_empty());
         let messages = context_messages(&view).unwrap();
         assert_eq!(
             messages[0],
@@ -4500,9 +3954,8 @@ mod tests {
         let mut golden = golden_two_calls().unwrap();
         loop {
             let view = Conversation::open(&golden.store, &golden.head).unwrap();
-            let request = require_request(&view, &golden.request).unwrap();
-            let round = round_state(&view, &request).unwrap();
-            let Some(call) = round.pending.first() else {
+            let declaration = declaration_of(&view, "first").unwrap().unwrap();
+            let Some(call) = declaration.pending.first() else {
                 break;
             };
             let reason = "interrupted before this tool ran";
@@ -4521,7 +3974,7 @@ mod tests {
         let view = Conversation::open(&golden.store, &golden.head).unwrap();
         for id in ["first", "second"] {
             assert_eq!(
-                view.tool(&golden.request, 0, id).unwrap().unwrap().status,
+                view.tool(id).unwrap().unwrap().status,
                 CallStatus::Cancelled
             );
         }
@@ -4640,60 +4093,98 @@ mod tests {
     }
 
     #[test]
-    fn queued_escape_is_the_request_terminal_head() {
-        let mut store = MemoryStore::new();
-        let root = root_with(&mut store, BTreeMap::new()).unwrap();
-        let user = append_memory(
-            &mut store,
-            &root,
+    fn turn_state_is_read_from_the_transcript() {
+        let mut golden = golden_two_calls().unwrap();
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        let turn = Turn {
+            request: golden.request.clone(),
+            prompt: Some(0),
+        };
+        // The prompt's answer declared calls, so it is not the answer yet.
+        assert!(!answered(&view, 0).unwrap());
+        assert!(!interrupted(&view, &turn).unwrap());
+        // Neither call has a record: the model is shown each as unfinished.
+        let messages = context_messages(&view).unwrap();
+        assert_eq!(
+            messages[2],
+            message(
+                "user",
+                json!([
+                    error_block("first", "this call did not finish"),
+                    error_block("second", "this call did not finish")
+                ])
+            )
+        );
+
+        // A system notice does not answer a prompt.
+        append_text(&mut golden, "33333333333333333333333333333333", Role::System, "notice");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        assert!(!answered(&view, 0).unwrap());
+        // A message with no call does, until a newer prompt arrives.
+        append_answer(&mut golden, "44444444444444444444444444444444");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        assert!(answered(&view, 0).unwrap());
+        append_text(&mut golden, "55555555555555555555555555555555", Role::User, "and more");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        assert!(!answered(&view, 0).unwrap());
+        // An interruption after the prompt stops the turn; one before it does not.
+        append_text(
+            &mut golden,
+            "66666666666666666666666666666666",
+            Role::System,
+            conversation_protocol::v3::INTERRUPT_TEXT,
+        );
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        assert!(interrupted(&view, &turn).unwrap());
+        append_text(&mut golden, "77777777777777777777777777777777", Role::User, "go on");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
+        let later = Turn {
+            request: golden.request.clone(),
+            prompt: Some(6),
+        };
+        assert!(!interrupted(&view, &later).unwrap());
+    }
+
+    fn append_text(golden: &mut Golden, id: &str, role: Role, text: &str) {
+        golden.head = append_memory(
+            &mut golden.store,
+            &golden.head,
             Transition::MessageAppend {
                 entry: test_entry(
-                    USER_ID,
-                    Role::User,
+                    id,
+                    role,
                     vec![Block::Text {
-                        text: "stop".to_string(),
+                        text: text.to_string(),
                     }],
                 ),
                 payloads: Vec::new(),
             },
         )
         .unwrap();
-        let request = test_oid('d');
+    }
 
-        let admitted = append_memory(
-            &mut store,
-            &user,
-            Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request.clone(),
-                    request_head: user.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-config".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            },
-        )
-        .unwrap();
-        let escaped = append_memory(
-            &mut store,
-            &admitted,
-            Transition::TurnEscape {
-                request: request.clone(),
-                reason: Some("escape".to_string()),
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            terminal_head_in(&store, &escaped, &request).unwrap(),
-            escaped
+    fn append_answer(golden: &mut Golden, id: &str) {
+        let mut entry = test_entry(
+            id,
+            Role::Assistant,
+            vec![Block::Text {
+                text: "done".to_string(),
+            }],
         );
+        entry.model = Some("test-model".to_string());
+        let response = json!([{"type":"text", "text":"done"}]);
+        golden.head = append_memory(
+            &mut golden.store,
+            &golden.head,
+            Transition::MessageAppend {
+                entry,
+                payloads: vec![(
+                    "response.json".to_string(),
+                    canonical_payload_bytes(&response).unwrap(),
+                )],
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4965,7 +4456,7 @@ mod tests {
                 name: "import_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let first = json!({"commit":"a".repeat(40)});
             let second = json!({"commit":"b".repeat(40)});
             let mut record = site.stub(None);
@@ -5031,7 +4522,7 @@ mod tests {
                 name: "publish_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let store = ImportStore {
                 objects: golden.store,
                 head: golden.head.clone(),
@@ -5185,7 +4676,7 @@ mod tests {
                 name: "import_source".into(),
                 input: args,
             };
-            let site = CallSite::at(&golden.request, 0, &call, ASSISTANT_ID);
+            let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let provenance = json!({"repository":"https://example.com/repo.git","commit":imported});
             import_source::attach(&mut state, &site, "imports/base", &imported, &provenance)
                 .unwrap();
@@ -5194,7 +4685,7 @@ mod tests {
                 .unwrap();
             assert_eq!(*state.head(), head, "replay added another transition");
             let view = state.conversation().unwrap();
-            let record = view.tool(&golden.request, 0, "first").unwrap().unwrap();
+            let record = view.tool("first").unwrap().unwrap();
             let block: Value =
                 serde_json::from_slice(&view.payload(&observation_path(&record)).unwrap()).unwrap();
             if let Some(path) = race_path {

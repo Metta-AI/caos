@@ -281,60 +281,9 @@ fn reconstruct(
             let (entry, payloads) = transcript_change(kind, child_snapshot, changes)?;
             Ok(Transition::MessageAppend { entry, payloads })
         }
-        Kind::TurnAdmit => Ok(Transition::TurnAdmit {
-            record: request_change(kind, child_snapshot, changes)?.1,
-        }),
-        Kind::TurnClaim => {
-            let (request, record) = request_change(kind, child_snapshot, changes)?;
-            let latest_message = record.latest_message.ok_or_else(|| {
-                format!("{}: changed request has no latest_message", kind.as_str())
-            })?;
-            Ok(Transition::TurnClaim {
-                request,
-                latest_message,
-            })
-        }
-        Kind::TurnInterject => {
-            let (request, _) = request_change(kind, child_snapshot, changes)?;
-            let (entry, payloads) = transcript_change(kind, child_snapshot, changes)?;
-            Ok(Transition::TurnInterject {
-                request,
-                entry,
-                payloads,
-            })
-        }
-        Kind::TurnEscape => {
-            let (request, record) = request_change(kind, child_snapshot, changes)?;
-            Ok(Transition::TurnEscape {
-                request,
-                reason: record.escape_reason,
-            })
-        }
-        Kind::TurnTerminal => {
-            let (request, record) = request_change(kind, child_snapshot, changes)?;
-            let outcome = record
-                .outcome
-                .ok_or_else(|| format!("{}: changed request has no outcome", kind.as_str()))?;
-            Ok(Transition::TurnTerminal { request, outcome })
-        }
-        Kind::ModelComplete => {
-            let (_, record) = request_change(kind, child_snapshot, changes)?;
-            let (entry, payloads) = transcript_change(kind, child_snapshot, changes)?;
-            let request = entry
-                .request
-                .clone()
-                .ok_or_else(|| format!("{}: transcript entry has no request", kind.as_str()))?;
-            Ok(Transition::ModelComplete {
-                request,
-                entry,
-                payloads,
-                calls: record.calls,
-            })
-        }
         Kind::ToolStart => {
             let (_, record) = tool_change(kind, child_snapshot, changes)?;
-            let directory =
-                paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+            let directory = paths::call_payload_dir(&record.id);
             Ok(Transition::ToolStart {
                 payloads: payload_changes(kind, child_snapshot, changes, &directory)?,
                 record,
@@ -342,8 +291,7 @@ fn reconstruct(
         }
         Kind::ToolComplete => {
             let (_, record) = tool_change(kind, child_snapshot, changes)?;
-            let payload_dir =
-                paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
+            let payload_dir = paths::call_payload_dir(&record.id);
             Ok(Transition::ToolComplete {
                 payloads: payload_changes(kind, child_snapshot, changes, &payload_dir)?,
                 files: file_changes(child_snapshot, changes)?
@@ -368,7 +316,7 @@ fn reconstruct(
         Kind::SubagentSpawn => {
             let (_, tool) = tool_change(kind, child_snapshot, changes)?;
             let (_, child) = child_change(kind, child_snapshot, changes)?;
-            let payload_dir = paths::call_payload_dir(tool.request.as_str(), tool.round, &tool.id);
+            let payload_dir = paths::call_payload_dir(&tool.id);
             Ok(Transition::SubagentSpawn {
                 payloads: payload_changes(kind, child_snapshot, changes, &payload_dir)?,
                 tool,
@@ -424,25 +372,6 @@ fn transcript_change(
     let payload_dir = paths::transcript_payload_dir(ordinal, &message_id);
     let payloads = payload_changes(kind, child, changes, &payload_dir)?;
     Ok((entry, payloads))
-}
-
-fn request_change(
-    kind: Kind,
-    child: &Conversation<'_>,
-    _changes: &[Change],
-) -> Result<(Oid, TurnRecord), String> {
-    let records: Vec<_> = child
-        .current_events()?
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Request(r) => Some((r.id.clone(), r)),
-            _ => None,
-        })
-        .collect();
-    if records.len() != 1 {
-        return Err(format!("{} requires one request event", kind.as_str()));
-    }
-    Ok(records.into_iter().next().unwrap())
 }
 
 fn tool_change(

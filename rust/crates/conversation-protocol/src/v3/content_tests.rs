@@ -11,8 +11,6 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
     let source = store.read_commit(&fork).unwrap().parents[0].clone();
     validate_spine(&store, &fork, &mut HashSet::new()).unwrap();
     let view = Conversation::open(&store, &source).unwrap();
-    assert!(view.active_turn().unwrap().is_none());
-    assert!(!view.turn_ids().unwrap().is_empty());
     for path in [
         ".caos/source_trees",
         ".caos/requests",
@@ -27,17 +25,26 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
         view.snapshot().entry("main").unwrap().unwrap().mode,
         Mode::Commit
     );
-    let calls = view
-        .tools(&Oid::parse(&"1".repeat(40), "request").unwrap(), 0)
-        .unwrap();
-    assert_eq!(calls.len(), 2);
-    for call in calls {
-        if let Some(ToolResult::Complete { observation, .. }) = call.result {
-            assert!(!view.payload(&observation).unwrap().is_empty());
+    // Calls are keyed by id alone: the read, the bash and the spawn.
+    let calls = view.tools().unwrap();
+    assert_eq!(calls.len(), 3);
+    for call in &calls {
+        assert_eq!(view.tool(&call.id).unwrap().as_ref(), Some(call));
+        if let Some(ToolResult::Complete { observation, .. }) = &call.result {
+            assert!(!view.payload(observation).unwrap().is_empty());
         }
     }
+    // The async call was declared and never recorded: unfinished, and nothing
+    // more than that.
+    assert!(view.tool("async-call").unwrap().is_none());
+    let last = view.transcript_len().unwrap() - 1;
+    assert!(view
+        .transcript_entry(last)
+        .unwrap()
+        .unwrap()
+        .1
+        .is_interrupt());
     let fork_view = Conversation::open(&store, &fork).unwrap();
-    assert!(fork_view.turn_ids().unwrap().is_empty());
     assert_eq!(
         fork_view.reference_start("main").unwrap(),
         fork_view.source_tree("main").unwrap().unwrap().commit
@@ -46,9 +53,6 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
         view.reference_start("main").unwrap(),
         view.source_tree("main").unwrap().unwrap().commit
     );
-    assert!(fork_view.active_turn().unwrap().is_none());
-    assert!(fork_view.latest_turn().unwrap().is_none());
-    assert!(view.latest_turn().unwrap().is_some());
     assert!(fork_view.publications_by_creation().unwrap().is_empty());
     let ordered = view.publications_by_creation().unwrap();
     assert_eq!(ordered.len(), view.publications().unwrap().len());
@@ -59,12 +63,8 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
         );
     }
 
-    let request = Oid::parse(&"1".repeat(40), "request").unwrap();
-    assert_eq!(
-        fork_view.tools(&request, 0).unwrap(),
-        view.tools(&request, 0).unwrap()
-    );
-    for call in fork_view.tools(&request, 0).unwrap() {
+    assert_eq!(fork_view.tools().unwrap(), view.tools().unwrap());
+    for call in fork_view.tools().unwrap() {
         if let Some(ToolResult::Complete { observation, .. }) = call.result {
             assert_eq!(
                 fork_view.payload(&observation).unwrap(),
@@ -87,13 +87,17 @@ fn event_only_commits_validate_and_tampered_events_do_not() {
     loop {
         let mut info = store.read_commit(&cursor).unwrap();
         let (kind, mut events) = events::decode(&info.message).unwrap();
-        if kind == Kind::TurnClaim {
+        if kind == Kind::ToolStart {
             assert_eq!(info.tree, store.read_commit(&info.parents[0]).unwrap().tree);
             validate_commit(&store, &cursor).unwrap();
-            let Event::Request(request) = &mut events[0] else {
-                panic!("request event")
+            let Some(Event::Tool(record)) = events.last_mut() else {
+                panic!("tool event")
             };
-            request.round += 1;
+            record.status = CallStatus::Cancelled;
+            record.result = Some(ToolResult::Cancelled {
+                reason: "tampered".to_string(),
+            });
+            record.files_outcome = None;
             info.message = events::encode(kind, &events);
             let corrupted = store.write_commit(&info).unwrap();
             assert!(validate_commit(&store, &corrupted).is_err());
@@ -102,7 +106,6 @@ fn event_only_commits_validate_and_tampered_events_do_not() {
         cursor = info.parents[0].clone();
     }
 }
-
 #[test]
 fn code_paths_are_content_and_renaming_preserves_code_history() {
     let mut store = MemoryStore::new();

@@ -57,7 +57,7 @@ const SESSION_PREFIX: &str = "cc/";
 /// exactly as the model wrote it.
 const TOOL_PREFIX: &str = "mcp__caos__";
 
-/// What a request record says ran the turn. Claude Code chooses the model and
+/// The model a recorded prompt and closing message name. Claude Code chooses the model and
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
@@ -441,7 +441,7 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
 }
 
 /// What the step answered to a recorded event: which of its outcomes it was
-/// (`created`, `forked`, `recorded`, `joined`, `held`, `nothing`) and the head it left.
+/// (`created`, `forked`, `recorded`, `nothing`) and the head it left.
 struct Recorded {
     status: String,
     head: String,
@@ -492,11 +492,9 @@ fn username() -> Result<String, String> {
 /// Record a user's prompt, creating the conversation on the session's first one;
 /// the step's status says what happened (`created`, `forked`, `recorded`, ...).
 ///
-/// The step makes the message, the request it opens, and the claim that puts the
-/// request in `running`, in one compare-and-swap. The claim is not a shortcut:
-/// v3 requires it before any tool may be recorded, and Claude Code has already
-/// begun the turn by the time this hook fires, so no runner will pick the
-/// request up.
+/// The step appends the message and nothing else: a conversation keeps no turn
+/// state, so there is no request to open before Claude Code's calls are
+/// recorded.
 ///
 /// A NEW conversation needs where it starts from, which the step cannot find for
 /// itself: `from`, the commit it forks, and the locator naming its content. With
@@ -557,8 +555,9 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     if let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) {
         object.insert("caos_tool_use_id".to_string(), json!(id));
     }
-    // The turn this call belongs to, which becomes the event's `request` — the
-    // same job `llm-step`'s `run` does for a turn it drives itself.
+    // The prompt this call belongs to. The conversation keys a call by its id
+    // alone and records no turn, so the server strips it with the other
+    // injected values.
     if let Some(prompt) = payload.get("prompt_id").and_then(Value::as_str) {
         object.insert("caos_prompt_id".to_string(), json!(prompt));
     }
@@ -600,19 +599,20 @@ fn string_field<'a>(payload: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("hook payload has no string {key}"))
 }
 
-/// The assistant's closing message, and the end of the request it answered.
+/// The assistant's closing message. A call still running in the background is
+/// unaffected: its result is recorded whenever it arrives.
 fn on_stop(config: &Config, payload: &Value) -> Result<(), String> {
     let id = recorded_conversation(payload)?;
     let message = payload
         .get("last_assistant_message")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let recorded = record_event(config, &id, "stop", &[("text", message)])?;
-    if recorded.status == "held" {
-        eprintln!(
-            "caos mcp hook: a call is still running; leaving its request open for the result"
-        );
-    }
+    let recorded = record_event(
+        config,
+        &id,
+        "stop",
+        &[("text", message), ("model", CLAUDE_CODE_MODEL)],
+    )?;
     announce(&format!("caos head {}", recorded.head))
 }
 

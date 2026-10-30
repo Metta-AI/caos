@@ -2,19 +2,18 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
-    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_request,
-    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
-    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
-    InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
-    TurnOutcome, TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary,
-    DEFAULT_MODEL,
+    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_conversation,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
+    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    UserConversationSummary, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
@@ -158,8 +157,6 @@ enum ActivityState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Activity {
-    request: String,
-    round: u64,
     id: String,
     step_commit: String,
     name: String,
@@ -169,8 +166,8 @@ struct Activity {
 }
 
 impl Activity {
-    fn answers(&self, request: &str, round: u64, tool_use_id: &str) -> bool {
-        self.request == request && self.round == round && self.id == tool_use_id
+    fn answers(&self, tool_use_id: &str) -> bool {
+        self.id == tool_use_id
     }
 
     fn running_verb(&self) -> &'static str {
@@ -203,14 +200,10 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
         match event {
             TurnEvent::ToolCall {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 name,
                 summary,
             } => activities.push(Activity {
-                request: request.clone(),
-                round: *round,
                 id: tool_use_id.clone(),
                 step_commit: step_commit.clone(),
                 name: name.clone(),
@@ -220,15 +213,13 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
             }),
             TurnEvent::ToolResult {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 is_error,
                 content,
             } => {
                 if let Some(activity) = activities
                     .iter_mut()
-                    .find(|activity| activity.answers(request, *round, tool_use_id))
+                    .find(|activity| activity.answers(tool_use_id))
                 {
                     activity.state = if *is_error {
                         ActivityState::Failed
@@ -238,8 +229,6 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
                     activity.detail = content.clone();
                 } else {
                     activities.push(Activity {
-                        request: request.clone(),
-                        round: *round,
                         id: tool_use_id.clone(),
                         step_commit: step_commit.clone(),
                         name: "result".to_string(),
@@ -1017,9 +1006,6 @@ struct ConversationState {
     running: bool,
     interrupting: bool,
     local_turn: bool,
-    active_request: Option<String>,
-    reconciling_request: Option<String>,
-    reconcile_after: Option<Instant>,
     turn_phase: TurnPhase,
     forking: bool,
     source_tree_operation: bool,
@@ -1063,9 +1049,6 @@ impl ConversationState {
             running: false,
             interrupting: false,
             local_turn: false,
-            active_request: None,
-            reconciling_request: None,
-            reconcile_after: None,
             turn_phase: TurnPhase::System,
             forking: false,
             source_tree_operation: false,
@@ -1128,30 +1111,17 @@ impl ConversationState {
         {
             self.reference_notice = None;
         }
-        let preserve_local_lifecycle = self.running
-            && self.local_turn
-            && matches!(
-                load.snapshot.status,
-                TurnStatus::Queued | TurnStatus::Running
-            )
-            && self
-                .active_request
-                .as_ref()
-                .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
+        // A turn this process runs keeps its own lifecycle across reloads: only
+        // the process running a turn knows it is running.
+        let preserve_local_lifecycle = self.running && self.local_turn;
         let previous_activity_len = self.activities.len();
         let followed_activity_tail = self
             .activity_selection
             .is_none_or(|selected| selected + 1 == previous_activity_len);
         let previous_activity_selection = self.activity_selection;
         let previous_activity_detail_scroll = self.activity_detail_scroll;
-        let local_lifecycle = preserve_local_lifecycle.then(|| {
-            (
-                self.status.clone(),
-                self.turn_phase,
-                self.reconciling_request.clone(),
-                self.reconcile_after,
-            )
-        });
+        let local_lifecycle =
+            preserve_local_lifecycle.then(|| (self.status.clone(), self.turn_phase));
         self.apply_snapshot(&load.snapshot);
         self.activities = replayed_activities(&load.replay.activity);
         if followed_activity_tail && self.activities.len() > previous_activity_len {
@@ -1205,12 +1175,10 @@ impl ConversationState {
         self.transcript = transcript;
         self.remote_head = Some(load.snapshot.head);
         self.transcript_selection = None;
-        if let Some((status, turn_phase, reconciling_request, reconcile_after)) = local_lifecycle {
+        if let Some((status, turn_phase)) = local_lifecycle {
             self.status = status;
             self.turn_phase = turn_phase;
             self.local_turn = true;
-            self.reconciling_request = reconciling_request;
-            self.reconcile_after = reconcile_after;
         }
     }
 
@@ -1261,31 +1229,22 @@ impl ConversationState {
     }
 
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
-        self.running = matches!(snapshot.status, TurnStatus::Queued | TurnStatus::Running);
-        self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
-        self.status = match snapshot.status {
-            TurnStatus::Queued => "queued".to_string(),
-            TurnStatus::Running => "agent running".to_string(),
-            TurnStatus::Idle if snapshot.interrupted => {
-                format!("interrupted {}", short_hash(&snapshot.head))
-            }
-            TurnStatus::Idle => format!("updated {}", short_hash(&snapshot.head)),
+        // Running is this process's own fact: a turn it drives runs until the
+        // turn's request returns, whatever the conversation shows meanwhile.
+        if self.local_turn {
+            return;
+        }
+        self.running = false;
+        self.interrupting = false;
+        self.status = match (&snapshot.error, snapshot.interrupted) {
             // A follower never runs the turn, so this status line is the only
             // place it learns why one ended. Recomputed from the snapshot on
             // every poll, so it cannot accumulate the way a transcript row
             // would.
-            TurnStatus::Failed => match snapshot.error.as_deref() {
-                Some(error) => format!("failed: {}", Self::first_line(error)),
-                None => "failed".to_string(),
-            },
-            TurnStatus::Cancelling => "cancelling".to_string(),
+            (Some(error), _) => format!("failed: {}", Self::first_line(error)),
+            (None, true) => format!("interrupted {}", short_hash(&snapshot.head)),
+            (None, false) => format!("updated {}", short_hash(&snapshot.head)),
         };
-        if !self.running {
-            self.interrupting = false;
-            self.reconciling_request = None;
-            self.reconcile_after = None;
-            self.local_turn = false;
-        }
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -1579,11 +1538,6 @@ enum UiMessage {
         conversation: String,
         result: Result<(Result<(), String>, Box<ConversationLoad>), String>,
     },
-    Reconciled {
-        conversation: String,
-        request: String,
-        result: Result<(), String>,
-    },
     RemotePolled {
         result: Result<Vec<RemotePollEntry>, String>,
     },
@@ -1864,7 +1818,7 @@ impl App {
         } else if load_selected {
             let _ = states[selected].reload(&transport, &args.user);
         }
-        let mut app = Self {
+        let app = Self {
             repo_dir,
             user: args.user,
             conversations: states,
@@ -1887,7 +1841,6 @@ impl App {
             tx,
             rx,
         };
-        app.reconcile_active_requests();
         Ok(app)
     }
 
@@ -1901,49 +1854,6 @@ impl App {
 
     fn transport(&self) -> Result<GitTransport, String> {
         GitTransport::discover(&self.repo_dir)
-    }
-
-    /// Ensure every remotely active request has one process-local join. The
-    /// guard is per request, so unchanged 500ms polls cannot create an
-    /// unbounded set of HTTP waiters. Transport failures retry after a small
-    /// backoff; successful joins stay guarded until the ref becomes terminal.
-    fn reconcile_active_requests(&mut self) -> bool {
-        let now = Instant::now();
-        let repo_dir = self.repo_dir.clone();
-        let tx = self.tx.clone();
-        let mut started = false;
-        for state in &mut self.conversations {
-            if state.local_turn || !state.running {
-                continue;
-            }
-            let Some(request) = state.active_request.clone() else {
-                continue;
-            };
-            if state.reconciling_request.as_deref() == Some(&request)
-                || state.reconcile_after.is_some_and(|after| after > now)
-            {
-                continue;
-            }
-            state.reconciling_request = Some(request.clone());
-            state.reconcile_after = None;
-            let conversation = state.id.clone();
-            let request_to_resume = request.clone();
-            let conversation_to_resume = conversation.clone();
-            spawn(
-                repo_dir.clone(),
-                tx.clone(),
-                move |transport| {
-                    resume_request(transport, &conversation_to_resume, &request_to_resume)
-                },
-                move |result| UiMessage::Reconciled {
-                    conversation,
-                    request,
-                    result,
-                },
-            );
-            started = true;
-        }
-        started
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -2509,7 +2419,6 @@ impl App {
         if !self.selected().running || self.selected().interrupting {
             return;
         }
-        let wait_for_admission = self.selected().active_request.is_none();
         let conversation = self.selected().id.clone();
         self.selected_mut().interrupting = true;
         self.selected_mut().status = "stopping agent".to_string();
@@ -2518,10 +2427,12 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let attempts = if wait_for_admission { 40 } else { 1 };
+                // Retried: the first message may still be on its way, and the
+                // conversation not there yet to interrupt.
+                let attempts = 40;
                 let mut last_error = None;
                 for attempt in 0..attempts {
-                    match interrupt_request(transport, &conversation) {
+                    match interrupt_conversation(transport, &conversation) {
                         Ok(commit) => return Ok(commit),
                         Err(error) => last_error = Some(error),
                     }
@@ -2529,7 +2440,7 @@ impl App {
                         std::thread::sleep(Duration::from_millis(125));
                     }
                 }
-                Err(last_error.unwrap_or_else(|| "recording Escape failed".to_string()))
+                Err(last_error.unwrap_or_else(|| "recording the interruption failed".to_string()))
             },
             move |result| UiMessage::Interrupted {
                 conversation: interrupted_conversation,
@@ -2672,23 +2583,13 @@ impl App {
                             .ok()
                             .and_then(|transport| state.reload(transport, &user));
                         if refreshed.is_none() {
-                            state.running = false;
-                            state.active_request = None;
-                            state.reconciling_request = None;
                             state.remote_head = None;
                         }
+                        state.running = false;
                         state.restore_pending_submission(pending_id);
-                        if state.running {
-                            state.sidebar_attention =
-                                Some("Local follower failed — turn still active".to_string());
-                            state.show_command_error_preserving_status(format!(
-                                "following turn failed: {error}"
-                            ));
-                        } else {
-                            state.sidebar_attention = Some("Failed — open for details".to_string());
-                            state.push_error(error);
-                            state.status = "turn failed".to_string();
-                        }
+                        state.sidebar_attention = Some("Failed — open for details".to_string());
+                        state.push_error(error);
+                        state.status = "turn failed".to_string();
                     }
                 }
                 UiMessage::Completed {
@@ -2803,23 +2704,6 @@ impl App {
                         }
                     }
                 }
-                UiMessage::Reconciled {
-                    conversation,
-                    request,
-                    result,
-                } => {
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        let state = &mut self.conversations[index];
-                        if state.reconciling_request.as_deref() != Some(&request) {
-                            continue;
-                        }
-                        if let Err(error) = result {
-                            state.reconciling_request = None;
-                            state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
-                            state.status = format!("recovery retry pending: {error}");
-                        }
-                    }
-                }
                 UiMessage::RemotePolled { result } => {
                     self.remote_polling = false;
                     if let Ok(entries) = result {
@@ -2828,7 +2712,6 @@ impl App {
                 }
             }
         }
-        changed |= self.reconcile_active_requests();
         changed
     }
 
@@ -2988,15 +2871,11 @@ impl App {
             TurnEvent::Status(status) => state.status = status,
             TurnEvent::ToolCall {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 name,
                 summary,
             } => {
                 state.push_activity(Activity {
-                    request,
-                    round,
                     id: tool_use_id,
                     step_commit,
                     name,
@@ -3007,8 +2886,6 @@ impl App {
             }
             TurnEvent::ToolResult {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 is_error,
                 content,
@@ -3016,7 +2893,7 @@ impl App {
                 if let Some(activity) = state
                     .activities
                     .iter_mut()
-                    .find(|activity| activity.answers(&request, round, &tool_use_id))
+                    .find(|activity| activity.answers(&tool_use_id))
                 {
                     activity.state = if is_error {
                         ActivityState::Failed
@@ -3026,8 +2903,6 @@ impl App {
                     activity.detail = content;
                 } else {
                     state.push_activity(Activity {
-                        request,
-                        round,
                         id: tool_use_id.clone(),
                         step_commit,
                         name: "result".to_string(),
@@ -3051,9 +2926,6 @@ impl App {
         state.running = false;
         state.interrupting = false;
         state.local_turn = false;
-        state.active_request = None;
-        state.reconciling_request = None;
-        state.reconcile_after = None;
         state.sidebar_attention = None;
         state.status = if outcome.interrupted {
             format!("interrupted {}", outcome.short_commit)
@@ -4015,8 +3887,7 @@ mod tests {
     use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
-        Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry, TurnRecord,
-        TurnStatus,
+        Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry,
     };
     use conversation_protocol::v3::refs;
     use conversation_protocol::v3::{GitStore, Oid, RefUpdate};
@@ -4154,8 +4025,6 @@ mod tests {
                 conversation: id.to_string(),
                 role: Role::User,
                 actor: username.to_string(),
-                request: None,
-                round: None,
                 model: None,
                 blocks: vec![Block::Text {
                     text: message.to_string(),
@@ -4165,29 +4034,10 @@ mod tests {
             },
             payloads: Vec::new(),
         };
-        let mut head = mint_test_transition(&mut store, &root, &message_transition);
+        let head = mint_test_transition(&mut store, &root, &message_transition);
+        // The request a local turn would run for it. Nothing records it: a
+        // conversation keeps no turn state.
         let request = queued.then(|| "b".repeat(40));
-        if let Some(request) = request.as_deref() {
-            let request = Oid::parse(request, "test request").unwrap();
-
-            let admission = Transition::TurnAdmit {
-                record: TurnRecord {
-                    id: request,
-                    request_head: head.clone(),
-
-                    model: "test-model".to_string(),
-                    configuration: "test-configuration".to_string(),
-                    round: 0,
-                    calls: Vec::new(),
-                    interjections: Vec::new(),
-                    status: TurnStatus::Queued,
-                    latest_message: None,
-                    escape_reason: None,
-                    outcome: None,
-                },
-            };
-            head = mint_test_transition(&mut store, &head, &admission);
-        }
         store
             .push(&[RefUpdate {
                 refname: refs::head_ref(id).unwrap(),
@@ -4255,8 +4105,6 @@ mod tests {
 
     fn activity(number: usize) -> Activity {
         Activity {
-            request: "a".repeat(40),
-            round: number as u64,
             id: format!("tool-{number}"),
             step_commit: format!("{number:040x}"),
             name: "bash".to_string(),
@@ -4312,8 +4160,6 @@ mod tests {
                 id: "talk-1".to_string(),
                 head: "f".repeat(40),
                 title: "talk-1".to_string(),
-                status: TurnStatus::Idle,
-                request: None,
                 interrupted: false,
                 error: None,
             },
@@ -5955,20 +5801,15 @@ mod tests {
 
     #[test]
     fn replayed_activity_restores_tool_results() {
-        let request = "a".repeat(40);
         let activities = replayed_activities(&[
             TurnEvent::ToolCall {
                 step_commit: "1".repeat(40),
-                request: request.clone(),
-                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 name: "read".to_string(),
                 summary: "read README.md".to_string(),
             },
             TurnEvent::ToolResult {
                 step_commit: "2".repeat(40),
-                request,
-                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 is_error: false,
                 content: "README contents".to_string(),
@@ -5982,71 +5823,6 @@ mod tests {
     }
 
     #[test]
-    fn replayed_activity_scopes_reused_ids_by_request_and_round() {
-        let request_a = "a".repeat(40);
-        let request_b = "b".repeat(40);
-        let events = [
-            TurnEvent::ToolCall {
-                step_commit: "1".repeat(40),
-                request: request_a.clone(),
-                round: 0,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "first call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "2".repeat(40),
-                request: request_a.clone(),
-                round: 0,
-                tool_use_id: "reused".to_string(),
-                is_error: false,
-                content: "first result".to_string(),
-            },
-            TurnEvent::ToolCall {
-                step_commit: "3".repeat(40),
-                request: request_a.clone(),
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "second call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "4".repeat(40),
-                request: request_a,
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                is_error: true,
-                content: "second result".to_string(),
-            },
-            TurnEvent::ToolCall {
-                step_commit: "5".repeat(40),
-                request: request_b.clone(),
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "third call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "6".repeat(40),
-                request: request_b,
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                is_error: false,
-                content: "third result".to_string(),
-            },
-        ];
-
-        let activities = replayed_activities(&events);
-        assert_eq!(activities.len(), 3);
-        assert_eq!(activities[0].state, ActivityState::Succeeded);
-        assert_eq!(activities[0].detail, "first result");
-        assert_eq!(activities[1].state, ActivityState::Failed);
-        assert_eq!(activities[1].detail, "second result");
-        assert_eq!(activities[2].state, ActivityState::Succeeded);
-        assert_eq!(activities[2].detail, "third result");
-    }
-
-    #[test]
     fn new_activity_follows_only_a_selection_at_the_tail() {
         let mut conversation = state("talk-1");
         conversation.activities = vec![activity(1), activity(2)];
@@ -6057,8 +5833,6 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "3".repeat(40),
-                request: "a".repeat(40),
-                round: 0,
                 tool_use_id: "tool-3".to_string(),
                 name: "bash".to_string(),
                 summary: "third".to_string(),
@@ -6071,8 +5845,6 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "4".repeat(40),
-                request: "a".repeat(40),
-                round: 0,
                 tool_use_id: "tool-4".to_string(),
                 name: "bash".to_string(),
                 summary: "fourth".to_string(),
@@ -6383,8 +6155,6 @@ mod tests {
             },
         ];
         selected.activities = vec![Activity {
-            request: "a".repeat(40),
-            round: 0,
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
             name: "bash".to_string(),
@@ -6742,7 +6512,7 @@ mod tests {
     fn active_turn_accepts_an_interjection() {
         let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         let mut conversation = state("talk-1");
@@ -6751,7 +6521,6 @@ mod tests {
         conversation.running = true;
         conversation.local_turn = true;
         conversation.remote_head = Some(head);
-        conversation.active_request = Some(request);
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
         conversation.activities.push(activity(1));
@@ -6808,12 +6577,8 @@ mod tests {
         let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
-        // Admission has already advanced the head past the message's own commit.
-        let durable_commit = transport
-            .git_capture(&["rev-parse", &format!("{head}^")], None)
-            .unwrap()
-            .trim()
-            .to_string();
+        // The head is the message's own commit: nothing is recorded after it.
+        let durable_commit = head;
         let mut conversation = state("talk-1");
         let pending_id = conversation.queue_pending_submission("another prompt".to_string());
 
@@ -6841,13 +6606,11 @@ mod tests {
     #[test]
     fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
         let head = "a".repeat(40);
-        let request = "b".repeat(40);
         let mut conversation = state("talk-1");
         conversation.running = true;
         conversation.local_turn = true;
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
-        assert!(conversation.active_request.is_none());
 
         conversation.apply_load(
             ConversationLoad {
@@ -6855,8 +6618,6 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: head.clone(),
                     title: "talk-1".to_string(),
-                    status: TurnStatus::Queued,
-                    request: Some(request.clone()),
                     interrupted: false,
                     error: None,
                 },
@@ -6880,8 +6641,6 @@ mod tests {
                     ],
                     activity: vec![TurnEvent::ToolCall {
                         step_commit: "e".repeat(40),
-                        request: request.clone(),
-                        round: 2,
                         tool_use_id: "sleep".to_string(),
                         name: "bash".to_string(),
                         summary: "$ sleep 120; echo done".to_string(),
@@ -6915,10 +6674,6 @@ mod tests {
         assert_eq!(conversation.activities[0].id, "sleep");
         assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
         assert_eq!(conversation.activity_selection, Some(0));
-        assert_eq!(
-            conversation.active_request.as_deref(),
-            Some(request.as_str())
-        );
         assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
     }
 
@@ -7001,8 +6756,6 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: old_head.clone(),
                     title: "talk-1".to_string(),
-                    status: TurnStatus::Queued,
-                    request: Some("c".repeat(40)),
                     interrupted: false,
                     error: None,
                 },
@@ -7538,7 +7291,7 @@ mod tests {
         let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let transport = GitTransport::discover(&repo).unwrap();
-        let (_, request) = seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
+        seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
         invite_user_to_conversation(&transport, "Bob", "shared").unwrap();
 
         let (mut app, _) = app_with(vec![state("local")]);
@@ -7551,12 +7304,8 @@ mod tests {
             .iter()
             .find(|conversation| conversation.id == "shared")
             .unwrap();
-        assert!(shared.running);
-        assert_eq!(shared.active_request.as_deref(), Some(request.as_str()));
-        assert_eq!(
-            shared.reconciling_request.as_deref(),
-            Some(request.as_str())
-        );
+        // Alice's turn is hers: nothing in the conversation says it runs.
+        assert!(!shared.running);
         assert!(matches!(
             &shared.transcript[0].role,
             EntryRole::Peer(author) if author == "Alice"
@@ -7566,32 +7315,6 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
-    }
-
-    #[test]
-    fn active_request_reconciliation_has_one_process_local_join() {
-        let request = "b".repeat(40);
-        let mut conversation = state("shared");
-        conversation.running = true;
-        conversation.active_request = Some(request.clone());
-        let (mut app, _) = app_with(vec![conversation]);
-        app.repo_dir = std::env::temp_dir().join(format!(
-            "caos-cli-tui-missing-reconcile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-
-        assert!(app.reconcile_active_requests());
-        assert_eq!(
-            app.selected().reconciling_request.as_deref(),
-            Some(request.as_str())
-        );
-        // Polling an unchanged active snapshot cannot fan out more waiters for
-        // the same exact request. Completion/failure is consumed by drain.
-        assert!(!app.reconcile_active_requests());
     }
 
     #[test]
