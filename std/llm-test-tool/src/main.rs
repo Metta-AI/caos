@@ -842,13 +842,8 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
         &human,
         &input.secret_hash,
     )?;
-    let admitted = admit_request(
-        &mut store,
-        &human,
-        request.clone(),
-        input.model,
-        input.configuration.to_string(),
-    )?;
+    // The prompt is the head: the request answers it, and nothing else is recorded.
+    let admitted = human.clone();
 
     let refname = refs::head_ref(&input.id)?;
     push_plain(
@@ -929,8 +924,6 @@ fn append_user_message(
             conversation: id,
             role: Role::User,
             actor,
-            request: None,
-            round: None,
             model: None,
             blocks: vec![Block::Text { text }],
             proposal: None,
@@ -939,33 +932,6 @@ fn append_user_message(
         payloads: Vec::new(),
     };
     Ok((append(store, head, transition)?, message_id))
-}
-
-fn admit_request(
-    store: &mut GitStore,
-    head: &Oid,
-    request: Oid,
-    model: String,
-    configuration: String,
-) -> Result<Oid, ToolError> {
-    let view = Conversation::open(store, head)?;
-
-    drop(view);
-    let record = TurnRecord {
-        id: request.clone(),
-        request_head: head.clone(),
-
-        model,
-        configuration,
-        round: 0,
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    };
-    append(store, head, Transition::TurnAdmit { record })
 }
 
 fn prepare_turn_request(
@@ -1266,16 +1232,6 @@ fn text_blocks(blocks: &[Block]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-fn request_status_name(status: &TurnStatus) -> &'static str {
-    match status {
-        TurnStatus::Queued => "queued",
-        TurnStatus::Running => "running",
-        TurnStatus::Cancelling => "cancelling",
-        TurnStatus::Idle => "idle",
-        TurnStatus::Failed => "failed",
-    }
 }
 
 fn wait_terminal(
