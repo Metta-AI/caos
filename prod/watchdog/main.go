@@ -8,9 +8,11 @@
 // means. This program reads that decision back:
 //
 //	caos-watchdog probe             every two minutes, from a timer: can a
-//	                                client reach the server (iroh), can an
+//	                                client reach the server (iroh), can it
+//	                                compute something (std/hello), can an
 //	                                operator reach the box (SSM)? Reported as
-//	                                Datadog service checks, nothing else.
+//	                                Datadog service checks plus the two
+//	                                latencies as gauges, nothing else.
 //	caos-watchdog respond           the daemon: polls Datadog for alerting
 //	                                caos monitors; when the set becomes
 //	                                non-empty, posts to Slack, waits for the
@@ -45,6 +47,7 @@ type conf struct {
 	dogstatsd  string // host:port of the local agent's DogStatsD
 	runbookDir string // CLAUDE.md and .claude/settings.json for the session
 	model      string
+	helloRev   string // caos revision whose std/hello the run probe executes
 }
 
 func env(name, fallback string) string {
@@ -65,6 +68,7 @@ func loadConf() conf {
 		dogstatsd:  env("CAOS_WATCHDOG_DOGSTATSD", "127.0.0.1:8125"),
 		runbookDir: env("CAOS_WATCHDOG_RUNBOOK", ""),
 		model:      env("CAOS_WATCHDOG_MODEL", "claude-opus-5-5"),
+		helloRev:   env("CAOS_WATCHDOG_HELLO_REV", ""),
 	}
 }
 

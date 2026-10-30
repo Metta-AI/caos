@@ -1852,6 +1852,10 @@ sandbox = false''
             caos.watchdog.clientTools = self.packages.x86_64-linux.caos-tools;
             # caosd-prod, the one production server (prod/README.md).
             caos.watchdog.targetInstance = "i-0c0aae25be3e44d8e";
+            # The run probe executes THIS checkout's std/hello on the server.
+            # A dirty tree still names its HEAD; the server fetches from
+            # GitHub, so whatever is deployed must be pushed.
+            caos.watchdog.helloRev = self.rev or (nixpkgs.lib.removeSuffix "-dirty" self.dirtyRev);
           }
         ];
       };

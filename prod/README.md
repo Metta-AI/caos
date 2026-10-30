@@ -123,11 +123,14 @@ killing SSM; disk or memory exhaustion) are exactly the ones a process on the
 server cannot report.
 
 Detection is Datadog's. The agent on each host reports units, disk, memory
-and containers; `caos-watchdog probe` runs every two minutes and adds two
-service checks, `caos.probe.iroh` (a real `git ls-remote caos://<ticket>`)
-and `caos.probe.ssm` (an SSM RunCommand round trip). The monitors over all of
-it are code in metta, `devops/tf/datadog-monitors/caos_monitors.tf`, tagged
-`service:caos`.
+and containers; `caos-watchdog probe` runs every two minutes and adds three
+service checks: `caos.probe.iroh` (a real `git ls-remote caos://<ticket>`),
+`caos.probe.run` (`caos-cli run std/hello` with a fresh `--date`, so the
+server has to compute, not just answer) and `caos.probe.ssm` (an SSM
+RunCommand round trip). The two client latencies go up as gauges,
+`caos.probe.iroh.seconds` and `caos.probe.run.seconds`. The monitors over
+all of it are code in metta, `devops/tf/datadog-monitors/caos_monitors.tf`,
+tagged `service:caos`.
 
 Response is `caos-watchdog respond`, a daemon that polls those monitors.
 When any alert, it posts to Slack #proj-caos at once (no model in that path),
