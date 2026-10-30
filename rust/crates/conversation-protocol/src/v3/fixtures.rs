@@ -102,10 +102,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         ),
         &signature,
     );
-    let read_observation = format!(
-        "{}/observation",
-        paths::call_payload_dir("read-call")
-    );
+    let read_observation = format!("{}/observation", paths::call_payload_dir("read-call"));
     commit(
         store,
         &mut head,
@@ -153,10 +150,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         },
         &signature,
     );
-    let bash_observation = format!(
-        "{}/observation",
-        paths::call_payload_dir("bash-call")
-    );
+    let bash_observation = format!("{}/observation", paths::call_payload_dir("bash-call"));
     commit(
         store,
         &mut head,
@@ -198,12 +192,8 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         ),
         &signature,
     );
-    let child_id =
-        ids::child_id("golden-conversation", "spawn-call").expect("derive child id");
-    let spawn_observation = format!(
-        "{}/observation",
-        paths::call_payload_dir("spawn-call")
-    );
+    let child_id = ids::child_id("golden-conversation", "spawn-call").expect("derive child id");
+    let spawn_observation = format!("{}/observation", paths::call_payload_dir("spawn-call"));
     let spawn_tool = CallRecord {
         id: "spawn-call".to_string(),
         name: "spawn_agent".to_string(),
