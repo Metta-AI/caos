@@ -368,207 +368,31 @@ pub struct TranscriptEntry {
 
 impl_record!(TranscriptEntry, validate);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeclaredCall {
-    pub id: String,
-    pub name: String,
-}
+/// The text of the system message a person appends to stop whatever is driving
+/// the conversation. It is a fact in the transcript like any other: a driver
+/// that sees one after the prompt it is answering stops, and the calls it had
+/// not finished are left as they are.
+pub const INTERRUPT_TEXT: &str = "Interrupted.";
 
-impl_record!(DeclaredCall);
+impl TranscriptEntry {
+    /// Whether this entry is an interruption (`INTERRUPT_TEXT`).
+    pub fn is_interrupt(&self) -> bool {
+        self.role == Role::System
+            && matches!(self.blocks.as_slice(), [Block::Text { text }] if text == INTERRUPT_TEXT)
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TurnStatus {
-    Queued,
-    Running,
-    Cancelling,
-    Idle,
-    Failed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
-pub enum TurnOutcome {
-    Idle {
-        result: Option<String>,
-        interrupted: bool,
-    },
-    Failed {
-        error: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawTurnRecord", into = "RawTurnRecord")]
-pub struct TurnRecord {
-    pub id: Oid,
-    pub request_head: Oid,
-    pub model: String,
-    pub configuration: String,
-    pub round: u64,
-    pub calls: Vec<DeclaredCall>,
-    pub interjections: Vec<String>,
-    pub status: TurnStatus,
-    pub latest_message: Option<String>,
-    pub escape_reason: Option<String>,
-    pub outcome: Option<TurnOutcome>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTurnRecord {
-    id: Oid,
-    request_head: Oid,
-    model: String,
-    configuration: String,
-    round: u64,
-    calls: Vec<DeclaredCall>,
-    interjections: Vec<String>,
-    status: TurnStatus,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    latest_message: Option<String>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    escape_reason: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "double_option",
-        skip_serializing_if = "absent"
-    )]
-    result: Option<Option<String>>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    interrupted: Option<bool>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    error: Option<String>,
-}
-
-impl TryFrom<RawTurnRecord> for TurnRecord {
-    type Error = String;
-
-    fn try_from(raw: RawTurnRecord) -> Result<Self, Self::Error> {
-        let outcome = match raw.status {
-            TurnStatus::Idle => {
-                if raw.error.is_some() {
-                    return Err("request error is forbidden for idle status".to_string());
-                }
-                Some(TurnOutcome::Idle {
-                    result: raw
-                        .result
-                        .ok_or_else(|| "request result is required for idle status".to_string())?,
-                    interrupted: raw.interrupted.ok_or_else(|| {
-                        "request interrupted is required for idle status".to_string()
-                    })?,
-                })
-            }
-            TurnStatus::Failed => {
-                if raw.result.is_some() || raw.interrupted.is_some() {
-                    return Err("request idle outcome is forbidden for failed status".to_string());
-                }
-                Some(TurnOutcome::Failed {
-                    error: raw
-                        .error
-                        .ok_or_else(|| "request error is required for failed status".to_string())?,
-                })
-            }
-            _ => {
-                if raw.result.is_some() || raw.interrupted.is_some() || raw.error.is_some() {
-                    return Err("request outcome is forbidden for nonterminal status".to_string());
-                }
-                None
-            }
-        };
-        let record = TurnRecord {
-            id: raw.id,
-            request_head: raw.request_head,
-            model: raw.model,
-            configuration: raw.configuration,
-            round: raw.round,
-            calls: raw.calls,
-            interjections: raw.interjections,
-            status: raw.status,
-            latest_message: raw.latest_message,
-            escape_reason: raw.escape_reason,
-            outcome,
-        };
-        record.validate()?;
-        Ok(record)
+    /// The `tool_use` blocks this entry declares, as (id, name, arguments path).
+    pub fn tool_uses(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.blocks.iter().filter_map(|block| match block {
+            Block::ToolUse {
+                id,
+                name,
+                arguments,
+            } => Some((id.as_str(), name.as_str(), arguments.as_str())),
+            _ => None,
+        })
     }
 }
-
-impl From<TurnRecord> for RawTurnRecord {
-    fn from(record: TurnRecord) -> Self {
-        let (result, interrupted, error) = match record.outcome {
-            Some(TurnOutcome::Idle {
-                result,
-                interrupted,
-            }) => (Some(result), Some(interrupted), None),
-            Some(TurnOutcome::Failed { error }) => (None, None, Some(error)),
-            None => (None, None, None),
-        };
-        RawTurnRecord {
-            id: record.id,
-            request_head: record.request_head,
-            model: record.model,
-            configuration: record.configuration,
-            round: record.round,
-            calls: record.calls,
-            interjections: record.interjections,
-            status: record.status,
-            latest_message: record.latest_message,
-            escape_reason: record.escape_reason,
-            result,
-            interrupted,
-            error,
-        }
-    }
-}
-
-impl TurnRecord {
-    fn validate(&self) -> Result<(), String> {
-        if self.round > MAX_JSON_INT {
-            return Err("request round exceeds the maximum JSON integer".to_string());
-        }
-        if self.configuration.is_empty() {
-            return Err("request configuration must not be empty".to_string());
-        }
-        if matches!(self.status, TurnStatus::Running | TurnStatus::Cancelling)
-            != self.latest_message.is_some()
-        {
-            return Err(
-                "request latest_message is required only for running or cancelling status"
-                    .to_string(),
-            );
-        }
-        if self.escape_reason.is_some()
-            && !matches!(self.status, TurnStatus::Cancelling | TurnStatus::Idle)
-        {
-            return Err(
-                "request escape_reason is allowed only for cancelling or idle status".to_string(),
-            );
-        }
-        match (&self.status, &self.outcome) {
-            (TurnStatus::Idle, Some(TurnOutcome::Idle { result, .. })) => {
-                if let Some(result) = result {
-                    path(result, "request result path")?;
-                }
-            }
-            (TurnStatus::Failed, Some(TurnOutcome::Failed { error })) => {
-                path(error, "request error path")?;
-            }
-            (TurnStatus::Idle, _) => {
-                return Err("request idle status requires idle outcome".to_string())
-            }
-            (TurnStatus::Failed, _) => {
-                return Err("request failed status requires failed outcome".to_string())
-            }
-            (_, None) => {}
-            _ => return Err("request outcome is forbidden for nonterminal status".to_string()),
-        }
-        Ok(())
-    }
-}
-
-impl_record!(TurnRecord);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
