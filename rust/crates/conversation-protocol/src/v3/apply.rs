@@ -305,12 +305,7 @@ pub fn apply(
             if child.status != TaskStatus::Pending {
                 return Err("subagent spawn requires a running child".to_string());
             }
-            let expected = ids::child_id(
-                &conversation.identity()?.id,
-                &tool.request,
-                tool.round,
-                &tool.id,
-            )?;
+            let expected = ids::child_id(&conversation.identity()?.id, &tool.id)?;
             if child.id != expected {
                 return Err(format!(
                     "subagent child id mismatch: got {:?}, expected {expected:?}",
