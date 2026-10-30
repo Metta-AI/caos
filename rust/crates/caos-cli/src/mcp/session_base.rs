@@ -1,10 +1,15 @@
-//! Where a new session's conversation content comes from: a git locator.
+//! Where a new session's conversation content comes from: a git locator naming a
+//! COMMIT.
 //!
 //! The harness puts whatever it wants the conversation to start from into a git
 //! repository (committing and pushing dirty files first, if it has them) and names
 //! the commit by locator. The hook does not read a checkout, push anything or
-//! resolve the locator: it hands the server `content:@@=<locator>` with the first
-//! prompt, and the server fetches the commit and records its tree.
+//! resolve the locator: it hands the step `content-locator=<locator>` with the
+//! first prompt, and the step imports the commit, with its history, and records
+//! it -- as the parent of a new conversation's root, or merged into a fork
+//! (`std/llm-step/src/record.rs`). The commit rather than its tree, because that
+//! history is what lets git find the base when the repository's newer commit is
+//! merged in later.
 //!
 //! Two places can name the locator, most specific first:
 //!
@@ -14,14 +19,12 @@
 //! ```
 //!
 //! A directive counts only as a LEADING line, so a prompt that merely quotes one
-//! further down is not a request (the rule `resume::parse_command` uses for
+//! further down is not a request (the rule `fork::parse_command` uses for
 //! `/fork-caos-conversation`). With none of them the conversation starts without
 //! code.
 //!
-//! A locator pins its commit (`rev=<sha>`). The content is the commit's own
-//! tree, not what evaluating it produces (a repository that mounts caos has a
-//! `.caos-expr` at its root, and content is code to read), so `raw=1` is added
-//! when the locator lacks it.
+//! A locator pins its commit (`rev=<sha>`). It is passed as written: the step
+//! parses it (`git_locator::parse_git_ref`) and fetches the commit it names.
 
 const START_FROM_COMMAND: &str = "caos-session-start-from";
 
@@ -35,23 +38,9 @@ fn leading_start_from(prompt: &str) -> Option<String> {
     words.next().map(str::to_string)
 }
 
-/// The content locator for a new conversation, ready to send as `content:@@=`.
+/// The content locator for a new conversation, ready to send as `content-locator`.
 pub(super) fn content_locator(configured: Option<&str>, prompt: &str) -> Option<String> {
-    leading_start_from(prompt)
-        .or_else(|| configured.map(str::to_string))
-        .map(|locator| raw(&locator))
-}
-
-/// `locator` naming the tree itself.
-fn raw(locator: &str) -> String {
-    let (_, query) = locator.split_once('?').unwrap_or((locator, ""));
-    if query.split('&').any(|pair| pair == "raw=1") {
-        locator.to_string()
-    } else if query.is_empty() && !locator.contains('?') {
-        format!("{locator}?raw=1")
-    } else {
-        format!("{locator}&raw=1")
-    }
+    leading_start_from(prompt).or_else(|| configured.map(str::to_string))
 }
 
 #[cfg(test)]
@@ -75,22 +64,16 @@ mod tests {
     }
 
     #[test]
-    fn a_locator_names_the_tree_unevaluated() {
-        assert_eq!(raw(PINNED), format!("{PINNED}&raw=1"));
-        assert_eq!(raw(&format!("{PINNED}&raw=1")), format!("{PINNED}&raw=1"));
-        assert_eq!(raw("github:o/r"), "github:o/r?raw=1");
-    }
-
-    #[test]
-    fn the_prompt_beats_the_argument() {
+    fn the_prompt_beats_the_argument_and_the_locator_is_passed_as_written() {
         let prompt = format!("/caos-session-start-from {PINNED}\n");
         assert_eq!(
             content_locator(Some("github:o/other?rev=abc"), &prompt),
-            Some(format!("{PINNED}&raw=1"))
+            Some(PINNED.to_string())
         );
         assert_eq!(
             content_locator(Some("github:o/other?rev=abc"), "hello"),
-            Some("github:o/other?rev=abc&raw=1".to_string())
+            Some("github:o/other?rev=abc".to_string())
         );
+        assert_eq!(content_locator(None, "hello"), None);
     }
 }

@@ -1515,13 +1515,16 @@ fn parents(
             ));
         }
         let info = store.read_commit(&current).map_err(String::from)?;
-        if info.parents.len() != 1 {
+        let kind = Kind::parse_message(&info.message)?;
+        // The first parent is the spine; only a fork that merged content in
+        // has a second.
+        let allowed = if kind == Kind::ConversationFork { 2 } else { 1 };
+        if info.parents.is_empty() || info.parents.len() > allowed {
             return Err(ToolError::new(format!(
                 "conversation commit {current} has {} parents",
                 info.parents.len()
             )));
         }
-        let kind = Kind::parse_message(&info.message)?;
         println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
             let (request, id) = started_tool.expect("checked as present");
@@ -1542,9 +1545,14 @@ fn parents(
         }
         let parent = info.parents[0].clone();
         if kind == Kind::ConversationRoot {
-            if parent != g3() {
+            // G3, or the commit the root's content came from: anything but a
+            // conversation commit.
+            if parent != g3()
+                && Kind::parse_message(&store.read_commit(&parent).map_err(String::from)?.message)
+                    .is_ok()
+            {
                 return Err(ToolError::new(format!(
-                    "conversation root {current} does not parent G3"
+                    "conversation root {current} parents a conversation commit"
                 )));
             }
             return if found_started_tool {
