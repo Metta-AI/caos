@@ -6513,7 +6513,7 @@ mod tests {
     fn active_turn_accepts_an_interjection() {
         let (repo, remote, _) = repo_with_default_branch("active-interjection", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
-        let (head, request) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
+        let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         let mut conversation = state("talk-1");
@@ -6522,7 +6522,6 @@ mod tests {
         conversation.running = true;
         conversation.local_turn = true;
         conversation.remote_head = Some(head);
-        conversation.active_request = Some(request);
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
         conversation.activities.push(activity(1));
@@ -6612,13 +6611,11 @@ mod tests {
     #[test]
     fn first_durable_load_replays_activity_and_preserves_local_lifecycle() {
         let head = "a".repeat(40);
-        let request = "b".repeat(40);
         let mut conversation = state("talk-1");
         conversation.running = true;
         conversation.local_turn = true;
         conversation.status = "running a tool".to_string();
         conversation.turn_phase = TurnPhase::Model;
-        assert!(conversation.active_request.is_none());
 
         conversation.apply_load(
             ConversationLoad {
@@ -6682,10 +6679,6 @@ mod tests {
         assert_eq!(conversation.activities[0].id, "sleep");
         assert_eq!(conversation.activities[0].summary, "$ sleep 120; echo done");
         assert_eq!(conversation.activity_selection, Some(0));
-        assert_eq!(
-            conversation.active_request.as_deref(),
-            Some(request.as_str())
-        );
         assert_eq!(conversation.remote_head.as_deref(), Some(head.as_str()));
     }
 
