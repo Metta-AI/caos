@@ -244,9 +244,10 @@ if $TOOL source-tree --repo "$PWD" --head "$tip" --name code/dirty >/dev/null 2>
   fail "conversation still carries a code/dirty source tree; --base seeds the root now"
 fi
 
-admitted=$(git log --format=%H --grep='^request.admit$' --max-count=1 "$tip")
-admission=$($TOOL request --repo "$PWD" --head "$admitted")
-request=$(jq -r .id <<<"$admission")
+# Nothing in the conversation records the request that answered it; the
+# client that started it says which.
+request=$(sed -n 's/^\[request \([0-9a-f]\{40\}\)\]$/\1/p' talk.err | head -1)
+[ -n "$request" ] || fail "the client did not report the request it started: $(cat talk.err)"
 # The server formed this ArgTree, so it is read from there: the one tree
 # object, not the image closure a fetch would bring with it.
 curl -fsS "$CAOS_SERVER_URL/object/$request" \
