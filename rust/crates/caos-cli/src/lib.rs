@@ -402,8 +402,6 @@ fn system_entry(id: &str, message_id: String, text: String) -> TranscriptEntry {
         conversation: id.to_string(),
         role: Role::System,
         actor: "caos".to_string(),
-        request: None,
-        round: None,
         model: None,
         blocks: vec![Block::Text { text }],
         proposal: None,
@@ -416,7 +414,6 @@ fn user_entry(
     username: &str,
     message_id: &str,
     message: &str,
-    request: Option<Oid>,
     proposal: Option<Proposal>,
     source_tree_resolution: Option<SourceTreeResolution>,
 ) -> TranscriptEntry {
@@ -425,8 +422,6 @@ fn user_entry(
         conversation: id.to_string(),
         role: Role::User,
         actor: username.to_string(),
-        request,
-        round: None,
         model: None,
         blocks: vec![Block::Text {
             text: message.to_string(),
