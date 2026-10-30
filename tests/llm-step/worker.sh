@@ -67,7 +67,6 @@ new_llm_conversation llm-step "$STUB_PORT" "$ws" \
 
 stage "first turn: pre-dispatch interjection and durable tool records"
 admit_turn "create out.txt containing hi, then confirm"
-request1=$request
 interject_output=$($TOOL interject --repo /tmp/repo --head "$head" \
   --actor racer --text "$EARLY_INTERJECTION_TEXT" --ref "$conversation_ref") \
   || fail "publishing the pre-dispatch interjection"
@@ -170,79 +169,55 @@ mkfifo /tmp/stub/response-6.json
 new_llm_conversation llm-interrupt "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 
-stage "escape a running request at the model boundary"
+stage "interrupt a running turn at the model boundary"
 dispatch_turn "this prompt was accidental"
-request1=$request
 wait_for_file /tmp/stub/request-6.json || fail "model request never arrived"
 
-escape_output=$($TOOL escape --repo /tmp/repo --request "$request1" --ref "$conversation_ref") \
-  || fail "publishing request.escape"
-escape_head=""
-escape_status=""
-while read -r key value; do
-  case "$key" in
-    head) escape_head=$value ;;
-    status) escape_status=$value ;;
-  esac
-done <<<"$escape_output"
-assert_oid "$escape_head" "the escaped request head"
-head=$escape_head
-[ "$escape_status" = cancelling ] || fail "running escape did not cancel"
+interrupt_output=$($TOOL interrupt --repo /tmp/repo --ref "$conversation_ref") \
+  || fail "publishing the interruption"
+interrupt_head=${interrupt_output#head }
+assert_oid "$interrupt_head" "the interruption head"
+head=$interrupt_head
 
 printf '%s\n' \
   '{"content":[{"text":"I had started this response.","type":"text"},{"id":"toolu_interrupted","input":{"file-path":"interrupted.txt","content":"must not run\n"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
   > /tmp/stub/response-6.json
 wait_turn || fail "the interrupted turn never reached a terminal head"
-head1=$head
+# Give the step time to see its response land on a moved head and stop.
+sleep 2
+head1=$(remote_tip "$conversation_ref") || fail "reading the interrupted conversation"
 
-stage "the request is interrupted before the stale response is admitted"
-$TOOL request --repo /tmp/repo --head "$head1" --id "$request1" > /tmp/interrupted.request
-jq -e '.status == "idle" and .interrupted == true' /tmp/interrupted.request >/dev/null \
-  || fail "request did not end idle and interrupted"
-$TOOL tools --repo /tmp/repo --head "$head1" --request "$request1" > /tmp/interrupted.tools
+stage "the turn stops before the stale response is admitted"
+[ "$head1" = "$interrupt_head" ] \
+  || fail "the interrupted step appended after the interruption"
+$TOOL tools --repo /tmp/repo --head "$head1" > /tmp/interrupted.tools
 [ ! -s /tmp/interrupted.tools ] \
-  || fail "post-escape model calls were admitted onto the conversation"
+  || fail "post-interruption model calls were admitted onto the conversation"
 interrupted_transcript=$(transcript_text "$head1")
 if grep -qF 'I had started this response.' <<<"$interrupted_transcript"; then
-  fail "post-escape model response became canonical"
+  fail "post-interruption model response became canonical"
 fi
 [ "$(source_tree_commit "$head1")" = "$base" ] \
   || fail "interrupted write changed main"
-[ ! -e /tmp/stub/request-7.json ] || fail "escape allowed another model round"
+[ ! -e /tmp/stub/request-7.json ] || fail "the interruption allowed another model round"
 
-stage "escape a queued request before it can be claimed"
+stage "interrupt a turn before it is dispatched"
 new_llm_conversation llm-interrupt-queued "$STUB_PORT" - \
   "You are a coding agent operating on a git source_tree." "$base" \
   "currying queued-interrupt llm-step"
 admit_turn "cancel this before dispatch"
-queued_request=$request
-queued_admitted=$head
-escape_output=$($TOOL escape --repo /tmp/repo --head "$head" --request "$queued_request" \
-  --ref "$conversation_ref") || fail "escaping the queued request"
-queued_escape=""
-queued_status=""
-queued_interrupted=""
-while read -r key value; do
-  case "$key" in
-    head) queued_escape=$value ;;
-    interrupted) queued_interrupted=$value ;;
-    status) queued_status=$value ;;
-  esac
-done <<<"$escape_output"
-assert_oid "$queued_escape" "the queued escape head"
-head=$queued_escape
-if [ "$queued_status" != idle ] || [ "$queued_interrupted" != true ]; then
-  fail "queued escape was not terminal immediately"
-fi
+queued_prompt=$head
+interrupt_output=$($TOOL interrupt --repo /tmp/repo --head "$head" --ref "$conversation_ref") \
+  || fail "interrupting the undispatched turn"
+queued_interrupt=${interrupt_output#head }
+assert_oid "$queued_interrupt" "the queued interruption head"
+head=$queued_interrupt
 start_turn
 sleep 0.2
-[ "$(remote_tip "$conversation_ref")" = "$queued_escape" ] \
-  || fail "dispatching an escaped queued request appended another event"
-$TOOL parents --repo /tmp/repo --head "$queued_escape" > /tmp/queued.parents
-if grep -q ' request.claim$' /tmp/queued.parents; then
-  fail "queued escape acquired a worker claim"
-fi
-[ "$(git rev-parse "$queued_escape^1")" = "$queued_admitted" ] \
-  || fail "queued request.escape did not append directly to admission"
+[ "$(remote_tip "$conversation_ref")" = "$queued_interrupt" ] \
+  || fail "dispatching an interrupted turn appended another event"
+[ "$(git rev-parse "$queued_interrupt^1")" = "$queued_prompt" ] \
+  || fail "the interruption did not append directly to the prompt"
+[ ! -e /tmp/stub/request-7.json ] || fail "an interrupted turn called the model"
 
 pass llm-step
