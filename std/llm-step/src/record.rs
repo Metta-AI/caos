@@ -228,14 +228,6 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
-<<<<<<< 47613a3f150ad3b41c52fad178f75c5f1432a613
-=======
-/// The step as a conversation's configured worker: this image with the
-/// conversation bound, which is what the request records as its configuration.
-fn configuration(conversation: &str) -> Result<String, String> {
-    let image = cas_hash(&arg("base"))?;
-    caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
-}
 
 /// The tree a conversation's content was seeded from: its root's tree, found by
 /// following first parents from `head`, without the conversation's own .caos/.
@@ -258,7 +250,6 @@ fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
 }
 
 /// Make the conversation as a FORK of `from`, with its first prompt: the fork,
->>>>>>> ff94dd738ef778cc4ed9e2c3a80cf89f0f3fae37
 /// then the prompt's request, pushed together with the creator's membership
 /// refs. `None` when the conversation exists, so the caller records onto it.
 ///
