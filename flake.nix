@@ -1692,7 +1692,10 @@ sandbox = false''
             # Bake in the flake this driver came from, so `nix run <ref>#...`
             # applies the host config from <ref> rather than from main.
             ldflags = [ "-X main.defaultFlake=path:${self}" ];
-            vendorHash = "sha256-1+bSEs1daOIaXWddfmkEOsxcyn/zBzB/0T29YGw+RCw=";
+            # NOTE: the vendor tree includes caos/w through the `replace`, so this
+            # hash moves whenever std/go/prelude changes, not only go.mod. The
+            # cache workflow builds this on every push and is what notices.
+            vendorHash = "sha256-D2Tg239wTsZ1zz7Nkj7ZidEeQ5/hRv7fRg7Qc4r09SA=";
           };
 
           # The watchdog-prod host's program (prod/watchdog): probes, the
