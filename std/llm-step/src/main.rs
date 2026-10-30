@@ -4104,78 +4104,75 @@ mod tests {
             )
         );
 
-        let mut append = |id: &str, role: Role, text: &str| {
-            golden.head = append_memory(
-                &mut golden.store,
-                &golden.head,
-                Transition::MessageAppend {
-                    entry: test_entry(
-                        id,
-                        role,
-                        vec![Block::Text {
-                            text: text.to_string(),
-                        }],
-                    ),
-                    payloads: Vec::new(),
-                },
-            )
-            .unwrap();
-            golden.head.clone()
-        };
-        let mut answer = |head: &Oid, ordinal: u64, store: &mut MemoryStore| {
-            let id = format!("{ordinal:032}");
-            append_memory(
-                store,
-                head,
-                Transition::MessageAppend {
-                    entry: TranscriptEntry {
-                        message_id: id.clone(),
-                        conversation: CONVERSATION.to_string(),
-                        role: Role::Assistant,
-                        actor: "test-model".to_string(),
-                        model: Some("test-model".to_string()),
-                        blocks: vec![Block::Text {
-                            text: "done".to_string(),
-                        }],
-                        proposal: None,
-                        source_tree_resolution: None,
-                    },
-                    payloads: vec![(
-                        "response.json".to_string(),
-                        canonical_payload_bytes(&json!([{"type":"text","text":"done"}]))
-                            .unwrap(),
-                    )],
-                },
-            )
-            .unwrap()
-        };
         // A system notice does not answer a prompt.
-        let noticed = append("33333333333333333333333333333333", Role::System, "notice");
-        let view = Conversation::open(&golden.store, &noticed).unwrap();
+        append_text(&mut golden, "33333333333333333333333333333333", Role::System, "notice");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
         assert!(!answered(&view, 0).unwrap());
         // A message with no call does, until a newer prompt arrives.
-        let answered_head = answer(&noticed, 3, &mut golden.store);
-        let view = Conversation::open(&golden.store, &answered_head).unwrap();
+        append_answer(&mut golden, "44444444444444444444444444444444");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
         assert!(answered(&view, 0).unwrap());
-        golden.head = answered_head;
-        let prompted = append("44444444444444444444444444444444", Role::User, "and more");
-        let view = Conversation::open(&golden.store, &prompted).unwrap();
+        append_text(&mut golden, "55555555555555555555555555555555", Role::User, "and more");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
         assert!(!answered(&view, 0).unwrap());
         // An interruption after the prompt stops the turn; one before it does not.
-        let stopped = append(
-            "55555555555555555555555555555555",
+        append_text(
+            &mut golden,
+            "66666666666666666666666666666666",
             Role::System,
             conversation_protocol::v3::INTERRUPT_TEXT,
         );
-        let view = Conversation::open(&golden.store, &stopped).unwrap();
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
         assert!(interrupted(&view, &turn).unwrap());
+        append_text(&mut golden, "77777777777777777777777777777777", Role::User, "go on");
+        let view = Conversation::open(&golden.store, &golden.head).unwrap();
         let later = Turn {
             request: golden.request.clone(),
             prompt: Some(6),
         };
-        let resumed = append("66666666666666666666666666666666", Role::User, "go on");
-        let view = Conversation::open(&golden.store, &resumed).unwrap();
         assert!(!interrupted(&view, &later).unwrap());
+    }
+
+    fn append_text(golden: &mut Golden, id: &str, role: Role, text: &str) {
+        golden.head = append_memory(
+            &mut golden.store,
+            &golden.head,
+            Transition::MessageAppend {
+                entry: test_entry(
+                    id,
+                    role,
+                    vec![Block::Text {
+                        text: text.to_string(),
+                    }],
+                ),
+                payloads: Vec::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn append_answer(golden: &mut Golden, id: &str) {
+        let mut entry = test_entry(
+            id,
+            Role::Assistant,
+            vec![Block::Text {
+                text: "done".to_string(),
+            }],
+        );
+        entry.model = Some("test-model".to_string());
+        let response = json!([{"type":"text", "text":"done"}]);
+        golden.head = append_memory(
+            &mut golden.store,
+            &golden.head,
+            Transition::MessageAppend {
+                entry,
+                payloads: vec![(
+                    "response.json".to_string(),
+                    canonical_payload_bytes(&response).unwrap(),
+                )],
+            },
+        )
+        .unwrap();
     }
 
     #[test]
