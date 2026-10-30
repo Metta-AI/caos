@@ -4050,7 +4050,6 @@ mod tests {
 
                     model: "test-model".to_string(),
                     configuration: "test-configuration".to_string(),
-                    round: 0,
                     calls: Vec::new(),
                     interjections: Vec::new(),
                     status: TurnStatus::Queued,
@@ -4128,8 +4127,6 @@ mod tests {
 
     fn activity(number: usize) -> Activity {
         Activity {
-            request: "a".repeat(40),
-            round: number as u64,
             id: format!("tool-{number}"),
             step_commit: format!("{number:040x}"),
             name: "bash".to_string(),
@@ -5828,20 +5825,15 @@ mod tests {
 
     #[test]
     fn replayed_activity_restores_tool_results() {
-        let request = "a".repeat(40);
         let activities = replayed_activities(&[
             TurnEvent::ToolCall {
                 step_commit: "1".repeat(40),
-                request: request.clone(),
-                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 name: "read".to_string(),
                 summary: "read README.md".to_string(),
             },
             TurnEvent::ToolResult {
                 step_commit: "2".repeat(40),
-                request,
-                round: 3,
                 tool_use_id: "tool-1".to_string(),
                 is_error: false,
                 content: "README contents".to_string(),
@@ -5855,71 +5847,6 @@ mod tests {
     }
 
     #[test]
-    fn replayed_activity_scopes_reused_ids_by_request_and_round() {
-        let request_a = "a".repeat(40);
-        let request_b = "b".repeat(40);
-        let events = [
-            TurnEvent::ToolCall {
-                step_commit: "1".repeat(40),
-                request: request_a.clone(),
-                round: 0,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "first call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "2".repeat(40),
-                request: request_a.clone(),
-                round: 0,
-                tool_use_id: "reused".to_string(),
-                is_error: false,
-                content: "first result".to_string(),
-            },
-            TurnEvent::ToolCall {
-                step_commit: "3".repeat(40),
-                request: request_a.clone(),
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "second call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "4".repeat(40),
-                request: request_a,
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                is_error: true,
-                content: "second result".to_string(),
-            },
-            TurnEvent::ToolCall {
-                step_commit: "5".repeat(40),
-                request: request_b.clone(),
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                name: "read".to_string(),
-                summary: "third call".to_string(),
-            },
-            TurnEvent::ToolResult {
-                step_commit: "6".repeat(40),
-                request: request_b,
-                round: 1,
-                tool_use_id: "reused".to_string(),
-                is_error: false,
-                content: "third result".to_string(),
-            },
-        ];
-
-        let activities = replayed_activities(&events);
-        assert_eq!(activities.len(), 3);
-        assert_eq!(activities[0].state, ActivityState::Succeeded);
-        assert_eq!(activities[0].detail, "first result");
-        assert_eq!(activities[1].state, ActivityState::Failed);
-        assert_eq!(activities[1].detail, "second result");
-        assert_eq!(activities[2].state, ActivityState::Succeeded);
-        assert_eq!(activities[2].detail, "third result");
-    }
-
-    #[test]
     fn new_activity_follows_only_a_selection_at_the_tail() {
         let mut conversation = state("talk-1");
         conversation.activities = vec![activity(1), activity(2)];
@@ -5930,8 +5857,6 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "3".repeat(40),
-                request: "a".repeat(40),
-                round: 0,
                 tool_use_id: "tool-3".to_string(),
                 name: "bash".to_string(),
                 summary: "third".to_string(),
@@ -5944,8 +5869,6 @@ mod tests {
             0,
             TurnEvent::ToolCall {
                 step_commit: "4".repeat(40),
-                request: "a".repeat(40),
-                round: 0,
                 tool_use_id: "tool-4".to_string(),
                 name: "bash".to_string(),
                 summary: "fourth".to_string(),
@@ -6256,8 +6179,6 @@ mod tests {
             },
         ];
         selected.activities = vec![Activity {
-            request: "a".repeat(40),
-            round: 0,
             id: "tool-1".to_string(),
             step_commit: "c".repeat(40),
             name: "bash".to_string(),
@@ -6753,8 +6674,6 @@ mod tests {
                     ],
                     activity: vec![TurnEvent::ToolCall {
                         step_commit: "e".repeat(40),
-                        request: request.clone(),
-                        round: 2,
                         tool_use_id: "sleep".to_string(),
                         name: "bash".to_string(),
                         summary: "$ sleep 120; echo done".to_string(),
@@ -7411,7 +7330,7 @@ mod tests {
         let (repo, remote, _) = repo_with_default_branch("remote-poll", "main");
         git_ok(&repo, &["remote", "add", "caos", remote.to_str().unwrap()]);
         let transport = GitTransport::discover(&repo).unwrap();
-        let (_, request) = seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
+        seed_queued_conversation(&repo, "shared", "Alice", "hello from Alice");
         invite_user_to_conversation(&transport, "Bob", "shared").unwrap();
 
         let (mut app, _) = app_with(vec![state("local")]);
@@ -7424,12 +7343,8 @@ mod tests {
             .iter()
             .find(|conversation| conversation.id == "shared")
             .unwrap();
-        assert!(shared.running);
-        assert_eq!(shared.active_request.as_deref(), Some(request.as_str()));
-        assert_eq!(
-            shared.reconciling_request.as_deref(),
-            Some(request.as_str())
-        );
+        // Alice's turn is hers: nothing in the conversation says it runs.
+        assert!(!shared.running);
         assert!(matches!(
             &shared.transcript[0].role,
             EntryRole::Peer(author) if author == "Alice"
@@ -7439,32 +7354,6 @@ mod tests {
 
         std::fs::remove_dir_all(&repo).unwrap();
         std::fs::remove_dir_all(&remote).unwrap();
-    }
-
-    #[test]
-    fn active_request_reconciliation_has_one_process_local_join() {
-        let request = "b".repeat(40);
-        let mut conversation = state("shared");
-        conversation.running = true;
-        conversation.active_request = Some(request.clone());
-        let (mut app, _) = app_with(vec![conversation]);
-        app.repo_dir = std::env::temp_dir().join(format!(
-            "caos-cli-tui-missing-reconcile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-
-        assert!(app.reconcile_active_requests());
-        assert_eq!(
-            app.selected().reconciling_request.as_deref(),
-            Some(request.as_str())
-        );
-        // Polling an unchanged active snapshot cannot fan out more waiters for
-        // the same exact request. Completion/failure is consumed by drain.
-        assert!(!app.reconcile_active_requests());
     }
 
     #[test]
