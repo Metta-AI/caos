@@ -2921,8 +2921,6 @@ fn background_notice(conversation_id: &str, message_id: String, text: String) ->
         conversation: conversation_id.to_string(),
         role: Role::System,
         actor: "caos".to_string(),
-        request: None,
-        round: None,
         model: None,
         blocks: vec![Block::Text { text }],
         proposal: None,
@@ -2999,29 +2997,23 @@ fn child_status_text(status: TaskStatus) -> &'static str {
     }
 }
 
-fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
+/// Someone interrupted the turn: stop. The calls the latest message declared
+/// that have not finished are closed as cancelled, so the transcript the next
+/// turn reads back answers every `tool_use`; then the step is done.
+fn drain(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
     loop {
         state.reload()?;
-        let record = require_request(&state.conversation()?, request)?;
-        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
-            return finish_from_terminal(state, request);
-        }
-        let round = round_state(&state.conversation()?, &record)?;
-        let Some(call) = round.pending.first() else {
-            let result = newest_assistant_path(&state.conversation()?, request)?;
-            let terminal = state.append(Transition::TurnTerminal {
-                request: request.clone(),
-                outcome: TurnOutcome::Idle {
-                    result,
-                    interrupted: true,
-                },
-            })?;
+        let declaration = working_declaration(cfg, &state.conversation()?)?;
+        let Some((declaration, call)) = declaration
+            .as_ref()
+            .and_then(|declaration| Some((declaration, declaration.pending.first()?)))
+        else {
             reconcile_background_tasks(state)?;
-            return forward_result(&terminal.commit);
+            return forward_result(state.head());
         };
         let reason = "interrupted before this tool ran";
         let block = error_block(&call.id, reason);
-        close_pending_call(state, request, &round, call, &block, |_| {
+        close_pending_call(state, &turn.request, declaration, call, &block, |_| {
             ToolResult::Cancelled {
                 reason: reason.to_string(),
             }
@@ -3029,51 +3021,40 @@ fn drain(state: &mut progress::State, request: &Oid) -> Result<(), String> {
     }
 }
 
-fn newest_assistant_path(view: &Conversation<'_>, request: &Oid) -> Result<Option<String>, String> {
-    last_matching(view, |ordinal, entry| {
-        (entry.role == Role::Assistant && entry.request.as_ref() == Some(request))
-            .then(|| paths::transcript_entry_path(ordinal, &entry.message_id))
-    })
-}
-
+/// The step failed. Every call it was running is closed as failed, so nothing
+/// is left waiting for a result that will not come, and a step that answers a
+/// prompt says why in the transcript. A tools-only run leaves that to its
+/// harness, which reports the failure of its own call.
 fn record_failure(
     cfg: &Config,
     state: &mut progress::State,
-    request: &Oid,
+    turn: &Turn,
     error: &str,
 ) -> Result<(), String> {
     loop {
         state.reload()?;
-        let Some(record) = state.conversation()?.turn(request)? else {
-            return Ok(());
+        let declaration = working_declaration(cfg, &state.conversation()?)?;
+        let Some((declaration, call)) = declaration
+            .as_ref()
+            .and_then(|declaration| Some((declaration, declaration.pending.first()?)))
+        else {
+            break;
         };
-        if matches!(record.status, TurnStatus::Idle | TurnStatus::Failed) {
-            reconcile_background_tasks(state)?;
-            return Ok(());
-        }
-        if !matches!(record.status, TurnStatus::Running | TurnStatus::Cancelling) {
-            return Ok(());
-        }
-        let round = working_round(cfg, &state.conversation()?, &record)?;
-        if let Some(call) = round.pending.first() {
-            let text = format!("the request stopped before this tool completed: {error}");
-            let block = error_block(&call.id, &text);
-            close_pending_call(state, request, &round, call, &block, |stub| {
-                ToolResult::Failed {
-                    error: observation_path(stub),
-                }
-            })?;
-            continue;
-        }
-        let message_id = client_key()?;
-        let appended = state.append(Transition::MessageAppend {
+        let text = format!("the turn stopped before this tool completed: {error}");
+        let block = error_block(&call.id, &text);
+        close_pending_call(state, &turn.request, declaration, call, &block, |stub| {
+            ToolResult::Failed {
+                error: observation_path(stub),
+            }
+        })?;
+    }
+    if cfg.tools_only.is_none() {
+        state.append(Transition::MessageAppend {
             entry: TranscriptEntry {
-                message_id: message_id.clone(),
+                message_id: client_key()?,
                 conversation: cfg.conversation.clone(),
                 role: Role::System,
                 actor: "llm-step".to_string(),
-                request: Some(request.clone()),
-                round: Some(record.round),
                 model: None,
                 blocks: vec![Block::Text {
                     text: error.to_string(),
@@ -3083,89 +3064,8 @@ fn record_failure(
             },
             payloads: Vec::new(),
         })?;
-        let ordinal = appended
-            .ordinal
-            .ok_or("failure message did not append a transcript entry")?;
-        state.append(Transition::TurnTerminal {
-            request: request.clone(),
-            outcome: TurnOutcome::Failed {
-                error: paths::transcript_entry_path(ordinal, &message_id),
-            },
-        })?;
-        reconcile_background_tasks(state)?;
-        return Ok(());
     }
-}
-
-fn finish_from_terminal(state: &mut progress::State, request: &Oid) -> Result<(), String> {
-    let terminal = terminal_head(state, request)?;
-    let outcome = require_request(&state.conversation_at(&terminal)?, request)?.outcome;
-    let failure = match outcome {
-        Some(TurnOutcome::Idle { .. }) => None,
-        Some(TurnOutcome::Failed { error }) => {
-            let view = state.conversation_at(&terminal)?;
-            let (ordinal, message_id) = paths::parse_transcript_entry_path(&error)?;
-            let (_, entry) = view
-                .transcript_entry(ordinal)?
-                .ok_or_else(|| format!("request error entry {error} does not exist"))?;
-            if entry.message_id != message_id {
-                return Err(format!(
-                    "request error entry {error} has the wrong message id"
-                ));
-            }
-            Some(
-                entry
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        Block::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-                    .trim_end()
-                    .to_string(),
-            )
-        }
-        None => {
-            return Err(format!(
-                "request {request} has terminal status but no outcome"
-            ))
-        }
-    };
-    reconcile_background_tasks(state)?;
-    match failure {
-        Some(error) => Err(error),
-        None => forward_result(&terminal),
-    }
-}
-
-fn terminal_head(state: &progress::State, request: &Oid) -> Result<Oid, String> {
-    terminal_head_in(state.store(), state.head(), request)
-}
-
-fn terminal_head_in(store: &dyn ObjectStore, head: &Oid, request: &Oid) -> Result<Oid, String> {
-    let mut current = head.clone();
-    let mut child = Conversation::open(store, &current)?.turn(request)?;
-    for _ in 0..MAX_SPINE_WALK {
-        let info = store.read_commit(&current).map_err(String::from)?;
-        let Some(parent) = info.parents.first() else {
-            break;
-        };
-        let parent_record = Conversation::open(store, parent)?.turn(request)?;
-        let became_terminal = child.as_ref().is_some_and(|record| {
-            matches!(record.status, TurnStatus::Idle | TurnStatus::Failed)
-                && !parent_record.as_ref().is_some_and(|parent| {
-                    matches!(parent.status, TurnStatus::Idle | TurnStatus::Failed)
-                })
-        });
-        if became_terminal {
-            return Ok(current);
-        }
-        current = parent.clone();
-        child = parent_record;
-    }
-    Err(format!("request {request} has no request.terminal commit"))
+    reconcile_background_tasks(state)
 }
 
 fn forward_result(terminal: &Oid) -> Result<(), String> {
