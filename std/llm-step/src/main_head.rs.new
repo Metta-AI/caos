@@ -1,0 +1,931 @@
+//! The agent turn driver for the v3 conversation protocol.
+//!
+//! A conversation is a flat transcript of facts: prompts, assistant messages,
+//! tool calls and their results. The driver keeps no turn state in it, and
+//! derives what to do from the transcript every time it looks: the latest
+//! assistant message's `tool_use` blocks with no terminal record are the calls
+//! still to run; once there are none, an assistant message with no `tool_use`
+//! after the prompt (and no newer prompt after that) means the turn is done;
+//! otherwise the model is called and its message appended. A round is only a
+//! message's position, and "running" is a fact about this process, not about
+//! the conversation.
+
+mod async_work;
+mod githist;
+mod import_source;
+mod progress;
+mod publish_source;
+mod stack_publish;
+mod stack_sync;
+mod record;
+mod source_trees;
+mod subagents;
+mod timing;
+mod tools;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io::Read;
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transition};
+use conversation_protocol::v3::canonical::canonical_bytes;
+use conversation_protocol::v3::ids;
+use conversation_protocol::v3::paths;
+use conversation_protocol::v3::view::Conversation;
+use conversation_protocol::v3::{
+    reconcile, validate_spine, AsyncRecord, Block, CallRecord, CallStatus, ChildRecord, CodeOps,
+    FilesOutcome, Identity, IdentityKind, Mode, ObjectStore, Oid, Owner, Role,
+    SourceTreeResolution, SpawnIntent, TaskStatus, ToolResult, TranscriptEntry,
+};
+use llm_client::{post_messages, DEFAULT_BASE_URL};
+use serde_json::{json, Value};
+use worker_common::{
+    arg, caos, caos_curry, caos_recurry, cas_hash, cas_kind, eval_then_catching, link,
+    own_args_tree, path, prepare_request, read_arg, read_arg_opt, run_request_then_catching,
+    run_worker, scratch, secret, Arg,
+};
+
+const MAX_TOKENS: u64 = 64000;
+const MAX_CONTINUATIONS: u32 = 8;
+
+fn main() -> std::process::ExitCode {
+    timing::start();
+    let exit = run_worker("llm-step", run);
+    timing::phase("exit");
+    exit
+}
+
+#[derive(Clone)]
+struct Config {
+    api_key: String,
+    system: String,
+    grep_image: Option<String>,
+    run_and_update_ref_image: Option<String>,
+    /// Run one call and STOP -- do not call the model.
+    ///
+    /// For a harness that drives the model ITSELF and wants only the tools:
+    /// `caos mcp` hands over the call Claude Code is making, this runs it, and
+    /// the observation goes back. Without it the step would answer a model that
+    /// already answered.
+    ///
+    /// The value is the id of the call. It is the call's identity in the
+    /// conversation (a call is keyed by its id alone), and it separates one
+    /// dispatch from the next: every other argument is the same for every call of
+    /// a session, so without it a second call would name the first's ArgTree and
+    /// be answered from the memo.
+    tools_only: Option<String>,
+    /// With `tools_only`: the call to run, as a tool name and its arguments,
+    /// instead of one a harness declared beforehand. The step declares it -- an
+    /// assistant message carrying the `tool_use` -- and then runs it, so a caller
+    /// needs only this ArgTree, with no conversation access of its own. A call
+    /// already declared under the id is not declared twice, so a retry runs it
+    /// rather than failing.
+    tool_call: Option<(String, Value)>,
+    /// With `tools_only`: a completed call whose text is longer than this many
+    /// characters is also saved in the conversation, and the run's result says
+    /// where (`spilled`). 0 saves nothing. See [`spill_oversized`].
+    max_result_chars: usize,
+    /// Record a harness's event (a prompt, the end of a turn, a failure) on the
+    /// conversation and stop: no model, no tool. See `record`.
+    record: Option<record::Request>,
+    /// Describe the tools and stop, writing the registry as JSON. A harness
+    /// that drives the model itself has to publish these declarations to it,
+    /// and they belong to the step that implements them.
+    list_tools: bool,
+    merge_refs: Option<String>,
+    model: String,
+    base_url: String,
+    conversation: String,
+}
+
+fn image_arg(name: &str) -> Result<Option<String>, String> {
+    let value = arg(name);
+    if Path::new(&value).exists() {
+        cas_hash(&value).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+impl Config {
+    fn read() -> Result<Self, String> {
+        let run_and_update_ref_image = if read_arg_opt("subagent")?.is_some() {
+            None
+        } else {
+            image_arg("run-and-update-ref-image")?
+        };
+        let tools_only = read_arg_opt("tools-only")?;
+        let tool_call = match (read_arg_opt("tool")?, read_arg_opt("arguments")?) {
+            (Some(_), _) | (_, Some(_)) if tools_only.is_none() => {
+                return Err("--tool and --arguments need --tools-only=<call id>".to_string())
+            }
+            (Some(name), arguments) => {
+                let arguments = match arguments {
+                    Some(text) => serde_json::from_str(&text)
+                        .map_err(|error| format!("--arguments is not JSON: {error}"))?,
+                    None => json!({}),
+                };
+                Some((name, arguments))
+            }
+            (None, Some(_)) => return Err("--arguments needs --tool".to_string()),
+            (None, None) => None,
+        };
+        let max_result_chars = match read_arg_opt("max-result-chars")? {
+            Some(text) => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("--max-result-chars is not a count: {text:?}"))?,
+            None => 0,
+        };
+        let list_tools = read_arg_opt("list-tools")?.is_some();
+        let record = record::Request::read()?;
+        // None of those modes reaches the model, so none may DEMAND what a
+        // model call takes. The key especially: `caos mcp` runs Claude Code's
+        // tools for a session whose model is Claude Code's own, and requiring
+        // an Anthropic key of it would refuse a turn over a call nothing makes.
+        let answers_model = tools_only.is_none() && !list_tools && record.is_none();
+        Ok(Self {
+            api_key: match answers_model {
+                true => secret("anthropic-api-key")?,
+                false => secret("anthropic-api-key").unwrap_or_default(),
+            },
+            system: match answers_model {
+                true => read_arg("system")?,
+                false => String::new(),
+            },
+            grep_image: image_arg("grep-image")?,
+            run_and_update_ref_image,
+            tools_only,
+            tool_call,
+            max_result_chars,
+            record,
+            list_tools,
+            merge_refs: read_arg_opt("merge-refs")?,
+            model: match answers_model {
+                true => read_arg("model")?,
+                false => String::new(),
+            },
+            base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            // A listing describes tools, which no conversation owns.
+            conversation: match (read_arg_opt("conversation")?, list_tools) {
+                (Some(conversation), _) => conversation,
+                (None, true) => String::new(),
+                (None, false) => return Err("llm-step requires --conversation".to_string()),
+            },
+        })
+    }
+}
+
+/// What this run of the step is doing: its own identity, and the prompt it
+/// answers. Nothing of it is in the conversation.
+struct Turn {
+    /// The step's own request, the ArgTree its callbacks are curried with
+    /// (`run`), so that a callback is the same run picking up where it left off.
+    request: Oid,
+    /// The transcript ordinal of the prompt this step answers: the last entry of
+    /// the commit it was asked about (`head`). `None` for a tools-only run, which
+    /// answers nothing and runs one call.
+    prompt: Option<u64>,
+}
+
+fn run() -> Result<(), String> {
+    let cfg = Config::read()?;
+    if cfg.list_tools {
+        return list_tools(&cfg);
+    }
+    if let Some(request) = &cfg.record {
+        return record::run(&cfg.conversation, request);
+    }
+    let mut state = progress::State::open(&cfg.conversation)?;
+    timing::phase("state.open");
+    let run_text = read_arg_opt("run")?.unwrap_or(own_args_tree()?);
+    let request = Oid::parse(&run_text, "conversation request")?;
+    let prompt = match (&cfg.tools_only, &cfg.tool_call) {
+        (Some(call), Some((name, arguments))) => {
+            declare_requested_call(&mut state, call, name, arguments)?;
+            None
+        }
+        // A call a harness declared beforehand.
+        (Some(_), None) => None,
+        (None, _) => {
+            let head = Oid::parse(&cas_hash(&arg("head"))?, "request head")?;
+            Some(admit(&mut state, &head)?)
+        }
+    };
+    let turn = Turn { request, prompt };
+    let outcome = if Path::new(&arg("result")).exists() || Path::new(&arg("error")).exists() {
+        callback(&cfg, &mut state, &turn)
+    } else {
+        start(&cfg, &mut state, &turn)
+    };
+    if let Err(error) = &outcome {
+        if let Err(record_error) = record_failure(&cfg, &mut state, &turn, error) {
+            eprintln!("llm-step: additionally failed to record failure: {record_error}");
+        }
+    }
+    outcome
+}
+
+fn start(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
+    reconcile_background_tasks(state)?;
+    announce_background_tasks(&cfg.conversation, state)?;
+    resume(cfg, state, turn)
+}
+
+/// Check that `head`, the commit the step was asked to answer, is on this
+/// conversation's spine, and say where its prompt is: the last entry it holds.
+fn admit(state: &mut progress::State, head: &Oid) -> Result<u64, String> {
+    let identity = state.conversation()?.identity()?;
+    if identity.id != state_conversation_id(state)? {
+        return Err(format!(
+            "conversation identity {:?} does not match its ref",
+            identity.id
+        ));
+    }
+    if !state.store().is_ancestor(head, state.head())? {
+        return Err(format!("request head {head} is not on the conversation spine"));
+    }
+    state
+        .conversation_at(head)?
+        .transcript_len()?
+        .checked_sub(1)
+        .ok_or_else(|| format!("request head {head} holds no prompt to answer"))
+}
+
+fn state_conversation_id(state: &progress::State) -> Result<String, String> {
+    conversation_protocol::v3::refs::parse_head_ref(state.refname())
+}
+
+fn last_matching<T>(
+    view: &Conversation<'_>,
+    mut select: impl FnMut(u64, TranscriptEntry) -> Option<T>,
+) -> Result<Option<T>, String> {
+    for ordinal in (0..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        if let Some(result) = select(ordinal, entry) {
+            return Ok(Some(result));
+        }
+    }
+    Ok(None)
+}
+
+fn callback(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
+    let id = read_arg("current-id")?;
+    let tool = read_arg_opt("current-tool")?.unwrap_or_else(|| "bash".to_string());
+    timing::phase(&format!("tool wait {tool}"));
+
+    // WHICH LEG. `run_tool`/`tool_help` carry `tool-lookup` only while they are
+    // waiting for their own EVALUATION -- `self_curry` unbinds it before the
+    // evaluated tool is dispatched -- so its presence is what tells a tool's two
+    // legs apart. `eval_path` has one leg and binds nothing of its own, so it
+    // routes by name.
+    if tool == tools::EVAL_PATH || read_arg_opt("tool-lookup")?.is_some() {
+        if Path::new(&arg("error")).exists() {
+            let mut error = read_arg("error")?;
+            let target = pending_call_target(state, &id)?;
+            if let Some(path) = read_arg_opt("tool-lookup")? {
+                let path = target
+                    .as_ref()
+                    .map_or(path.clone(), |(name, _)| format!("{name}/{path}"));
+                error = format!("{path}: {error}");
+            }
+            let block = failed_run_block(&id, &tool, &error);
+            let declaration = declaration_message(&state.conversation()?, &id)?;
+            let call = Call {
+                id,
+                name: tool,
+                input: Value::Null,
+            };
+            CallSite::at(&turn.request, &call, &declaration).failed(state, &block, target)?;
+            return resume(cfg, state, turn);
+        }
+        return launch_resolved_tool(cfg, state, turn, &id);
+    }
+
+    let record = state
+        .conversation()?
+        .tool(&id)?
+        .ok_or_else(|| format!("callback for call {id} has no tool.start"))?;
+    if record.is_terminal() {
+        return resume(cfg, state, turn);
+    }
+    if record.name != tool {
+        return Err(format!(
+            "callback tool {tool:?} does not match recorded tool {:?}",
+            record.name
+        ));
+    }
+    if Path::new(&arg("error")).exists() {
+        let error = read_arg("error")?;
+        let block = failed_run_block(&id, &tool, &error);
+        complete_started_failed(state, &record, &block)?;
+        return resume(cfg, state, turn);
+    }
+
+    let (mut block, proposal) = callback_result(state, &record)?;
+    append_trace_key(&mut block, &record);
+    complete_compute(state, &record, block, proposal)?;
+    resume(cfg, state, turn)
+}
+
+fn pending_call_target(state: &progress::State, id: &str) -> Result<Option<(String, Oid)>, String> {
+    let view = state.conversation()?;
+    let Some(declaration) = declaration_of(&view, id)? else {
+        return Ok(None);
+    };
+    let Some(call) = declaration.pending.iter().find(|call| call.id == id) else {
+        return Ok(None);
+    };
+    Ok(match resolve_target(&view, call)? {
+        Target::SourceTree { name, commit } => Some((name, commit)),
+        Target::Files => None,
+    })
+}
+
+fn resume(cfg: &Config, state: &mut progress::State, turn: &Turn) -> Result<(), String> {
+    loop {
+        if !state.take_fresh_after_append() {
+            state.reload()?;
+        }
+        if interrupted(&state.conversation()?, turn)? {
+            return drain(cfg, state, turn);
+        }
+        if let Some(declaration) = working_declaration(cfg, &state.conversation()?)? {
+            if let Some(call) = declaration.pending.first() {
+                if drive_call(cfg, state, &turn.request, &declaration, call)? {
+                    continue;
+                }
+                return Ok(());
+            }
+        }
+
+        reconcile_background_tasks(state)?;
+        announce_background_tasks(&cfg.conversation, state)?;
+        state.reload()?;
+        let view = state.conversation()?;
+        if interrupted(&view, turn)?
+            || working_declaration(cfg, &view)?
+                .is_some_and(|declaration| !declaration.pending.is_empty())
+        {
+            continue;
+        }
+        drop(view);
+        // Nothing left to run. A tools-only run is finished, and its result is
+        // its call's own record.
+        if let Some(call) = &cfg.tools_only {
+            require_completed_call(state, call)?;
+            return forward_tool_result(cfg, state, call);
+        }
+        let prompt = turn
+            .prompt
+            .ok_or("a step that answers the model needs a prompt")?;
+        if answered(&state.conversation()?, prompt)? {
+            reconcile_background_tasks(state)?;
+            return forward_result(state.head());
+        }
+        let messages = context_messages(&state.conversation()?)?;
+        let source_trees = source_tree_paths(state)?;
+        let previous = state.head().clone();
+        // Appended or not -- the transcript may have moved under the model, a
+        // prompt or an interruption arriving -- the next look decides.
+        llm_round(cfg, state, messages, &source_trees, &previous)?;
+    }
+}
+
+/// Whether someone interrupted this turn: an interruption after its prompt.
+fn interrupted(view: &Conversation<'_>, turn: &Turn) -> Result<bool, String> {
+    let Some(prompt) = turn.prompt else {
+        return Ok(false);
+    };
+    for ordinal in (prompt + 1..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        if entry.is_interrupt() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the prompt at `prompt` has its answer: the newest assistant message
+/// after it declares no call, and no newer prompt came after that message.
+fn answered(view: &Conversation<'_>, prompt: u64) -> Result<bool, String> {
+    for ordinal in (prompt + 1..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        match entry.role {
+            Role::User => return Ok(false),
+            Role::Assistant => return Ok(entry.tool_uses().next().is_none()),
+            Role::System => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Check that the call a tools-only run was dispatched for actually ran.
+///
+/// An empty queue is not on its own evidence that this call was among it -- a
+/// caller whose declaration lost a race would otherwise be handed a result with
+/// nothing of its own in it.
+fn require_completed_call(state: &mut progress::State, call: &str) -> Result<(), String> {
+    match state.conversation()?.tool(call)? {
+        Some(tool) if tool.is_terminal() => Ok(()),
+        Some(tool) => Err(format!("call {call} is {:?}, not complete", tool.status)),
+        None => Err(format!("no call {call} is recorded")),
+    }
+}
+
+#[derive(Clone)]
+struct Call {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+impl Call {
+    fn value(&self) -> Value {
+        json!({"type":"tool_use", "id":self.id, "name":self.name, "input":self.input})
+    }
+}
+
+/// An assistant message that declared calls, and those of them that have not
+/// finished: declared with no record, or started with no result.
+struct Declaration {
+    message_id: String,
+    pending: Vec<Call>,
+}
+
+struct CallSite<'a> {
+    /// The step's own request, which its callbacks are curried with.
+    request: &'a Oid,
+    call: &'a Call,
+    declaration: &'a str,
+}
+
+impl<'a> CallSite<'a> {
+    fn new(request: &'a Oid, declaration: &'a Declaration, call: &'a Call) -> Self {
+        Self::at(request, call, &declaration.message_id)
+    }
+
+    fn at(request: &'a Oid, call: &'a Call, declaration: &'a str) -> Self {
+        Self {
+            request,
+            call,
+            declaration,
+        }
+    }
+
+    fn stub(&self, target: Option<(String, Oid)>) -> CallRecord {
+        let (source_tree_name, input_commit) = match target {
+            Some((name, commit)) => (Some(name), Some(commit)),
+            None => (None, None),
+        };
+        CallRecord {
+            id: self.call.id.clone(),
+            name: self.call.name.clone(),
+            declaration_message: self.declaration.to_string(),
+            source_tree_name,
+            input_commit,
+            status: CallStatus::Complete,
+            task: None,
+            result: None,
+            source_tree_resolution: None,
+            files: Vec::new(),
+            files_outcome: None,
+        }
+    }
+
+    fn finish(
+        &self,
+        state: &mut progress::State,
+        block: &Value,
+        target: Option<(String, Oid)>,
+        resolution: Option<SourceTreeResolution>,
+        task: Option<Oid>,
+        result: impl FnOnce(&CallRecord) -> ToolResult,
+    ) -> Result<(), String> {
+        let mut stub = self.stub(target);
+        stub.task = task;
+        let record = completed_record(&stub, result(&stub), resolution);
+        let expected = state.head().clone();
+        let _ = state.try_append_at(
+            &expected,
+            tool_complete_transition(record, block, Vec::new())?,
+        )?;
+        Ok(())
+    }
+
+    fn complete(
+        &self,
+        state: &mut progress::State,
+        block: Value,
+        target: Option<(String, Oid)>,
+        proposal: Option<Oid>,
+        resolution: Option<SourceTreeResolution>,
+    ) -> Result<(), String> {
+        self.finish(state, &block, target, resolution, None, |stub| {
+            ToolResult::Complete {
+                observation: observation_path(stub),
+                proposal,
+            }
+        })
+    }
+
+    fn fail(&self, state: &mut progress::State, text: &str) -> Result<(), String> {
+        self.complete(state, error_block(&self.call.id, text), None, None, None)
+    }
+
+    fn failed(
+        &self,
+        state: &mut progress::State,
+        block: &Value,
+        target: Option<(String, Oid)>,
+    ) -> Result<(), String> {
+        self.finish(state, block, target, None, None, |stub| {
+            ToolResult::Failed {
+                error: observation_path(stub),
+            }
+        })
+    }
+}
+
+fn close_pending_call(
+    state: &mut progress::State,
+    request: &Oid,
+    declaration: &Declaration,
+    call: &Call,
+    block: &Value,
+    result: impl FnOnce(&CallRecord) -> ToolResult,
+) -> Result<(), String> {
+    let existing = state.conversation()?.tool(&call.id)?;
+    let target = existing
+        .as_ref()
+        .and_then(|record| {
+            record
+                .source_tree_name
+                .clone()
+                .zip(record.input_commit.clone())
+        })
+        .or_else(
+            || match resolve_target(&state.conversation().ok()?, call).ok()? {
+                Target::SourceTree { name, commit } => Some((name, commit)),
+                Target::Files => None,
+            },
+        );
+    let stub =
+        existing.unwrap_or_else(|| CallSite::new(request, declaration, call).stub(target));
+    let record = completed_record(&stub, result(&stub), None);
+    let expected = state.head().clone();
+    let _ = state.try_append_at(
+        &expected,
+        tool_complete_transition(record, block, Vec::new())?,
+    )?;
+    Ok(())
+}
+
+/// The declaration this run works on. A step that drives the model works on
+/// the LATEST assistant message, since it finishes one message's calls before
+/// it asks for the next. A tools-only run works on its own call, wherever it was
+/// declared: a harness that drives the model itself (Claude Code, through
+/// `caos mcp`) can move a slow call to the background and declare more calls
+/// while it runs.
+fn working_declaration(
+    cfg: &Config,
+    view: &Conversation<'_>,
+) -> Result<Option<Declaration>, String> {
+    if let Some(call) = &cfg.tools_only {
+        return Ok(declaration_of(view, call)?.map(|mut declaration| {
+            declaration.pending.retain(|pending| pending.id == *call);
+            declaration
+        }));
+    }
+    last_matching(view, |ordinal, entry| {
+        (entry.role == Role::Assistant).then_some((ordinal, entry))
+    })?
+    .map(|(_, entry)| declaration(view, entry))
+    .transpose()
+}
+
+/// The declaration that carries call `id`, if a message declared it.
+fn declaration_of(view: &Conversation<'_>, id: &str) -> Result<Option<Declaration>, String> {
+    last_matching(view, |_, entry| {
+        (entry.role == Role::Assistant && entry.tool_uses().any(|(call, _, _)| call == id))
+            .then_some(entry)
+    })?
+    .map(|entry| declaration(view, entry))
+    .transpose()
+}
+
+fn declaration_message(view: &Conversation<'_>, id: &str) -> Result<String, String> {
+    declaration_of(view, id)?
+        .map(|declaration| declaration.message_id)
+        .ok_or_else(|| format!("no message declares call {id}"))
+}
+
+/// The calls an assistant message declared, and which of them have not finished.
+fn declaration(view: &Conversation<'_>, entry: TranscriptEntry) -> Result<Declaration, String> {
+    let mut pending = Vec::new();
+    for (id, name, arguments) in entry.tool_uses() {
+        if view.tool(id)?.is_some_and(|tool| tool.is_terminal()) {
+            continue;
+        }
+        let input = serde_json::from_slice(&view.payload(arguments)?)
+            .map_err(|error| format!("parsing tool arguments {arguments}: {error}"))?;
+        pending.push(Call {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        });
+    }
+    Ok(Declaration {
+        message_id: entry.message_id,
+        pending,
+    })
+}
+
+fn context_messages(view: &Conversation<'_>) -> Result<Vec<Value>, String> {
+    let mut messages = Vec::new();
+    for ordinal in 0..view.transcript_len()? {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        match entry.role {
+            Role::User | Role::System => {
+                let text = entry
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                messages.push(user_text(&text));
+            }
+            Role::Assistant => {
+                let response_path = format!(
+                    "{}/response.json",
+                    paths::transcript_payload_dir(ordinal, &entry.message_id)
+                );
+                let response: Value = serde_json::from_slice(&view.payload(&response_path)?)
+                    .map_err(|error| format!("parsing {response_path}: {error}"))?;
+                let blocks = response
+                    .as_array()
+                    .cloned()
+                    .ok_or_else(|| format!("{response_path} is not a JSON array"))?;
+                messages.push(message("assistant", Value::Array(blocks)));
+                // Every `tool_use` is answered, in declaration order. A call that
+                // never finished -- its turn was interrupted, or the process
+                // driving it died -- is answered as such, so the model reads a
+                // well-formed history.
+                let mut results = Vec::new();
+                for (id, _, _) in entry.tool_uses() {
+                    let finished = view.tool(id)?.filter(CallRecord::is_terminal);
+                    let Some(tool) = finished else {
+                        results.push(error_block(id, "this call did not finish"));
+                        continue;
+                    };
+                    let observation =
+                        format!("{}/observation.json", paths::call_payload_dir(id));
+                    let observation: Value =
+                        serde_json::from_slice(&view.payload(&observation)?)
+                            .map_err(|error| format!("parsing {observation}: {error}"))?;
+                    results.push(render_tool_observation(view, &tool, observation)?);
+                }
+                if !results.is_empty() {
+                    messages.push(message("user", Value::Array(results)));
+                }
+            }
+        }
+    }
+    Ok(messages)
+}
+
+fn render_tool_observation(
+    view: &Conversation<'_>,
+    tool: &CallRecord,
+    observation: Value,
+) -> Result<Value, String> {
+    if observation.get("type").and_then(Value::as_str) == Some("tool_result") {
+        return Ok(observation);
+    }
+    if tool.name == subagents::SPAWN_TOOL {
+        let child_id = observation["child"]
+            .as_str()
+            .ok_or("spawn observation has no child")?;
+        let child = view
+            .child(child_id)?
+            .ok_or_else(|| format!("spawn tool {} has no child record {child_id}", tool.id))?;
+        return Ok(subagents::spawn_result(
+            &tool.id,
+            &child.id,
+            &child.request,
+            &child.relay,
+        ));
+    }
+    Ok(result_block(
+        &tool.id,
+        &observation.to_string(),
+        tool.status == CallStatus::Conflict,
+    ))
+}
+
+/// Ask the model for the next message and append it on top of `previous`. A
+/// message that lands on a moved head is not appended: the transcript changed
+/// under the model, and the caller looks again.
+fn llm_round(
+    cfg: &Config,
+    state: &mut progress::State,
+    messages: Vec<Value>,
+    source_trees: &[String],
+    previous: &Oid,
+) -> Result<(), String> {
+    let body = json!({
+        "model": cfg.model,
+        "max_tokens": MAX_TOKENS,
+        "thinking": {"type": "adaptive"},
+        "cache_control": {"type": "ephemeral"},
+        "system": format!("{}{}", cfg.system, format!("{}{}", source_trees::context(&state.conversation()?)?, source_trees::repository_context(&state.conversation()?, source_trees)?)),
+        "tools": registry(cfg)?,
+        "messages": messages,
+    });
+    let status = |text: &str| eprintln!("llm-step: {text}");
+    let mut messages = messages;
+    let mut blocks = Vec::new();
+    let mut continuation = 0u32;
+    let stop = loop {
+        if continuation == 0 {
+            status(&format!("calling {}…", cfg.model));
+        } else {
+            status(&format!(
+                "{} hit the {MAX_TOKENS}-token cap; continuing ({continuation}/{MAX_CONTINUATIONS})…",
+                cfg.model
+            ));
+        }
+        let mut request_body = body.clone();
+        request_body["messages"] = Value::Array(messages.clone());
+        let started = std::time::Instant::now();
+        let response = post_messages(&cfg.base_url, &cfg.api_key, &request_body, &status);
+        timing::phase(&format!("model call {}", cfg.model));
+        let response = response?;
+        status(&format!(
+            "{} answered in {:.1}s",
+            cfg.model,
+            started.elapsed().as_secs_f64()
+        ));
+        let stop = response["stop_reason"].as_str().unwrap_or("").to_string();
+        let round_blocks = response["content"]
+            .as_array()
+            .cloned()
+            .ok_or("API response has no content array")?;
+        blocks.extend(round_blocks.iter().cloned());
+        if stop == "max_tokens" && continuation < MAX_CONTINUATIONS {
+            append_max_tokens_prefill(&mut messages, round_blocks);
+            continuation += 1;
+        } else {
+            break stop;
+        }
+    };
+    let tool_uses: Vec<Value> = blocks
+        .iter()
+        .filter(|block| block["type"] == "tool_use")
+        .cloned()
+        .collect();
+    let durable = validated_tool_calls(&stop, &tool_uses)?;
+    if stop == "max_tokens" {
+        return Err(format!(
+            "LLM round still hit stop_reason \"max_tokens\" after {MAX_CONTINUATIONS} continuation(s); the response would not converge and the turn fails here"
+        ));
+    }
+    if !matches!(stop.as_str(), "end_turn" | "tool_use") {
+        return Err(format!(
+            "LLM round ended with stop_reason {stop:?} (only end_turn and tool_use are handled; the turn fails here by design for now)"
+        ));
+    }
+    let transition = model_transition(cfg, state, &blocks, durable.as_deref().unwrap_or(&[]))?;
+    let _ = state.try_append_at(previous, transition)?;
+    Ok(())
+}
+
+fn append_max_tokens_prefill(messages: &mut Vec<Value>, blocks: Vec<Value>) {
+    messages.push(message("assistant", Value::Array(blocks)));
+}
+
+fn model_transition(
+    cfg: &Config,
+    state: &progress::State,
+    blocks: &[Value],
+    calls: &[Value],
+) -> Result<Transition, String> {
+    model_transition_by(
+        &cfg.conversation,
+        &cfg.model,
+        Some(&cfg.model),
+        state,
+        blocks,
+        calls,
+    )
+}
+
+/// The assistant message for a model's response: its text, and a `tool_use`
+/// block per call with the call's arguments as a payload. With the author and
+/// model named, for a caller whose model is not this step's: a harness that
+/// answers the model itself.
+fn model_transition_by(
+    conversation: &str,
+    actor: &str,
+    model: Option<&str>,
+    state: &progress::State,
+    blocks: &[Value],
+    calls: &[Value],
+) -> Result<Transition, String> {
+    let message_id = client_key()?;
+    let ordinal = state.conversation()?.transcript_len()?;
+    let dir = paths::transcript_payload_dir(ordinal, &message_id);
+    let mut payloads = vec![(
+        "response.json".to_string(),
+        canonical_payload_bytes(&Value::Array(blocks.to_vec()))?,
+    )];
+    let mut entry_blocks = Vec::new();
+    let text = response_text(blocks);
+    if !text.is_empty() {
+        entry_blocks.push(Block::Text { text });
+    }
+    for call in calls {
+        let raw_id = call["id"]
+            .as_str()
+            .ok_or("durable tool call has no string id")?;
+        let name = call["name"]
+            .as_str()
+            .ok_or("durable tool call has no string name")?;
+        let admitted = paths::admit_external_id(raw_id);
+        let payload_name = format!("args-{admitted}.json");
+        payloads.push((
+            payload_name.clone(),
+            canonical_payload_bytes(call.get("args").unwrap_or(&Value::Null))?,
+        ));
+        entry_blocks.push(Block::ToolUse {
+            id: raw_id.to_string(),
+            name: name.to_string(),
+            arguments: format!("{dir}/{payload_name}"),
+        });
+    }
+    Ok(Transition::MessageAppend {
+        entry: TranscriptEntry {
+            message_id,
+            conversation: conversation.to_string(),
+            role: Role::Assistant,
+            actor: actor.to_string(),
+            model: model.map(str::to_string),
+            blocks: entry_blocks,
+            proposal: None,
+            source_tree_resolution: None,
+        },
+        payloads,
+    })
+}
+
+/// Declare `call` -- an assistant message carrying its `tool_use` -- unless a
+/// message already has.
+///
+/// This is the half of a tool call a harness that drives the model itself
+/// cannot record for itself: the model's `tool_use`, which the call's result
+/// answers. It is authored by the newest prompt's actor, as the harness's own
+/// declaration was, and names no model: the harness does not say which.
+fn declare_requested_call(
+    state: &mut progress::State,
+    call: &str,
+    name: &str,
+    arguments: &Value,
+) -> Result<(), String> {
+    loop {
+        let view = state.conversation()?;
+        if declaration_of(&view, call)?.is_some() {
+            return Ok(());
+        }
+        let actor = newest_user_actor(&view)?;
+        drop(view);
+        let blocks = [json!({"type": "tool_use", "id": call, "name": name, "input": arguments})];
+        let calls = [json!({"id": call, "name": name, "args": arguments})];
+        let transition = model_transition_by(
+            &state_conversation_id(state)?,
+            &actor,
+            None,
+            state,
+            &blocks,
+            &calls,
+        )?;
+        let expected = state.head().clone();
+        match state.try_append_at(&expected, transition)? {
+            progress::TryAppend::Appended(_) => return Ok(()),
+            progress::TryAppend::HeadChanged(_) => continue,
+        }
+    }
+}
+
