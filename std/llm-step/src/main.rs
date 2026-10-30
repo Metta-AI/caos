@@ -1636,30 +1636,23 @@ fn prepared_request(
 fn launch_resolved_tool(
     cfg: &Config,
     state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-    round: u64,
+    turn: &Turn,
     id: &str,
 ) -> Result<(), String> {
-    let record = require_request(&state.conversation()?, request)?;
-    let current = working_round(cfg, &state.conversation()?, &record)?;
-    if current.declaring_round != round {
-        return resume(cfg, state, request, request_head);
-    }
-    let call = current
-        .pending
-        .iter()
-        .find(|call| call.id == id)
-        .cloned()
-        .ok_or("resolved tool is no longer pending")?;
-    let target = resolve_target(&state.conversation()?, &call)?;
+    // The call this evaluation was for, if nothing has finished it since.
+    let Some(current) = declaration_of(&state.conversation()?, id)? else {
+        return Err(format!("resolved tool {id} has no declaration"));
+    };
+    let Some(call) = current.pending.iter().find(|call| call.id == id).cloned() else {
+        return resume(cfg, state, turn);
+    };
     let (name, current_input) = match target {
         Target::SourceTree { name, commit } => (Some(name), commit),
         Target::Files => (None, state.head().clone()),
     };
     let commit = Oid::parse(&cas_hash(&arg("wc"))?, "tool lookup input commit")?;
     if current_input != commit {
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     // `eval_path` asked for the evaluated object's IDENTITY, not for a tool, so
     // it answers here -- ahead of `materialize_source_tree`, which this answer
@@ -1668,7 +1661,7 @@ fn launch_resolved_tool(
     if call.name == tools::EVAL_PATH {
         let result = arg("result");
         let report = tools::eval_path_report(&cas_kind(&result)?, &cas_hash(&result)?);
-        let site = CallSite::at(request, round, &call, &current.declaration_message);
+        let site = CallSite::at(&turn.request, &call, &current.message_id);
         site.complete(
             state,
             result_block(id, &report, false),
@@ -1676,12 +1669,12 @@ fn launch_resolved_tool(
             None,
             None,
         )?;
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     let (ws, wc) = materialize_source_tree(state, &commit)?;
     let relative = read_arg("tool-lookup")?;
     let image = arg("result");
-    let site = CallSite::at(request, round, &call, &current.declaration_message);
+    let site = CallSite::at(&turn.request, &call, &current.message_id);
     let tool = match tools::evaluated_tool(&image, call.input["path"].as_str().unwrap_or(&relative))
     {
         Ok(tool) => tool,
@@ -1691,7 +1684,7 @@ fn launch_resolved_tool(
                 &error_block(id, &error),
                 name.map(|name| (name, commit)),
             )?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     if call.name == "tool_help" {
@@ -1701,15 +1694,15 @@ fn launch_resolved_tool(
             false,
         );
         site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
-        return resume(cfg, state, request, request_head);
+        return resume(cfg, state, turn);
     }
     // An operation of the step: the entry gave it a path and a help, and the step
     // does the work here, in process.
     if let Some(op) = tool.op.as_deref() {
         let inner = op_call(&call);
-        let op_site = CallSite::at(request, round, &inner, &current.declaration_message);
+        let op_site = CallSite::at(&turn.request, &inner, &current.message_id);
         return if run_op(cfg, op, state, &op_site, None)? {
-            resume(cfg, state, request, request_head)
+            resume(cfg, state, turn)
         } else {
             Ok(())
         };
@@ -1741,7 +1734,7 @@ fn launch_resolved_tool(
                     &error_block(id, &why),
                     name.map(|name| (name, commit)),
                 )?;
-                return resume(cfg, state, request, request_head);
+                return resume(cfg, state, turn);
             }
         },
     };
@@ -1750,7 +1743,7 @@ fn launch_resolved_tool(
         Ok(bound) => bound,
         Err(block) => {
             site.failed(state, &block, name.map(|name| (name, commit)))?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     let tool_tree = cas_hash(&image)?;
@@ -1780,13 +1773,13 @@ fn launch_resolved_tool(
     let task = match task {
         Ok(task) => task,
         Err(error) => {
-            let site = CallSite::at(request, round, &call, &current.declaration_message);
+            let site = CallSite::at(&turn.request, &call, &current.message_id);
             site.failed(
                 state,
                 &error_block(id, &error),
                 source_tree_name.map(|name| (name, commit)),
             )?;
-            return resume(cfg, state, request, request_head);
+            return resume(cfg, state, turn);
         }
     };
     let started = CallRecord {
@@ -1794,7 +1787,7 @@ fn launch_resolved_tool(
         round,
         id: id.to_string(),
         name: call.name.clone(),
-        declaration_message: current.declaration_message,
+        declaration_message: current.message_id,
         source_tree_name,
         input_commit: Some(commit),
         status: CallStatus::Started,
@@ -1812,9 +1805,9 @@ fn launch_resolved_tool(
             record: started.clone(),
         },
     )? {
-        progress::TryAppend::HeadChanged(_) => resume(cfg, state, request, request_head),
+        progress::TryAppend::HeadChanged(_) => resume(cfg, state, turn),
         progress::TryAppend::Appended(_) => {
-            dispatch_started(state, request, round, &call, &started)
+            dispatch_started(state, &turn.request, &call, &started)
         }
     }
 }
