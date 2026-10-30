@@ -8,12 +8,12 @@ use caos::{GitTransport, Transport};
 use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
-    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_request,
+    describe_tool_set, fork_conversation, generate_conversation_title, interrupt_conversation,
     invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    resume_request, run_chat_turn, set_conversation_title, submit_interjection,
+    run_chat_turn, set_conversation_title, submit_interjection,
     unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
     InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
-    TurnOutcome, TurnPhase, TurnStatus, UserConversationStatus, UserConversationSummary,
+    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
     DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
@@ -158,8 +158,6 @@ enum ActivityState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Activity {
-    request: String,
-    round: u64,
     id: String,
     step_commit: String,
     name: String,
@@ -169,8 +167,8 @@ struct Activity {
 }
 
 impl Activity {
-    fn answers(&self, request: &str, round: u64, tool_use_id: &str) -> bool {
-        self.request == request && self.round == round && self.id == tool_use_id
+    fn answers(&self, tool_use_id: &str) -> bool {
+        self.id == tool_use_id
     }
 
     fn running_verb(&self) -> &'static str {
@@ -203,14 +201,10 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
         match event {
             TurnEvent::ToolCall {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 name,
                 summary,
             } => activities.push(Activity {
-                request: request.clone(),
-                round: *round,
                 id: tool_use_id.clone(),
                 step_commit: step_commit.clone(),
                 name: name.clone(),
@@ -220,15 +214,13 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
             }),
             TurnEvent::ToolResult {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 is_error,
                 content,
             } => {
                 if let Some(activity) = activities
                     .iter_mut()
-                    .find(|activity| activity.answers(request, *round, tool_use_id))
+                    .find(|activity| activity.answers(tool_use_id))
                 {
                     activity.state = if *is_error {
                         ActivityState::Failed
@@ -238,8 +230,6 @@ fn replayed_activities(events: &[TurnEvent]) -> Vec<Activity> {
                     activity.detail = content.clone();
                 } else {
                     activities.push(Activity {
-                        request: request.clone(),
-                        round: *round,
                         id: tool_use_id.clone(),
                         step_commit: step_commit.clone(),
                         name: "result".to_string(),
@@ -1937,7 +1927,6 @@ impl App {
                 },
                 move |result| UiMessage::Reconciled {
                     conversation,
-                    request,
                     result,
                 },
             );
@@ -2805,7 +2794,6 @@ impl App {
                 }
                 UiMessage::Reconciled {
                     conversation,
-                    request,
                     result,
                 } => {
                     if let Some(index) = self.conversation_index(&conversation) {
@@ -2988,15 +2976,11 @@ impl App {
             TurnEvent::Status(status) => state.status = status,
             TurnEvent::ToolCall {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 name,
                 summary,
             } => {
                 state.push_activity(Activity {
-                    request,
-                    round,
                     id: tool_use_id,
                     step_commit,
                     name,
@@ -3007,8 +2991,6 @@ impl App {
             }
             TurnEvent::ToolResult {
                 step_commit,
-                request,
-                round,
                 tool_use_id,
                 is_error,
                 content,
@@ -3016,7 +2998,7 @@ impl App {
                 if let Some(activity) = state
                     .activities
                     .iter_mut()
-                    .find(|activity| activity.answers(&request, round, &tool_use_id))
+                    .find(|activity| activity.answers(&tool_use_id))
                 {
                     activity.state = if is_error {
                         ActivityState::Failed
@@ -3026,8 +3008,6 @@ impl App {
                     activity.detail = content;
                 } else {
                     state.push_activity(Activity {
-                        request,
-                        round,
                         id: tool_use_id.clone(),
                         step_commit,
                         name: "result".to_string(),
