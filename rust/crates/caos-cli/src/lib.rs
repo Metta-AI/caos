@@ -37,6 +37,8 @@ use conversation_protocol::v3::{reconcile, GitStore, ObjectStore, Oid, RefUpdate
 use conversation_protocol::v3::Kind;
 
 const MAX_APPEND_ATTEMPTS: usize = 32;
+/// Who the step records its own failure messages as (`std/llm-step`).
+const STEP_ACTOR: &str = "llm-step";
 const MAX_FETCH_REFS: usize = 200;
 pub const MODEL_API_SECRET: &str = "anthropic-api-key";
 pub const MODEL_API_SECRET_VALUE_FILE: &str = ".anthropic-api-key-value";
@@ -1148,53 +1150,33 @@ fn snapshot_from(
     id: &str,
     head: &Oid,
 ) -> Result<ConversationSnapshot, String> {
-    let active = conversation.active_turn()?;
-    let newest = if active.is_none() {
-        conversation.latest_turn()?
-    } else {
-        None
-    };
-    let record = active.as_ref().or(newest.as_ref());
-    let status = record
-        .map(|record| record.status)
-        .unwrap_or(TurnStatus::Idle);
-    let interrupted = active.is_none()
-        && matches!(
-            newest.as_ref().and_then(|record| record.outcome.as_ref()),
-            Some(ProtocolTurnOutcome::Idle {
-                interrupted: true,
-                ..
-            })
-        );
-    let error = match record.and_then(|record| record.outcome.as_ref()) {
-        Some(ProtocolTurnOutcome::Failed { error }) => {
-            transcript_text_at_path(conversation, error.as_str())?
+    // How the latest turn ended, read off its newest entry: background notices
+    // (system messages caos writes) come after a turn without ending it.
+    let mut interrupted = false;
+    let mut error = None;
+    for ordinal in (0..conversation.transcript_len()?).rev() {
+        let Some((_, entry)) = conversation.transcript_entry(ordinal)? else {
+            return Err(format!("missing transcript ordinal {ordinal}"));
+        };
+        if entry.role != Role::System {
+            break;
         }
-        _ => None,
-    };
+        if entry.is_interrupt() {
+            interrupted = true;
+            break;
+        }
+        if entry.actor == STEP_ACTOR {
+            error = Some(text_blocks(&entry.blocks));
+            break;
+        }
+    }
     Ok(ConversationSnapshot {
         id: id.to_string(),
         head: head.to_string(),
         title: conversation.title()?,
-        status,
-        request: active.as_ref().map(|record| record.id.to_string()),
         interrupted,
         error,
     })
-}
-
-fn transcript_text_at_path(
-    conversation: &Conversation<'_>,
-    path: &str,
-) -> Result<Option<String>, String> {
-    let (ordinal, message_id) = paths::parse_transcript_entry_path(path)?;
-    let Some((found_id, entry)) = conversation.transcript_entry(ordinal)? else {
-        return Err(format!("request outcome entry {path} is absent"));
-    };
-    if found_id != message_id {
-        return Err(format!("request outcome entry {path} has a mismatched id"));
-    }
-    Ok(Some(text_blocks(&entry.blocks)))
 }
 
 fn replay_from(
