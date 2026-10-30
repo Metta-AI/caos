@@ -225,10 +225,7 @@ impl<'s> Conversation<'s> {
                 for event in events.into_iter().rev() {
                     match event {
                         Event::Tool(record) => {
-                            result
-                                .tools
-                                .entry(record.id.clone())
-                                .or_insert(record);
+                            result.tools.entry(record.id.clone()).or_insert(record);
                         }
                         Event::Child(record) => {
                             result
