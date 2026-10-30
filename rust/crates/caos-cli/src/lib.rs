@@ -3663,7 +3663,7 @@ mod tests {
     }
 
     #[test]
-    fn active_request_proposals_move_directly_and_record_conflicts() {
+    fn interjection_proposals_move_directly_and_record_conflicts() {
         let (root, transport, base) = fixture("active-proposal");
         let options = options(&transport);
         let request = "a".repeat(40);
@@ -3681,18 +3681,16 @@ mod tests {
 
         let ours = commit_file(&transport, &base, "ours\n", "ours");
         let theirs = commit_file(&transport, &base, "theirs\n", "theirs");
-        let interjected_request = submit_message_inner_with(
+        // An interjection is only a message: nothing is prepared to answer it.
+        submit_interjection(
             &transport,
             &options,
             "proposal-talk",
             "use ours",
-            false,
             Some(&ours),
             Some(&base),
-            |_, _, _, _| panic!("interjections do not prepare a request"),
         )
         .unwrap();
-        assert_eq!(interjected_request.as_deref(), Some(request.as_str()));
 
         let store = open_store(&transport).unwrap();
         let (_, direct_head) = fetch_head(&transport, &store, "proposal-talk")
