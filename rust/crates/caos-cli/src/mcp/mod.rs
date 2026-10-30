@@ -499,9 +499,11 @@ fn username() -> Result<String, String> {
 /// request up.
 ///
 /// A NEW conversation needs where it starts from, which the step cannot find for
-/// itself: `from`, the commit it forks, or else the locator naming its content.
-/// Both go with every prompt and the step uses them only when the conversation
-/// does not exist yet (a pinned locator is resolved once and memoized).
+/// itself: `from`, the commit it forks, and the locator naming its content. With
+/// `from` alone the fork keeps its source's content; with both, the content
+/// commit is merged into the fork, which is how a session picks a conversation
+/// up on a newer client repo. Both go with every prompt and the step uses them
+/// only when the conversation does not exist yet.
 fn record_prompt(
     config: &Config,
     id: &str,
@@ -511,10 +513,14 @@ fn record_prompt(
     let mut extra = vec![("text", prompt), ("model", CLAUDE_CODE_MODEL)];
     let from = from.map(|from| from.to_string());
     let content = session_base::content_locator(config.base.as_deref(), prompt);
+    // Both go: a root is seeded from the content, a fork merges it into the
+    // forked conversation (`std/llm-step/src/record.rs`). The step imports the
+    // commit the locator names, so the hook resolves nothing.
     if let Some(from) = &from {
         extra.push(("from", from));
-    } else if let Some(content) = &content {
-        extra.push(("content:@@", content));
+    }
+    if let Some(content) = &content {
+        extra.push(("content-locator", content));
     }
     let phase = std::time::Instant::now();
     let recorded = record_event(config, id, "prompt", &extra)?;

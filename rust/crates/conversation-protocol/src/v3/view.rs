@@ -40,10 +40,10 @@ pub struct Conversation<'s> {
 impl<'s> Conversation<'s> {
     pub fn open(store: &'s dyn ObjectStore, commit: &Oid) -> Result<Conversation<'s>, String> {
         let info = store.read_commit(commit).map_err(String::from)?;
-        if info.parents.len() != 1 {
-            return Err(format!(
-                "conversation commit {commit} must have exactly one parent"
-            ));
+        // The FIRST parent is the conversation's spine; a fork that merged a
+        // content commit in carries that commit as a second parent.
+        if info.parents.is_empty() {
+            return Err(format!("conversation commit {commit} must have a parent"));
         }
         let kind = Kind::parse_message(&info.message)?;
         let conversation = Conversation {

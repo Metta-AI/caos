@@ -121,6 +121,8 @@ in
       group = "caos-watchdog";
       home = stateDir;
       createHome = true;
+      # Claude Code's Bash tool runs commands through the user's shell.
+      shell = pkgs.bash;
       # The responder reads Datadog's monitor state with the same API key the
       # agent reports with; that file is root:datadog (prod/base.nix).
       extraGroups = [ "datadog" ];
@@ -151,6 +153,7 @@ in
         pkgs.awscli2
         pkgs.git
         pkgs.coreutils
+        pkgs.bash
       ];
       environment = watchdogEnv // {
         HOME = stateDir;

@@ -534,6 +534,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
             owner: None,
         },
         title: "Golden Fork".to_string(),
+        content: None,
     };
     commit(store, &mut head, fork, &signature);
     (head, [message_applied, model_applied])

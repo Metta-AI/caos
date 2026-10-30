@@ -7951,7 +7951,7 @@ mod tests {
         assert_eq!(app.selected().id, pending_id);
         assert_eq!(app.selected().composer.text, "must not submit");
         let error = app.selected().command_error.as_deref().unwrap();
-        assert!(error.contains("must have exactly one parent"), "{error}");
+        assert!(error.contains("must have a parent"), "{error}");
         assert!(conversation_head(&transport, &pending_id)
             .unwrap()
             .is_none());

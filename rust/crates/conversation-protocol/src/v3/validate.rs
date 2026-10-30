@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use super::apply::{apply, Transition};
+use super::apply::{apply, is_conversation_commit, Transition};
 use super::canonical::parse_canonical;
 use super::events::Event;
 use super::kinds::Kind;
 use super::oid::{empty_tree, g3, Oid};
 use super::paths;
 use super::records::*;
-use super::tree::{diff, Change, DryRunStore, Mode, ObjectStore};
+use super::tree::{diff, Change, DryRunStore, Mode, ObjectStore, TreeBuilder};
 use super::view::Conversation;
 
 type Payloads = Vec<(String, Vec<u8>)>;
@@ -81,21 +81,40 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
     if !info.extra_headers.is_empty() {
         return Err("conversation commits must not have extra headers".to_string());
     }
-    if info.parents.len() != 1 {
-        return Err("exactly one parent required".to_string());
-    }
+    // The first parent is the spine. A root may instead parent the commit its
+    // content came from, and a fork may carry the commit it merged in as a
+    // second parent (`apply::mint_with_parents`); both exist so that git can find
+    // the base when that repository's newer commit is merged in later.
+    let Some(parent) = info.parents.first().cloned() else {
+        return Err("a parent is required".to_string());
+    };
+    let merged = &info.parents[1..];
     let kind = Kind::parse_message(&info.message).map_err(|_| {
         format!(
             "commit message is not a registered kind: {:?}",
             String::from_utf8_lossy(&info.message)
         )
     })?;
-    let parent = info.parents[0].clone();
-    if kind == Kind::ConversationRoot && parent != g3() {
-        return Err("root must parent G3".to_string());
-    }
-    if kind != Kind::ConversationRoot && parent == g3() {
+    if kind == Kind::ConversationRoot {
+        if parent != g3() && is_conversation_commit(store, &parent)? {
+            return Err(
+                "a root parents G3 or the commit its content came from, not a conversation commit"
+                    .to_string(),
+            );
+        }
+    } else if parent == g3() {
         return Err("only a root may parent G3".to_string());
+    }
+    if !merged.is_empty() {
+        if kind != Kind::ConversationFork {
+            return Err("only a fork has more than one parent".to_string());
+        }
+        if merged.len() != 1 {
+            return Err("a fork merges one commit in".to_string());
+        }
+        if is_conversation_commit(store, &merged[0])? {
+            return Err("a fork merges a content commit in, not a conversation commit".to_string());
+        }
     }
     let parent_tree = if kind == Kind::ConversationRoot {
         empty_tree()
@@ -142,11 +161,32 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
         {
             return Err("invalid root identity or execution history".into());
         }
+        if parent != g3() {
+            // A root's content IS its parent commit's tree: the parent is only
+            // worth having if git finding it as a merge base says something
+            // true about the content.
+            let seed = store.read_commit(&parent).map_err(String::from)?.tree;
+            if diff(store, Some(&seed), &info.tree)?.iter().any(|change| {
+                change.path != paths::CAOS_DIR && !under(&change.path, paths::CAOS_DIR)
+            }) {
+                return Err("root content differs from its parent commit's tree".into());
+            }
+        }
         return Ok(Validated { parent, kind });
     }
 
-    let transition = reconstruct(kind, parent_view.as_ref(), &child, &changes)?;
     let mut dry_run = DryRunStore::new(store);
+    // A fork that merged a commit in starts from the merged content: what it
+    // holds outside .caos/. Without that second parent, a fork's content is its
+    // source's, and re-applying the transition proves it.
+    let fork_content = if kind == Kind::ConversationFork && !merged.is_empty() {
+        let mut content = TreeBuilder::from(Some(info.tree.clone()));
+        content.delete(paths::CAOS_DIR);
+        Some(content.build(&mut dry_run)?)
+    } else {
+        None
+    };
+    let transition = reconstruct(kind, parent_view.as_ref(), &child, &changes, fork_content)?;
     let applied = apply(
         &mut dry_run,
         (kind != Kind::ConversationRoot).then_some(&parent),
@@ -222,6 +262,7 @@ fn reconstruct(
     parent_snapshot: Option<&Conversation<'_>>,
     child_snapshot: &Conversation<'_>,
     changes: &[Change],
+    fork_content: Option<Oid>,
 ) -> Result<Transition, String> {
     if kind != Kind::ConversationRoot && parent_snapshot.is_none() {
         return Err(format!("{}: parent snapshot is missing", kind.as_str()));
@@ -231,6 +272,7 @@ fn reconstruct(
         Kind::ConversationFork => Ok(Transition::ConversationFork {
             identity: child_snapshot.identity()?,
             title: child_snapshot.title()?,
+            content: fork_content,
         }),
         Kind::MetadataTitleSet => Ok(Transition::TitleSet {
             title: child_snapshot.title()?,

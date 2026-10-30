@@ -3,14 +3,15 @@
 # prompt: the new session gets its OWN conversation, whose history is <hash>'s;
 # the original does not move.
 #
-# A head left open (a session that died mid-turn) is used as it is: the
-# protocol refuses to fork a running request, so the hook closes it as new
-# commits on top, and the record says so.
+# A head left open (a session that died mid-turn) is forked as it is: a
+# conversation is a flat transcript, so the fork copies it unchanged, open
+# request and all, and the record shows the fork landing straight on top.
 #
-# Driven through `caos mcp hook` only -- no tool server, no model. What that
-# leaves untested is the closing of a CALL a dead session left running or
-# declared; the request-only case below covers `settle`'s path through the
-# terminal, and the call paths are what `llm-step`'s `drain` already does.
+# A conversation rooted on G3 (made before roots parented their content commit)
+# shares no history with the client repository, and a fork of it with --base
+# still merges that repository's commit in, from the tree the root holds.
+#
+# Driven through `caos mcp hook` only -- no tool server, no model.
 set -euo pipefail
 
 # The hook's diag journal lives under $HOME/.cache, and the worker's HOME
@@ -93,11 +94,50 @@ g="resume-g-$stamp"
 prompt "$g" "/fork-caos-conversation $head_b" >/dev/null
 head_g=$(head_of "cc/$g")
 [ -n "$head_g" ] || fail "an open head could not be forked"
+# No settle: the fork lands straight on the open head, whose newest commit is
+# b's own request.claim. (It used to insert a request.terminal before forking.)
 case "$(subjects "$head_g")" in
-  *"conversation.fork request.terminal "*) ;;
-  *) fail "the open request was not closed before the fork: $(subjects "$head_g")" ;;
+  *"conversation.fork request.claim "*) ;;
+  *) fail "the fork did not land directly on the open head: $(subjects "$head_g")" ;;
+esac
+case "$(subjects "$head_g")" in
+  *request.terminal*) fail "forking an open head should not settle it: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
+
+echo "== a conversation rooted on G3 forks with --base ==" >&2
+# Made with no --base, as every conversation was before roots parented their
+# content commit: it shares no history with the client repository, so git
+# finds no base to merge that repository's commit in from.
+bare_hook() { printf "%s\n" "$1" | "$CAOS_CLI" mcp hook $CAOS_MCP_ARGS; }
+o="resume-o-$stamp"
+bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"UserPromptSubmit",session_id:$s,prompt:"a G3-rooted conversation"}')" >/dev/null
+bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"Stop",session_id:$s,last_assistant_message:"done"}')" >/dev/null
+head_o=$(head_of "cc/$o")
+[ -n "$head_o" ] || fail "the G3-rooted conversation was never recorded"
+content=$(git rev-parse HEAD)  # the commit mcp_base_arg pins
+if git merge-base "$head_o" "$content" >/dev/null; then
+  fail "a conversation made without --base shares history with the client repository"
+fi
+
+p="resume-p-$stamp"
+out=$(prompt "$p" "/fork-caos-conversation $head_o")
+case "$out" in
+  *"forked from $head_o"*) ;;
+  *) fail "forking a G3-rooted conversation with --base failed: $out" ;;
+esac
+head_p=$(head_of "cc/$p")
+[ -n "$head_p" ] || fail "the fork of the G3-rooted conversation has no conversation of its own"
+fork_p=$(git log --first-parent --format='%H %s' "$head_p" \
+  | awk '$2 == "conversation.fork" && !found { print $1; found = 1 }')
+[ -n "$fork_p" ] || fail "no conversation.fork on the fork's branch: $(subjects "$head_p")"
+[ "$(git rev-parse "$fork_p^1")" = "$head_o" ] || fail "the fork's first parent is not its source"
+[ "$(git rev-parse -q --verify "$fork_p^2")" = "$content" ] \
+  || fail "the fork's second parent is not the content commit $content"
+[ "$(git rev-parse "$head_p:test")" = "$(git rev-parse "$content:test")" ] \
+  || fail "the fork does not carry the client repository's files"
+git grep -q "a G3-rooted conversation" "$head_p" -- .caos/transcript \
+  || fail "the fork lost the source's transcript"
 
 echo "== a prompt with no server is refused, naming what is missing ==" >&2
 # Exit 2 is the one status with which Claude Code blocks the prompt and shows the

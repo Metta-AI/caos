@@ -26,12 +26,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use conversation_protocol::v3::apply::{
-    apply, client_signature, inherited_signature, mint, Transition,
+    apply, client_signature, inherited_signature, mint, mint_with_parents, Transition,
 };
 use conversation_protocol::v3::oid::ensure_genesis;
+use conversation_protocol::v3::reconcile::MergeOutcome;
+use conversation_protocol::v3::tree::{ObjectStore, TreeBuilder};
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    paths, Block, CallStatus, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
+    paths, Block, CallStatus, GitStore, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
     TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
 };
 use worker_common::{arg, cas_hash, caos_curry, read_arg, read_arg_opt, Arg};
@@ -57,11 +59,13 @@ pub(crate) struct Request {
     /// The model the harness's request is recorded as having been answered by.
     /// A prompt's: a stop and a failure take the request's own.
     model: String,
-    /// A tree to seed a NEW conversation's content with.
-    content: Option<Oid>,
+    /// A git locator naming the COMMIT a NEW conversation's content comes from
+    /// (`content-locator`). A root parents it and starts from its tree; a fork
+    /// merges it into the conversation it forks.
+    content: Option<String>,
     /// A conversation commit to FORK, for a NEW conversation: the prompt's
-    /// conversation is then made as a fork of it (settled first, if a session
-    /// died mid-turn) rather than as a root.
+    /// conversation is then made as a fork of it, as it stands, rather than as
+    /// a root.
     from: Option<Oid>,
 }
 
@@ -79,11 +83,9 @@ impl Request {
         let message_id = read_arg("message-id")?.trim().to_string();
         conversation_protocol::v3::ids::validate_client_key(&message_id)
             .map_err(|error| format!("--message-id: {error}"))?;
-        let content = if std::path::Path::new(&arg("content")).exists() {
-            Some(Oid::parse(&cas_hash(&arg("content"))?, "--content")?)
-        } else {
-            None
-        };
+        let content = read_arg_opt("content-locator")?
+            .map(|locator| locator.trim().to_string())
+            .filter(|locator| !locator.is_empty());
         let from = match read_arg_opt("from")? {
             Some(hash) => Some(Oid::parse(hash.trim(), "--from")?),
             None => None,
@@ -232,6 +234,38 @@ fn open_request(
     Ok((claimed, ordinal))
 }
 
+/// The commit a content locator names, in `store` with its history. The server
+/// is asked first: a `git+caos://` locator names it, and any commit a
+/// conversation was made from before is still there. Otherwise the commit is
+/// fetched from the repository the locator names, with the GitHub token the
+/// `import-source` tool would use, and the push that follows carries its history
+/// to the server. A locator pins its commit, so the answer is the rev it names.
+fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
+    let parsed = git_locator::parse_git_ref(locator)?;
+    let rev = parsed
+        .rev
+        .as_deref()
+        .ok_or_else(|| format!("content locator {locator:?} pins no commit"))?;
+    let commit = Oid::parse(rev, "content commit")?;
+    if store.has_local(&commit)? || store.fetch_object(&commit).is_ok() {
+        return Ok(commit);
+    }
+    if parsed.url.starts_with("git+caos://") {
+        return Err(format!(
+            "content locator {locator:?} names a commit this server does not have"
+        ));
+    }
+    let url = parsed.fetch_url();
+    let token = crate::import_source::token_file(&url)
+        .map(std::fs::read_to_string)
+        .transpose()
+        .map_err(|_| "reading the GitHub token".to_string())?;
+    store
+        .fetch_commit_from(&url, &commit, token.as_deref().map(str::trim_end))
+        .map_err(|error| format!("fetching {locator}: {error}"))?;
+    Ok(commit)
+}
+
 /// The step as a conversation's configured worker: this image with the
 /// conversation bound, which is what the request records as its configuration.
 fn configuration(conversation: &str) -> Result<String, String> {
@@ -239,11 +273,33 @@ fn configuration(conversation: &str) -> Result<String, String> {
     caos_curry(Arg::Hash(&image), &[("conversation", Arg::Lit(conversation))])
 }
 
-/// Make the conversation as a FORK of `from`, with its first prompt: the source
-/// settled (a session that died mid-turn left work open, which the protocol will
-/// not fork), the fork, then the prompt's request, pushed together with the
-/// creator's membership refs. `None` when the conversation exists, so the caller
-/// records onto it.
+/// The tree a conversation's content was seeded from: its root's tree, found by
+/// following first parents from `head`, without the conversation's own .caos/.
+fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
+    let mut current = head.clone();
+    loop {
+        let info = store.read_commit(&current).map_err(String::from)?;
+        use conversation_protocol::v3::Kind as CommitKind;
+        if CommitKind::parse_message(&info.message)? == CommitKind::ConversationRoot {
+            let mut tree = TreeBuilder::from(Some(info.tree));
+            tree.delete(paths::CAOS_DIR);
+            return Ok(tree.build(store)?);
+        }
+        current = info
+            .parents
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("{current} has no parent before its conversation's root"))?;
+    }
+}
+
+/// Make the conversation as a FORK of `from`, with its first prompt: the fork,
+/// then the prompt's request, pushed together with the creator's membership
+/// refs. `None` when the conversation exists, so the caller records onto it.
+///
+/// `from` is forked as it stands. A conversation is a flat transcript, so a
+/// source that died mid-turn needs no settling first; its unfinished calls are
+/// tool_use blocks with no result, carried into the fork as they are.
 fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Option<State>, String> {
     let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
     let mut store = State::scratch_store()?;
@@ -254,8 +310,42 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     if Conversation::open(&store, from)?.identity()?.id == conversation {
         return Err("a fork's id must differ from its source conversation".to_string());
     }
-    let settled = crate::settle::settle(&mut store, from)?;
     let signature = signature(&request.actor)?;
+    // With a content locator the fork starts from the MERGE of its source and
+    // that commit, as git merges them: the base is what the two share, which the
+    // root's parent gives them. .caos/ is the fork's own record and stays as the
+    // source left it. A conflict refuses the fork, naming the files: nobody is
+    // in the conversation yet to resolve it.
+    //
+    // A conversation made before roots parented their content commit is rooted
+    // on G3 and shares no history with that repository, so git finds no base.
+    // Its root's content, without .caos/, is the tree it was seeded from, and
+    // the fork merges from that instead.
+    let (content, merged) = match &request.content {
+        Some(locator) => {
+            let commit = content_commit(&store, locator)?;
+            let outcome = if store.merge_base(from, &commit)?.is_some() {
+                store.merge_commits(from, &commit)?
+            } else {
+                let base = seed_tree(&mut store, from)?;
+                store.merge_commits_over(&base, from, &commit)?
+            };
+            let tree = match outcome {
+                MergeOutcome::Merged { tree } => tree,
+                MergeOutcome::Conflict { paths } => {
+                    return Err(format!(
+                        "merging {locator} into the fork conflicts in {}; \
+                         fork without it, or resolve that in the repository first",
+                        paths.join(", ")
+                    ))
+                }
+            };
+            let mut content = TreeBuilder::from(Some(tree));
+            content.delete(paths::CAOS_DIR);
+            (Some(content.build(&mut store)?), vec![commit])
+        }
+        None => (None, Vec::new()),
+    };
     let transition = Transition::ConversationFork {
         identity: Identity {
             id: conversation.to_string(),
@@ -265,9 +355,17 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
             owner: None,
         },
         title: format!("fork of {}", &from.as_str()[..12]),
+        content,
     };
-    let applied = apply(&mut store, Some(&settled), &transition)?;
-    let forked = mint(&mut store, &settled, &applied, transition.kind(), &signature)?;
+    let applied = apply(&mut store, Some(from), &transition)?;
+    let forked = mint_with_parents(
+        &mut store,
+        from,
+        &merged,
+        &applied,
+        transition.kind(),
+        &signature,
+    )?;
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
     let (claimed, _) = open_request(
         &mut state,
@@ -280,7 +378,9 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     let active = conversation_protocol::v3::refs::active_membership_ref(&request.actor, conversation)?;
     let archived =
         conversation_protocol::v3::refs::archived_membership_ref(&request.actor, conversation)?;
-    let pushed = state.store().push(&[
+    // Negotiated: the content commit's history is on the server under no
+    // advertised ref, and only negotiation keeps it out of the pack.
+    let pushed = state.store().push_negotiating(&[
         RefUpdate {
             refname: refname.clone(),
             expected: None,
@@ -319,13 +419,16 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
     }
     let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
     let mut store = State::scratch_store()?;
-    let genesis = ensure_genesis(&mut store)?;
-    let content = match &request.content {
-        Some(content) => {
-            store.ensure_local(content)?;
-            Some(content.clone())
+    // The root PARENTS the commit its content came from, so that a fork made
+    // later can merge that repository's newer commit in with git finding the
+    // base. Without content it parents G3, the genesis every conversation shares.
+    let (parent, content) = match &request.content {
+        Some(locator) => {
+            let commit = content_commit(&store, locator)?;
+            let tree = store.read_commit(&commit).map_err(String::from)?.tree;
+            (commit, Some(tree))
         }
-        None => None,
+        None => (ensure_genesis(&mut store)?, None),
     };
     let signature = signature(&request.actor)?;
     let root = Transition::ConversationRoot {
@@ -338,13 +441,7 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
         content,
     };
     let applied = apply(&mut store, None, &root)?;
-    let root = mint(
-        &mut store,
-        &genesis,
-        &applied,
-        root.kind(),
-        &signature,
-    )?;
+    let root = mint(&mut store, &parent, &applied, root.kind(), &signature)?;
     // The chain is minted in a State whose head is the root, so it can use the
     // same helpers as a conversation that exists; only the push differs.
     let mut state = State::from_store(store, refname.clone(), root.clone())?;
@@ -356,7 +453,9 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
         &configuration(conversation)?,
         &signature,
     )?;
-    let pushed = state.store().push(&[RefUpdate {
+    // Negotiated, as for a fork: the root's parent and its history may be on
+    // the server under no advertised ref.
+    let pushed = state.store().push_negotiating(&[RefUpdate {
         refname: refname.clone(),
         expected: None,
         new: Some(claimed.clone()),
