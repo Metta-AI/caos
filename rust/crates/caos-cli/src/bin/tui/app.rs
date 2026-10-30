@@ -1176,12 +1176,10 @@ impl ConversationState {
         self.transcript = transcript;
         self.remote_head = Some(load.snapshot.head);
         self.transcript_selection = None;
-        if let Some((status, turn_phase, reconciling_request, reconcile_after)) = local_lifecycle {
+        if let Some((status, turn_phase)) = local_lifecycle {
             self.status = status;
             self.turn_phase = turn_phase;
             self.local_turn = true;
-            self.reconciling_request = reconciling_request;
-            self.reconcile_after = reconcile_after;
         }
     }
 
@@ -1232,31 +1230,22 @@ impl ConversationState {
     }
 
     fn apply_snapshot(&mut self, snapshot: &ConversationSnapshot) {
-        self.running = matches!(snapshot.status, TurnStatus::Queued | TurnStatus::Running);
-        self.active_request = self.running.then(|| snapshot.request.clone()).flatten();
-        self.status = match snapshot.status {
-            TurnStatus::Queued => "queued".to_string(),
-            TurnStatus::Running => "agent running".to_string(),
-            TurnStatus::Idle if snapshot.interrupted => {
-                format!("interrupted {}", short_hash(&snapshot.head))
-            }
-            TurnStatus::Idle => format!("updated {}", short_hash(&snapshot.head)),
+        // Running is this process's own fact: a turn it drives runs until the
+        // turn's request returns, whatever the conversation shows meanwhile.
+        if self.local_turn {
+            return;
+        }
+        self.running = false;
+        self.interrupting = false;
+        self.status = match (&snapshot.error, snapshot.interrupted) {
             // A follower never runs the turn, so this status line is the only
             // place it learns why one ended. Recomputed from the snapshot on
             // every poll, so it cannot accumulate the way a transcript row
             // would.
-            TurnStatus::Failed => match snapshot.error.as_deref() {
-                Some(error) => format!("failed: {}", Self::first_line(error)),
-                None => "failed".to_string(),
-            },
-            TurnStatus::Cancelling => "cancelling".to_string(),
+            (Some(error), _) => format!("failed: {}", Self::first_line(error)),
+            (None, true) => format!("interrupted {}", short_hash(&snapshot.head)),
+            (None, false) => format!("updated {}", short_hash(&snapshot.head)),
         };
-        if !self.running {
-            self.interrupting = false;
-            self.reconciling_request = None;
-            self.reconcile_after = None;
-            self.local_turn = false;
-        }
     }
 
     fn current_hash(&self) -> Option<&str> {
@@ -1549,11 +1538,6 @@ enum UiMessage {
     SourceTreeUpdated {
         conversation: String,
         result: Result<(Result<(), String>, Box<ConversationLoad>), String>,
-    },
-    Reconciled {
-        conversation: String,
-        request: String,
-        result: Result<(), String>,
     },
     RemotePolled {
         result: Result<Vec<RemotePollEntry>, String>,
@@ -1858,7 +1842,6 @@ impl App {
             tx,
             rx,
         };
-        app.reconcile_active_requests();
         Ok(app)
     }
 
@@ -1872,48 +1855,6 @@ impl App {
 
     fn transport(&self) -> Result<GitTransport, String> {
         GitTransport::discover(&self.repo_dir)
-    }
-
-    /// Ensure every remotely active request has one process-local join. The
-    /// guard is per request, so unchanged 500ms polls cannot create an
-    /// unbounded set of HTTP waiters. Transport failures retry after a small
-    /// backoff; successful joins stay guarded until the ref becomes terminal.
-    fn reconcile_active_requests(&mut self) -> bool {
-        let now = Instant::now();
-        let repo_dir = self.repo_dir.clone();
-        let tx = self.tx.clone();
-        let mut started = false;
-        for state in &mut self.conversations {
-            if state.local_turn || !state.running {
-                continue;
-            }
-            let Some(request) = state.active_request.clone() else {
-                continue;
-            };
-            if state.reconciling_request.as_deref() == Some(&request)
-                || state.reconcile_after.is_some_and(|after| after > now)
-            {
-                continue;
-            }
-            state.reconciling_request = Some(request.clone());
-            state.reconcile_after = None;
-            let conversation = state.id.clone();
-            let request_to_resume = request.clone();
-            let conversation_to_resume = conversation.clone();
-            spawn(
-                repo_dir.clone(),
-                tx.clone(),
-                move |transport| {
-                    resume_request(transport, &conversation_to_resume, &request_to_resume)
-                },
-                move |result| UiMessage::Reconciled {
-                    conversation,
-                    result,
-                },
-            );
-            started = true;
-        }
-        started
     }
 
     pub(crate) fn should_quit(&self) -> bool {
@@ -2773,22 +2714,6 @@ impl App {
                         }
                     }
                 }
-                UiMessage::Reconciled {
-                    conversation,
-                    result,
-                } => {
-                    if let Some(index) = self.conversation_index(&conversation) {
-                        let state = &mut self.conversations[index];
-                        if state.reconciling_request.as_deref() != Some(&request) {
-                            continue;
-                        }
-                        if let Err(error) = result {
-                            state.reconciling_request = None;
-                            state.reconcile_after = Some(Instant::now() + Duration::from_secs(5));
-                            state.status = format!("recovery retry pending: {error}");
-                        }
-                    }
-                }
                 UiMessage::RemotePolled { result } => {
                     self.remote_polling = false;
                     if let Ok(entries) = result {
@@ -2797,7 +2722,6 @@ impl App {
                 }
             }
         }
-        changed |= self.reconcile_active_requests();
         changed
     }
 
