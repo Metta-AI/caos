@@ -1051,24 +1051,6 @@ fn forward_files(head: &Oid, files: &[(&str, &[u8])]) -> Result<(), String> {
     caos(["put", path(&dir), "/cas/out"])
 }
 
-fn record_response_after_escape(
-    cfg: &Config,
-    state: &mut progress::State,
-    request: &Oid,
-    request_head: &Oid,
-    round: u64,
-) -> Result<(), String> {
-    let record = require_request(&state.conversation()?, request)?;
-    if record.status == TurnStatus::Cancelling && record.round == round {
-        // The shared v3 transition contract currently admits model.complete
-        // only while a request is Running. Once request.escape has changed the
-        // status to Cancelling there is no legal transition that can retain an
-        // assistant response, so finish the required cancellation drain.
-        return drain(state, request);
-    }
-    resume(cfg, state, request, request_head)
-}
-
 #[derive(Clone, Debug)]
 enum Target {
     SourceTree { name: String, commit: Oid },
