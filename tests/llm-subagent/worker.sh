@@ -97,7 +97,7 @@ if [ "$child" = "$child_hex" ] || [ "${#child_hex}" -ne 64 ]; then
   fail "spawn returned invalid child id: $child"
 fi
 case "$child_hex" in *[!0-9a-f]*) fail "spawn returned invalid child id: $child" ;; esac
-expected_child=$($TOOL child-id --parent "$conv" --tool toolu_spawn) \
+expected_child=$($TOOL child-id --parent "$conv" --tool toolu_spawn) || fail "recomputing child id"
 expected_child=${expected_child#child }
 [ "$child" = "$expected_child" ] || fail "child id is not derived from the durable call"
 
