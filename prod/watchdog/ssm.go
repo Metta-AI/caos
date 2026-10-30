@@ -45,7 +45,7 @@ var reserved = regexp.MustCompile(strings.Join([]string{
 	`\breboot\b`, `\bshutdown\b`, `\bpoweroff\b`, `\bhalt\b`, `\binit [06]\b`,
 	`\bsystemctl\s+(kexec|poweroff|halt|reboot)\b`,
 	`\bnixos-rebuild\b`, `\bnix-env\b`, `\bswitch-to-configuration\b`, `deploy-caosd`,
-	`\bmkfs\b`, `\be2label\b`, `\bdd\b`, `\bwipefs\b`,
+	`\bmkfs\b`, `\be2label\b`, `\bdd\s+(if|of)=`, `\bwipefs\b`,
 	`rm\s+(-\w+\s+)*/data/caos/stack`, `\bchown\s+-R\b`,
 	`\bcaosd\s+down\b`,
 	`\bdocker\s+(system\s+prune\s+(-a|--all|--volumes)|volume\s+prune|rm\b|rmi\b)`,

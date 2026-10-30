@@ -121,6 +121,9 @@ in
       group = "caos-watchdog";
       home = stateDir;
       createHome = true;
+      # The responder reads Datadog's monitor state with the same API key the
+      # agent reports with; that file is root:datadog (prod/base.nix).
+      extraGroups = [ "datadog" ];
     };
     # The operator arrives as ssm-user; let them run `caos-watchdog ssh` and
     # read the ledger without sudo.
