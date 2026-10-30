@@ -1335,21 +1335,10 @@ fn parents(
         }
         println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
-            let (request, id) = started_tool.expect("checked as present");
-            let view = Conversation::open(store, &current)?;
-            let request_record = view
-                .turn(request)?
-                .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
-            for round in 0..request_record.round {
-                if view
-                    .tools(request, round)?
-                    .iter()
-                    .any(|tool| tool.id == *id && tool.status == CallStatus::Started)
-                {
-                    found_started_tool = true;
-                    break;
-                }
-            }
+            let id = started_tool.expect("checked as present");
+            found_started_tool = Conversation::open(store, &current)?
+                .tool(id)?
+                .is_some_and(|tool| tool.status == CallStatus::Started);
         }
         let parent = info.parents[0].clone();
         if kind == Kind::ConversationRoot {
@@ -1366,7 +1355,7 @@ fn parents(
             return if found_started_tool {
                 Ok(())
             } else {
-                let (_, id) = started_tool.expect("checked as present");
+                let id = started_tool.expect("checked as present");
                 Err(ToolError::new(format!(
                     "tool {id:?} has no started record on the conversation spine"
                 )))
