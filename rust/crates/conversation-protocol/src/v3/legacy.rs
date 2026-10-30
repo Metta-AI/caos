@@ -525,8 +525,10 @@ mod tests {
 
         let genesis = ensure_genesis(&mut store).unwrap();
         let signature = client_signature("New", "new@example.com", 1_700_000_100);
-        let head =
-            migrate_v5(&mut store, &source, "new", "Carried", None, &genesis, &signature).unwrap();
+        let head = migrate_v5(
+            &mut store, &source, "new", "Carried", None, &genesis, &signature,
+        )
+        .unwrap();
         validate_spine(&store, &head, &mut HashSet::new()).unwrap();
         assert!(!is_v5(&store, &head).unwrap());
 
