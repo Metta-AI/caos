@@ -363,9 +363,9 @@ mod tests {
         };
         assert_eq!(red.verdict(), Some(Standing::Failing));
         assert_eq!(red.summary(), "FAILING: build; pending: test");
-        assert!(render("https://github.com/o/r", "feature", &red).starts_with(
-            "repository https://github.com/o/r  branch feature  head 0123456789ab\n"
-        ));
+        let text = render("r", "f", &red);
+        assert!(text.starts_with("repository r  branch f  head 0123456789ab\n"));
+        assert!(text.ends_with("checks: FAILING: build; pending: test\n"));
     }
 
     #[test]
