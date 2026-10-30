@@ -111,8 +111,7 @@ bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"UserPromptSubmit",session_id
 bare_hook "$(jq -nc --arg s "$o" '{hook_event_name:"Stop",session_id:$s,last_assistant_message:"done"}')" >/dev/null
 head_o=$(head_of "cc/$o")
 [ -n "$head_o" ] || fail "the G3-rooted conversation was never recorded"
-base_arg=$(mcp_base_arg)
-content=$(git rev-parse HEAD)
+content=$(git rev-parse HEAD)  # the commit mcp_base_arg pins
 if git merge-base "$head_o" "$content" >/dev/null; then
   fail "a conversation made without --base shares history with the client repository"
 fi
