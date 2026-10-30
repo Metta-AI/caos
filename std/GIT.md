@@ -30,6 +30,8 @@ for what the operation does not do (read and answer comments, anything else).
 | merge another commit into a source tree | `caos-std/merge` |
 | publish a stack: push every layer, open or update its PRs, link them | `caos-std/stack-publish` |
 | bring a stack up to date with its remote before republishing | `caos-std/stack-sync` |
+| merge a published stack's PRs, bottom to top, each squashed with its `.pr.md` as the commit message | `caos-std/stack-merge` |
+| see what CI says about a branch, a layer or a commit | `caos-std/ci-status` |
 | rename a layer and its `.pr.md` together | `caos-std/move-sed` |
 | push one commit to a GitHub branch | `publish_source` |
 | read and answer PR comments, anything else on GitHub | `caos-std/github` |
