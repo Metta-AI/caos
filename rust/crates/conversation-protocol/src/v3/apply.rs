@@ -276,13 +276,9 @@ pub fn apply(
             child,
         } => {
             let conversation = parent(store, parent_head)?;
-            let request = require_request_running_or_cancelling(&conversation, &tool.request)?;
             canonical_shape(tool, "tool")?;
             canonical_shape(child, "child")?;
-            if conversation
-                .tool(&tool.request, tool.round, &tool.id)?
-                .is_some()
-            {
+            if conversation.tool(&tool.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", tool.id));
             }
             let Some(ToolResult::Complete {
