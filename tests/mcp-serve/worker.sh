@@ -257,13 +257,13 @@ evaluated=$(curl -fsS "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "$locator"
 missing=$(curl -s -o /dev/null -w '%{http_code}' "$CAOS_SERVER_URL/eval?root:@@=$(jq -rn --arg l "${locator%dir=hello}raw=1&dir=nope" '$l|@uri')")
 [ "$missing" = 404 ] || fail "a raw dir that is not there answered $missing, not 404"
 
-echo "== a call still running at Stop keeps its request, and its result ==" >&2
+echo "== a call still running at Stop records its result when it finishes ==" >&2
 # Claude Code moves any MCP call past 120s to the background and ends the turn,
 # so `Stop` fires while the call runs and the result arrives in a later turn --
-# which Claude Code opens with a `UserPromptSubmit`. A Stop that closed the
-# request left the call nowhere to record its completion, and the result reached
-# the model as an EMPTY error ("Task failed: no detail"), while a re-run was an
-# instant memo hit. The sleep stands in for the 120s.
+# which Claude Code opens with a `UserPromptSubmit`. The transcript is flat: the
+# Stop's closing message and the call's result are facts appended as they
+# happen, and nothing the Stop does can leave the call with nowhere to record
+# its completion. The sleep stands in for the 120s.
 mkdir -p slow
 cat > slow/.caos-expr <<EXPR
 HELP=<<END
@@ -294,42 +294,38 @@ send "$(jq -nc --arg session "$held" --arg path "${prefix}slow" --arg request_id
   '{jsonrpc:"2.0",id:30,method:"tools/call",params:{name:"run",arguments:{
     caos_session:$session,caos_tool_use_id:"held-30",path:$path,
     arguments:{seconds:"25","request-id":$request_id}}}}')"
-# The Stop must land AFTER the call is declared, as a backgrounded call's does.
+# The Stop lands while the call runs, as a backgrounded call's does.
 #
-# The STEP declares the call now, on the server, a moment after the request
-# reaches it, so the declaration is not in this checkout's copy of the ref:
-# fetch it. And it is not the newest commit for long -- the step starts the tool
-# right behind it -- so look for it among the last few.
+# The STEP declares and starts the call on the server, a moment after the
+# request reaches it, so it is not in this checkout's copy of the ref: fetch it.
 sync_held() { git fetch -q caos "+$held_ref:$held_ref"; }
-declared=""
+started_call=""
 for _ in $(seq 60); do
   if sync_held 2>/dev/null; then
     case "$(git log -4 --format=%s "$held_ref")" in
-      *model.complete*) declared=yes; break ;;
+      *tool.start*) started_call=yes; break ;;
     esac
   fi
   sleep 1
 done
-if [ -z "$declared" ]; then fail "the call was never declared"; fi
+if [ -z "$started_call" ]; then fail "the call was never started"; fi
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"moved to the background\"}"
-sync_held
-if [ "$(git log -1 --format=%s "$held_ref")" = request.terminal ]; then
-  fail "Stop closed a request whose call was still running"
-fi
 answer=$(await '"id":30' 300) || fail "the held call never answered"
 case "$answer" in
   *'"isError":false'*'slept 25'*|*'slept 25'*'"isError":false'*) ;;
   *) fail "a call that outlived its turn lost its result: $answer" ;;
 esac
-# The turn that delivers the result closes the held request and opens its own,
-# and that one's Stop closes it as usual.
+# The turn that delivers the result is one more prompt, and its Stop one more
+# closing message.
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$held\",\"prompt\":\"the result arrived\"}"
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$held\",\"last_assistant_message\":\"done\"}"
 sync_held
+# Newest first: the second Stop and prompt, the call's completion, the first
+# Stop (which came while the call ran), the call's start, and its declaration.
 subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
 case "$subjects" in
-  "request.terminal model.complete request.claim request.admit message.append request.terminal "*) ;;
-  *) fail "the held request was not closed before the next one opened: $subjects" ;;
+  "message.append message.append tool.complete message.append tool.start message.append message.append conversation.root "*) ;;
+  *) fail "the backgrounded call was not recorded as it happened: $subjects" ;;
 esac
 
 echo "== a started call is declared before its ticket, so the Stop right behind it holds the request ==" >&2
