@@ -6,31 +6,27 @@ caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1
 # shellcheck disable=SC1090
 source /cas/args/common
 
-# Declare one call the way a harness that drives the model itself does, and
-# leave it PENDING. `$head` and `$round` follow the declaration.
+# Declare one call the way a harness that drives the model itself does -- an
+# assistant message carrying the tool_use -- and leave it PENDING. `$head`
+# follows the declaration.
 declare_call() {
   local call=$1 tool=$2 input=$3 output key value
-  round=""
-  output=$($TOOL declare --repo /tmp/repo --head "$head" --request "$request" \
+  output=$($TOOL declare --repo /tmp/repo --head "$head" \
     --actor tester --id "$call" --tool "$tool" --input "$input" \
     --ref "$conversation_ref") || fail "declaring $call"
   while read -r key value; do
-    case "$key" in
-      head) head=$value ;;
-      round) round=$value ;;
-    esac
+    if [ "$key" = head ]; then head=$value; fi
   done <<<"$output"
   assert_oid "$head" "the declared conversation head"
-  [ -n "$round" ] || fail "declare did not report a round"
 }
 
 # Run the step for one declared call. A FRESH ARG TREE each time, naming the
-# admitted request by `--run`: the request itself is one ArgTree, so a second
+# prompt's request by `--run`: the request itself is one ArgTree, so a second
 # call that reused it would be answered from the first's memo.
 #
 # `sub-run` starts the job and returns, so the call's own record is what says
-# it is done -- the request stays running throughout, which is the whole point
-# of the mode and leaves nothing terminal to wait on.
+# it is done: nothing about a turn is recorded, so there is nothing terminal to
+# wait on.
 run_tools_only() {
   local call=$1 arg_tree attempt status
   arg_tree=$(caos prepare-request --base:hash="$llm" --head:commit="$human" \
@@ -42,7 +38,7 @@ run_tools_only() {
       || fail "fetching the conversation after $call"
     head=${head#head }
     assert_oid "$head" "the conversation head after $call"
-    status=$($TOOL tools --repo /tmp/repo --head "$head" --request "$request" \
+    status=$($TOOL tools --repo /tmp/repo --head "$head" \
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     case "$status" in
       complete) return 0 ;;
@@ -51,10 +47,6 @@ run_tools_only() {
     sleep 0.2
   done
   fail "call $call never completed"
-}
-
-request_status() {
-  $TOOL request --repo /tmp/repo --head "$head" --id "$request" | jq -r .status
 }
 
 stage "workspace and a step with no model to call"
@@ -83,10 +75,9 @@ admit_turn "read the greeting, then write a file"
 
 stage "a read the harness declared, run by the step"
 declare_call toolu_read read '{"source_tree":"main","file-path":"greeting.txt"}'
-read_round=$round
 run_tools_only toolu_read
-$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-  --round "$read_round" --id toolu_read > /tmp/read.observation \
+$TOOL tool-observation --repo /tmp/repo --head "$head" \
+  --id toolu_read > /tmp/read.observation \
   || fail "the read call recorded no observation"
 grep -qF "hello tools" /tmp/read.observation || fail "the read did not return the file"
 [ "$(request_status)" = running ] \
@@ -95,11 +86,9 @@ grep -qF "hello tools" /tmp/read.observation || fail "the read did not return th
 stage "a second call, in its own run, mutating the source tree"
 declare_call toolu_write run_tool \
   '{"arguments":{"cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
-write_round=$round
-[ "$write_round" != "$read_round" ] || fail "the second call declared the same round"
 run_tools_only toolu_write
-$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-  --round "$write_round" --id toolu_write > /tmp/write.observation \
+$TOOL tool-observation --repo /tmp/repo --head "$head" \
+  --id toolu_write > /tmp/write.observation \
   || fail "the bash call recorded no observation"
 grep -qF 'exit: 0' /tmp/write.observation \
   || fail "the bash call did not report a successful exit"
