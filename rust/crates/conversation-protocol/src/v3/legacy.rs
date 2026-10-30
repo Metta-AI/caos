@@ -105,11 +105,6 @@ pub fn migrate_v5(
     };
     let applied = apply(store, None, &root)?;
     let mut head = mint(store, parent, &applied, root.kind(), signature)?;
-    let mut append = |store: &mut dyn ObjectStore, head: &mut Oid, transition: Transition| {
-        let applied = apply(store, Some(head), &transition)?;
-        *head = mint(store, head, &applied, transition.kind(), signature)?;
-        Ok::<(), String>(())
-    };
 
     for (ordinal, (entry, entry_payloads)) in entries.into_iter().enumerate() {
         let ordinal = ordinal as u64;
@@ -128,7 +123,7 @@ pub fn migrate_v5(
             let Some(transition) = carried_call(&tools, &payloads, &call, &message_id)? else {
                 continue;
             };
-            append(store, &mut head, transition)?;
+            append(store, &mut head, transition, signature)?;
         }
     }
 
