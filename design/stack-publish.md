@@ -176,8 +176,8 @@ pushes and the report costs a few reads.
   names the call, because a merge can conflict and resolving one is the
   agent's work.
 - Squash, rewrite or mint commits, or delete branches.
-- Merge PRs. That is a reviewer's decision; GitHub's asynchronous merge API
-  for stacks is the next tool, not this one.
+- Merge PRs. That is a reviewer's decision, and `stack-merge-to-master`
+  (below) is the tool for it.
 - Publish to a remote it cannot lease on. The pushes have the same guards as
   `publish-source`: fast-forward unless `force`, `.gitignore` check unless
   `allow-ignored`, a `.caos/conflicts` ledger is the agent's to clear first.
