@@ -43,17 +43,19 @@ impl<'s> Conversation<'s> {
         if info.parents.is_empty() {
             return Err(format!("conversation commit {commit} must have a parent"));
         }
-        let kind = Kind::parse_message(&info.message)?;
-        let conversation = Conversation {
+        let mut conversation = Conversation {
             store,
             execution: OnceCell::new(),
             commit: Some(commit.clone()),
             parent: info.parents.first().cloned(),
-            kind: Some(kind),
+            kind: None,
             tree: info.tree.clone(),
             snapshot: Snapshot::new(store, info.tree),
         };
+        // The format before the kind: a conversation of an older format names
+        // kinds this build no longer has, and its format says why.
         conversation.require_format()?;
+        conversation.kind = Some(Kind::parse_message(&info.message)?);
         Ok(conversation)
     }
 
