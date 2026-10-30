@@ -2584,8 +2584,6 @@ impl App {
                             .and_then(|transport| state.reload(transport, &user));
                         if refreshed.is_none() {
                             state.running = false;
-                            state.active_request = None;
-                            state.reconciling_request = None;
                             state.remote_head = None;
                         }
                         state.restore_pending_submission(pending_id);
@@ -2936,9 +2934,6 @@ impl App {
         state.running = false;
         state.interrupting = false;
         state.local_turn = false;
-        state.active_request = None;
-        state.reconciling_request = None;
-        state.reconcile_after = None;
         state.sidebar_attention = None;
         state.status = if outcome.interrupted {
             format!("interrupted {}", outcome.short_commit)
