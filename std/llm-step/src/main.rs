@@ -2373,7 +2373,6 @@ fn spawn_agent_call(
     state: &mut progress::State,
     site: &CallSite<'_>,
 ) -> Result<bool, String> {
-    let request = site.request;
     let call = site.call;
     let prompt = match subagents::required_string(&call.value(), "prompt", subagents::SPAWN_TOOL) {
         Ok(prompt) => prompt.to_string(),
@@ -2398,9 +2397,9 @@ fn spawn_agent_call(
     let parent_id = parent_view.identity()?.id;
     let actor = newest_user_actor(&parent_view)?;
 
-    let prompt_path = tool_arguments_path(&parent_view, request, site.round, &call.id)?;
+    let prompt_path = tool_arguments_path(&parent_view, &call.id)?;
     drop(parent_view);
-    let child_id = ids::child_id(&parent_id, request, site.round, &call.id)?;
+    let child_id = ids::child_id(&parent_id, &call.id)?;
     let signature = inherited_signature(state.store(), &parent_head)?;
     let genesis = conversation_protocol::v3::oid::ensure_genesis(state.store_mut())?;
     let view = state.conversation()?;
@@ -2432,8 +2431,6 @@ fn spawn_agent_call(
             owner: Some(Owner {
                 parent: parent_id,
                 parent_head: parent_head.clone(),
-                request: request.clone(),
-                round: site.round,
                 tool: call.id.clone(),
             }),
         },
@@ -2455,8 +2452,6 @@ fn spawn_agent_call(
             conversation: child_id.clone(),
             role: Role::User,
             actor,
-            request: None,
-            round: None,
             model: None,
             blocks: vec![Block::Text {
                 text: prompt.clone(),
@@ -2512,8 +2507,6 @@ fn spawn_agent_call(
         request: child_request.clone(),
         relay: relay.clone(),
         spawn_intent: SpawnIntent {
-            request: request.clone(),
-            round: site.round,
             tool: call.id.clone(),
             prompt: prompt_path,
             model: cfg.model.clone(),
@@ -2609,8 +2602,6 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     };
     validate_child_relay(state, &child)?;
     let started = CallRecord {
-        request: site.request.clone(),
-        round: site.round,
         id: call.id.clone(),
         name: call.name.clone(),
         declaration_message: site.declaration.to_string(),
@@ -2633,7 +2624,7 @@ fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<b
     )? {
         progress::TryAppend::HeadChanged(_) => Ok(true),
         progress::TryAppend::Appended(_) => {
-            dispatch_wait_started(state, site.request, site.round, call, &started)?;
+            dispatch_wait_started(state, site.request, call, &started)?;
             Ok(false)
         }
     }
