@@ -52,8 +52,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
                 conversation: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
-                request: None,
-                round: None,
                 model: None,
                 blocks: vec![Block::Payload {
                     path: format!("{}/body", paths::transcript_payload_dir(0, "user-0")),
@@ -189,31 +187,19 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &signature,
     );
 
-    let second_calls = vec![
-        DeclaredCall {
-            id: "spawn-call".to_string(),
-            name: "spawn_agent".to_string(),
-        },
-        DeclaredCall {
-            id: "async-call".to_string(),
-            name: "run_async".to_string(),
-        },
-    ];
     commit(
         store,
         &mut head,
-        model_complete(
-            &request,
-            1,
+        assistant_message(
             3,
             "assistant-2",
-            &second_calls,
+            &[("spawn-call", "spawn_agent"), ("async-call", "run_async")],
             "golden-conversation",
         ),
         &signature,
     );
     let child_id =
-        ids::child_id("golden-conversation", &request, 1, "spawn-call").expect("derive child id");
+        ids::child_id("golden-conversation", "spawn-call").expect("derive child id");
     let spawn_observation = format!(
         "{}/observation",
         paths::call_payload_dir("spawn-call")
@@ -237,6 +223,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     let child = ChildRecord {
         id: child_id.clone(),
         initial_head: head.clone(),
+        request: oid('1'),
         relay: oid('3'),
         spawn_intent: SpawnIntent {
             tool: "spawn-call".to_string(),
@@ -276,14 +263,12 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        Transition::TurnInterject {
+        Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "interjection-3".to_string(),
                 conversation: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
-                request: Some(request.clone()),
-                round: Some(2),
                 model: None,
                 blocks: vec![Block::Text {
                     text: "One more detail".to_string(),
@@ -320,17 +305,6 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         store,
         &mut head,
         assistant_message(5, "assistant-4", &[], "golden-conversation"),
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnTerminal {
-            outcome: TurnOutcome::Idle {
-                result: None,
-                interrupted: false,
-            },
-        },
         &signature,
     );
     commit(
