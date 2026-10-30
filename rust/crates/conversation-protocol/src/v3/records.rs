@@ -1028,8 +1028,6 @@ mod tests {
 
     fn spawn_intent() -> SpawnIntent {
         SpawnIntent {
-            request: oid('1'),
-            round: 2,
             tool: "tool-1".into(),
             prompt: ".caos/tools/prompt".into(),
             model: "model".into(),
@@ -1091,8 +1089,6 @@ mod tests {
         let owner = Owner {
             parent: "parent".to_string(),
             parent_head: oid('a'),
-            request: oid('b'),
-            round: 3,
             tool: "tool".to_string(),
         };
         round_trip!(Owner, owner.clone());
@@ -1203,8 +1199,6 @@ mod tests {
                     conversation: "conversation".to_string(),
                     role,
                     actor: "actor".to_string(),
-                    request: Some(oid('1')),
-                    round: Some(0),
                     model: Some("model".to_string()),
                     blocks: vec![Block::Text {
                         text: "text".to_string()
@@ -1214,70 +1208,6 @@ mod tests {
                 }
             );
         }
-        round_trip!(
-            DeclaredCall,
-            DeclaredCall {
-                id: "tool-1".to_string(),
-                name: "shell".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn request_status_variants_round_trip() {
-        let base = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "configuration-hash".to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        };
-        round_trip!(TurnRecord, base.clone());
-        round_trip!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Running,
-                latest_message: Some("message-1".to_string()),
-                ..base.clone()
-            }
-        );
-        round_trip!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Cancelling,
-                latest_message: Some("message-1".to_string()),
-                escape_reason: Some("stop".to_string()),
-                ..base.clone()
-            }
-        );
-        round_trip!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Idle,
-                escape_reason: Some("stop".to_string()),
-                outcome: Some(TurnOutcome::Idle {
-                    result: Some(".caos/requests/result".to_string()),
-                    interrupted: true,
-                }),
-                ..base.clone()
-            }
-        );
-        round_trip!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Failed,
-                outcome: Some(TurnOutcome::Failed {
-                    error: ".caos/requests/error".to_string()
-                }),
-                ..base
-            }
-        );
     }
 
     #[test]
@@ -1287,43 +1217,6 @@ mod tests {
         round_trip!(SpawnIntent, intent.clone());
         intent.configuration.clear();
         assert!(SpawnIntent::from_value(&intent.to_value()).is_err());
-
-        let mut request = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "opaque value that is not a tree path".to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        };
-        round_trip!(TurnRecord, request.clone());
-        request.configuration.clear();
-        assert!(TurnRecord::from_value(&request.to_value()).is_err());
-    }
-
-    #[test]
-    fn failed_requests_forbid_escape_reason() {
-        let request = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "configuration-hash".to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Failed,
-            latest_message: None,
-            escape_reason: Some("stop".to_string()),
-            outcome: Some(TurnOutcome::Failed {
-                error: ".caos/requests/error".to_string(),
-            }),
-        };
-        assert!(TurnRecord::from_value(&request.to_value()).is_err());
     }
 
     #[test]
@@ -1346,8 +1239,6 @@ mod tests {
         let owner = Owner {
             parent: "parent".to_string(),
             parent_head: oid('a'),
-            request: oid('b'),
-            round: 0,
             tool: "tool".to_string(),
         };
         let merge = MergeInfo {
@@ -1358,22 +1249,7 @@ mod tests {
             output: Some(oid('d')),
             conflict_paths: None,
         };
-        let request = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "configuration".to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        };
         let tool = CallRecord {
-            request: oid('1'),
-            round: 0,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             declaration_message: "message-1".to_string(),
@@ -1441,22 +1317,12 @@ mod tests {
                 conversation: "conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
-                request: None,
-                round: None,
                 model: None,
                 blocks: Vec::new(),
                 proposal: None,
                 source_tree_resolution: None,
             }
         );
-        rejects_unknown!(
-            DeclaredCall,
-            DeclaredCall {
-                id: "tool-1".to_string(),
-                name: "shell".to_string(),
-            }
-        );
-        rejects_unknown!(TurnRecord, request);
         rejects_unknown!(
             ToolResult,
             ToolResult::Cancelled {
@@ -1521,51 +1387,13 @@ mod tests {
             conversation: "conversation".to_string(),
             role: Role::User,
             actor: "user".to_string(),
-            request: None,
-            round: None,
             model: None,
             blocks: Vec::new(),
             proposal: None,
             source_tree_resolution: None,
         };
-        rejects_null!(TranscriptEntry, transcript.clone(), "request");
-        rejects_null!(TranscriptEntry, transcript.clone(), "round");
         rejects_null!(TranscriptEntry, transcript, "model");
 
-        let queued = TurnRecord {
-            id: oid('1'),
-            request_head: oid('2'),
-            model: "model".to_string(),
-            configuration: "configuration".to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        };
-        rejects_null!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Running,
-                latest_message: Some("message-1".to_string()),
-                ..queued.clone()
-            },
-            "latest_message"
-        );
-        rejects_null!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Idle,
-                outcome: Some(TurnOutcome::Idle {
-                    result: None,
-                    interrupted: false,
-                }),
-                ..queued.clone()
-            },
-            "escape_reason"
-        );
         for key in ["target_ref", "result", "error", "reason"] {
             let mut value = AsyncRecord {
                 task: oid('1'),
@@ -1628,21 +1456,7 @@ mod tests {
             },
             "current"
         );
-        rejects_missing!(
-            TurnRecord,
-            TurnRecord {
-                status: TurnStatus::Idle,
-                outcome: Some(TurnOutcome::Idle {
-                    result: None,
-                    interrupted: false,
-                }),
-                ..queued
-            },
-            "result"
-        );
         let started_tool = CallRecord {
-            request: oid('1'),
-            round: 0,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             declaration_message: "message-1".to_string(),
@@ -1699,8 +1513,6 @@ mod tests {
                     proposal: None,
                 }),
                 ..CallRecord {
-                    request: oid('1'),
-                    round: 0,
                     id: "tool-1".to_string(),
                     name: "shell".to_string(),
                     declaration_message: "message-1".to_string(),
@@ -1721,8 +1533,6 @@ mod tests {
     #[test]
     fn tool_status_variants_round_trip() {
         let base = CallRecord {
-            request: oid('1'),
-            round: 0,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             declaration_message: "message-1".to_string(),
@@ -1863,9 +1673,6 @@ mod tests {
             "Title"
         );
         assert!(encode_title("").is_err());
-        assert!(encode_title("bad\n").is_err());
-        let hash = oid('a');
-        assert_eq!(parse_active_turn(&hash.encode_line()), Ok(hash));
         assert!(parse_active_turn(b"aaaa\n").is_err());
         assert!(Owner::from_value(&obj(&[("unknown", Value::Null)])).is_err());
         assert!(Evidence::from_value(&obj(&[("kind", value_str("push-success"))])).is_ok());
