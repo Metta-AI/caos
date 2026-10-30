@@ -1,12 +1,13 @@
 //! `--record=<prompt|stop|failure>`: write a harness's events on a conversation.
 //!
 //! A harness that drives the model itself (Claude Code, Hermes) reports three
-//! things to a conversation: the prompt a person typed, the end of a turn, and a
-//! turn that ended badly. `caos mcp hook` used to write those from the harness's
-//! own checkout, with `apply` and a compare-and-swap push. They are the same
-//! transitions this step already writes for a turn it drives, so they are modes
-//! of the step: a hook sends one request and needs no git, no checkout and no
-//! conversation of its own.
+//! things to a conversation: the prompt a person typed, the message that ended
+//! a turn, and a turn that ended badly. Each is one fact appended to the
+//! transcript, and nothing else: the conversation keeps no turn, round or
+//! request state, so there is nothing to open, hold or close. A harness that
+//! backgrounds a slow call and carries on is recorded the same way as one that
+//! does not -- the call's `tool_use` and its result are facts appended whenever
+//! they happen.
 //!
 //! EVERY EVENT CARRIES ITS OWN MESSAGE ID, chosen by the caller. A repeat of an
 //! event (a retried hook, a request answered twice) names the id the first one
@@ -19,27 +20,23 @@
 //! - `created`: the first prompt, which made the conversation
 //! - `forked`: the first prompt, which made the conversation as a fork of `from`
 //! - `recorded`: the event was written (or had been already)
-//! - `joined`: a prompt that joined a request still held open for a running call
-//! - `held`: a stop that left its request open because a call is still running
-//! - `nothing`: a stop or failure with no active request to close
+//! - `nothing`: a stop with no closing message to record
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use conversation_protocol::v3::apply::{
-    apply, client_signature, inherited_signature, mint, mint_with_parents, Transition,
-};
+use conversation_protocol::v3::apply::{apply, client_signature, mint, mint_with_parents, Transition};
 use conversation_protocol::v3::oid::ensure_genesis;
 use conversation_protocol::v3::reconcile::MergeOutcome;
 use conversation_protocol::v3::tree::{ObjectStore, TreeBuilder};
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    paths, Block, CallStatus, GitStore, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
-    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
+    paths, Block, GitStore, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
+    TranscriptEntry,
 };
-use worker_common::{arg, cas_hash, caos_curry, read_arg, read_arg_opt, Arg};
+use worker_common::{read_arg, read_arg_opt};
 
 use crate::progress::{self, State, TryAppend};
-use crate::{forward_files, message_ordinal, mint_detached};
+use crate::{forward_files, message_ordinal};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
