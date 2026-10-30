@@ -357,10 +357,6 @@ pub struct TranscriptEntry {
     pub role: Role,
     pub actor: String,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    pub request: Option<Oid>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
-    pub round: Option<u64>,
-    #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
     pub model: Option<String>,
     pub blocks: Vec<Block>,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
