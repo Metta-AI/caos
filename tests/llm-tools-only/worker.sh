@@ -80,8 +80,6 @@ $TOOL tool-observation --repo /tmp/repo --head "$head" \
   --id toolu_read > /tmp/read.observation \
   || fail "the read call recorded no observation"
 grep -qF "hello tools" /tmp/read.observation || fail "the read did not return the file"
-[ "$(request_status)" = running ] \
-  || fail "a tools-only run left the request $(request_status), not running"
 
 stage "a second call, in its own run, mutating the source tree"
 declare_call toolu_write run_tool \
@@ -100,9 +98,13 @@ fetch_code "$workspace" "fetching the source tree the tools produced"
 [ "$(git show "$workspace:greeting.txt")" = "hello tools" ] \
   || fail "the source tree lost the file it started with"
 
-stage "the request is still the harness's to end"
-[ "$(request_status)" = running ] \
-  || fail "the request ended without anyone terminating it"
+stage "nothing but the facts is recorded"
+# The prompt and the two declarations: a tools-only run ends nothing, and
+# records no turn of its own.
+roles=$($TOOL transcript --repo /tmp/repo --head "$head" \
+  | while read -r _ role _; do printf '%s\n' "$role"; done | paste -sd,)
+[ "$roles" = user,assistant,assistant ] \
+  || fail "the transcript is $roles, not the prompt and two declarations"
 assert_spine "$head"
 [ ! -f /tmp/stub/request-1.json ] || fail "a tools-only run called the model"
 
