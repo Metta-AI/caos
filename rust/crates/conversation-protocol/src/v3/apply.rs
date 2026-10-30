@@ -204,8 +204,10 @@ pub fn apply(
         }
         Transition::MessageAppend { entry, payloads } => {
             let conversation = parent(store, parent_head)?;
-            if !matches!(entry.role, Role::User | Role::System) {
-                return Err("message.append requires a user or system entry".to_string());
+            if entry.role == Role::Assistant {
+                validate_declared_calls(&conversation, entry)?;
+            } else if entry.tool_uses().next().is_some() {
+                return Err("only an assistant message declares tool calls".to_string());
             }
             let next = conversation.transcript_len()?;
             validate_entry_resolution(&conversation, entry, &mut builder)?;
