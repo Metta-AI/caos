@@ -43,6 +43,13 @@ cat /data/caos/stack/iroh/ticket
 - `caos-watchdog ticket --refresh` re-reads the iroh ticket from the host.
 - `git ls-remote $(caos-watchdog ticket)` is the client-side truth:
   if this works, users can reach the server.
+- `journalctl -u caos-watchdog-probe --since -30min --no-pager -o cat` is
+  the probe's own account, on THIS box: each line is one check with its
+  error text and timing. Read it first when a `caos.probe.*` monitor is
+  what alerted; the Datadog state in your prompt does not carry it.
+- `caos-cli run --base:@@="git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello" --date=$(date -u +%FT%TZ)`
+  from `/var/lib/caos-watchdog/probe-repo` reproduces the run probe by
+  hand; the sha is `$CAOS_WATCHDOG_HELLO_REV`.
 - `aws ec2 describe-instance-status` / `aws ssm describe-instance-information`
   for the machine's view from outside.
 
