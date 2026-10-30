@@ -167,7 +167,7 @@ fn observe(repository: &str, branch: &str, token: Option<&str>) -> Result<Option
 }
 
 /// The number of a merged pull request whose head was `branch`, if any.
-fn merged_pr(github: &Github, branch: &str) -> Result<Option<u64>, String> {
+pub(super) fn merged_pr(github: &Github, branch: &str) -> Result<Option<u64>, String> {
     let found = github.expect(
         "GET",
         &github.repo_path(&format!(

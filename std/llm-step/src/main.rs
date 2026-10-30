@@ -1,10 +1,12 @@
 //! The agent turn driver for the v3 conversation protocol.
 
 mod async_work;
+mod ci_status;
 mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod stack_merge_to_master;
 mod stack_publish;
 mod stack_sync;
 mod record;
@@ -1442,6 +1444,8 @@ fn run_op(
         ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
         ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
         ("stack-sync", _) => stack_sync::execute(state, site).map(|()| true),
+        ("stack-merge-to-master", _) => stack_merge_to_master::execute(state, site).map(|()| true),
+        ("ci-status", _) => ci_status::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
