@@ -492,11 +492,9 @@ fn username() -> Result<String, String> {
 /// Record a user's prompt, creating the conversation on the session's first one;
 /// the step's status says what happened (`created`, `forked`, `recorded`, ...).
 ///
-/// The step makes the message, the request it opens, and the claim that puts the
-/// request in `running`, in one compare-and-swap. The claim is not a shortcut:
-/// v3 requires it before any tool may be recorded, and Claude Code has already
-/// begun the turn by the time this hook fires, so no runner will pick the
-/// request up.
+/// The step appends the message and nothing else: a conversation keeps no turn
+/// state, so there is no request to open before Claude Code's calls are
+/// recorded.
 ///
 /// A NEW conversation needs where it starts from, which the step cannot find for
 /// itself: `from`, the commit it forks, and the locator naming its content. With
