@@ -74,6 +74,30 @@ in
   config = {
     system.stateVersion = "25.11";
 
+    # nixpkgs at this pin cannot build datadog-agent: integrations-core
+    # names each check by its directory suffix (pname "checks-base") while
+    # the wheel it installs is "datadog-checks-base", and the python
+    # metadata-check hook, new in this nixpkgs, refuses the mismatch:
+    #   PackageNotFoundError: No package metadata was found for checks-base
+    # Upstream bug in pkgs/tools/networking/dd-agent/integrations-core.nix.
+    # Until it is fixed there, build the integrations with that one check
+    # off. The attrset update (not overrideScope) keeps every other python
+    # package the cached one.
+    nixpkgs.overlays = [
+      (final: prev: {
+        datadog-integrations-core =
+          extras:
+          final.callPackage "${prev.path}/pkgs/tools/networking/dd-agent/integrations-core.nix" {
+            extraIntegrations = extras;
+            python3Packages = final.python3Packages // {
+              buildPythonPackage =
+                args: final.python3Packages.buildPythonPackage (args // { dontCheckPythonMetadata = true; });
+            };
+          };
+        datadog-agent = prev.datadog-agent.override { pythonPackages = final.datadog-integrations-core { }; };
+      })
+    ];
+
     # A flake-managed machine must NOT also be user-data-managed. The NixOS EC2
     # image runs amazon-init on EVERY boot, which copies user-data over
     # /etc/nixos/configuration.nix and switches to it -- silently reverting any
@@ -104,6 +128,21 @@ in
       # while the branch had moved on, until --refresh was passed. These are
       # deploy targets told to fetch, not build farms keeping an index warm.
       tarball-ttl = 5;
+
+      # A private binary cache in the account, so a host never has to BUILD
+      # caos: the Rust workspace is hours on a t3.small and minutes even on
+      # the server. A deploy builds on a workstation (or the server) and
+      # pushes; the host substitutes. Reads go through the instance role
+      # (s3:GetObject on the bucket); pushes need the signing key, kept in
+      # Secrets Manager as caos/nix-cache-signing-key. See prod/README.md.
+      substituters = [
+        "s3://caos-nix-cache-109251245574?region=us-east-1"
+        "https://cache.nixos.org"
+      ];
+      trusted-public-keys = [
+        "caos-cache-1:3BSj35RzBLAtUyTlJlLO3xa9b7uYFtIJIx17Jri8lPs="
+        "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+      ];
     };
 
     # Docker gives every container a host-side veth. dhcpcd treats it as an
