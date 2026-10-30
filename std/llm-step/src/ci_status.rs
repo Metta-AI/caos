@@ -146,7 +146,9 @@ impl Checks {
         match self.verdict() {
             None => "no checks".to_string(),
             Some(Standing::Passing) => format!("{passing} passing"),
-            Some(Standing::Pending) => format!("pending: {} ({passing} passing)", pending.join(", ")),
+            Some(Standing::Pending) => {
+                format!("pending: {} ({passing} passing)", pending.join(", "))
+            }
             Some(Standing::Failing) => {
                 let mut text = format!("FAILING: {}", failing.join(", "));
                 if !pending.is_empty() {
