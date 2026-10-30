@@ -290,7 +290,11 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     };
     match read(&github, &reference) {
         Ok(checks) => {
-            let block = result_block(&site.call.id, &render(&repository, &reference, &checks), false);
+            let block = result_block(
+                &site.call.id,
+                &render(&repository, &reference, &checks),
+                false,
+            );
             site.complete(state, block, None, None, None)
         }
         Err(error) => site.fail(state, &format!("ci-status: {error}")),
