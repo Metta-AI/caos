@@ -1249,7 +1249,10 @@ fn replay_from(
                 name: call_name.to_string(),
                 summary: {
                     let text = tool_call_summary(call_name, &args);
-                    match tool.as_ref().and_then(|tool| tool.source_tree_name.as_ref()) {
+                    match tool
+                        .as_ref()
+                        .and_then(|tool| tool.source_tree_name.as_ref())
+                    {
                         Some(name) if conversation.source_tree_names()?.len() > 1 => {
                             format!("[{name}] {text}")
                         }
