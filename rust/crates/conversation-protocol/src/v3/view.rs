@@ -225,8 +225,6 @@ impl<'s> Conversation<'s> {
                         Event::Tool(record) => {
                             result
                                 .tools
-                                .entry((record.request.clone(), record.round))
-                                .or_default()
                                 .entry(record.id.clone())
                                 .or_insert(record);
                         }
@@ -269,56 +267,15 @@ impl<'s> Conversation<'s> {
         Ok(self.execution.get().expect("loaded"))
     }
 
-    pub fn latest_turn(&self) -> Result<Option<TurnRecord>, String> {
-        let execution = self.execution()?;
-        Ok(execution
-            .latest_turn
-            .as_ref()
-            .and_then(|id| execution.turns.get(id))
-            .map(|(_, r)| r.clone()))
+    /// The record of the call with this id, in this conversation or inherited by
+    /// a fork. A call id is unique within a conversation.
+    pub fn tool(&self, id: &str) -> Result<Option<CallRecord>, String> {
+        Ok(self.execution()?.tools.get(id).cloned())
     }
 
-    pub fn active_turn(&self) -> Result<Option<TurnRecord>, String> {
-        Ok(self.latest_turn()?.filter(|r| {
-            matches!(
-                r.status,
-                super::TurnStatus::Queued
-                    | super::TurnStatus::Running
-                    | super::TurnStatus::Cancelling
-            )
-        }))
-    }
-
-    pub fn turn(&self, id: &Oid) -> Result<Option<TurnRecord>, String> {
-        Ok(self.execution()?.turns.get(id).map(|(_, r)| r.clone()))
-    }
-
-    pub fn turn_ids(&self) -> Result<Vec<Oid>, String> {
-        Ok(self
-            .execution()?
-            .turns
-            .iter()
-            .filter(|(_, (context, _))| *context)
-            .map(|(id, _)| id.clone())
-            .collect())
-    }
-
-    pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<CallRecord>, String> {
-        Ok(self
-            .execution()?
-            .tools
-            .get(&(request.clone(), round))
-            .and_then(|tools| tools.get(id))
-            .cloned())
-    }
-
-    pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<CallRecord>, String> {
-        Ok(self
-            .execution()?
-            .tools
-            .get(&(request.clone(), round))
-            .map(|tools| tools.values().cloned().collect())
-            .unwrap_or_default())
+    /// Every call record, by id.
+    pub fn tools(&self) -> Result<Vec<CallRecord>, String> {
+        Ok(self.execution()?.tools.values().cloned().collect())
     }
 
     pub fn transcript_len(&self) -> Result<u64, String> {
