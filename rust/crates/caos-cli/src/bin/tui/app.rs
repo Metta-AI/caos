@@ -9,12 +9,11 @@ use caos_cli::{
     archive_user_conversation, compare_and_set_conversation_title, conversation_load,
     conversation_load_at, conversation_ref, conversation_snapshot, default_title,
     describe_tool_set, fork_conversation, generate_conversation_title, interrupt_conversation,
-    invite_user_to_conversation, list_user_conversations, publish_user_conversation,
-    run_chat_turn, set_conversation_title, submit_interjection,
-    unarchive_user_conversation, ConversationLoad, ConversationRole, ConversationSnapshot,
-    InviteOutcome, PublicationSummary, SourceTreeDiff, ToolSetDescription, TurnEvent, TurnOptions,
-    TurnOutcome, TurnPhase, UserConversationStatus, UserConversationSummary,
-    DEFAULT_MODEL,
+    invite_user_to_conversation, list_user_conversations, publish_user_conversation, run_chat_turn,
+    set_conversation_title, submit_interjection, unarchive_user_conversation, ConversationLoad,
+    ConversationRole, ConversationSnapshot, InviteOutcome, PublicationSummary, SourceTreeDiff,
+    ToolSetDescription, TurnEvent, TurnOptions, TurnOutcome, TurnPhase, UserConversationStatus,
+    UserConversationSummary, DEFAULT_MODEL,
 };
 use ratatui_core::buffer::{Buffer, CellWidth};
 use ratatui_core::layout::Rect;
