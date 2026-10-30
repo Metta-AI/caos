@@ -25,6 +25,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use conversation_protocol::v3::apply::{apply, client_signature, mint, mint_with_parents, Transition};
+use conversation_protocol::v3::legacy;
 use conversation_protocol::v3::oid::ensure_genesis;
 use conversation_protocol::v3::reconcile::MergeOutcome;
 use conversation_protocol::v3::tree::{ObjectStore, TreeBuilder};
@@ -231,21 +232,12 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
 /// The tree a conversation's content was seeded from: its root's tree, found by
 /// following first parents from `head`, without the conversation's own .caos/.
 fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
-    let mut current = head.clone();
-    loop {
-        let info = store.read_commit(&current).map_err(String::from)?;
-        use conversation_protocol::v3::Kind as CommitKind;
-        if CommitKind::parse_message(&info.message)? == CommitKind::ConversationRoot {
-            let mut tree = TreeBuilder::from(Some(info.tree));
-            tree.delete(paths::CAOS_DIR);
-            return Ok(tree.build(store)?);
-        }
-        current = info
-            .parents
-            .first()
-            .cloned()
-            .ok_or_else(|| format!("{current} has no parent before its conversation's root"))?;
-    }
+    // By kind name, so a v5 source (whose history holds kinds this build no
+    // longer has) is walked too.
+    let root = legacy::conversation_root(store, head)?;
+    let mut tree = TreeBuilder::from(Some(store.read_commit(&root).map_err(String::from)?.tree));
+    tree.delete(paths::CAOS_DIR);
+    Ok(tree.build(store)?)
 }
 
 /// Make the conversation as a FORK of `from`, with its first prompt: the fork,
@@ -262,7 +254,13 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         return Ok(None);
     }
     store.ensure_local(from)?;
-    if Conversation::open(&store, from)?.identity()?.id == conversation {
+    // A v5 source cannot be read as it stands; it is carried over instead.
+    let v5 = legacy::is_v5(&store, from)?;
+    let source_id = match v5 {
+        true => legacy::v5_id(&store, from)?,
+        false => Conversation::open(&store, from)?.identity()?.id,
+    };
+    if source_id == conversation {
         return Err("a fork's id must differ from its source conversation".to_string());
     }
     let signature = signature(&request.actor)?;
@@ -301,26 +299,38 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         }
         None => (None, Vec::new()),
     };
-    let transition = Transition::ConversationFork {
-        identity: Identity {
-            id: conversation.to_string(),
-            kind: IdentityKind::Fork {
-                source: from.clone(),
+    let title = format!("fork of {}", &from.as_str()[..12]);
+    let forked = if v5 {
+        // Rebuilt as a new root from the v5 conversation (`legacy`), parented on
+        // the content commit as a new conversation is, so a later fork finds the
+        // base to merge that repository's newer commit in from.
+        let parent = match merged.first() {
+            Some(commit) => commit.clone(),
+            None => ensure_genesis(&mut store)?,
+        };
+        legacy::migrate_v5(&mut store, from, conversation, &title, content, &parent, &signature)?
+    } else {
+        let transition = Transition::ConversationFork {
+            identity: Identity {
+                id: conversation.to_string(),
+                kind: IdentityKind::Fork {
+                    source: from.clone(),
+                },
+                owner: None,
             },
-            owner: None,
-        },
-        title: format!("fork of {}", &from.as_str()[..12]),
-        content,
+            title,
+            content,
+        };
+        let applied = apply(&mut store, Some(from), &transition)?;
+        mint_with_parents(
+            &mut store,
+            from,
+            &merged,
+            &applied,
+            transition.kind(),
+            &signature,
+        )?
     };
-    let applied = apply(&mut store, Some(from), &transition)?;
-    let forked = mint_with_parents(
-        &mut store,
-        from,
-        &merged,
-        &applied,
-        transition.kind(),
-        &signature,
-    )?;
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
     let claimed = mint_prompt(state.store_mut(), &forked, conversation, request, &signature)?;
     let active = conversation_protocol::v3::refs::active_membership_ref(&request.actor, conversation)?;
