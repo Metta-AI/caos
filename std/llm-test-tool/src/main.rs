@@ -1234,6 +1234,10 @@ fn text_blocks(blocks: &[Block]) -> String {
         .join("\n\n")
 }
 
+/// Wait for the turn `request` answers to end, as the transcript shows it: the
+/// prompt the request's `head` names has an answer (an assistant message with no
+/// call and no newer prompt after it), or an interruption after it (`idle`), or
+/// the step's own failure message (`failed`).
 fn wait_terminal(
     repo: &Path,
     refname: &str,
@@ -1241,6 +1245,13 @@ fn wait_terminal(
     timeout_secs: u64,
 ) -> Result<(), ToolError> {
     let store = open(repo)?;
+    let prompt_head = required_entry(
+        &store.read_tree(request).map_err(String::from)?,
+        "head",
+        request,
+    )?
+    .oid
+    .clone();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut seen = None;
     while Instant::now() < deadline {
@@ -1253,41 +1264,20 @@ fn wait_terminal(
                     continue;
                 };
                 seen = Some(head.clone());
-                let view = Conversation::open(&store, &head)?;
-                if let Some(record) = view.turn(request)? {
-                    match record.status {
-                        TurnStatus::Idle => {
-                            println!("head {head}");
-                            println!("status idle");
-                            return Ok(());
-                        }
-                        TurnStatus::Failed => {
-                            let error = match record.outcome {
-                                Some(TurnOutcome::Failed { error }) => {
-                                    let (ordinal, message_id) =
-                                        paths::parse_transcript_entry_path(&error)?;
-                                    let (found, entry) =
-                                        view.transcript_entry(ordinal)?.ok_or_else(|| {
-                                            ToolError::new(format!(
-                                                "request error entry {error} is absent"
-                                            ))
-                                        })?;
-                                    if found != message_id {
-                                        return Err(ToolError::new(format!(
-                                            "request error entry {error} has a mismatched id"
-                                        )));
-                                    }
-                                    text_blocks(&entry.blocks)
-                                }
-                                _ => "request failed without an error entry".to_string(),
-                            };
-                            println!("head {head}");
-                            println!("status failed");
-                            println!("error {error}");
-                            return Err(ToolError::code(1));
-                        }
-                        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling => {}
+                let prompt = Conversation::open(&store, &prompt_head)?.transcript_len()?;
+                match turn_outcome(&Conversation::open(&store, &head)?, prompt)? {
+                    Some(Ok(())) => {
+                        println!("head {head}");
+                        println!("status idle");
+                        return Ok(());
                     }
+                    Some(Err(error)) => {
+                        println!("head {head}");
+                        println!("status failed");
+                        println!("error {error}");
+                        return Err(ToolError::code(1));
+                    }
+                    None => {}
                 }
             }
         }
@@ -1296,10 +1286,34 @@ fn wait_terminal(
     Err(ToolError::code(2))
 }
 
+/// How the turn whose entries start at `from` ended, if it has: `Ok` for an
+/// answer or an interruption, `Err` with the step's failure message.
+fn turn_outcome(
+    view: &Conversation<'_>,
+    from: u64,
+) -> Result<Option<Result<(), String>>, ToolError> {
+    for ordinal in (from..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| ToolError::new(format!("missing transcript ordinal {ordinal}")))?;
+        match entry.role {
+            Role::User => return Ok(None),
+            Role::Assistant if entry.tool_uses().next().is_some() => return Ok(None),
+            Role::Assistant => return Ok(Some(Ok(()))),
+            Role::System if entry.is_interrupt() => return Ok(Some(Ok(()))),
+            Role::System if entry.actor == "llm-step" => {
+                return Ok(Some(Err(text_blocks(&entry.blocks))))
+            }
+            Role::System => {}
+        }
+    }
+    Ok(None)
+}
+
 fn parents(
     store: &GitStore,
     mut current: Oid,
-    started_tool: Option<&(Oid, String)>,
+    started_tool: Option<&String>,
 ) -> Result<(), ToolError> {
     let mut found_started_tool = started_tool.is_none();
     loop {
