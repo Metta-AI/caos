@@ -57,7 +57,7 @@ const SESSION_PREFIX: &str = "cc/";
 /// exactly as the model wrote it.
 const TOOL_PREFIX: &str = "mcp__caos__";
 
-/// What a request record says ran the turn. Claude Code chooses the model and
+/// The model a recorded prompt and closing message name. Claude Code chooses the model and
 /// does not tell a hook which, so naming the harness is the honest answer --
 /// better than a plausible-looking model string nothing verified.
 const CLAUDE_CODE_MODEL: &str = "claude-code";
