@@ -3889,7 +3889,6 @@ mod tests {
     use conversation_protocol::v3::oid::ensure_genesis;
     use conversation_protocol::v3::records::{
         Block, Identity, IdentityKind, Role, TranscriptEntry as V3TranscriptEntry,
-        TurnStatus,
     };
     use conversation_protocol::v3::refs;
     use conversation_protocol::v3::{GitStore, Oid, RefUpdate};
@@ -4162,8 +4161,6 @@ mod tests {
                 id: "talk-1".to_string(),
                 head: "f".repeat(40),
                 title: "talk-1".to_string(),
-                status: TurnStatus::Idle,
-                request: None,
                 interrupted: false,
                 error: None,
             },
@@ -6629,8 +6626,6 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: head.clone(),
                     title: "talk-1".to_string(),
-                    status: TurnStatus::Queued,
-                    request: Some(request.clone()),
                     interrupted: false,
                     error: None,
                 },
@@ -6773,8 +6768,6 @@ mod tests {
                     id: "talk-1".to_string(),
                     head: old_head.clone(),
                     title: "talk-1".to_string(),
-                    status: TurnStatus::Queued,
-                    request: Some("c".repeat(40)),
                     interrupted: false,
                     error: None,
                 },
