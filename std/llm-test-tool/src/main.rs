@@ -10,8 +10,7 @@ use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    AsyncRecord, Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TaskStatus,
-    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
+    AsyncRecord, Block, CallStatus, Identity, IdentityKind, Role, TaskStatus, TranscriptEntry,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -23,8 +22,6 @@ use conversation_protocol::v3::{
 enum ToolCommand {
     ChildId {
         parent: String,
-        request: Oid,
-        round: u64,
         tool: String,
     },
     Ref {
@@ -46,35 +43,32 @@ enum ToolCommand {
         actor: String,
         text: String,
         secret_hash: Oid,
-        model: String,
         configuration: Oid,
     },
     Interject {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         actor: String,
         text: String,
         refname: Option<String>,
     },
-    /// Declare a tool call on a request WITHOUT running it -- what a harness
-    /// that drives the model itself records before handing the call to a
-    /// tools-only step (`caos mcp`). Claims a queued request first, because a
-    /// declaration needs a running one.
+    /// Declare a tool call WITHOUT running it -- what a harness that drives the
+    /// model itself records before handing the call to a tools-only step
+    /// (`caos mcp`): an assistant message carrying the `tool_use`.
     Declare {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         actor: String,
         id: String,
         tool: String,
         input: String,
         refname: Option<String>,
     },
-    Escape {
+    /// Interrupt whatever is driving the conversation: the system message that
+    /// says so.
+    Interrupt {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         refname: Option<String>,
     },
     Create {
@@ -92,11 +86,6 @@ enum ToolCommand {
         repo: PathBuf,
         head: Oid,
         path: String,
-    },
-    Request {
-        repo: PathBuf,
-        head: Oid,
-        id: Option<Oid>,
     },
     WaitTerminal {
         repo: PathBuf,
@@ -116,13 +105,10 @@ enum ToolCommand {
     Tools {
         repo: PathBuf,
         head: Oid,
-        request: Oid,
     },
     ToolObservation {
         repo: PathBuf,
         head: Oid,
-        request: Oid,
-        round: u64,
         id: String,
     },
     Async {
@@ -145,10 +131,9 @@ enum ToolCommand {
         repo: PathBuf,
         head: Oid,
         validate: bool,
-        started_tool: Option<(Oid, String)>,
+        started_tool: Option<String>,
     },
 }
-
 #[derive(Debug)]
 struct ToolError {
     code: u8,
