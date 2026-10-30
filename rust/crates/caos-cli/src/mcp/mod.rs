@@ -441,7 +441,7 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
 }
 
 /// What the step answered to a recorded event: which of its outcomes it was
-/// (`created`, `forked`, `recorded`, `joined`, `held`, `nothing`) and the head it left.
+/// (`created`, `forked`, `recorded`, `nothing`) and the head it left.
 struct Recorded {
     status: String,
     head: String,
