@@ -419,7 +419,11 @@ mod tests {
         let genesis = ensure_genesis(store).unwrap();
         let mut tree = TreeBuilder::from(None);
         tree.put(paths::FORMAT, Mode::Blob, V5_FORMAT.to_vec());
-        tree.put(paths::IDENTITY, Mode::Blob, json(serde_json::json!({"id": "old"})));
+        tree.put(
+            paths::IDENTITY,
+            Mode::Blob,
+            json(serde_json::json!({"id": "old"})),
+        );
         tree.put(paths::TITLE, Mode::Blob, b"Old\n".to_vec());
         tree.put("notes.md", Mode::Blob, b"kept\n".to_vec());
         let root_tree = tree.build(store).unwrap();
