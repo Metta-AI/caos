@@ -488,18 +488,15 @@ impl<S: RefStore> State<S> {
                 view.async_task(&record.task)?.as_ref() == Some(record)
             }
             Transition::ToolStart { record, payloads } => {
-                let directory =
-                    paths::call_payload_dir(record.request.as_str(), record.round, &record.id);
-                view.tool(&record.request, record.round, &record.id)?
-                    .as_ref()
+                let directory = paths::call_payload_dir(&record.id);
+                view.tool(&record.id)?.as_ref()
                     == Some(record)
                     && payloads.iter().all(|(name, bytes)| {
                         view.payload(&format!("{directory}/{name}")).as_ref() == Ok(bytes)
                     })
             }
             Transition::ToolComplete { record, .. } => {
-                view.tool(&record.request, record.round, &record.id)?
-                    .as_ref()
+                view.tool(&record.id)?.as_ref()
                     == Some(record)
             }
             _ => false,
@@ -522,7 +519,7 @@ fn same_spawn(observed: &ChildRecord, expected: &ChildRecord) -> bool {
 
 fn transition_entry(transition: &Transition) -> Option<&TranscriptEntry> {
     match transition {
-        Transition::MessageAppend { entry, .. } | Transition::ModelComplete { entry, .. } => {
+        Transition::MessageAppend { entry, .. } => Some(entry),
             Some(entry)
         }
         _ => None,
