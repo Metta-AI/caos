@@ -1818,7 +1818,7 @@ impl App {
         } else if load_selected {
             let _ = states[selected].reload(&transport, &args.user);
         }
-        let mut app = Self {
+        let app = Self {
             repo_dir,
             user: args.user,
             conversations: states,
