@@ -7,7 +7,7 @@ use super::oid::Oid;
 use super::paths;
 use super::records::{
     parse_title, AsyncRecord, CallRecord, ChildRecord, Identity, PublicationRecord,
-    SourceTreeRecord, TranscriptEntry, TurnRecord,
+    SourceTreeRecord, TranscriptEntry,
 };
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
@@ -16,9 +16,7 @@ use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 /// results that remain readable in a fork's transcript.
 #[derive(Default)]
 struct Execution {
-    turns: BTreeMap<Oid, (bool, TurnRecord)>,
-    latest_turn: Option<Oid>,
-    tools: BTreeMap<(Oid, u64), BTreeMap<String, CallRecord>>,
+    tools: BTreeMap<String, CallRecord>,
     children: BTreeMap<String, (bool, ChildRecord)>,
     tasks: BTreeMap<Oid, AsyncRecord>,
     publications: BTreeMap<String, PublicationRecord>,
@@ -224,15 +222,6 @@ impl<'s> Conversation<'s> {
                 let (kind, events) = super::events::decode(&info.message)?;
                 for event in events.into_iter().rev() {
                     match event {
-                        Event::Request(record) => {
-                            if in_context && result.latest_turn.is_none() {
-                                result.latest_turn = Some(record.id.clone());
-                            }
-                            result
-                                .turns
-                                .entry(record.id.clone())
-                                .or_insert((in_context, record));
-                        }
                         Event::Tool(record) => {
                             result
                                 .tools
