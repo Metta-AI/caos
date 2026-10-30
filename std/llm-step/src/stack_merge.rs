@@ -520,7 +520,11 @@ mod tests {
 
     #[test]
     fn up_to_selects_the_described_layers_below_and_including_it() {
-        let layers = vec![layer("01-feature", true), layer("02-tests", true), layer("99-dirty", false)];
+        let layers = vec![
+            layer("01-feature", true),
+            layer("02-tests", true),
+            layer("99-dirty", false),
+        ];
         assert_eq!(names(&select(&layers, None).unwrap()), ["01-feature", "02-tests"]);
         assert_eq!(names(&select(&layers, Some("01-feature")).unwrap()), ["01-feature"]);
         assert_eq!(names(&select(&layers, Some("01")).unwrap()), ["01-feature"]);
