@@ -472,7 +472,11 @@ mod tests {
                             "arguments": {"path": format!("{dir}/args-call-1.json")}}],
             })),
         );
-        tree.put(&format!("{dir}/args-call-1.json"), Mode::Blob, b"{}".to_vec());
+        tree.put(
+            &format!("{dir}/args-call-1.json"),
+            Mode::Blob,
+            b"{}".to_vec(),
+        );
         tree.put(&format!("{dir}/response.json"), Mode::Blob, b"[]".to_vec());
         let answered_tree = tree.build(store).unwrap();
         let answered = v5_commit(store, &admitted, &answered_tree, "model.complete", Value::Array(vec![]));
