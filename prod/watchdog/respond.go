@@ -236,9 +236,18 @@ func session(c conf, inc *incident, current []alert) run {
 
 	workspace := c.stateDir + "/workspace"
 	w.Must(os.RemoveAll(workspace))
-	w.Must(os.MkdirAll(workspace+"/.claude", 0o700))
+	w.Must(os.MkdirAll(workspace, 0o700))
 	w.Must(os.WriteFile(workspace+"/CLAUDE.md", w.Check(os.ReadFile(c.runbookDir+"/CLAUDE.md")), 0o600))
-	w.Must(os.WriteFile(workspace+"/.claude/settings.json", w.Check(os.ReadFile(c.runbookDir+"/settings.json")), 0o600))
+	// The permission rules go in USER settings ($HOME/.claude/settings.json),
+	// not the workspace's .claude/settings.json: Claude Code ignores a
+	// project's allow list until the workspace has been trusted, which only
+	// an interactive session can do. Seen on the first real incident
+	// (20261030-1812): "Ignoring 14 permissions.allow entries from
+	// .claude/settings.json: this workspace has not been trusted", and a
+	// session that could run nothing. HOME is this daemon's state dir, so
+	// user scope is still ours alone.
+	w.Must(os.MkdirAll(c.stateDir+"/.claude", 0o700))
+	w.Must(os.WriteFile(c.stateDir+"/.claude/settings.json", w.Check(os.ReadFile(c.runbookDir+"/settings.json")), 0o600))
 
 	var prompt strings.Builder
 	fmt.Fprintf(&prompt, "Incident %s on the caos production host %s, opened %s. Session %d of at most %d.\n\n",
@@ -265,6 +274,7 @@ func session(c conf, inc *incident, current []alert) run {
 	cmd.Dir = workspace
 	cmd.Env = append(os.Environ(),
 		"HOME="+c.stateDir,
+		"SHELL="+w.Check(exec.LookPath("bash")),
 		"ANTHROPIC_API_KEY="+c.secret("anthropic-api-key"),
 		"DISABLE_AUTOUPDATER=1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
