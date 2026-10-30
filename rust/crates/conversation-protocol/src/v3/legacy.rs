@@ -48,10 +48,10 @@ pub fn v5_id(store: &dyn ObjectStore, commit: &Oid) -> Result<String, String> {
         .ok_or_else(|| "v5 conversation identity has no id".to_string())
 }
 
-/// The commit a v5 conversation's content was seeded from: its root's first
-/// parent, which is G3 for a conversation made before roots parented their
-/// content commit. Found by commit kind name alone, which every format shares.
-pub fn v5_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> {
+/// The root commit of the conversation at `head`, in this format or v5: found by
+/// commit kind name alone, which every format shares, so a v5 history with kinds
+/// this build no longer has can still be walked.
+pub fn conversation_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> {
     let mut current = head.clone();
     loop {
         let info = store.read_commit(&current).map_err(String::from)?;
