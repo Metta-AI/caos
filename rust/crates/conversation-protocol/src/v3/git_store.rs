@@ -906,21 +906,7 @@ impl CodeOps for GitStore {
         let base_commit = self.read_commit(base).map_err(String::from)?;
         let ours_tree = self.tree_of(ours)?;
         let theirs_tree = self.tree_of(theirs)?;
-        let synthetic_head = |tree: Oid, message: &[u8]| CommitInfo {
-            tree,
-            parents: vec![base.clone()],
-            author: base_commit.author.clone(),
-            committer: base_commit.committer.clone(),
-            extra_headers: Vec::new(),
-            message: message.to_vec(),
-        };
-        let ours_head = self
-            .write_commit(&synthetic_head(ours_tree, b"caos merge ours\n"))
-            .map_err(String::from)?;
-        let theirs_head = self
-            .write_commit(&synthetic_head(theirs_tree, b"caos merge theirs\n"))
-            .map_err(String::from)?;
-        self.merge_tree(&ours_head, &theirs_head)
+        self.merge_over(base, &base_commit, ours_tree, theirs_tree)
     }
 
     fn commit(
