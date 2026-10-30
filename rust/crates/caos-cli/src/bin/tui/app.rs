@@ -1112,30 +1112,17 @@ impl ConversationState {
         {
             self.reference_notice = None;
         }
-        let preserve_local_lifecycle = self.running
-            && self.local_turn
-            && matches!(
-                load.snapshot.status,
-                TurnStatus::Queued | TurnStatus::Running
-            )
-            && self
-                .active_request
-                .as_ref()
-                .is_none_or(|request| load.snapshot.request.as_ref() == Some(request));
+        // A turn this process runs keeps its own lifecycle across reloads: only
+        // the process running a turn knows it is running.
+        let preserve_local_lifecycle = self.running && self.local_turn;
         let previous_activity_len = self.activities.len();
         let followed_activity_tail = self
             .activity_selection
             .is_none_or(|selected| selected + 1 == previous_activity_len);
         let previous_activity_selection = self.activity_selection;
         let previous_activity_detail_scroll = self.activity_detail_scroll;
-        let local_lifecycle = preserve_local_lifecycle.then(|| {
-            (
-                self.status.clone(),
-                self.turn_phase,
-                self.reconciling_request.clone(),
-                self.reconcile_after,
-            )
-        });
+        let local_lifecycle =
+            preserve_local_lifecycle.then(|| (self.status.clone(), self.turn_phase));
         self.apply_snapshot(&load.snapshot);
         self.activities = replayed_activities(&load.replay.activity);
         if followed_activity_tail && self.activities.len() > previous_activity_len {
