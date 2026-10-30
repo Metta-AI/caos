@@ -33,7 +33,7 @@ use conversation_protocol::v3::reconcile::MergeOutcome;
 use conversation_protocol::v3::tree::{ObjectStore, TreeBuilder};
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    paths, Block, CallStatus, GitStore, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
+    paths, Block, CallStatus, GitStore, Identity, IdentityKind, Kind, Oid, RefUpdate, Role, Signature,
     TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
 };
 use worker_common::{arg, cas_hash, caos_curry, read_arg, read_arg_opt, Arg};
