@@ -1,4 +1,4 @@
-# std/stack-merge (design/stack-publish.md, "stack-merge"): an entry for an
+# std/stack-merge-to-master (design/stack-publish.md, "stack-merge-to-master"): an entry for an
 # OPERATION OF THE STEP. `@op` says llm-step does the work in process: it holds
 # the github-token reader already, so merging through it needs no new secret
 # grant, and the operation reads the stack directory the way stack-publish does.
@@ -13,6 +13,6 @@ Merge a published stack's pull requests (std/GIT.md, "Merging a stack"), bottom 
 @param [trunk] The branch the stack merges into. Default: the branch 00-base was imported from, or the remote's default branch.
 @param [force] true to merge although CI is failing or has not finished on some layer.
 @param [dry-run] true to read the pull requests and their checks and report what would be merged, merging nothing.
-@op stack-merge
+@op stack-merge-to-master
 END
 curry --base:@=DEEP-DEPS/llm-step --help=$HELP
