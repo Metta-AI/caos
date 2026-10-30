@@ -175,6 +175,9 @@ fn kind_name(message: &[u8]) -> &str {
 
 type Payloads = BTreeMap<String, Vec<u8>>;
 
+/// A transcript entry and its payloads, by name.
+type Entry = (TranscriptEntry, Vec<(String, Vec<u8>)>);
+
 /// The newest record of every call the v5 history holds, by call id, and every
 /// payload by path: from the source back to its root, and through a fork into
 /// what it forked, as a v5 reader did.
@@ -226,7 +229,7 @@ fn v5_calls(
 fn v5_transcript(
     store: &dyn ObjectStore,
     tree: &Oid,
-) -> Result<Vec<(TranscriptEntry, Vec<(String, Vec<u8>)>)>, String> {
+) -> Result<Vec<Entry>, String> {
     let snapshot = Snapshot::new(store, tree.clone());
     if snapshot.entry(paths::TRANSCRIPT_DIR)?.is_none() {
         return Ok(Vec::new());
