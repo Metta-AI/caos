@@ -250,7 +250,8 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         Err(error) => return site.fail(state, &error),
     };
     let dir = p.stack.clone();
-    let refused = |error: String| format!("stack-merge-to-master refused; nothing was merged: {error}");
+    let refused =
+        |error: String| format!("stack-merge-to-master refused; nothing was merged: {error}");
     // Everything that reads the conversation, before anything reaches the remote.
     let read = {
         let view = state.conversation()?;
