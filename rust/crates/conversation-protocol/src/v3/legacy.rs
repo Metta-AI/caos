@@ -118,6 +118,7 @@ pub fn migrate_v5(
                 entry,
                 payloads: entry_payloads,
             },
+            signature,
         )?;
         for call in declared {
             let Some(transition) = carried_call(&tools, &payloads, &call, &message_id)? else {
