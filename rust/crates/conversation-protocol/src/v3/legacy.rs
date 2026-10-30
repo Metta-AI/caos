@@ -128,7 +128,10 @@ pub fn migrate_v5(
         }
     }
 
-    let note = ids::protocol_id("v5-migration", &serde_json::json!({"source": source.as_str()}))?;
+    let note = ids::protocol_id(
+        "v5-migration",
+        &serde_json::json!({"source": source.as_str()}),
+    )?;
     append(
         store,
         &mut head,
