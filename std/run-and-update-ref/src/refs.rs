@@ -4,7 +4,7 @@ use conversation_protocol::v3::apply::{apply, inherited_signature, mint, Transit
 use conversation_protocol::v3::refs as conversation_refs;
 use conversation_protocol::v3::view::Conversation;
 use conversation_protocol::v3::{
-    CodeOps, GitStore, ObjectStore, Oid, RefUpdate, TaskStatus, TurnOutcome, TurnStatus,
+    CodeOps, GitStore, ObjectStore, Oid, RefUpdate, Role, TaskStatus,
 };
 
 const MAX_CAS_ATTEMPTS: usize = 32;
@@ -35,6 +35,7 @@ pub fn append_child_terminal(
     child: &str,
     subrequest: &str,
     relay: &str,
+    status: &str,
 ) -> Result<(), String> {
     validate_target_ref(refname)?;
     validate_child(child)?;
@@ -45,7 +46,7 @@ pub fn append_child_terminal(
     let terminal_head = store
         .fetch_ref(&child_ref)?
         .ok_or_else(|| format!("child conversation ref {child_ref} does not exist"))?;
-    let status = terminal_facts(&store, &terminal_head, &subrequest)?;
+    let status = terminal_facts(&store, &terminal_head, status)?;
     append_child_terminal_with(
         &mut store,
         refname,
@@ -57,32 +58,33 @@ pub fn append_child_terminal(
     )
 }
 
+/// How a child's run ended, from how its step request finished (`complete` or
+/// `failed`) and the transcript it left. A step that stopped because someone
+/// interrupted the child finishes normally, so the interruption is read from the
+/// transcript: one after the child's last assistant message.
 fn terminal_facts(
     store: &dyn ObjectStore,
     terminal_head: &Oid,
-    subrequest: &Oid,
+    status: &str,
 ) -> Result<TaskStatus, String> {
+    match status {
+        "complete" => {}
+        "failed" => return Ok(TaskStatus::Failed),
+        other => return Err(format!("invalid child status {other:?}")),
+    }
     let conversation = Conversation::open(store, terminal_head)?;
-    let request = conversation
-        .turn(subrequest)?
-        .ok_or_else(|| format!("child request {subrequest} does not exist at {terminal_head}"))?;
-    let status = match (request.status, request.outcome) {
-        (
-            TurnStatus::Idle,
-            Some(TurnOutcome::Idle {
-                interrupted: false, ..
-            }),
-        ) => TaskStatus::Complete,
-        (
-            TurnStatus::Idle,
-            Some(TurnOutcome::Idle {
-                interrupted: true, ..
-            }),
-        ) => TaskStatus::Cancelled,
-        (TurnStatus::Failed, Some(TurnOutcome::Failed { .. })) => TaskStatus::Failed,
-        _ => return Err("child request not terminal".to_string()),
-    };
-    Ok(status)
+    for ordinal in (0..conversation.transcript_len()?).rev() {
+        let (_, entry) = conversation
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| format!("missing transcript ordinal {ordinal}"))?;
+        if entry.is_interrupt() {
+            return Ok(TaskStatus::Cancelled);
+        }
+        if entry.role == Role::Assistant {
+            break;
+        }
+    }
+    Ok(TaskStatus::Complete)
 }
 
 #[allow(clippy::too_many_arguments)]
