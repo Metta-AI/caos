@@ -1,10 +1,12 @@
 //! The agent turn driver for the v3 conversation protocol.
 
 mod async_work;
+mod ci_status;
 mod githist;
 mod import_source;
 mod progress;
 mod publish_source;
+mod stack_merge;
 mod stack_publish;
 mod stack_sync;
 mod record;
