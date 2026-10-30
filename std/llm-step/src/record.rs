@@ -228,7 +228,6 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
-
 /// The tree a conversation's content was seeded from: its root's tree, found by
 /// following first parents from `head`, without the conversation's own .caos/.
 fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
@@ -250,7 +249,7 @@ fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
 }
 
 /// Make the conversation as a FORK of `from`, with its first prompt: the fork,
-/// then the prompt's request, pushed together with the creator's membership
+/// then its first prompt, pushed together with the creator's membership
 /// refs. `None` when the conversation exists, so the caller records onto it.
 ///
 /// `from` is forked as it stands. A conversation is a flat transcript, so a
