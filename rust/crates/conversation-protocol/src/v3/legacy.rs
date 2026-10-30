@@ -479,7 +479,13 @@ mod tests {
         );
         tree.put(&format!("{dir}/response.json"), Mode::Blob, b"[]".to_vec());
         let answered_tree = tree.build(store).unwrap();
-        let answered = v5_commit(store, &admitted, &answered_tree, "model.complete", Value::Array(vec![]));
+        let answered = v5_commit(
+            store,
+            &admitted,
+            &answered_tree,
+            "model.complete",
+            Value::Array(vec![]),
+        );
 
         let observation = format!(".caos/tools/{REQUEST}/0000/call-1/observation.json");
         let completed = v5_commit(
