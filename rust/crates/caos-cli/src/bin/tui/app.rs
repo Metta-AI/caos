@@ -2420,7 +2420,6 @@ impl App {
         if !self.selected().running || self.selected().interrupting {
             return;
         }
-        let wait_for_admission = self.selected().active_request.is_none();
         let conversation = self.selected().id.clone();
         self.selected_mut().interrupting = true;
         self.selected_mut().status = "stopping agent".to_string();
@@ -2429,10 +2428,12 @@ impl App {
             self.repo_dir.clone(),
             self.tx.clone(),
             move |transport| {
-                let attempts = if wait_for_admission { 40 } else { 1 };
+                // Retried: the first message may still be on its way, and the
+                // conversation not there yet to interrupt.
+                let attempts = 40;
                 let mut last_error = None;
                 for attempt in 0..attempts {
-                    match interrupt_request(transport, &conversation) {
+                    match interrupt_conversation(transport, &conversation) {
                         Ok(commit) => return Ok(commit),
                         Err(error) => last_error = Some(error),
                     }
@@ -2440,7 +2441,7 @@ impl App {
                         std::thread::sleep(Duration::from_millis(125));
                     }
                 }
-                Err(last_error.unwrap_or_else(|| "recording Escape failed".to_string()))
+                Err(last_error.unwrap_or_else(|| "recording the interruption failed".to_string()))
             },
             move |result| UiMessage::Interrupted {
                 conversation: interrupted_conversation,
@@ -2583,21 +2584,13 @@ impl App {
                             .ok()
                             .and_then(|transport| state.reload(transport, &user));
                         if refreshed.is_none() {
-                            state.running = false;
                             state.remote_head = None;
                         }
+                        state.running = false;
                         state.restore_pending_submission(pending_id);
-                        if state.running {
-                            state.sidebar_attention =
-                                Some("Local follower failed — turn still active".to_string());
-                            state.show_command_error_preserving_status(format!(
-                                "following turn failed: {error}"
-                            ));
-                        } else {
-                            state.sidebar_attention = Some("Failed — open for details".to_string());
-                            state.push_error(error);
-                            state.status = "turn failed".to_string();
-                        }
+                        state.sidebar_attention = Some("Failed — open for details".to_string());
+                        state.push_error(error);
+                        state.status = "turn failed".to_string();
                     }
                 }
                 UiMessage::Completed {
