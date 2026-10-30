@@ -312,7 +312,10 @@ fn carried_call(
     let Some(record) = tools.get(id) else {
         return Ok(None);
     };
-    if record["status"].as_str().is_none_or(|status| status == "started") {
+    if record["status"]
+        .as_str()
+        .is_none_or(|status| status == "started")
+    {
         return Ok(None);
     }
     let Ok(result) = ToolResult::from_value(&record["result"]) else {
