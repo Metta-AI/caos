@@ -4,8 +4,8 @@
 # the original does not move.
 #
 # A head left open (a session that died mid-turn) is forked as it is: a
-# conversation is a flat transcript, so the fork copies it unchanged, open
-# request and all, and the record shows the fork landing straight on top.
+# conversation is a flat transcript, so the fork copies it unchanged, its
+# unanswered prompt and all, and the record shows the fork landing straight on top.
 #
 # Driven through `caos mcp hook` only -- no tool server, no model.
 set -euo pipefail
@@ -82,8 +82,8 @@ prompt "$b" "a turn that never finished" >/dev/null
 head_b=$(head_of "cc/$b")
 [ -n "$head_b" ] || fail "the open conversation was never recorded"
 case "$(subjects "$head_b")" in
-  "request.claim "*) ;;
-  *) fail "expected an open request at the head: $(subjects "$head_b")" ;;
+  "message.append "*) ;;
+  *) fail "expected the unanswered prompt at the head: $(subjects "$head_b")" ;;
 esac
 
 g="resume-g-$stamp"
@@ -91,13 +91,10 @@ prompt "$g" "/fork-caos-conversation $head_b" >/dev/null
 head_g=$(head_of "cc/$g")
 [ -n "$head_g" ] || fail "an open head could not be forked"
 # No settle: the fork lands straight on the open head, whose newest commit is
-# b's own request.claim. (It used to insert a request.terminal before forking.)
+# b's own prompt. (It used to settle an open request before forking.)
 case "$(subjects "$head_g")" in
-  *"conversation.fork request.claim "*) ;;
+  "message.append conversation.fork message.append "*) ;;
   *) fail "the fork did not land directly on the open head: $(subjects "$head_g")" ;;
-esac
-case "$(subjects "$head_g")" in
-  *request.terminal*) fail "forking an open head should not settle it: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
 
