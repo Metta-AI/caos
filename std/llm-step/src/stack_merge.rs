@@ -372,7 +372,12 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             (Some((pr, checks)), _) => {
                 line.push_str(&format!("  PR #{}  checks: {}", pr.number, checks.summary()));
                 if matches!(checks.verdict(), Some(Standing::Failing | Standing::Pending)) {
-                    blockers.push(format!("{} (PR #{}): {}", target.layer.name, pr.number, checks.summary()));
+                    blockers.push(format!(
+                        "{} (PR #{}): {}",
+                        target.layer.name,
+                        pr.number,
+                        checks.summary()
+                    ));
                 }
             }
             (None, Some(number)) => line.push_str(&format!("  PR #{number}  already merged")),
