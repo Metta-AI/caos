@@ -104,6 +104,21 @@ in
       # while the branch had moved on, until --refresh was passed. These are
       # deploy targets told to fetch, not build farms keeping an index warm.
       tarball-ttl = 5;
+
+      # A private binary cache in the account, so a host never has to BUILD
+      # caos: the Rust workspace is hours on a t3.small and minutes even on
+      # the server. A deploy builds on a workstation (or the server) and
+      # pushes; the host substitutes. Reads go through the instance role
+      # (s3:GetObject on the bucket); pushes need the signing key, kept in
+      # Secrets Manager as caos/nix-cache-signing-key. See prod/README.md.
+      substituters = [
+        "s3://caos-nix-cache-109251245574?region=us-east-1"
+        "https://cache.nixos.org"
+      ];
+      trusted-public-keys = [
+        "caos-cache-1:3BSj35RzBLAtUyTlJlLO3xa9b7uYFtIJIx17Jri8lPs="
+        "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+      ];
     };
 
     # Docker gives every container a host-side veth. dhcpcd treats it as an

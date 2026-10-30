@@ -164,6 +164,28 @@ From a shell on the box: `caos-watchdog ssh -- <cmd>` runs a command on the
 server, `systemctl status caos-watchdog caos-watchdog-probe.timer` shows the
 two units, `journalctl -u caos-watchdog-probe` the probe results.
 
+## The binary cache
+
+Hosts never build caos. `s3://caos-nix-cache-109251245574` is a private
+binary cache in the account; both roles list it as a substituter with its
+public key (`prod/base.nix`) and read it through their instance role. A
+deploy therefore builds elsewhere and pushes first:
+
+```sh
+KEY=$(mktemp) && aws secretsmanager get-secret-value --profile caos-admin \
+  --region us-east-1 --secret-id caos/nix-cache-signing-key \
+  --query SecretString --output text > "$KEY"
+AWS_PROFILE=caos-admin nix copy \
+  --to "s3://caos-nix-cache-109251245574?region=us-east-1&secret-key=$KEY" \
+  .#nixosConfigurations.watchdog-prod.config.system.build.toplevel
+rm "$KEY"
+```
+
+Then on the host, `nixos-rebuild switch --refresh --flake
+github:Metta-AI/caos#watchdog-prod` is substitution, not compilation. Push
+`.#caos-tools` the same way before `deploy-caosd-prod` and the server's
+deploy stops rebuilding 498 crates.
+
 ## Adding a role
 
 Add `prod/<daemon>/configuration.nix` and a `nixosConfigurations.<daemon>-<env>`
