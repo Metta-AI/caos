@@ -65,7 +65,11 @@ sources/<repo>/
 - **`NN-<name>.pr.md`** beside a layer is its pull request: the first line is
   the title (a leading `# ` is dropped), the rest the body. A layer with one
   is published; a layer without one is not, and a described layer may not sit
-  above an undescribed one.
+  above an undescribed one. The title and body become the squash commit on
+  the trunk (see "Merging a stack"), so write them as a commit message, and
+  **keep the title under about 64 characters**: GitHub cuts a longer subject
+  with an ellipsis and moves the rest into the body. Keep the layer names
+  short too, since they are the branch names.
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
   history grow. It has no `.pr.md`, so it is never published. When the work in
   it is a finished chunk, `move` it to the next layer name
