@@ -1980,12 +1980,13 @@ pub fn fork_conversation_in(
             };
             let conversation = Conversation::open(&*store, &observed)?;
             let identity = conversation.identity()?;
-            if identity.id == id
-                && identity.kind
-                    == (IdentityKind::Fork {
-                        source: from.clone(),
-                    })
-                && conversation.title()? == title
+            let expected_kind = match v5 {
+                true => IdentityKind::Root,
+                false => IdentityKind::Fork {
+                    source: from.clone(),
+                },
+            };
+            if identity.id == id && identity.kind == expected_kind && conversation.title()? == title
             {
                 repair_creation_membership(&*store, user, id, &observed)?;
                 Ok(observed.to_string())
