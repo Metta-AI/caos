@@ -1379,7 +1379,7 @@ fn run_op(
         ("publish-source", _) => publish_source::execute(state, site).map(|()| true),
         ("stack-publish", _) => stack_publish::execute(state, site).map(|()| true),
         ("stack-sync", _) => stack_sync::execute(state, site).map(|()| true),
-        ("stack-merge", _) => stack_merge::execute(state, site).map(|()| true),
+        ("stack-merge-to-master", _) => stack_merge_to_master::execute(state, site).map(|()| true),
         ("ci-status", _) => ci_status::execute(state, site).map(|()| true),
         ("agent-spawn", _) => spawn_agent_call(cfg, state, site),
         ("agent-harvest", _) => harvest_agent_call(state, site).map(|()| true),
