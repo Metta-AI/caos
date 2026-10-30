@@ -2186,20 +2186,11 @@ pub fn ensure_conversation_secret() -> Result<(), String> {
     Ok(())
 }
 
-fn request_is_active(status: TurnStatus) -> bool {
-    matches!(
-        status,
-        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling
-    )
-}
-
-pub fn resume_request(t: &GitTransport, id: &str, request: &str) -> Result<(), String> {
-    oid(request, "request")?;
-    let secrets = conversation_secrets(id)?;
-    let server = t.server_url()?;
-    compute_client_request_with_secrets(&server, request, &secrets).map(|_| ())
-}
-
+/// Send a message and run the turn that answers it, to its end.
+///
+/// The turn is this process's: it runs the request the message was prepared
+/// with and is done when that request is. The conversation is watched only to
+/// report progress; nothing in it says whether the turn is running.
 #[allow(clippy::too_many_arguments)]
 pub fn run_chat_turn(
     t: &GitTransport,
@@ -2228,71 +2219,48 @@ pub fn run_chat_turn(
             elapsed_secs: started.elapsed().as_secs_f64(),
         });
     }
-    let request = match submitted.request {
-        Some(request) => Some(request),
-        None => conversation_snapshot(t, id)?
-            .filter(|snapshot| request_is_active(snapshot.status))
-            .and_then(|snapshot| snapshot.request),
-    };
-    let mut request_result = None;
-    if let Some(request) = request {
-        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
-        emit(TurnEvent::Status("waiting for agent".to_string()));
-        let secrets = conversation_secrets(id)?;
-        let server = t.server_url()?;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result =
-                compute_client_request_with_secrets(&server, &request, &secrets).map(|_| ());
-            let _ = tx.send(result);
-        });
-        request_result = Some(rx);
-    } else {
-        emit(TurnEvent::PhaseStarted(TurnPhase::Model));
-        emit(TurnEvent::Status("joined active turn".to_string()));
-    }
-    let mut snapshot =
-        conversation_snapshot(t, id)?.ok_or_else(|| format!("conversation {id:?} disappeared"))?;
-    let mut last_head = String::new();
+    let request = submitted
+        .request
+        .ok_or_else(|| "the message was saved but no turn was prepared for it".to_string())?;
+    emit(TurnEvent::PhaseStarted(TurnPhase::Model));
+    emit(TurnEvent::Status("agent running".to_string()));
+    let secrets = conversation_secrets(id)?;
+    let server = t.server_url()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = compute_client_request_with_secrets(&server, &request, &secrets).map(|_| ());
+        let _ = tx.send(result);
+    });
+    let mut last_head = conversation_head(t, id)?.unwrap_or_default();
     loop {
-        if snapshot.head != last_head {
-            last_head = snapshot.head.clone();
-            emit(TurnEvent::Status(match snapshot.status {
-                TurnStatus::Queued => "queued".to_string(),
-                TurnStatus::Running => "agent running".to_string(),
-                TurnStatus::Cancelling => "cancelling".to_string(),
-                TurnStatus::Idle => "idle".to_string(),
-                TurnStatus::Failed => "failed".to_string(),
-            }));
-        }
-        match snapshot.status {
-            TurnStatus::Idle => {
-                return Ok(TurnOutcome {
-                    conversation: id.to_string(),
-                    short_commit: short_hash(&snapshot.head).to_string(),
-                    commit: snapshot.head,
-                    interrupted: snapshot.interrupted,
-                })
+        let finished = match rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err("agent request watcher disconnected".to_string())
             }
-            TurnStatus::Failed => return Err(failure_reason(&snapshot)),
-            _ => {}
-        }
-        if let Some(rx) = &request_result {
-            match rx.try_recv() {
-                Ok(Err(error)) => return Err(error),
-                Ok(Ok(())) => request_result = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("agent request watcher disconnected".to_string())
-                }
+        };
+        if let Some(result) = finished {
+            let snapshot = conversation_snapshot(t, id)?
+                .ok_or_else(|| format!("conversation {id:?} disappeared"))?;
+            // The step's own failure message says why better than the run's
+            // error does, when it got as far as writing one.
+            if let Err(error) = result {
+                return Err(snapshot.error.unwrap_or(error));
             }
+            return Ok(TurnOutcome {
+                conversation: id.to_string(),
+                short_commit: short_hash(&snapshot.head).to_string(),
+                commit: snapshot.head,
+                interrupted: snapshot.interrupted,
+            });
         }
         std::thread::sleep(Duration::from_millis(250));
         let head =
             conversation_head(t, id)?.ok_or_else(|| format!("conversation {id:?} disappeared"))?;
-        if head != snapshot.head {
-            snapshot = conversation_snapshot(t, id)?
-                .ok_or_else(|| format!("conversation {id:?} disappeared"))?;
+        if head != last_head {
+            last_head = head;
+            emit(TurnEvent::Status("agent running".to_string()));
         }
     }
 }
