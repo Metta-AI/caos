@@ -312,13 +312,9 @@ pub fn apply(
                     child.id
                 ));
             }
-            if child.spawn_intent.request != tool.request
-                || child.spawn_intent.round != tool.round
-                || child.spawn_intent.tool != tool.id
-            {
+            if child.spawn_intent.tool != tool.id {
                 return Err("subagent spawn intent does not match tool".to_string());
             }
-            validate_current_call(&request, tool)?;
             if conversation.child(&child.id)?.is_some() {
                 return Err(format!("subagent {:?} already exists", child.id));
             }
