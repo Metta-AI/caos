@@ -445,7 +445,13 @@ mod tests {
             })),
         );
         let prompted_tree = tree.build(store).unwrap();
-        let prompted = v5_commit(store, &root, &prompted_tree, "message.append", Value::Array(vec![]));
+        let prompted = v5_commit(
+            store,
+            &root,
+            &prompted_tree,
+            "message.append",
+            Value::Array(vec![]),
+        );
         let admitted = v5_commit(
             store,
             &prompted,
