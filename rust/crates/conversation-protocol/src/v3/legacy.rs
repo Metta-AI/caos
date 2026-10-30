@@ -427,7 +427,13 @@ mod tests {
         tree.put(paths::TITLE, Mode::Blob, b"Old\n".to_vec());
         tree.put("notes.md", Mode::Blob, b"kept\n".to_vec());
         let root_tree = tree.build(store).unwrap();
-        let root = v5_commit(store, &genesis, &root_tree, "conversation.root", Value::Array(vec![]));
+        let root = v5_commit(
+            store,
+            &genesis,
+            &root_tree,
+            "conversation.root",
+            Value::Array(vec![]),
+        );
 
         let mut tree = TreeBuilder::from(Some(root_tree));
         tree.put(
