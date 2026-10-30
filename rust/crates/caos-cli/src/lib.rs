@@ -20,9 +20,7 @@ use caos::{
     compute_client_request_with_secrets, curry_client_object, eval_cli_image_arg,
     run_client_request_with_secrets, GitTransport, Secrets, Transport, CAOS_REMOTE,
 };
-use conversation_protocol::v3::apply::{
-    apply, client_signature, mint, Transition,
-};
+use conversation_protocol::v3::apply::{apply, client_signature, mint, Transition};
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
