@@ -3759,8 +3759,8 @@ mod tests {
         )
         .unwrap();
         let active_source = conversation_head(&transport, "source").unwrap().unwrap();
-        // A conversation is a flat transcript, so it forks as it stands, even
-        // with a request still open (it used to be refused until interrupted).
+        // A conversation is a flat transcript, so it forks as it stands, with its
+        // prompt still unanswered.
         assert!(
             fork_conversation(&transport, "Alice", "forked-active", "Fork", &active_source).is_ok()
         );
