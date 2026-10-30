@@ -52,7 +52,7 @@ request1=$request
 # The parent's wait and harvest calls name the child. Its id is derived from the durable
 # spawn call (the parent conversation, the request, round 0 and the tool id), so it is
 # known here, before the child exists.
-child_id=$($TOOL child-id --parent "$conv" --request "$request1" --round 0 \
+child_id=$($TOOL child-id --parent "$conv" \
   --tool toolu_spawn) || fail "deriving the child id"
 child_id=${child_id#child }
 [ -n "$child_id" ] || fail "the child id is empty"
@@ -117,7 +117,7 @@ for name in 01-child-reports 02-child-writes 03-parent-reports 04-parent-harvest
   [ "$used" = 1 ] || fail "rule $name answered $used requests, not 1"
 done
 head1=$head
-$TOOL tools --repo /tmp/repo --head "$head1" --request "$request1" > /tmp/parent-tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head1" > /tmp/parent-tools.jsonl
 
 stage "each operation is recorded as the run_tool call the model made, and completed"
 for id in toolu_spawn toolu_wait toolu_harvest toolu_async; do
@@ -128,7 +128,7 @@ for id in toolu_spawn toolu_wait toolu_harvest toolu_async; do
 done
 
 stage "spawn made the child, wait joined its relay, harvest applied its file"
-$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" --round 0 --id toolu_spawn > /tmp/spawn-observation.json
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --id toolu_spawn > /tmp/spawn-observation.json
 child=$(jq -r '.child // empty' /tmp/spawn-observation.json)
 [ "${#child}" -gt 10 ] || fail "spawn returned no child id: $(cat /tmp/spawn-observation.json)"
 [ "$child" = "$child_id" ] || fail "spawn made child $child, not the derived $child_id"
@@ -137,7 +137,7 @@ relay=$(jq -r --arg child "$child" 'select(.id == $child) | .relay' /tmp/childre
 assert_oid "$relay" "child relay"
 wait_record=$(jq -c 'select(.id == "toolu_wait")' /tmp/parent-tools.jsonl)
 [ "$(jq -r '.task' <<<"$wait_record")" = "$relay" ] || fail "wait did not join the child's relay"
-$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" --round 1 --id toolu_wait > /tmp/wait-observation.json
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --id toolu_wait > /tmp/wait-observation.json
 [ "$(jq -r '.child' /tmp/wait-observation.json)" = "$child" ] || fail "wait names the wrong child"
 [ "$(jq -r '.status' /tmp/wait-observation.json)" = completed ] || fail "wait did not report the child completed"
 source_tree=$(source_tree_commit "$head1" main)
@@ -150,7 +150,7 @@ $TOOL async --repo /tmp/repo --head "$head1" > /tmp/async.tasks
 [ "$(jq -s 'length' /tmp/async.tasks)" -eq 1 ] || fail "run-async did not record exactly one task: $(cat /tmp/async.tasks)"
 async_task=$(jq -r '.task' /tmp/async.tasks)
 assert_oid "$async_task" "the async task"
-$TOOL tool-observation --repo /tmp/repo --head "$head1" --request "$request1" --round 0 --id toolu_async > /tmp/async-observation.json
+$TOOL tool-observation --repo /tmp/repo --head "$head1" --id toolu_async > /tmp/async-observation.json
 grep -qF "$async_task" /tmp/async-observation.json || fail "run-async's answer omitted the task: $(cat /tmp/async-observation.json)"
 assert_spine "$head1"
 pass llm-subagent-path
