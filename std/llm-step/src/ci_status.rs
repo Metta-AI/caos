@@ -1,7 +1,7 @@
 //! What CI says about a commit, read from GitHub: its check runs and its
-//! commit statuses, and the verdict `stack-merge` gates on
+//! commit statuses, and the verdict `stack-merge-to-master` gates on
 //! (design/stack-publish.md, "ci-status"). `ci-status` is the operation that
-//! prints it for a branch, a layer or a commit; `stack_merge` reads the same
+//! prints it for a branch, a layer or a commit; `stack_merge_to_master` reads the same
 //! thing for every pull request head before it merges anything.
 use super::*;
 
