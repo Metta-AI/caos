@@ -328,12 +328,11 @@ case "$subjects" in
   *) fail "the backgrounded call was not recorded as it happened: $subjects" ;;
 esac
 
-echo "== a started call is declared before its ticket, so the Stop right behind it holds the request ==" >&2
+echo "== a started call loses nothing to the Stop right behind its ticket ==" >&2
 # `start` answers at once and the model usually ends its turn straight after the
-# ticket, so the turn's Stop lands in the gap before a job could declare its own
-# call. A Stop that saw no declared call closed the request, and the job then
-# failed with "no active request" -- and kept failing, for its ticket is the call's
-# id. The server declares the call before it answers, so there is no gap.
+# ticket, so the turn's Stop lands before the job has declared its own call.
+# When a Stop closed a request, the job then failed with "no active request" --
+# and kept failing, for its ticket is the call's id. A Stop closes nothing now.
 started="mcp-start-$(date +%s)-$$"
 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$started\",\"prompt\":\"start slow\"}"
 started_ref="refs/caos/v3/conversations/$(printf 'cc/%s' "$started" | od -An -tx1 | tr -d ' \n')/head"
@@ -346,10 +345,6 @@ ticket=$(printf '%s' "$ticket_answer" | grep -oE 'ticket: [0-9a-f]{40}' | head -
 [ -n "$ticket" ] || fail "start returned no ticket: $ticket_answer"
 # The Stop goes in IMMEDIATELY, with nothing awaited between the ticket and it.
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$started\",\"last_assistant_message\":\"started it, will check back\"}"
-git fetch -q caos "+$started_ref:$started_ref"
-if [ "$(git log -1 --format=%s "$started_ref")" = request.terminal ]; then
-  fail "Stop closed a request whose started call was not yet declared"
-fi
 # The ticket still resolves to the tool's own result, polled as a model would.
 finished=""
 for poll in $(seq 41 160); do
@@ -366,16 +361,17 @@ case "$finished" in
   *'slept 15'*) ;;
   *) fail "a started call that outlived its turn lost its result: ${finished:-never finished}" ;;
 esac
-# Starting a call with no request open fails in the call itself, not in a ticket.
+# A call started after the turn's Stop is recorded and run like any other:
+# there is no request it would need open.
 hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"$started\",\"last_assistant_message\":\"done\"}"
 send "$(jq -nc --arg session "$started" --arg path "${prefix}slow" --arg request_id "$started-late" \
   '{jsonrpc:"2.0",id:200,method:"tools/call",params:{name:"start",arguments:{
     caos_session:$session,caos_tool_use_id:"started-200",path:$path,
     arguments:{seconds:"1","request-id":$request_id}}}}')"
-late=$(await '"id":200' 120) || fail "a start with no open request never answered"
+late=$(await '"id":200' 120) || fail "a start after the turn's Stop never answered"
 case "$late" in
-  *'found none open'*) ;;
-  *) fail "a start with no open request did not fail in the call: $late" ;;
+  *'ticket: '*) ;;
+  *) fail "a start after the turn's Stop was refused: $late" ;;
 esac
 
 echo "== a started call is run and read back on the round that declared it ==" >&2
