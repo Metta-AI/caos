@@ -3,11 +3,11 @@
 #
 # tests/llm-tools-only-http — a tool call run with HTTP alone.
 #
-# The conversation and its admitted request are made as in tests/llm-tools-only,
+# The conversation and its prompt are made as in tests/llm-tools-only,
 # because opening a conversation is a prompt hook's job. From there a call
 # needs ONE request: the configured step, the call's id, the tool and its
-# arguments. The step declares the call on the conversation's active request
-# itself and runs it, and the run's RESULT is the call's output:
+# arguments. The step declares the call -- an assistant message carrying the
+# tool_use -- and runs it, and the run's RESULT is the call's output:
 #
 #   POST /start/run   base:hash=<llm-step>  tools-only=<id>  tool=<name>  arguments=<json>
 #   GET  /result/<ticket>   ->   ok tree <oid>   {status, observation, conversation}
@@ -101,12 +101,10 @@ head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") \
 head=${head#head }
 [ "$head" = "$result_head" ] \
   || fail "the result's conversation $result_head is not the ref's head $head"
-$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-  --round 0 --id toolu_read > /tmp/read.observation \
+$TOOL tool-observation --repo /tmp/repo --head "$head" \
+  --id toolu_read > /tmp/read.observation \
   || fail "the conversation recorded no observation for the call"
 grep -qF "hello tools" /tmp/read.observation || fail "the recorded observation lacks the file"
-request_status=$($TOOL request --repo /tmp/repo --head "$head" --id "$request" | jq -r .status)
-[ "$request_status" = running ] || fail "the request is $request_status, not running"
 
 stage "a second call, run to completion with one blocking request"
 call_params toolu_write run_tool \
@@ -144,11 +142,13 @@ post /eval/run "${params[@]}"
 [ "$code" = 200 ] || fail "repeat: HTTP $code: $body"
 head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") || fail "fetching the conversation"
 head=${head#head }
-declared=$($TOOL tools --repo /tmp/repo --head "$head" --request "$request" \
-  | jq -r --arg id toolu_missing 'select(.id == $id) | .id' | wc -l)
-[ "$declared" -eq 1 ] || fail "toolu_missing is recorded $declared times"
+# The prompt and one declaration per call: the retry declared nothing.
+roles=$($TOOL transcript --repo /tmp/repo --head "$head" \
+  | while read -r _ role _; do printf '%s\n' "$role"; done | paste -sd,)
+[ "$roles" = user,assistant,assistant,assistant ] \
+  || fail "the transcript is $roles, not the prompt and three declarations"
 
-stage "the request is still the harness's to end"
+stage "nothing ends the turn but the harness"
 assert_spine "$head"
 [ ! -f /tmp/stub/request-1.json ] || fail "a tools-only run called the model"
 
