@@ -1096,7 +1096,7 @@ fn run_op(
         ("run-async", _) => run_async_call(cfg, state, site).map(|()| true),
         ("agent-wait", None) => wait_agent_call(state, site),
         ("agent-wait", Some(record)) => {
-            dispatch_wait_started(state, site.request, site.round, site.call, record)?;
+            dispatch_wait_started(state, site.request, site.call, record)?;
             Ok(false)
         }
         (other, _) => site
@@ -1122,7 +1122,7 @@ fn op_marker(call: &Call, op: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
 fn op_marker_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/op.json",
-        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+        paths::call_payload_dir(&site.call.id)
     )
 }
 
@@ -1152,18 +1152,18 @@ fn drive_call(
     cfg: &Config,
     state: &mut progress::State,
     request: &Oid,
-    round: &RoundState,
+    declaration: &Declaration,
     call: &Call,
 ) -> Result<bool, String> {
-    let site = CallSite::new(request, round, call);
+    let site = CallSite::new(request, declaration, call);
     if let Some(existing) = state
         .conversation()?
-        .tool(request, round.declaring_round, &call.id)?
+        .tool(&call.id)?
     {
         if existing.status == CallStatus::Started {
             if existing.name == "run_tool" {
                 let inner = op_call(call);
-                let op_site = CallSite::new(request, round, &inner);
+                let op_site = CallSite::new(request, declaration, &inner);
                 let op = started_op(&state.conversation()?, &op_site);
                 if let Some(op) = op {
                     return run_op(cfg, &op, state, &op_site, Some(&existing));
@@ -1178,9 +1178,9 @@ fn drive_call(
                 return Ok(true);
             }
             if existing.name == subagents::WAIT_TOOL {
-                dispatch_wait_started(state, request, round.declaring_round, call, &existing)?;
+                dispatch_wait_started(state, request, call, &existing)?;
             } else {
-                dispatch_started(state, request, round.declaring_round, call, &existing)?;
+                dispatch_started(state, request, call, &existing)?;
             }
             return Ok(false);
         }
@@ -1259,7 +1259,6 @@ fn drive_call(
         &wc,
         conversation.as_str(),
         request,
-        round,
     )? {
         Prepared::Result(block) => {
             site.complete(state, block, name.map(|name| (name, commit)), None, None)?;
@@ -1268,11 +1267,9 @@ fn drive_call(
         Prepared::Evaluation => Ok(false),
         Prepared::Task(task) => {
             let record = CallRecord {
-                request: request.clone(),
-                round: round.declaring_round,
                 id: call.id.clone(),
                 name: call.name.clone(),
-                declaration_message: round.declaration_message.clone(),
+                declaration_message: declaration.message_id.clone(),
                 source_tree_name: name,
                 input_commit: Some(commit),
                 status: CallStatus::Started,
@@ -1292,7 +1289,7 @@ fn drive_call(
             )? {
                 progress::TryAppend::HeadChanged(_) => Ok(true),
                 progress::TryAppend::Appended(_) => {
-                    dispatch_started(state, request, round.declaring_round, call, &record)?;
+                    dispatch_started(state, request, call, &record)?;
                     Ok(false)
                 }
             }
@@ -1490,7 +1487,6 @@ fn prepare_compute(
     // resolves against, which is not the source tree the tool runs in.
     conversation: &str,
     request: &Oid,
-    round: &RoundState,
 ) -> Result<Prepared, String> {
     let clean = call_without_source_tree(call);
     match call.name.as_str() {
@@ -1499,7 +1495,6 @@ fn prepare_compute(
             let me = self_curry(
                 Some(wc),
                 request,
-                round.declaring_round,
                 &call.id,
                 &[
                     ("current-tool", Arg::Lit(&call.name)),
@@ -1559,7 +1554,7 @@ fn prepare_compute(
             if !relative.is_empty() {
                 extras.push(("tool-lookup", Arg::Lit(&relative)));
             }
-            let me = self_curry(Some(wc), request, round.declaring_round, &call.id, &extras)?;
+            let me = self_curry(Some(wc), request, &call.id, &extras)?;
             eval_then_catching(&start, &relative, Arg::Hash(&me))?;
             Ok(Prepared::Evaluation)
         }
@@ -1827,7 +1822,6 @@ fn launch_resolved_tool(
 fn dispatch_started(
     state: &mut progress::State,
     request: &Oid,
-    round: u64,
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
@@ -1858,7 +1852,7 @@ fn dispatch_started(
         scope_storage = prefix;
         extras.push(("scope", Arg::Lit(&scope_storage)));
     }
-    let me = self_curry(Some(&wc), request, round, &call.id, &extras)?;
+    let me = self_curry(Some(&wc), request, &call.id, &extras)?;
     let task = record.task.as_ref().ok_or("started tool has no task")?;
     let dispatched = run_request_then_catching(task.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
@@ -1904,7 +1898,6 @@ fn declared_writer(call: &Call, record: &CallRecord) -> Result<Option<String>, S
 fn dispatch_wait_started(
     state: &mut progress::State,
     request: &Oid,
-    round: u64,
     call: &Call,
     record: &CallRecord,
 ) -> Result<(), String> {
@@ -1932,7 +1925,7 @@ fn dispatch_wait_started(
     if call.name == "run_tool" {
         extras.push(("op", Arg::Lit("agent-wait")));
     }
-    let me = self_curry(None, request, round, &call.id, &extras)?;
+    let me = self_curry(None, request, &call.id, &extras)?;
     let dispatched = run_request_then_catching(relay.as_str(), Arg::Hash(&me));
     timing::phase(&format!("tool dispatch {}", call.name));
     dispatched.map_err(|error| format!("joining subagent relay {relay}: {error}"))
@@ -2091,7 +2084,7 @@ fn complete_compute(
         state.reload()?;
         if state
             .conversation()?
-            .tool(&started.request, started.round, &started.id)?
+            .tool(&started.id)?
             .is_some_and(|record| record.is_terminal())
         {
             return Ok(());
@@ -2282,19 +2275,10 @@ fn complete_started_failed(
     Ok(())
 }
 
-fn declaration_message(
-    view: &Conversation<'_>,
-    request: &Oid,
-    round: u64,
-) -> Result<String, String> {
-    let record = require_request(view, request)?;
-    Ok(round_state_at(view, &record, round)?.declaration_message)
-}
-
 fn observation_path(record: &CallRecord) -> String {
     format!(
         "{}/observation.json",
-        paths::call_payload_dir(record.request.as_str(), record.round, &record.id)
+        paths::call_payload_dir(&record.id)
     )
 }
 
