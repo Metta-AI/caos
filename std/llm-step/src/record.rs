@@ -358,8 +358,8 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     }
 }
 
-/// Make the conversation, with its first prompt: root, message, admission and
-/// claim, pushed together to a ref that must not exist. `None` when it does, so
+/// Make the conversation, with its first prompt: root and message, pushed
+/// together to a ref that must not exist. `None` when it does, so
 /// the caller records onto the winner's.
 fn create(conversation: &str, request: &Request) -> Result<Option<State>, String> {
     if let Some(from) = &request.from {
