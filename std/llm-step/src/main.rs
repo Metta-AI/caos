@@ -3794,16 +3794,6 @@ mod tests {
                         canonical_bytes(&json!({"path":"files"}))?,
                     ),
                 ],
-                calls: vec![
-                    DeclaredCall {
-                        id: "first".to_string(),
-                        name: first_name.to_string(),
-                    },
-                    DeclaredCall {
-                        id: "second".to_string(),
-                        name: "ls".to_string(),
-                    },
-                ],
             },
         )?;
         Ok(Golden {
