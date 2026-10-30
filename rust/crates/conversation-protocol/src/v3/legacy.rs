@@ -162,8 +162,8 @@ fn append(
     transition: Transition,
     signature: &Signature,
 ) -> Result<(), String> {
-    let applied = apply(store, Some(head), &transition)?;
-    *head = mint(store, head, &applied, transition.kind(), signature)?;
+    let applied = apply(store, Some(&*head), &transition)?;
+    *head = mint(store, &*head, &applied, transition.kind(), signature)?;
     Ok(())
 }
 
@@ -359,4 +359,158 @@ fn carried_call(
         payloads: carried,
         files: Vec::new(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+    use crate::v3::apply::client_signature;
+    use crate::v3::oid::ensure_genesis;
+    use crate::v3::tree::{CommitInfo, MemoryStore};
+    use crate::v3::validate_spine;
+    use crate::v3::view::Conversation;
+
+    const REQUEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// A v5 commit as the earlier build wrote one: `kind`, then its events.
+    fn v5_commit(
+        store: &mut MemoryStore,
+        parent: &Oid,
+        tree: &Oid,
+        kind: &str,
+        events: Value,
+    ) -> Oid {
+        let signature = client_signature("Old", "old@example.com", 1_700_000_000);
+        let mut message = format!("{kind}\n\n").into_bytes();
+        message.extend(serde_json::to_vec(&serde_json::json!({ "events": events })).unwrap());
+        message.push(b'\n');
+        store
+            .write_commit(&CommitInfo {
+                tree: tree.clone(),
+                parents: vec![parent.clone()],
+                author: signature.clone(),
+                committer: signature,
+                extra_headers: Vec::new(),
+                message,
+            })
+            .unwrap()
+    }
+
+    fn json(value: Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    /// A v5 conversation: a prompt, an admitted request, an answer declaring a
+    /// read, the read's completion, and the request's terminal.
+    fn v5_conversation(store: &mut MemoryStore) -> Oid {
+        let genesis = ensure_genesis(store).unwrap();
+        let mut tree = TreeBuilder::from(None);
+        tree.put(paths::FORMAT, Mode::Blob, V5_FORMAT.to_vec());
+        tree.put(paths::IDENTITY, Mode::Blob, json(serde_json::json!({"id": "old"})));
+        tree.put(paths::TITLE, Mode::Blob, b"Old\n".to_vec());
+        tree.put("notes.md", Mode::Blob, b"kept\n".to_vec());
+        let root_tree = tree.build(store).unwrap();
+        let root = v5_commit(store, &genesis, &root_tree, "conversation.root", Value::Array(vec![]));
+
+        let mut tree = TreeBuilder::from(Some(root_tree));
+        tree.put(
+            &paths::transcript_entry_path(0, "u1"),
+            Mode::Blob,
+            json(serde_json::json!({
+                "message_id": "u1", "conversation": "old", "role": "user", "actor": "me",
+                "blocks": [{"type": "text", "text": "read the notes"}],
+            })),
+        );
+        let prompted_tree = tree.build(store).unwrap();
+        let prompted = v5_commit(store, &root, &prompted_tree, "message.append", Value::Array(vec![]));
+        let admitted = v5_commit(
+            store,
+            &prompted,
+            &prompted_tree,
+            "request.admit",
+            serde_json::json!([{"event": "request", "value": {"id": REQUEST, "round": 0}}]),
+        );
+
+        let dir = paths::transcript_payload_dir(1, "a1");
+        let mut tree = TreeBuilder::from(Some(prompted_tree));
+        tree.put(
+            &paths::transcript_entry_path(1, "a1"),
+            Mode::Blob,
+            json(serde_json::json!({
+                "message_id": "a1", "conversation": "old", "role": "assistant",
+                "actor": "model", "request": REQUEST, "round": 0, "model": "model",
+                "blocks": [{"type": "tool_use", "id": "call-1", "name": "read",
+                            "arguments": {"path": format!("{dir}/args-call-1.json")}}],
+            })),
+        );
+        tree.put(&format!("{dir}/args-call-1.json"), Mode::Blob, b"{}".to_vec());
+        tree.put(&format!("{dir}/response.json"), Mode::Blob, b"[]".to_vec());
+        let answered_tree = tree.build(store).unwrap();
+        let answered = v5_commit(store, &admitted, &answered_tree, "model.complete", Value::Array(vec![]));
+
+        let observation = format!(".caos/tools/{REQUEST}/0000/call-1/observation.json");
+        let completed = v5_commit(
+            store,
+            &answered,
+            &answered_tree,
+            "tool.complete",
+            serde_json::json!([
+                {"event": "payload", "value": {"path": observation, "bytes": b"\"kept\"".to_vec()}},
+                {"event": "tool", "value": {
+                    "request": REQUEST, "round": 0, "id": "call-1", "name": "read",
+                    "declaration_message": "a1", "source_tree_name": null, "input_commit": null,
+                    "status": "complete",
+                    "result": {"kind": "complete", "observation": observation},
+                    "files": [], "files_outcome": null,
+                }},
+            ]),
+        );
+        v5_commit(
+            store,
+            &completed,
+            &answered_tree,
+            "request.terminal",
+            serde_json::json!([{"event": "request", "value": {"id": REQUEST}}]),
+        )
+    }
+
+    #[test]
+    fn a_v5_conversation_is_carried_into_a_new_root() {
+        let mut store = MemoryStore::new();
+        let source = v5_conversation(&mut store);
+        assert!(is_v5(&store, &source).unwrap());
+        assert_eq!(v5_id(&store, &source).unwrap(), "old");
+        // This build cannot read it as it stands, and says why.
+        let refused = Conversation::open(&store, &source).err().unwrap();
+        assert!(refused.contains("v5"), "{refused}");
+
+        let genesis = ensure_genesis(&mut store).unwrap();
+        let signature = client_signature("New", "new@example.com", 1_700_000_100);
+        let head =
+            migrate_v5(&mut store, &source, "new", "Carried", None, &genesis, &signature).unwrap();
+        validate_spine(&store, &head, &mut HashSet::new()).unwrap();
+        assert!(!is_v5(&store, &head).unwrap());
+
+        let view = Conversation::open(&store, &head).unwrap();
+        assert_eq!(view.identity().unwrap().id, "new");
+        assert_eq!(view.identity().unwrap().kind, IdentityKind::Root);
+        assert_eq!(view.title().unwrap(), "Carried");
+        assert_eq!(view.file("notes.md").unwrap(), Some(b"kept\n".to_vec()));
+        let transcript = view.transcript(0, view.transcript_len().unwrap()).unwrap();
+        let roles: Vec<Role> = transcript.iter().map(|(_, _, entry)| entry.role).collect();
+        assert_eq!(roles, [Role::User, Role::Assistant, Role::System]);
+        let tool = view.tool("call-1").unwrap().unwrap();
+        assert_eq!(tool.declaration_message, "a1");
+        let Some(ToolResult::Complete { observation, .. }) = tool.result else {
+            panic!("the read did not come across complete");
+        };
+        assert_eq!(observation, format!("{}/observation.json", paths::call_payload_dir("call-1")));
+        assert_eq!(view.payload(&observation).unwrap(), b"\"kept\"".to_vec());
+        let (_, _, note) = &transcript[2];
+        assert!(matches!(&note.blocks[..], [Block::Text { text }] if text.contains(source.as_str())));
+    }
 }
