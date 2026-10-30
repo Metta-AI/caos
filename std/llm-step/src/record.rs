@@ -53,8 +53,8 @@ pub(crate) struct Request {
     /// The prompt, the closing message, or the error.
     text: String,
     actor: String,
-    /// The model the harness's request is recorded as having been answered by.
-    /// A prompt's: a stop and a failure take the request's own.
+    /// The model a stop's closing message is recorded as written by, when the
+    /// harness names one.
     model: String,
     /// A git locator naming the COMMIT a NEW conversation's content comes from
     /// (`content-locator`). A root parents it and starts from its tree; a fork
