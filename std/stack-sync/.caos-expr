@@ -1,0 +1,17 @@
+# std/stack-sync (design/stack-publish.md, "stack-sync"): an entry for an
+# OPERATION OF THE STEP. `@op` says llm-step does the work in process (it reads
+# the remote, mints merge commits in the conversation's store and moves the
+# stack's gitlinks in one append), so this entry exists to give the operation a
+# path, a help and a place in `tool_help`/`run_tool`. The image it curries is
+# never run.
+HELP=<<END
+Bring a stack directory (std/GIT.md, "Stacks") up to date with its remote, the way gt sync does, without pushing anything. It reads the trunk's head and every published layer's branch, then, bottom to top: if the trunk moved, 00-base becomes its new head (and 00-base.source.json says so); a branch GitHub rewrote with the same content, which is what merging a stacked PR does to the branches above it, is adopted as the layer's new base, keeping any edits made since; a branch someone else pushed to is merged in; a layer whose PR was merged is reported (and removed with its .pr.md when remove-merged is true); and every layer that no longer contains the one below it is restacked by merging the one below in. Merges are three-way merges minted in the conversation; a conflict stops the sync at that layer and names the caos-std/merge call that resolves it with a ledger. Then stack-publish pushes the result as fast-forwards. The result is one line per entry saying what changed; dry-run reports without changing anything.
+@param stack The stack directory, such as sources/repo.
+@param [branch-prefix] Text put before every branch name, the same value given to stack-publish.
+@param [repository] HTTPS repository URL, without credentials. Default: the repository 00-base was imported from.
+@param [trunk] The trunk branch. Default: the branch 00-base was imported from, or the remote's default branch.
+@param [remove-merged] true to remove a layer, and its .pr.md, whose pull request has been merged.
+@param [dry-run] true to report what would change without changing anything.
+@op stack-sync
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

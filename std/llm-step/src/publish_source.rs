@@ -24,7 +24,9 @@ struct Parameters {
 
 /// A boolean as a JSON boolean or as the string a tool's arguments are: through
 /// `run_tool` every argument is a string, and `force` is declared like the rest.
-fn bool_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+pub(super) fn bool_or_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
     use serde::de::Error;
     match <Value as serde::Deserialize>::deserialize(deserializer)? {
         Value::Bool(value) => Ok(value),
@@ -149,9 +151,25 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     if pending.status != PublicationStatus::Pending {
         return finish(state, site, &pending, None);
     }
-    // An attempt that pinned this intent may send it, including concurrent
-    // attempts that joined the identical transition. The exact lease makes
-    // those pushes converge. Recovery never obtains a fresh source or lease.
+    let outcome = send(&pending, &p.branch, p.allow_ignored, token_file, observe)?;
+    finish(state, site, &pending, Some(outcome))
+}
+
+/// Send a pinned publication: `caos push-git` with exactly the commit and lease
+/// the record pinned, then reconcile what came back against the remote. Any
+/// attempt that holds the pin may send it, including concurrent attempts that
+/// joined the identical transition: the exact lease makes those pushes
+/// converge, and recovery never obtains a fresh source or lease. `branch` and
+/// `allow_ignored` come from the call's input, which is fixed per call id, so
+/// a recovered attempt sends the same values. `publish_stack` sends one of
+/// these per layer.
+pub(super) fn send(
+    pending: &PublicationRecord,
+    branch: &str,
+    allow_ignored: bool,
+    token_file: Option<&str>,
+    observe: impl FnOnce() -> Result<Option<Oid>, String>,
+) -> Result<Outcome, String> {
     let outcome = {
         let mut command = std::process::Command::new("caos");
         command
@@ -159,7 +177,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 "push-git",
                 &pending.repository,
                 pending.planned_head.as_str(),
-                &p.branch,
+                branch,
             ])
             .arg(format!(
                 "--expected={}",
@@ -177,7 +195,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         // Not part of the pinned descriptor: the call's input is fixed per
         // call id, so a recovered attempt sends the same value, and it only
         // relaxes a validation. The commit and the lease stay pinned.
-        if p.allow_ignored {
+        if allow_ignored {
             command.arg("--allow-ignored");
         }
         if let Some(file) = token_file {
@@ -210,7 +228,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                         value["diagnostic"].as_str().map(str::to_owned),
                         observed,
                     );
-                    reconcile(&pending, outcome, observe)
+                    reconcile(pending, outcome, observe)
                 }
                 Ok(output) if output.status.code() == Some(1) => Outcome::new(
                     PublicationStatus::Conflict,
@@ -218,11 +236,11 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
                     None,
                 ),
-                _ => recovered(&pending, observe()),
+                _ => recovered(pending, observe()),
             },
         }
     };
-    finish(state, site, &pending, Some(outcome))
+    Ok(outcome)
 }
 
 pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {

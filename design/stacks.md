@@ -155,7 +155,53 @@ mystack/02-y        -> A2  parents A, X1
 mystack/03-tests    -> B2  parents B, A2
 ```
 
+## Syncing with the remote
+
+`caos-std/stack-sync` does the "Updating the base" moves above against the
+remote in one call, the way `gt sync` does, and more: it reads the trunk's
+head and every published branch, puts the trunk's head at `00-base`, adopts a
+branch GitHub rewrote (merging a stacked PR rebases the branches above it) under
+the layer's local edits, merges in a branch someone else pushed to, restacks
+each layer onto the one below, and reports layers whose PR was merged. It
+pushes nothing; `stack-publish` then fast-forwards every branch
+([stack-publish.md](stack-publish.md), "stack-sync").
+
+## Renaming layers
+
+A layer is two entries, the gitlink and its `NN-<name>.pr.md` description
+(stack-publish.md), and `00-base` has its `.source.json`. `caos-std/move-sed`
+renames the entries of one directory by regular expression in ONE proposal, so
+the pair moves together and a shift has no ordering problem:
+
+```text
+move-sed(dir="mystack", pattern="^02-tests(\..+)?$", replacement="03-tests$1")
+move-sed(dir="mystack", pattern="^01-feature(\..+)?$", replacement="02-y$1")
+```
+
+Renumbering does not rename a layer's branch or PR: the branch is the name
+without its number.
+
 ## Publishing
+
+`caos-std/stack-publish` publishes the whole folder in one call
+([stack-publish.md](stack-publish.md)): every layer that has a `.pr.md`
+beside it is pushed as it is to a branch named after it without the number,
+its PR is found or opened on the branch below (the trunk for the first), and
+the PRs are linked as a GitHub stack. Nothing is squashed: the trunk
+squash-merges, so the commits inside a branch never reach it, and a republish
+after merging up is a fast-forward.
+
+```text
+run_tool(path="caos-std/stack-publish", arguments={"stack": "mystack"})
+```
+
+What follows is the older, by-hand flow. `create-squashed-stack` still exists
+for a stack that must be published as one commit per layer, but it is not
+part of publishing a stack: a squashed commit does not descend from the one
+it replaces, so every republish needs `force`, and the squash copies the
+authorship of whatever commit happens to be the layer's tip.
+
+### By hand
 
 The git history from the working stack will have lots of commits, for agent turns, merges, etc. Squashing is optional, since `publish_source` can publish a layer's gitlink as it is, but it clears that noise away: each layer's changes become a single commit, forming a clean new temp stack.
 
