@@ -1191,15 +1191,8 @@ fn replay_from(
     let mut declarations = Vec::new();
     for (ordinal, _, entry) in transcript {
         has_own_user_messages |= entry.role == Role::User && entry.conversation == conversation_id;
-        if let (Some(request), Some(round)) = (&entry.request, entry.round) {
-            if entry.role == Role::Assistant {
-                assistant_entries.insert((request.clone(), round), entry.clone());
-            }
-        }
-        if let Some(request) = &entry.request {
-            if !request_order.contains(request) {
-                request_order.push(request.clone());
-            }
+        if entry.role == Role::Assistant && entry.tool_uses().next().is_some() {
+            declarations.push((ordinal, entry.clone()));
         }
         let message = text_blocks(&entry.blocks);
         let (author, role) = match entry.role {
@@ -1243,61 +1236,39 @@ fn replay_from(
     }
 
     let mut activity = Vec::new();
-    for request in request_order {
-        let Some(record) = conversation.turn(&request)? else {
-            return Err(format!("transcript names missing request {request}"));
-        };
-        for round in 0..record.round {
-            let Some(assistant) = assistant_entries.get(&(request.clone(), round)) else {
-                return Err(format!(
-                    "request {request} round {round} has no assistant entry"
-                ));
-            };
-            for (call_id, call_name, arguments_path) in
-                assistant.blocks.iter().filter_map(|block| match block {
-                    Block::ToolUse {
-                        id,
-                        name,
-                        arguments,
-                    } => Some((id, name, arguments)),
-                    _ => None,
-                })
-            {
-                let args = serde_json::from_slice::<Value>(&conversation.payload(arguments_path)?)
-                    .map_err(|error| format!("parsing tool arguments: {error}"))?;
-                activity.push(TurnEvent::ToolCall {
-                    request: request.to_string(),
-                    round,
-                    tool_use_id: call_id.clone(),
-                    name: call_name.clone(),
-                    summary: {
-                        let text = tool_call_summary(call_name, &args);
-                        match conversation
-                            .tool(&request, round, call_id)?
-                            .and_then(|tool| tool.source_tree_name)
-                        {
-                            Some(name) if conversation.source_tree_names()?.len() > 1 => {
-                                format!("[{name}] {text}")
-                            }
-                            _ => text,
+    for (ordinal, assistant) in declarations {
+        let step_commit = usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| turns.get(ordinal))
+            .map(|turn| turn.commit.clone())
+            .unwrap_or_default();
+        for (call_id, call_name, arguments_path) in assistant.tool_uses() {
+            let args = serde_json::from_slice::<Value>(&conversation.payload(arguments_path)?)
+                .map_err(|error| format!("parsing tool arguments: {error}"))?;
+            let tool = conversation.tool(call_id)?;
+            activity.push(TurnEvent::ToolCall {
+                tool_use_id: call_id.to_string(),
+                name: call_name.to_string(),
+                summary: {
+                    let text = tool_call_summary(call_name, &args);
+                    match tool.as_ref().and_then(|tool| tool.source_tree_name.as_ref()) {
+                        Some(name) if conversation.source_tree_names()?.len() > 1 => {
+                            format!("[{name}] {text}")
                         }
-                    },
-                    step_commit: request.to_string(),
-                });
-                if let Some(tool) = conversation.tool(&request, round, call_id)? {
-                    if tool.is_terminal() {
-                        let (is_error, content) =
-                            protocol_tool_result(conversation, tool.result.as_ref())?;
-                        activity.push(TurnEvent::ToolResult {
-                            request: request.to_string(),
-                            round,
-                            tool_use_id: call_id.clone(),
-                            is_error,
-                            content,
-                            step_commit: request.to_string(),
-                        });
+                        _ => text,
                     }
-                }
+                },
+                step_commit: step_commit.clone(),
+            });
+            if let Some(tool) = tool.filter(|tool| tool.is_terminal()) {
+                let (is_error, content) =
+                    protocol_tool_result(conversation, tool.result.as_ref())?;
+                activity.push(TurnEvent::ToolResult {
+                    tool_use_id: call_id.to_string(),
+                    is_error,
+                    content,
+                    step_commit: step_commit.clone(),
+                });
             }
         }
     }
