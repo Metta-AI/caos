@@ -25,11 +25,9 @@ use conversation_protocol::v3::apply::{
 };
 use conversation_protocol::v3::oid::{ensure_genesis, G3};
 use conversation_protocol::v3::paths;
-pub use conversation_protocol::v3::records::TurnStatus;
 use conversation_protocol::v3::records::{
     Block, Identity, IdentityKind, Proposal, PublicationStatus, Role, SourceTreeResolution,
-    ToolResult as ProtocolToolResult, TranscriptEntry, TurnOutcome as ProtocolTurnOutcome,
-    TurnRecord,
+    ToolResult as ProtocolToolResult, TranscriptEntry, INTERRUPT_TEXT,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -136,16 +134,12 @@ pub enum TurnEvent {
     },
     Status(String),
     ToolCall {
-        request: String,
-        round: u64,
         tool_use_id: String,
         name: String,
         summary: String,
         step_commit: String,
     },
     ToolResult {
-        request: String,
-        round: u64,
         tool_use_id: String,
         is_error: bool,
         content: String,
