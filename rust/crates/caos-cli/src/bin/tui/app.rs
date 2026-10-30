@@ -6578,12 +6578,8 @@ mod tests {
         let (head, _) = seed_queued_conversation(&repo, "talk-1", "Alice", "first prompt");
         let transport = GitTransport::discover(&repo).unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
-        // Admission has already advanced the head past the message's own commit.
-        let durable_commit = transport
-            .git_capture(&["rev-parse", &format!("{head}^")], None)
-            .unwrap()
-            .trim()
-            .to_string();
+        // The head is the message's own commit: nothing is recorded after it.
+        let durable_commit = head;
         let mut conversation = state("talk-1");
         let pending_id = conversation.queue_pending_submission("another prompt".to_string());
 
