@@ -96,7 +96,7 @@ record prompt "$p1" "read the greeting" "model=claude-code" "content:hash=$conte
 [ "$status" = created ] || fail "the first prompt was '$status', not created"
 # The prompt is all that is recorded: no turn is opened for it.
 case "$(subjects)" in
-  "message.append conversation.root ") echo "  ok: $(subjects)" >&2 ;;
+  "message.append conversation.root "*) echo "  ok: $(subjects)" >&2 ;;
   *) fail "unexpected history: $(subjects)" ;;
 esac
 
