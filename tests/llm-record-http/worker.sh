@@ -61,11 +61,21 @@ subjects() { # -> the commit subjects, newest first, on one line
   git -C /tmp/repo log --format=%s "$head" | tr '\n' ' '
 }
 
-request_status() { # <request id>
+# The transcript's roles, oldest first, and its newest entry's text.
+roles() {
   local head
   head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the conversation"
   head=${head#head }
-  $TOOL request --repo /tmp/repo --head "$head" --id "$1" | jq -r .status
+  $TOOL transcript --repo /tmp/repo --head "$head" \
+    | while read -r _ role _; do printf '%s\n' "$role"; done | paste -sd,
+}
+
+newest_text() {
+  local head
+  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the conversation"
+  head=${head#head }
+  $TOOL transcript --repo /tmp/repo --head "$head" | tail -1 \
+    | { read -r _ _ _ _ encoded; printf '%s' "$encoded" | jq -r .; }
 }
 
 new_id() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
@@ -84,12 +94,11 @@ stage "the first prompt creates it, from the content it names"
 p1=$(new_id)
 record prompt "$p1" "read the greeting" "model=claude-code" "content:hash=$content"
 [ "$status" = created ] || fail "the first prompt was '$status', not created"
+# The prompt is all that is recorded: no turn is opened for it.
 case "$(subjects)" in
-  "request.claim request.admit message.append conversation.root "*) echo "  ok: $(subjects)" >&2 ;;
+  "message.append conversation.root ") echo "  ok: $(subjects)" >&2 ;;
   *) fail "unexpected history: $(subjects)" ;;
 esac
-first_request=$(git -C /tmp/repo log -1 --format=%H "$($TOOL fetch --repo /tmp/repo --ref "$ref" | cut -d' ' -f2)~2")
-[ "$(request_status "$first_request")" = running ] || fail "the first request is not running"
 
 stage "the same event again writes nothing"
 before=$recorded_head
@@ -105,28 +114,33 @@ code=$(curl -sS -X POST -o /tmp/call.body -w '%{http_code}' \
   --data-urlencode "salt=$SALT-call" "$server/eval/run") || fail "the tool call did not complete"
 [ "$code" = 200 ] || fail "tool call: HTTP $code: $(cat /tmp/call.body)"
 
-stage "a stop closes the request and keeps the closing message"
+stage "a stop records the closing message, once"
+[ "$(roles)" = user,assistant ] || fail "the call was not declared: $(roles)"
 s1=$(new_id)
 record stop "$s1" "I read it."
 [ "$status" = recorded ] || fail "the stop was '$status'"
-[ "$(request_status "$first_request")" = idle ] || fail "the stop left the request $(request_status "$first_request")"
+[ "$(roles)" = user,assistant,assistant ] || fail "the stop recorded $(roles)"
+[ "$(newest_text)" = "I read it." ] || fail "the closing message is '$(newest_text)'"
 record stop "$s1" "I read it."
 [ "$status" = recorded ] || fail "a repeated stop was '$status'"
+[ "$(roles)" = user,assistant,assistant ] || fail "a repeated stop recorded again"
 
-stage "a stop with nothing open is not an error"
-record stop "$(new_id)" "again"
-[ "$status" = nothing ] || fail "a stop with no request was '$status'"
+stage "a stop with no closing message records nothing"
+before=$recorded_head
+record stop "$(new_id)" ""
+[ "$status" = nothing ] || fail "an empty stop was '$status'"
+[ "$recorded_head" = "$before" ] || fail "an empty stop moved the head"
 
-stage "a second prompt opens a request, and a failure closes it as failed"
+stage "a second prompt, and a failure, are facts like any other"
 p2=$(new_id)
 record prompt "$p2" "do something else" "model=claude-code"
 [ "$status" = recorded ] || fail "the second prompt was '$status'"
-second_request=$(git -C /tmp/repo log -1 --format=%H "$($TOOL fetch --repo /tmp/repo --ref "$ref" | cut -d' ' -f2)~2")
-[ "$second_request" != "$first_request" ] || fail "the second prompt reused the first request"
 record failure "$(new_id)" "overloaded_error: try later"
 [ "$status" = recorded ] || fail "the failure was '$status'"
-[ "$(request_status "$second_request")" = failed ] \
-  || fail "the failure left the request $(request_status "$second_request")"
+[ "$(roles)" = user,assistant,assistant,user,system ] \
+  || fail "the prompt and failure recorded $(roles)"
+[ "$(newest_text)" = "overloaded_error: try later" ] \
+  || fail "the failure message is '$(newest_text)'"
 
 stage "a stop for a conversation nobody created is refused"
 code=$(curl -sS -X POST -o /tmp/none.body -w '%{http_code}' \
