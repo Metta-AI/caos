@@ -2864,7 +2864,6 @@ mod tests {
             |_, _, _, _| Ok(base.to_string()),
         )
         .unwrap();
-        interrupt_request(transport, id).unwrap();
     }
 
     #[test]
@@ -2977,7 +2976,6 @@ mod tests {
             |_, _, _, _| Ok(base.clone()),
         )
         .unwrap();
-        interrupt_request(&transport, "empty").unwrap();
         fixture_reference(&transport, "empty", "code", Some(&base)).unwrap();
         assert_eq!(
             conversation_load(&transport, "empty")
@@ -3605,7 +3603,6 @@ mod tests {
             |_, _, _, _| Ok("a".repeat(40)),
         )
         .unwrap();
-        interrupt_request(&transport, "proposal-talk").unwrap();
 
         let ours = commit_file(&transport, &base, "ours\n", "ours");
         let theirs = commit_file(&transport, &base, "theirs\n", "theirs");
@@ -3635,7 +3632,6 @@ mod tests {
             Some(SourceTreeResolution::Direct { .. })
         ));
         drop(conversation);
-        interrupt_request(&transport, "proposal-talk").unwrap();
 
         let error = submit_message_inner_with(
             &transport,
@@ -3778,7 +3774,6 @@ mod tests {
         assert!(
             fork_conversation(&transport, "Alice", "forked-active", "Fork", &active_source).is_ok()
         );
-        interrupt_request(&transport, "source").unwrap();
         let source = conversation_head(&transport, "source").unwrap().unwrap();
         let fork = fork_conversation(&transport, "Alice", "forked", "Fork", &source).unwrap();
         let store = open_store(&transport).unwrap();
@@ -3824,7 +3819,6 @@ mod tests {
             |_, _, _, _| Ok("a".repeat(40)),
         )
         .unwrap();
-        interrupt_request(&transport, "race").unwrap();
 
         let stale = std::cell::RefCell::new(String::new());
         let calls = std::cell::Cell::new(0);
