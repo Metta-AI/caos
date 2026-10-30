@@ -7,6 +7,10 @@
 # conversation is a flat transcript, so the fork copies it unchanged, open
 # request and all, and the record shows the fork landing straight on top.
 #
+# A conversation rooted on G3 (made before roots parented their content commit)
+# shares no history with the client repository, and a fork of it with --base
+# still merges that repository's commit in, from the tree the root holds.
+#
 # Driven through `caos mcp hook` only -- no tool server, no model.
 set -euo pipefail
 
