@@ -138,7 +138,12 @@ fn open_pr(github: &Github, branch: &str) -> Result<Option<Pr>, String> {
 }
 
 fn get_pr(github: &Github, number: u64) -> Result<Pr, String> {
-    let value = github.expect("GET", &github.repo_path(&format!("/pulls/{number}")), None, &[200])?;
+    let value = github.expect(
+        "GET",
+        &github.repo_path(&format!("/pulls/{number}")),
+        None,
+        &[200],
+    )?;
     pr_from(&value).ok_or_else(|| format!("GitHub answered for PR #{number} with no pull request"))
 }
 
