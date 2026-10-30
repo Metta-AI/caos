@@ -322,7 +322,7 @@ fi
 # declared args reached the script at /cas/args/<name>.
 grep -qF 'hello-from-tree-v2 word=banana-split' /tmp/stub/request-2.json \
   || fail "the queued tool lost its args or the edited source_tree"
-$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/caos-tools.records
+$TOOL tools --repo /tmp/repo --head "$head" > /tmp/caos-tools.records
 # toolu_04 (the good `hello`) and toolu_06 (the writer) must have run on THE
 # SAME source commit: hello is read-only, so nothing moved the pointer between
 # them. That is the queue continuing on one tree, which is what this ever meant.

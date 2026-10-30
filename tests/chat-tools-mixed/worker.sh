@@ -73,7 +73,7 @@ git merge-base --is-ancestor "$feature" "$source_tree" \
 [ "$(git show "$source_tree:second.txt")" = "second" ] \
   || fail "merging the source tree at 'side' by path did not bring its file in"
 
-$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/mixed-tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head" > /tmp/mixed-tools.jsonl
 jq -s -e '
   (map(.id) | sort) == (["tu_tool","tu_mtool","tu_mw","tu_mb","tu_me","tu_mg","tu_mm","tu_mp","tu_create","tu_side"] | sort) and
   (map(select(.id == "tu_mb"))[0] |
@@ -92,7 +92,7 @@ $TOOL parents --repo /tmp/repo --head "$head" > /tmp/mixed.parents
 start_found=0
 while read -r parent_oid parent_kind; do
   if [ "$parent_kind" = tool.start ] && \
-      $TOOL tools --repo /tmp/repo --head "$parent_oid" --request "$request" \
+      $TOOL tools --repo /tmp/repo --head "$parent_oid" \
         | jq -e 'select(.id == "tu_mb" and .status == "started")' >/dev/null; then
     start_found=1
   fi
