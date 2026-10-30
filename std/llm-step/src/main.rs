@@ -2466,23 +2466,8 @@ fn spawn_agent_call(
     let (configuration, child_request) =
         subagents::child_request(&child_id, &prompt_head, &cfg.system)?;
 
-    let admit = Transition::TurnAdmit {
-        record: TurnRecord {
-            id: child_request.clone(),
-            request_head: prompt_head.clone(),
-
-            model: cfg.model.clone(),
-            configuration: configuration.to_string(),
-            round: 0,
-            calls: Vec::new(),
-            interjections: Vec::new(),
-            status: TurnStatus::Queued,
-            latest_message: None,
-            escape_reason: None,
-            outcome: None,
-        },
-    };
-    let initial_head = mint_detached(state, &prompt_head, &admit, &signature)?;
+    // The child's first commit is its prompt: the request it runs answers it.
+    let initial_head = prompt_head.clone();
     validate_spine(state.store(), &initial_head, &mut HashSet::new()).map_err(String::from)?;
     let relay = subagents::prepare_relay(
         &child_request,
@@ -2562,29 +2547,17 @@ fn newest_user_actor(view: &Conversation<'_>) -> Result<String, String> {
     .ok_or_else(|| "request has no user actor in the transcript".to_string())
 }
 
-fn tool_arguments_path(
-    view: &Conversation<'_>,
-    request: &Oid,
-    round: u64,
-    tool: &str,
-) -> Result<String, String> {
+fn tool_arguments_path(view: &Conversation<'_>, tool: &str) -> Result<String, String> {
     last_matching(view, |_, entry| {
-        if entry.role != Role::Assistant
-            || entry.request.as_ref() != Some(request)
-            || entry.round != Some(round)
-        {
+        if entry.role != Role::Assistant {
             return None;
         }
-        entry.blocks.into_iter().find_map(|block| {
-            if let Block::ToolUse { id, arguments, .. } = block {
-                if id == tool {
-                    return Some(arguments);
-                }
-            }
-            None
-        })
+        entry
+            .tool_uses()
+            .find(|(id, _, _)| *id == tool)
+            .map(|(_, _, arguments)| arguments.to_string())
     })?
-    .ok_or_else(|| format!("declared tool {request}/{round}/{tool} has no argument payload"))
+    .ok_or_else(|| format!("declared call {tool} has no argument payload"))
 }
 
 fn wait_agent_call(state: &mut progress::State, site: &CallSite<'_>) -> Result<bool, String> {
