@@ -2688,6 +2688,8 @@ fn run_line_turn(
         .map_err(|error| (error, false))?;
     (|| {
         if let Some(request) = request {
+            // Nothing records which request answers a message, so say it.
+            eprintln!("[request {request}]");
             run_request(t, id, &request)?;
         }
         let load = conversation_load(t, id)?
