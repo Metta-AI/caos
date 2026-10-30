@@ -1262,8 +1262,7 @@ fn replay_from(
                 step_commit: step_commit.clone(),
             });
             if let Some(tool) = tool.filter(|tool| tool.is_terminal()) {
-                let (is_error, content) =
-                    protocol_tool_result(conversation, tool.result.as_ref())?;
+                let (is_error, content) = protocol_tool_result(conversation, tool.result.as_ref())?;
                 activity.push(TurnEvent::ToolResult {
                     tool_use_id: call_id.to_string(),
                     is_error,
