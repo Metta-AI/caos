@@ -3464,12 +3464,12 @@ mod tests {
         std::fs::write(&ref_lock, "another reader").unwrap();
         let load = conversation_load(&transport, "talk-1").unwrap().unwrap();
         std::fs::remove_file(ref_lock).unwrap();
-        assert_eq!(load.snapshot.status, TurnStatus::Queued);
         assert_eq!(load.replay.turns[0].message, "hello");
         assert_eq!(load.source_trees[0].name, "main");
         let head = oid(&load.snapshot.head, "head").unwrap();
         let store = open_store(&transport).unwrap();
-        let first_message = store.read_commit(&head).unwrap().parents[0].to_string();
+        // The head is the message itself: nothing is recorded but the fact.
+        let first_message = head.to_string();
         assert_eq!(load.replay.turns[0].commit, first_message);
         assert!(validate_spine(&store, &head, &mut HashSet::new()).is_ok());
         let mut cursor = head.clone();
@@ -3506,6 +3506,8 @@ mod tests {
             .unwrap()
             .is_none());
 
+        // Every message is answered by a request of its own, prepared when it is
+        // sent; whether another is still running is the sender's to know.
         let prepared_calls = std::cell::Cell::new(0);
         let next_request = submit_message_inner_with(
             &transport,
@@ -3523,21 +3525,11 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(next_request, base);
-        assert_eq!(prepared_calls.get(), 0);
+        assert_eq!(prepared_calls.get(), 1);
         let store = open_store(&transport).unwrap();
         let (_, active_head) = fetch_head(&transport, &store, "talk-1").unwrap().unwrap();
-        assert_eq!(
-            Conversation::open(&store, &active_head)
-                .unwrap()
-                .active_turn()
-                .unwrap()
-                .unwrap()
-                .interjections
-                .len(),
-            1
-        );
 
-        interrupt_request(&transport, "talk-1").unwrap();
+        interrupt_conversation(&transport, "talk-1").unwrap();
         assert!(
             conversation_snapshot(&transport, "talk-1")
                 .unwrap()
@@ -3575,7 +3567,6 @@ mod tests {
             3
         );
 
-        interrupt_request(&transport, "talk-1").unwrap();
         std::fs::write(transport.work_dir().join("other"), "other\n").unwrap();
         git(transport.work_dir(), &["add", "other"]);
         git(transport.work_dir(), &["commit", "--quiet", "-m", "other"]);
