@@ -222,7 +222,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 actor,
                 text,
                 secret_hash,
-                model,
                 configuration,
             }
         }
@@ -232,7 +231,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             actor: args.required("--actor")?,
             text: args.required("--text")?,
             refname: args.take("--ref")?,
@@ -243,20 +241,18 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             actor: args.required("--actor")?,
             id: args.required("--id")?,
             tool: args.required("--tool")?,
             input: args.required("--input")?,
             refname: args.take("--ref")?,
         },
-        "escape" => ToolCommand::Escape {
+        "interrupt" => ToolCommand::Interrupt {
             repo: args.repo()?,
             head: args
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             refname: args.take("--ref")?,
         },
         "create" => ToolCommand::Create {
@@ -274,14 +270,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
             path: args.required("--path")?,
-        },
-        "request" => ToolCommand::Request {
-            repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
-            id: args
-                .take("--id")?
-                .map(|value| parse_oid(&value, "request"))
-                .transpose()?,
         },
         "wait-terminal" => ToolCommand::WaitTerminal {
             repo: args.repo()?,
@@ -305,13 +293,10 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
         "tools" => ToolCommand::Tools {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
-            request: args.oid("--request", "request")?,
         },
         "tool-observation" => ToolCommand::ToolObservation {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
-            request: args.oid("--request", "request")?,
-            round: parse_u64(&args.required("--round")?, "round")?,
             id: args.required("--id")?,
         },
         "async" => ToolCommand::Async {
@@ -337,17 +322,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let repo = args.repo()?;
             let head = args.oid("--head", "conversation head")?;
             let validate = args.flag("--validate");
-            let request = args.take("--request")?;
             let started_tool = args.take("--started-tool")?;
-            let started_tool = match (request, started_tool) {
-                (None, None) => None,
-                (Some(request), Some(tool)) => Some((parse_oid(&request, "request")?, tool)),
-                _ => {
-                    return Err(ToolError::new(
-                        "parents needs both --request and --started-tool",
-                    ))
-                }
-            };
             ToolCommand::Parents {
                 repo,
                 head,
