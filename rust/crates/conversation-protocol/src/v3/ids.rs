@@ -77,10 +77,9 @@ mod tests {
             protocol_id("t", &json!({"a": 1})).unwrap(),
             "589086ca616938bbd6e0f55090b3d91d3945e9c43180b032b2dd534b45d63eb5"
         );
-        let request = Oid::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "request").unwrap();
         assert_eq!(
-            child_id("talk-1", &request, 3, "toolu_01AB").unwrap(),
-            "subagent-a9278ef7d75f32ccaf0e1a1c0aa64909fb37efbf01bd9d95eda62a8c2f4a1ea4"
+            child_id("talk-1", "toolu_01AB").unwrap(),
+            "subagent-45642338fd6008e5a80ca80ba594b6e2983a369ba04d16c0f8b8e73532495dbf"
         );
         assert_eq!(
             projection_id(&json!({
