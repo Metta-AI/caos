@@ -102,8 +102,8 @@ the session then ran somewhere caos had not been told about.
 
 Each call is ONE request to the server: `run` is `POST /eval/run` of `llm-step` in its
 tools-only mode, `start` is `POST /start/run`, `result` is `GET /result/<ticket>`
-(see [HTTP API](../../../spec/http-api.md)). The step declares the call on the conversation's active
-request, runs the tool, and answers with the call's own record, so this client neither
+(see [HTTP API](../../../spec/http-api.md)). The step declares the call (an assistant message carrying its
+`tool_use`), runs the tool, and answers with the call's own record, so this client neither
 writes the conversation nor reads it back. The tools run exactly as they run in a turn
 the step drives itself, and a tool reads and behaves one way whether a model meets it
 here or in the tui.
@@ -230,7 +230,7 @@ message id the hook mints -- and the step makes these transitions on the
 conversation. This process writes no part of a conversation, for a hook or a
 tool call. A repeated event names the message id it already recorded and writes
 nothing, so a retried hook is harmless. The answer is `status` (`created`,
-`recorded`, `joined`, `held` or `nothing`) and `head`.
+`forked`, `recorded` or `nothing`) and `head`.
 
 The one thing the step cannot find is a NEW conversation's content: the locator
 `--base:@@=` names (or a `/caos-session-start-from` line does) goes to the step
@@ -247,22 +247,21 @@ caos +<ref>:<ref>`); it used to be current because the hook pushed from here.
 
 | Hook | Transitions |
 |---|---|
-| `UserPromptSubmit` | `conversation.root` (the first only), `message.append` (the prompt), `request.admit`, `request.claim` — or, while a request is held open, `request.interject` or a `request.terminal` first (below) |
-| tool call | the step's own `model.complete` declaring the call, then its `tool.start` and `tool.complete` — this process writes nothing |
-| `Stop` | `model.complete` (the closing message), `request.terminal` idle — nothing, while a call is still running |
-| `StopFailure` | `message.append` (the error), `request.terminal` failed — the terminal only once no call is running |
+| `UserPromptSubmit` | `conversation.root` (the first only), `message.append` (the prompt) |
+| tool call | the step's own `message.append` of an assistant message declaring the call, then its `tool.start` and `tool.complete` -- this process writes nothing |
+| `Stop` | `message.append` (the closing message, as the assistant's) -- nothing when there is none |
+| `StopFailure` | `message.append` (the error, as a system message) |
 
-**A call can outlive its turn.** Claude Code moves any MCP call still running
-after 120s to the background, ends the turn, and delivers the result later in a
-turn of its own, which it opens with a `UserPromptSubmit`. Only a running
-request accepts a call's `tool.complete`, so a `Stop` that finds a call
-outstanding leaves the request open, and records no closing message, since a
-`model.complete` would open a new round the finishing call is then checked
-against. The next prompt closes that request if its calls have finished, and
-otherwise joins it as an interjection. A request closed under a running call
-has nowhere to record its result: the step finds it terminal and records
-nothing, and the model receives an empty error ("Task failed: no detail") for
-a call that succeeded.
+**The transcript is flat: facts, appended as they happen.** A prompt, an
+assistant message, a call, a call's result. Nothing in a conversation says which
+turn is running, so there is nothing to open on a prompt, hold for a running
+call, or close on a `Stop`. That matters because Claude Code drives calls
+asynchronously: it moves any MCP call still running after 120s to the
+background, ends the turn, opens new ones, and delivers the result later. The
+call's result is a fact recorded whenever it arrives, after whatever came in
+between, and its `tool_use` is answered by the record keyed by its id. A call
+that never finishes is a `tool_use` with no result, which a reader shows as
+unfinished.
 
 A session's first prompt creates the conversation, taking its `base` from the
 current `HEAD` and its fallback title from that prompt. Only a prompt may create
@@ -273,14 +272,6 @@ the middle.
 The conversation id is derived from the session id rather than stored in a map,
 so the ref is the whole record. `claude --resume` keeps its session id, so a
 resumed session extends the same conversation.
-
-**The prompt admits a request and claims it in the same compare-and-swap.**
-Claimed here rather than by a runner because the turn is already running by the
-time the hook fires. The request is identified by the commit of the prompt that
-opened it -- unique, and known before the admission that names it is written --
-and it is what the step finds as the conversation's active one when a call
-arrives. It is not an ArgTree anyone can run: no runner will pick it up, and a
-call names no request.
 
 **A call is one request to the server.** `POST /eval/run` of the step, as a
 form: `base:hash` (the step), `conversation`, `tools-only=<tool_use_id>`, `tool`
