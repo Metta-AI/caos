@@ -545,7 +545,10 @@ mod tests {
         let Some(ToolResult::Complete { observation, .. }) = tool.result else {
             panic!("the read did not come across complete");
         };
-        assert_eq!(observation, format!("{}/observation.json", paths::call_payload_dir("call-1")));
+        assert_eq!(
+            observation,
+            format!("{}/observation.json", paths::call_payload_dir("call-1"))
+        );
         assert_eq!(view.payload(&observation).unwrap(), b"\"kept\"".to_vec());
         let (_, _, note) = &transcript[2];
         assert!(matches!(&note.blocks[..], [Block::Text { text }] if text.contains(source.as_str())));
