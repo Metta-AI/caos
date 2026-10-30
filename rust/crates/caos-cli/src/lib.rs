@@ -178,13 +178,19 @@ pub struct SourceTreeDiff {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A conversation as its head stands. Whether a turn is running is not here:
+/// a conversation records facts, not the state of whatever drives it, so a
+/// process knows it is running a turn only because it is the one running it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationSnapshot {
     pub id: String,
     pub head: String,
     pub title: String,
-    pub status: TurnStatus,
-    pub request: Option<String>,
+    /// The latest turn was interrupted: an interruption is the newest entry,
+    /// background notices aside.
     pub interrupted: bool,
+    /// The latest turn failed: the step's failure message is the newest entry,
+    /// background notices aside.
     pub error: Option<String>,
 }
 
