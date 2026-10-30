@@ -296,10 +296,21 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     // root's parent gives them. .caos/ is the fork's own record and stays as the
     // source left it. A conflict refuses the fork, naming the files: nobody is
     // in the conversation yet to resolve it.
+    //
+    // A conversation made before roots parented their content commit is rooted
+    // on G3 and shares no history with that repository, so git finds no base.
+    // Its root's content, without .caos/, is the tree it was seeded from, and
+    // the fork merges from that instead.
     let (content, merged) = match &request.content {
         Some(locator) => {
             let commit = content_commit(&store, locator)?;
-            let tree = match store.merge_commits(from, &commit)? {
+            let outcome = if store.merge_base(from, &commit)?.is_some() {
+                store.merge_commits(from, &commit)?
+            } else {
+                let base = seed_tree(&mut store, from)?;
+                store.merge_commits_over(&base, from, &commit)?
+            };
+            let tree = match outcome {
                 MergeOutcome::Merged { tree } => tree,
                 MergeOutcome::Conflict { paths } => {
                     return Err(format!(
