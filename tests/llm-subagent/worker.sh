@@ -97,8 +97,7 @@ if [ "$child" = "$child_hex" ] || [ "${#child_hex}" -ne 64 ]; then
   fail "spawn returned invalid child id: $child"
 fi
 case "$child_hex" in *[!0-9a-f]*) fail "spawn returned invalid child id: $child" ;; esac
-expected_child=$($TOOL child-id --parent "$conv" --round 0 \
-  --tool toolu_spawn) || fail "recomputing child id"
+expected_child=$($TOOL child-id --parent "$conv" --tool toolu_spawn) \
 expected_child=${expected_child#child }
 [ "$child" = "$expected_child" ] || fail "child id is not derived from the durable call"
 
@@ -208,7 +207,6 @@ mkfifo /tmp/stub/response-6.json
 printf '{"content":[{"text":"%s","type":"text"}],"stop_reason":"end_turn"}\n' \
   "$TERMINAL_TEXT" > /tmp/stub/response-7.json
 admit_turn "apply the child result"
-request2=$request
 start_turn
 wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arrived"
 # Promotion mounts a NEW source tree beside the existing one, so its shell has
