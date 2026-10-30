@@ -319,7 +319,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     commit(
         store,
         &mut head,
-        model_complete(&request, 2, 5, "assistant-4", &[], "golden-conversation"),
+        assistant_message(5, "assistant-4", &[], "golden-conversation"),
         &signature,
     );
     commit(
@@ -419,63 +419,23 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &signature,
     );
 
-    let queued_escape = oid('7');
-    let queued_head = head.clone();
     commit(
         store,
         &mut head,
-        Transition::TurnAdmit {
-            record: request_record(queued_escape.clone(), queued_head),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnEscape {
-            request: queued_escape,
-            reason: Some("cancel before claim".to_string()),
-        },
-        &signature,
-    );
-
-    let cancelling = oid('8');
-    let cancelling_head = head.clone();
-    commit(
-        store,
-        &mut head,
-        Transition::TurnAdmit {
-            record: request_record(cancelling.clone(), cancelling_head),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnClaim {
-            request: cancelling.clone(),
-            latest_message: "assistant-4".to_string(),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnEscape {
-            request: cancelling.clone(),
-            reason: Some("stop running".to_string()),
-        },
-        &signature,
-    );
-    commit(
-        store,
-        &mut head,
-        Transition::TurnTerminal {
-            request: cancelling,
-            outcome: TurnOutcome::Idle {
-                result: None,
-                interrupted: true,
+        Transition::MessageAppend {
+            entry: TranscriptEntry {
+                message_id: "interrupt-6".to_string(),
+                conversation: "golden-conversation".to_string(),
+                role: Role::System,
+                actor: "user".to_string(),
+                model: None,
+                blocks: vec![Block::Text {
+                    text: INTERRUPT_TEXT.to_string(),
+                }],
+                proposal: None,
+                source_tree_resolution: None,
             },
+            payloads: Vec::new(),
         },
         &signature,
     );
@@ -506,39 +466,21 @@ fn commit(
     applied
 }
 
-fn request_record(id: Oid, request_head: Oid) -> TurnRecord {
-    TurnRecord {
-        id,
-        request_head,
-
-        model: "model".to_string(),
-        configuration: configuration(),
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    }
-}
-
-fn model_complete(
-    request: &Oid,
-    round: u64,
+fn assistant_message(
     ordinal: u64,
     message_id: &str,
-    calls: &[DeclaredCall],
+    calls: &[(&str, &str)],
     conversation: &str,
 ) -> Transition {
     let mut blocks = vec![Block::Text {
         text: "Working".to_string(),
     }];
     let mut payloads = Vec::new();
-    for call in calls {
-        let name = format!("{}-arguments", call.id);
+    for (id, tool) in calls {
+        let name = format!("{id}-arguments");
         blocks.push(Block::ToolUse {
-            id: call.id.clone(),
-            name: call.name.clone(),
+            id: id.to_string(),
+            name: tool.to_string(),
             arguments: format!(
                 "{}/{name}",
                 paths::transcript_payload_dir(ordinal, message_id)
@@ -546,21 +488,18 @@ fn model_complete(
         });
         payloads.push((name, b"{}".to_vec()));
     }
-    Transition::ModelComplete {
+    Transition::MessageAppend {
         entry: TranscriptEntry {
             message_id: message_id.to_string(),
             conversation: conversation.to_string(),
             role: Role::Assistant,
             actor: "model".to_string(),
-            request: Some(request.clone()),
-            round: Some(round),
             model: Some("model".to_string()),
             blocks,
             proposal: None,
             source_tree_resolution: None,
         },
         payloads,
-        calls: calls.to_vec(),
     }
 }
 
