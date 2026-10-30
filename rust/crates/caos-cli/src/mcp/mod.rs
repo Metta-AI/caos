@@ -555,8 +555,9 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     if let Some(id) = payload.get("tool_use_id").and_then(Value::as_str) {
         object.insert("caos_tool_use_id".to_string(), json!(id));
     }
-    // The turn this call belongs to, which becomes the event's `request` — the
-    // same job `llm-step`'s `run` does for a turn it drives itself.
+    // The prompt this call belongs to. The conversation keys a call by its id
+    // alone and records no turn, so the server strips it with the other
+    // injected values.
     if let Some(prompt) = payload.get("prompt_id").and_then(Value::as_str) {
         object.insert("caos_prompt_id".to_string(), json!(prompt));
     }
