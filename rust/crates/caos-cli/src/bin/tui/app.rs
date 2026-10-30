@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use caos::{GitTransport, Transport};
 use caos_cli::{
