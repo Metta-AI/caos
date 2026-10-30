@@ -129,7 +129,7 @@ esac
 head_p=$(head_of "cc/$p")
 [ -n "$head_p" ] || fail "the fork of the G3-rooted conversation has no conversation of its own"
 fork_p=$(git log --first-parent --format='%H %s' "$head_p" \
-  | awk '$2 == "conversation.fork" { print $1; exit }')
+  | awk '$2 == "conversation.fork" && !found { print $1; found = 1 }')
 [ -n "$fork_p" ] || fail "no conversation.fork on the fork's branch: $(subjects "$head_p")"
 [ "$(git rev-parse "$fork_p^1")" = "$head_o" ] || fail "the fork's first parent is not its source"
 [ "$(git rev-parse -q --verify "$fork_p^2")" = "$content" ] \
