@@ -68,7 +68,7 @@ new_llm_conversation llm-step "$STUB_PORT" "$ws" \
 stage "first turn: pre-dispatch interjection and durable tool records"
 admit_turn "create out.txt containing hi, then confirm"
 request1=$request
-interject_output=$($TOOL interject --repo /tmp/repo --head "$head" --request "$request" \
+interject_output=$($TOOL interject --repo /tmp/repo --head "$head" \
   --actor racer --text "$EARLY_INTERJECTION_TEXT" --ref "$conversation_ref") \
   || fail "publishing the pre-dispatch interjection"
 early_head=${interject_output%%$'\n'*}
@@ -80,9 +80,6 @@ start_turn
 wait_turn || fail "the first turn never reached a terminal head"
 head1=$head
 
-$TOOL request --repo /tmp/repo --head "$head1" --id "$request1" > /tmp/request1.record
-jq -e --arg id "$early_message" '.interjections | index($id) != null' \
-  /tmp/request1.record >/dev/null || fail "request record lost the pre-dispatch interjection"
 $TOOL transcript --repo /tmp/repo --head "$head1" > /tmp/transcript1
 roles=$(while read -r _ role _; do printf '%s\n' "$role"; done \
   < /tmp/transcript1 | paste -sd,)
@@ -115,23 +112,19 @@ start_turn
 wait_for_file /tmp/stub/request-4.json 150 \
   || fail "second turn never reached the blocked response"
 
-interject_output=$($TOOL interject --repo /tmp/repo --request "$request" \
+interject_output=$($TOOL interject --repo /tmp/repo \
   --actor racer --text "$INTERJECTION_TEXT" --ref "$conversation_ref") \
   || fail "publishing the terminal-race interjection"
 interjection=${interject_output%%$'\n'*}
 interjection=${interjection#head }
-running2=""
-running_status=""
+interjected_onto=""
 while read -r key value; do
-  case "$key" in
-    parent) running2=$value ;;
-    status) running_status=$value ;;
-  esac
+  if [ "$key" = parent ]; then interjected_onto=$value; fi
 done <<<"$interject_output"
-assert_oid "$running2" "the running request head"
-[ "$running_status" = running ] || fail "request is not running"
-[ "$(git rev-parse "$running2^1")" = "$admitted2" ] \
-  || fail "request.claim is not immediately after admission"
+# The step keeps no turn state: while it waits on the model, nothing has been
+# recorded after the prompt it answers.
+[ "$interjected_onto" = "$admitted2" ] \
+  || fail "something was recorded between the prompt and the interjection"
 interjection_message=${interject_output##*$'\n'}
 interjection_message=${interjection_message#message }
 head=$interjection
