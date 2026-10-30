@@ -580,6 +580,23 @@ fn validate_entry_payloads(
     Ok(())
 }
 
+/// An assistant message's `tool_use` ids are the ids its calls are recorded
+/// under, so they are unique: within the message, and against every call the
+/// conversation has already recorded.
+fn validate_declared_calls(
+    conversation: &Conversation<'_>,
+    entry: &TranscriptEntry,
+) -> Result<(), String> {
+    let ids: Vec<String> = entry.tool_uses().map(|(id, _, _)| id.to_string()).collect();
+    paths::validate_unique(&ids, "declared call id")?;
+    for id in &ids {
+        if conversation.tool(id)?.is_some() {
+            return Err(format!("call {id:?} is already recorded"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_entry_resolution(
     conversation: &Conversation<'_>,
     entry: &TranscriptEntry,
@@ -818,12 +835,4 @@ fn require_child(conversation: &Conversation<'_>, child: &str) -> Result<ChildRe
     conversation
         .child(child)?
         .ok_or_else(|| format!("subagent {child:?} does not exist"))
-}
-
-fn validate_caos_path(value: &str, what: &str) -> Result<(), String> {
-    paths::validate_tree_path(value)?;
-    if !value.starts_with(".caos/") {
-        return Err(format!("{what} must start with .caos/, got {value:?}"));
-    }
-    Ok(())
 }
