@@ -181,8 +181,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
     let parsed = match command.as_str() {
         "child-id" => ToolCommand::ChildId {
             parent: args.required("--parent")?,
-            request: args.oid("--request", "parent request")?,
-            round: parse_u64(&args.required("--round")?, "round")?,
             tool: args.required("--tool")?,
         },
         "ref" => ToolCommand::Ref {
@@ -212,7 +210,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let actor = args.required("--actor")?;
             let text = args.required("--text")?;
             let secret_hash = args.oid("--secret-hash", "secret hash")?;
-            let model = args.required("--model")?;
             let configuration = args.oid("--configuration", "model configuration")?;
             let source_trees = args.source_trees()?;
             ToolCommand::Turn {
