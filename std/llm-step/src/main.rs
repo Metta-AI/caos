@@ -3884,7 +3884,19 @@ mod tests {
         let pending = declaration_of(&view, "second").unwrap().unwrap().pending;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "second");
-        assert_eq!(context_messages(&view).unwrap().len(), 2);
+        // The unfinished call is answered as unfinished, not cut from the context.
+        let messages = context_messages(&view).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[2],
+            message(
+                "user",
+                json!([
+                    first_block.clone(),
+                    error_block("second", "this call did not finish")
+                ])
+            )
+        );
 
         let second_block = json!({
             "type":"tool_result", "tool_use_id":"second", "content":"two"
