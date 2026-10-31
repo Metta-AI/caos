@@ -204,13 +204,21 @@ echo "hermes-gateway: caos server $server; gateway on 127.0.0.1:$port" >&2
 echo "  ticket:  $ticket" >&2
 {
   echo ""
-  echo "  On the desktop, start the client side:"
-  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
-  echo "      --port $vhost_port --host 127.0.0.1:$port"
-  echo "  then give Remote gateway the URL this prints:"
-  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- \\"
-  echo "      url --port $vhost_port $ticket"
-  echo "  and the session token '$(cat "$ws_token")'."
+  echo "  There are two ways to connect the Hermes Desktop to this gateway:"
+  echo ""
+  echo "  Iroh:"
+  echo "  - Use this if the gateway is not directly reachable from the computer running Hermes Desktop"
+  echo "  - Run all commands on the desktop's computer"
+  echo "  - Add a gateway with the url printed by this command:"
+  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- url --port $vhost_port $ticket"
+  echo "  - Start the http-iroh bridge:"
+  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- --port $vhost_port --host 127.0.0.1:$port"
+  echo ""
+  echo "  Directly:"
+  echo "  - Use this if the Desktop app can reach the gateway directly"
+  echo "  - Add a gateway with 127.0.0.1:$port"
+  echo ""
+  echo "  In either case, use a session token: '$(cat "$ws_token")'"
   echo ""
 } >&2
 

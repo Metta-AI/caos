@@ -36,23 +36,37 @@ functions, cached by redis
     - Name the file `softmax-token`
     - Set the reader to `reader:@@=git+https://github.com/Metta-AI/caos-softmax?ref=refs/heads/main&dir=tools/gota`
   - `nix run github:Metta-AI/caos#caos-cli -- secrets-push --dir=. --server=$CAOS_SERVER`. This prints your `SECRET_READERS_KEY`
-- Go go https://claude.ai/code. Click New
-- At the bottom, click Default > Cloud > Add Cloud env... and fill in the form:
-  - Name: Caos
-  - Network: Full
-  - Setup script:
-    ```
-      echo last modified on 2026-10-01T1455PT
-      B=https://raw.githubusercontent.com/Metta-AI/caos/main
-      curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
-      go run /tmp/caos-bootstrap.go --base="$B" \
-        --server=<CAOS_SERVER> --secret-readers=<SECRET_READERS_KEY>
-    ```
-- From the repo picker (next to the env picker), choose `metta-ai/caos-session`
+- For Claude Code:
+  - Go go https://claude.ai/code. Click New
+  - At the bottom, click Default > Cloud > Add Cloud env... and fill in the form:
+    - Name: Caos
+    - Network: Full
+    - Setup script:
+      ```
+        echo last modified on 2026-10-01T1455PT
+        B=https://raw.githubusercontent.com/Metta-AI/caos/main
+        curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
+        go run /tmp/caos-bootstrap.go --base="$B" \
+          --server=<CAOS_SERVER> --secret-readers=<SECRET_READERS_KEY>
+      ```
+  - From the repo picker (next to the env picker), choose `metta-ai/caos-session`
+- For Hermes:
+  - Run the hermes/caos gateway: `nix run .#hermes-gateway`. `$CAOS_SERVER` must be set at this point
+  - Settings (gear icon in the top right of the window, or control/command-comma) > Gateways > Saved connections
+    - Add Connection
+    - Name: Caos
+    - Url: Enter the url from `nix run .#hermesgateway` above (iroh or direct)
+    - Session token: `caos`
+    - Save connection
+    - Click 'Test' and check that your connection is ok
+  - Start a new session
+    - Pick Caos > Default from the gateway picker at the bottom of the window
+    - Pick a model. It defaults to no model and then gives errors
+    - Enter a prompt (below)
 - Type a prompt
-  - `Use caos to import metta-ai/caos into caos/main`
-  - `Use caos' RunTool to run caos-std/caos-build on caos/main`
-  - `Use caos' RunTool to run caos-std/caos-test on caos/main`
+  - `Import <name of repo>`
+  - `Add a joke to the top of <repo's README.md>`
+  - `Make a PR for this`
 
 # Why?
 
