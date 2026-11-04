@@ -638,6 +638,8 @@ mod tests {
             json!({"stack": "sources/repo", "squash": "true"}),
             json!({"stack": "sources/repo", "trunk": "bad..name"}),
             json!({"stack": "sources/repo", "force": "maybe"}),
+            json!({"stack": "sources/repo", "wait-for-ci-min": "later"}),
+            json!({"stack": "sources/repo", "wait-for-ci-min": "1000"}),
         ] {
             assert!(parameters(&call(input.clone())).is_err(), "{input}");
         }
