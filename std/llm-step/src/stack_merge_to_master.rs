@@ -38,6 +38,13 @@ struct Parameters {
         deserialize_with = "bool_or_string"
     )]
     dry_run: bool,
+    #[serde(
+        default,
+        rename = "wait-for-ci-min",
+        alias = "wait_for_ci_min",
+        deserialize_with = "ci_status::minutes_or_string"
+    )]
+    wait_for_ci_min: u64,
 }
 
 fn blank(value: Option<String>) -> Option<String> {
