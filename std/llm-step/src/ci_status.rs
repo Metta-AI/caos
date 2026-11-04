@@ -297,12 +297,21 @@ pub(super) fn read(github: &Github, reference: &str) -> Result<Checks, String> {
     Ok(Checks { head, checks })
 }
 
+/// The verdict first, so a failure is the first thing read, then where, then
+/// the checks with the failing ones first and the pending ones next.
 pub(super) fn render(repository: &str, reference: &str, checks: &Checks) -> String {
     let mut text = format!(
-        "repository {repository}  branch {reference}  head {}\n",
+        "checks: {}\nrepository {repository}  branch {reference}  head {}\n",
+        checks.summary(),
         &checks.head[..checks.head.len().min(12)]
     );
-    for check in &checks.checks {
+    let mut listed: Vec<&Check> = checks.checks.iter().collect();
+    listed.sort_by_key(|check| match check.standing {
+        Standing::Failing => 0,
+        Standing::Pending => 1,
+        Standing::Passing => 2,
+    });
+    for check in listed {
         text.push_str(&format!("{:<16} {}", check.state, check.name));
         if !check.url.is_empty() {
             text.push_str("  ");
