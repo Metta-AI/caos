@@ -422,10 +422,16 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             text.push_str(line);
             text.push('\n');
         }
+        let waited = if p.wait_for_ci_min > 0 && !ci_settled {
+            format!(" after waiting {} min", p.wait_for_ci_min)
+        } else {
+            String::new()
+        };
         text.push_str(&format!(
-            "FAILED: stack-merge-to-master refused; nothing was merged: CI is not passing on {}. Wait for it or fix it (caos-std/ci-status reads one branch), or pass force=true to merge anyway.\n",
+            "FAILED: stack-merge-to-master refused; nothing was merged: CI is not passing on {}{waited}. Fix it, or wait for it (wait-for-ci-min=<minutes>), or pass force=true to merge anyway.\n",
             blockers.join("; ")
         ));
+        text.push_str(&ci_detail(&repository, &targets));
         return site.complete(state, result_block(&site.call.id, &text, true), None, None, None);
     }
     if p.dry_run {
