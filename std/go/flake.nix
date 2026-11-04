@@ -14,6 +14,8 @@
   # DO NOT COPY IT SOMEWHERE WRITABLE. Go tolerates a GOCACHE it cannot write —
   # writes fail silently and the run still hits every primed entry — and a
   # writable copy measures the same, so a 135MB copy per job buys nothing.
+  # The one write Go does NOT tolerate is the module index's, which is why the
+  # image sets GODEBUG=goindex=0 (see its Env).
   #
   # THE PRELUDE (./prelude) IS WHY A SCRIPT CAN IMPORT ANYTHING. A lone `go
   # run` file has no module and may import only the standard library, so
@@ -184,6 +186,18 @@
               # Must match the prime (see goCache): CGO_ENABLED is part of the
               # build cache key, and there is no C compiler here anyway.
               "CGO_ENABLED=0"
+              # THE MODULE INDEX IS THE ONE CACHE WRITE GO TREATS AS FATAL, and
+              # under -mod=vendor it indexes every package dir — /tmp/run's
+              # included — keyed on file mtimes, skipping any dir touched in the
+              # last 2s. So a `go run` that starts within 2s of /worker's copy
+              # skips it and passes, and a slower one must write an entry to
+              # the read-only /gocache and dies with `open /gocache/…-d:
+              # permission denied` at an import line. That presented as a
+              # flaky tests/actor (probe.go runs `go run ./kvcmd` after its git
+              # work). Off costs ~60ms a run (the primed std entries); on, any
+              # slow job fails. A script that sets its own GODEBUG must keep
+              # this in it.
+              "GODEBUG=goindex=0"
               # NAMED EXPLICITLY, because cacert installs `ca-bundle.crt` and
               # none of the six paths Go searches by default is that one
               # (`/etc/ssl/certs/ca-certificates.crt` is the closest). A pure-Go
