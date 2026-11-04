@@ -10,6 +10,7 @@ What CI says about a branch on GitHub. The first line is the verdict: passing, p
 @param [stack] A stack directory, such as sources/repo: names the repository, and lets branch be a layer.
 @param [repository] HTTPS repository URL on github.com, without credentials. Required without stack.
 @param [branch-prefix] Text put before a layer's branch name, the same value given to stack-publish.
+@param [wait-min] Minutes to wait for CI to settle, at most 180: it returns as soon as a check fails or none is pending, and after that long says it is still pending. Default 0, read once.
 @op ci-status
 END
 curry --base:@=DEEP-DEPS/llm-step --help=$HELP
