@@ -419,10 +419,10 @@ start(path="caos-std/ci-status", arguments={
 result(ticket=<ticket>)
 ```
 
-`start` gives the same ticket for the same arguments and does not run a
-finished call again, so to read CI afresh after a new push, `run` it or vary
-the arguments. A check that has not been created yet is not waited for: right
-after a push the answer can be `no checks`.
+Every call reads GitHub afresh: `ci-status` runs inside the step, which is
+keyed on the call itself, so the same arguments after a new push are a new
+read, not a cached answer. A check that has not been created yet is not
+waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting
 
