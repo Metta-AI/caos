@@ -78,7 +78,8 @@ One job runs like this:
    cache if it matches this V8 build, and fall back to compiling if it does
    not.
 3. Instantiate with two import modules: `wasi_snapshot_preview1` (implemented
-   by the host, over the filesystem view below) and `caos` (the verbs below).
+   by the host, over the filesystem view below) and `caos_v1` (the verbs
+   below).
    An import outside these two is refused at instantiation.
 4. Call `_start`. The argv is the module name; the environment is empty.
 5. Map the outcome to a job result:
