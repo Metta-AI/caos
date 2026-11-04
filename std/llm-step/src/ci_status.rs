@@ -374,16 +374,26 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         repo,
         token: token_for(&repository)?,
     };
-    match read(&github, &reference) {
-        Ok(checks) => {
-            let block = result_block(
-                &site.call.id,
-                &render(&repository, &reference, &checks),
-                false,
-            );
-            site.complete(state, block, None, None, None)
+    let mut last: Option<Checks> = None;
+    let waited = wait_until(p.wait_min, || {
+        let checks = read(&github, &reference)?;
+        let done = settled([checks.verdict()]);
+        last = Some(checks);
+        Ok(done)
+    });
+    match (waited, last) {
+        (Ok(done), Some(checks)) => {
+            let mut text = render(&repository, &reference, &checks);
+            if !done {
+                text.push_str(&format!(
+                    "still pending after waiting {} min; run ci-status again to wait longer\n",
+                    p.wait_min
+                ));
+            }
+            site.complete(state, result_block(&site.call.id, &text, false), None, None, None)
         }
-        Err(error) => site.fail(state, &format!("ci-status: {error}")),
+        (Ok(_), None) => site.fail(state, "ci-status: nothing was read"),
+        (Err(error), _) => site.fail(state, &format!("ci-status: {error}")),
     }
 }
 
