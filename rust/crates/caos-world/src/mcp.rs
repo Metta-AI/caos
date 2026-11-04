@@ -42,7 +42,8 @@ before you use one you have not used.
 To work on code in caos, import it with import-source into sources/<repo>/00-base, copy \
 that to sources/<repo>/99-dirty, edit the copy with the file tools, move it to a layer \
 sources/<repo>/NN-<name> with a NN-<name>.pr.md beside it, stack-sync to bring the stack up \
-to date with the remote, and stack-publish to push it and open its PRs (std/GIT.md). Tools that act on a source tree take its path as \
+to date with the remote, stack-publish to push it and open its PRs, and stack-merge-to-master \
+to merge them once reviewed (std/GIT.md). Tools that act on a source tree take its path as \
 `source-tree`.";
 
 pub fn initialize(params: &Value) -> Value {

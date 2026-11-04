@@ -1,0 +1,15 @@
+# std/ci-status (design/stack-publish.md, "ci-status"): an entry for an
+# OPERATION OF THE STEP. It reads GitHub and writes nothing, but `@op` keeps it
+# in llm-step, which already holds the github-token reader: a worker of its own
+# would need its own secret grant, and stack-merge-to-master reads the same thing before
+# it merges. This entry exists to give the operation a path, a help and a place
+# in `tool_help`/`run_tool`. The image it curries is never run.
+HELP=<<END
+What CI says about a branch on GitHub: every check run and commit status on its head, one per line with its state and link, and a verdict: passing, pending (something has not finished), FAILING (something failed; neutral and skipped checks pass), or no checks. The branch can be a branch name, a commit hash, or, with stack, a layer's name (02-tests) or its name without the number, which means that layer's branch (with branch-prefix in front). The repository comes from stack's 00-base.source.json unless given.
+@param branch The branch, commit, or layer to read.
+@param [stack] A stack directory, such as sources/repo: names the repository, and lets branch be a layer.
+@param [repository] HTTPS repository URL on github.com, without credentials. Required without stack.
+@param [branch-prefix] Text put before a layer's branch name, the same value given to stack-publish.
+@op ci-status
+END
+curry --base:@=DEEP-DEPS/llm-step --help=$HELP

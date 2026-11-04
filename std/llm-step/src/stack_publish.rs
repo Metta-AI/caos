@@ -580,6 +580,7 @@ impl Github {
             "GET" => minreq::Method::Get,
             "POST" => minreq::Method::Post,
             "PATCH" => minreq::Method::Patch,
+            "PUT" => minreq::Method::Put,
             other => return Err(format!("unsupported GitHub method {other}")),
         };
         let mut request = minreq::Request::new(verb, url)

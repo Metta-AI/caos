@@ -1,0 +1,8 @@
+# What this test reaches for (format `<path> <name>`).
+../../std/go go
+../../std/llm-step llm-step
+../../std/bash-tool bash-tool
+../../std/llm-stub llm-stub
+../../std/llm-test-tool llm-test-tool
+../../std/stack-merge-to-master stack-merge-to-master
+../../std/ci-status ci-status
