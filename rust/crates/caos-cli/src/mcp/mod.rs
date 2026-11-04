@@ -76,6 +76,10 @@ pub struct Config {
     /// longer tool text in the conversation and answers with a preview. Absent
     /// means the server's default (50000); 0 for no limit.
     max_result_chars: Option<usize>,
+    /// `--agents-md`: give the model the conversation's own `AGENTS.md` when the
+    /// first prompt creates it. Claude Code stands in a checkout of the client
+    /// repo and reads it there, so only a harness that does not (Hermes) asks.
+    agents_md: bool,
 }
 
 impl Config {
@@ -90,6 +94,8 @@ impl Config {
                 config.max_result_chars = Some(count.parse().map_err(|_| {
                     format!("--max-result-chars must be a non-negative integer, not {count:?}")
                 })?);
+            } else if argument == "--agents-md" {
+                config.agents_md = true;
             } else if let Some(url) = argument.strip_prefix("--server=") {
                 config.server = Some(url.to_string());
             } else if let Some(locator) = argument.strip_prefix("--base:@@=") {
@@ -136,7 +142,9 @@ fn usage() -> String {
          Both take the server (--server=<url>) and name the step that \
          runs this session's tools:\n  \
          {}\n\
-         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from.\n\
+         and the hook takes `--base:@@=<git locator>` for what a new conversation starts from, \
+         and `--agents-md` to answer the prompt that creates it with the conversation's \
+         AGENTS.md as additionalContext.\n\
          `serve` takes `--max-result-chars=<n>`: a tool result longer than that is kept in \
          the conversation and answered with a preview (default 50000; 0 for no limit).",
         crate::missing_image_arg(LLM_STEP_ARG)
@@ -422,22 +430,72 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
     };
     let id = recorded_conversation(payload)?;
     let readers = crate::secret_store::reader_summary();
-    let status = match record_prompt(config, &id, prompt, from.as_ref()) {
-        Ok(status) => status,
+    let recorded = match record_prompt(config, &id, prompt, from.as_ref()) {
+        Ok(recorded) => recorded,
         Err(error) if from.is_some() => refuse_prompt(&error),
         Err(error) => return Err(error),
     };
-    match (status.as_str(), &from) {
-        ("forked", Some(from)) => announce(&format!(
+    let text = match (recorded.status.as_str(), &from) {
+        ("forked", Some(from)) => format!(
             "caos conversation ref {} forked from {from}; {readers}",
             conversation_ref(&id)?
-        )),
-        ("created", _) => announce(&format!(
+        ),
+        ("created", _) => format!(
             "caos conversation ref {}; {readers}",
             conversation_ref(&id)?
-        )),
-        _ => Ok(()),
+        ),
+        _ => return Ok(()),
+    };
+    let mut message = json!({ "systemMessage": text });
+    if config.agents_md {
+        if let Some(context) = agents_md(config, &recorded.head)? {
+            message["hookSpecificOutput"] = json!({
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": context,
+            });
+        }
     }
+    println!(
+        "{}",
+        serde_json::to_string(&message)
+            .map_err(|error| format!("encoding hook response: {error}"))?
+    );
+    Ok(())
+}
+
+/// The `AGENTS.md` at the root of the conversation `head`, introduced for the
+/// model; `None` when the conversation has none. Bounded as `llm-step` bounds a
+/// source tree's (`std/llm-step/src/source_trees.rs`).
+fn agents_md(config: &Config, head: &str) -> Result<Option<String>, String> {
+    let transport = HttpTransport::new(&config.server()?);
+    let object = |oid: &str| caos::Transport::get_object(&transport, oid);
+    let (kind, bytes) = object(head)?;
+    if kind != "commit" {
+        return Err(format!(
+            "conversation head {head} is a {kind}, not a commit"
+        ));
+    }
+    let commit = gix::objs::CommitRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
+        .map_err(|error| format!("invalid commit {head}: {error}"))?;
+    let tree = commit.tree().to_string();
+    let (_, bytes) = object(&tree)?;
+    let entries = gix::objs::TreeRef::from_bytes(&bytes, gix::hash::Kind::Sha1)
+        .map_err(|error| format!("malformed tree {tree}: {error}"))?;
+    let Some(entry) = entries
+        .entries
+        .iter()
+        .find(|entry| entry.filename == "AGENTS.md" && entry.mode.is_blob())
+    else {
+        return Ok(None);
+    };
+    let (_, bytes) = object(&entry.oid.to_string())?;
+    let text: String = String::from_utf8_lossy(&bytes)
+        .chars()
+        .take(64_000)
+        .collect();
+    Ok(Some(format!(
+        "The conversation's AGENTS.md, its instructions for this session:\n\n{text}"
+    )))
 }
 
 /// What the step answered to a recorded event: which of its outcomes it was
@@ -507,7 +565,7 @@ fn record_prompt(
     id: &str,
     prompt: &str,
     from: Option<&Oid>,
-) -> Result<String, String> {
+) -> Result<Recorded, String> {
     let mut extra = vec![("text", prompt), ("model", CLAUDE_CODE_MODEL)];
     let from = from.map(|from| from.to_string());
     let content = session_base::content_locator(config.base.as_deref(), prompt);
@@ -523,7 +581,7 @@ fn record_prompt(
     let phase = std::time::Instant::now();
     let recorded = record_event(config, id, "prompt", &extra)?;
     cc_timing("record", phase.elapsed());
-    Ok(recorded.status)
+    Ok(recorded)
 }
 
 /// Tell a caos workspace tool which conversation it is working in.
@@ -735,6 +793,11 @@ mod config_tests {
             Some("--llm-step:@@=github:o/r?rev=abc")
         );
         assert_eq!(config.base.as_deref(), Some("github:o/c?rev=def"));
+        assert!(!config.agents_md);
+        let given = args(&["hook", "--agents-md"]);
+        let (config, rest) = Config::parse(&given).unwrap();
+        assert_eq!(rest, ["hook"]);
+        assert!(config.agents_md);
     }
 
     /// `--base=<sha>` named a commit in a checkout, and nothing reads one now.

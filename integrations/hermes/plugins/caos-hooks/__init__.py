@@ -18,7 +18,10 @@ Three events, three jobs, matching serve.rs/mod.rs exactly:
    Claude Code's own UserPromptSubmit hook event. Fires once per turn,
    before the tool loop -- the same ordering guarantee
    rust/crates/caos-cli/src/mcp/mod.rs's wait_for_conversation() tolerates a
-   near-miss on (serve.rs: "the first tool call can beat it").
+   near-miss on (serve.rs: "the first tool call can beat it"). On the turn
+   that creates the conversation it also injects the conversation's
+   AGENTS.md (`--agents-md`), which Hermes would otherwise read from the
+   gateway's launch directory.
 
 3. post_llm_call -- the Stop job. Same subprocess shape, firing once per
    turn after a *successful* turn.
@@ -246,6 +249,10 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
                 f"--server={server}",
                 step,
                 *_base_args(),
+                # Hermes reads AGENTS.md from where `hermes serve` was started,
+                # which is not the conversation; the hook hands over the
+                # conversation's own with the prompt that creates it.
+                "--agents-md",
             ],
             input=json.dumps(payload),
             capture_output=True,
@@ -296,17 +303,22 @@ def on_pre_llm_call(
     user_message: str = "",
     is_first_turn: bool = False,
     **_kwargs: Any,
-) -> None:
+) -> Optional[dict[str, Any]]:
     if not user_message.strip():
         return None
-    _run_hook(
+    answer = _run_hook(
         {
             "hook_event_name": "UserPromptSubmit",
             "session_id": session_id,
             "prompt": user_message,
         }
     )
-    return None  # observer only; no context injection
+    # The conversation's AGENTS.md, on the prompt that created it. Hermes
+    # appends it to this turn's user message and replays it on later turns.
+    context = ((answer or {}).get("hookSpecificOutput") or {}).get("additionalContext")
+    if context:
+        return {"context": context}
+    return None
 
 
 def on_post_llm_call(

@@ -172,10 +172,19 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 0' INT TERM
 
-HERMES_HOME="$hermes_home" \
-HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$session_secret")" \
-HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$ws_token")" \
-  hermes serve --host 127.0.0.1 --port "$port" --skip-build &
+# Started in an empty directory: Hermes puts the AGENTS.md of the directory it
+# was launched from into every session's system prompt, and a session's
+# instructions are the conversation's own, which caos-hooks supplies.
+workdir="$state/workdir"
+rm -rf "$workdir"
+mkdir -p "$workdir"
+(
+  cd "$workdir"
+  HERMES_HOME="$hermes_home" \
+  HERMES_DASHBOARD_BASIC_AUTH_SECRET="$(cat "$session_secret")" \
+  HERMES_DASHBOARD_SESSION_TOKEN="$(cat "$ws_token")" \
+    exec hermes serve --host 127.0.0.1 --port "$port" --skip-build
+) &
 pids+=($!)
 
 bridge_log="$state/dumbpipe.log"
