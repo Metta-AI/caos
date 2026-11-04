@@ -40,7 +40,7 @@ const (
 	// verbatim into a model's context).
 	ticket = "caos://a-dev-ticket"
 
-	base = "https://raw.githubusercontent.com/Metta-AI/caos/main"
+	base = "https://raw.githubusercontent.com/softmax-universe/caos/main"
 )
 
 // Run a command for its effect, failing with its own output as the diagnostic.
@@ -108,16 +108,16 @@ func fixtureAssets(dir string) string {
 // refuses a tree whose expression and lockfile disagree.
 func fixtureRepo(dir string) string {
 	expr := "# the consumer root (design/flake-inputs.md)\n" +
-		"run --base:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/flake-input-loader" +
+		"run --base:@@=github:softmax-universe/caos?rev=" + pinRev + "&dir=std/flake-input-loader" +
 		" --in:@=. --expr=$CAOS_EXPR --input=caos" +
-		" --input-tree:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std" +
+		" --input-tree:@@=github:softmax-universe/caos?rev=" + pinRev + "&dir=std" +
 		" --output-path=caos-std\n"
 	lock := `{
   "nodes": {
     "root": { "inputs": { "caos": "caos", "nixpkgs": "nixpkgs" } },
     "nixpkgs": { "locked": { "type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "` + devRev + `" } },
     "caos": {
-      "locked": { "type": "github", "owner": "Metta-AI", "repo": "caos", "rev": "` + pinRev + `" }
+      "locked": { "type": "github", "owner": "softmax-universe", "repo": "caos", "rev": "` + pinRev + `" }
     }
   },
   "root": "root",
@@ -187,7 +187,7 @@ func main() {
 		w.Do(script.Exec("caos get -r " + shared))
 
 		assets := fixtureAssets("/tmp/assets")
-		step := "--llm-step:@@=github:Metta-AI/caos?rev=" + pinRev + "&dir=std/llm-step"
+		step := "--llm-step:@@=github:softmax-universe/caos?rev=" + pinRev + "&dir=std/llm-step"
 		const serverURL = "http://caos.test"
 		const readersArg = "--secret-readers=abcd"
 		// A home that does not exist is skipped rather than invented (/home/claude
@@ -202,7 +202,7 @@ func main() {
 		must("", "go", "run", filepath.Join(assets, "install.go"),
 			"--assets="+assets,
 			"--caos-std-path=caos-std",
-			"--repo=Metta-AI/caos",
+			"--repo=softmax-universe/caos",
 			"--commit="+pinRev,
 			"--version=build-"+pinRev[:12],
 			"--server="+serverURL,
@@ -426,22 +426,22 @@ func main() {
 			_, statErr := os.Stat(filepath.Join(shareDir, "stale-install"))
 			return string(out), statErr == nil
 		}
-		hookOut, marked := hook("/tmp/share-current", "Metta-AI/caos@"+pinRev, "")
+		hookOut, marked := hook("/tmp/share-current", "softmax-universe/caos@"+pinRev, "")
 		w.True(!marked, "the hook marked an install that matches the checkout's pin stale:\n%s", hookOut)
 		const otherRev = "dddddddddddddddddddddddddddddddddddddddd"
-		hookOut, marked = hook("/tmp/share-moved", "Metta-AI/caos@"+otherRev, "")
+		hookOut, marked = hook("/tmp/share-moved", "softmax-universe/caos@"+otherRev, "")
 		w.True(marked, "the hook let an install from an older pin through:\n%s", hookOut)
 		w.True(strings.Contains(hookOut, "STALE INSTALL") && strings.Contains(hookOut, pinRev) &&
 			strings.Contains(hookOut, otherRev),
 			"the hook's stdout does not name both pins, so nobody can act on it:\n%s", hookOut)
 		// Dev mode installs the dev commit whatever the checkout pins.
-		hookOut, marked = hook("/tmp/share-dev", "Metta-AI/caos@"+otherRev, devRev)
+		hookOut, marked = hook("/tmp/share-dev", "softmax-universe/caos@"+otherRev, devRev)
 		w.True(!marked, "the hook failed a dev install over the checkout's pin:\n%s", hookOut)
 
 		// The conversation base setup computed is a commit; a checkout now at another
 		// one is told so, without failing the session.
 		write("/tmp/share-content/setup-stamp",
-			"pin=Metta-AI/caos@"+pinRev+"\ncontent=github:o/r?rev="+otherRev+"\n", 0o644)
+			"pin=softmax-universe/caos@"+pinRev+"\ncontent=github:o/r?rev="+otherRev+"\n", 0o644)
 		contentCmd := exec.Command("go", "run", filepath.Join(cloud, "session.go"), "--share-dir=/tmp/share-content")
 		contentCmd.Env = append(os.Environ(), "CLAUDE_PROJECT_DIR="+pinRepo)
 		contentCmd.Dir = "/tmp"

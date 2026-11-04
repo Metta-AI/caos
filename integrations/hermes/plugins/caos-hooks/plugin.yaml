@@ -6,7 +6,7 @@ description: >
   caos_prompt_id onto every caos tool call (PreToolUse's job), and drives
   `caos mcp hook` to record prompts and final messages into the durable
   caos conversation log (UserPromptSubmit/Stop's job).
-author: "Metta-AI/caos"
+author: "softmax-universe/caos"
 capabilities:
   - tools.override
 provides_hooks:

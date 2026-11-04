@@ -277,7 +277,7 @@ the setup line. That edit is also what makes the environment re-run its setup.
 ## What the settings form now holds
 
 ```
-B=https://raw.githubusercontent.com/Metta-AI/caos/main
+B=https://raw.githubusercontent.com/softmax-universe/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket>
 ```

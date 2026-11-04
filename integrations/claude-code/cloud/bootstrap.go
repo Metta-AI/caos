@@ -1,7 +1,7 @@
 // Stage 1 of a caos cloud session's install, run from the environment's setup
 // field (design/cloud-setup.md):
 //
-//	B=https://raw.githubusercontent.com/Metta-AI/caos/main
+//	B=https://raw.githubusercontent.com/softmax-universe/caos/main
 //	curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 //	go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> [--dev-commit=<sha>]
 //
@@ -634,7 +634,7 @@ func main() {
 			"  pinning a 'caos' input by revision, a root .caos-expr mounting that\n" +
 			"  input's std, and the AGENTS.md the agent is given.\n" +
 			"  Point this environment at one, or fork\n" +
-			"  Metta-AI/caos-session.")
+			"  softmax-universe/caos-session.")
 	}
 	p, err := readLock(filepath.Join(repoDir, "flake.lock"), "caos")
 	if err != nil {

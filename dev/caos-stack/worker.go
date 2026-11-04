@@ -176,7 +176,7 @@ func makeEnv() {
 	w.True(ticket != "" && devCommit != "", "the stack's reply names no ticket and dev_commit:\n%s", reply)
 	base := opt("bootstrap-base")
 	if base == "" {
-		base = "https://raw.githubusercontent.com/Metta-AI/caos/main"
+		base = "https://raw.githubusercontent.com/softmax-universe/caos/main"
 	}
 	name := "z Caos Dev " + devCommit[:12]
 	script := setupScript(base, devCommit, ticket, opt("secret-readers"))

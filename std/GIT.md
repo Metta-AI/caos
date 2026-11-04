@@ -422,7 +422,7 @@ run_tool(path="caos-std/github", arguments={"method": "PATCH",
 
 Check it with GraphQL: `repository(owner, name) { squashMergeCommitTitle
 squashMergeCommitMessage }` should read `PR_TITLE` and `PR_BODY`.
-Metta-AI/caos has been set this way since 2026-10-30. If someone asks why a
+softmax-universe/caos has been set this way since 2026-10-30. If someone asks why a
 squash commit on the trunk is a list of "Edit source tree" lines, this
 setting is the answer, or the PR was merged some way that bypassed it.
 

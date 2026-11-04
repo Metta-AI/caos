@@ -22,7 +22,7 @@
 #      variable's own job (distribution.yaml) is "which server a session
 #      talks to", set unconditionally on every deploy; its name does not
 #      imply anything about revision resolution at all.
-#   2. DEFAULT: Metta-AI/caos-session's current main tip -- the SAME tree a
+#   2. DEFAULT: softmax-universe/caos-session's current main tip -- the SAME tree a
 #      real Claude Code session reads its own pin from (its `caos-std/`
 #      mount, per that repo's root `.caos-expr` + `std/flake-input-loader`;
 #      integrations/claude-code/cloud/README.md). Resolved with a plain
@@ -33,7 +33,7 @@
 #      locator" like this one (rust/crates/caos-cli/src/mcp/session_base.rs's
 #      own words -- it was only wrong for THAT module's different purpose,
 #      resolving a conversation's raw content commit, not an image). So
-#      `:@@=github:Metta-AI/caos-session?rev=<sha>&dir=caos-std/llm-step`
+#      `:@@=github:softmax-universe/caos-session?rev=<sha>&dir=caos-std/llm-step`
 #      lets the evaluation mount caos's std/ from caos-session's OWN
 #      flake.lock pin itself, exactly like Claude Code's own
 #      `--llm-step:@=caos-std/llm-step` does for a local checkout -- no
@@ -115,7 +115,7 @@ fi
 # commit-tree`), and the seeded core (build-builtins.sh) is hand-built from
 # that SAME checkout at the SAME moment. So a `git+caos://local?rev=<that
 # commit>&dir=std/llm-step` locator resolves against content the seeder
-# actually answers for -- while the old `github:Metta-AI/caos?rev=<HEAD
+# actually answers for -- while the old `github:softmax-universe/caos?rev=<HEAD
 # commit sha>` form named whatever was last PUSHED, which disagrees the
 # moment there is so much as one uncommitted staged file (confirmed the hard
 # way: a seeded-sentinel 500, "the seeder answers X, the job asks Y",
@@ -145,24 +145,24 @@ if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
 fi
 
 # TIER 2, THE DEFAULT (only computed if tier 1 found nothing, to skip a
-# pointless second network round-trip when it already did): Metta-AI/
+# pointless second network round-trip when it already did): softmax-universe/
 # caos-session's current main tip. See the header comment for why this is
 # handed to `:@@=` as a locator rather than resolved by reading flake.lock
 # ourselves.
 session_sha=""
 if [ -z "$dev_sha" ]; then
-    session_sha="$(timeout 10 git ls-remote https://github.com/Metta-AI/caos-session main \
+    session_sha="$(timeout 10 git ls-remote https://github.com/softmax-universe/caos-session main \
         2>/dev/null | cut -f1)" || true
 fi
 
 if [ -n "$dev_sha" ]; then
     llm_step="--llm-step:@@=git+caos://local?rev=${dev_sha}&dir=std/llm-step"
 elif [ -n "$session_sha" ]; then
-    llm_step="--llm-step:@@=github:Metta-AI/caos-session?rev=${session_sha}&dir=caos-std/llm-step"
+    llm_step="--llm-step:@@=github:softmax-universe/caos-session?rev=${session_sha}&dir=caos-std/llm-step"
 else
     echo "caos-mcp-launch: cannot resolve --llm-step. Tried:" >&2
     echo "  - refs/caos/dev on \$CAOS_MCP_DEFAULT_SERVER (automatic probe)" >&2
-    echo "  - Metta-AI/caos-session's main tip (default) -- ls-remote failed," >&2
+    echo "  - softmax-universe/caos-session's main tip (default) -- ls-remote failed," >&2
     echo "    which usually means no network reach to github.com from here" >&2
     exit 1
 fi

@@ -76,7 +76,7 @@ inside the checkout.
 A Hermes gateway for a caos server is its own program, not part of `caosd`:
 
 ```bash
-nix run github:Metta-AI/caos#hermes-gateway -- \
+nix run github:softmax-universe/caos#hermes-gateway -- \
   --server=<url> --secret-readers=<key>
 ```
 

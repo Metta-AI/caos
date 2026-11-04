@@ -153,13 +153,13 @@ def _dev_sha(profile_env: dict[str, str]) -> Optional[str]:
 
 
 def _session_sha() -> Optional[str]:
-    """Metta-AI/caos-session's current main tip -- the DEFAULT --llm-step
+    """softmax-universe/caos-session's current main tip -- the DEFAULT --llm-step
     source once no dev ref is available (see _llm_step_arg). Same bounded
     `git ls-remote` pattern as `_dev_sha`, just against a fixed repo instead
     of a configured server."""
     try:
         result = subprocess.run(
-            ["git", "ls-remote", "https://github.com/Metta-AI/caos-session", "main"],
+            ["git", "ls-remote", "https://github.com/softmax-universe/caos-session", "main"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -184,7 +184,7 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
     matches what THIS stack's seeded core actually answers for, uncommitted
     changes included, with no second version to keep in sync.
 
-    DEFAULT, otherwise: Metta-AI/caos-session's current main tip -- the
+    DEFAULT, otherwise: softmax-universe/caos-session's current main tip -- the
     SAME tree a real Claude Code session reads its own pin from (its
     `caos-std/` mount, per that repo's root `.caos-expr` +
     `std/flake-input-loader`), via `:@@=`'s own evaluation of
@@ -204,7 +204,7 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
     session_sha = _session_sha()
     if session_sha:
         return (
-            "--llm-step:@@=github:Metta-AI/caos-session"
+            "--llm-step:@@=github:softmax-universe/caos-session"
             f"?rev={session_sha}&dir=caos-std/llm-step"
         )
     return None
@@ -212,12 +212,12 @@ def _llm_step_arg(profile_env: dict[str, str]) -> Optional[str]:
 
 def _base_args() -> list[str]:
     """What a NEW conversation starts from, as `--base:@@=<locator>`:
-    Metta-AI/caos-session at its current main tip. `caos mcp` reads no
+    softmax-universe/caos-session at its current main tip. `caos mcp` reads no
     checkout, so the server fetches this commit itself; a prompt can still
     name another with a leading `/caos-session-start-from <locator>` line."""
     session_sha = _session_sha()
     if session_sha:
-        return [f"--base:@@=github:Metta-AI/caos-session?rev={session_sha}"]
+        return [f"--base:@@=github:softmax-universe/caos-session?rev={session_sha}"]
     return []
 
 

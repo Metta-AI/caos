@@ -1,6 +1,6 @@
 // prod/caosd/deploy — turn the machine this runs on into a caosd-prod host.
 //
-//	nix run github:Metta-AI/caos#deploy-caosd-prod
+//	nix run github:softmax-universe/caos#deploy-caosd-prod
 //
 // A flake is pure, so it cannot read this machine's public address or look at
 // its disks. That is the whole reason this program exists: it gathers the facts
@@ -45,7 +45,7 @@ const (
 // be repeated as an argument to get the obvious behaviour. Now the driver and
 // the host config it applies always come from the same revision, and an
 // argument is only needed to deliberately build from somewhere ELSE.
-var defaultFlake = "github:Metta-AI/caos"
+var defaultFlake = "github:softmax-universe/caos"
 
 // run executes argv and returns its stdout, failing with the command's own
 // stderr as the diagnostic. Explicit argv: no quoting, no word splitting.

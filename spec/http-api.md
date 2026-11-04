@@ -98,7 +98,7 @@ type rides in the parameter's name, exactly as it rides in `caos-cli run
 
 ```text
 POST /eval/run?base:hash=<oid>&msg=hello
-POST /eval/run?base:@@=github%3AMetta-AI%2Fcaos%3Frev%3D<sha>%26dir%3Dstd%2Fllm-step
+POST /eval/run?base:@@=github%3Asoftmax-universe%2Fcaos%3Frev%3D<sha>%26dir%3Dstd%2Fllm-step
 ```
 
 - `salt` is the one reserved parameter. It is not an argument; it only changes

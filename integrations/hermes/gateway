@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A Hermes gateway wired to one caos server, run on its own:
 #
-#   nix run github:Metta-AI/caos#hermes-gateway -- --help
+#   nix run github:softmax-universe/caos#hermes-gateway -- --help
 #
 # It is NOT part of caosd. The gateway is a client of the server it names
 # (--server); the only thing the two share is that URL.
@@ -268,9 +268,9 @@ echo "  ticket:  $ticket" >&2
   echo "  - Use this if the gateway is not directly reachable from the computer running Hermes Desktop"
   echo "  - Run all commands on the desktop's computer"
   echo "  - Add a gateway with the url printed by this command:"
-  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- url --port $vhost_port $ticket"
+  echo "    nix run 'github:softmax-universe/caos?dir=tools/iroh-vhost' -- url --port $vhost_port $ticket"
   echo "  - Start the http-iroh bridge:"
-  echo "    nix run 'github:Metta-AI/caos?dir=tools/iroh-vhost' -- --port $vhost_port --host 127.0.0.1:$port"
+  echo "    nix run 'github:softmax-universe/caos?dir=tools/iroh-vhost' -- --port $vhost_port --host 127.0.0.1:$port"
   echo ""
   echo "  Directly:"
   echo "  - Use this if the Desktop app can reach the gateway directly"

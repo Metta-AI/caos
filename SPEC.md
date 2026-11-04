@@ -526,7 +526,7 @@ entropy=<filled in by push>
 value=<secret>
 # or read from a file, relative to this one
 value:@=<file>
-reader:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step since=<sha>
+reader:@@=git+https://github.com/softmax-universe/caos?rev=<sha>&dir=std/llm-step since=<sha>
 reader:@=imports/caos/std/llm-step conversation=<id>
 ```
 

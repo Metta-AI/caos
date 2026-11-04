@@ -4,7 +4,7 @@
 #
 # Apply it with
 #
-#   sudo nixos-rebuild switch --refresh --flake github:Metta-AI/caos#watchdog-prod
+#   sudo nixos-rebuild switch --refresh --flake github:softmax-universe/caos#watchdog-prod
 #
 # A bare rebuild works for this role, unlike caosd-prod: nothing here is
 # per-machine, because the one fact that is (which instance to watch) is a
@@ -80,7 +80,7 @@ in
       type = lib.types.str;
       description = ''
         The caos commit whose std/hello the run probe executes on the server,
-        by locator (git+https://github.com/Metta-AI/caos?rev=...). The server
+        by locator (git+https://github.com/softmax-universe/caos?rev=...). The server
         refuses a branch name here, so the flake passes its own revision: the
         probe runs the hello of the checkout the watchdog was built from, which
         must be pushed to GitHub for the server to fetch it.

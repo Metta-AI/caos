@@ -67,7 +67,7 @@ Both are required; the TUI looks in no path of its own. The paths above are
 this repository's; a repo that mounted caos through
 `std/flake-input-loader` writes `--llm-step:@=caos-std/llm-step`, and one that
 only pinned it writes
-`--llm-step:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step`.
+`--llm-step:@@=git+https://github.com/softmax-universe/caos?rev=<sha>&dir=std/llm-step`.
 `:hash=<oid>` and `:docker=<ref>` work too — it is the same arg vocabulary
 `caos run` and `caos curry` take.
 

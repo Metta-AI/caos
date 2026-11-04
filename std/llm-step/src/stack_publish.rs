@@ -1109,8 +1109,8 @@ mod tests {
     #[test]
     fn only_github_remotes_get_pull_requests() {
         assert_eq!(
-            github_repo("https://github.com/Metta-AI/caos"),
-            Some(("Metta-AI".into(), "caos".into()))
+            github_repo("https://github.com/softmax-universe/caos"),
+            Some(("softmax-universe".into(), "caos".into()))
         );
         assert_eq!(
             github_repo("https://GitHub.com/owner/repo.git"),

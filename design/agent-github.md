@@ -45,8 +45,8 @@ Supply the token through your secret store (SPEC.md, "Secrets"):
 ```text
 # <your secrets directory>/github-token
 value:@=values/github-token
-reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-step
-reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/github
+reader:@@=git+https://github.com/softmax-universe/caos?ref=refs/heads/main&dir=std/llm-step
+reader:@@=git+https://github.com/softmax-universe/caos?ref=refs/heads/main&dir=std/github
 ```
 
 `caos-cli secrets-push --dir=<d>` adds its entropy and sends it to the server.

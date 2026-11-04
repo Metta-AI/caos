@@ -2,7 +2,7 @@
 #
 # Apply it with the deploy driver, NOT with nixos-rebuild:
 #
-#   nix run github:Metta-AI/caos#deploy-caosd-prod
+#   nix run github:softmax-universe/caos#deploy-caosd-prod
 #
 # `nixos-rebuild switch --flake ...#caosd-prod` cannot work on its own: this
 # role leaves caos.advertiseAddress undefined because it differs per machine,
