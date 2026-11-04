@@ -45,7 +45,7 @@ new_llm_conversation tools-move "$STUB_PORT" "$ws"
 dispatch_turn "exercise move"
 wait_turn || fail "the turn never reached a terminal head"
 
-$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head" > /tmp/tools.jsonl
 jq -s -e '
   length == 12 and all(.[]; .status == "complete" and .task == null)
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "tool records are wrong"; }
@@ -54,8 +54,7 @@ jq -s -e '
 # Ids are the call ids without their tu_ prefix. expect_error takes the text the
 # error must contain ("" = only that it is an error); expect_ok the result text.
 observe() {
-  $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-    --round 0 --id "tu_$1" > "/tmp/obs-$1.json"
+  $TOOL tool-observation --repo /tmp/repo --head "$head" --id "tu_$1" > "/tmp/obs-$1.json"
 }
 expect_error() {
   observe "$1"

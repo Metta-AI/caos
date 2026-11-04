@@ -7,6 +7,7 @@ pub mod fixtures;
 pub mod git_store;
 pub mod ids;
 pub mod kinds;
+pub mod legacy;
 pub mod oid;
 pub mod paths;
 pub mod publication;

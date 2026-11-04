@@ -1,7 +1,7 @@
 use super::oid::hex_lower;
 
 pub const FORMAT: &str = ".caos/format";
-pub const FORMAT_BYTES: &str = "caos-conversation-v5\n";
+pub const FORMAT_BYTES: &str = "caos-conversation-v6\n";
 pub const IDENTITY: &str = ".caos/identity.json";
 pub const TITLE: &str = ".caos/title";
 pub const TRANSCRIPT_DIR: &str = ".caos/transcript";
@@ -18,7 +18,8 @@ pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
 pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
     match bytes {
         bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(()),
-        b"caos-conversation-v4\n" => Err("unsupported conversation format v4; this build reads v5. Open it with the earlier v4 build".into()),
+        b"caos-conversation-v5\n" => Err("unsupported conversation format v5 (turn records); this build reads v6, a flat transcript. Open it with an earlier v5 build".into()),
+        b"caos-conversation-v4\n" => Err("unsupported conversation format v4; this build reads v6. Open it with the earlier v4 build".into()),
         _ => Err("conversation format is invalid".into()),
     }
 }
@@ -103,18 +104,10 @@ pub fn transcript_payload_dir(ordinal: u64, message_id: &str) -> String {
     format!("{TRANSCRIPT_DIR}/{ordinal:012}-{message_id}")
 }
 
-pub fn call_record_path(request: &str, round: u64, tool_id: &str) -> String {
-    format!(
-        "{CALLS_DIR}/{request}/{round:04}/{}.json",
-        admit_external_id(tool_id)
-    )
-}
-
-pub fn call_payload_dir(request: &str, round: u64, tool_id: &str) -> String {
-    format!(
-        "{CALLS_DIR}/{request}/{round:04}/{}",
-        admit_external_id(tool_id)
-    )
+/// Where a call's payloads live: under its id alone, which is unique within a
+/// conversation (a model's `tool_use` id, or the harness's).
+pub fn call_payload_dir(tool_id: &str) -> String {
+    format!("{CALLS_DIR}/{}", admit_external_id(tool_id))
 }
 
 pub fn files_path(relative: &str) -> String {

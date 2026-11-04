@@ -366,7 +366,7 @@ fn dry_run_report(plan: &Plan) -> String {
 pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/stack-publish.json",
-        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+        paths::call_payload_dir(&site.call.id)
     )
 }
 
@@ -376,7 +376,7 @@ fn pinned(
     site: &CallSite<'_>,
 ) -> Result<Option<(Plan, Vec<PublicationRecord>)>, String> {
     if view
-        .tool(site.request, site.round, &site.call.id)?
+        .tool(&site.call.id)?
         .is_none()
     {
         return Ok(None);
@@ -413,7 +413,7 @@ fn pin_all(
         state.reload()?;
         let view = state.conversation()?;
         if view
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(None);
@@ -485,7 +485,7 @@ fn complete(
         state.reload()?;
         if state
             .conversation()?
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(());

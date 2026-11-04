@@ -10,8 +10,8 @@ use conversation_protocol::v3::canonical::canonical_bytes;
 use conversation_protocol::v3::oid::{ensure_genesis, g3, hex_lower};
 use conversation_protocol::v3::paths;
 use conversation_protocol::v3::records::{
-    AsyncRecord, Block, CallStatus, DeclaredCall, Identity, IdentityKind, Role, TaskStatus,
-    TranscriptEntry, TurnOutcome, TurnRecord, TurnStatus,
+    AsyncRecord, Block, CallStatus, Identity, IdentityKind, Role, TaskStatus, TranscriptEntry,
+    INTERRUPT_TEXT,
 };
 use conversation_protocol::v3::refs;
 use conversation_protocol::v3::view::Conversation;
@@ -23,8 +23,6 @@ use conversation_protocol::v3::{
 enum ToolCommand {
     ChildId {
         parent: String,
-        request: Oid,
-        round: u64,
         tool: String,
     },
     Ref {
@@ -46,35 +44,32 @@ enum ToolCommand {
         actor: String,
         text: String,
         secret_hash: Oid,
-        model: String,
         configuration: Oid,
     },
     Interject {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         actor: String,
         text: String,
         refname: Option<String>,
     },
-    /// Declare a tool call on a request WITHOUT running it -- what a harness
-    /// that drives the model itself records before handing the call to a
-    /// tools-only step (`caos mcp`). Claims a queued request first, because a
-    /// declaration needs a running one.
+    /// Declare a tool call WITHOUT running it -- what a harness that drives the
+    /// model itself records before handing the call to a tools-only step
+    /// (`caos mcp`): an assistant message carrying the `tool_use`.
     Declare {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         actor: String,
         id: String,
         tool: String,
         input: String,
         refname: Option<String>,
     },
-    Escape {
+    /// Interrupt whatever is driving the conversation: the system message that
+    /// says so.
+    Interrupt {
         repo: PathBuf,
         head: Option<Oid>,
-        request: Oid,
         refname: Option<String>,
     },
     Create {
@@ -92,11 +87,6 @@ enum ToolCommand {
         repo: PathBuf,
         head: Oid,
         path: String,
-    },
-    Request {
-        repo: PathBuf,
-        head: Oid,
-        id: Option<Oid>,
     },
     WaitTerminal {
         repo: PathBuf,
@@ -116,13 +106,10 @@ enum ToolCommand {
     Tools {
         repo: PathBuf,
         head: Oid,
-        request: Oid,
     },
     ToolObservation {
         repo: PathBuf,
         head: Oid,
-        request: Oid,
-        round: u64,
         id: String,
     },
     Async {
@@ -145,7 +132,7 @@ enum ToolCommand {
         repo: PathBuf,
         head: Oid,
         validate: bool,
-        started_tool: Option<(Oid, String)>,
+        started_tool: Option<String>,
     },
 }
 
@@ -195,8 +182,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
     let parsed = match command.as_str() {
         "child-id" => ToolCommand::ChildId {
             parent: args.required("--parent")?,
-            request: args.oid("--request", "parent request")?,
-            round: parse_u64(&args.required("--round")?, "round")?,
             tool: args.required("--tool")?,
         },
         "ref" => ToolCommand::Ref {
@@ -226,7 +211,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let actor = args.required("--actor")?;
             let text = args.required("--text")?;
             let secret_hash = args.oid("--secret-hash", "secret hash")?;
-            let model = args.required("--model")?;
             let configuration = args.oid("--configuration", "model configuration")?;
             let source_trees = args.source_trees()?;
             ToolCommand::Turn {
@@ -239,7 +223,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 actor,
                 text,
                 secret_hash,
-                model,
                 configuration,
             }
         }
@@ -249,7 +232,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             actor: args.required("--actor")?,
             text: args.required("--text")?,
             refname: args.take("--ref")?,
@@ -260,20 +242,18 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             actor: args.required("--actor")?,
             id: args.required("--id")?,
             tool: args.required("--tool")?,
             input: args.required("--input")?,
             refname: args.take("--ref")?,
         },
-        "escape" => ToolCommand::Escape {
+        "interrupt" => ToolCommand::Interrupt {
             repo: args.repo()?,
             head: args
                 .take("--head")?
                 .map(|value| parse_oid(&value, "conversation head"))
                 .transpose()?,
-            request: args.oid("--request", "request")?,
             refname: args.take("--ref")?,
         },
         "create" => ToolCommand::Create {
@@ -291,14 +271,6 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
             path: args.required("--path")?,
-        },
-        "request" => ToolCommand::Request {
-            repo: args.repo()?,
-            head: args.oid("--head", "conversation head")?,
-            id: args
-                .take("--id")?
-                .map(|value| parse_oid(&value, "request"))
-                .transpose()?,
         },
         "wait-terminal" => ToolCommand::WaitTerminal {
             repo: args.repo()?,
@@ -322,13 +294,10 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
         "tools" => ToolCommand::Tools {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
-            request: args.oid("--request", "request")?,
         },
         "tool-observation" => ToolCommand::ToolObservation {
             repo: args.repo()?,
             head: args.oid("--head", "conversation head")?,
-            request: args.oid("--request", "request")?,
-            round: parse_u64(&args.required("--round")?, "round")?,
             id: args.required("--id")?,
         },
         "async" => ToolCommand::Async {
@@ -354,17 +323,7 @@ fn parse_args(args: Vec<String>) -> Result<ToolCommand, ToolError> {
             let repo = args.repo()?;
             let head = args.oid("--head", "conversation head")?;
             let validate = args.flag("--validate");
-            let request = args.take("--request")?;
             let started_tool = args.take("--started-tool")?;
-            let started_tool = match (request, started_tool) {
-                (None, None) => None,
-                (Some(request), Some(tool)) => Some((parse_oid(&request, "request")?, tool)),
-                _ => {
-                    return Err(ToolError::new(
-                        "parents needs both --request and --started-tool",
-                    ))
-                }
-            };
             ToolCommand::Parents {
                 repo,
                 head,
@@ -462,14 +421,9 @@ fn parse_u64(value: &str, what: &str) -> Result<u64, ToolError> {
 
 fn run(command: ToolCommand) -> Result<(), ToolError> {
     match command {
-        ToolCommand::ChildId {
-            parent,
-            request,
-            round,
-            tool,
-        } => println!(
+        ToolCommand::ChildId { parent, tool } => println!(
             "child {}",
-            conversation_protocol::v3::ids::child_id(&parent, &request, round, &tool)?
+            conversation_protocol::v3::ids::child_id(&parent, &tool)?
         ),
         ToolCommand::Ref { id } => println!("ref {}", refs::head_ref(&id)?),
         ToolCommand::Root {
@@ -492,7 +446,6 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             actor,
             text,
             secret_hash,
-            model,
             configuration,
         } => turn(TurnInput {
             repo,
@@ -504,50 +457,25 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             actor,
             text,
             secret_hash,
-            model,
             configuration,
         })?,
         ToolCommand::Interject {
             repo,
             head,
-            request,
             actor,
             text,
             refname,
         } => {
             let mut store = open(&repo)?;
-            let head = match head {
-                Some(head) => {
-                    store.ensure_local(&head)?;
-                    head
-                }
-                None => {
-                    let refname = refname
-                        .as_ref()
-                        .ok_or_else(|| ToolError::new("interject needs either --head or --ref"))?;
-                    store
-                        .fetch_ref(refname)?
-                        .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))?
-                }
-            };
-            let view = Conversation::open(&store, &head)?;
-            let id = view.identity()?.id;
-            let request_record = view
-                .turn(&request)?
-                .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
-            let round = request_record.round;
-            let status = request_status_name(&request_record.status);
-            drop(view);
+            let head = resolve_head(&store, head, refname.as_ref(), "interject")?;
+            let id = Conversation::open(&store, &head)?.identity()?.id;
             let message_id = client_key()?;
-            let transition = Transition::TurnInterject {
-                request: request.clone(),
+            let transition = Transition::MessageAppend {
                 entry: TranscriptEntry {
                     message_id: message_id.clone(),
                     conversation: id,
                     role: Role::User,
                     actor,
-                    request: Some(request),
-                    round: Some(round),
                     model: None,
                     blocks: vec![Block::Text { text }],
                     proposal: None,
@@ -561,13 +489,11 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
             }
             println!("head {new}");
             println!("parent {head}");
-            println!("status {status}");
             println!("message {message_id}");
         }
         ToolCommand::Declare {
             repo,
             head,
-            request,
             actor,
             id,
             tool,
@@ -576,58 +502,40 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
         } => declare(DeclareInput {
             repo,
             head,
-            request,
             actor,
             id,
             tool,
             input,
             refname,
         })?,
-        ToolCommand::Escape {
+        ToolCommand::Interrupt {
             repo,
             head,
-            request,
             refname,
         } => {
             let mut store = open(&repo)?;
-            let head = match head {
-                Some(head) => {
-                    store.ensure_local(&head)?;
-                    head
-                }
-                None => {
-                    let refname = refname
-                        .as_ref()
-                        .ok_or_else(|| ToolError::new("escape needs either --head or --ref"))?;
-                    store
-                        .fetch_ref(refname)?
-                        .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))?
-                }
-            };
-            let new = append(
-                &mut store,
-                &head,
-                Transition::TurnEscape {
-                    request: request.clone(),
-                    reason: None,
+            let head = resolve_head(&store, head, refname.as_ref(), "interrupt")?;
+            let id = Conversation::open(&store, &head)?.identity()?.id;
+            let transition = Transition::MessageAppend {
+                entry: TranscriptEntry {
+                    message_id: client_key()?,
+                    conversation: id,
+                    role: Role::System,
+                    actor: "tester".to_string(),
+                    model: None,
+                    blocks: vec![Block::Text {
+                        text: INTERRUPT_TEXT.to_string(),
+                    }],
+                    proposal: None,
+                    source_tree_resolution: None,
                 },
-            )?;
-            let request_record = Conversation::open(&store, &new)?
-                .turn(&request)?
-                .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
-            let interrupted = matches!(
-                request_record.outcome,
-                Some(TurnOutcome::Idle {
-                    interrupted: true,
-                    ..
-                })
-            );
+                payloads: Vec::new(),
+            };
+            let new = append(&mut store, &head, transition)?;
             if let Some(refname) = refname {
                 push_with_lease(&store, refname, &head, &new)?;
             }
             println!("head {new}");
-            println!("interrupted {interrupted}");
-            println!("status {}", request_status_name(&request_record.status));
         }
         ToolCommand::Create {
             repo,
@@ -677,19 +585,6 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 ToolError::new(format!("writing record to standard output: {error}"))
             })?;
         }
-        ToolCommand::Request { repo, head, id } => {
-            let store = open(&repo)?;
-            store.ensure_local(&head)?;
-            let view = Conversation::open(&store, &head)?;
-            let record = match id {
-                Some(id) => view.turn(&id)?,
-                None => view.active_turn()?,
-            };
-            match record {
-                Some(record) => write_record(&record.encode())?,
-                None => println!("none"),
-            }
-        }
         ToolCommand::WaitTerminal {
             repo,
             refname,
@@ -727,36 +622,17 @@ fn run(command: ToolCommand) -> Result<(), ToolError> {
                 );
             }
         }
-        ToolCommand::Tools {
-            repo,
-            head,
-            request,
-        } => {
+        ToolCommand::Tools { repo, head } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let view = Conversation::open(&store, &head)?;
-            let record = view
-                .turn(&request)?
-                .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
-            for round in 0..record.round {
-                for tool in view.tools(&request, round)? {
-                    write_record(&tool.encode())?;
-                }
+            for tool in Conversation::open(&store, &head)?.tools()? {
+                write_record(&tool.encode())?;
             }
         }
-        ToolCommand::ToolObservation {
-            repo,
-            head,
-            request,
-            round,
-            id,
-        } => {
+        ToolCommand::ToolObservation { repo, head, id } => {
             let store = open(&repo)?;
             store.ensure_local(&head)?;
-            let path = format!(
-                "{}/observation.json",
-                paths::call_payload_dir(request.as_str(), round, &id)
-            );
+            let path = format!("{}/observation.json", paths::call_payload_dir(&id));
             let bytes = Conversation::open(&store, &head)?.payload(&path)?;
             std::io::stdout().write_all(&bytes).map_err(|error| {
                 ToolError::new(format!("writing observation to standard output: {error}"))
@@ -839,14 +715,12 @@ struct TurnInput {
     actor: String,
     text: String,
     secret_hash: Oid,
-    model: String,
     configuration: Oid,
 }
 
 struct DeclareInput {
     repo: PathBuf,
     head: Option<Oid>,
-    request: Oid,
     actor: String,
     id: String,
     tool: String,
@@ -854,55 +728,40 @@ struct DeclareInput {
     refname: Option<String>,
 }
 
-/// Record a tool call the way a harness that drives the model itself does:
-/// claim the request if it is still queued, then one `model.complete` naming
-/// the call and carrying its arguments. Nothing runs -- the call is left
-/// PENDING, for a tools-only step to drain.
-fn declare(input: DeclareInput) -> Result<(), ToolError> {
-    let mut store = open(&input.repo)?;
-    let head = match input.head {
+/// The conversation head a command works at: `--head`, or what `--ref` names.
+fn resolve_head(
+    store: &GitStore,
+    head: Option<Oid>,
+    refname: Option<&String>,
+    command: &str,
+) -> Result<Oid, ToolError> {
+    match head {
         Some(head) => {
             store.ensure_local(&head)?;
-            head
+            Ok(head)
         }
         None => {
-            let refname = input
-                .refname
-                .as_ref()
-                .ok_or_else(|| ToolError::new("declare needs either --head or --ref"))?;
+            let refname = refname.ok_or_else(|| {
+                ToolError::new(format!("{command} needs either --head or --ref"))
+            })?;
             store
                 .fetch_ref(refname)?
-                .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))?
+                .ok_or_else(|| ToolError::new(format!("ref {refname} is absent")))
         }
-    };
+    }
+}
+
+/// Record a tool call the way a harness that drives the model itself does: an
+/// assistant message naming the call and carrying its arguments. Nothing runs --
+/// the call is left PENDING, for a tools-only step to run.
+fn declare(input: DeclareInput) -> Result<(), ToolError> {
+    let mut store = open(&input.repo)?;
+    let head = resolve_head(&store, input.head, input.refname.as_ref(), "declare")?;
     let arguments: serde_json::Value = serde_json::from_str(&input.input)
         .map_err(|error| ToolError::new(format!("parsing --input as JSON: {error}")))?;
 
     let view = Conversation::open(&store, &head)?;
     let conversation = view.identity()?.id;
-    let record = view
-        .turn(&input.request)?
-        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?;
-    let latest_message = newest_user_message(&view)?;
-    drop(view);
-
-    let mut at = head.clone();
-    if record.status == TurnStatus::Queued {
-        at = append(
-            &mut store,
-            &at,
-            Transition::TurnClaim {
-                request: input.request.clone(),
-                latest_message,
-            },
-        )?;
-    }
-
-    let view = Conversation::open(&store, &at)?;
-    let round = view
-        .turn(&input.request)?
-        .ok_or_else(|| ToolError::new(format!("request {} does not exist", input.request)))?
-        .round;
     let ordinal = view.transcript_len()?;
     drop(view);
 
@@ -914,12 +773,10 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
         conversation,
         role: Role::Assistant,
         actor: input.actor,
-        request: Some(input.request.clone()),
-        round: Some(round),
         model: Some("test-model".to_string()),
         blocks: vec![Block::ToolUse {
-            id: input.id.clone(),
-            name: input.tool.clone(),
+            id: input.id,
+            name: input.tool,
             arguments: format!("{dir}/{payload_name}"),
         }],
         proposal: None,
@@ -927,22 +784,16 @@ fn declare(input: DeclareInput) -> Result<(), ToolError> {
     };
     let new = append(
         &mut store,
-        &at,
-        Transition::ModelComplete {
-            request: input.request.clone(),
+        &head,
+        Transition::MessageAppend {
             entry,
             payloads: vec![(payload_name, canonical_payload_bytes(&arguments)?)],
-            calls: vec![DeclaredCall {
-                id: input.id,
-                name: input.tool,
-            }],
         },
     )?;
     if let Some(refname) = input.refname {
         push_with_lease(&store, refname, &head, &new)?;
     }
     println!("head {new}");
-    println!("round {round}");
     println!("message {message_id}");
     Ok(())
 }
@@ -958,18 +809,6 @@ fn canonical_payload_bytes(value: &serde_json::Value) -> Result<Vec<u8>, ToolErr
         ));
     }
     Ok(wrapped[PREFIX.len()..wrapped.len() - 2].to_vec())
-}
-
-fn newest_user_message(view: &Conversation<'_>) -> Result<String, ToolError> {
-    for ordinal in (0..view.transcript_len()?).rev() {
-        let (_, entry) = view
-            .transcript_entry(ordinal)?
-            .ok_or_else(|| ToolError::new(format!("missing transcript ordinal {ordinal}")))?;
-        if entry.role == Role::User {
-            return Ok(entry.message_id);
-        }
-    }
-    Err(ToolError::new("the request has no user message"))
 }
 
 struct RequestTreeEntry {
@@ -1004,13 +843,8 @@ fn turn(input: TurnInput) -> Result<(), ToolError> {
         &human,
         &input.secret_hash,
     )?;
-    let admitted = admit_request(
-        &mut store,
-        &human,
-        request.clone(),
-        input.model,
-        input.configuration.to_string(),
-    )?;
+    // The prompt is the head: the request answers it, and nothing else is recorded.
+    let admitted = human.clone();
 
     let refname = refs::head_ref(&input.id)?;
     push_plain(
@@ -1091,8 +925,6 @@ fn append_user_message(
             conversation: id,
             role: Role::User,
             actor,
-            request: None,
-            round: None,
             model: None,
             blocks: vec![Block::Text { text }],
             proposal: None,
@@ -1101,33 +933,6 @@ fn append_user_message(
         payloads: Vec::new(),
     };
     Ok((append(store, head, transition)?, message_id))
-}
-
-fn admit_request(
-    store: &mut GitStore,
-    head: &Oid,
-    request: Oid,
-    model: String,
-    configuration: String,
-) -> Result<Oid, ToolError> {
-    let view = Conversation::open(store, head)?;
-
-    drop(view);
-    let record = TurnRecord {
-        id: request.clone(),
-        request_head: head.clone(),
-
-        model,
-        configuration,
-        round: 0,
-        calls: Vec::new(),
-        interjections: Vec::new(),
-        status: TurnStatus::Queued,
-        latest_message: None,
-        escape_reason: None,
-        outcome: None,
-    };
-    append(store, head, Transition::TurnAdmit { record })
 }
 
 fn prepare_turn_request(
@@ -1430,16 +1235,10 @@ fn text_blocks(blocks: &[Block]) -> String {
         .join("\n\n")
 }
 
-fn request_status_name(status: &TurnStatus) -> &'static str {
-    match status {
-        TurnStatus::Queued => "queued",
-        TurnStatus::Running => "running",
-        TurnStatus::Cancelling => "cancelling",
-        TurnStatus::Idle => "idle",
-        TurnStatus::Failed => "failed",
-    }
-}
-
+/// Wait for the turn `request` answers to end, as the transcript shows it: the
+/// prompt the request's `head` names has an answer (an assistant message with no
+/// call and no newer prompt after it), or an interruption after it (`idle`), or
+/// the step's own failure message (`failed`).
 fn wait_terminal(
     repo: &Path,
     refname: &str,
@@ -1447,6 +1246,13 @@ fn wait_terminal(
     timeout_secs: u64,
 ) -> Result<(), ToolError> {
     let store = open(repo)?;
+    let prompt_head = required_entry(
+        &store.read_tree(request).map_err(String::from)?,
+        "head",
+        request,
+    )?
+    .oid
+    .clone();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut seen = None;
     while Instant::now() < deadline {
@@ -1459,41 +1265,20 @@ fn wait_terminal(
                     continue;
                 };
                 seen = Some(head.clone());
-                let view = Conversation::open(&store, &head)?;
-                if let Some(record) = view.turn(request)? {
-                    match record.status {
-                        TurnStatus::Idle => {
-                            println!("head {head}");
-                            println!("status idle");
-                            return Ok(());
-                        }
-                        TurnStatus::Failed => {
-                            let error = match record.outcome {
-                                Some(TurnOutcome::Failed { error }) => {
-                                    let (ordinal, message_id) =
-                                        paths::parse_transcript_entry_path(&error)?;
-                                    let (found, entry) =
-                                        view.transcript_entry(ordinal)?.ok_or_else(|| {
-                                            ToolError::new(format!(
-                                                "request error entry {error} is absent"
-                                            ))
-                                        })?;
-                                    if found != message_id {
-                                        return Err(ToolError::new(format!(
-                                            "request error entry {error} has a mismatched id"
-                                        )));
-                                    }
-                                    text_blocks(&entry.blocks)
-                                }
-                                _ => "request failed without an error entry".to_string(),
-                            };
-                            println!("head {head}");
-                            println!("status failed");
-                            println!("error {error}");
-                            return Err(ToolError::code(1));
-                        }
-                        TurnStatus::Queued | TurnStatus::Running | TurnStatus::Cancelling => {}
+                let prompt = Conversation::open(&store, &prompt_head)?.transcript_len()?;
+                match turn_outcome(&Conversation::open(&store, &head)?, prompt)? {
+                    Some(Ok(())) => {
+                        println!("head {head}");
+                        println!("status idle");
+                        return Ok(());
                     }
+                    Some(Err(error)) => {
+                        println!("head {head}");
+                        println!("status failed");
+                        println!("error {error}");
+                        return Err(ToolError::code(1));
+                    }
+                    None => {}
                 }
             }
         }
@@ -1502,10 +1287,34 @@ fn wait_terminal(
     Err(ToolError::code(2))
 }
 
+/// How the turn whose entries start at `from` ended, if it has: `Ok` for an
+/// answer or an interruption, `Err` with the step's failure message.
+fn turn_outcome(
+    view: &Conversation<'_>,
+    from: u64,
+) -> Result<Option<Result<(), String>>, ToolError> {
+    for ordinal in (from..view.transcript_len()?).rev() {
+        let (_, entry) = view
+            .transcript_entry(ordinal)?
+            .ok_or_else(|| ToolError::new(format!("missing transcript ordinal {ordinal}")))?;
+        match entry.role {
+            Role::User => return Ok(None),
+            Role::Assistant if entry.tool_uses().next().is_some() => return Ok(None),
+            Role::Assistant => return Ok(Some(Ok(()))),
+            Role::System if entry.is_interrupt() => return Ok(Some(Ok(()))),
+            Role::System if entry.actor == "llm-step" => {
+                return Ok(Some(Err(text_blocks(&entry.blocks))))
+            }
+            Role::System => {}
+        }
+    }
+    Ok(None)
+}
+
 fn parents(
     store: &GitStore,
     mut current: Oid,
-    started_tool: Option<&(Oid, String)>,
+    started_tool: Option<&String>,
 ) -> Result<(), ToolError> {
     let mut found_started_tool = started_tool.is_none();
     loop {
@@ -1527,21 +1336,10 @@ fn parents(
         }
         println!("{current} {}", kind.as_str());
         if !found_started_tool && kind == Kind::ToolStart {
-            let (request, id) = started_tool.expect("checked as present");
-            let view = Conversation::open(store, &current)?;
-            let request_record = view
-                .turn(request)?
-                .ok_or_else(|| ToolError::new(format!("request {request} does not exist")))?;
-            for round in 0..request_record.round {
-                if view
-                    .tools(request, round)?
-                    .iter()
-                    .any(|tool| tool.id == *id && tool.status == CallStatus::Started)
-                {
-                    found_started_tool = true;
-                    break;
-                }
-            }
+            let id = started_tool.expect("checked as present");
+            found_started_tool = Conversation::open(store, &current)?
+                .tool(id)?
+                .is_some_and(|tool| tool.status == CallStatus::Started);
         }
         let parent = info.parents[0].clone();
         if kind == Kind::ConversationRoot {
@@ -1558,7 +1356,7 @@ fn parents(
             return if found_started_tool {
                 Ok(())
             } else {
-                let (_, id) = started_tool.expect("checked as present");
+                let id = started_tool.expect("checked as present");
                 Err(ToolError::new(format!(
                     "tool {id:?} has no started record on the conversation spine"
                 )))
@@ -1627,8 +1425,6 @@ mod tests {
             "hello".to_string(),
             "--secret-hash".to_string(),
             "e".repeat(40),
-            "--model".to_string(),
-            "test-model".to_string(),
             "--configuration".to_string(),
             "f".repeat(40),
             "--source-tree".to_string(),
@@ -1664,8 +1460,6 @@ mod tests {
             "/repo".to_string(),
             "--head".to_string(),
             "a".repeat(40),
-            "--request".to_string(),
-            "b".repeat(40),
             "--started-tool".to_string(),
             "toolu_01".to_string(),
         ])
@@ -1673,7 +1467,7 @@ mod tests {
         assert!(matches!(
             command,
             ToolCommand::Parents {
-                started_tool: Some((_, ref id)),
+                started_tool: Some(ref id),
                 ..
             } if id == "toolu_01"
         ));

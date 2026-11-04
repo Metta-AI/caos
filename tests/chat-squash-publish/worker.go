@@ -272,7 +272,7 @@ func main() {
 		w.Step("the turn")
 		admitted := fields(run(tool, "turn", "--repo", repo, "--id", conv, "--user", "tester", "--title", conv,
 			"--actor", "tester", "--text", "build a two-layer stack, squash it, republish it, publish it",
-			"--secret-hash", caos("hash", "/cas/args/secret-hash"), "--model", "test-model",
+			"--secret-hash", caos("hash", "/cas/args/secret-hash"),
 			"--configuration", llm, "--source-tree", "main="+base))
 		caos("sub-run", admitted["request"])
 		done := fields(run(tool, "wait-terminal", "--repo", repo, "--ref", admitted["ref"],

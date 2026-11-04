@@ -14,8 +14,8 @@
 //! that reads it once or ignores `tools/list_changed` is correct, not stale.
 //!
 //! A call is `llm-step` in its tools-only mode, evaluated by the server the way
-//! `POST /eval/run` evaluates anything: the step declares the call on the
-//! conversation's active request, runs it, and answers with the call's record.
+//! `POST /eval/run` evaluates anything: the step declares the call (an assistant
+//! message carrying its `tool_use`), runs it, and answers with the call's record.
 //! Nothing here writes a conversation.
 //!
 //! WHAT A REQUEST CARRIES, as headers, because a request is all a stateless
@@ -151,16 +151,9 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         .map_err(|e| e.message().to_string())?;
     let params = step_params(caller, &conversation, step_name, &args)?;
     if name == "start" {
-        // DECLARE THE CALL BEFORE ANSWERING. The ticket goes back at once and the
-        // model may end its turn right behind it; the turn's `Stop` holds its
-        // request open only for a call already declared on it. Left to the job,
-        // the declaration lands later -- after the `Stop` closed the request -- and
-        // the job fails with "no active request". Declared here, a request with no
-        // open turn is refused now, in the call that caused it, and the job below
-        // finds its call declared (the step declares each call once).
-        let declare = format!("{params}&declare-only=1");
-        compute::eval_expression_endpoint(config, "run", &declare, &secrets)
-            .map_err(|e| e.message().to_string())?;
+        // The ticket goes back at once, and the job declares its call and runs it
+        // whenever it gets there. The model may end its turn first: a turn's end
+        // is one more fact in the transcript, and closes nothing the call needs.
         let ticket = compute::start_expression(config, "run", &params, &secrets)
             .map_err(|e| e.message().to_string())?;
         let ticket = String::from_utf8_lossy(&ticket).trim().to_string();

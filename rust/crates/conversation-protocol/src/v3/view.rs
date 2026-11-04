@@ -7,7 +7,7 @@ use super::oid::Oid;
 use super::paths;
 use super::records::{
     parse_title, AsyncRecord, CallRecord, ChildRecord, Identity, PublicationRecord,
-    SourceTreeRecord, TranscriptEntry, TurnRecord,
+    SourceTreeRecord, TranscriptEntry,
 };
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
@@ -16,9 +16,7 @@ use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 /// results that remain readable in a fork's transcript.
 #[derive(Default)]
 struct Execution {
-    turns: BTreeMap<Oid, (bool, TurnRecord)>,
-    latest_turn: Option<Oid>,
-    tools: BTreeMap<(Oid, u64), BTreeMap<String, CallRecord>>,
+    tools: BTreeMap<String, CallRecord>,
     children: BTreeMap<String, (bool, ChildRecord)>,
     tasks: BTreeMap<Oid, AsyncRecord>,
     publications: BTreeMap<String, PublicationRecord>,
@@ -45,17 +43,19 @@ impl<'s> Conversation<'s> {
         if info.parents.is_empty() {
             return Err(format!("conversation commit {commit} must have a parent"));
         }
-        let kind = Kind::parse_message(&info.message)?;
-        let conversation = Conversation {
+        let mut conversation = Conversation {
             store,
             execution: OnceCell::new(),
             commit: Some(commit.clone()),
             parent: info.parents.first().cloned(),
-            kind: Some(kind),
+            kind: None,
             tree: info.tree.clone(),
             snapshot: Snapshot::new(store, info.tree),
         };
+        // The format before the kind: a conversation of an older format names
+        // kinds this build no longer has, and its format says why.
         conversation.require_format()?;
+        conversation.kind = Some(Kind::parse_message(&info.message)?);
         Ok(conversation)
     }
 
@@ -224,22 +224,8 @@ impl<'s> Conversation<'s> {
                 let (kind, events) = super::events::decode(&info.message)?;
                 for event in events.into_iter().rev() {
                     match event {
-                        Event::Request(record) => {
-                            if in_context && result.latest_turn.is_none() {
-                                result.latest_turn = Some(record.id.clone());
-                            }
-                            result
-                                .turns
-                                .entry(record.id.clone())
-                                .or_insert((in_context, record));
-                        }
                         Event::Tool(record) => {
-                            result
-                                .tools
-                                .entry((record.request.clone(), record.round))
-                                .or_default()
-                                .entry(record.id.clone())
-                                .or_insert(record);
+                            result.tools.entry(record.id.clone()).or_insert(record);
                         }
                         Event::Child(record) => {
                             result
@@ -280,56 +266,15 @@ impl<'s> Conversation<'s> {
         Ok(self.execution.get().expect("loaded"))
     }
 
-    pub fn latest_turn(&self) -> Result<Option<TurnRecord>, String> {
-        let execution = self.execution()?;
-        Ok(execution
-            .latest_turn
-            .as_ref()
-            .and_then(|id| execution.turns.get(id))
-            .map(|(_, r)| r.clone()))
+    /// The record of the call with this id, in this conversation or inherited by
+    /// a fork. A call id is unique within a conversation.
+    pub fn tool(&self, id: &str) -> Result<Option<CallRecord>, String> {
+        Ok(self.execution()?.tools.get(id).cloned())
     }
 
-    pub fn active_turn(&self) -> Result<Option<TurnRecord>, String> {
-        Ok(self.latest_turn()?.filter(|r| {
-            matches!(
-                r.status,
-                super::TurnStatus::Queued
-                    | super::TurnStatus::Running
-                    | super::TurnStatus::Cancelling
-            )
-        }))
-    }
-
-    pub fn turn(&self, id: &Oid) -> Result<Option<TurnRecord>, String> {
-        Ok(self.execution()?.turns.get(id).map(|(_, r)| r.clone()))
-    }
-
-    pub fn turn_ids(&self) -> Result<Vec<Oid>, String> {
-        Ok(self
-            .execution()?
-            .turns
-            .iter()
-            .filter(|(_, (context, _))| *context)
-            .map(|(id, _)| id.clone())
-            .collect())
-    }
-
-    pub fn tool(&self, request: &Oid, round: u64, id: &str) -> Result<Option<CallRecord>, String> {
-        Ok(self
-            .execution()?
-            .tools
-            .get(&(request.clone(), round))
-            .and_then(|tools| tools.get(id))
-            .cloned())
-    }
-
-    pub fn tools(&self, request: &Oid, round: u64) -> Result<Vec<CallRecord>, String> {
-        Ok(self
-            .execution()?
-            .tools
-            .get(&(request.clone(), round))
-            .map(|tools| tools.values().cloned().collect())
-            .unwrap_or_default())
+    /// Every call record, by id.
+    pub fn tools(&self) -> Result<Vec<CallRecord>, String> {
+        Ok(self.execution()?.tools.values().cloned().collect())
     }
 
     pub fn transcript_len(&self) -> Result<u64, String> {

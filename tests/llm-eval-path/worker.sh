@@ -24,26 +24,22 @@ caos get /cas/args/common || { echo "FAIL: reading worker-common.sh" >&2; exit 1
 # shellcheck disable=SC1090
 source /cas/args/common
 
-# Declare one call the way a harness that drives the model itself does, and
-# leave it PENDING. `$head` and `$round` follow the declaration.
+# Declare one call the way a harness that drives the model itself does -- an
+# assistant message carrying the tool_use -- and leave it PENDING. `$head`
+# follows the declaration.
 declare_call() {
   local call=$1 tool=$2 input=$3 output key value
-  round=""
-  output=$($TOOL declare --repo /tmp/repo --head "$head" --request "$request" \
+  output=$($TOOL declare --repo /tmp/repo --head "$head" \
     --actor tester --id "$call" --tool "$tool" --input "$input" \
     --ref "$conversation_ref") || fail "declaring $call"
   while read -r key value; do
-    case "$key" in
-      head) head=$value ;;
-      round) round=$value ;;
-    esac
+    if [ "$key" = head ]; then head=$value; fi
   done <<<"$output"
   assert_oid "$head" "the declared conversation head"
-  [ -n "$round" ] || fail "declare did not report a round"
 }
 
 # Run the step for one declared call, in its own fresh ArgTree naming the
-# admitted request by `--run`. `sub-run` starts the job and returns, so the
+# prompt's request by `--run`. `sub-run` starts the job and returns, so the
 # call's own record is what says it is done.
 run_tools_only() {
   local call=$1 arg_tree attempt status
@@ -56,7 +52,7 @@ run_tools_only() {
       || fail "fetching the conversation after $call"
     head=${head#head }
     assert_oid "$head" "the conversation head after $call"
-    status=$($TOOL tools --repo /tmp/repo --head "$head" --request "$request" \
+    status=$($TOOL tools --repo /tmp/repo --head "$head" \
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     # `failed` is a TERMINAL outcome carrying a tool_result the model reads, not
     # a dead turn: an evaluation that cannot be done is recorded that way -- the
@@ -78,8 +74,8 @@ do_call() {
   local id=$1 tool=$2 input=$3
   declare_call "$id" "$tool" "$input"
   run_tools_only "$id"
-  $TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-    --round "$round" --id "$id" > /tmp/observation.json \
+  $TOOL tool-observation --repo /tmp/repo --head "$head" \
+    --id "$id" > /tmp/observation.json \
     || fail "$id recorded no observation"
   TEXT=$(jq -r '.content[0].text' /tmp/observation.json) \
     || fail "$id's observation carries no text"

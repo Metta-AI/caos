@@ -203,7 +203,7 @@ fn complete(
         state.reload()?;
         if state
             .conversation()?
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(());

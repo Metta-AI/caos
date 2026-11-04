@@ -179,12 +179,12 @@ fn parse_ref(revision: &str, output: &str) -> Result<(String, Option<String>), S
 pub(super) fn pin_path(site: &CallSite<'_>) -> String {
     format!(
         "{}/import.json",
-        paths::call_payload_dir(site.request.as_str(), site.round, &site.call.id)
+        paths::call_payload_dir(&site.call.id)
     )
 }
 
 fn pinned(view: &Conversation<'_>, site: &CallSite<'_>) -> Result<Option<Value>, String> {
-    match view.tool(site.request, site.round, &site.call.id)? {
+    match view.tool(&site.call.id)? {
         Some(record) if record.status == CallStatus::Started => {
             let bytes = view.payload(&pin_path(site))?;
             Ok(Some(
@@ -204,7 +204,7 @@ pub(super) fn pin<S: progress::RefStore>(
     for _ in 0..32 {
         state.reload()?;
         let view = state.conversation()?;
-        if let Some(record) = view.tool(site.request, site.round, &site.call.id)? {
+        if let Some(record) = view.tool(&site.call.id)? {
             return if record.is_terminal() {
                 Ok(None)
             } else {
@@ -236,7 +236,7 @@ pub(super) fn attach<S: progress::RefStore>(
         state.reload()?;
         if state
             .conversation()?
-            .tool(site.request, site.round, &site.call.id)?
+            .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
             return Ok(());

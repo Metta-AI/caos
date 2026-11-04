@@ -87,7 +87,7 @@ fn finish(status: &str, result: &str) -> Result<(), String> {
     if let Some(child) = read_arg_opt("child")? {
         let subrequest = read_arg("subreq")?;
         let relay = read_arg("task")?;
-        return refs::append_child_terminal(&target_ref, &child, &subrequest, &relay);
+        return refs::append_child_terminal(&target_ref, &child, &subrequest, &relay, status);
     }
     let task = read_arg("task")?;
     refs::append_status(&target_ref, &task, status, result)

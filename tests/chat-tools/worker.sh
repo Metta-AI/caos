@@ -40,7 +40,7 @@ fetch_code "$source_tree" "fetching the resulting source_tree"
 [ "$(git show "$source_tree:notes/todo.txt")" = "hello notes" ] \
   || fail "sibling file lost"
 
-$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head" > /tmp/tools.jsonl
 jq -s -e '
   length == 5 and
   (map(.id) | sort) == (["tu_w","tu_r","tu_e","tu_x","tu_l"] | sort) and
@@ -48,8 +48,7 @@ jq -s -e '
 ' /tmp/tools.jsonl >/dev/null || { cat /tmp/tools.jsonl >&2; fail "inline tool records are wrong"; }
 [ "$($TOOL parents --repo /tmp/repo --head "$head" | grep -c ' tool.complete$')" -eq 5 ] \
   || fail "inline calls did not append five tool.complete transitions"
-$TOOL tool-observation --repo /tmp/repo --head "$head" --request "$request" \
-  --round 0 --id tu_x > /tmp/failed-edit.json
+$TOOL tool-observation --repo /tmp/repo --head "$head" --id tu_x > /tmp/failed-edit.json
 grep -qF 'old-string not found' /tmp/failed-edit.json \
   || fail "bad edit observation lacks its error"
 grep -qF '"is_error":true' /tmp/failed-edit.json \
@@ -81,7 +80,7 @@ new_llm_conversation tools-zero "$zero_port" - "You are a coding agent." "" \
   "currying zero-source_tree llm-step"
 dispatch_turn "exercise files without a source tree"
 wait_turn || fail "the zero-source_tree turn did not finish"
-$TOOL tools --repo /tmp/repo --head "$head" --request "$request" > /tmp/zero-tools.jsonl
+$TOOL tools --repo /tmp/repo --head "$head" > /tmp/zero-tools.jsonl
 jq -s -e 'length == 2 and all(.[]; .status == "complete")' \
   /tmp/zero-tools.jsonl >/dev/null || fail "conversation writes did not complete"
 [ "$(record "$head" plan.md)" = "root plan" ] \
