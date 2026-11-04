@@ -112,6 +112,10 @@ root-owned so that no worker can tamper with content-addressed files
     ride the musl-static `std/runner`. It gets its own flake image
     (`std/wasm/flake.nix`, the way `std/go` has one), and nix supplies
     `RUSTY_V8_ARCHIVE` so cargo stays `--offline`.
+  - The V8 closure is heavy. Build it as a `#depsImage` memo
+    (`design/flake-deps-image.md`), so that a host edit re-keys a thin layer
+    rather than the whole closure. `std/cargo` uses the same arrangement for
+    `worker-cargo`.
 - **Spike: Node 22 from nixpkgs plus a ~500-line JS host** that implements WASI
   preview1 over synchronous `node:fs`.
   - Not `node:wasi`: it is uvwasi underneath, so `path_open` cannot be
