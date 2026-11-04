@@ -169,6 +169,22 @@ fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
 }
 
+/// Every check of each layer whose CI is not passing, as ci-status prints
+/// them, so a refusal or a failure says what CI says without another call.
+fn ci_detail(repository: &str, targets: &[Target<'_>]) -> String {
+    let mut text = String::new();
+    for target in targets {
+        let Some((pr, checks)) = &target.pr else {
+            continue;
+        };
+        if matches!(checks.verdict(), Some(Standing::Failing | Standing::Pending)) {
+            text.push_str(&format!("\n{}  PR #{}\n", target.layer.name, pr.number));
+            text.push_str(&ci_status::render(repository, &target.branch, checks));
+        }
+    }
+    text
+}
+
 /// Wait for GitHub to point the PR at the trunk, which it does itself for a PR
 /// in a GitHub stack once the PR below merges, and do it ourselves for one that
 /// is not. Returns the PR as last read, whose head is what gets merged.
