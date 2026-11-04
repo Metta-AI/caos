@@ -323,6 +323,17 @@ Rust comes first: the workspace is Rust and `worker-rustc` is the model.
     profile. That needs a separate target directory: `bake.nix` already keeps
     musl and host apart because they cannot share one `target/`.
   - It stays `--offline`.
+  - **Caveat:** cargo, rustc and runner are part of the SEEDED core
+    (`stack/build-builtins.sh`), and `rust/rust-toolchain.toml` pins musl
+    targets only. Adding a target there re-keys the core bake for every
+    tool.
+  - The alternative is a separate `std/cargo-wasm` image. It would use the
+    same toolchain plus the wasm target, and bake only `caos-guest`'s
+    dependency graph.
+  - Recommendation: start with `std/cargo-wasm`, and fold it into
+    `std/cargo` only if keeping two bakes in sync hurts.
+- **No C toolchain exists today.** `std/go` has `CGO_ENABLED=0`, and the
+  bake's musl cc is internal, so a wasi-sdk image is new work, not a reuse.
 - **`rust/crates/caos-guest`**: the guest crate above. It must not depend on
   `std::process`.
 - **`worker-rust-wasm`**: the factory. It runs on `std/runner`, like rustc.
