@@ -621,12 +621,15 @@ mod tests {
         let p = parameters(&call(json!({"stack": "sources/repo/"}))).unwrap();
         assert_eq!(p.stack, "sources/repo");
         assert!(!p.force && !p.dry_run && p.up_to.is_none());
+        assert_eq!(p.wait_for_ci_min, 0);
         let p = parameters(&call(json!({
             "stack": "sources/repo", "up-to": "02-tests", "force": "true",
-            "dry-run": "true", "branch-prefix": "me/", "trunk": "main"
+            "dry-run": "true", "branch-prefix": "me/", "trunk": "main",
+            "wait-for-ci-min": "20"
         })))
         .unwrap();
         assert!(p.force && p.dry_run);
+        assert_eq!(p.wait_for_ci_min, 20);
         assert_eq!(p.up_to.as_deref(), Some("02-tests"));
         assert_eq!(p.branch_prefix.as_deref(), Some("me/"));
         for input in [
