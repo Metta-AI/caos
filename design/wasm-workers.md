@@ -381,7 +381,7 @@ fn main() -> caos::Result<()> {
    - `tests/wasm-hello` runs a checked-in `.wasm` built from `.wat`: args,
      lazy `/cas`, `/tmp`, `put`.
 2. `02-rust-wasm`
-   - `caos-guest`, the `wasm32-wasip1` target in `std/cargo`, the
+   - `caos-guest`, the `std/cargo-wasm` bake, the
      `std/rust-wasm` factory and `std/hello-wasm`.
    - `tests/wasm-rust` covers a `run-then` round trip, a `map-then` fan-out,
      a failure that surfaces stderr, a refused verb and a refused import.
