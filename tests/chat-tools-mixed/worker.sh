@@ -56,7 +56,9 @@ printf '%s\n' \
   '{"content":[{"text":"mixed done","type":"text"}],"stop_reason":"end_turn"}' \
   > /tmp/stub/response-2.json
 dispatch_turn "write, run bash, edit, grep, and merge"
-wait_turn || fail "the mixed turn never reached a terminal head"
+# Several tool calls, a merge among them: under a full suite's load the turn has
+# taken longer than wait_turn's 120s default.
+wait_turn 240 || fail "the mixed turn never reached a terminal head"
 
 source_tree=$(source_tree_commit "$head")
 fetch_code "$source_tree" "fetching the mixed-tool source_tree"
