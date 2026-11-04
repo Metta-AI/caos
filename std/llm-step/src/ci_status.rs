@@ -63,18 +63,28 @@ pub(super) fn minutes_or_string<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// Consecutive failed reads a wait rides out: a long wait sees the odd 502.
+const TOLERATED_ERRORS: u32 = 3;
+
 /// Call `settled` until it says yes or `minutes` have passed, sleeping `POLL`
 /// between calls; with 0 minutes it is called once. True if it settled, false
-/// if the time ran out first. The first error stops the wait.
+/// if the time ran out first. An error on the first call stops the wait, and
+/// so does one on a later call once `TOLERATED_ERRORS` have come in a row.
 pub(super) fn wait_until(
     minutes: u64,
     mut settled: impl FnMut() -> Result<bool, String>,
 ) -> Result<bool, String> {
     let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+    let mut first = true;
+    let mut errors = 0;
     loop {
-        if settled()? {
-            return Ok(true);
+        match settled() {
+            Ok(true) => return Ok(true),
+            Ok(false) => errors = 0,
+            Err(error) if first || errors >= TOLERATED_ERRORS => return Err(error),
+            Err(_) => errors += 1,
         }
+        first = false;
         let now = Instant::now();
         if now >= deadline {
             return Ok(false);
