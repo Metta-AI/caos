@@ -102,7 +102,7 @@ Where the code differs from, or settles, what the sections below say:
 
 Describes what to build on top of the runner as it exists today (SPEC.md,
 "Runners: how a worker's container lives"; if that section is not in this
-tree yet, it is Metta-AI/caos#311). Replaces the "Deferred: daemons" sketch in
+tree yet, it is softmax-universe/caos#311). Replaces the "Deferred: daemons" sketch in
 `design/actors.md` on the `actors-design` branch, which put a separate
 supervisor in the author's image. The supervisor already exists: it is
 `caos runner`, PID 1 in every worker container.

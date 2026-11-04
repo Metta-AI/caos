@@ -4910,7 +4910,7 @@ mod tests {
         assert_eq!(command.action, AppAction::Import);
         assert_eq!(arguments, "code https://example.com/repo.git");
 
-        assert!(parse_command("/load https://github.com/Metta-AI/caos/pull/34").is_none());
+        assert!(parse_command("/load https://github.com/softmax-universe/caos/pull/34").is_none());
 
         assert!(parse_command("/pr feature/01-change main").is_none());
 

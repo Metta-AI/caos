@@ -1683,7 +1683,7 @@ sandbox = false''
           caos-client-x86_64-linux = clientForTarget "x86_64-unknown-linux-musl";
           caos-client-aarch64-linux = clientForTarget "aarch64-unknown-linux-musl";
 
-          # `nix run github:Metta-AI/caos#deploy-caosd-prod` on a fresh box.
+          # `nix run github:softmax-universe/caos#deploy-caosd-prod` on a fresh box.
           # Go rather than shell: this program's job is quoting a nix
           # expression and branching on host facts, which is precisely where
           # `set -euo pipefail` scripts go wrong (CLAUDE.md lists the three
@@ -1827,7 +1827,7 @@ sandbox = false''
     # eachDefaultSystem above -- it is merged alongside it. These are machine
     # ROLES, named <daemon>-<environment>: a fresh box becomes one with
     #
-    #   nix run github:Metta-AI/caos#deploy-caosd-prod
+    #   nix run github:softmax-universe/caos#deploy-caosd-prod
     #
     # and NOT with a bare `nixos-rebuild switch --flake ...#caosd-prod`, which
     # fails on the per-machine caos.advertiseAddress the driver supplies.

@@ -16,7 +16,7 @@ guard), secrets from AWS Secrets Manager, and the Datadog agent.
 On the machine you want to become the host:
 
 ```sh
-nix run github:Metta-AI/caos#deploy-caosd-prod
+nix run github:softmax-universe/caos#deploy-caosd-prod
 ```
 
 That is the whole procedure. It reads the host's facts, refuses if the machine
@@ -25,7 +25,7 @@ if nix serves a stale revision, and pass a flake ref to deploy from somewhere
 other than the revision the driver itself came from:
 
 ```sh
-nix run 'git+https://github.com/Metta-AI/caos?ref=my-branch#deploy-caosd-prod'
+nix run 'git+https://github.com/softmax-universe/caos?ref=my-branch#deploy-caosd-prod'
 ```
 
 The driver bakes in its own source (`-X main.defaultFlake=path:${self}`), so
@@ -36,7 +36,7 @@ branch deploy itself.
 ### Do not use `nixos-rebuild` directly
 
 ```sh
-nixos-rebuild switch --flake github:Metta-AI/caos#caosd-prod   # FAILS
+nixos-rebuild switch --flake github:softmax-universe/caos#caosd-prod   # FAILS
 # error: The option `caos.advertiseAddress' was accessed but has no value defined
 ```
 
@@ -146,7 +146,7 @@ per day. The ledger is `/var/lib/caos-watchdog/incident.json` and
 Deploying it:
 
 ```sh
-sudo nixos-rebuild switch --refresh --flake github:Metta-AI/caos#watchdog-prod
+sudo nixos-rebuild switch --refresh --flake github:softmax-universe/caos#watchdog-prod
 ```
 
 The instance, its IAM role (SSM on the one prod instance, read of four
@@ -185,7 +185,7 @@ rm "$KEY"
 ```
 
 Then on the host, `nixos-rebuild switch --refresh --flake
-github:Metta-AI/caos#watchdog-prod` is substitution, not compilation, and
+github:softmax-universe/caos#watchdog-prod` is substitution, not compilation, and
 `deploy-caosd-prod` on the server stops rebuilding 498 crates.
 
 ## Adding a role

@@ -3447,12 +3447,12 @@ mod tests {
     #[test]
     fn repository_identity_normalizes_scp_and_https_spellings() {
         assert_eq!(
-            normalize_repository_identity("git@github.com:Metta-AI/caos.git").unwrap(),
-            normalize_repository_identity("https://github.com/Metta-AI/caos").unwrap()
+            normalize_repository_identity("git@github.com:softmax-universe/caos.git").unwrap(),
+            normalize_repository_identity("https://github.com/softmax-universe/caos").unwrap()
         );
         assert_eq!(
-            normalize_repository_identity("https://GITHUB.COM/Metta-AI/caos.git/").unwrap(),
-            "https://github.com/Metta-AI/caos"
+            normalize_repository_identity("https://GITHUB.COM/softmax-universe/caos.git/").unwrap(),
+            "https://github.com/softmax-universe/caos"
         );
     }
 

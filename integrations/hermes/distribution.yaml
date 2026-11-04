@@ -5,7 +5,7 @@ description: >
   (terminal, file, code_execution) and installs the caos MCP server plus
   the hook plugin that attributes tool calls to a caos conversation.
 hermes_requires: ">=0.0.0"
-author: "Metta-AI/caos"
+author: "softmax-universe/caos"
 license: MIT
 # Default distribution_owned (config.yaml, mcp.json, skills, cron,
 # distribution.yaml) doesn't include arbitrary directories -- confirmed by a
@@ -37,7 +37,7 @@ env_requires:
       Always set, on every deploy -- NOT specific to dev/testing despite
       caos-mcp-launch also querying its refs/caos/dev as an automatic,
       always-attempted probe for --llm-step's own revision (when that probe
-      finds nothing, --llm-step falls back to Metta-AI/caos-session's own
+      finds nothing, --llm-step falls back to softmax-universe/caos-session's own
       main tip, hardcoded, not configured through this or any other var).
     required: true
   - name: CAOS_SECRET_READERS
@@ -62,5 +62,5 @@ env_requires:
       for building the caos BINARY. Unrelated to --llm-step resolution,
       which no longer reads this (or any other) var at all: it's either the
       server's own refs/caos/dev probe, or the hardcoded
-      Metta-AI/caos-session fallback.
+      softmax-universe/caos-session fallback.
     required: false

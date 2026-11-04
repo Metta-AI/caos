@@ -77,7 +77,7 @@ func hello(c conf, ticket string) (bool, string, time.Duration) {
 
 	started := time.Now()
 	cmd := exec.Command("timeout", "600", "caos-cli", "run",
-		"--base:@@=git+https://github.com/Metta-AI/caos?rev="+c.helloRev+"&dir=std/hello",
+		"--base:@@=git+https://github.com/softmax-universe/caos?rev="+c.helloRev+"&dir=std/hello",
 		"--date="+started.UTC().Format(time.RFC3339))
 	cmd.Dir = repo
 	out, err := cmd.CombinedOutput()

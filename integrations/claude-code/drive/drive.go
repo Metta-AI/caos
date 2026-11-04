@@ -462,7 +462,7 @@ func start(c creds, o opts, prompt string) error {
 	}
 	if o.repo == "" {
 		return errors.New("`repo` is required: a session opens a repository, and a worker has no\n" +
-			"  checkout to fall back on — name it, e.g. repo=Metta-AI/caos-session")
+			"  checkout to fall back on — name it, e.g. repo=softmax-universe/caos-session")
 	}
 	repoURL, ref, err := parseRepo(o.repo, o.ref)
 	if err != nil {

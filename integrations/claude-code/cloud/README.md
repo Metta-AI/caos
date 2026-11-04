@@ -50,7 +50,7 @@ server. Before it, nothing tested any of this but a four-minute cloud round trip
 ## The session starts from a CLIENT repo, not from the code
 
 The repository a session opens is a **caos client repo** — a handful of text
-files that pin a caos and mount its `std/`. `Metta-AI/caos-session` is the one
+files that pin a caos and mount its `std/`. `softmax-universe/caos-session` is the one
 to fork; its shape is spelled out under *Configuring the environment* below,
 so this does not depend on being able to open it. The code to work on is
 **imported into the conversation** by the agent's `import_source` tool — the
@@ -128,7 +128,7 @@ See [`../drive`](../drive) for starting one.
 
 ## Configuring the environment
 
-**Repository**: a caos client repo — fork `Metta-AI/caos-session` and point the
+**Repository**: a caos client repo — fork `softmax-universe/caos-session` and point the
 environment at your fork. It is four things, and nothing else:
 
 ```
@@ -148,7 +148,7 @@ field (swap `main` for a branch or commit to test a change to the *bootstrap
 scripts* — everything else is read back out of it):
 
 ```
-B=https://raw.githubusercontent.com/Metta-AI/caos/main
+B=https://raw.githubusercontent.com/softmax-universe/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
   --secret-readers=<key>
@@ -207,7 +207,7 @@ A third line on the setup command runs the session against the caos on your
 machine, with no push and no CI:
 
 ```
-B=https://raw.githubusercontent.com/Metta-AI/caos/main
+B=https://raw.githubusercontent.com/softmax-universe/caos/main
 curl -fsSL "$B/integrations/claude-code/cloud/bootstrap.go" -o /tmp/caos-bootstrap.go
 go run /tmp/caos-bootstrap.go --base="$B" --server=caos://<ticket> \
   --dev-commit=<sha>

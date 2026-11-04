@@ -47,7 +47,7 @@ cat /data/caos/stack/iroh/ticket
   the probe's own account, on THIS box: each line is one check with its
   error text and timing. Read it first when a `caos.probe.*` monitor is
   what alerted; the Datadog state in your prompt does not carry it.
-- `caos-cli run --base:@@="git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/hello" --date=$(date -u +%FT%TZ)`
+- `caos-cli run --base:@@="git+https://github.com/softmax-universe/caos?rev=<sha>&dir=std/hello" --date=$(date -u +%FT%TZ)`
   from `/var/lib/caos-watchdog/probe-repo` reproduces the run probe by
   hand; the sha is `$CAOS_WATCHDOG_HELLO_REV`.
 - `aws ec2 describe-instance-status` / `aws ssm describe-instance-information`

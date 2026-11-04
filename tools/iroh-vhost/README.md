@@ -8,7 +8,7 @@ copies bytes both ways, so keep-alive, streaming and websockets work.
     dumbpipe listen-tcp --host 127.0.0.1:9119
 
     # client: run the gateway (default 127.0.0.1:8080)
-    nix run github:Metta-AI/caos?dir=tools/iroh-vhost -- --host 127.0.0.1:9119
+    nix run github:softmax-universe/caos?dir=tools/iroh-vhost -- --host 127.0.0.1:9119
 
 ## Where the ticket goes
 
