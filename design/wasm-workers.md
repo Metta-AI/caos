@@ -138,6 +138,11 @@ root-owned so that no worker can tamper with content-addressed files
   one component at a time.
 - The first time a component is touched, the host runs `caos get <prefix>`
   (one level, never `-r`) and remembers that it did.
+- The host can tell a placeholder without asking: it is mode `r--------`
+  until a `get` makes it world-readable, and every `/cas` path carries its
+  hash in the `user.caos.hash` xattr (README, "The CAS and /cas").
+  `fd_filestat_get` can report the real file type from the tree entry, so
+  `readdir` never forces a fetch.
 - So `std::fs::read("/cas/args/in/src/main.rs")` just works, and fetches only
   the levels it walks. bash-tool's `paths` footgun (std/README, "Using
   bash-tool") does not exist here.
