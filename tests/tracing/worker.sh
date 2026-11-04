@@ -157,6 +157,14 @@ echo "  ok: out-trace $oid reads back" >&2
 
 echo "== the run completes with the fan-out's results ==" >&2
 wait "$runner" || true
+# A server that restarts mid-run loses the wait, not the work, and says so: start
+# it again, as the error asks. The run is content-addressed, so the second start
+# joins or replays the first rather than redoing it.
+if [ "$(cat run.rc)" != "0" ] && grep -q 'the server restarted before this finished' run.err; then
+  echo "  the server restarted during the run; starting it again" >&2
+  "$CAOS_CLI" run --base:hash="$driver" --in:@=test/tree > run.out 2> run.err
+  echo $? > run.rc
+fi
 t1=$(ms)
 [ "$(cat run.rc)" = "0" ] || fail "the run failed: $(tail -c 2000 run.err)"
 got=$(cat run.out)
