@@ -51,11 +51,15 @@ functions, cached by redis
       ```
   - From the repo picker (next to the env picker), choose `metta-ai/caos-session`
 - For Hermes:
-  - Run the hermes/caos gateway: `nix run .#hermes-gateway`. `$CAOS_SERVER` must be set at this point
+  - Run the hermes/caos gateway (`--help` lists its flags):
+    ```
+    nix run .#hermes-gateway -- --server=$CAOS_SERVER \
+      --secret-readers=<SECRET_READERS_KEY>
+    ```
   - Settings (gear icon in the top right of the window, or control/command-comma) > Gateways > Saved connections
     - Add Connection
     - Name: Caos
-    - Url: Enter the url from `nix run .#hermesgateway` above (iroh or direct)
+    - Url: Enter the url from `nix run .#hermes-gateway` above (iroh or direct)
     - Session token: `caos`
     - Save connection
     - Click 'Test' and check that your connection is ok

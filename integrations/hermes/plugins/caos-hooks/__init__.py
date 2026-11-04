@@ -240,6 +240,10 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
     server = _env("CAOS_MCP_DEFAULT_SERVER", profile_env)
     if not server or _unsubstituted(server):
         return None
+    # The hook runs the step that creates the conversation, so it presents the
+    # same reader keys as the tool server, from the same place.
+    readers = _env("CAOS_SECRET_READERS", profile_env)
+    reader_args = [] if not readers or _unsubstituted(readers) else [f"--secret-readers={readers}"]
     try:
         result = subprocess.run(
             [
@@ -253,6 +257,7 @@ def _run_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
                 # which is not the conversation; the hook hands over the
                 # conversation's own with the prompt that creates it.
                 "--agents-md",
+                *reader_args,
             ],
             input=json.dumps(payload),
             capture_output=True,

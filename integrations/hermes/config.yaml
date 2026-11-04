@@ -80,6 +80,8 @@ mcp_servers:
       # The server `caos mcp` is told, as `--server=<url>`, by the launcher and
       # the hook plugin.
       CAOS_MCP_DEFAULT_SERVER: "${CAOS_MCP_DEFAULT_SERVER}"
+      # The SecretReaderKey(s), passed on as `--secret-readers=` the same way.
+      CAOS_SECRET_READERS: "${CAOS_SECRET_READERS}"
     # Generous: a cold `nix build`/cold caos-server-side tool build can take
     # minutes. Raise further if a first-session timeout is observed.
     timeout: 1800
