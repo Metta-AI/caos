@@ -2,7 +2,11 @@
 //! commit statuses, and the verdict `stack-merge-to-master` gates on
 //! (design/stack-publish.md, "ci-status"). `ci-status` is the operation that
 //! prints it for a branch, a layer or a commit; `stack_merge_to_master` reads the same
-//! thing for every pull request head before it merges anything.
+//! thing for every pull request head before it merges anything. Both can wait
+//! for CI to settle (`wait-min`, `wait-for-ci-min`), polling with `wait_until`.
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
 use super::*;
 
 use crate::stack_publish::{github_repo, provenance, read_stack, Github};
@@ -17,6 +21,80 @@ struct Parameters {
     repository: Option<String>,
     #[serde(default, rename = "branch-prefix", alias = "branch_prefix")]
     branch_prefix: Option<String>,
+    #[serde(
+        default,
+        rename = "wait-min",
+        alias = "wait_min",
+        deserialize_with = "minutes_or_string"
+    )]
+    wait_min: u64,
+}
+
+/// The longest a call may wait for CI. A longer wait is refused rather than
+/// cut short, so the caller learns the limit instead of a surprise.
+pub(super) const MAX_WAIT_MIN: u64 = 180;
+
+/// How often a wait reads CI again. GitHub has no long poll for checks, so a
+/// wait is a poll; each read is three requests or more, and CI moves in
+/// minutes, so a read every 15 seconds is plenty.
+const POLL: Duration = Duration::from_secs(15);
+
+/// A number of minutes, as a JSON number or as the string a tool's arguments
+/// are; empty or absent is 0, no wait. More than `MAX_WAIT_MIN` is refused.
+pub(super) fn minutes_or_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    let minutes = match <Value as serde::Deserialize>::deserialize(deserializer)? {
+        Value::Null => Some(0),
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) if text.trim().is_empty() => Some(0),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match minutes {
+        Some(minutes) if minutes <= MAX_WAIT_MIN => Ok(minutes),
+        Some(minutes) => Err(D::Error::custom(format!(
+            "a wait is at most {MAX_WAIT_MIN} minutes, not {minutes}"
+        ))),
+        None => Err(D::Error::custom(
+            "a wait is a whole number of minutes, such as 20",
+        )),
+    }
+}
+
+/// Call `settled` until it says yes or `minutes` have passed, sleeping `POLL`
+/// between calls; with 0 minutes it is called once. True if it settled, false
+/// if the time ran out first. The first error stops the wait.
+pub(super) fn wait_until(
+    minutes: u64,
+    mut settled: impl FnMut() -> Result<bool, String>,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+    loop {
+        if settled()? {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        sleep(POLL.min(deadline - now));
+    }
+}
+
+/// Whether a wait on these verdicts is over: as soon as anything fails, since
+/// the verdict can no longer turn to passing, else once nothing is pending.
+pub(super) fn settled(verdicts: impl IntoIterator<Item = Option<Standing>>) -> bool {
+    let mut pending = false;
+    for verdict in verdicts {
+        match verdict {
+            Some(Standing::Failing) => return true,
+            Some(Standing::Pending) => pending = true,
+            _ => {}
+        }
+    }
+    !pending
 }
 
 fn blank(value: Option<String>) -> Option<String> {
