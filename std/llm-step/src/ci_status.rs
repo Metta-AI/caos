@@ -470,8 +470,70 @@ mod tests {
         assert_eq!(red.verdict(), Some(Standing::Failing));
         assert_eq!(red.summary(), "FAILING: build; pending: test");
         let text = render("r", "f", &red);
-        assert!(text.starts_with("repository r  branch f  head 0123456789ab\n"));
-        assert!(text.ends_with("checks: FAILING: build; pending: test\n"));
+        assert!(text.starts_with(
+            "checks: FAILING: build; pending: test\nrepository r  branch f  head 0123456789ab\n"
+        ));
+        let red_first = Checks {
+            head: "0123456789abcdef".into(),
+            checks: vec![
+                check("lint", Standing::Passing),
+                check("test", Standing::Pending),
+                check("build", Standing::Failing),
+            ],
+        };
+        let names: Vec<&str> = render("r", "f", &red_first)
+            .lines()
+            .skip(2)
+            .map(|line| line.trim())
+            .collect();
+        assert_eq!(names, ["build", "test", "lint"], "failing, then pending, then passing");
+    }
+
+    #[test]
+    fn a_wait_ends_on_the_first_failure_or_when_nothing_is_pending() {
+        use Standing::*;
+        assert!(settled([]));
+        assert!(settled([None]));
+        assert!(settled([Some(Passing), Some(Passing)]));
+        assert!(!settled([Some(Passing), Some(Pending)]));
+        assert!(settled([Some(Pending), Some(Failing)]));
+        assert!(settled([Some(Failing), Some(Pending)]));
+    }
+
+    #[test]
+    fn wait_until_with_no_time_asks_once_and_errors_only_stop_it_when_they_persist() {
+        let mut calls = 0;
+        assert_eq!(wait_until(0, || { calls += 1; Ok(false) }), Ok(false));
+        assert_eq!(calls, 1);
+        assert_eq!(wait_until(0, || Ok(true)), Ok(true));
+        assert_eq!(wait_until(0, || Err::<bool, _>("down".to_string())), Err("down".into()));
+    }
+
+    #[test]
+    fn wait_min_is_whole_minutes_up_to_the_limit() {
+        let call = |input: Value| Call {
+            id: "a".into(),
+            name: "run_tool".into(),
+            input,
+        };
+        let with = |wait: Value| {
+            parameters(&call(json!({
+                "branch": "feature", "repository": "https://github.com/o/r", "wait-min": wait
+            })))
+            .map(|p| p.wait_min)
+        };
+        assert_eq!(with(json!("20")), Ok(20));
+        assert_eq!(with(json!(" 5 ")), Ok(5));
+        assert_eq!(with(json!(30)), Ok(30));
+        assert_eq!(with(json!("")), Ok(0));
+        assert_eq!(with(Value::Null), Ok(0));
+        assert_eq!(with(json!(MAX_WAIT_MIN.to_string())), Ok(MAX_WAIT_MIN));
+        for bad in [json!("soon"), json!("1.5"), json!("-1"), json!(true), json!((MAX_WAIT_MIN + 1).to_string())] {
+            assert!(with(bad.clone()).is_err(), "{bad}");
+        }
+        let p = parameters(&call(json!({"branch": "feature", "repository": "https://github.com/o/r"})))
+            .unwrap();
+        assert_eq!(p.wait_min, 0);
     }
 
     #[test]
