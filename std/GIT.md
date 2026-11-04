@@ -391,8 +391,11 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
 - Before anything merges it refuses unless every selected layer has an open
   PR whose head is the layer's commit (run `stack-sync` and `stack-publish`
   first) and CI on each of those heads is passing. A failing or unfinished
-  check refuses the whole merge; `force=true` merges anyway. `dry-run=true`
-  reads the PRs and checks and says what it would do.
+  check refuses the whole merge, and the refusal lists every check of the
+  layers that are not passing; `force=true` merges anyway. `dry-run=true`
+  reads the PRs and checks and says what it would do. `wait-for-ci-min=20`
+  first waits up to 20 minutes for unfinished CI, ending as soon as a check
+  fails or none is pending.
 - Each PR is merged with GitHub's asynchronous merge, after GitHub has
   pointed it at the trunk, which it does itself for a linked stack once the
   PR below merges. A failure stops it there: the layers below are merged, the
