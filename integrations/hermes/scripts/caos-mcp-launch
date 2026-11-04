@@ -173,4 +173,8 @@ server_arg=()
 if resolved "${CAOS_MCP_DEFAULT_SERVER:-}"; then
     server_arg=("--server=$CAOS_MCP_DEFAULT_SERVER")
 fi
+# The reader keys too: without them every tool runs with no secret granted.
+if resolved "${CAOS_SECRET_READERS:-}"; then
+    server_arg+=("--secret-readers=$CAOS_SECRET_READERS")
+fi
 exec "$bin" mcp serve ${server_arg[@]+"${server_arg[@]}"} "$llm_step"

@@ -1666,10 +1666,10 @@ sandbox = false''
                 pkgs.gawk
               ];
               text = ''
-                export CAOS_HERMES_PROFILE=${./integrations/hermes}
-                export CAOS_HERMES_CLI=${caos-cli}/bin/caos-cli
                 export SSL_CERT_FILE=''${SSL_CERT_FILE:-${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt}
-                exec bash ${./integrations/hermes/gateway} "$@"
+                exec bash ${./integrations/hermes/gateway} \
+                  --profile=${./integrations/hermes} \
+                  --cli=${caos-cli}/bin/caos-cli "$@"
               '';
             }
           else

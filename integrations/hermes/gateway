@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # A Hermes gateway wired to one caos server, run on its own:
 #
-#   nix run github:Metta-AI/caos#hermes-gateway
+#   nix run github:Metta-AI/caos#hermes-gateway -- --help
 #
 # It is NOT part of caosd. The gateway is a client of the server it names
-# (CAOS_SERVER); the only thing the two share is that URL.
+# (--server); the only thing the two share is that URL.
 #
 # `hermes serve` binds 127.0.0.1 on purpose: Hermes's dashboard-auth gate
 # engages only on a non-loopback bind, and a login in front of a single-profile
@@ -17,43 +17,81 @@
 # iroh-vhost's own hostname fails that check without it.
 #
 # The flake (flake.nix, `hermes-gateway`) supplies hermes, dumbpipe, git and
-# coreutils on PATH and sets the two variables below that name store paths.
+# coreutils on PATH and passes --profile and --cli, the two store paths.
 #
-#   CAOS_HERMES_PROFILE   integrations/hermes as a build product (set by the flake)
-#   CAOS_HERMES_CLI       the caos-cli the MCP launcher execs (set by the flake)
-#   CAOS_SERVER           the caos server sessions talk to
-#                         (default http://localhost:9090, a `caosd up` stack)
-#   CAOS_HERMES_STATE     where the gateway keeps its HERMES_HOME, secrets and
-#                         ticket (default $XDG_STATE_HOME/caos-hermes). The
-#                         layout matches what caosd's old bundled gateway kept
-#                         under $CAOS_DATA/stack, so pointing this there carries
-#                         its sessions and saved keys over.
-#   CAOS_HERMES_PORT      the gateway's loopback port (default 9119)
-#   CAOS_HERMES_VHOST_PORT
-#                         the port the DESKTOP runs iroh-vhost on, printed into
-#                         both of the commands it is told to run (default 8080).
-#                         Not the gateway's port: on one machine they would collide.
-#   CAOS_HERMES_IROH_PORT the bridge's UDP port (default 11205)
-#   CAOS_HERMES_DEFAULT_TOOLS
-#                         yes|no, default yes. Whether the root `default`
-#                         profile gets caos's MCP tools. `hermes serve` cannot
-#                         be forced onto a named profile, and Hermes refuses to
-#                         install a distribution as `default`, so a client that
-#                         never picks one would otherwise get the stock shell.
-#
-# The model credential is not set here. Add it the way Desktop's Keys UI does
-# (`PUT /api/env`), or by hand to $state/hermes/.env; this script rewrites only
-# its own CAOS_* lines there and keeps the rest.
+# Every input is a flag, listed by --help. The only environment here is
+# Hermes's own: config.yaml's ${VAR} forms are filled from $state/hermes/.env,
+# which this script writes.
 set -euo pipefail
 
-profile="${CAOS_HERMES_PROFILE:?CAOS_HERMES_PROFILE is set by the flake wrapper}"
-cli="${CAOS_HERMES_CLI:?CAOS_HERMES_CLI is set by the flake wrapper}"
-server=${CAOS_SERVER:-http://localhost:9090}
-state=${CAOS_HERMES_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/caos-hermes}
-port=${CAOS_HERMES_PORT:-9119}
-iroh_port=${CAOS_HERMES_IROH_PORT:-11205}
-vhost_port=${CAOS_HERMES_VHOST_PORT:-8080}
-default_tools=${CAOS_HERMES_DEFAULT_TOOLS:-yes}
+usage() {
+  cat <<'USAGE'
+usage: hermes-gateway [options]
+
+Runs a Hermes gateway for Hermes Desktop, wired to one caos server, and an
+iroh bridge to reach it from another machine.
+
+  --server=<url>          the caos server sessions talk to
+                          (default http://localhost:9090, a `caosd up` stack)
+  --secret-readers=<key>  the SecretReaderKey(s) sessions present, as printed
+                          by `caos-cli secrets-push`; several are space-separated.
+                          Without it, no session is granted a secret.
+  --state=<dir>           where the gateway keeps its HERMES_HOME, secrets and
+                          ticket (default $XDG_STATE_HOME/caos-hermes)
+  --port=<n>              the gateway's loopback port (default 9119)
+  --vhost-port=<n>        the port the DESKTOP runs iroh-vhost on, printed into
+                          the commands it is told to run (default 8080). Not the
+                          gateway's port: on one machine they would collide.
+  --iroh-port=<n>         the bridge's UDP port (default 11205)
+  --default-tools=yes|no  whether the root `default` profile gets caos's MCP
+                          tools (default yes). A client that never picks a
+                          profile would otherwise get the stock shell.
+  -h, --help              this text
+
+Set by the flake wrapper, not by hand:
+  --profile=<dir>         integrations/hermes as a build product
+  --cli=<path>            the caos-cli the MCP launcher execs
+
+The model credential is not set here. Add it in Desktop's Keys UI, or by hand
+to <state>/hermes/.env; the gateway rewrites only its own CAOS_* lines there.
+USAGE
+}
+
+profile=""
+cli=""
+server=http://localhost:9090
+readers=""
+state=${XDG_STATE_HOME:-$HOME/.local/state}/caos-hermes
+port=9119
+iroh_port=11205
+vhost_port=8080
+default_tools=yes
+for arg in "$@"; do
+  case "$arg" in
+    --profile=*) profile=${arg#*=} ;;
+    --cli=*) cli=${arg#*=} ;;
+    --server=*) server=${arg#*=} ;;
+    --secret-readers=*) readers=${arg#*=} ;;
+    --state=*) state=${arg#*=} ;;
+    --port=*) port=${arg#*=} ;;
+    --vhost-port=*) vhost_port=${arg#*=} ;;
+    --iroh-port=*) iroh_port=${arg#*=} ;;
+    --default-tools=yes | --default-tools=no) default_tools=${arg#*=} ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "hermes-gateway: unknown argument: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+if [ -z "$profile" ] || [ -z "$cli" ]; then
+  echo "hermes-gateway: --profile and --cli are passed by the flake; run it with \`nix run .#hermes-gateway\`" >&2
+  exit 2
+fi
 
 hermes_home="$state/hermes"
 iroh_state="$state/iroh-hermes"
@@ -119,23 +157,34 @@ hermes_config plugins.enabled "$plugins"
 # SSL_CERT_FILE is spelled out because Hermes hands an MCP subprocess only a
 # fixed allowlist of its environment, and caos-mcp-launch's `git ls-remote
 # https://github.com/...` fails without a CA bundle.
+#
+# CAOS_SECRET_READERS is --secret-readers, empty when not given. It reaches both
+# `caos mcp serve` and `caos mcp hook` as their own --secret-readers.
 env_file="$hermes_home/.env"
 extra=""
 if [ -f "$env_file" ]; then
-  extra=$(grep -v '^\(CAOS_HERMES_DIST_DIR\|CAOS_BIN\|CAOS_MCP_DEFAULT_SERVER\|CAOS_LLM_STEP_REV\|SSL_CERT_FILE\|NIX_SSL_CERT_FILE\)=' "$env_file" || true)
+  extra=$(grep -v '^\(CAOS_HERMES_DIST_DIR\|CAOS_BIN\|CAOS_MCP_DEFAULT_SERVER\|CAOS_SECRET_READERS\|CAOS_LLM_STEP_REV\|SSL_CERT_FILE\|NIX_SSL_CERT_FILE\)=' "$env_file" || true)
 fi
-{
-  cat <<ENV
+(
+  umask 177
+  {
+    cat <<ENV
 CAOS_HERMES_DIST_DIR=$profile
 CAOS_BIN=$cli
 CAOS_MCP_DEFAULT_SERVER=$server
+CAOS_SECRET_READERS=$readers
 SSL_CERT_FILE=${SSL_CERT_FILE:-}
 NIX_SSL_CERT_FILE=${NIX_SSL_CERT_FILE:-${SSL_CERT_FILE:-}}
 ENV
-  if [ -n "$extra" ]; then
-    printf '%s\n' "$extra"
-  fi
-} >"$env_file"
+    if [ -n "$extra" ]; then
+      printf '%s\n' "$extra"
+    fi
+  } >"$env_file.tmp"
+  mv "$env_file.tmp" "$env_file"
+)
+if [ -z "$readers" ]; then
+  echo "hermes-gateway: no --secret-readers; sessions will be granted no secrets" >&2
+fi
 
 # The same toolset ban caos applies to itself, on the root profile.
 hermes_config agent.disabled_toolsets '["terminal","file","code_execution"]'
@@ -156,7 +205,7 @@ if [ "$default_tools" = yes ]; then
   hermes_config mcp_single_query_discovery_timeout 180
   # --force: a second run is otherwise refused as replacing a whole section.
   # The ${VAR} forms are written literally; Hermes resolves them from .env.
-  hermes_config mcp_servers '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}","SSL_CERT_FILE":"${SSL_CERT_FILE}","NIX_SSL_CERT_FILE":"${NIX_SSL_CERT_FILE}"},"timeout":1800,"connect_timeout":300}}' --force
+  hermes_config mcp_servers '{"caos":{"command":"${CAOS_HERMES_DIST_DIR}/scripts/caos-mcp-launch","args":[],"env":{"CAOS_HERMES_DIST_DIR":"${CAOS_HERMES_DIST_DIR}","CAOS_REPO":"${CAOS_REPO}","CAOS_BIN":"${CAOS_BIN}","CAOS_MCP_DEFAULT_SERVER":"${CAOS_MCP_DEFAULT_SERVER}","CAOS_SECRET_READERS":"${CAOS_SECRET_READERS}","SSL_CERT_FILE":"${SSL_CERT_FILE}","NIX_SSL_CERT_FILE":"${NIX_SSL_CERT_FILE}"},"timeout":1800,"connect_timeout":300}}' --force
 fi
 
 # A persisted key, or dumbpipe mints a new endpoint (and a dead ticket) per run.

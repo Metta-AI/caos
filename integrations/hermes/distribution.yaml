@@ -40,6 +40,13 @@ env_requires:
       finds nothing, --llm-step falls back to Metta-AI/caos-session's own
       main tip, hardcoded, not configured through this or any other var).
     required: true
+  - name: CAOS_SECRET_READERS
+    description: >
+      The SecretReaderKey(s) `caos-cli secrets-push` prints, space-separated.
+      The launcher and the hook plugin present them as `--secret-readers=`;
+      without them no session is granted a secret (no GitHub token, so no
+      private import and no publish).
+    required: false
   - name: CAOS_BIN
     description: >
       Optional path to a pre-built caos binary. When set, skips CAOS_REPO

@@ -76,10 +76,11 @@ inside the checkout.
 A Hermes gateway for a caos server is its own program, not part of `caosd`:
 
 ```bash
-nix run github:Metta-AI/caos#hermes-gateway        # or `nix run .#hermes-gateway`
+nix run github:Metta-AI/caos#hermes-gateway -- \
+  --server=<url> --secret-readers=<key>
 ```
 
-It talks to the server named by `CAOS_SERVER` (default `http://localhost:9090`,
-a `caosd up` stack), keeps its state under `CAOS_HERMES_STATE`, and prints an
-iroh ticket and the exact `iroh-vhost` commands a desktop runs to reach it.
-`gateway` is the script, and its header lists every variable.
+It talks to the server named by `--server` (default `http://localhost:9090`,
+a `caosd up` stack), presents `--secret-readers` for every session, keeps its
+state under `--state`, and prints an iroh ticket and the exact `iroh-vhost`
+commands a desktop runs to reach it. `--help` lists every flag.
