@@ -372,6 +372,28 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         targets.push(target);
     }
 
+    // With wait-for-ci-min, read the pending heads again until one fails or
+    // none is pending: the same rule as ci-status's wait-min.
+    let mut fresh = true;
+    let waited = ci_status::wait_until(p.wait_for_ci_min, || {
+        if !std::mem::take(&mut fresh) {
+            for target in targets.iter_mut() {
+                if let Some((pr, checks)) = &mut target.pr {
+                    if checks.verdict() == Some(Standing::Pending) {
+                        *checks = ci_status::read(&github, &pr.head)?;
+                    }
+                }
+            }
+        }
+        Ok(ci_status::settled(
+            targets.iter().filter_map(|target| target.pr.as_ref()).map(|(_, checks)| checks.verdict()),
+        ))
+    });
+    let ci_settled = match waited {
+        Ok(settled) => settled,
+        Err(error) => return site.fail(state, &refused(error)),
+    };
+
     let mut lines: Vec<String> = Vec::new();
     let mut blockers: Vec<String> = Vec::new();
     for target in &targets {
