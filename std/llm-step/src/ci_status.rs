@@ -319,7 +319,6 @@ pub(super) fn render(repository: &str, reference: &str, checks: &Checks) -> Stri
         }
         text.push('\n');
     }
-    text.push_str(&format!("checks: {}\n", checks.summary()));
     text
 }
 
