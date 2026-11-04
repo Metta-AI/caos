@@ -515,6 +515,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         text.push_str("FAILED: ");
         text.push_str(problem);
         text.push_str("\nThe layers above it were not merged.\n");
+        text.push_str(&ci_detail(&repository, &targets));
     }
     if merged > 0 {
         text.push_str(
