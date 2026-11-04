@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn a_wait_ends_on_the_first_failure_or_when_nothing_is_pending() {
         use Standing::*;
-        assert!(settled([]));
+        assert!(settled(Vec::<Option<Standing>>::new()));
         assert!(settled([None]));
         assert!(settled([Some(Passing), Some(Passing)]));
         assert!(!settled([Some(Passing), Some(Pending)]));
