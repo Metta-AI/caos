@@ -481,7 +481,8 @@ mod tests {
                 check("build", Standing::Failing),
             ],
         };
-        let names: Vec<&str> = render("r", "f", &red_first)
+        let listed = render("r", "f", &red_first);
+        let names: Vec<&str> = listed
             .lines()
             .skip(2)
             .map(|line| line.trim())
