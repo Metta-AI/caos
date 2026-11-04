@@ -38,7 +38,7 @@ Why have it at all:
 | `std/runner`: execs the `worker1` binary | `std/wasm`: instantiates the `module` blob in an isolate |
 | `std/rustc`: `src` → `curry(runner, worker1=<bin>)` | `std/rust-wasm`: `src` → `curry(wasm, module=<x.wasm>)` |
 | `worker-common` (the worker-side helper crate) | `caos-guest` (the guest-side crate) |
-| `std/cargo`, baked for (musl, dev) | `std/cargo` with `wasm32-wasip1` baked as well |
+| `std/cargo`, baked for (musl, dev) | `std/cargo-wasm`, the same toolchain baked for `wasm32-wasip1` |
 
 A tool is then exactly as small as `std/hello`:
 
