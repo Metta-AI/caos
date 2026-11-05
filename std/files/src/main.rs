@@ -396,19 +396,18 @@ fn edit(root: Option<&str>) -> Result<Written, Fail> {
     Ok((New::Content(replaced.into_bytes()), out))
 }
 
-fn copy(ws: &str) -> Result<Written, Fail> {
+fn copy(root: Option<&str>) -> Result<Written, Fail> {
+    let dir = directory(root, "copy works inside the directory that holds both paths")?;
     let from = components("from")?;
     let to = components("to")?;
     reject_protocol(&to)?;
-    let prop = copy_entry(ws, &from, &to)?;
-    Ok((
-        prop,
-        format!("copied {} to {}", from.join("/"), to.join("/")),
-        format!("copy {} to {}", from.join("/"), to.join("/")),
-    ))
+    let new = copy_entry(path(&dir), &from, &to)?;
+    let out = format!("copied {} to {}", from.join("/"), to.join("/"));
+    Ok((New::Object(new), out))
 }
 
-fn move_entry(ws: &str) -> Result<Written, Fail> {
+fn move_entry(root: Option<&str>) -> Result<Written, Fail> {
+    let dir = directory(root, "move works inside the directory that holds both paths")?;
     let from = components("from")?;
     let to = components("to")?;
     reject_protocol(&from)?;
