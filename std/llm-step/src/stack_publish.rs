@@ -1094,11 +1094,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 )
             }
             Some((owner, repo)) => {
-                let github = Github {
-                    owner,
-                    repo,
-                    token: token.map(str::to_string),
-                };
+                let github = Github::new(owner, repo, token.map(str::to_string));
                 match pull_requests(&github, &plan, &mut lines) {
                     Ok(prs) => match link_stack(&github, &plan, &prs) {
                         Ok(line) => stack_line = line,
