@@ -62,7 +62,8 @@ pub(super) fn wait_until(
     minutes: u64,
     mut settled: impl FnMut() -> Result<bool, String>,
 ) -> Result<bool, String> {
-    let deadline = Instant::now() + Duration::from_secs(minutes * 60);
+    // A wait too long for the clock to represent has no deadline.
+    let deadline = Instant::now().checked_add(Duration::from_secs(minutes.saturating_mul(60)));
     let mut first = true;
     let mut errors = 0;
     loop {
