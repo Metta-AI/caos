@@ -1,10 +1,9 @@
 # The `move-sed` tool (design/publish-stack.md, "move-sed"): the std/go worker
 # image with this directory's program curried onto it, plus the `help` it is
-# described by. A writer run on the session: `@in` hands it the
-# session tree, and it proposes that tree with one directory's entries
-# renamed.
+# described by. A writer under the root contract: `root` is the directory,
+# and it answers with that directory's entries renamed.
 HELP=<<END
-Rename the entries of ONE session directory by regular expression, in one
+Rename the entries of ONE directory by regular expression, in one
 atomic proposal: a layer and its sidecar files (01-feature, 01-feature.pr.md)
 move together, and a shift such as 02 to 03 and 01 to 02 in the same call has
 no ordering problem.
