@@ -165,7 +165,13 @@ fn history(op: &str) -> Result<String, Failure> {
         "show" => (at("rev", "HEAD")?, HistoryQuery::Show),
         "diff" => {
             let to = at("to", "HEAD")?;
+            let against = arg("against");
             let from = match input("from")? {
+                _ if fs::symlink_metadata(&against).is_ok() => {
+                    let commit = commit_arg(&against, "`against`")?;
+                    store.ensure_local(&commit).map_err(Infra)?;
+                    commit
+                }
                 Some(spec) => revision(&store, &head, &spec)?,
                 None => match store
                     .read_commit(&to)
