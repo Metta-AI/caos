@@ -89,9 +89,7 @@ func main() {
 			w.Must(os.WriteFile(filepath.Join(dir, "flake.nix"), []byte(w.Read("/cas/args/flake/flake.nix")), 0o644))
 			w.Must(os.WriteFile(filepath.Join(dir, "flake.lock"), raw, 0o644))
 			w.Put(dir, "/cas/flake2")
-			w.Caos("run-then", "/cas/flake2",
-				"--run:hash="+w.Caos("curry", "--base:@=/cas/args/update", "--input=systems", "--rev="+pin),
-				"--then:hash="+next("pinned"))
+			update("/cas/flake2", "pinned", "--input=systems", "--rev="+pin)
 
 		case "pinned":
 			_, lock := result()
