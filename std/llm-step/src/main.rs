@@ -2254,6 +2254,43 @@ fn completed_record(
     }
 }
 
+/// What a call left started by a step that stopped is answered with.
+const UNFINISHED: &str = "this call did not finish: the step running it stopped before it completed. \
+It was not run again. Call it again if you still need its result; for anything that changes \
+something outside caos (a push, an import, a GitHub request), look at the remote first.";
+
+/// Close a call that a previous step left started, as failed with
+/// [`UNFINISHED`]. Concurrent completion wins: a call that is terminal by the
+/// time this looks again is left alone.
+fn close_unfinished(state: &mut progress::State, started: &CallRecord) -> Result<(), String> {
+    let block = error_block(&started.id, UNFINISHED);
+    for _ in 0..progress::MAX_APPEND_ATTEMPTS {
+        state.reload()?;
+        if state
+            .session()?
+            .tool(&started.id)?
+            .is_some_and(|record| record.is_terminal())
+        {
+            return Ok(());
+        }
+        let record = completed_record(
+            started,
+            ToolResult::Failed {
+                error: observation_path(started),
+            },
+            None,
+        );
+        let expected = state.head().clone();
+        if let progress::TryAppend::Appended(_) = state.try_append_at(
+            &expected,
+            tool_complete_transition(record, &block, Vec::new())?,
+        )? {
+            return Ok(());
+        }
+    }
+    Err("session kept changing while closing an unfinished call".into())
+}
+
 fn complete_started_failed(
     state: &mut progress::State,
     started: &CallRecord,
