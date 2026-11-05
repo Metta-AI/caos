@@ -623,6 +623,9 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         } else if trimmed == "@request-id" {
             in_tags = true;
             request_id = true;
+        } else if trimmed == "@root" {
+            in_tags = true;
+            root = true;
         } else if let Some(rest) = trimmed
             .strip_prefix("@scope")
             .filter(|rest| rest.starts_with(char::is_whitespace))
