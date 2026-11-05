@@ -128,7 +128,16 @@ fn render() -> Result<(), String> {
         if text.is_empty() {
             return answer("no matches");
         }
-        let rendered: String = text.lines().map(|l| format!("{scope}:{l}\n")).collect();
+        let rendered: String = text
+            .lines()
+            .map(|l| {
+                if scope.is_empty() {
+                    format!("{l}\n")
+                } else {
+                    format!("{scope}:{l}\n")
+                }
+            })
+            .collect();
         return answer(rendered.trim_end());
     }
 
