@@ -242,7 +242,7 @@ impl TreeTool {
                 ty: ArgType::Tree,
             });
         }
-        if help.root {
+        if help.root && !args.iter().any(|a| a.name == ROOT) {
             // First, because it is what the call is about.
             args.insert(
                 0,
