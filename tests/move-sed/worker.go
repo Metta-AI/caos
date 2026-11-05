@@ -182,7 +182,11 @@ func next(s int) string {
 func launch(i int) {
 	c := cases[i]
 	w.Step(fmt.Sprintf("case %d: %s", i, c.name))
-	args := append([]string{"prepare-request", "--base:hash=" + w.Hash("/cas/args/tool"), "--in:@=/cas/conv"}, c.args...)
+	args := []string{"prepare-request", "--base:hash=" + w.Hash("/cas/args/tool")}
+	if c.dir != "-" {
+		args = append(args, "--root:@="+object("/cas/conv", c.dir))
+	}
+	args = append(args, c.args...)
 	request := w.Caos(args...)
 	w.Caos("run-request-then", request, "--then:hash="+next(i))
 }
