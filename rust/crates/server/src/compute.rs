@@ -3510,7 +3510,7 @@ mod ticket_state_tests {
     #[test]
     fn a_live_pending_ticket_is_pending_without_a_second_read() {
         let state = settle_ticket_state("pending".into(), live_sequence(&[true]), no_reread);
-        assert_eq!(state.unwrap(), "pending");
+        assert_eq!(answer(state), "pending");
     }
 
     #[test]
