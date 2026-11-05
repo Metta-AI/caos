@@ -3504,7 +3504,7 @@ mod ticket_state_tests {
         let state = settle_ticket_state("pending".into(), live_sequence(&[false, true]), || {
             Ok("pending".into())
         });
-        assert_eq!(state.unwrap(), "pending");
+        assert_eq!(answer(state), "pending");
     }
 
     #[test]
