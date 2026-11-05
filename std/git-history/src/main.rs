@@ -85,58 +85,28 @@ fn split_path(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// The commit of the source tree named by the `source-tree` argument.
+/// The commit of the source tree the call names as `root` (design/tool-contract.md):
+/// the harness binds the gitlink's commit itself.
 fn source_commit() -> Result<Oid, Failure> {
-    let raw = input("source-tree")?.ok_or_else(|| {
-        User(
-            "history needs `source-tree`: the path of the source tree, such as feature/01-change"
+    let root = arg("root");
+    if fs::symlink_metadata(&root).is_err() {
+        return Err(User(
+            "nothing is at the root path: root is the source tree whose history to read, \
+             such as sources/repo/01-layer"
                 .into(),
-        )
-    })?;
-    commit_at(&raw)
+        ));
+    }
+    commit_arg(&root, "the root")
 }
 
-/// The commit of the source tree at `raw`, a path in the `in` tree: the ENTRY AS
-/// STORED, not what resolving it makes of it (that walks through the commit to
-/// its code tree).
-fn commit_at(raw: &str) -> Result<Oid, Failure> {
-    let comps = split_path(raw);
-    if comps.is_empty() || comps.iter().any(|c| c == "..") {
-        return Err(User(format!("`source-tree` names no source tree: {raw:?}")));
-    }
-    let tree = cas_hash(&arg("in")).map_err(Infra)?;
-    let resolve = |relative: &str, into: &str| -> Result<PathBuf, Failure> {
-        let output = std::process::Command::new("caos")
-            .args(["resolve", &tree, relative, into])
-            .output()
-            .map_err(|e| Infra(format!("launching caos resolve: {e}")))?;
-        if output.status.success() {
-            Ok(PathBuf::from(into))
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let reason = stderr.trim_end();
-            Err(User(format!(
-                "{relative}: {}",
-                reason.strip_prefix("caos: ").unwrap_or(reason)
-            )))
-        }
-    };
-    // One landing place per lookup: `diff` resolves two paths, and `caos resolve`
-    // does not overwrite.
-    static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
-    let landing = format!("/cas/history-parent-{}", LOOKUPS.fetch_add(1, Ordering::Relaxed));
-    let parent = resolve(&comps[..comps.len() - 1].join("/"), &landing)?;
-    let entry = parent.join(&comps[comps.len() - 1]);
-    if !entry.exists() {
-        return Err(User(format!("{} is not in this tree", comps.join("/"))));
-    }
-    if cas_kind(path(&entry)).map_err(Infra)? != "commit" {
+/// The commit bound at `at`, or the model's mistake when it is not one.
+fn commit_arg(at: &str, what: &str) -> Result<Oid, Failure> {
+    if cas_kind(at).map_err(Infra)? != "commit" {
         return Err(User(format!(
-            "{} is not a source tree (a code reference); history is a source tree's",
-            comps.join("/")
+            "{what} is not a source tree (a code reference); history is a source tree's"
         )));
     }
-    let hash = cas_hash(path(&entry)).map_err(Infra)?;
+    let hash = cas_hash(at).map_err(Infra)?;
     Oid::parse(&hash, "the source tree's commit").map_err(Infra)
 }
 
