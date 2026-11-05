@@ -362,6 +362,14 @@ change what they describe.
 
 - Whether the server accepts `/git/push` and `/git/import` from a worker, and
   under which credentials. To check before step 5.
+- That a `reader:@@=` grant to `std/github` still matches when only other
+  directories of a caos copy changed. SPEC says a copy carries the origins of
+  what it was copied from; to confirm with an edited `stack-publish` in a
+  conversation.
+- The batch format: how operations and results are spelled, and whether a
+  batch may continue past a failure.
+- Whether `caos-std/github`'s agent-facing parameters (`method`, `path`,
+  `body`) stay as they are, as the one-operation form of the batch.
 - Whether `import-source`'s provenance should stay a `.source.json` sibling,
   which forces its root to be the whole stack directory, or move somewhere
   inside the entry it describes.
