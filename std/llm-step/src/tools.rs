@@ -2322,6 +2322,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
@@ -2344,6 +2345,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
@@ -2377,6 +2379,7 @@ mod tests {
             writer: false,
             wants_in: false,
             call: false,
+            request_id: false,
             scope: None,
             op: None,
         };
