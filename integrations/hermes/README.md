@@ -49,6 +49,11 @@ inside the checkout.
   recording are real git transitions, implemented only in the Rust client,
   so `pre_llm_call`/`post_llm_call` shell out to `caos mcp hook` with a
   payload shaped like Claude Code's own hook events.
+- **The conversation ref is part of the reply.** Hermes hooks have no
+  user-only `systemMessage`, so on the turn that creates or forks the
+  conversation `transform_llm_output` appends the ref to the reply. The model
+  sees that line in later turns; the caos conversation records the reply
+  without it.
 
 ## Not yet done
 

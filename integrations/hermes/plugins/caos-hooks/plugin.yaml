@@ -12,4 +12,5 @@ capabilities:
 provides_hooks:
   - pre_tool_call
   - pre_llm_call
+  - transform_llm_output
   - post_llm_call
