@@ -371,21 +371,9 @@ fn edit(root: Option<&str>) -> Result<Written, Fail> {
         input("new-string")?.ok_or_else(|| User("edit needs a string `new-string`".to_string()))?;
     let replace_all = flag("replace-all")?;
 
-    let p = resolve(ws, &comps)?;
-    if p.is_dir() {
-        return Err(User(format!("{} is a directory", comps.join("/"))));
-    }
-    caos(["get", path(&p)]).map_err(Infra)?;
-    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    let mode = fs::metadata(&p)
-        .map(|m| m.permissions().mode())
-        .map_err(|e| Infra(format!("stat {}: {e}", p.display())))?;
-    let text = String::from_utf8(bytes).map_err(|_| {
-        User(format!(
-            "{} is not valid UTF-8; edit only text files",
-            comps.join("/")
-        ))
-    })?;
+    let bytes = file(root, "edit changes one file")?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| User("the root is not valid UTF-8; edit only text files".to_string()))?;
 
     let count = text.matches(old.as_str()).count();
     let replaced =
