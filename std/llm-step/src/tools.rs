@@ -667,6 +667,19 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             scope = None;
         }
     }
+    // `@root` replaces the three ways a tool used to learn its tree. Declaring
+    // one of them as well would ask for two inputs at once: reported, and the
+    // old one not obeyed.
+    if root {
+        for (declared, tag) in [(wants_in, "@in"), (git, "@git"), (scope.is_some(), "@scope")] {
+            if declared {
+                eprintln!("{ctx}: {tag} cannot be declared with @root — ignored");
+            }
+        }
+        wants_in = false;
+        git = false;
+        scope = None;
+    }
     Help {
         doc: doc.join(" ").trim().to_string(),
         args,
@@ -676,6 +689,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
         wants_in,
         call,
         request_id,
+        root,
         scope,
         op,
     }
