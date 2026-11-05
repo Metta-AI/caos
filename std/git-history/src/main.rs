@@ -75,14 +75,6 @@ fn input(name: &str) -> Result<Option<String>, Failure> {
         .map_err(|e| User(format!("`{name}` is not UTF-8 text: {e}")))
 }
 
-fn split_path(raw: &str) -> Vec<String> {
-    raw.trim()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .map(str::to_string)
-        .collect()
-}
 
 /// The commit of the source tree the call names as `root` (design/tool-contract.md):
 /// the harness binds the gitlink's commit itself.
