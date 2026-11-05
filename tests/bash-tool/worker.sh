@@ -44,7 +44,7 @@ req() { # <cmd> [paths] -> a request hash
   local paths=()
   if [ $# -ge 2 ]; then paths=(--paths="$2"); fi
   caos prepare-request --base:hash="$(caos hash /cas/args/tool)" \
-    --in:@=/cas/args/ws --cmd="$1" "${paths[@]}" \
+    --root:@=/cas/args/ws --cmd="$1" "${paths[@]}" \
     || fail "forming the request"
 }
 
