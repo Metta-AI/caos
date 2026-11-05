@@ -83,7 +83,7 @@ grep -qF "hello tools" /tmp/read.observation || fail "the read did not return th
 
 stage "a second call, in its own run, mutating the source tree"
 declare_call toolu_write run_tool \
-  '{"arguments":{"cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
+  '{"arguments":{"root":"main","cmd":"echo written > out.txt"},"path":"main/tools/sh"}'
 run_tools_only toolu_write
 $TOOL tool-observation --repo /tmp/repo --head "$head" \
   --id toolu_write > /tmp/write.observation \
