@@ -86,12 +86,12 @@ denied)
 write)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "write: exit $(cat "$R/exit")"
-  [ "$(cat "$R/prop/new.txt")" = "hi" ] || fail "created file missing/wrong"
-  [ "$(cat "$R/prop/a/one.txt")" = "$(printf 'one\nedited')" ] || fail "edit not staged"
+  [ "$(cat "$R/root/new.txt")" = "hi" ] || fail "created file missing/wrong"
+  [ "$(cat "$R/root/a/one.txt")" = "$(printf 'one\nedited')" ] || fail "edit not staged"
   caos get -r /cas/args/ws || fail "reading the fixture"
-  [ "$(caos hash "$R/prop/a/b")" = "$(caos hash /cas/args/ws/a/b)" ] \
+  [ "$(caos hash "$R/root/a/b")" = "$(caos hash /cas/args/ws/a/b)" ] \
     || fail "untouched subtree a/b did not round-trip by hash"
-  [ "$(cat "$R/prop/top.txt")" = "top" ] || fail "untouched top.txt lost"
+  [ "$(cat "$R/root/top.txt")" = "top" ] || fail "untouched top.txt lost"
   echo "  ok: new.txt + edit staged, a/b round-tripped" >&2
 
   echo "== a failing command is a value, not a run error ==" >&2
