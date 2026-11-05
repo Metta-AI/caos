@@ -1680,6 +1680,61 @@ mod tests {
         assert_eq!(reader.read_ref(&head).unwrap(), Some(third));
     }
 
+    /// A session ref that does not exist yet (a new session, polled until its
+    /// first write) costs what it did before the rename: the legacy name rides
+    /// along in the same `ls-remote`, it is not another round trip.
+    #[test]
+    fn a_missing_session_ref_costs_no_extra_round_trip() {
+        let (_directory, _remote, client) = remote_and_client("missing-session");
+        let store = GitStore::open(&client, Some("caos")).expect("open git store");
+        let head = super::super::refs::head_ref("new-talk").unwrap();
+
+        let before = store.command_count.get();
+        assert_eq!(store.read_ref(&head).unwrap(), None);
+        assert_eq!(store.command_count.get(), before + 1, "read: one ls-remote");
+
+        let before = store.command_count.get();
+        assert_eq!(store.fetch_ref(&head).unwrap(), None);
+        assert_eq!(
+            store.command_count.get(),
+            before + 2,
+            "fetch: the failed fetch and one ls-remote"
+        );
+    }
+
+    /// `read_ref` finds a legacy session through the combined `ls-remote`, and a
+    /// lease on the value it read expects the v4 ref to be absent.
+    #[test]
+    fn read_ref_finds_a_legacy_session_in_one_ls_remote() {
+        let (_directory, _remote, client) = remote_and_client("legacy-read");
+        let mut store = GitStore::open(&client, Some("caos")).expect("open git store");
+        let tree = store.write_tree(&[]).expect("write empty tree");
+        let first = write_commit(&mut store, &tree, &[], "first\n");
+        let second = write_commit(&mut store, &tree, std::slice::from_ref(&first), "second\n");
+        let head = super::super::refs::head_ref("old-talk").unwrap();
+        let legacy = super::super::refs::legacy_ref(&head).unwrap();
+        store
+            .push(&[RefUpdate {
+                refname: legacy,
+                expected: None,
+                new: Some(first.clone()),
+            }])
+            .expect("push legacy ref");
+
+        let reader = GitStore::open(&client, Some("caos")).expect("open git store");
+        let before = reader.command_count.get();
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(first.clone()));
+        assert_eq!(reader.command_count.get(), before + 1);
+        reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(first),
+                new: Some(second.clone()),
+            }])
+            .expect("the first write creates the v4 ref");
+        assert_eq!(reader.read_ref_exact(&head).unwrap(), Some(second));
+    }
+
     #[test]
     fn fetch_after_push_transfers_no_new_objects() {
         let (_directory, _remote, client) = remote_and_client("push-fetch");
