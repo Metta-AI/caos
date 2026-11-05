@@ -192,6 +192,23 @@ pub fn apply(
                     builder.put_oid(&entry.name, entry.mode, entry.oid);
                 }
             }
+            // Forking a v6 session (recorded before the rename) makes a v7
+            // one: the history it starts from is re-spelled the v7 way, so
+            // nothing written after the fork has to know about v6.
+            if session.format()? == paths::Format::V6 {
+                builder.put(
+                    paths::FORMAT,
+                    Mode::Blob,
+                    paths::FORMAT_BYTES.as_bytes().to_vec(),
+                );
+                for (ordinal, message_id, entry) in session.transcript(0, session.transcript_len()?)? {
+                    builder.put(
+                        &paths::transcript_entry_path(ordinal, &message_id),
+                        Mode::Blob,
+                        entry.encode_as(paths::Format::V7),
+                    );
+                }
+            }
             builder.put(paths::IDENTITY, Mode::Blob, identity.content_bytes());
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
         }
