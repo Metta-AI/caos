@@ -5,7 +5,11 @@
 /// band because a key is a credential and an ArgTree is readable by anyone.
 pub const READERS_HEADER: &str = "X-Caos-Secret-Readers";
 /// The session a request is for, which `reader:@=` grants are scoped to.
-pub const SESSION_HEADER: &str = "X-Caos-Conversation";
+pub const SESSION_HEADER: &str = "X-Caos-Session";
+/// What [`SESSION_HEADER`] was called before caos called a conversation a
+/// session. Clients send both, so a server from before the rename still scopes
+/// grants; a server reads either.
+pub const LEGACY_SESSION_HEADER: &str = "X-Caos-Conversation";
 /// The step that runs the tools of an MCP connection (`POST /mcp`): a git
 /// locator, or a bare 40-hex hash. A header because the endpoint is stateless
 /// and every message of a connection must say it.

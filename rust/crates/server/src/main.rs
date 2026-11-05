@@ -781,7 +781,9 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
     secrets::Context::admit(
         config,
         &header(caos_world::secrets::READERS_HEADER).unwrap_or_default(),
-        header(caos_world::secrets::SESSION_HEADER).as_deref(),
+        header(caos_world::secrets::SESSION_HEADER)
+            .or_else(|| header(caos_world::secrets::LEGACY_SESSION_HEADER))
+            .as_deref(),
     )
 }
 

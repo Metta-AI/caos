@@ -319,6 +319,7 @@ impl Secrets {
         }
         if let Some(session) = &self.session {
             headers.push((caos_world::secrets::SESSION_HEADER, session.clone()));
+            headers.push((caos_world::secrets::LEGACY_SESSION_HEADER, session.clone()));
         }
         headers
     }
