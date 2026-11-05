@@ -14,10 +14,12 @@ message, the session id, the hash of its current tip commit, its title, and who 
 it (`user:active` or `user:archived`). `limit=N` is therefore the N most recent. Pass a
 tip hash to `caos-session` to read one.
 
-Sessions live as git refs on the server: `refs/caos/v3/conversations/<hex id>/head`
-is the tip, and `refs/caos/v3/users/<hex user>/conversations/{active,archived}/<hex id>`
-records who has it. This reads those refs; nothing is cloned. A Claude Code session's id
-is `cc/<session-id>`.
+Sessions live as git refs on the server: `refs/caos/v4/sessions/<hex id>/head`
+is the tip, and `refs/caos/v4/users/<hex user>/sessions/{active,archived}/<hex id>`
+records who has it. Sessions recorded before caos called them sessions are under
+`refs/caos/v3/conversations/` and `refs/caos/v3/users/<hex user>/conversations/`, and
+are listed too; any of their tip hashes can be forked. This reads those refs; nothing is
+cloned. A Claude Code session's id is `cc/<Claude Code session id>`.
 
 THE TIME is the committer time of the tip commit: refs carry none, so every tip is read
 to sort, which costs one fetch per session. A session whose tip cannot be read
