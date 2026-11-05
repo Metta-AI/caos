@@ -3,9 +3,11 @@
 // Runs std/move-sed over a fixture session holding a stack the way
 // design/publish-stack.md lays one out: sources/repo with 00-base and its
 // .source.json, two layers with their .pr.md descriptions, a 99-dirty, plus a
-// source tree and a file at the root. A success is checked by the tree it
-// proposes: it must equal the fixture rebuilt with exactly those entries
-// renamed. A refusal must propose the fixture unchanged and mark `failed`.
+// source tree and a file at the root. Under the root contract
+// (design/tool-contract.md) each case binds one directory of it as `root`. A
+// success is checked by the directory it answers with: it must equal that
+// directory rebuilt with exactly those entries renamed. A refusal must mark
+// `failed` and answer no `root`.
 //
 // Every fixture message carries --test-salt, so a salted run is a cache miss.
 //
