@@ -409,8 +409,8 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
   PR below merges. A failure stops it there: the layers below are merged, the
   ones above are untouched, and running it again carries on.
 - `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
-  name, a commit, or with `stack` a layer (`02-tests` or `tests`). Its first
-  line is the verdict, and failing checks are listed first.
+  name, a commit, or, with the stack as `root`, a layer (`02-tests` or
+  `tests`). Its first line is the verdict, and failing checks are listed first.
 
 ### Waiting for CI
 
