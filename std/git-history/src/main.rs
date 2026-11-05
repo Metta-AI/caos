@@ -19,9 +19,8 @@
 //! a failed worker.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use session_protocol::v3::git_store::HistoryQuery;
 use session_protocol::v3::{GitStore, ObjectStore, Oid};
