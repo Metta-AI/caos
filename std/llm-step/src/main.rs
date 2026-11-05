@@ -2175,13 +2175,13 @@ fn root_callback(
     let components = root::components(root_path)?;
     let base_tree = state.store().tree_of(&base)?;
     let old = root::resolve(state.store(), &base_tree, &components)?;
+    // Without a message of its own, the commit says which tool changed what.
     let message = result
         .commit_message
         .as_deref()
         .map(str::trim)
         .filter(|message| !message.is_empty())
-        .unwrap_or(tool)
-        .to_string();
+        .map_or_else(|| format!("{tool} {root_path}"), str::to_string);
     let new = if result.deleted {
         None
     } else {
