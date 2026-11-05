@@ -372,6 +372,12 @@ with `POST /repos/{owner}/{repo}/pulls` (`title`, `head`, `base`, `body`), and
 link PRs with `POST /repos/{owner}/{repo}/stacks` and
 `{"pull_requests": [<numbers, earliest first>]}`.
 
+In place of `method`/`path`/`body`, `caos-std/github` takes `batch`: a JSON
+array of operations (`api`, `head`, `push`, `import`), run in order and
+stopping at the first that is not ok, answered with a JSON array of results.
+It is how the other git tools reach GitHub (only `std/github` holds the token,
+design/tool-contract.md); `tool_help` describes each operation.
+
 ## Merging a stack
 
 Merge a reviewed stack with `caos-std/stack-merge-to-master`, never by hand
