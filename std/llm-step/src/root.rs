@@ -169,10 +169,8 @@ fn replace_in(
                 return Ok(None);
             }
             canonical_tree_order(&mut entries);
-            Ok(Some((
-                Mode::Tree,
-                store.write_tree(&entries).map_err(String::from)?,
-            )))
+            let written = store.write_tree(&entries).map_err(String::from)?;
+            Ok(Some((Mode::Tree, written)))
         }
         Some(_) => Err(crosses_a_file(walked)),
     }
