@@ -437,10 +437,7 @@ func merge(base, ours, theirs, message string) (string, []string) {
 		return "", paths
 	}
 	minted++
-	work := fmt.Sprintf("/tmp/merged-%d", minted)
-	w.Must(os.MkdirAll(work, 0o755))
-	archive := exec.Command("sh", "-c", `git -C "$1" archive "$2" | tar -x -C "$3"`, "sh", graph, lines[0], work)
-	w.Must(archive.Run())
+	work := export(lines[0])
 	w.Caos("put", work, fmt.Sprintf("/cas/tree-%d", minted))
 	tree := w.Caos("hash", fmt.Sprintf("/cas/tree-%d", minted))
 	when := mustGit("show", "-s", "--format=%ct", ours)
