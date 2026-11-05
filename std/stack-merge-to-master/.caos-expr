@@ -12,7 +12,7 @@ Merge a published stack's pull requests (std/GIT.md, "Merging a stack"), bottom 
 @param [repository] HTTPS repository URL, without credentials. Default: the repository 00-base was imported from.
 @param [trunk] The branch the stack merges into. Default: the branch 00-base was imported from, or the remote's default branch.
 @param [force] true to merge although CI is failing or has not finished on some layer.
-@param [wait-for-ci-min] Minutes to wait for CI on the layers' heads to settle before deciding, at most 180, reading every 15 seconds. Default 0, read once.
+@param [wait-for-ci-min] Minutes to wait for CI on the layers' heads to settle before deciding, reading every 15 seconds. Default 0, read once.
 @param [dry-run] true to read the pull requests and their checks and report what would be merged, merging nothing.
 @op stack-merge-to-master
 END
