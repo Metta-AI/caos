@@ -1832,10 +1832,12 @@ fn dispatch_started(
     // Read from the declaration here, at dispatch, because by the time the
     // result comes back the tool's own path is no longer bound (`self_curry`
     // unbinds it) and `record.name` is only ever `run_tool`.
-    let writer_storage;
-    if let Some(declared) = declared_writer(call, record)? {
-        writer_storage = declared;
-        extras.push(("tool-writer", Arg::Lit(&writer_storage)));
+    let (writer_storage, root_storage) = declared_contract(call, record)?;
+    if let Some(declared) = &writer_storage {
+        extras.push(("tool-writer", Arg::Lit(declared)));
+    }
+    if let Some(root) = &root_storage {
+        extras.push(("tool-root", Arg::Lit(root)));
     }
     let scope_storage;
     if call.name == "grep" {
