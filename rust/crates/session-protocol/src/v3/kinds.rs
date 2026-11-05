@@ -34,8 +34,8 @@ impl Kind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::SessionRoot => "conversation.root",
-            Kind::SessionFork => "conversation.fork",
+            Kind::SessionRoot => "session.root",
+            Kind::SessionFork => "session.fork",
             Kind::MetadataTitleSet => "metadata.title.set",
             Kind::MessageAppend => "message.append",
             Kind::ToolStart => "tool.start",
