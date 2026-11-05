@@ -250,15 +250,37 @@ fn resolve_failure(relative: &str, stderr: &str) -> String {
 
 // ---- the readers -------------------------------------------------------------
 
-fn read(ws: &str) -> Result<String, Fail> {
-    let comps = components("file-path")?;
-    let p = resolve(ws, &comps)?;
-    if p.is_dir() {
-        return Err(User(format!("{} is a directory; use ls", comps.join("/"))));
+/// The root, or the model's mistake when nothing is there.
+fn present(root: Option<&str>) -> Result<&str, Fail> {
+    root.ok_or_else(|| {
+        User(
+            "nothing is at the root path. Check it with ls on the directory above it"
+                .to_string(),
+        )
+    })
+}
+
+/// The root as a directory: a tree as it is, a source tree as its code tree.
+fn directory(root: Option<&str>, otherwise: &str) -> Result<PathBuf, Fail> {
+    let dir = resolve(present(root)?, &[])?;
+    if !dir.is_dir() {
+        return Err(User(format!("the root is a file; {otherwise}")));
     }
-    caos(["get", path(&p)]).map_err(Infra)?;
-    let bytes = fs::read(&p).map_err(|e| Infra(format!("reading {}: {e}", p.display())))?;
-    bounded(&bytes)
+    Ok(dir)
+}
+
+/// The root as a file's bytes.
+fn file(root: Option<&str>, otherwise: &str) -> Result<Vec<u8>, Fail> {
+    let root = present(root)?;
+    if cas_kind(root).map_err(Infra)? != "blob" {
+        return Err(User(format!("the root is a directory; {otherwise}")));
+    }
+    caos(["get", root]).map_err(Infra)?;
+    fs::read(root).map_err(|e| Infra(format!("reading the root: {e}")))
+}
+
+fn read(root: Option<&str>) -> Result<String, Fail> {
+    bounded(&file(root, "use ls, or name a file in it")?)
 }
 
 /// Apply `read`'s bounds to raw bytes: a line window when `offset`/`limit` is
