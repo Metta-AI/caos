@@ -967,6 +967,88 @@ pub fn writer_result(result: &str) -> Result<WriterResult, String> {
     })
 }
 
+/// What a `@root` tool's result says (design/tool-contract.md, "The result"):
+/// `{stdout, failed?}`, and for a writer one of `root` (the new object for its
+/// root path) and `deleted`, and an optional `commit-message`.
+pub struct RootResult {
+    /// The text the model reads.
+    pub stdout: String,
+    /// The `failed` marker is present: the call failed, and a writer's result
+    /// is not applied, whatever else it holds.
+    pub failed: bool,
+    /// A writer returned `root`; its mode and object are read from the result
+    /// tree itself, which says exactly what the tool meant.
+    pub has_root: bool,
+    /// A writer returned `deleted`: remove whatever is at the root path.
+    pub deleted: bool,
+    pub commit_message: Option<String>,
+}
+
+/// Read a `@root` tool's result. Every mistake here is the TOOL's, answered to
+/// the model rather than failing the worker, as for [`writer_result`]. A writer
+/// that has not failed must say exactly one of `root` and `deleted`, so one
+/// that forgets its output can never delete its root.
+pub fn root_result(result: &str, writer: bool) -> Result<RootResult, String> {
+    caos(["get", result])?;
+    let dir = Path::new(result);
+    if !dir.is_dir() {
+        return Err("a result must be a tree holding `stdout`, not a blob".to_string());
+    }
+    let blob = |name: &str| -> Result<Option<String>, String> {
+        let file = dir.join(name);
+        if !file.exists() {
+            return Ok(None);
+        }
+        caos(["get", path(&file)])?;
+        let bytes = fs::read(&file).map_err(|e| format!("reading {name}: {e}"))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    let stdout =
+        blob("stdout")?.ok_or("the result has no `stdout` entry — the text for the model")?;
+    let failed = dir.join("failed").exists();
+    let has_root = dir.join("root").exists();
+    let deleted = dir.join("deleted").exists();
+    if !writer && (has_root || deleted) {
+        return Err(
+            "the result holds `root` or `deleted`, but the tool does not declare @writer"
+                .to_string(),
+        );
+    }
+    if writer && !failed {
+        match (has_root, deleted) {
+            (true, true) => return Err("the result holds both `root` and `deleted`".to_string()),
+            (false, false) => {
+                return Err(
+                    "the result holds neither `root` (the new object for its root path) \
+                     nor `deleted`"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+    }
+    Ok(RootResult {
+        stdout,
+        failed,
+        has_root,
+        deleted,
+        commit_message: blob("commit-message")?,
+    })
+}
+
+/// The text a model reads, cut to [`MAX_READ_BYTES`] by keeping the TAIL:
+/// reports and diagnostics put the summary last.
+pub fn keep_tail(text: &str) -> String {
+    if text.len() <= MAX_READ_BYTES {
+        return text.trim_end().to_string();
+    }
+    let mut cut = text.len() - MAX_READ_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[... truncated ...]\n{}", text[cut..].trim_end())
+}
+
 /// Bind a tree-tool call's inputs to the parameters the script declared,
 /// returning the `--<name>=<value>` pairs for the curry. A missing required
 /// arg, an undeclared one, or a non-scalar value is the model's mistake, so it
