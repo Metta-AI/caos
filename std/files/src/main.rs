@@ -81,46 +81,52 @@ fn put(dir: &Path) -> Result<(), String> {
     caos(["put", path(dir), "/cas/out"])
 }
 
-/// A reader's answer: the text itself, or a `report` that says `FAILED` and why.
-fn reader(outcome: Result<String, Fail>) -> Result<(), String> {
-    match outcome {
-        Ok(text) => {
-            let dir = scratch("files-out")?;
-            let file = dir.join("answer");
-            fs::write(&file, text).map_err(|e| format!("writing the answer: {e}"))?;
-            caos(["put", path(&file), "/cas/out"])
-        }
-        Err(User(message)) => {
-            let dir = scratch("files-out")?;
-            fs::write(dir.join("report"), format!("FAILED: {message}\n"))
-                .map_err(|e| format!("writing the report: {e}"))?;
-            put(&dir)
-        }
-        Err(Infra(error)) => Err(error),
-    }
+/// A failed call's answer: the reason as `stdout`, and the `failed` marker.
+fn failed(dir: &Path, op: &str, message: &str) -> Result<(), String> {
+    fs::write(dir.join("stdout"), format!("{op}: {message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(dir.join("failed"), format!("{op} failed\n"))
+        .map_err(|e| format!("writing failed: {e}"))
 }
 
-/// A writer's answer. On a mistake `prop` is the input, unchanged, so the
-/// harness has nothing to apply and the model reads why.
-fn writer(
-    ws: &str,
-    op: &str,
-    outcome: Result<(String, String, String), Fail>,
-) -> Result<(), String> {
+/// A reader's answer: `{stdout}`, or `{stdout, failed}` saying why.
+fn reader(outcome: Result<String, Fail>) -> Result<(), String> {
     let dir = scratch("files-out")?;
-    let (prop, out, message, failed) = match outcome {
-        Ok((prop, out, message)) => (prop, out, Some(message), false),
-        Err(User(message)) => (ws.to_string(), message, None, true),
+    match outcome {
+        Ok(text) => fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?,
+        Err(User(message)) => failed(&dir, "read", &message)?,
         Err(Infra(error)) => return Err(error),
-    };
-    link(&prop, dir.join("prop"))?;
-    fs::write(dir.join("out"), out).map_err(|e| format!("writing out: {e}"))?;
-    if let Some(message) = message {
-        fs::write(dir.join("message"), message).map_err(|e| format!("writing message: {e}"))?;
     }
-    if failed {
-        fs::write(dir.join("failed"), format!("{op} failed\n"))
-            .map_err(|e| format!("writing failed: {e}"))?;
+    put(&dir)
+}
+
+/// What a writer puts at its root path.
+enum New {
+    /// A file with these contents.
+    Content(Vec<u8>),
+    /// An object already in CAS: the new directory.
+    Object(String),
+    /// Nothing: the root is removed.
+    Deleted,
+}
+
+/// A writer's answer: `{stdout, root | deleted}`, or `{stdout, failed}` with
+/// nothing to apply.
+fn writer(op: &str, outcome: Result<(New, String), Fail>) -> Result<(), String> {
+    let dir = scratch("files-out")?;
+    match outcome {
+        Ok((new, out)) => {
+            fs::write(dir.join("stdout"), out).map_err(|e| format!("writing stdout: {e}"))?;
+            match new {
+                New::Content(bytes) => fs::write(dir.join("root"), bytes)
+                    .map_err(|e| format!("writing root: {e}"))?,
+                New::Object(object) => link(&object, dir.join("root"))?,
+                New::Deleted => fs::write(dir.join("deleted"), format!("{op}\n"))
+                    .map_err(|e| format!("writing deleted: {e}"))?,
+            }
+        }
+        Err(User(message)) => failed(&dir, op, &message)?,
+        Err(Infra(error)) => return Err(error),
     }
     put(&dir)
 }
