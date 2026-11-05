@@ -63,6 +63,7 @@ pub fn archived_membership_ref(user: &str, id: &str) -> Result<String, String> {
 pub fn parse_head_ref(refname: &str) -> Result<String, String> {
     let key = refname
         .strip_prefix(SESSIONS_PREFIX)
+        .or_else(|| refname.strip_prefix(LEGACY_SESSIONS_PREFIX))
         .and_then(|rest| rest.strip_suffix(HEAD_SUFFIX))
         .ok_or_else(|| format!("invalid session head ref {refname:?}"))?;
     if key.contains('/') {
