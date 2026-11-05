@@ -274,11 +274,8 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         .map_err(|_| "reading GitHub token")?;
     let token = token.as_deref().map(str::trim_end);
     let prefix = p.branch_prefix.clone().unwrap_or_default();
-    let github = github_repo(&repository).map(|(owner, repo)| Github {
-        owner,
-        repo,
-        token: token.map(str::to_string),
-    });
+    let github = github_repo(&repository)
+        .map(|(owner, repo)| Github::new(owner, repo, token.map(str::to_string)));
 
     let mut lines = vec![format!("repository {repository}  trunk {trunk}")];
     let mut files: Vec<(String, Option<(Mode, Vec<u8>)>)> = Vec::new();

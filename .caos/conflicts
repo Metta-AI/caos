@@ -1,0 +1,14 @@
+100644 fae27d46e07d40bf9eb40854b2669772012acd8a 1	std/README.md
+100644 724168284be132278536cc523a01983f0a594b38 2	std/README.md
+100644 a34a65e30ae7bca631455c64d41a70a14d7e808f 3	std/README.md
+
+Auto-merging design/stack-publish.md
+Auto-merging std/GIT.md
+Auto-merging std/README.md
+CONFLICT (content): Merge conflict in std/README.md
+Auto-merging std/llm-step/src/ci_status.rs
+Auto-merging std/llm-step/src/publish_source.rs
+Auto-merging std/llm-step/src/source_trees.rs
+Auto-merging std/llm-step/src/stack_merge_to_master.rs
+Auto-merging std/llm-step/src/stack_publish.rs
+Auto-merging std/llm-step/src/stack_sync.rs
