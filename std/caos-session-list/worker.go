@@ -6,9 +6,11 @@
 //
 // WHERE A SESSION LIVES (v3/refs.rs): in two kinds of git ref on the server,
 // with every id hex-encoded into its ref path:
-//   - `refs/caos/v3/conversations/<key>/head`: the tip commit.
-//   - `refs/caos/v3/users/<user key>/conversations/{active,archived}/<key>`:
+//   - `refs/caos/v4/sessions/<key>/head`: the tip commit.
+//   - `refs/caos/v4/users/<user key>/sessions/{active,archived}/<key>`:
 //     one per user who has it. Its value is not read here; the name is the fact.
+// Sessions recorded before the rename are under `refs/caos/v3/conversations/`
+// and `refs/caos/v3/users/<user key>/conversations/`, and are listed too.
 //
 // caos has no verb for refs (`caos get-hash` fetches an object BY hash), so this
 // asks git, which std/go carries for exactly that, at $CAOS_SERVER_URL, the same
@@ -45,11 +47,17 @@ import (
 	"github.com/bitfield/script"
 )
 
-const (
-	headPrefix  = "refs/caos/v3/conversations/"
-	headSuffix  = "/head"
-	usersPrefix = "refs/caos/v3/users/"
-)
+// A namespace of session refs (v3/refs.rs). Sessions recorded before the rename
+// are under the v3 names, and stay there; newer ones, and any older one that has
+// been written since, are under v4. v4 is read first and wins.
+type namespace struct{ headPrefix, usersPrefix, userSessions string }
+
+var namespaces = []namespace{
+	{"refs/caos/v4/sessions/", "refs/caos/v4/users/", "/sessions/"},
+	{"refs/caos/v3/conversations/", "refs/caos/v3/users/", "/conversations/"},
+}
+
+const headSuffix = "/head"
 
 var out strings.Builder
 
