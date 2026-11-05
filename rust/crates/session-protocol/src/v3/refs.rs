@@ -1,7 +1,16 @@
 use super::oid::{hex_lower, hex_nibble, is_lower_hex};
 
-pub const SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
-pub const USERS_PREFIX: &str = "refs/caos/v3/users/";
+pub const SESSIONS_PREFIX: &str = "refs/caos/v4/sessions/";
+pub const USERS_PREFIX: &str = "refs/caos/v4/users/";
+const USER_SESSIONS: &str = "/sessions/";
+/// Where sessions recorded before the rename keep their refs: the same keys,
+/// under the names a session had when caos called it a conversation. Nothing
+/// writes them any more; a reader that finds no v4 ref falls back to them
+/// ([`legacy_ref`]), and the first write after that creates the v4 ref.
+pub const LEGACY_SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
+pub const LEGACY_USERS_PREFIX: &str = "refs/caos/v3/users/";
+const LEGACY_USER_SESSIONS: &str = "/conversations/";
+pub const HEAD_SUFFIX: &str = "/head";
 pub const HEAD_SUFFIX: &str = "/head";
 pub const MAX_SESSION_ID_BYTES: usize = 124;
 pub const MAX_USER_ID_BYTES: usize = 126;
