@@ -1619,14 +1619,23 @@ mod tests {
         assert_eq!(reader.read_ref_exact(&head).unwrap(), Some(second.clone()));
         assert_eq!(reader.read_ref_exact(&legacy).unwrap(), Some(first.clone()));
         // From now on the lease is on the v4 ref itself.
+        let third = write_commit(&mut store, &tree, std::slice::from_ref(&second), "third\n");
         assert!(reader
             .push(&[RefUpdate {
                 refname: head.clone(),
                 expected: Some(first),
-                new: Some(second.clone()),
+                new: Some(third.clone()),
             }])
             .is_err());
-        assert_eq!(reader.read_ref(&head).unwrap(), Some(second));
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(second.clone()));
+        reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(second),
+                new: Some(third.clone()),
+            }])
+            .expect("a lease on the v4 value");
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(third));
     }
 
     #[test]
