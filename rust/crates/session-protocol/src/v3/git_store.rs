@@ -189,31 +189,66 @@ impl GitStore {
     }
 
     /// The ref's value, or for a session ref that does not exist yet, the value
-    /// of its pre-rename name (`refs::legacy_ref`).
+    /// of its pre-rename name (`refs::legacy_ref`). Against a remote both names
+    /// go in ONE `ls-remote`: a ref that does not exist yet (every new session,
+    /// polled until its first write) must cost no more round trips than it did
+    /// before the rename.
     pub fn read_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
-        match self.read_ref_exact(refname)? {
-            Some(found) => Ok(Some(found)),
-            None => self.read_legacy(refname, |legacy| self.read_ref_exact(legacy)),
+        let legacy = super::refs::legacy_ref(refname);
+        let Some(remote) = &self.remote else {
+            if let Some(found) = self.read_local_ref(refname)? {
+                return Ok(Some(found));
+            }
+            return match &legacy {
+                Some(legacy) => self.note_legacy(refname, self.read_local_ref(legacy)?),
+                None => Ok(None),
+            };
+        };
+        let mut names = vec![refname];
+        names.extend(legacy.as_deref());
+        let mut found = self.ls_remote(remote, &names)?;
+        if let Some(oid) = found.remove(refname) {
+            return Ok(Some(oid));
+        }
+        match &legacy {
+            Some(legacy) => self.note_legacy(refname, found.remove(legacy.as_str())),
+            None => Ok(None),
         }
     }
 
-    /// `fetch_ref`, with the same fallback as `read_ref`.
+    /// `fetch_ref`, with the same fallback as `read_ref`. A ref that exists costs
+    /// one fetch. A miss costs what it did before the rename: the failed fetch,
+    /// then one `ls-remote` that asks for both names.
     pub fn fetch_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
-        match self.fetch_ref_exact(refname)? {
-            Some(found) => Ok(Some(found)),
-            None => self.read_legacy(refname, |legacy| self.fetch_ref_exact(legacy)),
+        let remote = self
+            .remote
+            .as_deref()
+            .ok_or_else(|| "no remote".to_string())?;
+        let output = self.fetch_into_local(remote, refname)?;
+        if output.status.success() {
+            return self.fetched(refname);
         }
-    }
-
-    fn read_legacy(
-        &self,
-        refname: &str,
-        read: impl FnOnce(&str) -> Result<Option<Oid>, String>,
-    ) -> Result<Option<Oid>, String> {
-        let Some(legacy) = super::refs::legacy_ref(refname) else {
+        let legacy = super::refs::legacy_ref(refname);
+        let mut names = vec![refname];
+        names.extend(legacy.as_deref());
+        let found = self.ls_remote(remote, &names)?;
+        if found.contains_key(refname) {
+            // The ref is there, so the fetch failed for some other reason.
+            return Err(self.output_error("git fetch", &output));
+        }
+        let Some(legacy) = legacy.filter(|legacy| found.contains_key(legacy.as_str())) else {
             return Ok(None);
         };
-        let found = read(&legacy)?;
+        let output = self.fetch_into_local(remote, &legacy)?;
+        if !output.status.success() {
+            return Err(self.output_error("git fetch", &output));
+        }
+        let head = self.fetched(&legacy)?;
+        self.note_legacy(refname, head)
+    }
+
+    /// Remember that `refname` was read under its legacy name, with `found`.
+    fn note_legacy(&self, refname: &str, found: Option<Oid>) -> Result<Option<Oid>, String> {
         if let Some(oid) = &found {
             self.legacy_reads
                 .borrow_mut()
@@ -222,17 +257,30 @@ impl GitStore {
         Ok(found)
     }
 
+    #[cfg(test)]
     fn read_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
         let Some(remote) = &self.remote else {
             return self.read_local_ref(refname);
         };
-        let output = self.output(&["ls-remote", "--refs", remote, refname])?;
+        Ok(self.ls_remote(remote, &[refname])?.remove(refname))
+    }
+
+    /// The values `remote` has for exactly these ref names, from one `ls-remote`.
+    /// A name the remote lacks is absent from the map.
+    fn ls_remote(
+        &self,
+        remote: &str,
+        names: &[&str],
+    ) -> Result<std::collections::HashMap<String, Oid>, String> {
+        let mut arguments = vec!["ls-remote", "--refs", remote];
+        arguments.extend_from_slice(names);
+        let output = self.output(&arguments)?;
         if !output.status.success() {
             return Err(self.output_error("git ls-remote", &output));
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|_| "git ls-remote returned non-UTF-8 output".to_string())?;
-        let mut matches = Vec::new();
+        let mut found = std::collections::HashMap::new();
         for line in stdout.lines() {
             let mut fields = line.split_whitespace();
             let oid = fields
@@ -244,18 +292,16 @@ impl GitStore {
             if fields.next().is_some() {
                 return Err("git ls-remote returned a malformed line".to_string());
             }
-            if name == refname {
-                matches.push(Oid::parse(oid, "remote ref oid")?);
+            // A pattern also matches longer names that end with it; keep exact ones.
+            if names.contains(&name) {
+                found.insert(name.to_string(), Oid::parse(oid, "remote ref oid")?);
             }
         }
-        Ok(matches.pop())
+        Ok(found)
     }
 
-    fn fetch_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
-        let remote = self
-            .remote
-            .as_deref()
-            .ok_or_else(|| "no remote".to_string())?;
+    /// Run `git fetch` of `refname` into the same local ref.
+    fn fetch_into_local(&self, remote: &str, refname: &str) -> Result<Output, String> {
         let refspec = format!("{refname}:{refname}");
         let tip = self
             .read_local_ref(refname)?
@@ -263,20 +309,16 @@ impl GitStore {
         let mut arguments = fetch_arguments(tip.as_ref());
         arguments.extend([remote.to_string(), refspec]);
         let argument_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
-        let output = self.output(&argument_refs)?;
-        if output.status.success() {
-            let head = self.read_local_ref(refname)?;
-            if let Some(head) = &head {
-                *self.remote_tip.borrow_mut() = Some(head.clone());
-            }
-            return Ok(head);
+        self.output(&argument_refs)
+    }
+
+    /// The local value of a ref just fetched, remembered as the remote tip.
+    fn fetched(&self, refname: &str) -> Result<Option<Oid>, String> {
+        let head = self.read_local_ref(refname)?;
+        if let Some(head) = &head {
+            *self.remote_tip.borrow_mut() = Some(head.clone());
         }
-        let probe = self.output(&["ls-remote", "--exit-code", "--refs", remote, refname])?;
-        if probe.status.code() == Some(2) {
-            Ok(None)
-        } else {
-            Err(self.output_error("git fetch", &output))
-        }
+        Ok(head)
     }
 
     pub fn fetch_object(&self, oid: &Oid) -> Result<(), String> {
