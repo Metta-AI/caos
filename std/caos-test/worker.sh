@@ -19,9 +19,45 @@
 # suite run is meant to be a hit.
 set -euo pipefail
 
+# THE ANSWER STAGE. The daemon answers with a `report` (or a blob); a `@root`
+# tool answers with `{stdout, failed?}` (design/tool-contract.md), so the
+# daemon's answer comes back here to be reshaped. A report that says FAILED
+# marks the call failed, as the harness read it before.
+if [ -e /cas/args/stage ]; then
+  caos get /cas/args/result
+  res=/tmp/caos-test-answer
+  rm -rf "$res"; mkdir -p "$res"
+  if [ -d /cas/args/result ]; then
+    caos get /cas/args/result/report
+    cp /cas/args/result/report "$res/stdout"
+  else
+    cp /cas/args/result "$res/stdout"
+  fi
+  if grep -q FAILED "$res/stdout"; then
+    printf 'the suite failed\n' > "$res/failed"
+  fi
+  caos put "$res" /cas/out
+  exit 0
+fi
+
+# `root` is the tree to test (design/tool-contract.md): a source tree's commit
+# resolves to its code tree, which is what the daemon is keyed by.
+answer() {
+  local res=/tmp/caos-test-answer
+  rm -rf "$res"; mkdir -p "$res"
+  cat > "$res/stdout"
+  caos put "$res" /cas/out
+  exit 0
+}
+if [ ! -e /cas/args/root ] && [ ! -L /cas/args/root ]; then
+  echo "caos-test: nothing is at the root path: root is the source tree to test, such as sources/caos/02-layer" | answer
+fi
+caos resolve "$(caos hash /cas/args/root)" "" /cas/caos-test-tree
+in=/cas/caos-test-tree
+
 # List the tree one level — enough to look for the codebase's own files.
-caos get /cas/args/in
-caos get /cas/args/in/dev 2>/dev/null || true
+caos get "$in" 2>/dev/null || true
+caos get "$in/dev" 2>/dev/null || true
 
 # WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-test is registered on
 # every session (it is one of the harness's own tools), so it is offered
