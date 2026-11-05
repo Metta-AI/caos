@@ -2020,10 +2020,7 @@ mod tests {
         assert_eq!(offered.len(), 1);
         assert!(!offered[0].required);
         // A tool that already declared it by hand is not offered it twice.
-        let h = parse_help(
-            "t",
-            "d\n@param [request-id] Its own words.\n@request-id",
-        );
+        let h = parse_help("t", "d\n@param [request-id] Its own words.\n@request-id");
         let tool = TreeTool::new("t", h);
         assert_eq!(tool.args.len(), 1);
         assert_eq!(tool.args[0].doc, "Its own words.");
