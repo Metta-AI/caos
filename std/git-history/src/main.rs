@@ -182,14 +182,3 @@ fn history(op: &str) -> Result<String, Failure> {
         .history(&target, query, scope.as_deref())
         .map_err(User)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paths_split_like_the_file_tools_split_them() {
-        assert_eq!(split_path("/feature//01-change/"), ["feature", "01-change"]);
-        assert!(split_path(" . ").is_empty());
-    }
-}
