@@ -30,10 +30,6 @@ struct Parameters {
     wait_min: u64,
 }
 
-/// The longest a call may wait for CI. A longer wait is refused rather than
-/// cut short, so the caller learns the limit instead of a surprise.
-pub(super) const MAX_WAIT_MIN: u64 = 180;
-
 /// How often a wait reads CI again. GitHub has no long poll for checks, so a
 /// wait is a poll; each read is three requests or more, and CI moves in
 /// minutes, so a read every 15 seconds is plenty.
