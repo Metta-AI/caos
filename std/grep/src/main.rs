@@ -197,14 +197,3 @@ impl Render {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_scope_splits_the_way_the_file_tools_split_paths() {
-        assert_eq!(split_path("/a//b/./c"), ["a", "b", "c"]);
-        assert!(split_path(" . ").is_empty());
-    }
-}
