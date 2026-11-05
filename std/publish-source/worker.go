@@ -120,10 +120,7 @@ func start() {
 		refuse("branch must omit refs/heads/")
 	}
 	flag("allow-ignored")
-	carry := []string{}
-	_ = carry
 	// The commit rides along under its own name from here on.
-	w.Must(os.WriteFile("/tmp/commit", []byte(commit), 0o644))
 	if flag("force") {
 		expected := arg("expected")
 		if expected != "absent" && !hash.MatchString(expected) {
