@@ -93,10 +93,13 @@ mod tests {
     fn v6_root_and_fork_names_still_parse() {
         assert_eq!(Kind::parse("conversation.root"), Ok(Kind::SessionRoot));
         assert_eq!(Kind::parse("conversation.fork"), Ok(Kind::SessionFork));
-        assert_eq!(
-            Kind::parse_message(b"conversation.fork\n\n{\"events\":[]}"),
-            Ok(Kind::SessionFork)
-        );
+        let current = super::super::events::encode(Kind::SessionFork, &[]);
+        let v6 = [
+            b"conversation.fork".as_slice(),
+            &current[b"session.fork".len()..],
+        ]
+        .concat();
+        assert_eq!(Kind::parse_message(&v6), Ok(Kind::SessionFork));
         assert_eq!(Kind::SessionRoot.as_str(), "session.root");
     }
 
