@@ -53,7 +53,7 @@ impl Args {
                 "--username" => user_flag = Some(value(&mut args, arg)?),
                 "--list-archived" => parsed.list_archived = true,
                 "--unarchive" => parsed.unarchive = Some(value(&mut args, arg)?),
-                "-c" | "--session" => parsed.session = Some(value(&mut args, arg)?),
+                "-c" | "--session" | "--conversation" => parsed.session = Some(value(&mut args, arg)?),
                 "--new" => parsed.new_session = true,
                 "--empty" => {
                     parsed.empty = true;

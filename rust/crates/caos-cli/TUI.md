@@ -88,7 +88,7 @@ changed under it:
 - Run in caos itself, `--llm-step:@=std/llm-step` evaluates the working tree,
   which no `reader:@@=` grant covers once it differs from a commit in the
   grant's range. A grant on a branch you commit to covers committed work;
-  uncommitted work needs `reader:@=std/llm-step session=<id>`.
+  uncommitted work needs `reader:@=std/llm-step conversation=<id>`.
 
 Before submitting a chat turn, the client asks the server which secrets the
 request would be given, and refuses to send a turn whose `llm-step` would not

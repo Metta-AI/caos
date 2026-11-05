@@ -335,7 +335,7 @@ mod tests {
         init(dir).unwrap();
         let key = "a".repeat(64);
 
-        let first = write_tree(dir, &[spec("gh", "reader:@=x session=c\n")]).unwrap();
+        let first = write_tree(dir, &[spec("gh", "reader:@=x conversation=c\n")]).unwrap();
         git(
             Some(dir),
             &["update-ref", &format!("refs/keys/{key}"), &first],

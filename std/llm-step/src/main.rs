@@ -172,7 +172,7 @@ impl Config {
             },
             base_url: read_arg_opt("base-url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             // A listing describes tools, which no session owns.
-            session: match (read_arg_opt("session")?, list_tools) {
+            session: match (read_arg_opt("session")?.or(read_arg_opt("conversation")?), list_tools) {
                 (Some(session), _) => session,
                 (None, true) => String::new(),
                 (None, false) => return Err("llm-step requires --session".to_string()),

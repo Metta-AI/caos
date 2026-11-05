@@ -2173,7 +2173,7 @@ pub fn image_arg_reader(argument: &str, session: &str) -> String {
         .map(|(key, value)| (key.split_once(':').map_or("", |(_, ty)| ty), value));
     match value {
         Some(("@@", locator)) => format!("reader:@@={locator}"),
-        Some(("@", path)) => format!("reader:@={path} session={session}"),
+        Some(("@", path)) => format!("reader:@={path} conversation={session}"),
         _ => format!("a reader for {argument}"),
     }
 }
@@ -2584,7 +2584,7 @@ fn parse_cli_args(args: &[String], positional_message: bool) -> Result<LineArgs,
                 .ok_or_else(|| format!("{argument} needs a value"))
         };
         match argument.as_str() {
-            "-c" | "--session" if positional_message => parsed.name = Some(next(&mut index)?),
+            "-c" | "--session" | "--conversation" if positional_message => parsed.name = Some(next(&mut index)?),
             "-m" | "--message" => {
                 if message_from_position {
                     return Err(

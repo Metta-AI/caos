@@ -353,6 +353,8 @@ impl_record!(SourceTreeResolution, validate);
 #[serde(deny_unknown_fields)]
 pub struct TranscriptEntry {
     pub message_id: String,
+    /// Stored as `conversation`: the transcript format predates the rename.
+    #[serde(rename = "conversation")]
     pub session: String,
     pub role: Role,
     pub actor: String,
