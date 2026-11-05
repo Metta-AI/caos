@@ -2012,6 +2012,25 @@ mod tests {
     }
 
     #[test]
+    fn request_id_is_an_optional_parameter_offered_once() {
+        let h = parse_help("t", "Talks to GitHub.\n@param path The path.\n@request-id");
+        assert!(h.request_id);
+        let tool = TreeTool::new("t", h);
+        let offered: Vec<_> = tool.args.iter().filter(|a| a.name == REQUEST_ID).collect();
+        assert_eq!(offered.len(), 1);
+        assert!(!offered[0].required);
+        // A tool that already declared it by hand is not offered it twice.
+        let h = parse_help(
+            "t",
+            "d\n@param [request-id] Its own words.\n@request-id",
+        );
+        let tool = TreeTool::new("t", h);
+        assert_eq!(tool.args.len(), 1);
+        assert_eq!(tool.args[0].doc, "Its own words.");
+        assert!(!parse_help("t", "d\n@param path The path.").request_id);
+    }
+
+    #[test]
     fn a_tag_this_parser_cannot_act_on_is_never_absorbed() {
         // A misspelled `@writer` must not leave a writer silently read-only:
         // the proposal would be discarded as a value and the edit would just
