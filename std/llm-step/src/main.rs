@@ -1131,25 +1131,15 @@ fn op_marker_path(site: &CallSite<'_>) -> String {
     )
 }
 
-/// The operation a STARTED `run_tool` call is in the middle of. A call resumed
-/// after a restart has only its record to go on, and re-evaluating the tool's path
-/// to learn the operation would be a build: so an operation says what it is in a
-/// payload of its own start, or by the pin it wrote before doing anything
-/// irreversible.
+/// The operation a STARTED `run_tool` call is in the middle of, as the marker in
+/// its start says. Only `agent-wait` is ever picked up again from here (a join
+/// spans step invocations); re-evaluating the tool's path to learn the operation
+/// would be a build, which is why the start carries it.
 fn started_op(view: &Session<'_>, site: &CallSite<'_>) -> Option<String> {
-    if let Ok(bytes) = view.payload(&op_marker_path(site)) {
-        if let Ok(Value::String(op)) = serde_json::from_slice::<Value>(&bytes) {
-            return Some(op);
-        }
-    }
-    if view.payload(&import_source::pin_path(site)).is_ok() {
-        Some("import-source".to_string())
-    } else if view.payload(&publish_source::pin_path(site)).is_ok() {
-        Some("publish-source".to_string())
-    } else if view.payload(&stack_publish::pin_path(site)).is_ok() {
-        Some("stack-publish".to_string())
-    } else {
-        None
+    let bytes = view.payload(&op_marker_path(site)).ok()?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::String(op)) => Some(op),
+        _ => None,
     }
 }
 
