@@ -79,11 +79,11 @@ func present(name string) bool {
 }
 
 func token() string {
-	bytes, err := os.ReadFile(tokenFile)
+	data, err := os.ReadFile(tokenFile)
 	if os.IsNotExist(err) {
 		return ""
 	}
-	t := strings.TrimRight(string(w.Check(bytes, err)), "\r\n")
+	t := strings.TrimRight(string(w.Check(data, err)), "\r\n")
 	// A line break inside a header value would end the header block early.
 	w.True(!strings.ContainsAny(t, "\r\n"), "github: the github-token secret has a line break inside it")
 	return t
