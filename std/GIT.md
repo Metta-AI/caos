@@ -281,9 +281,9 @@ such as `02` to `03` then `01` to `02` has no ordering problem:
 
 ```text
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
+  "root": "sources/repo", "pattern": "^02-tests(\\..+)?$", "replacement": "03-tests$1"})
 run_tool(path="caos-std/move-sed", arguments={
-  "dir": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
+  "root": "sources/repo", "pattern": "^01-feature(\\..+)?$", "replacement": "02-y$1"})
 ```
 
 `replacement` uses Go's `$1` / `${name}`, never sed's `\1`. The result lists
