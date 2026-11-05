@@ -70,17 +70,16 @@ type expectation struct {
 
 var cases = []testCase{
 	{
-		name: "an unreachable remote stops the batch",
-		batch: `[{"op":"head","repository":"` + invalid + `","branch":"main"},
-		         {"op":"api","method":"GET","path":"/zen"}]`,
+		name:   "an unreachable remote stops the batch",
+		batch:  `[{"op":"head","repository":"` + invalid + `","branch":"main"},{"op":"api","method":"GET","path":"/zen"}]`,
 		expect: []expectation{
 			{error: "reading the refs of " + invalid + " failed"},
 			{skipped: true},
 		},
 	},
 	{
-		name: "malformed operations are refused before anything is sent",
-		batch: `[{"op":"push","repository":"` + invalid + `","commit":"abc","branch":"topic","expected":"absent"}]`,
+		name:   "malformed operations are refused before anything is sent",
+		batch:  `[{"op":"push","repository":"` + invalid + `","commit":"abc","branch":"topic","expected":"absent"}]`,
 		expect: []expectation{{error: "full commit hash"}},
 	},
 	{
