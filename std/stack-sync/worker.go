@@ -647,7 +647,10 @@ func rebuild(s *State, changed map[string]string) string {
 			w.Must(os.Symlink(at, filepath.Join(dir, name)))
 		}
 	}
-	return dir
+	// Recorded in caos first: the result links the recorded tree, not a
+	// scratch path that ends with this run.
+	w.Put(dir, "/cas/new-root")
+	return "/cas/new-root"
 }
 
 func main() {
