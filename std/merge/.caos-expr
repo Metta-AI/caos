@@ -10,9 +10,8 @@
 # the same way. It used to be a string literal inside llm-step, which meant a
 # second harness had to copy it -- and a copied description drifts.
 #
-# `@param theirs` is the only thing a caller supplies. `ours` is the workspace
-# it is merging into, which the launch binds; a model naming it would be naming
-# the session it is already in.
+# `ours` is the source tree the call names as `root` (design/tool-contract.md);
+# `theirs` and `merge-base` are the commits merged into it.
 #
 # `@writer` is what tells the harness this tool's result is a PROPOSAL rather
 # than a value (SPEC, "CaosTools"). It used to be known by matching the tool's
