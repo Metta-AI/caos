@@ -1,3 +1,0 @@
-# What this entry builds from (format `<path> <name>`): the step, which performs the
-# operation (`@op`) and is the image the entry curries its help onto.
-../llm-step llm-step
