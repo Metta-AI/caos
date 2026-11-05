@@ -331,6 +331,8 @@ stack 367: unchanged
   call to run. A refusal pushes nothing and says so.
 - Repository and trunk come from `00-base.source.json`; pass `repository` and
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
+  A repository that was renamed or moved to another owner since the import
+  is followed: the GitHub calls use the name GitHub gives it now.
 - `dry-run=true` reports the layers, branches, bases and titles without
   observing or changing anything. Use it first on a new stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
