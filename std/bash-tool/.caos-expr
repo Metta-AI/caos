@@ -30,7 +30,7 @@
 # sends the model there first. Keep the examples in step with std/README.md
 # ("Using bash-tool") and the client repo's AGENTS.md.
 HELP=<<END
-Run sh -c over a scratch copy of the SESSION TREE: your files, imports/ and feature/. It is not this machine's disk, and nothing in it is a git checkout. To copy, move or delete files and directories use the copy, move and remove tools instead: they need no `paths`. Use the read, write, edit, ls and grep tools for single files and searches. Use this tool to compute something over the content.
+Run sh -c over a scratch copy of the directory `root` names: a source tree such as sources/repo/99-dirty, a directory, or `.` for the whole session. `paths` and `cwd` are relative to it, and the command runs there. It is not this machine's disk, and nothing in it is a git checkout. To copy, move or delete files and directories use the copy, move and remove tools instead: they need no `paths`. Use the read, write, edit, ls and grep tools for single files and searches. Use this tool to compute something over the content.
 
 THE ONE RULE: content is lazy. Put in `paths` every existing file or directory the command reads, edits, copies or moves. A directory brings everything under it, source trees included. Anything not listed is a placeholder link into /cas. Naming one in cat, ls, cp, grep, find or rm says Permission denied. cd says Not a directory, and then the rest of the command runs from the root, where grep -r . and find . print nothing at all because they do not follow those links. Every one of these means: add that path to `paths` and run it again. "No matches" from a command that touched a placeholder is not an answer.
 
