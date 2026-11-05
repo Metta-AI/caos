@@ -391,17 +391,9 @@ fn edit(root: Option<&str>) -> Result<Written, Fail> {
             (_, true) => text.replace(old.as_str(), &new),
             (_, false) => text.replacen(old.as_str(), &new, 1),
         };
-    let prop = rebuild(ws, &comps, replaced.as_bytes(), Some(mode))?;
     let n = if replace_all { count } else { 1 };
-    Ok((
-        prop,
-        format!(
-            "edited {} ({n} replacement{})",
-            comps.join("/"),
-            if n == 1 { "" } else { "s" }
-        ),
-        format!("edit {}", comps.join("/")),
-    ))
+    let out = format!("edited ({n} replacement{})", if n == 1 { "" } else { "s" });
+    Ok((New::Content(replaced.into_bytes()), out))
 }
 
 fn copy(ws: &str) -> Result<Written, Fail> {
