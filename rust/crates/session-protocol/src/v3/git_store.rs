@@ -417,6 +417,11 @@ impl GitStore {
         let argument_refs: Vec<&str> = arguments.iter().map(String::as_str).collect();
         let output = self.output(&argument_refs)?;
         if output.status.success() {
+            let mut legacy_reads = self.legacy_reads.borrow_mut();
+            for update in updates {
+                legacy_reads.remove(&update.refname);
+            }
+            drop(legacy_reads);
             if let Err(error) = self.update_local_refs(updates) {
                 eprintln!(
                     "session-protocol: warning: push succeeded but local refs were not advanced: {error}"
