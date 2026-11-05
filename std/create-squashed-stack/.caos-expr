@@ -1,7 +1,8 @@
 # The `create-squashed-stack` tool (design/stacks.md, "Publishing"): the std/go
 # worker image with this directory's program curried onto it, plus the `help`
-# it is described by. A writer run on the session: `@in` hands it the
-# session tree, and it proposes that tree with the plan's `into` replaced.
+# it is described by. A writer under the root contract: `root` is the
+# directory holding the plan and the stack, and it answers with that directory
+# with the plan's `into` replaced.
 HELP=<<END
 Squash a stack to one commit per layer, for publishing each layer as a branch
 with a linear history, as a plan file says. The layers keep their own merge
