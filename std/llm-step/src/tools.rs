@@ -2386,6 +2386,7 @@ mod tests {
             wants_in: false,
             call: false,
             request_id: false,
+            root: false,
             scope: None,
             op: None,
         };
@@ -2409,6 +2410,7 @@ mod tests {
             wants_in: false,
             call: false,
             request_id: false,
+            root: false,
             scope: None,
             op: None,
         };
@@ -2443,6 +2445,7 @@ mod tests {
             wants_in: false,
             call: false,
             request_id: false,
+            root: false,
             scope: None,
             op: None,
         };
