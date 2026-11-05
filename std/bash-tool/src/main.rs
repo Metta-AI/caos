@@ -34,17 +34,23 @@ fn run() -> Result<(), String> {
     // It used to be an ENVELOPE — `in` holding `{tree, cmd, paths}` — built by
     // the step's own bash arm, back when the step registered this tool and bound
     // its input itself. Nothing builds that now.
-    let tree = arg("in");
-    if !Path::new(&tree).exists() {
-        return Err(format!(
-            "no input tree at {tree}: bash-tool runs over the tree bound as `in`"
-        ));
-    }
+    //
+    // Now it is `root` (design/tool-contract.md): the directory or source tree
+    // the call named, which a source tree's commit resolves to the code tree
+    // of. Absent is an empty directory, which the command can fill.
     let base = ARGS.to_string();
+    let root = arg("root");
     let cmd = read_blob(&format!("{base}/cmd"))?;
     let paths = read_paths(&format!("{base}/paths"))?;
     let work = scratch("work")?;
-    worker_common::files::materialize(&tree, &work, &paths)?;
+    if fs::symlink_metadata(&root).is_ok() {
+        let tree = "/cas/bash-root";
+        caos(["resolve", &worker_common::cas_hash(&root)?, "", tree])?;
+        if worker_common::cas_kind(tree)? != "tree" {
+            return refuse("the root is a file; bash-tool runs over a directory");
+        }
+        worker_common::files::materialize(tree, &work, &paths)?;
+    }
     let cwd = if Path::new(&format!("{base}/cwd")).exists() {
         read_blob(&format!("{base}/cwd"))?
     } else {
