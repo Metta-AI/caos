@@ -3181,8 +3181,11 @@ pub(crate) fn wait_ticket(config: &Config, ticket: &str) -> Result<Vec<u8>, Http
     }
 }
 
-/// Evaluations running in THIS process. A ticket recorded `pending` that is not
-/// in here belonged to a server that has since died.
+/// Evaluations running in THIS process. A ticket joins it after redis records
+/// `pending` and leaves it after redis records the outcome (`TicketGuard`'s
+/// drop), so a ticket recorded `pending` that is not in here belonged to a
+/// server that has since died, or has just finished: `settle_ticket_state`
+/// reads redis again to tell the two apart.
 fn live_tickets() -> &'static Mutex<HashSet<String>> {
     static LIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     LIVE.get_or_init(|| Mutex::new(HashSet::new()))
