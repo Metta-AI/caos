@@ -1,9 +1,0 @@
-100644 0fc3bccab457033138e81ad16f70b902a0500758 1	std/README.md
-100644 944f2a064ac292aa7380fbd0ee4598269379fe1f 2	std/README.md
-100644 056416a8d7047a7f19ee27aaa9314fd4cabee74e 3	std/README.md
-
-Auto-merging AGENTS.md
-Auto-merging rust/crates/caos-cli/MCP.md
-Auto-merging std/GIT.md
-Auto-merging std/README.md
-CONFLICT (content): Merge conflict in std/README.md
