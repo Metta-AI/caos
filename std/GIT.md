@@ -92,10 +92,10 @@ the old name; `caos-std/move-sed` renames a layer and its sidecar in one call
 ```text
 import_source(source="https://github.com/<owner>/<repo>.git",
               revision="main", into="sources/<repo>/00-base")
-copy(from="sources/<repo>/00-base", to="sources/<repo>/99-dirty")
+copy(root="sources/<repo>", from="00-base", to="99-dirty")
 ... edit sources/<repo>/99-dirty ...
-move(from="sources/<repo>/99-dirty", to="sources/<repo>/01-<name>")
-write(file-path="sources/<repo>/01-<name>.pr.md",
+move(root="sources/<repo>", from="99-dirty", to="01-<name>")
+write(root="sources/<repo>/01-<name>.pr.md",
       content="<PR title>\n\n<PR body>\n")
 run_tool(path="caos-std/stack-publish", arguments={"stack": "sources/<repo>"})
 ```
