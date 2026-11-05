@@ -25,6 +25,6 @@ for the top of the session). The result lists every rename, old to new.
 @param replacement The new name, with $1 or ${name} standing for the pattern's groups.
 @param [dry-run] true to list the renames without making them.
 @writer
-@in
+@root
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
