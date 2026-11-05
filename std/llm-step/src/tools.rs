@@ -2147,6 +2147,21 @@ mod tests {
     }
 
     #[test]
+    fn root_is_a_required_first_parameter_and_replaces_in_git_and_scope() {
+        let h = parse_help("t", "Edits a file.\n@param text The text.\n@writer\n@root\n@in");
+        assert!(h.root && h.writer);
+        assert!(!h.wants_in, "@in is not obeyed beside @root");
+        let tool = TreeTool::new("t", h);
+        assert_eq!(tool.args[0].name, ROOT);
+        assert!(tool.args[0].required);
+        assert_eq!(tool.args.len(), 2, "no `in` is offered");
+        let described = describe(&tool, "caos-std/t");
+        assert!(described.contains("`root` parameter"), "{described}");
+        let h = parse_help("t", "d\n@param source-tree The tree.\n@scope source-tree\n@root");
+        assert!(h.scope.is_none() && !h.git);
+    }
+
+    #[test]
     fn request_id_is_an_optional_parameter_offered_once() {
         let h = parse_help("t", "Talks to GitHub.\n@param path The path.\n@request-id");
         assert!(h.request_id);
