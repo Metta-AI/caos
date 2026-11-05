@@ -1166,28 +1166,26 @@ fn drive_call(
         .tool(&call.id)?
     {
         if existing.status == CallStatus::Started {
+            // A subagent join spans step invocations by design: the step
+            // dispatches a join on the child's relay and is called back when
+            // the child finishes, so finding one started is the normal case.
+            if existing.name == subagents::WAIT_TOOL {
+                dispatch_wait_started(state, request, call, &existing)?;
+                return Ok(false);
+            }
             if existing.name == "run_tool" {
                 let inner = op_call(call);
                 let op_site = CallSite::new(request, declaration, &inner);
-                let op = started_op(&state.session()?, &op_site);
-                if let Some(op) = op {
-                    return run_op(cfg, &op, state, &op_site, Some(&existing));
+                if started_op(&state.session()?, &op_site).as_deref() == Some("agent-wait") {
+                    return run_op(cfg, "agent-wait", state, &op_site, Some(&existing));
                 }
             }
-            if existing.name == "publish_source" {
-                publish_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == "import_source" {
-                import_source::execute(state, &site)?;
-                return Ok(true);
-            }
-            if existing.name == subagents::WAIT_TOOL {
-                dispatch_wait_started(state, request, call, &existing)?;
-            } else {
-                dispatch_started(state, request, call, &existing)?;
-            }
-            return Ok(false);
+            // Anything else found started was being run by a step that stopped
+            // before it finished. It is never run again behind the agent's back
+            // (design/tool-contract.md, "No automatic resume"): it is answered
+            // as unfinished, and the agent decides whether to call again.
+            close_unfinished(state, &existing)?;
+            return Ok(true);
         }
         return Ok(true);
     }
