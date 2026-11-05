@@ -144,11 +144,11 @@ automatically. Run relevant checks.
 
 .caos/conflicts:
 CONFLICTS
-  cat "$work/.caos/conflicts" >> "$res/out"
+  cat "$work/.caos/conflicts" >> "$res/stdout"
   # A conflict is NOT a failed call: the proposal is wanted and the model is
   # being asked to finish it, so no `failed` entry.
 else
-  printf 'merge completed cleanly; the source tree is the merged result.\n' > "$res/out"
+  printf 'merge completed cleanly; the source tree is the merged result.\n' > "$res/stdout"
 fi
-ln -s /cas/mergecommit "$res/prop"
+ln -s /cas/mergecommit "$res/root"
 caos put "$res" /cas/out
