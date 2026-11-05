@@ -20,6 +20,7 @@ mod stack_merge_to_master;
 mod stack_publish;
 mod stack_sync;
 mod record;
+mod root;
 mod source_trees;
 mod subagents;
 mod timing;
