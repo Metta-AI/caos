@@ -244,7 +244,7 @@ with none gets a placeholder); `@param` tags declare the parameters:
 The bracketed name is the one extension over stock javadoc, which has no
 notion of an optional parameter.
 
-Four bare tags are flags:
+These bare tags are flags:
 - `@writer` — this tool PROPOSES A CHANGE to the tree it is run on, rather
   than returning a value. Absent means READ-ONLY, which is the default because
   it is the safe reading of a tool that forgot to say
