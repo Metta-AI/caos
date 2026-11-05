@@ -1,21 +1,22 @@
 // The `create-squashed-stack` tool's worker. Its docs live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "CaosTools").
 //
-// A writer run on the session (SPEC, "Writers"). Args, under /cas/args:
+// A writer under the root contract (design/tool-contract.md). Args, under
+// /cas/args:
 //
-//	in    the session tree it was run on
-//	plan  the session path of the plan file
+//	root  the directory holding the plan and everything it names
+//	plan  the path of the plan file, relative to root
 //
-// The plan names everything else: `onto`, `into`, and one block per layer of
-// `layer=`, `commit=` and `message=` lines.
+// The plan names everything else, relative to root: `onto`, `into`, and one
+// block per layer of `layer=`, `commit=` and `message=` lines.
 //
-// The result is {prop, out, message, failed?}. `prop` is the session
-// with `into` replaced by {<layer>: <squashed commit>}. It is built from links
-// to the CAS entries it keeps, which `caos put` records by oid, so nothing in
-// the session is checked out.
+// The result is {stdout, root, commit-message} or {stdout, failed}. `root` is
+// the directory with `into` replaced by {<layer>: <squashed commit>}. It is
+// built from links to the CAS entries it keeps, which `caos put` records by
+// oid, so nothing is checked out.
 //
-// A refusal proposes `in` unchanged and marks `failed`: the agent reads it and
-// acts (merges, fixes the plan). Only a broken environment is a job error.
+// A refusal is a value: the agent reads it and acts (merges, fixes the plan).
+// Only a broken environment is a job error.
 package main
 
 import (
