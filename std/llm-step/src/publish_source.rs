@@ -1,7 +1,7 @@
-//! Pin publication intent in the conversation before any remote mutation.
+//! Pin publication intent in the session before any remote mutation.
 use super::*;
-use conversation_protocol::v3::publication::Outcome;
-use conversation_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
+use session_protocol::v3::publication::Outcome;
+use session_protocol::v3::{Descriptor, PublicationRecord, PublicationStatus};
 
 pub(super) const HELP: &str = "Publish the exact selected source commit to an HTTPS Git repository branch, preserving its history. Test and inspect the intended PR diff first. Resolve merge conflicts and clear .caos/conflicts before publishing. The endpoint rejects files matched by the source commit's .gitignore rules, including tracked files. The rejection lists those paths. Remove them, adjust the rules, or set allow_ignored to publish them anyway. It never strips files or rewrites commits. This does not create a PR (caos-std/github opens one) or change the source gitlink. Updates are fast-forward only unless force is true, which permits replacing the branch's history (as when publishing a squashed stack layer, design/stacks.md); the push is still leased on the exact remote head observed when the call starts, so a concurrent change is never overwritten. Otherwise import and merge remote changes before retrying a conflict. A receipt names the exact published commit even if the source later changes. On uncertainty, inspect the remote before taking another action.
 @param repository HTTPS Git repository URL, without credentials.
@@ -49,7 +49,7 @@ fn parameters(call: &Call) -> Result<Parameters, String> {
         .map_err(|e| format!("invalid publish_source arguments: {e}"))?;
     paths::validate_source_tree_name(&p.source_tree)?;
     git_locator::import::remote(&p.repository)?;
-    conversation_protocol::v3::source_trees::validate_branch(&p.branch)?;
+    session_protocol::v3::source_trees::validate_branch(&p.branch)?;
     if p.branch.starts_with("refs/") {
         return Err("branch must omit refs/heads/".into());
     }
@@ -64,7 +64,7 @@ pub(super) fn pin_path(site: &CallSite<'_>) -> String {
 }
 
 fn pinned(
-    view: &Conversation<'_>,
+    view: &Session<'_>,
     site: &CallSite<'_>,
 ) -> Result<Option<PublicationRecord>, String> {
     if view
@@ -95,10 +95,10 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         git_locator::publish::read_branch(&p.repository, &p.branch, token)
             .and_then(|h| h.map(|h| Oid::parse(&h, "remote head")).transpose())
     };
-    let pending = match pinned(&state.conversation()?, site)? {
+    let pending = match pinned(&state.session()?, site)? {
         Some(record) => record,
         None => {
-            let view = state.conversation()?;
+            let view = state.session()?;
             let head = match view.source_tree(&p.source_tree)? {
                 Some(source) => source.commit,
                 None => {
@@ -243,11 +243,11 @@ pub(super) fn send(
     Ok(outcome)
 }
 
-pub(super) fn invocation(conversation: &str, site: &CallSite<'_>) -> Result<String, String> {
+pub(super) fn invocation(session: &str, site: &CallSite<'_>) -> Result<String, String> {
     ids::protocol_id(
         "external-tool",
         &json!({
-            "conversation":conversation, "call":site.call.id
+            "conversation":session, "call":site.call.id
         }),
     )
 }
@@ -301,7 +301,7 @@ pub(super) fn pin<S: progress::RefStore>(
 ) -> Result<Option<PublicationRecord>, String> {
     for _ in 0..32 {
         state.reload()?;
-        let view = state.conversation()?;
+        let view = state.session()?;
         if view
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
@@ -333,7 +333,7 @@ pub(super) fn pin<S: progress::RefStore>(
             return Ok(Some(pending.clone()));
         }
     }
-    Err("conversation kept moving while pinning publication".into())
+    Err("session kept moving while pinning publication".into())
 }
 
 pub(super) fn finish<S: progress::RefStore>(
@@ -344,7 +344,7 @@ pub(super) fn finish<S: progress::RefStore>(
 ) -> Result<(), String> {
     for _ in 0..32 {
         state.reload()?;
-        let view = state.conversation()?;
+        let view = state.session()?;
         if view
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
@@ -391,7 +391,7 @@ pub(super) fn finish<S: progress::RefStore>(
             return Ok(());
         }
     }
-    Err("conversation kept moving while completing publication".into())
+    Err("session kept moving while completing publication".into())
 }
 
 #[cfg(test)]

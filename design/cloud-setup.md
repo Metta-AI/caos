@@ -150,14 +150,14 @@ The first attempt refused this, on a reading that was correct about the code and
 wrong about what to do. `eval_cli_image_with_store` resolves a
 `--llm-step:@=<path>` by `t.ingest_path(".")` — the tracked working tree, dirty
 edits included — and nothing about `mcp serve`'s `--base` reaches that walk. So
-the seed commit decided what the CONVERSATION recorded while the worktree decided
+the seed commit decided what the SESSION recorded while the worktree decided
 which tools the server resolved, and rewriting only the seed would have produced
 exactly the half-update the rewrite exists to prevent: a dev client evaluating the
 committed tools.
 
 The conclusion drawn from that — "the worktree rewrite stays" — treated the
 client's resolution rule as fixed. It is not, and it was the thing that was
-wrong: a recorded conversation has a base commit, and resolving its step anywhere
+wrong: a recorded session has a base commit, and resolving its step anywhere
 else is a gap between what a session runs and what it records, dev mode or not.
 `resolve_cli_image_arg_in_tree` closes it, `mcp`'s two resolution sites pass the
 base commit's tree, and stage 1 now builds the rewrite in a throwaway index only.
@@ -176,7 +176,7 @@ to declining — "it bakes an ephemeral dev-mode endpoint URL … into the repo,
 
 The seed commit was already minted through a throwaway index (`git commit-tree`,
 unreferenced, so no push can carry it). Building the rewritten content only in
-that index leaves the worktree untouched: the conversation seeds from the dev pin
+that index leaves the worktree untouched: the session seeds from the dev pin
 through `caos mcp hook --base=<sha>`, the step resolves in that same commit, and
 the ticket never enters a file anyone can commit. "Verify first that nothing
 reads the worktree's expression directly" was the right instruction; something

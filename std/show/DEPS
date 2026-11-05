@@ -4,5 +4,5 @@
 ../git-history git-history
 ../rustc rustc
 ../git-runner git-runner
-../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/session-protocol session-protocol
 ../../rust/crates/git-locator git-locator

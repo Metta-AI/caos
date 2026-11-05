@@ -3,7 +3,7 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-List a directory: one entry per line, directories (and source trees) with a trailing `/`. Paths start at the root of the tree this tool runs over (the conversation, unless `in` names another) and traverse code references, for example feature/dirty/src. Prefer this over `ls` via bash. Listings are cut at 1000 entries.
+List a directory: one entry per line, directories (and source trees) with a trailing `/`. Paths start at the root of the tree this tool runs over (the session, unless `in` names another) and traverse code references, for example feature/dirty/src. Prefer this over `ls` via bash. Listings are cut at 1000 entries.
 @param [path] Directory to list; omit for the root itself.
 @in
 END

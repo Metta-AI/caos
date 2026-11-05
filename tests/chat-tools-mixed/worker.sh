@@ -16,8 +16,8 @@ cp -R /tmp/ws /tmp/feat
 echo "merged" > /tmp/feat/feature.txt
 feature_tree=$(publish_tree /tmp/feat /cas/feat "publishing the feature tree")
 
-# THE SHELL IS A TOOL AT THE CONVERSATION ROOT, and that position is the whole
-# point of this test: a path outside every source tree runs over the conversation
+# THE SHELL IS A TOOL AT THE SESSION ROOT, and that position is the whole
+# point of this test: a path outside every source tree runs over the session
 # tree, which is the one scope from which `cp -a main side`, `mv side review` and
 # a write into `memories/` are all reachable at once. A tool inside `main` would
 # see only `main`. The model stages it here with `write`, which is all a tool is
@@ -26,16 +26,16 @@ bash_tool_img=$(caos hash /cas/args/bash-tool)
 merge_img=$(caos hash /cas/args/merge)
 # The stub reads its scripted responses when the turn asks for them, so it can
 # start empty: the merge call below names the feature commit by hash, and that
-# commit is made on top of the conversation's own base, which needs the stub's port.
+# commit is made on top of the session's own base, which needs the stub's port.
 mkdir -p /tmp/stub
 start_stub /tmp/stub
 
-new_llm_conversation tools-mixed "$STUB_PORT" "$ws"
+new_llm_session tools-mixed "$STUB_PORT" "$ws"
 feature=$(mint_commit /cas/feature "$feature_tree" feature "$base")
 fetch_code "$feature" "fetching the feature commit"
 git push -q caos "$feature:refs/caos/req/$feature" || fail "pushing feature closure"
 
-# THE MERGE IS A TOOL TOO, at the conversation root like the shell, and it picks
+# THE MERGE IS A TOOL TOO, at the session root like the shell, and it picks
 # the source tree it advances by ARGUMENT (`source-tree`), not by where it sits:
 # `@scope` in its help. `theirs` is a commit hash, the one thing the tool cannot
 # find for itself.
@@ -116,7 +116,7 @@ if git cat-file -e "$source_tree:side.txt" 2>/dev/null; then fail "side edit lea
 [ "$(git show "$side_source_tree:mix.txt")" = hello ] || fail "input snapshot changed with main"
 grep -qF 'side' /tmp/stub/request-2.json || fail "new source_tree missing from model context"
 
-[ "$(git show "$head:memories/test.txt")" = remembered ] || fail "conversation memory was not staged"
+[ "$(git show "$head:memories/test.txt")" = remembered ] || fail "session memory was not staged"
 [ "$(git show "$side_source_tree:second.txt")" = second ] || fail "second source tree edit lost"
 review=$(source_tree_commit "$head" review)
 fetch_code "$review" "fetching copied source tree"

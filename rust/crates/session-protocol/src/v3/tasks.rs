@@ -1,4 +1,4 @@
-//! Background computations and conversations share one lifecycle.
+//! Background computations and sessions share one lifecycle.
 use super::{AsyncRecord, ChildRecord, Oid};
 use serde::{Deserialize, Serialize};
 
@@ -28,20 +28,20 @@ impl TaskStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskRecord {
     Computation(AsyncRecord),
-    Conversation(ChildRecord),
+    Session(ChildRecord),
 }
 
 impl TaskRecord {
     pub fn computation(&self) -> &Oid {
         match self {
             Self::Computation(task) => &task.task,
-            Self::Conversation(child) => &child.relay,
+            Self::Session(child) => &child.relay,
         }
     }
     pub fn is_pending(&self) -> bool {
         (match self {
             Self::Computation(task) => task.status,
-            Self::Conversation(child) => child.status,
+            Self::Session(child) => child.status,
         }) == TaskStatus::Pending
     }
 }

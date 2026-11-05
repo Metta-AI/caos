@@ -10,7 +10,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use super::*;
-use conversation_protocol::v3::source_trees::validate_branch;
+use session_protocol::v3::source_trees::validate_branch;
 
 use crate::ci_status::{self, Checks, Standing};
 use crate::publish_source::bool_or_string;
@@ -275,9 +275,9 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     let dir = p.stack.clone();
     let refused =
         |error: String| format!("stack-merge-to-master refused; nothing was merged: {error}");
-    // Everything that reads the conversation, before anything reaches the remote.
+    // Everything that reads the session, before anything reaches the remote.
     let read = {
-        let view = state.conversation()?;
+        let view = state.session()?;
         read_stack(&view, &dir).and_then(|stack| {
             let prov = provenance(&view, &dir)?;
             let repository = p

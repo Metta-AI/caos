@@ -1,7 +1,7 @@
 //! Shared transport for Anthropic Messages API calls made by CAOS workers.
 //!
 //! This crate deliberately owns only provider transport, defaults, and retry
-//! behavior. Conversation commits, tools, progress refs, and response policy
+//! behavior. Session commits, tools, progress refs, and response policy
 //! remain responsibilities of the worker making the call.
 
 use serde_json::Value;

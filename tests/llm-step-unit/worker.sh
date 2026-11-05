@@ -19,14 +19,14 @@ tgt="$(uname -m)-unknown-linux-musl"
 
 # The layout is the one in std/llm-step/Cargo.toml: llm-step's own Cargo.toml and
 # src/ at the root, each path dependency in a directory of its own name beside
-# them. conversation-protocol reaches git-locator as `../git-locator`, which is
+# them. session-protocol reaches git-locator as `../git-locator`, which is
 # the same directory from here. Copied out of the mounts (DEEP-DEPS is staged
 # from read-only content), and only what cargo reads: a deepened mount also
 # carries DEEP-DEPS/ and the caos metadata, which cargo has no use for.
 mkdir ws
 cp DEEP-DEPS/llm-step/Cargo.toml ws/
 cp -rL DEEP-DEPS/llm-step/src ws/src
-for crate in llm-client conversation-protocol git-locator worker-common; do
+for crate in llm-client session-protocol git-locator worker-common; do
   mkdir "ws/$crate"
   cp DEEP-DEPS/"$crate"/Cargo.toml "ws/$crate/"
   cp -rL DEEP-DEPS/"$crate"/src "ws/$crate/src"

@@ -4,10 +4,10 @@
 # tests/llm-record-http — what `caos mcp hook` used to write from the harness's
 # checkout, written by the step over HTTP:
 #
-#   POST /eval/run   base:hash=<llm-step>  conversation=<id>  record=<prompt|stop|failure>
+#   POST /eval/run   base:hash=<llm-step>  session=<id>  record=<prompt|stop|failure>
 #                    message-id=<32 hex>  actor=<who>  text=<...>  [model=...]  [content:hash=<tree>]
 #
-# The first prompt CREATES the conversation, so nothing exists beforehand: no
+# The first prompt CREATES the session, so nothing exists beforehand: no
 # repo, no ref, no turn. Each event names its own message id, so repeating one
 # writes nothing.
 set -euo pipefail
@@ -28,7 +28,7 @@ record() { # <kind> <message-id> <text> [extra name=value ...]
   calls=$((calls + 1))
   local -a data=(
     --data-urlencode "base:hash=$LLM_TEST_LLM_STEP"
-    --data-urlencode "conversation=$conv"
+    --data-urlencode "session=$conv"
     --data-urlencode "record=$kind"
     --data-urlencode "message-id=$mid"
     --data-urlencode "actor=tester"
@@ -49,14 +49,14 @@ record() { # <kind> <message-id> <text> [extra name=value ...]
   caos get "$dir" || fail "expanding the result of $kind"
   caos get "$dir/status" || fail "fetching the status of $kind"
   status=$(cat "$dir/status")
-  recorded_head=$(caos hash "$dir/conversation")
-  assert_oid "$recorded_head" "the conversation after $kind"
+  recorded_head=$(caos hash "$dir/session")
+  assert_oid "$recorded_head" "the session after $kind"
 }
 
-# The conversation as the server holds it, in the checkout the test tool keeps.
+# The session as the server holds it, in the checkout the test tool keeps.
 subjects() { # -> the commit subjects, newest first, on one line
   local head
-  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the conversation"
+  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the session"
   head=${head#head }
   git -C /tmp/repo log --format=%s "$head" | tr '\n' ' '
 }
@@ -64,7 +64,7 @@ subjects() { # -> the commit subjects, newest first, on one line
 # The transcript's roles, oldest first, and its newest entry's text.
 roles() {
   local head
-  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the conversation"
+  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the session"
   head=${head#head }
   $TOOL transcript --repo /tmp/repo --head "$head" \
     | while read -r _ role _; do printf '%s\n' "$role"; done | paste -sd,
@@ -72,7 +72,7 @@ roles() {
 
 newest_text() {
   local head
-  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the conversation"
+  head=$($TOOL fetch --repo /tmp/repo --ref "$ref") || fail "fetching the session"
   head=${head#head }
   $TOOL transcript --repo /tmp/repo --head "$head" | tail -1 \
     | { read -r _ _ _ _ encoded; printf '%s' "$encoded" | jq -r .; }
@@ -80,7 +80,7 @@ newest_text() {
 
 new_id() { od -An -N16 -tx1 /dev/urandom | tr -d ' \n'; }
 
-stage "a conversation that does not exist yet"
+stage "a session that does not exist yet"
 llm_test_setup
 conv="record-http-$(date +%s%N)-$$"
 ref="refs/caos/v3/conversations/$(printf '%s' "$conv" | od -An -tx1 | tr -d ' \n')/head"
@@ -106,9 +106,9 @@ record prompt "$p1" "read the greeting" "model=claude-code" "content:hash=$conte
 [ "$status" = recorded ] || fail "a repeated prompt was '$status'"
 [ "$recorded_head" = "$before" ] || fail "a repeated prompt moved the head"
 
-stage "a tool call on the new conversation"
+stage "a tool call on the new session"
 code=$(curl -sS -X POST -o /tmp/call.body -w '%{http_code}' \
-  --data-urlencode "base:hash=$LLM_TEST_LLM_STEP" --data-urlencode "conversation=$conv" \
+  --data-urlencode "base:hash=$LLM_TEST_LLM_STEP" --data-urlencode "session=$conv" \
   --data-urlencode "tools-only=toolu_one" --data-urlencode "tool=read" \
   --data-urlencode 'arguments={"file-path":"greeting.txt"}' \
   --data-urlencode "salt=$SALT-call" "$server/eval/run") || fail "the tool call did not complete"
@@ -142,13 +142,13 @@ record failure "$(new_id)" "overloaded_error: try later"
 [ "$(newest_text)" = "overloaded_error: try later" ] \
   || fail "the failure message is '$(newest_text)'"
 
-stage "a stop for a conversation nobody created is refused"
+stage "a stop for a session nobody created is refused"
 code=$(curl -sS -X POST -o /tmp/none.body -w '%{http_code}' \
-  --data-urlencode "base:hash=$LLM_TEST_LLM_STEP" --data-urlencode "conversation=no-such-$conv" \
+  --data-urlencode "base:hash=$LLM_TEST_LLM_STEP" --data-urlencode "session=no-such-$conv" \
   --data-urlencode "record=stop" --data-urlencode "message-id=$(new_id)" \
   --data-urlencode "actor=tester" --data-urlencode "text=x" "$server/eval/run") \
   || fail "the stop did not complete"
-[ "$code" -ge 400 ] || fail "a stop with no conversation was accepted: $(cat /tmp/none.body)"
+[ "$code" -ge 400 ] || fail "a stop with no session was accepted: $(cat /tmp/none.body)"
 
 stage "the history is a valid spine"
 head=$($TOOL fetch --repo /tmp/repo --ref "$ref")

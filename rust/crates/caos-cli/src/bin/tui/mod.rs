@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use caos::GitTransport;
-use caos_cli::{list_user_conversations, unarchive_user_conversation, UserConversationStatus};
+use caos_cli::{list_user_sessions, unarchive_user_session, UserSessionStatus};
 use ratatui_core::layout::Rect;
 use ratatui_core::terminal::Terminal;
 use ratatui_crossterm::crossterm::event::{
@@ -136,7 +136,7 @@ fn selection_lock_allows_redraw(was_locked: bool, is_locked: bool) -> bool {
 
 /// While the TUI owns the terminal, anything written to stderr — a library
 /// warning from a background thread (the 500ms remote poll can emit
-/// "skipping malformed conversation" lines), a dependency, a panicking
+/// "skipping malformed session" lines), a dependency, a panicking
 /// thread — lands at the terminal cursor inside the alternate screen. The
 /// cursor rests in the composer, a few rows above the bottom, so a stray
 /// line and its newline overwrite and scroll exactly the rows the renderer
@@ -358,13 +358,12 @@ pub(crate) fn run(raw: &[String]) -> Result<(), String> {
         let transport = GitTransport::from_cwd()?;
         transport.ensure_server_reachable()?;
         if args.list_archived {
-            for conversation in
-                list_user_conversations(&transport, &args.user, UserConversationStatus::Archived)?
+            for session in list_user_sessions(&transport, &args.user, UserSessionStatus::Archived)?
             {
-                println!("{}\t{}", conversation.id, conversation.title);
+                println!("{}\t{}", session.id, session.title);
             }
         } else if let Some(id) = &args.unarchive {
-            unarchive_user_conversation(&transport, &args.user, id)?;
+            unarchive_user_session(&transport, &args.user, id)?;
             println!("unarchived {id}");
         }
         return Ok(());

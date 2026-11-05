@@ -104,7 +104,7 @@ Caos runs well-defined binaries with well-defined inputs and well-defined enviro
 | Crate | Binaries / image | What it is |
 |---|---|---|
 | `caos` | `caos` | Generic object, ArgTree, transport, and worker-side client machinery. The binary is baked setuid into worker images at `/bin/caos`. |
-| `caos-cli` | `caos-cli` | User-facing generic commands plus the conversation protocol, line client, and TUI. Also installed as plain `caos` on the host. See [clients](#the-two-clients). |
+| `caos-cli` | `caos-cli` | User-facing generic commands plus the session protocol, line client, and TUI. Also installed as plain `caos` on the host. See [clients](#the-two-clients). |
 | `caos-world` | — | The build's world tag, shared by the three crates that speak the server protocol (`caos`, `server`, `runnerd`) so they cannot disagree about their world. |
 | `server` | `caos-server` | One daemon: object storage, compute, and a git smart-HTTP transport, over its own repo. See [server](#server). |
 | `runnerd` | `caos-runnerd` | The generic host agent: long-polls the server for jobs and runs worker containers. The server itself runs nothing. See `design/runner-protocol.md`. |
@@ -130,7 +130,7 @@ No Rust toolchain is needed system-wide; the flake pins it.
 | `rust/rust-toolchain.toml` | Pins the compiler (`stable` + clippy/rustfmt/rust-src) and the static `musl` target |
 | `rust/Cargo.toml` | Workspace root (members + shared release profile) |
 | `rust/crates/caos/` | Generic CAOS client library and worker-side `caos` binary |
-| `rust/crates/caos-cli/` | Conversation protocol plus the user-facing `caos-cli` line client and TUI |
+| `rust/crates/caos-cli/` | Session protocol plus the user-facing `caos-cli` line client and TUI |
 | `rust/crates/server/` | The `server` crate → `caos-server` |
 | `rust/crates/worker-*/` | The worker crates |
 | `stack/` | The one bring-up: `bootstrap` (store + `nix build`), `serve` (daemons, publish, seeder), `build-builtins.sh` (the seeded core) |
@@ -433,7 +433,7 @@ it is bounded, deduplicated and scrubbed for secrets like any other `caos put`.
 
 The generic `caos` crate and the higher-level `caos-cli` crate share
 the object machinery through a one-way dependency. Their difference is the
-**transport**, privilege model, and whether conversation policy is present.
+**transport**, privilege model, and whether session policy is present.
 
 - **`caos`** (worker-side) talks to the server over **HTTP** (`/object`), and
   provides the container `runner`. It's installed **setuid-root** in
@@ -453,20 +453,20 @@ the object machinery through a one-way dependency. Their difference is the
     host path;
   - `curry` — bind args to an image, printing the curried ref;
   - `import-image` — get a docker image into caos, printing its hash;
-  - `tui` — interactive conversations, with a bundled harness independent of
+  - `tui` — interactive sessions, with a bundled harness independent of
     target repositories. **Probably broken at the moment:** it predates the
     server-held secret store, and its first-run key prompt is reduced to a
     check (rust/crates/caos-cli/TUI.md).
     It starts without code; `caos tui --import imports/repo/base`
-    imports the launching checkout's clean HEAD at that conversation path.
+    imports the launching checkout's clean HEAD at that session path.
     Add a source and revision to select another repository or commit; Git URLs
     require a full commit hash. Ctrl+O browses code entries; the agent
     organizes them through ordinary file operations. `/import` adds local or
     remote repository commits, and `/checkout <gitlink> [directory]` exports code
     for local editing; the agent opens PRs itself;
-  - `talk` / `chat` — agent conversations over the current protocol
+  - `talk` / `chat` — agent sessions over the current protocol
     (`design/chat.md`);
-    `caos talk "<prompt>"` is the everyday form. A conversation NAMES the two
+    `caos talk "<prompt>"` is the everyday form. A session NAMES the two
     workers it runs, as ordinary image args — `--llm-step:@=std/llm-step`,
     `--llm-call:@=std/llm-call` here, `--llm-step:@=caos-std/llm-step` in a repo
     that mounted caos, or `:@@=<git ref>` in one that only pinned it. There is
@@ -492,7 +492,7 @@ reader:@@=git+https://github.com/Metta-AI/caos?ref=refs/heads/main&dir=std/llm-c
 
 A reader names the image a secret is granted to: a path in a repository, at a
 commit (`rev=<sha>`) or a branch (`ref=`), back to an optional `since=<sha>`;
-or `reader:@=<path> conversation=<id>` for a path in one conversation. A copy
+or `reader:@=<path> conversation=<id>` for a path in one session. A copy
 of a granted tree — a `DEEP-DEPS` mount, a repository that pins caos — is
 granted too, so a client repo mounting caos' std needs nothing more. Then:
 
@@ -957,7 +957,7 @@ the commit hash. Use --github-token-file=PATH for private repositories.
 Resolve branch names before calling; retry with the same hash.
 
 The agent's import_source tool also accepts branch names and defaults to the
-remote's default branch. It saves the resolved hash in conversation progress
+remote's default branch. It saves the resolved hash in session progress
 before invoking import-git, then attaches the snapshot and provenance at the
 requested unused path. Use /import for local checkouts.
 

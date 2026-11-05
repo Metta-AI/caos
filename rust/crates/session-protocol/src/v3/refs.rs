@@ -1,9 +1,9 @@
 use super::oid::{hex_lower, hex_nibble, is_lower_hex};
 
-pub const CONVERSATIONS_PREFIX: &str = "refs/caos/v3/conversations/";
+pub const SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
 pub const USERS_PREFIX: &str = "refs/caos/v3/users/";
 pub const HEAD_SUFFIX: &str = "/head";
-pub const MAX_CONVERSATION_ID_BYTES: usize = 124;
+pub const MAX_SESSION_ID_BYTES: usize = 124;
 pub const MAX_USER_ID_BYTES: usize = 126;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,8 +12,8 @@ pub enum Membership {
     Archived,
 }
 
-pub fn validate_conversation_id(id: &str) -> Result<(), String> {
-    validate_id(id, MAX_CONVERSATION_ID_BYTES, "conversation")
+pub fn validate_session_id(id: &str) -> Result<(), String> {
+    validate_id(id, MAX_SESSION_ID_BYTES, "session")
 }
 
 pub fn validate_user_id(id: &str) -> Result<(), String> {
@@ -40,8 +40,8 @@ pub fn id_of_key(key: &str) -> Result<String, String> {
 }
 
 pub fn head_ref(id: &str) -> Result<String, String> {
-    validate_conversation_id(id)?;
-    Ok(format!("{CONVERSATIONS_PREFIX}{}{HEAD_SUFFIX}", key_of(id)))
+    validate_session_id(id)?;
+    Ok(format!("{SESSIONS_PREFIX}{}{HEAD_SUFFIX}", key_of(id)))
 }
 
 pub fn active_membership_ref(user: &str, id: &str) -> Result<String, String> {
@@ -54,43 +54,42 @@ pub fn archived_membership_ref(user: &str, id: &str) -> Result<String, String> {
 
 pub fn parse_head_ref(refname: &str) -> Result<String, String> {
     let key = refname
-        .strip_prefix(CONVERSATIONS_PREFIX)
+        .strip_prefix(SESSIONS_PREFIX)
         .and_then(|rest| rest.strip_suffix(HEAD_SUFFIX))
-        .ok_or_else(|| format!("invalid conversation head ref {refname:?}"))?;
+        .ok_or_else(|| format!("invalid session head ref {refname:?}"))?;
     if key.contains('/') {
-        return Err(format!("invalid conversation head ref {refname:?}"));
+        return Err(format!("invalid session head ref {refname:?}"));
     }
-    let id = id_of_key(key).map_err(|_| format!("invalid conversation head ref {refname:?}"))?;
-    validate_conversation_id(&id)
-        .map_err(|_| format!("invalid conversation head ref {refname:?}"))?;
+    let id = id_of_key(key).map_err(|_| format!("invalid session head ref {refname:?}"))?;
+    validate_session_id(&id).map_err(|_| format!("invalid session head ref {refname:?}"))?;
     Ok(id)
 }
 
 pub fn parse_membership_ref(refname: &str) -> Result<(String, Membership, String), String> {
     let rest = refname
         .strip_prefix(USERS_PREFIX)
-        .ok_or_else(|| format!("invalid conversation membership ref {refname:?}"))?;
+        .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
     let (user_key, rest) = rest
         .split_once("/conversations/")
-        .ok_or_else(|| format!("invalid conversation membership ref {refname:?}"))?;
-    let (membership, conversation_key) = if let Some(key) = rest.strip_prefix("active/") {
+        .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
+    let (membership, session_key) = if let Some(key) = rest.strip_prefix("active/") {
         (Membership::Active, key)
     } else if let Some(key) = rest.strip_prefix("archived/") {
         (Membership::Archived, key)
     } else {
-        return Err(format!("invalid conversation membership ref {refname:?}"));
+        return Err(format!("invalid session membership ref {refname:?}"));
     };
-    if user_key.contains('/') || conversation_key.contains('/') {
-        return Err(format!("invalid conversation membership ref {refname:?}"));
+    if user_key.contains('/') || session_key.contains('/') {
+        return Err(format!("invalid session membership ref {refname:?}"));
     }
-    let user = id_of_key(user_key)
-        .map_err(|_| format!("invalid conversation membership ref {refname:?}"))?;
-    let conversation = id_of_key(conversation_key)
-        .map_err(|_| format!("invalid conversation membership ref {refname:?}"))?;
+    let user =
+        id_of_key(user_key).map_err(|_| format!("invalid session membership ref {refname:?}"))?;
+    let session = id_of_key(session_key)
+        .map_err(|_| format!("invalid session membership ref {refname:?}"))?;
     validate_user_id(&user)
-        .and_then(|()| validate_conversation_id(&conversation))
-        .map_err(|_| format!("invalid conversation membership ref {refname:?}"))?;
-    Ok((user, membership, conversation))
+        .and_then(|()| validate_session_id(&session))
+        .map_err(|_| format!("invalid session membership ref {refname:?}"))?;
+    Ok((user, membership, session))
 }
 
 fn validate_id(id: &str, maximum: usize, kind: &str) -> Result<(), String> {
@@ -102,7 +101,7 @@ fn validate_id(id: &str, maximum: usize, kind: &str) -> Result<(), String> {
 
 fn membership_ref(user: &str, membership: Membership, id: &str) -> Result<String, String> {
     validate_user_id(user)?;
-    validate_conversation_id(id)?;
+    validate_session_id(id)?;
     let kind = match membership {
         Membership::Active => "active",
         Membership::Archived => "archived",
@@ -150,10 +149,10 @@ mod tests {
     #[test]
     fn invalid_ids_and_keys_are_rejected() {
         for id in ["", "control\n", "delete\u{7f}"] {
-            assert!(validate_conversation_id(id).is_err());
+            assert!(validate_session_id(id).is_err());
             assert!(validate_user_id(id).is_err());
         }
-        assert!(validate_conversation_id(&"a".repeat(MAX_CONVERSATION_ID_BYTES + 1)).is_err());
+        assert!(validate_session_id(&"a".repeat(MAX_SESSION_ID_BYTES + 1)).is_err());
         assert!(validate_user_id(&"a".repeat(MAX_USER_ID_BYTES + 1)).is_err());
         for key in ["0", "AA", "gg", "ff"] {
             assert!(id_of_key(key).is_err(), "accepted {key:?}");

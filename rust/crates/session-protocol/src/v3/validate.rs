@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use super::apply::{apply, is_conversation_commit, Transition};
+use super::apply::{apply, is_session_commit, Transition};
 use super::canonical::parse_canonical;
 use super::events::Event;
 use super::kinds::Kind;
@@ -9,7 +9,7 @@ use super::oid::{empty_tree, g3, Oid};
 use super::paths;
 use super::records::*;
 use super::tree::{diff, Change, DryRunStore, Mode, ObjectStore, TreeBuilder};
-use super::view::Conversation;
+use super::view::Session;
 
 type Payloads = Vec<(String, Vec<u8>)>;
 type FileChanges = Vec<(String, Option<(Mode, Vec<u8>)>)>;
@@ -24,7 +24,7 @@ impl fmt::Display for Malformed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "malformed conversation commit {}: {}",
+            "malformed session commit {}: {}",
             self.commit, self.reason
         )
     }
@@ -65,7 +65,7 @@ pub fn validate_spine(
         }
         let result = validate_commit(store, &current)?;
         validated.push(current.clone());
-        if result.kind == Kind::ConversationRoot {
+        if result.kind == Kind::SessionRoot {
             break;
         }
         current = result.parent;
@@ -79,7 +79,7 @@ pub fn validate_spine(
 fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Validated, String> {
     let info = store.read_commit(commit).map_err(String::from)?;
     if !info.extra_headers.is_empty() {
-        return Err("conversation commits must not have extra headers".to_string());
+        return Err("session commits must not have extra headers".to_string());
     }
     // The first parent is the spine. A root may instead parent the commit its
     // content came from, and a fork may carry the commit it merged in as a
@@ -95,10 +95,10 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
             String::from_utf8_lossy(&info.message)
         )
     })?;
-    if kind == Kind::ConversationRoot {
-        if parent != g3() && is_conversation_commit(store, &parent)? {
+    if kind == Kind::SessionRoot {
+        if parent != g3() && is_session_commit(store, &parent)? {
             return Err(
-                "a root parents G3 or the commit its content came from, not a conversation commit"
+                "a root parents G3 or the commit its content came from, not a session commit"
                     .to_string(),
             );
         }
@@ -106,39 +106,39 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
         return Err("only a root may parent G3".to_string());
     }
     if !merged.is_empty() {
-        if kind != Kind::ConversationFork {
+        if kind != Kind::SessionFork {
             return Err("only a fork has more than one parent".to_string());
         }
         if merged.len() != 1 {
             return Err("a fork merges one commit in".to_string());
         }
-        if is_conversation_commit(store, &merged[0])? {
-            return Err("a fork merges a content commit in, not a conversation commit".to_string());
+        if is_session_commit(store, &merged[0])? {
+            return Err("a fork merges a content commit in, not a session commit".to_string());
         }
     }
-    let parent_tree = if kind == Kind::ConversationRoot {
+    let parent_tree = if kind == Kind::SessionRoot {
         empty_tree()
     } else {
         let parent_info = store.read_commit(&parent).map_err(String::from)?;
         Kind::parse_message(&parent_info.message)
-            .map_err(|_| "parent is not a conversation commit".to_string())?;
+            .map_err(|_| "parent is not a session commit".to_string())?;
         parent_info.tree
     };
 
     validate_root_shape(store, &info.tree)?;
-    let child = Conversation::open(store, commit)?;
-    let parent_view = if kind == Kind::ConversationRoot {
+    let child = Session::open(store, commit)?;
+    let parent_view = if kind == Kind::SessionRoot {
         None
     } else {
         Some(
-            Conversation::open(store, &parent)
+            Session::open(store, &parent)
                 .map_err(|error| format!("parent tree is malformed: {error}"))?,
         )
     };
 
     let changes = diff(
         store,
-        (kind != Kind::ConversationRoot).then_some(&parent_tree),
+        (kind != Kind::SessionRoot).then_some(&parent_tree),
         &info.tree,
     )?;
     if changes.is_empty() && child.current_events()?.is_empty() {
@@ -146,16 +146,16 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
     }
     validate_delta(store, &changes)?;
 
-    if kind == Kind::ConversationFork
+    if kind == Kind::SessionFork
         && child.identity()?.kind
             != (IdentityKind::Fork {
                 source: parent.clone(),
             })
     {
-        return Err("conversation fork identity does not name its source".to_string());
+        return Err("session fork identity does not name its source".to_string());
     }
 
-    if kind == Kind::ConversationRoot {
+    if kind == Kind::SessionRoot {
         if !matches!(child.identity()?.kind, IdentityKind::Root)
             || !child.current_events()?.is_empty()
         {
@@ -179,7 +179,7 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
     // A fork that merged a commit in starts from the merged content: what it
     // holds outside .caos/. Without that second parent, a fork's content is its
     // source's, and re-applying the transition proves it.
-    let fork_content = if kind == Kind::ConversationFork && !merged.is_empty() {
+    let fork_content = if kind == Kind::SessionFork && !merged.is_empty() {
         let mut content = TreeBuilder::from(Some(info.tree.clone()));
         content.delete(paths::CAOS_DIR);
         Some(content.build(&mut dry_run)?)
@@ -189,7 +189,7 @@ fn validate_commit_inner(store: &dyn ObjectStore, commit: &Oid) -> Result<Valida
     let transition = reconstruct(kind, parent_view.as_ref(), &child, &changes, fork_content)?;
     let applied = apply(
         &mut dry_run,
-        (kind != Kind::ConversationRoot).then_some(&parent),
+        (kind != Kind::SessionRoot).then_some(&parent),
         &transition,
     )
     .map_err(|error| format!("{}: {error}", kind.as_str()))?;
@@ -212,20 +212,17 @@ fn validate_root_shape(store: &dyn ObjectStore, tree: &Oid) -> Result<(), String
     let snapshot = super::tree::Snapshot::new(store, tree.clone());
     match snapshot.read(paths::FORMAT)? {
         Some(bytes) => paths::validate_format(&bytes)?,
-        None => return Err("conversation format is missing".to_string()),
+        None => return Err("session format is missing".to_string()),
     }
     for entry in snapshot.list(".caos")? {
         if !matches!(
             entry.name.as_str(),
             "format" | "identity.json" | "title" | "transcript"
         ) {
-            return Err(format!(
-                "unknown conversation metadata .caos/{}",
-                entry.name
-            ));
+            return Err(format!("unknown session metadata .caos/{}", entry.name));
         }
     }
-    Conversation::open_tree(store, tree)?.identity()?;
+    Session::open_tree(store, tree)?.identity()?;
     let title = snapshot
         .read(paths::TITLE)?
         .ok_or_else(|| "title is missing".to_string())?;
@@ -259,17 +256,17 @@ fn canonical_record_path(path: &str) -> bool {
 
 fn reconstruct(
     kind: Kind,
-    parent_snapshot: Option<&Conversation<'_>>,
-    child_snapshot: &Conversation<'_>,
+    parent_snapshot: Option<&Session<'_>>,
+    child_snapshot: &Session<'_>,
     changes: &[Change],
     fork_content: Option<Oid>,
 ) -> Result<Transition, String> {
-    if kind != Kind::ConversationRoot && parent_snapshot.is_none() {
+    if kind != Kind::SessionRoot && parent_snapshot.is_none() {
         return Err(format!("{}: parent snapshot is missing", kind.as_str()));
     }
     match kind {
-        Kind::ConversationRoot => Err("root is validated independently".into()),
-        Kind::ConversationFork => Ok(Transition::ConversationFork {
+        Kind::SessionRoot => Err("root is validated independently".into()),
+        Kind::SessionFork => Ok(Transition::SessionFork {
             identity: child_snapshot.identity()?,
             title: child_snapshot.title()?,
             content: fork_content,
@@ -357,7 +354,7 @@ fn reconstruct(
 
 fn transcript_change(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     changes: &[Change],
 ) -> Result<(TranscriptEntry, Payloads), String> {
     let path = single_change(changes, kind, "transcript record", transcript_record_path)?;
@@ -376,7 +373,7 @@ fn transcript_change(
 
 fn tool_change(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     _changes: &[Change],
 ) -> Result<(String, CallRecord), String> {
     let records: Vec<_> = child
@@ -395,7 +392,7 @@ fn tool_change(
 
 fn async_change(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     _changes: &[Change],
 ) -> Result<(Oid, AsyncRecord), String> {
     let records: Vec<_> = child
@@ -414,7 +411,7 @@ fn async_change(
 
 fn child_change(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     _changes: &[Change],
 ) -> Result<(String, ChildRecord), String> {
     let records: Vec<_> = child
@@ -433,7 +430,7 @@ fn child_change(
 
 fn publication_change(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     _changes: &[Change],
 ) -> Result<(String, PublicationRecord), String> {
     let records: Vec<_> = child
@@ -471,7 +468,7 @@ fn single_change<'a>(
 
 fn payload_changes(
     kind: Kind,
-    child: &Conversation<'_>,
+    child: &Session<'_>,
     changes: &[Change],
     directory: &str,
 ) -> Result<Payloads, String> {
@@ -510,7 +507,7 @@ fn payload_changes(
         .collect()
 }
 
-fn file_changes(child: &Conversation<'_>, changes: &[Change]) -> Result<FileChanges, String> {
+fn file_changes(child: &Session<'_>, changes: &[Change]) -> Result<FileChanges, String> {
     changes
         .iter()
         .filter(|change| !change.path.starts_with(".caos/"))

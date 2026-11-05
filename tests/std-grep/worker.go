@@ -3,7 +3,7 @@
 //
 // The tree has a SOURCE TREE in it (a commit entry, `feature/dirty`), because a
 // search that stops at a code reference is not the tool: matches inside one must
-// come back under their conversation path.
+// come back under their session path.
 package main
 
 import (

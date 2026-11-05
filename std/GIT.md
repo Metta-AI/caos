@@ -7,7 +7,7 @@ file is the working guide.
 
 ## The model in one paragraph
 
-Code is never checked out. A **source tree** is a gitlink in the conversation
+Code is never checked out. A **source tree** is a gitlink in the session
 tree (a path such as `sources/myrepo/01-parser`) that points at a commit.
 `import_source` creates one from GitHub, `copy` duplicates one with its
 history, `write`/`edit` (and `bash-tool`) change one, and every accepted change
@@ -106,7 +106,7 @@ was imported from, and prints what it did. Run it again after more edits and
 it fast-forwards the branch; the PR follows.
 
 - Edit and publish a source tree (`sources/<repo>/...`), never the
-  conversation root. `edit` on a bare path succeeds but changes only scratch
+  session root. `edit` on a bare path succeeds but changes only scratch
   files, and `publish_source` rejects `.`.
 - Omit `revision` to import the default branch. A new `import_source` call
   observes the remote again, so importing the same branch at a fresh path gives
@@ -189,7 +189,7 @@ base (a layer rebuilt on a force-pushed upstream: `merge-base` is the old tip
 of the previous layer).
 
 `theirs` is a **full commit hash** (from `log` on a source tree) or the **path of a
-source tree** in the conversation, such as one `import_source` just made. A branch
+source tree** in the session, such as one `import_source` just made. A branch
 NAME is not accepted: to merge `origin/main`, `import_source` the remote at
 `revision=main` into a fresh path, then pass that path as `theirs`.
 
@@ -300,7 +300,7 @@ rather than partly installed.
 
 ## Publishing
 
-The conversation history has many commits (agent turns, merges), and that is
+The session history has many commits (agent turns, merges), and that is
 what gets published. **Branches are always merged by squashing**, so the
 commits on a branch never reach the trunk: only its net diff does, and the
 history inside a branch does not matter. Do not spend effort tidying it, and
@@ -473,7 +473,7 @@ there is no feedback:
 
 | what | `GET` |
 |---|---|
-| the PR conversation | `/repos/{owner}/{repo}/issues/{n}/comments` |
+| the PR session | `/repos/{owner}/{repo}/issues/{n}/comments` |
 | inline comments on the diff, from submitted reviews | `/repos/{owner}/{repo}/pulls/{n}/comments` |
 | reviews and their state | `/repos/{owner}/{repo}/pulls/{n}/reviews` |
 | the comments of one review, **including a pending one** | `/repos/{owner}/{repo}/pulls/{n}/reviews/{review_id}/comments` |
@@ -560,7 +560,7 @@ reach usually means the grant is missing.
 - `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
   underscores), and the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
-  the conversation, never a branch name.
+  the session, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first. `move`
   takes one path, so a layer's `.pr.md` stays behind: rename both with
   `caos-std/move-sed`.

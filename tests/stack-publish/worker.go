@@ -196,7 +196,7 @@ func says(claim, out string, phrases ...string) {
 
 func main() {
 	w.Main(func() {
-		w.Step("a source tree, a stub model, and a conversation")
+		w.Step("a source tree, a stub model, and a session")
 		caos("get", "/cas/args/test-salt")
 		salt := strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/test-salt"))))
 		install("tool", "llm-test-tool", tool)
@@ -218,7 +218,7 @@ func main() {
 		w.Must(os.WriteFile("/tmp/system.txt", []byte("You are a coding agent."), 0o644))
 		caos("put", "/tmp/system.txt", "/cas/system")
 		llm := caos("curry", "--base:hash="+caos("hash", "/cas/args/llm-step"), "--system:@=/cas/system",
-			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--conversation="+conv)
+			"--model=test-model", fmt.Sprintf("--base-url=http://%s:%d", stubHost(), port), "--session="+conv)
 
 		// The tools, staged the way chat-tools-mixed stages its shell: a folder
 		// whose .caos-expr names the image by hash. An agent reaches the same

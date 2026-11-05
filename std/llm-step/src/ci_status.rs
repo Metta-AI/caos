@@ -325,7 +325,7 @@ pub(super) fn render(repository: &str, reference: &str, checks: &Checks) -> Stri
 /// The repository and the reference to read, from the parameters and, when a
 /// stack is named, its provenance and layers: a layer's name, or its name
 /// without the number, means that layer's branch.
-fn resolve(view: &Conversation<'_>, p: &Parameters) -> Result<(String, String), String> {
+fn resolve(view: &Session<'_>, p: &Parameters) -> Result<(String, String), String> {
     let Some(stack) = &p.stack else {
         let repository = p.repository.clone().ok_or("no repository")?;
         return Ok((repository, p.branch.clone()));
@@ -356,7 +356,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         Ok(p) => p,
         Err(error) => return site.fail(state, &error),
     };
-    let resolved = resolve(&state.conversation()?, &p);
+    let resolved = resolve(&state.session()?, &p);
     let (repository, reference) = match resolved {
         Ok(resolved) => resolved,
         Err(error) => return site.fail(state, &format!("ci-status refused: {error}")),

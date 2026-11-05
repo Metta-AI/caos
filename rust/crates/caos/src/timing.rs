@@ -1,7 +1,7 @@
 //! A phase journal that outlives the process that wrote it.
 //!
 //! The expensive work in a Claude Code session is spread across processes that
-//! nobody can watch: `mcp hook` fires per prompt and pushes the conversation
+//! nobody can watch: `mcp hook` fires per prompt and pushes the session
 //! base, `mcp serve` answers the tool calls. Each
 //! measured its own phases into a per-PROCESS static that only its own later
 //! code read -- so `ensure_code_commit`'s own doc comment can quote

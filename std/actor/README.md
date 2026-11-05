@@ -14,8 +14,8 @@ moves the branch with a direct receive-pack command and an empty pack instead
 of `git push`, so it fetches no history (see the question). Daemons are deliberately set aside; see
 [Deferred: daemons](#deferred-daemons).
 
-Builds on [client-owned conversation refs](../../design/client-owned-conversation-refs.md)
-(the Git protocol workers already use for conversation heads) and follows the
+Builds on [client-owned session refs](../../design/client-owned-session-refs.md)
+(the Git protocol workers already use for session heads) and follows the
 start/finish shape of `std/run-and-update-ref`.
 
 ---
@@ -24,7 +24,7 @@ start/finish shape of `std/run-and-update-ref`.
 
 caos runs pure, cached, hermetic jobs to completion. We also want named things
 whose state outlives any one job: small servers, and eventually a test stack
-that conversations drive. Today the only way to keep state is to hand it back
+that sessions drive. Today the only way to keep state is to hand it back
 through a caller.
 
 ## Model
@@ -175,7 +175,7 @@ with the inner's run time, and the compare-and-swap makes it safe.
   `--force-with-lease=<ref>:<observed>` is a server-side atomic compare-and-swap.
   Fast-forward-ness is **not** enforced by the server; the wrapper keeps the
   chain linear by always committing on the observed head. This matches the
-  "transport, not policy" stance of the conversation-refs doc.
+  "transport, not policy" stance of the session-refs doc.
 - That doc already defines the client protocol used above: a scratch repo whose
   origin is `CAOS_SERVER_URL`, an exact-ref fetch, a lease push, and the
   re-fetch rule after an ambiguous failure.
@@ -201,12 +201,12 @@ anything else, and only `/runner/*` checks a token. A wrapper needs only
 `run_async` and `spawn_agent` tools (bound in `std/llm-step/.caos-expr`, tested
 in `tests/run-and-update-ref`). For `run_async` it runs an already-built
 request and appends the task's terminal status, with the result oid, to the
-conversation ref that started it. For `spawn_agent` it checkpoints the child
-conversation's head onto the parent. It has the start/finish structure the
+session ref that started it. For `spawn_agent` it checkpoints the child
+session's head onto the parent. It has the start/finish structure the
 actor wrapper wants (start emits `run-request-then`, finish updates a ref), and
-`refs.rs` has the exact-ref fetch and lease-push logic for conversation refs.
-The conversation semantics live in `refs.rs`, but the Git plumbing it uses is
-generic and sits in the `conversation-protocol` crate (`git-cli` feature), which
+`refs.rs` has the exact-ref fetch and lease-push logic for session refs.
+The session semantics live in `refs.rs`, but the Git plumbing it uses is
+generic and sits in the `session-protocol` crate (`git-cli` feature), which
 the actor wrapper can depend on directly:
 
 - `GitStore::scratch(name, remote)` makes a bare scratch repo whose `origin` is
@@ -221,19 +221,19 @@ the actor wrapper can depend on directly:
 
 **One thing not to reuse as is:** `GitStore::fetch_ref` fetches with no depth
 and no filter into a scratch repo that is cleared for every job. For a
-conversation ref that is cheap by design (its trees hold gitlinks). For an actor
+session ref that is cheap by design (its trees hold gitlinks). For an actor
 it would download the whole history and the whole state closure on every
 request. The wrapper must use `read_ref` plus a depth-1, `tree:0` fetch of the
 head commit instead.
 
-**`TreeBuilder`** (`conversation_protocol::v3::tree`) builds trees by oid with
+**`TreeBuilder`** (`session_protocol::v3::tree`) builds trees by oid with
 no checkout: `put_oid(path, mode, oid)`, `delete(path)`, `build(store)`.
-`llm-step` uses it to seed a child conversation from the parent's tree. The
+`llm-step` uses it to seed a child session from the parent's tree. The
 wrapper can use it to build `{state: <oid>}` the same way.
 
 ### Caveats
 
-- Anyone who can reach the server can rewrite an actor branch. Conversation refs
+- Anyone who can reach the server can rewrite an actor branch. Session refs
   already accept this; actors inherit it.
 - Git advertises every ref on every push and fetch, so the number of actors is a
   soft scaling limit.
@@ -319,7 +319,7 @@ detection.
 ## Open questions
 
 1. **Caller retry.** The design assumes callers retry a failed request. Which
-   layer owns that for conversations and `map-then`, and does it back off under
+   layer owns that for sessions and `map-then`, and does it back off under
    contention on a hot actor?
 2. **History growth.** Every state change is a commit and GC is off. Options:
    periodic squash into a new root, or a per-actor compaction worker.

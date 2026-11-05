@@ -260,7 +260,7 @@ impl GitStore {
     }
 
     /// Fetch `commit` and its whole history from `url`, a repository other than
-    /// this store's remote: where a conversation's content comes from. The git
+    /// this store's remote: where a session's content comes from. The git
     /// that runs is the locator fetch's (`git_locator::locator::fetch_command`):
     /// the grammar's schemes only, a cleared environment, and a token carried
     /// over https alone. The push that follows takes the history to the server,
@@ -336,7 +336,7 @@ impl GitStore {
 
     /// `push`, negotiating what the remote already has instead of trusting its
     /// advertised refs alone. For a push whose history reaches commits the
-    /// remote holds under no advertised ref -- a conversation rooted on the
+    /// remote holds under no advertised ref -- a session rooted on the
     /// commit its content came from -- this is what keeps the pack to the new
     /// commits; a remote that cannot negotiate gets the whole history, which is
     /// correct and merely larger.
@@ -374,7 +374,7 @@ impl GitStore {
         if output.status.success() {
             if let Err(error) = self.update_local_refs(updates) {
                 eprintln!(
-                    "conversation-protocol: warning: push succeeded but local refs were not advanced: {error}"
+                    "session-protocol: warning: push succeeded but local refs were not advanced: {error}"
                 );
             }
             if let Some(tip) = self.pushed_remote_tip(updates) {
@@ -879,7 +879,7 @@ impl CodeOps for GitStore {
         if ancestor == descendant {
             return Ok(true);
         }
-        // Gitlinks do not bring their target commits into a conversation fetch.
+        // Gitlinks do not bring their target commits into a session fetch.
         // Raw Git needs both histories locally, just as read_commit does.
         self.ensure_local(ancestor)?;
         self.ensure_local(descendant)?;
@@ -938,7 +938,7 @@ impl CodeOps for GitStore {
 impl GitStore {
     /// Merge `theirs` into `ours` as git would, from the base the two commits
     /// share. Both must be local (`ensure_local`), with their ancestry reachable
-    /// from this store's remote: a conversation whose root parents its content
+    /// from this store's remote: a session whose root parents its content
     /// commit shares that commit's history with the repository it came from, so
     /// git finds the base on its own, and with nothing to share it refuses.
     pub fn merge_commits(&self, ours: &Oid, theirs: &Oid) -> Result<MergeOutcome, String> {
@@ -947,7 +947,7 @@ impl GitStore {
 
     /// Merge `theirs` into `ours` from `base_tree` rather than from a base
     /// their histories share: for two commits git finds no base for, such as a
-    /// conversation rooted on G3 and a commit of the repository its content was
+    /// session rooted on G3 and a commit of the repository its content was
     /// seeded from. The base is a parentless synthetic commit of that tree.
     pub fn merge_commits_over(
         &mut self,
@@ -1055,7 +1055,7 @@ mod tests {
     impl TestDirectory {
         fn new(label: &str) -> TestDirectory {
             let path = std::env::temp_dir().join(format!(
-                "conversation-protocol-git-{label}-{}-{}",
+                "session-protocol-git-{label}-{}-{}",
                 std::process::id(),
                 NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
             ));
@@ -1450,11 +1450,11 @@ mod tests {
     }
 
     #[test]
-    fn pushed_remote_tip_ignores_trees_and_prefers_conversation_heads() {
+    fn pushed_remote_tip_ignores_trees_and_prefers_session_heads() {
         let (_directory, _remote, client) = remote_and_client("push-remote-tip");
         let mut store = GitStore::open(&client, Some("caos")).expect("open git store");
         let tree = store.write_tree(&[]).expect("write empty tree");
-        let commit = write_commit(&mut store, &tree, &[], "conversation head\n");
+        let commit = write_commit(&mut store, &tree, &[], "session head\n");
 
         store
             .push(&[RefUpdate {
@@ -1478,7 +1478,7 @@ mod tests {
                     new: Some(commit.clone()),
                 },
             ])
-            .expect("push conversation head after request tree");
+            .expect("push session head after request tree");
         assert_eq!(*store.remote_tip.borrow(), Some(commit));
     }
 
@@ -1624,7 +1624,7 @@ mod tests {
         let remote = directory.child("remote.git");
         init(&remote, true);
         let scratch_name = format!(
-            "conversation-protocol-scratch-{}-{}",
+            "session-protocol-scratch-{}-{}",
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         );
@@ -1764,7 +1764,7 @@ mod tests {
         init(&repository, false);
         let mut store = GitStore::open(&repository, None).expect("open git store");
         // The tree both sides were seeded from, recorded in neither history: a
-        // conversation rooted on G3 and the repository its content came from.
+        // session rooted on G3 and the repository its content came from.
         let base_tree = update_tree(&mut store, None, "shared.txt", b"base\n");
         let base_tree = update_tree(&mut store, Some(&base_tree), "kept.txt", b"kept\n");
         let ours_tree = update_tree(&mut store, Some(&base_tree), "ours.txt", b"ours\n");

@@ -12,7 +12,7 @@ set -euo pipefail
 caos get /cas/args/in
 
 # WRONG SOURCE TREE — a CLEAN RESULT, not an error. This tool is reachable as
-# `caos-std/caos-build` from any conversation whose tree mounts caos, and `in`
+# `caos-std/caos-build` from any session whose tree mounts caos, and `in`
 # defaults to whatever tree the path selected, so it will be run on trees that
 # are not caos. There it has nothing to build: rather than fail the turn, say so,
 # so the model reads a calm "not applicable here" tool_result instead of a red one.

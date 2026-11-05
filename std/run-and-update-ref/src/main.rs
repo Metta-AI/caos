@@ -1,12 +1,12 @@
 //! Run one already-complete CAOS request, then append its task status to a
-//! conversation ref without making the caller wait in a worker container.
+//! session ref without making the caller wait in a worker container.
 //!
 //! `Q = run-and-update-ref { subreq: R, target-ref: F }` has three positions:
 //! start emits `run-request-then R` with this same Q (minus the call result) as
 //! its callback; success and failure finishes make the result addressable,
 //! append an async terminal transition containing that result OID to F, and
 //! return R's result unchanged. When `child` is present, the finish position
-//! instead validates the child's terminal conversation head and checkpoints it
+//! instead validates the child's terminal session head and checkpoints it
 //! on the parent before returning. A caught R failure is represented as a small
 //! result tree because the current promise protocol can deliver a failure to a
 //! callback but cannot ask that callback to rethrow it.

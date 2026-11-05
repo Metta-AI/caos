@@ -58,7 +58,7 @@ sources/<repo>/
   body differs from it, the operation updates the PR and says so in its
   report, so an edit made on GitHub is overwritten on the next publish. The
   rule used to be the other way round (leave PR text alone, a person may have
-  edited it); with the agent owning the stack, the conversation is where the
+  edited it); with the agent owning the stack, the session is where the
   text is edited.
 - **A layer without a description is not published.** That is how `99-dirty`
   is left out without a special case. A described layer ABOVE an undescribed
@@ -77,8 +77,8 @@ which is the squashing this design does without.
 
 `stack-publish` is an operation of the step (`@op`, SPEC "CaosTools"), like
 `publish-source`, and for the same reason: a publication is pinned in the
-conversation before any remote write (agent-publish.md), and only the step
-writes conversation records. Its entry is `std/stack-publish`, reached as
+session before any remote write (agent-publish.md), and only the step
+writes session records. Its entry is `std/stack-publish`, reached as
 `caos-std/stack-publish`; the work is `std/llm-step/src/stack_publish.rs`.
 
 ```text
@@ -106,7 +106,7 @@ One call does, in order:
    stack is published.
 3. **Observe the remote** head of every branch (`ls-remote`, as
    `publish-source` does), and **pin** one publication record per layer in
-   the conversation, all in one append with the call's start, so a resumed
+   the session, all in one append with the call's start, so a resumed
    attempt sends exactly what the first one planned: the same commits against
    the same leases.
 4. **Push bottom to top** with `caos push-git`, each push leased on its
@@ -187,13 +187,13 @@ pushes and the report costs a few reads.
 Merging a stacked PR is not the end of the stack's life, it is the common
 case: GitHub squash-merges the bottom PR onto the trunk and REWRITES every
 branch above it, rebasing each onto the new trunk and retargeting the next PR.
-The conversation's layers still hold the old history, so the next
+The session's layers still hold the old history, so the next
 `stack-publish` would be a non-fast-forward at every layer, and forcing it
 would undo GitHub's rebase and show the merged layer's changes again in the PR
-above. Something has to bring the conversation up to date first. `stack-sync`
+above. Something has to bring the session up to date first. `stack-sync`
 is that, the way `gt sync` is for a Graphite checkout. It is an operation of
 the step too (`std/stack-sync`, `std/llm-step/src/stack_sync.rs`): it reads
-the remote and mints merge commits in the conversation's store, then moves
+the remote and mints merge commits in the session's store, then moves
 the stack's gitlinks in one append. It pushes nothing.
 
 ```text
@@ -246,7 +246,7 @@ After a sync every layer descends from its branch's remote head, so
 above a merged one contains the squash commit through the adopted rebase, so
 its merge base with the trunk is that commit, not the old trunk.
 
-`stack-sync` needs no pin. It writes nothing remote, and its one conversation
+`stack-sync` needs no pin. It writes nothing remote, and its one session
 write is the completing append; an attempt that dies before it leaves
 unreferenced commits in the store and nothing else, and the next attempt
 recomputes everything.
@@ -361,13 +361,13 @@ run_tool(path="caos-std/move-sed", arguments={
   empty, `.`, `..`, contains `/`, or is `.caos` at the root, and a
   destination that exists and is not itself being renamed are all refusals,
   before anything changes. A directory inside a source tree is refused too:
-  renaming files in code is `move`'s job, and this tool rebuilds conversation
+  renaming files in code is `move`'s job, and this tool rebuilds session
   trees, not commits.
 - The result lists every rename, old name to new, and `dry-run=true` lists
   them without renaming.
 
-It is a writer on the conversation (`@writer`, `@in`), a Go program on
-`std/go` like `create-squashed-stack`, and its proposal is the conversation
+It is a writer on the session (`@writer`, `@in`), a Go program on
+`std/go` like `create-squashed-stack`, and its proposal is the session
 with that one directory rebuilt. The whole rename is one tree, so a shift
 such as `02-tests` to `03-tests` and `01-feature` to `02-y` in one call has
 no ordering problem. Regex replacement cannot count, so renumbering a run of
@@ -377,12 +377,12 @@ layers is one call per layer; stacks are short.
 
 - `tests/stack-publish`: llm-step's real tool loop with a scripted model,
   the shape of `tests/chat-squash-publish`. It builds a stack with
-  descriptions in a conversation and calls `caos-std/stack-publish` against
+  descriptions in a session and calls `caos-std/stack-publish` against
   a `.invalid` repository, so no push happens: the call must get through
   every check and stop at reading the remote; a stack with a described layer
   above an undescribed one, and one whose upper layer lacks the lower, must
   be refused before the remote is read; `dry-run` must report the plan.
-- `tests/move-sed`: a worker test over a fixture conversation, the shape of
+- `tests/move-sed`: a worker test over a fixture session, the shape of
   `tests/create-squashed-stack`: a success is checked by the exact tree it
   proposes, a refusal by an unchanged proposal and its message.
 - Unit tests in `stack_publish.rs` for the pure parts: reading a stack

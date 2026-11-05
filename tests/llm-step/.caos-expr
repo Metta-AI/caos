@@ -4,7 +4,7 @@
 # A WORKER TEST. Durable event recording, ordered tool replay, source tree
 # mutation, interjections on both sides of dispatch, and running or queued
 # request interruption are all llm-step's, and all observable on the
-# conversation ref. worker-common.sh curries the turns and polls.
+# session ref. worker-common.sh curries the turns and polls.
 #
 # `admit_turn`/`start_turn` rather than `dispatch_turn` for the first turn: the
 # pre-start interjection has to land between the admission and the dispatch,

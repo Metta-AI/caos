@@ -1,6 +1,6 @@
 // tests/create-squashed-stack — a WORKER test: no client, no repo.
 //
-// Runs std/create-squashed-stack over a conversation tree holding the stack shape
+// Runs std/create-squashed-stack over a session tree holding the stack shape
 // design/stacks.md describes: a base B at 00-base, layer 1 on B, layer 2
 // copied from layer 1, then layer 1 changed and merged up into layer 2, so
 // layer 2's tip is a merge commit; a third layer sits on layer 2. A plan must
@@ -8,8 +8,8 @@
 // commit's tree, author and committer and its plan message.
 //
 // The tool is a writer, so a success is checked by the tree it proposes: it
-// must equal the conversation with only `into` replaced, built here. A refusal
-// must propose the conversation unchanged and mark `failed`.
+// must equal the session with only `into` replaced, built here. A refusal
+// must propose the session unchanged and mark `failed`.
 //
 // Every fixture message carries --test-salt, so a salted run mints new
 // commits; the server's salt does not reach a sub-run's key (CLAUDE.md).
@@ -113,9 +113,9 @@ var cases []testCase
 // plan is a plan's text from its lines.
 func plan(lines ...string) string { return strings.Join(lines, "\n") + "\n" }
 
-// conversation stages the fixture conversation at dir, with each
+// session stages the fixture session at dir, with each
 // <path>=<cas-name> in extra put in place of what was there.
-func conversation(dir string, extra ...string) {
+func session(dir string, extra ...string) {
 	w.Must(os.RemoveAll(dir))
 	for _, d := range []string{"publish/mystack", "publish/other", ".caos", "plans"} {
 		w.Must(os.MkdirAll(filepath.Join(dir, d), 0o755))
@@ -125,7 +125,7 @@ func conversation(dir string, extra ...string) {
 		entry, target, _ := strings.Cut(l, "=")
 		w.Must(os.Symlink("/cas/"+target, filepath.Join(dir, entry)))
 	}
-	w.Must(os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("conversation notes\n"), 0o644))
+	w.Must(os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("session notes\n"), 0o644))
 	w.Must(os.WriteFile(filepath.Join(dir, ".caos/meta"), []byte("protocol\n"), 0o644))
 	w.Must(os.WriteFile(filepath.Join(dir, "publish/other/f.txt"), []byte("another stack\n"), 0o644))
 	for _, c := range cases {
@@ -208,7 +208,7 @@ func build() {
 		{"into-source-tree", good("mystack/00-base", "src/publish"), "", []string{"passes through src, which is a commit"}},
 		{"into-folder", good("mystack/00-base", "publish"), "", []string{"into (publish) holds mystack, which is not a gitlink"}},
 	}
-	conversation("/tmp/conv")
+	session("/tmp/conv")
 	caos("put", "/tmp/conv", "/cas/conv")
 	conv = caos("hash", "/cas/conv")
 
@@ -256,21 +256,21 @@ func check(i int) {
 	prop := caos("hash", filepath.Join(r, "prop"))
 	if c.into != "" {
 		w.True(!failed, "case %s was refused: %s", c.name, out)
-		conversation("/tmp/expect", c.into+"=squashed")
+		session("/tmp/expect", c.into+"=squashed")
 		caos("put", "/tmp/expect", "/cas/expect")
 		w.True(prop == caos("hash", "/cas/expect"),
-			"case %s: the proposal is not the conversation with %s replaced by {01-core: C1, 02-tests: C2, 03-docs: C3}; out: %s", c.name, c.into, out)
+			"case %s: the proposal is not the session with %s replaced by {01-core: C1, 02-tests: C2, 03-docs: C3}; out: %s", c.name, c.into, out)
 		for _, commit := range squashed {
 			w.True(strings.Contains(out, commit), "case %s: out does not name %s: %s", c.name, commit, out)
 		}
 		_, err := os.Lstat(filepath.Join(r, "message"))
-		w.True(err == nil, "case %s: no commit message for the conversation", c.name)
+		w.True(err == nil, "case %s: no commit message for the session", c.name)
 		fmt.Fprintf(os.Stderr, "  ok: %s = {01-core: C1, 02-tests: C2, 03-docs: C3}, nothing else changed\n", c.into)
 		return
 	}
 	w.True(failed, "case %s was not refused: %s", c.name, out)
 	w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-	w.True(prop == conv, "case %s: a refusal changed the conversation", c.name)
+	w.True(prop == conv, "case %s: a refusal changed the session", c.name)
 	for _, s := range c.says {
 		w.True(strings.Contains(out, s), "case %s does not say %q: %s", c.name, s, out)
 	}

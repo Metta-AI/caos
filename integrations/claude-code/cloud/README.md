@@ -1,7 +1,7 @@
 # Running a caos session in a cloud container
 
 A cloud session (claude.ai/code) needs two things: the **client** (`caos mcp
-hook` records the conversation, `caos mcp serve` is the tool server — one
+hook` records the session, `caos mcp serve` is the tool server — one
 downloaded binary), and a **caos server** to point it at. Neither requires the
 repository to carry anything.
 
@@ -53,7 +53,7 @@ The repository a session opens is a **caos client repo** — a handful of text
 files that pin a caos and mount its `std/`. `Metta-AI/caos-session` is the one
 to fork; its shape is spelled out under *Configuring the environment* below,
 so this does not depend on being able to open it. The code to work on is
-**imported into the conversation** by the agent's `import_source` tool — the
+**imported into the session** by the agent's `import_source` tool — the
 server fetches it from GitHub directly, so nothing is cloned into the container
 and nothing is pushed out of it.
 
@@ -89,11 +89,11 @@ The step is named by locator, pinned to the commit the client was built from:
 `--llm-step:@@=github:<repo>?rev=<sha>&dir=std/llm-step`. `caos mcp` reads no
 checkout, so a path in one (`caos-std/llm-step`) names nothing. That locator is
 also what a `reader:@@=` grant on caos's `std/llm-step` matches (SPEC.md,
-"Secrets"). The server, the content a new conversation starts from, and the
+"Secrets"). The server, the content a new session starts from, and the
 secret readers are arguments of their own (`--server`, `--base:@@=`,
 `--secret-readers`); setup computes the content locator from the checkout's
 `origin` and `HEAD` when it is on GitHub, so what is not committed and pushed is
-not in the conversation.
+not in the session.
 
 Claude Code's own configuration is still user-level in the container, so one
 environment serves every repo. Three routes were possible; only one works:
@@ -233,7 +233,7 @@ and stage 1 itself (re-exec'd once from the dev tree, handed the tree it already
 fetched, so an edit to stage 1 is in the package like anything else). It then
 mints a commit that is HEAD with `.caos-expr` and `flake.lock` pointed at
 `git+caos://…?rev=<dev>`, pushes it to the server, and names it to the client as the
-conversation's content (`--base:@@=git+caos://local?rev=<seed>`).
+session's content (`--base:@@=git+caos://local?rev=<seed>`).
 
 **Only that commit carries the dev pin; the checkout is left as cloned.** Blobs
 go in with `hash-object`, the tree through a throwaway index, the commit through
@@ -251,7 +251,7 @@ Two things are less obvious and both cost a session to find:
   `caos://` needs `git-remote-caos`, and the release install is what puts it on
   PATH; the dev package then replaces everything it laid down.
 - **`--base:@@=` goes on the hook, and on the tool server too.** The hook — not
-  `mcp serve` — is what creates a conversation, and without it the conversation
+  `mcp serve` — is what creates a session, and without it the session
   would start without code. Dev mode also names the step as
   `git+caos://local?rev=<dev>&dir=std/llm-step`: the pinned commit's step has no
   record mode. Any one missing runs your client against the *committed* tools,
@@ -290,7 +290,7 @@ environment's.
 Measured end to end, a fresh session on a correctly-ticketed environment:
 
 - **hooks fire** — `SessionStart` reports which caos this is;
-  `UserPromptSubmit`/`Stop`/`PreToolUse` record the conversation.
+  `UserPromptSubmit`/`Stop`/`PreToolUse` record the session.
 - **the MCP tool server is picked up** — the declaration in `/root/.claude.json`
   is honoured, `caos mcp serve` is spawned, and the model can call it.
 - **the five fixed tools answer** — `help`, `run`, `start`, `result` and

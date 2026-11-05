@@ -4,13 +4,13 @@
 /// Names one or more SecretReaderKeys, space-separated, on a request. Out of
 /// band because a key is a credential and an ArgTree is readable by anyone.
 pub const READERS_HEADER: &str = "X-Caos-Secret-Readers";
-/// The conversation a request is for, which `reader:@=` grants are scoped to.
-pub const CONVERSATION_HEADER: &str = "X-Caos-Conversation";
+/// The session a request is for, which `reader:@=` grants are scoped to.
+pub const SESSION_HEADER: &str = "X-Caos-Conversation";
 /// The step that runs the tools of an MCP connection (`POST /mcp`): a git
 /// locator, or a bare 40-hex hash. A header because the endpoint is stateless
 /// and every message of a connection must say it.
 pub const STEP_HEADER: &str = "X-Caos-Step";
-/// How long a tool's text may be before the step keeps it in the conversation
+/// How long a tool's text may be before the step keeps it in the session
 /// and the answer carries a preview (`POST /mcp`; absent means the default).
 pub const MAX_RESULT_CHARS_HEADER: &str = "X-Caos-Max-Result-Chars";
 
@@ -40,8 +40,8 @@ pub enum Reader {
         since: Option<String>,
     },
     /// `reader:@=<path> conversation=<id>`: whatever is at `path` in one
-    /// conversation.
-    Conversation { path: String, conversation: String },
+    /// session.
+    Session { path: String, session: String },
 }
 
 impl Reader {
@@ -51,8 +51,8 @@ impl Reader {
                 Some(since) => format!("reader:@@={locator} since={since}"),
                 None => format!("reader:@@={locator}"),
             },
-            Reader::Conversation { path, conversation } => {
-                format!("reader:@={path} conversation={conversation}")
+            Reader::Session { path, session } => {
+                format!("reader:@={path} conversation={session}")
             }
         }
     }
@@ -113,9 +113,7 @@ pub fn parse_spec(file_name: &str, text: &str) -> Result<Spec, String> {
             "value" => spec.value = Some(Value::Inline(val.to_string())),
             "value:@" => spec.value = Some(Value::File(val.trim().to_string())),
             "reader:@@" => spec.readers.push(parse_locator_reader(file_name, val)?),
-            "reader:@" => spec
-                .readers
-                .push(parse_conversation_reader(file_name, val)?),
+            "reader:@" => spec.readers.push(parse_session_reader(file_name, val)?),
             other => return Err(format!("secret {file_name}: unknown key {other:?}")),
         }
     }
@@ -146,22 +144,24 @@ fn parse_locator_reader(file_name: &str, val: &str) -> Result<Reader, String> {
     Ok(Reader::Locator { locator, since })
 }
 
-fn parse_conversation_reader(file_name: &str, val: &str) -> Result<Reader, String> {
+fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
     let mut words = val.split_whitespace();
     let path = words
         .next()
         .ok_or_else(|| format!("secret {file_name}: reader:@= names no path"))?
         .to_string();
-    let mut conversation = None;
+    let mut session = None;
     for word in words {
         match word.split_once('=') {
-            Some(("conversation", id)) if !id.is_empty() => conversation = Some(id.to_string()),
+            Some(("conversation" | "session", id)) if !id.is_empty() => {
+                session = Some(id.to_string())
+            }
             _ => return Err(format!("secret {file_name}: unknown reader field {word:?}")),
         }
     }
-    let conversation = conversation
+    let session = session
         .ok_or_else(|| format!("secret {file_name}: reader:@={path} needs conversation=<id>"))?;
-    Ok(Reader::Conversation { path, conversation })
+    Ok(Reader::Session { path, session })
 }
 
 fn is_full_sha(s: &str) -> bool {
@@ -201,9 +201,9 @@ mod tests {
                     locator: format!("git+https://x/y?rev={SHA}"),
                     since: None,
                 },
-                Reader::Conversation {
+                Reader::Session {
                     path: "imports/y/tool".into(),
-                    conversation: "c1".into(),
+                    session: "c1".into(),
                 },
             ]
         );

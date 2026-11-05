@@ -116,7 +116,7 @@ func run() string {
 }
 
 func visit() {
-	// `in` may be a commit (a source tree in the conversation): its tree.
+	// `in` may be a commit (a source tree in the session): its tree.
 	const root = "/cas/treemap-root"
 	w.Caos("resolve", w.Hash(args+"/in"), ".", root)
 	w.Get(root)
@@ -134,7 +134,7 @@ func visit() {
 	for _, e := range w.Check(os.ReadDir(root)) {
 		p := filepath.Join(root, e.Name())
 		// A git symlink is a real link here, and is a file. A gitlink (a source
-		// tree in the conversation) is a directory.
+		// tree in the session) is a directory.
 		if e.IsDir() || (e.Type()&os.ModeSymlink == 0 && w.Caos("kind", p) == "commit") {
 			w.Must(os.Symlink(p, filepath.Join(dirs, e.Name())))
 			ndirs++

@@ -12,7 +12,7 @@
 # THE HASH HAS TO BE USABLE, and that is the other half of the subject: `read`,
 # `ls` and `grep` each take a `root`, and this asserts the root may be ANY object
 # the server holds — including a build product that appears at no path in any
-# tree — rather than only another revision of the conversation.
+# tree — rather than only another revision of the session.
 #
 # Every call is declared by the test and run in `--tools-only` mode, exactly as
 # `caos mcp` runs one. Not a stylistic choice: each call's `root` is the PREVIOUS
@@ -31,11 +31,11 @@ declare_call() {
   local call=$1 tool=$2 input=$3 output key value
   output=$($TOOL declare --repo /tmp/repo --head "$head" \
     --actor tester --id "$call" --tool "$tool" --input "$input" \
-    --ref "$conversation_ref") || fail "declaring $call"
+    --ref "$session_ref") || fail "declaring $call"
   while read -r key value; do
     if [ "$key" = head ]; then head=$value; fi
   done <<<"$output"
-  assert_oid "$head" "the declared conversation head"
+  assert_oid "$head" "the declared session head"
 }
 
 # Run the step for one declared call, in its own fresh ArgTree naming the
@@ -48,10 +48,10 @@ run_tools_only() {
     || fail "preparing the tools-only run for $call"
   caos sub-run "$arg_tree" >/dev/null || fail "dispatching the tools-only step for $call"
   for ((attempt = 0; attempt < 900; attempt++)); do
-    head=$($TOOL fetch --repo /tmp/repo --ref "$conversation_ref") \
-      || fail "fetching the conversation after $call"
+    head=$($TOOL fetch --repo /tmp/repo --ref "$session_ref") \
+      || fail "fetching the session after $call"
     head=${head#head }
-    assert_oid "$head" "the conversation head after $call"
+    assert_oid "$head" "the session head after $call"
     status=$($TOOL tools --repo /tmp/repo --head "$head" \
       | jq -r --arg id "$call" 'select(.id == $id) | .status') || status=""
     # `failed` is a TERMINAL outcome carrying a tool_result the model reads, not
@@ -136,7 +136,7 @@ rm -rf /tmp/stub
 mkdir -p /tmp/stub
 start_stub /tmp/stub
 
-new_llm_conversation eval-path "$STUB_PORT" "$ws"
+new_llm_session eval-path "$STUB_PORT" "$ws"
 admit_turn "show me what this tree builds"
 
 stage "a bare source-tree name is that tree's own root"
@@ -165,7 +165,7 @@ echo "  ok: main/build -> $product" >&2
 
 stage "the product is a root for ls, read and grep"
 # THE POINT OF THE TOOL. This tree is named by nothing: it is not a revision of
-# the conversation and sits at no path, so before `eval_path` a model had no way
+# the session and sits at no path, so before `eval_path` a model had no way
 # to ask what a build produced.
 do_call ls-product ls "{\"root\":\"$product\"}"
 [ "$IS_ERROR" = false ] || fail "ls refused the product root: $TEXT"
@@ -220,23 +220,23 @@ case "$TEXT" in
 esac
 echo "  ok: a product hash roots a further evaluation" >&2
 
-stage "no path and no root is the conversation tree"
+stage "no path and no root is the session tree"
 eval_object eval-root '{}'
-[ "$KIND" = tree ] || fail "the conversation root evaluated to a $KIND, not a tree"
-do_call ls-conversation ls "{\"root\":\"$HASH\"}"
-[ "$IS_ERROR" = false ] || fail "ls refused the conversation tree: $TEXT"
+[ "$KIND" = tree ] || fail "the session root evaluated to a $KIND, not a tree"
+do_call ls-session ls "{\"root\":\"$HASH\"}"
+[ "$IS_ERROR" = false ] || fail "ls refused the session tree: $TEXT"
 # `main/` is the source tree's gitlink and `.caos/` the protocol's own directory:
-# together they say the default root really is the CONVERSATION tree, not the
+# together they say the default root really is the SESSION tree, not the
 # source tree inside it.
 case "$TEXT" in
   *"main/"*) ;;
-  *) fail "the default root is not the conversation tree: $TEXT" ;;
+  *) fail "the default root is not the session tree: $TEXT" ;;
 esac
 case "$TEXT" in
   *".caos/"*) ;;
   *) fail "the default root does not carry the protocol directory: $TEXT" ;;
 esac
-echo "  ok: the default root is the conversation tree" >&2
+echo "  ok: the default root is the session tree" >&2
 
 stage "an unevaluatable path and an unknown root are values, not dead turns"
 # `is_error` is the assertion, not the record's status: the two errors are

@@ -74,8 +74,8 @@ built)
     } > /tmp/commit
     caos put-commit /tmp/commit "$dst" || fail "minting $dst"
   }
-  root=$(mint /cas/root "conversation root")
-  head=$(mint /cas/head "conversation base" "$root")
+  root=$(mint /cas/root "session root")
+  head=$(mint /cas/head "session base" "$root")
 
   # --bash: the worker curries its tool onto the bash image, and a worker cannot
   # evaluate a `.caos-expr` — so it is resolved here and the hash bound.

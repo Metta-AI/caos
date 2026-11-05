@@ -147,7 +147,7 @@ export CAOS_STUB_HOST
 git add -A && git commit -qm testtree
 
 # THE ARGUMENTS `caos mcp` TAKES, for a test that drives it. `caos mcp` reads no
-# checkout: it is told the server, the step and (for a conversation's first prompt)
+# checkout: it is told the server, the step and (for a session's first prompt)
 # where its content comes from, all by name. Set only for a test that carries
 # DEEP-DEPS/llm-step.
 #
@@ -159,7 +159,7 @@ if [ -d ./DEEP-DEPS/llm-step ]; then
   export CAOS_MCP_ARGS
 fi
 
-# A CONVERSATION'S CONTENT is named by locator, and the server fetches it: so this
+# A SESSION'S CONTENT is named by locator, and the server fetches it: so this
 # repository is served over git, where the server can reach it (its own address, as
 # CAOS_STUB_HOST explains), and the locator pins HEAD. Commit first: what is not
 # committed is not there. Started on first use, once per test.

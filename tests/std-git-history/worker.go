@@ -95,7 +95,7 @@ func main() {
 		server = strings.TrimRight(os.Getenv("CAOS_SERVER_URL"), "/")
 		w.True(server != "", "this test needs CAOS_SERVER_URL from the runner")
 
-		w.Step("a source tree with two commits, in a conversation tree")
+		w.Step("a source tree with two commits, in a session tree")
 		first := commit("one", "", "first", map[string]string{"a.txt": "one\n"})
 		second := commit("two", first, "second", map[string]string{"a.txt": "two\n", "b.txt": "x\n"})
 		write("/tmp/ws/notes.txt", "hello\n")

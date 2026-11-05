@@ -11,7 +11,7 @@
 # crates must compile against them.
 #
 # The workspace source is this test's declared dependency (`../../rust`) —
-# exactly the tree an agent's conversation would carry.
+# exactly the tree an agent's session would carry.
 set -euo pipefail
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

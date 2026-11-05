@@ -1,6 +1,6 @@
 //! Test worker for first-class commits — the llm-step shape in miniature,
 //! built from source by the rustc builder in this test. Called with a
-//! conversation head commit (`--head`, a `:commit=` arg), it launches one tool
+//! session head commit (`--head`, a `:commit=` arg), it launches one tool
 //! call as a run-then sub-run, currying itself (plus the head) into `then`;
 //! called back with `--result`, it reads the head commit (message aside: tree,
 //! parent — walking one generation by hash), mints a child commit whose

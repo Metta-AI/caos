@@ -473,11 +473,11 @@ func installHelper(prefix, slug, tag string) {
 	}
 }
 
-// The conversation's seed: HEAD with its `.caos-expr` and `flake.lock` pointed
+// The session's seed: HEAD with its `.caos-expr` and `flake.lock` pointed
 // at the dev server, so the tools resolve from there too.
 //
 // ONLY A COMMIT CARRIES IT; the checkout is left as it was cloned. The commit is
-// pushed to the server and named to `caos mcp` as the conversation's content
+// pushed to the server and named to `caos mcp` as the session's content
 // (`--base:@@=git+caos://local?rev=<seed>`), so nothing reads the files on disk.
 // That is why they are not rewritten: a dirty checkout holding a ticket is a diff
 // an agent may commit and a session end that Claude Code's stop hook flags.
@@ -503,7 +503,7 @@ func seedCommit(repoDir, server, sha string) string {
 		// An identity of its own, because `commit-tree` refuses without one and
 		// the container's git may have none. Whose commit this is carries no
 		// meaning: nothing ever pushes it, and its only reader is the hook that
-		// seeds a conversation from it.
+		// seeds a session from it.
 		cmd.Env = append(os.Environ(),
 			"GIT_INDEX_FILE="+index.Name(),
 			"GIT_AUTHOR_NAME=caos setup", "GIT_AUTHOR_EMAIL=caos@localhost",
@@ -577,11 +577,11 @@ func seedCommit(repoDir, server, sha string) string {
 	}
 	commit, err := git(nil, "commit-tree", tree, "-p", "HEAD", "-m", "caos dev mode: the checkout pointed at the dev server")
 	if err != nil || commit == "" {
-		fatal("could not mint a conversation seed commit: %v\n"+
+		fatal("could not mint a session seed commit: %v\n"+
 			"  Without it the session evaluates the COMMITTED pin while running a\n"+
 			"  dev client -- the half-update dev mode prevents.", err)
 	}
-	say("dev tools: the conversation seeds from %s (unreferenced), resolving caos from the dev server at %s",
+	say("dev tools: the session seeds from %s (unreferenced), resolving caos from the dev server at %s",
 		commit[:12], sha[:12])
 	return commit
 }
@@ -733,16 +733,16 @@ func main() {
 		}
 	}
 
-	// What a new conversation starts from, as a locator the server fetches: the
+	// What a new session starts from, as a locator the server fetches: the
 	// session's checkout can hold uncommitted files, but `caos mcp` reads none, so
 	// what is not committed (and, for a checkout, pushed) is not in the
-	// conversation.
+	// session.
 	content := ""
 	if seed != "" {
 		// The seed is unreferenced here and the server cannot fetch it from a
 		// checkout, so it is pushed to the server itself and named as held there.
 		if _, err := run(repoDir, "git", "push", "-q", a.server, seed+":refs/caos/req/"+seed); err != nil {
-			say("could not push the dev seed commit to the server (%v); the first conversation will fail naming it", err)
+			say("could not push the dev seed commit to the server (%v); the first session will fail naming it", err)
 		}
 		content = "git+caos://local?rev=" + seed
 	} else {
@@ -842,17 +842,17 @@ func firstNonEmpty(values ...string) string {
 
 // A locator for the commit the checkout is at, which the server can fetch:
 // `github:owner/repo?rev=<sha>` when the checkout's origin is on GitHub. "" says
-// the conversation starts without code -- an origin the server cannot reach (a
+// the session starts without code -- an origin the server cannot reach (a
 // local proxy, a path) names nothing it could fetch.
 func checkoutLocator(repoDir string) string {
 	origin, err := run(repoDir, "git", "remote", "get-url", "origin")
 	if err != nil {
-		say("the checkout has no origin, so conversations start without code")
+		say("the checkout has no origin, so sessions start without code")
 		return ""
 	}
 	head, err := run(repoDir, "git", "rev-parse", "HEAD")
 	if err != nil || !isSha(head) {
-		say("the checkout has no commit, so conversations start without code")
+		say("the checkout has no commit, so sessions start without code")
 		return ""
 	}
 	slug := ""
@@ -863,7 +863,7 @@ func checkoutLocator(repoDir string) string {
 		}
 	}
 	if slug == "" {
-		say("origin %s is not on GitHub, so conversations start without code", origin)
+		say("origin %s is not on GitHub, so sessions start without code", origin)
 		return ""
 	}
 	return "github:" + slug + "?rev=" + head

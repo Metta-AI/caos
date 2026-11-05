@@ -143,7 +143,7 @@ pub enum IdentityKind {
 pub struct Owner {
     pub parent: String,
     pub parent_head: Oid,
-    /// The id of the parent's call that spawned this conversation.
+    /// The id of the parent's call that spawned this session.
     pub tool: String,
 }
 
@@ -229,7 +229,7 @@ pub fn encode_title(title: &str) -> Result<Vec<u8>, String> {
         || title.len() > paths::MAX_TITLE
         || title.bytes().any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
     {
-        return Err(format!("invalid conversation title {title:?}"));
+        return Err(format!("invalid session title {title:?}"));
     }
     Ok(format!("{title}\n").into_bytes())
 }
@@ -237,12 +237,12 @@ pub fn encode_title(title: &str) -> Result<Vec<u8>, String> {
 pub fn parse_title(bytes: &[u8]) -> Result<String, String> {
     let title = bytes
         .strip_suffix(b"\n")
-        .ok_or_else(|| "conversation title must end with LF".to_string())?;
+        .ok_or_else(|| "session title must end with LF".to_string())?;
     let title = std::str::from_utf8(title)
-        .map_err(|_| "conversation title must be UTF-8".to_string())?
+        .map_err(|_| "session title must be UTF-8".to_string())?
         .to_string();
     if encode_title(&title)? != bytes {
-        return Err("invalid conversation title encoding".to_string());
+        return Err("invalid session title encoding".to_string());
     }
     Ok(title)
 }
@@ -353,7 +353,9 @@ impl_record!(SourceTreeResolution, validate);
 #[serde(deny_unknown_fields)]
 pub struct TranscriptEntry {
     pub message_id: String,
-    pub conversation: String,
+    /// Stored as `conversation`: the transcript format predates the rename.
+    #[serde(rename = "conversation")]
+    pub session: String,
     pub role: Role,
     pub actor: String,
     #[serde(default, deserialize_with = "some_of", skip_serializing_if = "absent")]
@@ -369,7 +371,7 @@ pub struct TranscriptEntry {
 impl_record!(TranscriptEntry, validate);
 
 /// The text of the system message a person appends to stop whatever is driving
-/// the conversation. It is a fact in the transcript like any other: a driver
+/// the session. It is a fact in the transcript like any other: a driver
 /// that sees one after the prompt it is answering stops, and the calls it had
 /// not finished are left as they are.
 pub const INTERRUPT_TEXT: &str = "Interrupted.";
@@ -1057,7 +1059,7 @@ mod tests {
         }
     }
 
-    // Existing conversations use the former field names; new events use source_tree.
+    // Existing sessions use the former field names; new events use source_tree.
     fn legacy_keys(value: Value) -> Value {
         match value {
             Value::Object(fields) => Value::Object(
@@ -1196,7 +1198,7 @@ mod tests {
                 TranscriptEntry,
                 TranscriptEntry {
                     message_id: "message-1".to_string(),
-                    conversation: "conversation".to_string(),
+                    session: "session".to_string(),
                     role,
                     actor: "actor".to_string(),
                     model: Some("model".to_string()),
@@ -1314,7 +1316,7 @@ mod tests {
             TranscriptEntry,
             TranscriptEntry {
                 message_id: "message-1".to_string(),
-                conversation: "conversation".to_string(),
+                session: "session".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
                 model: None,
@@ -1384,7 +1386,7 @@ mod tests {
 
         let transcript = TranscriptEntry {
             message_id: "message-1".to_string(),
-            conversation: "conversation".to_string(),
+            session: "session".to_string(),
             role: Role::User,
             actor: "user".to_string(),
             model: None,

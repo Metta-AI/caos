@@ -30,7 +30,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Kind, Vec<Event>), String> {
     let split = bytes
         .windows(2)
         .position(|s| s == b"\n\n")
-        .ok_or("missing conversation events")?;
+        .ok_or("missing session events")?;
     let kind = Kind::parse(std::str::from_utf8(&bytes[..split]).map_err(|e| e.to_string())?)?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]

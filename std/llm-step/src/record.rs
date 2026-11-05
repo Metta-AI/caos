@@ -1,9 +1,9 @@
-//! `--record=<prompt|stop|failure>`: write a harness's events on a conversation.
+//! `--record=<prompt|stop|failure>`: write a harness's events on a session.
 //!
 //! A harness that drives the model itself (Claude Code, Hermes) reports three
-//! things to a conversation: the prompt a person typed, the message that ended
+//! things to a session: the prompt a person typed, the message that ended
 //! a turn, and a turn that ended badly. Each is one fact appended to the
-//! transcript, and nothing else: the conversation keeps no turn, round or
+//! transcript, and nothing else: the session keeps no turn, round or
 //! request state, so there is nothing to open, hold or close. A harness that
 //! backgrounds a slow call and carries on is recorded the same way as one that
 //! does not -- the call's `tool_use` and its result are facts appended whenever
@@ -14,23 +14,23 @@
 //! recorded, finds it in the transcript and writes nothing, so recording is
 //! idempotent without the step keeping any state of its own.
 //!
-//! The result is the conversation as it now stands (`conversation`), and
+//! The result is the session as it now stands (`session`), and
 //! `status` saying what happened:
 //!
-//! - `created`: the first prompt, which made the conversation
-//! - `forked`: the first prompt, which made the conversation as a fork of `from`
+//! - `created`: the first prompt, which made the session
+//! - `forked`: the first prompt, which made the session as a fork of `from`
 //! - `recorded`: the event was written (or had been already)
 //! - `nothing`: a stop with no closing message to record
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use conversation_protocol::v3::apply::{apply, client_signature, mint, mint_with_parents, Transition};
-use conversation_protocol::v3::legacy;
-use conversation_protocol::v3::oid::ensure_genesis;
-use conversation_protocol::v3::reconcile::MergeOutcome;
-use conversation_protocol::v3::tree::{ObjectStore, TreeBuilder};
-use conversation_protocol::v3::view::Conversation;
-use conversation_protocol::v3::{
+use session_protocol::v3::apply::{apply, client_signature, mint, mint_with_parents, Transition};
+use session_protocol::v3::legacy;
+use session_protocol::v3::oid::ensure_genesis;
+use session_protocol::v3::reconcile::MergeOutcome;
+use session_protocol::v3::tree::{ObjectStore, TreeBuilder};
+use session_protocol::v3::view::Session;
+use session_protocol::v3::{
     paths, Block, GitStore, Identity, IdentityKind, Oid, RefUpdate, Role, Signature,
     TranscriptEntry,
 };
@@ -57,12 +57,12 @@ pub(crate) struct Request {
     /// The model a stop's closing message is recorded as written by, when the
     /// harness names one.
     model: String,
-    /// A git locator naming the COMMIT a NEW conversation's content comes from
+    /// A git locator naming the COMMIT a NEW session's content comes from
     /// (`content-locator`). A root parents it and starts from its tree; a fork
-    /// merges it into the conversation it forks.
+    /// merges it into the session it forks.
     content: Option<String>,
-    /// A conversation commit to FORK, for a NEW conversation: the prompt's
-    /// conversation is then made as a fork of it, as it stands, rather than as
+    /// A session commit to FORK, for a NEW session: the prompt's
+    /// session is then made as a fork of it, as it stands, rather than as
     /// a root.
     from: Option<Oid>,
 }
@@ -79,7 +79,7 @@ impl Request {
             other => return Err(format!("--record is prompt, stop or failure, not {other:?}")),
         };
         let message_id = read_arg("message-id")?.trim().to_string();
-        conversation_protocol::v3::ids::validate_client_key(&message_id)
+        session_protocol::v3::ids::validate_client_key(&message_id)
             .map_err(|error| format!("--message-id: {error}"))?;
         let content = read_arg_opt("content-locator")?
             .map(|locator| locator.trim().to_string())
@@ -100,29 +100,29 @@ impl Request {
     }
 }
 
-pub(crate) fn run(conversation: &str, request: &Request) -> Result<(), String> {
+pub(crate) fn run(session: &str, request: &Request) -> Result<(), String> {
     let mut state = loop {
-        match State::open_if_present(conversation)? {
+        match State::open_if_present(session)? {
             Some(state) => break state,
             None if request.kind == Kind::Prompt => {
                 // Another prompt may create it between our look and our push; the
                 // loser opens the winner's.
-                if let Some(state) = create(conversation, request)? {
+                if let Some(state) = create(session, request)? {
                     return forward(&state, if request.from.is_some() { "forked" } else { "created" });
                 }
             }
             None => {
                 return Err(format!(
-                    "no conversation {conversation:?} to record into; \
+                    "no session {session:?} to record into; \
                      a session's first recorded event is its user prompt"
                 ))
             }
         }
     };
     let status = match request.kind {
-        Kind::Prompt => prompt(conversation, &mut state, request)?,
-        Kind::Stop => stop(conversation, &mut state, request)?,
-        Kind::Failure => failure(conversation, &mut state, request)?,
+        Kind::Prompt => prompt(session, &mut state, request)?,
+        Kind::Stop => stop(session, &mut state, request)?,
+        Kind::Failure => failure(session, &mut state, request)?,
     };
     forward(&state, status)
 }
@@ -148,7 +148,7 @@ fn signature(actor: &str) -> Result<Signature, String> {
     Ok(client_signature(actor, &format!("{actor}@caos"), now()?))
 }
 
-/// The same title the tui gives a conversation from its first message.
+/// The same title the tui gives a session from its first message.
 fn title(prompt: &str) -> String {
     const MAX_CHARS: usize = 60;
     let compact = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -165,10 +165,10 @@ fn title(prompt: &str) -> String {
 
 /// The transcript entry this event writes: the prompt, the closing message or
 /// the failure, authored by the harness's actor.
-fn entry(conversation: &str, request: &Request, role: Role) -> TranscriptEntry {
+fn entry(session: &str, request: &Request, role: Role) -> TranscriptEntry {
     TranscriptEntry {
         message_id: request.message_id.clone(),
-        conversation: conversation.to_string(),
+        session: session.to_string(),
         role,
         actor: request.actor.clone(),
         model: (role == Role::Assistant && !request.model.is_empty())
@@ -185,12 +185,12 @@ fn entry(conversation: &str, request: &Request, role: Role) -> TranscriptEntry {
 fn mint_prompt(
     store: &mut GitStore,
     parent: &Oid,
-    conversation: &str,
+    session: &str,
     request: &Request,
     signature: &Signature,
 ) -> Result<Oid, String> {
     let transition = Transition::MessageAppend {
-        entry: entry(conversation, request, Role::User),
+        entry: entry(session, request, Role::User),
         payloads: Vec::new(),
     };
     let applied = apply(store, Some(parent), &transition)?;
@@ -199,7 +199,7 @@ fn mint_prompt(
 
 /// The commit a content locator names, in `store` with its history. The server
 /// is asked first: a `git+caos://` locator names it, and any commit a
-/// conversation was made from before is still there. Otherwise the commit is
+/// session was made from before is still there. Otherwise the commit is
 /// fetched from the repository the locator names, with the GitHub token the
 /// `import-source` tool would use, and the push that follows carries its history
 /// to the server. A locator pins its commit, so the answer is the rev it names.
@@ -229,26 +229,26 @@ fn content_commit(store: &GitStore, locator: &str) -> Result<Oid, String> {
     Ok(commit)
 }
 
-/// The tree a conversation's content was seeded from: its root's tree, found by
-/// following first parents from `head`, without the conversation's own .caos/.
+/// The tree a session's content was seeded from: its root's tree, found by
+/// following first parents from `head`, without the session's own .caos/.
 fn seed_tree(store: &mut GitStore, head: &Oid) -> Result<Oid, String> {
     // By kind name, so a v5 source (whose history holds kinds this build no
     // longer has) is walked too.
-    let root = legacy::conversation_root(store, head)?;
+    let root = legacy::session_root(store, head)?;
     let mut tree = TreeBuilder::from(Some(store.read_commit(&root).map_err(String::from)?.tree));
     tree.delete(paths::CAOS_DIR);
     Ok(tree.build(store)?)
 }
 
-/// Make the conversation as a FORK of `from`, with its first prompt: the fork,
+/// Make the session as a FORK of `from`, with its first prompt: the fork,
 /// then its first prompt, pushed together with the creator's membership
-/// refs. `None` when the conversation exists, so the caller records onto it.
+/// refs. `None` when the session exists, so the caller records onto it.
 ///
-/// `from` is forked as it stands. A conversation is a flat transcript, so a
+/// `from` is forked as it stands. A session is a flat transcript, so a
 /// source that died mid-turn needs no settling first; its unfinished calls are
 /// tool_use blocks with no result, carried into the fork as they are.
-fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Option<State>, String> {
-    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+fn create_fork(session: &str, request: &Request, from: &Oid) -> Result<Option<State>, String> {
+    let refname = session_protocol::v3::refs::head_ref(session)?;
     let mut store = State::scratch_store()?;
     if store.fetch_ref(&refname)?.is_some() {
         return Ok(None);
@@ -258,19 +258,19 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     let v5 = legacy::is_v5(&store, from)?;
     let source_id = match v5 {
         true => legacy::v5_id(&store, from)?,
-        false => Conversation::open(&store, from)?.identity()?.id,
+        false => Session::open(&store, from)?.identity()?.id,
     };
-    if source_id == conversation {
-        return Err("a fork's id must differ from its source conversation".to_string());
+    if source_id == session {
+        return Err("a fork's id must differ from its source session".to_string());
     }
     let signature = signature(&request.actor)?;
     // With a content locator the fork starts from the MERGE of its source and
     // that commit, as git merges them: the base is what the two share, which the
     // root's parent gives them. .caos/ is the fork's own record and stays as the
     // source left it. A conflict refuses the fork, naming the files: nobody is
-    // in the conversation yet to resolve it.
+    // in the session yet to resolve it.
     //
-    // A conversation made before roots parented their content commit is rooted
+    // A session made before roots parented their content commit is rooted
     // on G3 and shares no history with that repository, so git finds no base.
     // Its root's content, without .caos/, is the tree it was seeded from, and
     // the fork merges from that instead.
@@ -301,18 +301,18 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     };
     let title = format!("fork of {}", &from.as_str()[..12]);
     let forked = if v5 {
-        // Rebuilt as a new root from the v5 conversation (`legacy`), parented on
-        // the content commit as a new conversation is, so a later fork finds the
+        // Rebuilt as a new root from the v5 session (`legacy`), parented on
+        // the content commit as a new session is, so a later fork finds the
         // base to merge that repository's newer commit in from.
         let parent = match merged.first() {
             Some(commit) => commit.clone(),
             None => ensure_genesis(&mut store)?,
         };
-        legacy::migrate_v5(&mut store, from, conversation, &title, content, &parent, &signature)?
+        legacy::migrate_v5(&mut store, from, session, &title, content, &parent, &signature)?
     } else {
-        let transition = Transition::ConversationFork {
+        let transition = Transition::SessionFork {
             identity: Identity {
-                id: conversation.to_string(),
+                id: session.to_string(),
                 kind: IdentityKind::Fork {
                     source: from.clone(),
                 },
@@ -332,10 +332,10 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
         )?
     };
     let mut state = State::from_store(store, refname.clone(), forked.clone())?;
-    let claimed = mint_prompt(state.store_mut(), &forked, conversation, request, &signature)?;
-    let active = conversation_protocol::v3::refs::active_membership_ref(&request.actor, conversation)?;
+    let claimed = mint_prompt(state.store_mut(), &forked, session, request, &signature)?;
+    let active = session_protocol::v3::refs::active_membership_ref(&request.actor, session)?;
     let archived =
-        conversation_protocol::v3::refs::archived_membership_ref(&request.actor, conversation)?;
+        session_protocol::v3::refs::archived_membership_ref(&request.actor, session)?;
     // Negotiated: the content commit's history is on the server under no
     // advertised ref, and only negotiation keeps it out of the pack.
     let pushed = state.store().push_negotiating(&[
@@ -368,18 +368,18 @@ fn create_fork(conversation: &str, request: &Request, from: &Oid) -> Result<Opti
     }
 }
 
-/// Make the conversation, with its first prompt: root and message, pushed
+/// Make the session, with its first prompt: root and message, pushed
 /// together to a ref that must not exist. `None` when it does, so
 /// the caller records onto the winner's.
-fn create(conversation: &str, request: &Request) -> Result<Option<State>, String> {
+fn create(session: &str, request: &Request) -> Result<Option<State>, String> {
     if let Some(from) = &request.from {
-        return create_fork(conversation, request, from);
+        return create_fork(session, request, from);
     }
-    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    let refname = session_protocol::v3::refs::head_ref(session)?;
     let mut store = State::scratch_store()?;
     // The root PARENTS the commit its content came from, so that a fork made
     // later can merge that repository's newer commit in with git finding the
-    // base. Without content it parents G3, the genesis every conversation shares.
+    // base. Without content it parents G3, the genesis every session shares.
     let (parent, content) = match &request.content {
         Some(locator) => {
             let commit = content_commit(&store, locator)?;
@@ -389,9 +389,9 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
         None => (ensure_genesis(&mut store)?, None),
     };
     let signature = signature(&request.actor)?;
-    let root = Transition::ConversationRoot {
+    let root = Transition::SessionRoot {
         identity: Identity {
-            id: conversation.to_string(),
+            id: session.to_string(),
             kind: IdentityKind::Root,
             owner: None,
         },
@@ -401,9 +401,9 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
     let applied = apply(&mut store, None, &root)?;
     let root = mint(&mut store, &parent, &applied, root.kind(), &signature)?;
     // The chain is minted in a State whose head is the root, so it can use the
-    // same helpers as a conversation that exists; only the push differs.
+    // same helpers as a session that exists; only the push differs.
     let mut state = State::from_store(store, refname.clone(), root.clone())?;
-    let claimed = mint_prompt(state.store_mut(), &root, conversation, request, &signature)?;
+    let claimed = mint_prompt(state.store_mut(), &root, session, request, &signature)?;
     // the server under no advertised ref.
     let pushed = state.store().push_negotiating(&[RefUpdate {
         refname: refname.clone(),
@@ -423,31 +423,31 @@ fn create(conversation: &str, request: &Request) -> Result<Option<State>, String
     }
 }
 
-fn prompt(conversation: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
-    append(conversation, state, request, Role::User, "prompt")
+fn prompt(session: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
+    append(session, state, request, Role::User, "prompt")
 }
 
 /// The message that ended a turn. A harness that moved a call to the background
 /// ends its turn with that call still running; its result is a fact recorded
 /// whenever it arrives, so nothing here waits for it or keeps anything open.
-fn stop(conversation: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
+fn stop(session: &str, state: &mut State, request: &Request) -> Result<&'static str, String> {
     if request.text.trim().is_empty() {
         return Ok("nothing");
     }
-    append(conversation, state, request, Role::Assistant, "stop")
+    append(session, state, request, Role::Assistant, "stop")
 }
 
 fn failure(
-    conversation: &str,
+    session: &str,
     state: &mut State,
     request: &Request,
 ) -> Result<&'static str, String> {
-    append(conversation, state, request, Role::System, "failure")
+    append(session, state, request, Role::System, "failure")
 }
 
 /// Append the event's entry, once: a repeat finds its message id already there.
 fn append(
-    conversation: &str,
+    session: &str,
     state: &mut State,
     request: &Request,
     role: Role,
@@ -455,12 +455,12 @@ fn append(
 ) -> Result<&'static str, String> {
     for _ in 0..progress::MAX_APPEND_ATTEMPTS {
         state.reload()?;
-        if message_ordinal(&state.conversation()?, &request.message_id)?.is_some() {
+        if message_ordinal(&state.session()?, &request.message_id)?.is_some() {
             return Ok("recorded");
         }
         let expected = state.head().clone();
         let transition = Transition::MessageAppend {
-            entry: entry(conversation, request, role),
+            entry: entry(session, request, role),
             payloads: Vec::new(),
         };
         match state.try_append_at(&expected, transition)? {
@@ -469,6 +469,6 @@ fn append(
         }
     }
     Err(format!(
-        "conversation {conversation:?} kept changing while its {what} was recorded"
+        "session {session:?} kept changing while its {what} was recorded"
     ))
 }

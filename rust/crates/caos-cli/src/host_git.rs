@@ -3,14 +3,14 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Check out a conversation's head commit in the local working tree.
+/// Check out a session's head commit in the local working tree.
 ///
 /// This is deliberately client policy rather than part of the chat engine:
 /// the TUI requires an explicit local destination, which it can remember.
 /// Rather than applying the base-to-head diff as unstaged changes,
-/// this moves the local HEAD onto the conversation head commit so the checkout
+/// this moves the local HEAD onto the session head commit so the checkout
 /// exactly matches it.
-pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), String> {
+pub fn load_session_source_tree(head: &str, cwd: &Path) -> Result<(), String> {
     let dirty = capture_required(
         "git",
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -18,7 +18,7 @@ pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), Strin
     )?;
     if !dirty.is_empty() {
         return Err(
-            "the working tree is not clean; commit or stash local changes before checking out the conversation head"
+            "the working tree is not clean; commit or stash local changes before checking out the session head"
                 .to_string(),
         );
     }
@@ -29,12 +29,12 @@ pub fn load_conversation_source_tree(head: &str, cwd: &Path) -> Result<(), Strin
 /// Commit the current working tree onto the local `HEAD` and return the new
 /// commit together with its shared ancestor with the selected source_tree.
 ///
-/// This is the inverse of `load_conversation_source_tree`: after checking out a
-/// conversation head and editing files, `/update-tree` folds those files into a
+/// This is the inverse of `load_session_source_tree`: after checking out a
+/// session head and editing files, `/update-tree` folds those files into a
 /// user-authored turn. It deliberately DOES commit — staging everything with
 /// `git add -A` and committing when the tree is dirty — so the checkout is left
 /// clean and its `HEAD` matches exactly what the turn receives. A later
-/// `/checkout` onto the conversation's new head then succeeds instead of tripping
+/// `/checkout` onto the session's new head then succeeds instead of tripping
 /// the clean-tree guard. When the working tree is already clean (the user
 /// committed the changes themselves), nothing is committed and the current
 /// `HEAD` is returned. `git add -A` respects `.gitignore`, so the commit
@@ -72,7 +72,7 @@ pub fn commit_working_tree(
 /// Resolve the default branch and its tip from the LOCAL branch, without
 /// touching the network.
 ///
-/// Starting a new conversation only needs a base commit to build on, and the
+/// Starting a new session only needs a base commit to build on, and the
 /// tip of your local default branch (e.g. `main`) is a fine one. This discovers
 /// the default branch *name* from the `origin/HEAD` symref, then reads the local
 /// `refs/heads/<name>` — not the `origin/<name>` tracking ref — so it reflects
@@ -180,15 +180,15 @@ mod tests {
     }
 
     #[test]
-    fn load_requires_a_clean_checkout_and_checks_out_the_conversation_head() {
+    fn load_requires_a_clean_checkout_and_checks_out_the_session_head() {
         let dir = temp_repo("load-test");
         let base = commit_file(&dir, "base\n", "base");
-        let head = commit_file(&dir, "conversation result\n", "turn");
+        let head = commit_file(&dir, "session result\n", "turn");
         capture_required("git", &["switch", "--detach", "-q", &base], &dir).unwrap();
-        load_conversation_source_tree(&head, &dir).unwrap();
+        load_session_source_tree(&head, &dir).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("file.txt")).unwrap(),
-            "conversation result\n"
+            "session result\n"
         );
         assert_eq!(
             capture_required("git", &["rev-parse", "HEAD"], &dir).unwrap(),
@@ -196,7 +196,7 @@ mod tests {
         );
 
         std::fs::write(dir.join("file.txt"), "local edit\n").unwrap();
-        assert!(load_conversation_source_tree(&head, &dir)
+        assert!(load_session_source_tree(&head, &dir)
             .unwrap_err()
             .contains("working tree is not clean"));
 

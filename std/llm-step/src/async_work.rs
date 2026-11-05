@@ -1,8 +1,8 @@
-//! Model-facing independent work on v3 conversation refs.
+//! Model-facing independent work on v3 session refs.
 
 use std::process::Command;
 
-use conversation_protocol::v3::{refs, Oid};
+use session_protocol::v3::{refs, Oid};
 use serde_json::{json, Value};
 use worker_common::{prepare_request, Arg};
 
@@ -91,7 +91,7 @@ pub fn dispatch(task: &Oid) -> Result<(), String> {
     Ok(())
 }
 
-/// Recovery proves that the immutable task still targets this conversation
+/// Recovery proves that the immutable task still targets this session
 /// before redispatching it verbatim.
 pub fn task_request(task: &Oid) -> Result<(String, String), String> {
     let mut arguments =

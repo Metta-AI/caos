@@ -1,4 +1,4 @@
-# Agent harness: conversations as commit chains — design note
+# Agent harness: sessions as commit chains — design note
 
 > **Historical context only.** The authoritative chat design is
 > [`chat.md`](chat.md) (v3). The schemas and ref layouts described below
@@ -6,10 +6,10 @@
 > migrate them. Current chat is isolated below `refs/caos/v3/`; the old
 > refs may remain in place and are invisible to the v3 clients.
 
-**Status:** historical for conversation storage and turn lifecycle. The
+**Status:** historical for session storage and turn lifecycle. The
 run-then, tool, and model-loop background remains useful, but the commit shapes,
 multi-ref protocol, progress/status refs, and client ownership described below
-were superseded by the conversation spine in `chat.md`. Treat that
+were superseded by the session spine in `chat.md`. Treat that
 document and the current code as normative; this note is retained as the
 implementation history that led to them. The implemented background includes
 run-then and first-class commits, the bounded bash tool
@@ -19,10 +19,10 @@ run-then and first-class commits, the bounded bash tool
 
 ## Idea
 
-Each turn of a conversation (a human update, or an agent response) is a git
+Each turn of a session (a human update, or an agent response) is a git
 commit: message = the turn's text, tree = the source tree after the turn,
-parent = the previous turn (or the base commit the conversation started from).
-The commit DAG *is* the conversation store: branching a conversation is a
+parent = the previous turn (or the base commit the session started from).
+The commit DAG *is* the session store: branching a session is a
 commit with the same parent, retrying is a new commit with a new timestamp,
 and `git log` / `git diff` are the transcript and review UI.
 
@@ -38,9 +38,9 @@ Why it fits caos:
 
 ## Commit structure
 
-Two kinds of commits, one conversation spine:
+Two kinds of commits, one session spine:
 
-- **Human turn** — created client-side, no run needed. Parent = conversation
+- **Human turn** — created client-side, no run needed. Parent = session
   head; tree = source tree (with any human edits); message = the human's text.
 - **Step commit** (internal) — one LLM API round. The chain of steps hangs
   off the human turn (step 1's parent is the human commit; each next step's
@@ -58,7 +58,7 @@ Step and turn commits are authored **`caos-agent <caos@caos>`** with real
 wall-clock timestamps (so a retried turn is a distinct commit); that author
 name is also how the transcript walk recognizes an agent turn — walking the
 first-parent spine down from a human turn, a `caos-agent` parent is the
-previous turn's merge and anything else is the conversation's base commit.
+previous turn's merge and anything else is the session's base commit.
 
 **`.caos/step.json`** (defined here; the tests pin it):
 
@@ -79,15 +79,15 @@ turn merge's second parent is that step. (A delta from the first draft, which
 minted steps only for tool-call rounds and would have dropped the last
 tool_results from the tree.)
 
-So `git log --first-parent` is the clean conversation; following second
+So `git log --first-parent` is the clean session; following second
 parents gives the full transcript with stock git tooling. All step data is
-tree-reachable, so a plain fetch of the conversation head transfers every
+tree-reachable, so a plain fetch of the session head transfers every
 source tree state and every API exchange (a blob oid named only in a commit
 message would be unreachable — messages are text, not references).
 
 Diff shapes: step↔step = real edits + one modified `.caos/step.json`;
 turn↔step = real edits + one deletion; turn↔turn = pure. `.caos` is a
-reserved name — the harness errors at conversation start if the base tree
+reserved name — the harness errors at session start if the base tree
 already contains one.
 
 ## The step loop
@@ -96,11 +96,11 @@ already contains one.
 `curry(runner, bin=worker-llm-step)` in the shared runner pool, not as its
 own image):
 
-- `head:commit=` — the human-turn commit to answer (the conversation head);
+- `head:commit=` — the human-turn commit to answer (the session head);
 - secret: `anthropic-api-key`, injected at `/secret/anthropic-api-key`;
 - curried config: `system` (the system prompt), `bash-image` (the
   tool registry — just bash for now, an image ref), `model`, `base-url` (default
-  `https://api.anthropic.com`; tests point it at a stub), `conversation`
+  `https://api.anthropic.com`; tests point it at a stub), `session`
   (names the progress ref);
 - continuation state, curried by the worker itself between tool calls:
   `step:commit=` (the newest step commit), `pending` / `results` (JSON arrays
@@ -151,13 +151,13 @@ Tool classes:
   `eval-path-then` continuation and exits, the server walks `.caos-expr` from a
   root down to the path on a request thread, and the callback receives the
   object it produced. `eval_path` is the one that HANDS THAT OBJECT TO THE
-  MODEL: `<kind> <hash>` for a path (conversation-relative, so a source-tree
+  MODEL: `<kind> <hash>` for a path (session-relative, so a source-tree
   prefix scopes it exactly as `run_tool`'s does) within a root that defaults to
-  the conversation tree. That closes a real gap — a build product exists at no
+  the session tree. That closes a real gap — a build product exists at no
   path in any tree, so before this a model could ask a tool to build something
   and then had no way to look at what came out. The hash it returns is a `root`
   for `read`, `ls`, `grep` and `eval_path` itself, and every one of those
-  accepts ANY object the server holds, not only a revision of the conversation
+  accepts ANY object the server holds, not only a revision of the session
   (`tests/llm-eval-path`). `--catch` makes a path that cannot be evaluated an
   `is_error` tool_result, which matters more here than for a tool: the model
   asked what a path evaluates to, and "it doesn't" is an answer.
@@ -262,15 +262,15 @@ itself. `caos mcp` is that harness: Claude Code chooses the calls and reads the
 results, and caos keeps the durable record.
 
 - `--list-tools` describes the tools as JSON and stops. Nothing about a
-  conversation is read, and NO TREE IS NAMED: a tool server is asked for its
-  tools before there is a conversation to run them in, and a repository's own
+  session is read, and NO TREE IS NAMED: a tool server is asked for its
+  tools before there is a session to run them in, and a repository's own
   tools are reached by path through `tool_help`/`run_tool` rather than
   enumerated (SPEC, "CaosTools"). The answer is therefore the same whatever
-  source trees a conversation gains. It used to accept
+  source trees a session gains. It used to accept
   `--workspace:hash=<tree>`, which pushed the caller's whole working tree to
   the server for an argument the step never read.
 - `--tools-only=<call id>` drains the request's declared calls and stops,
-  leaving the request RUNNING for the next one, with the conversation as it
+  leaving the request RUNNING for the next one, with the session as it
   now stands as its result. The named call must have completed by the time the
   queue empties, which is what makes a dispatch prove it did its own work.
 
@@ -301,7 +301,7 @@ commit). Hand-rolled retry on 429/5xx honoring `retry-after`. Top-level
 an identical prefix, so steps after the first read the prompt cache.
 
 Secrets: a turn's requests present the user's SecretReaderKeys and the
-conversation (SPEC.md, "Secrets"). `llm-step` reads `anthropic-api-key` from
+session (SPEC.md, "Secrets"). `llm-step` reads `anthropic-api-key` from
 `/secret/anthropic-api-key`; the value never enters its args or CAS. The server
 grants it where evaluation reaches a granted image, marks that image with
 `secret-hash` for its per-secret cache identity, and injects it into tool
@@ -310,8 +310,8 @@ sub-runs built from granted images.
 ## Progress
 
 The step chain grows in real time. The step worker pushes
-`refs/caos/conversations/<name>/from-agent` (next to the conversation head, so a conversation's refs sit together) to the server's existing smart-HTTP
-transport after each step (when a `conversation` arg names one); the client
+`refs/caos/conversations/<name>/from-agent` (next to the session head, so a session's refs sit together) to the server's existing smart-HTTP
+transport after each step (when a `session` arg names one); the client
 watches a turn by polling `git fetch` on that ref. No new progress API, no
 enabling change: the server sets `http.receivepack=true` on its repo at
 startup (`main.rs`), so push over smart-HTTP already works. (A stale comment
@@ -327,7 +327,7 @@ turn completes, steps are unreferenced objects known only by hash. And it
 doubles as crash insurance — if a turn run fails past retries (e.g. API
 errors), the minted steps are orphaned but still reachable via the progress
 ref; a retry restarts from the human commit today, but the ref head is a
-valid conversation state a future resume could start from.
+valid session state a future resume could start from.
 
 **In-round status** (finer than the step): the API call is the one slow,
 silent part of a turn — a toolless turn mints no step until it's over, and a
@@ -338,7 +338,7 @@ rate-limited round sleeps invisibly. So the worker also force-updates
 (the blob goes up via `/object` first). The first line scopes the status to
 its turn, so a client can ignore a previous turn's leftover. The client polls
 it in the same 2s loop and prints changes to *stderr* (transient meta, not
-conversation content). Same best-effort contract as the progress ref.
+session content). Same best-effort contract as the progress ref.
 
 ## Client
 
@@ -356,9 +356,9 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
 "Host and launcher inputs").
 
 - **`caos talk [<prompt>]`** — the everyday surface. The positional argument
-  is the prompt; the conversation is the repo's most recently advanced one
+  is the prompt; the session is the repo's most recently advanced one
   (`refs/caos/v2/conversations/*` by committer date), `-c <name>` picks one, and
-  `--new` mints a fresh auto-named `talk-<n>`. The chosen conversation is
+  `--new` mints a fresh auto-named `talk-<n>`. The chosen session is
   announced on stderr. With no prompt on a terminal it loops — one turn per
   line, ctrl-d ends, a failed turn is reported and the loop continues (the
   ref didn't advance, so the next line retries from the same head); with
@@ -367,22 +367,22 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   one-turn form (message from `-m` or stdin).
 - **`caos tui [--new | --from <turn>]`** — a Ratatui/Crossterm client in its
   own crate. It consumes structured `TurnEvent`s from the same engine,
-  reconstructs durable history from server-indexed conversation refs, and
-  presents independent virtual conversations in a left sidebar. A stable
-  conversation ID addresses `refs/caos/v2/conversations/<id>/head`; its mutable
+  reconstructs durable history from server-indexed session refs, and
+  presents independent virtual sessions in a left sidebar. A stable
+  session ID addresses `refs/caos/v2/conversations/<id>/head`; its mutable
   title lives at the sibling `title` ref. Per-user active and archived membership
   lives under `refs/caos/v2/users/<user-key>/conversations/{active,archived}/`,
   where `<user-key>` is `u-` plus lowercase hex of the normalized username's
-  UTF-8 bytes and each final `<conversation-key>` is `c-` plus lowercase hex of
-  the conversation ID's UTF-8 bytes. Usernames are limited to 126 UTF-8 bytes;
-  conversation IDs are limited to 124, leaving room for the encoded terminal
+  UTF-8 bytes and each final `<session-key>` is `c-` plus lowercase hex of
+  the session ID's UTF-8 bytes. Usernames are limited to 126 UTF-8 bytes;
+  session IDs are limited to 124, leaving room for the encoded terminal
   component's Git `.lock` suffix. Keeping the ID in one reversible component
   avoids Git ref file/directory collisions for IDs containing `/`.
   `--username` defaults to `$USER`; shared container accounts such as `root`
   must pass a personal value until persisted identity is implemented.
   `Ctrl+W` atomically archives for that user
   without changing HEAD or another user's state; `--list-archived` and
-  `--unarchive` recover old conversations. Every conversation retains its own
+  `--unarchive` recover old sessions. Every session retains its own
   transcript, prompt, activity, diff, and running worker thread, so turns can
   advance concurrently while the user switches between them. Live status and
   tool activity sit in a collapsible strip above the multiline prompt; each
@@ -395,9 +395,9 @@ points is the caller's tree's business, not this client's (`design/chat.md`,
   local checkout. `Ctrl+H` opens the keyboard and slash-command reference.
   The agent publishes PRs itself (agent-github.md, "PRs"); the client has no
   publish command. Merely opening, running, switching, or publishing
-  conversations never mutates the checkout. `/load` imports a
-  `remote/caos/<conversation>` branch or
-  GitHub PR back into the canonical server-side conversation. Imports preserve
+  sessions never mutates the checkout. `/load` imports a
+  `remote/caos/<session>` branch or
+  GitHub PR back into the canonical server-side session. Imports preserve
   the ID and event spine, allow only first-parent advancement, and reject
   divergent ID collisions. Progress remains one completed API round at a time,
   and a running turn is not cancellable until the server/runner protocol grows
@@ -410,12 +410,12 @@ document banner, not the current chat implementation.
 
 A turn creates the human commit → requests the run → hangs, printing progress
 from the ref → on completion advances `refs/caos/conversations/<name>/from-user` (in
-the *local* repo) and prints the response text and short hash. Conversation
+the *local* repo) and prints the response text and short hash. Session
 identity is that ref — the only mutable thing, owned by the client. Shared
-flags: `--base <revspec>` (a new conversation's base commit, default `HEAD` —
+flags: `--base <revspec>` (a new session's base commit, default `HEAD` —
 refused if its tree carries a top-level `.caos`), `--system <text>` /
 `--system-file <path>` (default: a short coding-agent prompt), `--model`,
-`--base-url`, and `--log` (print the conversation so far — the first-parent
+`--base-url`, and `--log` (print the session so far — the first-parent
 walk — and run nothing). The API key comes only from `$ANTHROPIC_API_KEY`
 (checked before anything is minted).
 
@@ -482,11 +482,11 @@ deadlines are comfortable; the top-level pending timeout
    progress ref push). **Done** (`crates/worker-llm-step`,
    `tests/llm-step` and the focused `tests/llm-{async,subagent,interrupt}`
    suites — end-to-end against a scripted stub API).
-5. `caos-cli chat` (human commits, conversation ref, progress printing).
+5. `caos-cli chat` (human commits, session ref, progress printing).
    **Done** (`crates/caos-cli/src/lib.rs`, `tests/chat-offline` and its
    `tests/chat-tools*` siblings; real-API turn: `tests/chat-online`).
 6. `caos talk` + std-published worker curries — prompt-first surface, sticky
-   conversation, interactive loop; `std/bash-tool` and `std/llm-step`
+   session, interactive loop; `std/bash-tool` and `std/llm-step`
    published by build-builtins.sh so a turn needs nothing built or committed
    locally. **Done** (same files; `tests/chat-online` is the UX spec).
 7. Structured client events + `caos tui` — presentation-independent turn

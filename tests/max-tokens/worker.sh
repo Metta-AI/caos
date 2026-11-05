@@ -23,7 +23,7 @@ printf '{"content":%s,"stop_reason":"max_tokens"}' "$P2" > /tmp/stub/response-2.
 printf '{"content":%s,"stop_reason":"end_turn"}' "$P3" > /tmp/stub/response-3.json
 start_stub /tmp/stub
 
-new_llm_conversation max-tokens "$STUB_PORT" "$ws" \
+new_llm_session max-tokens "$STUB_PORT" "$ws" \
   "You are a coding agent operating on a git source_tree."
 dispatch_turn "write me a long answer"
 wait_turn || fail "the max-tokens turn never reached a terminal head"

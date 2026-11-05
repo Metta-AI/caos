@@ -39,7 +39,7 @@ printf '%s\n' \
   > /tmp/stub/response-2.json
 start_stub /tmp/stub
 
-new_llm_conversation tools-remove "$STUB_PORT" "$ws"
+new_llm_session tools-remove "$STUB_PORT" "$ws"
 dispatch_turn "exercise remove"
 wait_turn || fail "the turn never reached a terminal head"
 
