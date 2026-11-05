@@ -1760,6 +1760,11 @@ fn launch_resolved_tool(
     if tool.call {
         args.push(("call", Arg::Lit(&call.id)));
     }
+    // `@request-id` the caller left out: the call's own id, so this call is its
+    // own run and the transcript says which key it used.
+    if tool.request_id && !args.iter().any(|(name, _)| *name == tools::REQUEST_ID) {
+        args.push((tools::REQUEST_ID, Arg::Lit(&call.id)));
+    }
     let task = (|| {
         let curried = caos_curry(Arg::Hash(&tool_tree), &args)?;
         let task_text = prepare_request(Arg::Hash(&curried), &input)?;
