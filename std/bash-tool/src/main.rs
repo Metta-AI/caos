@@ -89,8 +89,10 @@ fn run() -> Result<(), String> {
     // Assemble the result value.
     let res = scratch("result")?;
     fs::write(res.join("exit"), format!("{exit}\n")).map_err(|e| format!("writing exit: {e}"))?;
-    fs::write(res.join("stdout"), tail(&out.stdout)).map_err(|e| format!("writing stdout: {e}"))?;
-    fs::write(res.join("stderr"), tail(&out.stderr)).map_err(|e| format!("writing stderr: {e}"))?;
+    fs::write(res.join("command-stdout"), tail(&out.stdout))
+        .map_err(|e| format!("writing command-stdout: {e}"))?;
+    fs::write(res.join("command-stderr"), tail(&out.stderr))
+        .map_err(|e| format!("writing command-stderr: {e}"))?;
     if !denied.is_empty() {
         let listing: Vec<&str> = denied.iter().map(String::as_str).collect();
         fs::write(res.join("denied"), listing.join("\n") + "\n")
