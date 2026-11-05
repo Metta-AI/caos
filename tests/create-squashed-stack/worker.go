@@ -235,7 +235,7 @@ func launch(i int) {
 	}
 	w.Step(fmt.Sprintf("case %d: %s", i, path))
 	request := caos("prepare-request", "--base:hash="+caos("hash", "/cas/args/squash"),
-		"--in:@=/cas/conv", "--plan="+path)
+		"--root:@=/cas/conv", "--plan="+path)
 	caos("run-request-then", request, "--then:hash="+next(i))
 }
 
