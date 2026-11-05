@@ -214,7 +214,7 @@ wait_for_file /tmp/stub/request-6.json || fail "harvest model request never arri
 # tree, which is what selects that scope. `write` stages the tool first -- a
 # directory whose `.caos-expr` names std/bash-tool's image, which nothing
 # registers.
-printf '{"content":[{"id":"toolu_tool","input":{"content":"curry --base:hash=%s\\n","file-path":"tools/sh/.caos-expr"},"name":"write","type":"tool_use"},{"id":"toolu_promote","input":{"arguments":{"cmd":"caos get-hash %s /cas/promoted && ln -s /cas/promoted review"},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
+printf '{"content":[{"id":"toolu_tool","input":{"content":"curry --base:hash=%s\\n","file-path":"tools/sh/.caos-expr"},"name":"write","type":"tool_use"},{"id":"toolu_promote","input":{"arguments":{"root":".","cmd":"caos get-hash %s /cas/promoted && ln -s /cas/promoted review"},"path":"tools/sh"},"name":"run_tool","type":"tool_use"},{"id":"toolu_harvest","input":{"child":"%s"},"name":"harvest_agent","type":"tool_use"}],"stop_reason":"tool_use"}\n' \
   "$(caos hash /cas/args/bash-tool)" "$child_main" "$child" > /tmp/stub/response-6.json
 wait_turn || fail "the harvest turn never reached a terminal event"
 head2=$head
