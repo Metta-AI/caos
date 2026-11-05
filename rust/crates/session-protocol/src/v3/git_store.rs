@@ -1587,6 +1587,48 @@ mod tests {
         assert_eq!(store.read_ref(right).unwrap(), Some(second));
     }
 
+    /// A session recorded before the rename has only its v3 ref. Reading the v4
+    /// name finds it there, and the first write creates the v4 ref, leaving the
+    /// v3 ref where it was so a fork by the old name still finds the history.
+    #[test]
+    fn legacy_session_refs_are_read_and_the_first_write_creates_v4() {
+        let (_directory, _remote, client) = remote_and_client("legacy");
+        let mut store = GitStore::open(&client, Some("caos")).expect("open git store");
+        let tree = store.write_tree(&[]).expect("write empty tree");
+        let first = write_commit(&mut store, &tree, &[], "first\n");
+        let second = write_commit(&mut store, &tree, std::slice::from_ref(&first), "second\n");
+        let head = super::super::refs::head_ref("old-talk").unwrap();
+        let legacy = super::super::refs::legacy_ref(&head).unwrap();
+        store
+            .push(&[RefUpdate {
+                refname: legacy.clone(),
+                expected: None,
+                new: Some(first.clone()),
+            }])
+            .expect("push legacy ref");
+
+        let reader = GitStore::open(&client, Some("caos")).expect("open git store");
+        assert_eq!(reader.fetch_ref(&head).unwrap(), Some(first.clone()));
+        reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(first.clone()),
+                new: Some(second.clone()),
+            }])
+            .expect("the first write creates the v4 ref");
+        assert_eq!(reader.read_ref_exact(&head).unwrap(), Some(second.clone()));
+        assert_eq!(reader.read_ref_exact(&legacy).unwrap(), Some(first.clone()));
+        // From now on the lease is on the v4 ref itself.
+        assert!(reader
+            .push(&[RefUpdate {
+                refname: head.clone(),
+                expected: Some(first),
+                new: Some(second.clone()),
+            }])
+            .is_err());
+        assert_eq!(reader.read_ref(&head).unwrap(), Some(second));
+    }
+
     #[test]
     fn fetch_after_push_transfers_no_new_objects() {
         let (_directory, _remote, client) = remote_and_client("push-fetch");
