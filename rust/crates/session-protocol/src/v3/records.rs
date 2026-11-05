@@ -379,7 +379,9 @@ impl TranscriptEntry {
             let object = value
                 .as_object_mut()
                 .expect("a transcript entry is an object");
-            let session = object.remove("session").expect("an entry names its session");
+            let session = object
+                .remove("session")
+                .expect("an entry names its session");
             object.insert("conversation".to_string(), session);
         }
         encode_record(value)

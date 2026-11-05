@@ -196,7 +196,11 @@ pub fn apply(
             // one: the history it starts from is re-spelled the v7 way, so
             // nothing written after the fork has to know about v6.
             if session.format()? == paths::Format::V6 {
-                builder.put(paths::FORMAT, Mode::Blob, paths::FORMAT_BYTES.as_bytes().to_vec());
+                builder.put(
+                    paths::FORMAT,
+                    Mode::Blob,
+                    paths::FORMAT_BYTES.as_bytes().to_vec(),
+                );
                 let len = session.transcript_len()?;
                 for (ordinal, message_id, entry) in session.transcript(0, len)? {
                     builder.put(

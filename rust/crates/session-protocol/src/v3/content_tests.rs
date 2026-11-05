@@ -402,14 +402,24 @@ fn a_v6_session_appends_as_v6_and_forks_into_v7() {
         payloads: Vec::new(),
     };
     let applied = apply(&mut store, Some(&root_commit), &append).unwrap();
-    let head = mint(&mut store, &root_commit, &applied, append.kind(), &signature).unwrap();
+    let head = mint(
+        &mut store,
+        &root_commit,
+        &applied,
+        append.kind(),
+        &signature,
+    )
+    .unwrap();
     validate_spine(&store, &head, &mut HashSet::new()).unwrap();
     let view = Session::open(&store, &head).unwrap();
     assert_eq!(view.format().unwrap(), paths::Format::V6);
     let entry_path = paths::transcript_entry_path(0, "user-0");
     let stored = String::from_utf8(view.snapshot().read(&entry_path).unwrap().unwrap()).unwrap();
     assert!(stored.contains("\"conversation\":\"old-talk\""), "{stored}");
-    assert_eq!(view.transcript_entry(0).unwrap().unwrap().1.session, "old-talk");
+    assert_eq!(
+        view.transcript_entry(0).unwrap().unwrap().1.session,
+        "old-talk"
+    );
 
     let fork = Transition::SessionFork {
         identity: Identity {

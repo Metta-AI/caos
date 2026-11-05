@@ -134,8 +134,12 @@ pub fn legacy_ref(refname: &str) -> Option<String> {
     if let Some(rest) = refname.strip_prefix(SESSIONS_PREFIX) {
         return Some(format!("{LEGACY_SESSIONS_PREFIX}{rest}"));
     }
-    let (user_key, rest) = refname.strip_prefix(USERS_PREFIX)?.split_once(USER_SESSIONS)?;
-    Some(format!("{LEGACY_USERS_PREFIX}{user_key}{LEGACY_USER_SESSIONS}{rest}"))
+    let (user_key, rest) = refname
+        .strip_prefix(USERS_PREFIX)?
+        .split_once(USER_SESSIONS)?;
+    Some(format!(
+        "{LEGACY_USERS_PREFIX}{user_key}{LEGACY_USER_SESSIONS}{rest}"
+    ))
 }
 
 /// The refs a session's head may be under, newest naming first: where to look

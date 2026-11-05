@@ -163,8 +163,8 @@ fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
             _ => return Err(format!("secret {file_name}: unknown reader field {word:?}")),
         }
     }
-    let session = session
-        .ok_or_else(|| format!("secret {file_name}: reader:@={path} needs session=<id>"))?;
+    let session =
+        session.ok_or_else(|| format!("secret {file_name}: reader:@={path} needs session=<id>"))?;
     Ok(Reader::Session { path, session })
 }
 
@@ -229,7 +229,9 @@ mod tests {
                 session: "c1".into(),
             }]
         );
-        assert!(spec.render_pushed().contains("reader:@=imports/y/tool session=c1"));
+        assert!(spec
+            .render_pushed()
+            .contains("reader:@=imports/y/tool session=c1"));
     }
 
     #[test]

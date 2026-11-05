@@ -56,7 +56,10 @@ pub fn session_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> 
     loop {
         let info = store.read_commit(&current).map_err(String::from)?;
         // `session.root` since the rename; `conversation.root` in v6 and v5.
-        if matches!(kind_name(&info.message), "session.root" | "conversation.root") {
+        if matches!(
+            kind_name(&info.message),
+            "session.root" | "conversation.root"
+        ) {
             return Ok(current);
         }
         current = info
