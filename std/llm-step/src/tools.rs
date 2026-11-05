@@ -236,6 +236,14 @@ impl TreeTool {
                 ty: ArgType::Tree,
             });
         }
+        if help.request_id && !args.iter().any(|a| a.name == REQUEST_ID) {
+            args.push(TreeArg {
+                name: REQUEST_ID.to_string(),
+                doc: REQUEST_ID_DOC.to_string(),
+                required: false,
+                ty: ArgType::Text,
+            });
+        }
         TreeTool {
             name: name.to_string(),
             doc: help.doc,
@@ -244,6 +252,7 @@ impl TreeTool {
             writer: help.writer,
             wants_in: help.wants_in,
             call: help.call,
+            request_id: help.request_id,
             scope: help.scope,
             op: help.op,
         }
