@@ -645,7 +645,7 @@ fn recorded_session(payload: &Value) -> Result<String, String> {
 /// through the protocol's own parser rather than trusted — whether it arrives
 /// in a hook payload or as a tool argument.
 fn session_id_for(claude_session: &str) -> Result<String, String> {
-    let id = format!("{SESSION_PREFIX}{session}");
+    let id = format!("{SESSION_PREFIX}{claude_session}");
     refs::validate_session_id(&id)?;
     Ok(id)
 }

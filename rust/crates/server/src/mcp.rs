@@ -95,7 +95,7 @@ fn step_tool(name: &str) -> Option<&'static str> {
 /// state. A session id is the one ref component we do not author, so it is
 /// validated through the protocol's own parser rather than trusted.
 fn session_id_for(claude_session: &str) -> Result<String, String> {
-    let id = format!("{SESSION_PREFIX}{session}");
+    let id = format!("{SESSION_PREFIX}{claude_session}");
     refs::validate_session_id(&id)?;
     Ok(id)
 }
@@ -121,7 +121,7 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let session = args.get(SESSION_ARG).and_then(Value::as_str);
+    let claude_session = args.get(SESSION_ARG).and_then(Value::as_str);
     // `help` with no path reports on the server and belongs to no session
     // call: it takes the Claude Code session only to say which caos session that is.
     if name == "help"
@@ -130,9 +130,9 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
             .and_then(Value::as_str)
             .is_none_or(|path| path.trim().is_empty())
     {
-        return Ok(overview(config, caller, session));
+        return Ok(overview(config, caller, claude_session));
     }
-    let session = session.ok_or_else(|| {
+    let claude_session = claude_session.ok_or_else(|| {
         format!(
             "{SESSION_ARG} is missing: the PreToolUse hook that supplies it \
              is not installed, so this call cannot be attributed to a session"
@@ -146,7 +146,7 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         return tool_result(config, ticket.trim(), caller.max_result_chars);
     }
     let step_name = step_tool(name).ok_or_else(|| format!("unknown tool {name:?}"))?;
-    let session = session_id_for(session)?;
+    let session = session_id_for(claude_session)?;
     let secrets = crate::secrets::Context::admit(config, &caller.readers, Some(&session))
         .map_err(|e| e.message().to_string())?;
     let params = step_params(caller, &session, step_name, &args)?;
@@ -372,13 +372,13 @@ fn tool_result_text(value: &Value) -> String {
 
 /// `help` with no path: how caos is doing here. A model that finds caos missing
 /// should be able to ask and get the reason, not conclude caos is absent.
-fn overview(config: &Config, caller: &Caller, session: Option<&str>) -> Value {
-    let session = match session {
+fn overview(config: &Config, caller: &Caller, claude_session: Option<&str>) -> Value {
+    let session = match claude_session {
         None => format!(
             "session: unknown -- this call carried no {SESSION_ARG}, so the \
              PreToolUse hook that supplies it is not installed\n"
         ),
-        Some(session) => match session_id_for(session) {
+        Some(claude_session) => match session_id_for(claude_session) {
             Err(error) => format!("session: Claude Code session {claude_session:?} is unusable: {error}\n"),
             Ok(id) => format!(
                 "session: {id}\nsession head: {}\n",
