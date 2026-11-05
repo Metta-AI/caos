@@ -1703,6 +1703,9 @@ fn launch_resolved_tool(
             Ok(())
         };
     }
+    if tool.root {
+        return launch_root_tool(cfg, state, turn, &call, &tool, &image, &current.message_id);
+    }
     let nested = json!({"id": id, "input":
         call.input.get("arguments").cloned().unwrap_or_else(|| json!({}))});
     // A tool that declares `@scope <param>` runs over, and a writer changes, the
