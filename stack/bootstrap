@@ -55,7 +55,7 @@ attr="${CAOS_STACK_INPUTS_ATTR:?bootstrap needs CAOS_STACK_INPUTS_ATTR}"
 # `cp -n` will not overwrite the volume's db with the image's, so the two are
 # MERGED by dump-and-load instead.
 #
-# SERIALISED ACROSS CONTAINERS. Several of these run at once against one volume,
+# SERIALIZED ACROSS CONTAINERS. Several of these run at once against one volume,
 # and while nix itself is built for that (per-derivation locks, a sqlite db),
 # `cp` is not: it writes each file straight to its destination rather than to a
 # temp and renaming, so a concurrent nix can read a store path that is HALF

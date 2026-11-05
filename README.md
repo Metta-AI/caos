@@ -243,7 +243,7 @@ request hash immediately. The server recovers the launching job's run stack and
 secret store from its job nonce; neither is sent back into the worker.
 Capacity lives runner-side: the set of hanging `/runner/poll`s *is* the pool.
 
-| Request | Behaviour |
+| Request | Behavior |
 |---|---|
 | `GET /object/<hash>` | Return the serialized object (`<type> <size>\0<content>`, the bytes git hashes). `400` if malformed, `404` if absent. |
 | `POST /object/` | Store the serialized object in the body, return its git hash. Content-addressed, so idempotent. |

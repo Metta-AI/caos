@@ -161,7 +161,7 @@ fn uid() -> String {
 }
 
 /// Field `index` (1-based, per proc(5)) of `/proc/<pid>/stat`. The command name
-/// is parenthesised and may contain spaces, so count from its closing paren.
+/// is parenthesized and may contain spaces, so count from its closing paren.
 fn stat_field(pid: u32, index: usize) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];

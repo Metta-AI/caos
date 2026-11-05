@@ -269,7 +269,7 @@ fn copy_with_native(
     if native()? {
         return Ok(CopyOutcome::Copied);
     }
-    // OSC 52 has no write acknowledgement. A successful flush says nothing
+    // OSC 52 has no write acknowledgment. A successful flush says nothing
     // about terminal permissions or whether the clipboard changed.
     write_osc52(writer, text)?;
     Ok(CopyOutcome::Requested)

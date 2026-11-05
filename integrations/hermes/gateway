@@ -200,7 +200,7 @@ if [ "$default_tools" = yes ]; then
   hermes_config plugins.entries.caos-hooks.granted_capabilities '["tools.override"]'
   # The first connect resolves --llm-step against the server and takes minutes;
   # the discovery bounds default to 1.5s and 15s, and past them a session sees
-  # an empty tool catalogue with no error.
+  # an empty tool catalog with no error.
   hermes_config mcp_discovery_timeout 180
   hermes_config mcp_single_query_discovery_timeout 180
   # --force: a second run is otherwise refused as replacing a whole section.
