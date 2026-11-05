@@ -36,8 +36,8 @@ A tool is a directory of the session. The standard ones are under caos-std/: rea
 ls, write, edit, copy, move, remove, grep, log, show, diff, merge, import-source, \
 publish-source, bash-tool, caos-build, caos-test, github and more. caos-std exists only in \
 the EVALUATED tree, so to see what is there: eval-path(\"caos-std\"), then run \
-caos-std/read with file-path README.md and `in` set to that hash. Call help on a tool \
-before you use one you have not used.
+caos-std/read with `root` set to <that hash>/README.md. Every tool that works on a tree \
+takes its path as `root`. Call help on a tool before you use one you have not used.
 
 To work on code in caos, import it with import-source into sources/<repo>/00-base, copy \
 that to sources/<repo>/99-dirty, edit the copy with the file tools, move it to a layer \
