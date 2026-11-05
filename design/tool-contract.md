@@ -145,10 +145,66 @@ The result text is the receipt. Each tool reconciles an unclear push itself
 (read the branch: H means it landed) before it returns, as `publish_source.rs`
 does today in `reconcile`.
 
-Each needs a `reader:` grant for `github-token` in the secret store, like
-`std/github`. Workers already carry `/bin/caos` (flake-builder adds it to every
-image) and `merge` already uses `caos put-commit`; that the server accepts
-`/git/push` and `/git/import` from a worker is to be checked first.
+### One grant: everything remote goes through `std/github`
+
+None of these tools holds the token. Each mounts its NEIGHBOUR,
+`DEEP-DEPS/github` (the `std/github` beside it, not `caos-std/github`), and
+hands it every remote action. The token is granted to `std/github` alone, by
+the `reader:` line that already exists, so one grant covers every git tool,
+however many there are.
+
+Why that is enough:
+
+- A grant matches a node's origin, not the path it is reached by, and a
+  `DEEP-DEPS/<name>` mount is a copy, which "carries the origins of what it was
+  copied from" (SPEC, "Readers"). The `@op` entries already mount
+  `DEEP-DEPS/llm-step` this way.
+- A secret is injected only into a job whose own image was granted (SPEC,
+  "Isolation"). So the token is used inside the github worker and nowhere
+  else; the other tools never see it.
+- It exposes nothing new: the agent can already make any call the token allows
+  through `caos-std/github`.
+
+`std/github` becomes the one door to GitHub. It takes a BATCH of operations,
+runs them in order, stops at the first failure unless told otherwise, and
+returns one result per operation:
+
+| op | what | today in |
+|---|---|---|
+| `api` | one GitHub API call: method, path, optional JSON body | `std/github` |
+| `push` | `caos push-git <repo> <commit> <branch> --expected=<oid\|absent> [--force] [--allow-ignored]` | `publish_source.rs` |
+| `import` | resolve a revision on the remote, then `caos import-git <repo> <commit>` | `import_source.rs` |
+| `head` | read one remote branch's head, for leases and reconciliation | `publish_source.rs` |
+
+It must stay a CLOSED program: its arguments are data, never code. A grant
+also covers a job whose arg tree is a superset of the granted image (SPEC,
+"Isolation"), so an image that ran something a caller curried onto it would
+hand that caller the token.
+
+A worker may not block (design/map-then.md), so a tool reaches github with
+`caos run-request-then`: it records a continuation naming the github request
+and itself as `then`, exits, and is run again with github's result. Batching
+keeps the number of round trips small and independent of the stack's height.
+`stack-publish`, for example:
+
+1. read every layer's remote head and list the open PRs for their branches;
+2. push every layer (stopping at the first failure);
+3. create or update the PRs;
+4. link them as a GitHub stack.
+
+This also serves the reason the operations are moving at all. A `reader:@@=`
+grant matches content, so editing `stack-publish`'s logic in a copy of caos
+should leave `std/github` unchanged and still granted, and the edited tool
+runs with the token. Only an edit to `std/github` itself needs main, or a
+session grant (`reader:@=<path> session=<id>`, which exposes the token to that
+session). Compiling all the logic into one granted image instead (the
+`log`/`show`/`diff` pattern) would lose the grant on every logic edit made in
+a copy.
+
+Workers already carry `/bin/caos` (flake-builder adds it to every image), so
+the github worker can run `caos push-git` and `caos import-git`; that the
+server accepts `/git/push` and `/git/import` from a worker is to be checked
+first.
 
 ## 3. `root`
 
