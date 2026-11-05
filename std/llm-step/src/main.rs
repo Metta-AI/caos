@@ -2024,6 +2024,91 @@ fn writer_callback(
     ))
 }
 
+/// A `@root` tool's result (design/tool-contract.md, "The result"): the model
+/// reads `stdout`; a writer's `root` or `deleted` is put at its root path in
+/// the session as it was when the call started, everything above it rewritten
+/// (a child commit at each gitlink on the way), and that session is the
+/// proposal `complete_compute` reconciles with whatever happened since.
+///
+/// A tool's mistake is answered as an `is_error` tool_result naming it, as for
+/// any writer.
+fn root_callback(
+    state: &mut progress::State,
+    record: &CallRecord,
+    root_path: &str,
+    writer: Option<&str>,
+) -> Result<(Value, Option<Oid>), String> {
+    let fail = |message: String| Ok((error_block(&record.id, &message), None));
+    let result = match tools::root_result(&arg("result"), writer.is_some()) {
+        Ok(result) => result,
+        Err(error) => return fail(format!("{}: {error}", writer.unwrap_or("the tool"))),
+    };
+    let block = result_block(&record.id, &tools::keep_tail(&result.stdout), result.failed);
+    let Some(tool) = writer else {
+        return Ok((block, None));
+    };
+    if result.failed {
+        return Ok((block, None));
+    }
+    let base = record
+        .input_commit
+        .clone()
+        .ok_or("a root tool's start has no input commit")?;
+    let components = root::components(root_path)?;
+    let base_tree = state.store().tree_of(&base)?;
+    let old = root::resolve(state.store(), &base_tree, &components)?;
+    let message = result
+        .commit_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(tool)
+        .to_string();
+    let new = if result.deleted {
+        None
+    } else {
+        let result_tree = Oid::parse(&cas_hash(&arg("result"))?, "root tool result")?;
+        state.fetch_object(&result_tree)?;
+        let entry = state
+            .store()
+            .read_tree(&result_tree)
+            .map_err(String::from)?
+            .into_iter()
+            .find(|entry| entry.name == "root")
+            .ok_or("the result has no root entry")?;
+        // A plain file keeps an executable bit it had: a tool that writes a
+        // file's content rarely means to change its mode.
+        let mode = match (entry.mode, &old) {
+            (Mode::Blob, Some((Mode::Executable, _))) => Mode::Executable,
+            (mode, _) => mode,
+        };
+        match (mode, &old) {
+            // A source tree's new code: the harness commits it, a child of the
+            // commit it replaces.
+            (Mode::Tree, Some((Mode::Commit, parent))) => {
+                let parent = parent.clone();
+                let minted = mint_source_tree_commit(state, &entry.oid, &parent, &message)?;
+                state.push_code(&minted)?;
+                Some((Mode::Commit, minted))
+            }
+            _ => Some((mode, entry.oid)),
+        }
+    };
+    if new == old {
+        return Ok((block, None));
+    }
+    let rebuilt = root::replace(state.store_mut(), &base_tree, &components, new, &message)?;
+    // A gitlink's commit is not part of the closure of the tree that names it,
+    // so each commit made on the way goes up on its own, deepest first, before
+    // the proposal that names them.
+    for commit in &rebuilt.commits {
+        state.push_code(commit)?;
+    }
+    let proposal = mint_source_tree_commit(state, &rebuilt.tree, &base, &message)?;
+    state.push_code(&proposal)?;
+    Ok((block, Some(proposal)))
+}
+
 fn mint_source_tree_commit(
     state: &mut progress::State,
     tree: &Oid,
