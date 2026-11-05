@@ -44,7 +44,7 @@ ws=$(publish_tree /tmp/ws /cas/ws "publishing the source tree")
 # `@in` buys: the tree is an argument, so the tool sees that tree's root as its
 # working directory rather than the session root.
 R1='[{"signature":"sig-abc","thinking":"I should create the file.","type":"thinking"},{"text":"Creating out.txt.","type":"text"},{"id":"toolu_01","input":{"arguments":{"cmd":"echo hi > out.txt","root":"main"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
-R2='[{"id":"toolu_03","input":{"arguments":{"root":"main","cmd":"echo boom >&2; exit 3"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
+R2='[{"id":"toolu_03","input":{"arguments":{"cmd":"echo boom >&2; exit 3","root":"main"},"path":"main/tools/sh"},"name":"run_tool","type":"tool_use"}]'
 EARLY_INTERJECTION_TEXT="also keep the notes subtree"
 INTERJECTION_TEXT="one more thing before you finish"
 STALE_T2_TEXT="the source tree still holds out.txt"
