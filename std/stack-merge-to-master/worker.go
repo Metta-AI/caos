@@ -519,17 +519,17 @@ func verdictStage(s *State) {
 		}
 		s.Targets[i].Checks, s.Targets[i].Read = checks, true
 	}
-	settled := true
+	// Settled, as ci-status's wait-min: a check failed, or none is pending.
+	failing, pending := false, false
 	for _, t := range s.Targets {
 		switch verdict(t.Checks) {
 		case "failing":
-			settled = true
-			goto decided
+			failing = true
 		case "pending":
-			settled = false
+			pending = true
 		}
 	}
-decided:
+	settled := failing || !pending
 	if !settled && time.Now().Unix() < s.Deadline {
 		time.Sleep(min(15*time.Second, time.Until(time.Unix(s.Deadline, 0))))
 		readCI(s)
