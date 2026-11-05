@@ -1,7 +1,19 @@
 use super::oid::hex_lower;
 
 pub const FORMAT: &str = ".caos/format";
-pub const FORMAT_BYTES: &str = "caos-conversation-v6\n";
+/// The format this build writes into every new session.
+pub const FORMAT_BYTES: &str = "caos-session-v7\n";
+/// v6 is v7 under the names from before caos called a conversation a session:
+/// `conversation.root`/`conversation.fork` commits and a transcript entry's
+/// `conversation` key. A v6 session is read and appended to as v6; forking one
+/// makes a v7 session.
+pub const V6_FORMAT_BYTES: &str = "caos-conversation-v6\n";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    V6,
+    V7,
+}
 pub const IDENTITY: &str = ".caos/identity.json";
 pub const TITLE: &str = ".caos/title";
 pub const TRANSCRIPT_DIR: &str = ".caos/transcript";
