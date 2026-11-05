@@ -84,11 +84,9 @@ jq -s -e '
   (map(select(.id == "tu_mg"))[0] |
     .status == "complete" and .result.proposal == null) and
   (map(select(.id == "tu_mm"))[0] |
-    .status == "complete" and
-    (.source_tree_resolution.kind == "merged" or .source_tree_resolution.kind == "direct")) and
+    .status == "complete" and .source_tree_name == null and .files_outcome.applied == ["main"]) and
   (map(select(.id == "tu_mp"))[0] |
-    .status == "complete" and .source_tree_name == "main" and
-    (.source_tree_resolution.kind == "merged" or .source_tree_resolution.kind == "direct"))
+    .status == "complete" and .source_tree_name == null and .files_outcome.applied == ["main"])
 ' /tmp/mixed-tools.jsonl >/dev/null || { cat /tmp/mixed-tools.jsonl >&2; fail "mixed tool records are wrong"; }
 $TOOL parents --repo /tmp/repo --head "$head" > /tmp/mixed.parents
 start_found=0
