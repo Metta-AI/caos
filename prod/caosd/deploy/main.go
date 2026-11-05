@@ -42,7 +42,7 @@ const (
 //
 // fetched the driver from my-branch and then built the host from main --
 // silently, and fatally if main has no nixosConfigurations yet. The ref had to
-// be repeated as an argument to get the obvious behaviour. Now the driver and
+// be repeated as an argument to get the obvious behavior. Now the driver and
 // the host config it applies always come from the same revision, and an
 // argument is only needed to deliberately build from somewhere ELSE.
 var defaultFlake = "github:Metta-AI/caos"
@@ -82,7 +82,7 @@ func requireDataVolume() {
 	// Informational only: Try, not Out — a machine without lsblk should still
 	// get the instructions below rather than dying on the diagnostic.
 	devices, _ := w.Try(script.Exec("lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT"))
-	w.True(false, "no volume labelled %q.\n\n"+
+	w.True(false, "no volume labeled %q.\n\n"+
 		"  Attach the data volume, then label it ONCE (this ERASES that disk):\n"+
 		"      sudo mkfs.ext4 -L %s /dev/nvme1n1\n\n"+
 		"  Present block devices:\n%s",

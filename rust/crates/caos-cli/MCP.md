@@ -331,7 +331,7 @@ up after the client repo moved its pin: a fix deployed to caos reaches the
 session on its next fork, tools included.
 
 `cloud/install.go` writes the command into Claude Code's user config. The hook
-acts on a session's **first prompt** (`fork.rs`): it recognises the command and hands the commit to the step (`llm-step --record=prompt --from=<hash>`), which sets
+acts on a session's **first prompt** (`fork.rs`): it recognizes the command and hands the commit to the step (`llm-step --record=prompt --from=<hash>`), which sets
 up the session, and only then records the prompt as usual — so history and
 workspace are in place before the model's first turn. The command's own text is
 what tells the MODEL to go and read that history; the hook cannot put it in the

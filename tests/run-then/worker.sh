@@ -96,7 +96,7 @@ validated)
   echo "  ok: bad flag combinations refused before anything is recorded" >&2
 
   echo "== without --catch, a failing run fails the whole request ==" >&2
-  # The default, asserted so `--catch` below cannot quietly become the behaviour
+  # The default, asserted so `--catch` below cannot quietly become the behavior
   # everywhere: a pipeline that loses a step has no business reporting success.
   # The `--catch` HERE is on our own dispatch of the uncaught driver, so the
   # propagation arrives as a value; the driver itself catches nothing.

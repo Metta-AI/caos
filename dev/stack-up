@@ -72,7 +72,7 @@ inputs=""
 for a in "$@"; do
   case "$a" in
     --inputs=*) inputs=${a#--inputs=} ;;
-    *) fail "unrecognised argument: $a" ;;
+    *) fail "unrecognized argument: $a" ;;
   esac
 done
 [ -n "$inputs" ] || fail "stack-up needs --inputs=<dir>; the caller builds, this does not"
@@ -118,7 +118,7 @@ find "$state/runs" -mindepth 1 -maxdepth 1 -type d -mtime +2 \
 # its eval cache on the rev when a `.git` is present.
 #
 # `add -Af`: the tree is the truth. A caos `--in` carries what the client
-# pushed, so honouring the extracted `.gitignore` would drop real content.
+# pushed, so honoring the extracted `.gitignore` would drop real content.
 phase "git-init the workspace"
 if [ ! -d .git ]; then
   git init -q -b main

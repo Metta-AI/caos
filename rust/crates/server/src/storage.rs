@@ -223,7 +223,7 @@ fn validate_tree_dependencies(
 ///
 /// gix publishes a loose object by `rename()`ing a temp file into place and
 /// never fsyncs it (`gix-odb`'s loose store calls `persist` and stops there; it
-/// honours no `core.fsync`, so the repo config `main` sets covers git's writes
+/// honors no `core.fsync`, so the repo config `main` sets covers git's writes
 /// and not these). That is the pattern that hands ext4 a zero-length file after
 /// an unclean shutdown, which is worse than a lost object — see [`crate::repair`].
 ///

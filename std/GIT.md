@@ -136,7 +136,7 @@ applies unchanged. Verified end to end against a scratch repo:
 
    Use `POST /user/repos` for a personal account. Ask whether it should be
    public or private if the user did not say; private is the safe default.
-   The response's `full_name` gives the org's canonical capitalisation
+   The response's `full_name` gives the org's canonical capitalization
    (`Metta-AI`, not `metta-ai`).
 2. `import_source` it into `sources/<repo>/00-base`, `copy` that to
    `sources/<repo>/99-dirty`, `write` the files there.

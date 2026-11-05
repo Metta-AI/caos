@@ -60,7 +60,7 @@ const ENGINE_SOCKET_PATH: &str = "/run/caos/engine.sock";
 /// An image declares in its own config env that it hosts a caos stack and
 /// needs the engine socket (design/test-stack-image.md). Same shape as the
 /// `CAOS_WORKER_UID=0` root grant: the image states what containment it needs,
-/// and the runner decides whether to honour it. Before this, every worker in
+/// and the runner decides whether to honor it. Before this, every worker in
 /// the pool got the socket because one image needed it.
 const SOCKET_GRANT_ENV: &str = "CAOS_GRANT_ENGINE_SOCKET";
 

@@ -1400,7 +1400,7 @@ fn path_is_scoped(name: &str) -> bool {
 /// is the root.
 ///
 /// The normalization is `eval_path`'s alone, deliberately: it is the one of the
-/// three with a meaningful empty path, so it is the one that has to recognise
+/// three with a meaningful empty path, so it is the one that has to recognize
 /// every shape a model writes for "the root" — absent, empty, whitespace, `/`.
 /// Applying it to a tool path would quietly start accepting `main/tool/`, which
 /// `validate_tree_path` refuses today.
@@ -4770,7 +4770,7 @@ mod tests {
             self.head = new.unwrap().clone();
             if self.lost_ack {
                 self.lost_ack = false;
-                return Err("lost acknowledgement".into());
+                return Err("lost acknowledgment".into());
             }
             Ok(())
         }
@@ -4933,7 +4933,7 @@ mod tests {
                     || panic!("validation rejection must not observe the remote"),
                 )
             } else {
-                // Git may resend after a lost acknowledgement and report a
+                // Git may resend after a lost acknowledgment and report a
                 // rejected old value even though its first push succeeded.
                 publish_source::reconcile(
                     &recovered,

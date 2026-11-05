@@ -2009,7 +2009,7 @@ mod tests {
             .unwrap();
         assert!(doc.contains("commit hash"), "a commit takes a hash: {doc}");
 
-        // An oid is recognised by SHAPE, which is the only thing a path cannot
+        // An oid is recognized by SHAPE, which is the only thing a path cannot
         // also be. Both git hash widths count.
         assert!(is_oid(&"a".repeat(40)));
         assert!(is_oid(&"0".repeat(64)));
@@ -2572,7 +2572,7 @@ mod tests {
 
         for bad in [
             json!({}),                             // required arg missing
-            json!({"word": "x", "colour": "red"}), // undeclared arg
+            json!({"word": "x", "color": "red"}), // undeclared arg
             json!({"word": ["banana"]}),           // non-scalar value
         ] {
             let block = tree_tool_args(&call(bad), &tool, None).unwrap_err();

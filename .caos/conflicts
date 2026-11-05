@@ -1,0 +1,8 @@
+100644 2b3c71db721cf991274b5224ee72d3e45a357c5a 1	std/README.md
+100644 0fc3bccab457033138e81ad16f70b902a0500758 2	std/README.md
+100644 080fbe003eb223aca127904a90db46dbd4b18200 3	std/README.md
+
+Auto-merging std/GIT.md
+Auto-merging std/README.md
+CONFLICT (content): Merge conflict in std/README.md
+Auto-merging std/llm-step/src/main.rs
