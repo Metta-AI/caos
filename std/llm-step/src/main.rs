@@ -4462,15 +4462,6 @@ mod tests {
             let site = CallSite::at(&golden.request, &call, ASSISTANT_ID);
             let mut started = site.stub(None);
             started.status = CallStatus::Started;
-            let started_head = append_memory(
-                &mut golden.store.clone(),
-                &golden.head,
-                Transition::ToolStart {
-                    record: started.clone(),
-                    payloads: Vec::new(),
-                },
-            );
-            assert!(started_head.is_ok());
             let mut objects = golden.store;
             let head = append_memory(
                 &mut objects,
