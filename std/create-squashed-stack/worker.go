@@ -400,17 +400,19 @@ func rebuild(src, dst string, parts []string, node string) {
 	rebuild(child, filepath.Join(dst, head), parts[1:], node)
 }
 
-// finish writes the writer result and stores it at /cas/out.
-func finish(prop, out, message string, failed bool) {
+// finish writes the result and stores it at /cas/out: the new directory as
+// `root`, or `failed` and nothing to apply.
+func finish(newRoot, out, message string, failed bool) {
 	w.Must(os.MkdirAll(result, 0o755))
-	w.Must(os.WriteFile(filepath.Join(result, "out"), []byte(out), 0o644))
-	if message != "" {
-		w.Must(os.WriteFile(filepath.Join(result, "message"), []byte(message), 0o644))
-	}
+	w.Must(os.WriteFile(filepath.Join(result, "stdout"), []byte(out), 0o644))
 	if failed {
-		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte(out), 0o644))
+		w.Must(os.WriteFile(filepath.Join(result, "failed"), []byte("create-squashed-stack refused\n"), 0o644))
+	} else {
+		w.Must(os.Symlink(newRoot, filepath.Join(result, "root")))
+		if message != "" {
+			w.Must(os.WriteFile(filepath.Join(result, "commit-message"), []byte(message), 0o644))
+		}
 	}
-	w.Must(os.Symlink(prop, filepath.Join(result, "prop")))
 	run("caos", "put", result, "/cas/out")
 }
 
