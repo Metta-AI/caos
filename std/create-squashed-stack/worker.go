@@ -427,9 +427,10 @@ func main() {
 			if !ok {
 				panic(r)
 			}
-			finish(in, "FAILED: "+no.msg+"\n", "", true)
+			finish("", "FAILED: "+no.msg+"\n", "", true)
 		}()
 
+		in = directory()
 		get(in)
 		get("/cas/args/plan")
 		planPath := strings.Join(splitPath("plan", strings.TrimSpace(string(w.Check(os.ReadFile("/cas/args/plan"))))), "/")
