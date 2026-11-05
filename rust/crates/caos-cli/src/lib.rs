@@ -2145,7 +2145,7 @@ pub fn image_arg_reader(argument: &str, session: &str) -> String {
         .map(|(key, value)| (key.split_once(':').map_or("", |(_, ty)| ty), value));
     match value {
         Some(("@@", locator)) => format!("reader:@@={locator}"),
-        Some(("@", path)) => format!("reader:@={path} conversation={session}"),
+        Some(("@", path)) => format!("reader:@={path} session={session}"),
         _ => format!("a reader for {argument}"),
     }
 }

@@ -527,7 +527,7 @@ value=<secret>
 # or read from a file, relative to this one
 value:@=<file>
 reader:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step since=<sha>
-reader:@=imports/caos/std/llm-step conversation=<id>
+reader:@=imports/caos/std/llm-step session=<id>
 ```
 
 ## Readers
@@ -540,7 +540,7 @@ reader:@=imports/caos/std/llm-step conversation=<id>
   `ref=` in place of `rev=` names a branch, resolved when a request is admitted
   (`git+caos://` is this server's own; any other URL is asked), so the range
   moves with it — and trusts whoever can move that branch.
-- **`reader:@=<path> conversation=<id>`** grants whatever is at `path` in that
+- **`reader:@=<path> session=<id>`** grants whatever is at `path` in that
   session's tree, and only in that session. The agent can edit that
   code, so this exposes the secret to the agent.
 

@@ -43,7 +43,7 @@ pub enum Reader {
         locator: String,
         since: Option<String>,
     },
-    /// `reader:@=<path> conversation=<id>`: whatever is at `path` in one
+    /// `reader:@=<path> session=<id>`: whatever is at `path` in one
     /// session.
     Session { path: String, session: String },
 }
@@ -56,7 +56,7 @@ impl Reader {
                 None => format!("reader:@@={locator}"),
             },
             Reader::Session { path, session } => {
-                format!("reader:@={path} conversation={session}")
+                format!("reader:@={path} session={session}")
             }
         }
     }
@@ -164,7 +164,7 @@ fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
         }
     }
     let session = session
-        .ok_or_else(|| format!("secret {file_name}: reader:@={path} needs conversation=<id>"))?;
+        .ok_or_else(|| format!("secret {file_name}: reader:@={path} needs session=<id>"))?;
     Ok(Reader::Session { path, session })
 }
 
@@ -189,7 +189,7 @@ mod tests {
             "# a comment\nname=gh\nentropy=E\nvalue=tok\n\
              reader:@@=git+https://x/y?rev={SHA}&dir=std/llm-step since={SHA}\n\
              reader:@@=git+https://x/y?rev={SHA}\n\
-             reader:@=imports/y/tool conversation=c1\n"
+             reader:@=imports/y/tool session=c1\n"
         );
         let spec = parse_spec("file", &text).unwrap();
         assert_eq!(spec.name, "gh");
