@@ -113,12 +113,13 @@ fn commit_arg(at: &str, what: &str) -> Result<Oid, Failure> {
 /// A revision as git history takes it: `HEAD`/`wc`/`@` or a commit hash, then any
 /// `~N`/`^` ancestry.
 fn revision(store: &GitStore, head: &Oid, spec: &str) -> Result<Oid, Failure> {
-    // A path names another source tree in the session (`sources/foo/99-dirty`):
-    // its own commit, which may sit on a different line of history than `head`.
+    // This tool sees only its root, so another source tree is named by the
+    // harness-resolved `against` parameter, never by a path here.
     if spec.contains('/') {
-        let commit = commit_at(spec)?;
-        store.ensure_local(&commit).map_err(Infra)?;
-        return Ok(commit);
+        return Err(User(format!(
+            "{spec:?} looks like a path: pass a commit hash or HEAD with ~N or ^ here, \
+             and name another source tree to compare with as `against`"
+        )));
     }
     let split = spec.find(['~', '^']).unwrap_or(spec.len());
     let (base, suffix) = spec.split_at(split);
