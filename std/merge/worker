@@ -21,10 +21,26 @@
 # conflicts (see SPEC). M becomes the run's result at /cas/out.
 set -euo pipefail
 
+# A refusal is a value the model can act on: the reason, and `failed`.
+refuse() {
+  local res=/tmp/merge-result
+  rm -rf "$res"; mkdir -p "$res"
+  printf 'merge: %s\n' "$1" > "$res/stdout"
+  printf 'merge refused\n' > "$res/failed"
+  caos put "$res" /cas/out
+  exit 0
+}
+if [ ! -e /cas/args/root ] && [ ! -L /cas/args/root ]; then
+  refuse "nothing is at the root path: root is the source tree to merge into, such as sources/<repo>/02-layer"
+fi
+if [ "$(caos kind /cas/args/root)" != commit ]; then
+  refuse "the root is not a source tree: merge advances a source tree (a code reference), such as sources/<repo>/02-layer"
+fi
+
 # The commit args materialize as raw commit-object files; `caos hash` reads the
 # recorded id without fetching content — and the id is all we need, since the
 # objects themselves come from the server over git below.
-ours=$(caos hash /cas/args/wc)
+ours=$(caos hash /cas/args/root)
 theirs=$(caos hash /cas/args/theirs)
 base=()
 if [ -e /cas/args/merge-base ]; then
