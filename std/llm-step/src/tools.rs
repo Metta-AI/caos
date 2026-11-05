@@ -222,6 +222,9 @@ const IN_DOC: &str = "The tree to run over. Defaults to the source tree this \
 /// What `@request-id` offers the model (design/tool-contract.md, "`@request-id`").
 /// Leaving it out is the normal case: the harness fills in the call's own id.
 pub const REQUEST_ID: &str = "request-id";
+
+/// The parameter `@root` adds: the path the tool works on.
+pub const ROOT: &str = "root";
 const REQUEST_ID_DOC: &str = "Leave this out: each call is then its own run, \
                               never answered from an earlier call's cached result. \
                               Pass a value only to share one result between calls \
