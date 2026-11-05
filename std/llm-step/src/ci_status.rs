@@ -498,6 +498,8 @@ mod tests {
         assert_eq!(calls, 1);
         assert_eq!(wait_until(0, || Ok(true)), Ok(true));
         assert_eq!(wait_until(0, || Err::<bool, _>("down".to_string())), Err("down".into()));
+        // A wait too long for the clock has no deadline and does not panic.
+        assert_eq!(wait_until(u64::MAX, || Ok(true)), Ok(true));
     }
 
     #[test]
