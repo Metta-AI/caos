@@ -652,7 +652,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
             in_tags = true;
             eprintln!(
                 "{ctx}: unknown block tag @{tag} — ignored \
-                 (known: @param, @git, @writer, @in, @call, @request-id, @scope, @op)"
+                 (known: @param, @root, @writer, @request-id, @git, @in, @call, @scope, @op)"
             );
         } else if !in_tags {
             // Description text — everything before the first block tag.
