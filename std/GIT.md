@@ -333,15 +333,18 @@ stack 367: unchanged
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
   A repository that was renamed or moved to another owner since the import
   is followed: the GitHub calls use the name GitHub gives it now.
-- `dry-run=true` reports the layers, branches, bases and titles without
-  observing or changing anything. Use it first on a new stack.
+- `dry-run=true` reports the layers, branches, bases and titles, and each
+  branch's current head, without changing anything. Use it first on a new
+  stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
   updated to match, and the result says so; edit the file, not GitHub.
 - Republishing after you merged up is a fast-forward and needs no `force`. A
   non-fast-forward push is refused unless `force=true`, and means a rebuilt
-  layer or someone else's push to the branch: look before forcing.
-- Each push is leased on the remote head observed at the start, like
-  `publish_source`, and rejects a commit whose tree contains paths matched by
+  layer or someone else's push to the branch: look before forcing. With
+  `force`, pass `expected`: one line `<branch> <head>` per layer, as the dry
+  run prints them, so a branch that moved after you looked is not overwritten.
+- Without `force`, each push is leased on the remote head read when the call
+  runs, like `publish-source`, and rejects a commit whose tree contains paths matched by
   its own `.gitignore` rules, **including tracked files** (`allow-ignored=true`
   to publish them anyway). Resolve merge conflicts and clear `.caos/conflicts`
   first. Test and inspect the intended PR diff (`diff`) before publishing.
