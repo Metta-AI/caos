@@ -400,8 +400,13 @@ impl GitStore {
         if updates.len() > 1 {
             arguments.push("--atomic".to_string());
         }
+        let legacy_reads = self.legacy_reads.borrow().clone();
         for update in updates {
-            let expected = update.expected.as_ref().map(Oid::as_str).unwrap_or("");
+            let expected = match (&update.expected, legacy_reads.get(&update.refname)) {
+                // Read under the pre-rename name: this write creates the v4 ref.
+                (Some(expected), Some(legacy)) if expected == legacy => "",
+                (expected, _) => expected.as_ref().map(Oid::as_str).unwrap_or(""),
+            };
             arguments.push(format!("--force-with-lease={}:{expected}", update.refname));
         }
         arguments.push(remote.to_string());
