@@ -46,10 +46,11 @@ func main() {
 		// where a uid-0 lookup can fail, so point it at the /tmp it owns.
 		w.Must(os.Setenv("HOME", "/tmp"))
 
-		// `in` may be a tree or a commit (a source tree in the session):
+		// `root` may be a tree or a commit (a source tree in the session):
 		// resolve to the tree either way, fetch one level, then the two files.
 		const root = "/cas/flake-root"
-		w.Caos("resolve", w.Hash(args+"/in"), ".", root)
+		w.True(w.Exists(args+"/root"), "nothing is at the root path: root is the directory holding flake.nix")
+		w.Caos("resolve", w.Hash(args+"/root"), ".", root)
 		w.Get(root)
 		w.True(w.Check(os.Lstat(root)).IsDir(), "in is not a tree")
 		w.True(w.Exists(filepath.Join(root, "flake.nix")), "no flake.nix in the tree")
