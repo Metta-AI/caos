@@ -81,7 +81,7 @@ func main() {
 		// `{stdout}`, the new lock, for the caller to write.
 		const out = "/tmp/flake-update-out"
 		w.Must(os.MkdirAll(out, 0o755))
-		w.Must(os.WriteFile(filepath.Join(out, "stdout"), []byte(w.Read(filepath.Join(ws, "flake.lock"))), 0o644))
+		w.Must(os.WriteFile(filepath.Join(out, "stdout"), w.Check(os.ReadFile(filepath.Join(ws, "flake.lock"))), 0o644))
 		w.Put(out, "/cas/out")
 	})
 }
