@@ -26,7 +26,7 @@ Three-way merge another commit into a source tree. `root` is the source tree to 
 @param {commit} theirs A full commit hash, or the path of a source tree in the session.
 @param {commit} [merge-base] Full commit hash to use as the merge base instead of the one git finds. Only for replaying a change onto a history that does not contain its old base, such as a stack layer rebuilt on a force-pushed upstream: merge-base is then the old tip of the layer below.
 @writer
-@scope source-tree
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/flake-builder --in:@=. --lock:@=DEEP-DEPS/flake.lock
 curry --base=$IMAGE --help=$HELP
