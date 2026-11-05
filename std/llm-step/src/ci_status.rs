@@ -36,7 +36,7 @@ struct Parameters {
 const POLL: Duration = Duration::from_secs(15);
 
 /// A number of minutes, as a JSON number or as the string a tool's arguments
-/// are; empty or absent is 0, no wait. More than `MAX_WAIT_MIN` is refused.
+/// are; empty or absent is 0, no wait. There is no upper limit.
 pub(super) fn minutes_or_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u64, D::Error> {
@@ -48,15 +48,7 @@ pub(super) fn minutes_or_string<'de, D: serde::Deserializer<'de>>(
         Value::String(text) => text.trim().parse::<u64>().ok(),
         _ => None,
     };
-    match minutes {
-        Some(minutes) if minutes <= MAX_WAIT_MIN => Ok(minutes),
-        Some(minutes) => Err(D::Error::custom(format!(
-            "a wait is at most {MAX_WAIT_MIN} minutes, not {minutes}"
-        ))),
-        None => Err(D::Error::custom(
-            "a wait is a whole number of minutes, such as 20",
-        )),
-    }
+    minutes.ok_or_else(|| D::Error::custom("a wait is a whole number of minutes, such as 20"))
 }
 
 /// Consecutive failed reads a wait rides out: a long wait sees the odd 502.
