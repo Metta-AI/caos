@@ -103,9 +103,8 @@ var cases = []testCase{
 		expect: []expectation{{error: "a GET takes no body"}},
 	},
 	{
-		name: "the server refuses a commit it does not hold, and that is final",
-		batch: `[{"op":"push","repository":"` + invalid + `","commit":"` + unknown + `","branch":"topic","expected":"absent"},
-		         {"op":"head","repository":"` + invalid + `","branch":"main"}]`,
+		name:   "the server refuses a commit it does not hold, and that is final",
+		batch:  `[{"op":"push","repository":"` + invalid + `","commit":"` + unknown + `","branch":"topic","expected":"absent"},{"op":"head","repository":"` + invalid + `","branch":"main"}]`,
 		expect: []expectation{
 			{fields: map[string]string{"status": "conflict", "kind": "validation-rejected", "commit": unknown, "expected": "absent"}},
 			{skipped: true},
