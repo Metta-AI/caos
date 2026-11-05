@@ -7,7 +7,7 @@ Show a source tree's first-parent commit history newest-first: one line per comm
 @param [rev] Where to start (default HEAD, the source tree's own commit). A commit hash, or HEAD with ~N or ^ ancestry.
 @param [path] Only show commits that changed this source-tree-relative path.
 @param [count] Maximum number of commits to show (default 20).
-@in
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/git-history --dep0:@=DEEP-DEPS/session-protocol --dep1:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
 curry --base=$IMAGE --op=log --help=$HELP
