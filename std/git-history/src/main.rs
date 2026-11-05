@@ -47,16 +47,20 @@ enum Failure {
 
 use Failure::{Infra, User};
 
+/// The answer under the root contract (design/tool-contract.md): `{stdout}`.
 fn answer(text: &str) -> Result<(), String> {
-    let file = scratch("history-out")?.join("answer");
-    fs::write(&file, text).map_err(|e| format!("writing the answer: {e}"))?;
-    caos(["put", path(&file), "/cas/out"])
+    let dir = scratch("history-out")?;
+    fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?;
+    caos(["put", path(&dir), "/cas/out"])
 }
 
+/// A mistake the model can act on: `{stdout, failed}`.
 fn failed(message: &str) -> Result<(), String> {
     let dir = scratch("history-out")?;
-    fs::write(dir.join("report"), format!("FAILED: {message}\n"))
-        .map_err(|e| format!("writing the report: {e}"))?;
+    fs::write(dir.join("stdout"), format!("{message}\n"))
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    fs::write(dir.join("failed"), "history failed\n")
+        .map_err(|e| format!("writing failed: {e}"))?;
     caos(["put", path(&dir), "/cas/out"])
 }
 
