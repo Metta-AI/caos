@@ -295,6 +295,35 @@ mod tests {
     }
 
     #[test]
+    fn a_root_can_be_a_path_inside_an_object_named_by_hash() {
+        let mut store = MemoryStore::new();
+        let (root, layer) = session(&mut store);
+        let hash = root.as_str();
+        assert_eq!(
+            locate("sources/repo").unwrap(),
+            Located::Session(path("sources/repo"))
+        );
+        let Located::Object(oid, inside) = locate(&format!("{hash}/sources/repo/01-a")).unwrap()
+        else {
+            panic!("a hash prefix names an object");
+        };
+        assert_eq!(oid, root);
+        assert_eq!(
+            resolve_object(&store, &oid, &inside).unwrap(),
+            Some((Mode::Commit, layer.clone()))
+        );
+        // The commit itself, and a file inside it through its code tree.
+        assert_eq!(
+            resolve_object(&store, &layer, &[]).unwrap(),
+            Some((Mode::Commit, layer.clone()))
+        );
+        assert_eq!(
+            resolve_object(&store, &layer, &path("README.md")).unwrap().unwrap().0,
+            Mode::Blob
+        );
+    }
+
+    #[test]
     fn resolve_descends_into_a_gitlink() {
         let mut store = MemoryStore::new();
         let (root, layer) = session(&mut store);
