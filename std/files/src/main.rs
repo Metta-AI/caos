@@ -174,19 +174,6 @@ fn reject_parent(comps: &[String]) -> Result<(), Fail> {
     Ok(())
 }
 
-/// An OPTIONAL path: anything that names no component (absent, blank, `/`, `.`)
-/// is the ROOT, not a parse failure.
-fn components_opt(name: &str) -> Result<Vec<String>, Fail> {
-    match input(name)? {
-        None => Ok(Vec::new()),
-        Some(raw) => {
-            let comps = split_path(&raw);
-            reject_parent(&comps)?;
-            Ok(comps)
-        }
-    }
-}
-
 /// A REQUIRED path.
 fn components(name: &str) -> Result<Vec<String>, Fail> {
     let raw = input(name)?.ok_or_else(|| User(format!("missing `{name}`")))?;
