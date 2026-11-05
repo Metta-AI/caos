@@ -15,7 +15,9 @@ use session_protocol::v3::Oid;
 /// What the model is told the `root` parameter is.
 pub const ROOT_DOC: &str = "The path this tool works on, relative to the session \
                             root: a file, a directory, or a source tree such as \
-                            sources/<repo>/<layer>. `.` is the whole session. \
+                            sources/<repo>/<layer>. `.` is the whole session. A tool \
+                            that only reads also takes `<hash>[/<path>]`, inside an \
+                            object that is not in the session (an eval_path result). \
                             Required: nothing is implied by where the tool sits.";
 
 /// A `root` argument as path components, relative to the session root. `.`
