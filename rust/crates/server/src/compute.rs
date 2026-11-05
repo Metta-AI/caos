@@ -3488,7 +3488,7 @@ mod ticket_state_tests {
         let state = settle_ticket_state("pending".into(), live_sequence(&[false]), || {
             Ok("failed 422 bad args".into())
         });
-        assert_eq!(state.unwrap(), "failed 422 bad args");
+        assert_eq!(answer(state), "failed 422 bad args");
     }
 
     #[test]
