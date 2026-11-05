@@ -1078,7 +1078,7 @@ later push from that checkout dies for an unrelated-looking reason.
 
 Every session, with the names decoded:
 
-  git ls-remote %s 'refs/caos/v3/conversations/*' |
+  git ls-remote %s 'refs/caos/v4/sessions/*' |
     while read -r sha ref; do
       hex=$(echo "$ref" | cut -d/ -f5)
       echo "$sha $(echo "$hex" | fold -w2 | while read -r b; do printf "\x$b"; done)"
