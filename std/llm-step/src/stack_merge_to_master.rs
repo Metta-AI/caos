@@ -38,6 +38,13 @@ struct Parameters {
         deserialize_with = "bool_or_string"
     )]
     dry_run: bool,
+    #[serde(
+        default,
+        rename = "wait-for-ci-min",
+        alias = "wait_for_ci_min",
+        deserialize_with = "ci_status::minutes_or_string"
+    )]
+    wait_for_ci_min: u64,
 }
 
 fn blank(value: Option<String>) -> Option<String> {
@@ -160,6 +167,22 @@ struct Target<'a> {
 
 fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
+}
+
+/// Every check of each layer whose CI is not passing, as ci-status prints
+/// them, so a refusal or a failure says what CI says without another call.
+fn ci_detail(repository: &str, targets: &[Target<'_>]) -> String {
+    let mut text = String::new();
+    for target in targets {
+        let Some((pr, checks)) = &target.pr else {
+            continue;
+        };
+        if matches!(checks.verdict(), Some(Standing::Failing | Standing::Pending)) {
+            text.push_str(&format!("\n{}  PR #{}\n", target.layer.name, pr.number));
+            text.push_str(&ci_status::render(repository, &target.branch, checks));
+        }
+    }
+    text
 }
 
 /// Wait for GitHub to point the PR at the trunk, which it does itself for a PR
@@ -292,11 +315,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             )),
         );
     };
-    let github = Github {
-        owner,
-        repo,
-        token: ci_status::token_for(&repository)?,
-    };
+    let github = Github::new(owner, repo, ci_status::token_for(&repository)?);
     let prefix = p.branch_prefix.clone().unwrap_or_default();
 
     // The reads: each layer's pull request and the checks on its head.
@@ -365,6 +384,28 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         targets.push(target);
     }
 
+    // With wait-for-ci-min, read the pending heads again until one fails or
+    // none is pending: the same rule as ci-status's wait-min.
+    let mut fresh = true;
+    let waited = ci_status::wait_until(p.wait_for_ci_min, || {
+        if !std::mem::take(&mut fresh) {
+            for target in targets.iter_mut() {
+                if let Some((pr, checks)) = &mut target.pr {
+                    if checks.verdict() == Some(Standing::Pending) {
+                        *checks = ci_status::read(&github, &pr.head)?;
+                    }
+                }
+            }
+        }
+        Ok(ci_status::settled(
+            targets.iter().filter_map(|target| target.pr.as_ref()).map(|(_, checks)| checks.verdict()),
+        ))
+    });
+    let ci_settled = match waited {
+        Ok(settled) => settled,
+        Err(error) => return site.fail(state, &refused(error)),
+    };
+
     let mut lines: Vec<String> = Vec::new();
     let mut blockers: Vec<String> = Vec::new();
     for target in &targets {
@@ -393,10 +434,16 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
             text.push_str(line);
             text.push('\n');
         }
+        let waited = if p.wait_for_ci_min > 0 && !ci_settled {
+            format!(" after waiting {} min", p.wait_for_ci_min)
+        } else {
+            String::new()
+        };
         text.push_str(&format!(
-            "FAILED: stack-merge-to-master refused; nothing was merged: CI is not passing on {}. Wait for it or fix it (caos-std/ci-status reads one branch), or pass force=true to merge anyway.\n",
+            "FAILED: stack-merge-to-master refused; nothing was merged: CI is not passing on {}{waited}. Fix it, or wait for it (wait-for-ci-min=<minutes>), or pass force=true to merge anyway.\n",
             blockers.join("; ")
         ));
+        text.push_str(&ci_detail(&repository, &targets));
         return site.complete(state, result_block(&site.call.id, &text, true), None, None, None);
     }
     if p.dry_run {
@@ -480,6 +527,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         text.push_str("FAILED: ");
         text.push_str(problem);
         text.push_str("\nThe layers above it were not merged.\n");
+        text.push_str(&ci_detail(&repository, &targets));
     }
     if merged > 0 {
         text.push_str(
@@ -569,12 +617,15 @@ mod tests {
         let p = parameters(&call(json!({"stack": "sources/repo/"}))).unwrap();
         assert_eq!(p.stack, "sources/repo");
         assert!(!p.force && !p.dry_run && p.up_to.is_none());
+        assert_eq!(p.wait_for_ci_min, 0);
         let p = parameters(&call(json!({
             "stack": "sources/repo", "up-to": "02-tests", "force": "true",
-            "dry-run": "true", "branch-prefix": "me/", "trunk": "main"
+            "dry-run": "true", "branch-prefix": "me/", "trunk": "main",
+            "wait-for-ci-min": "20"
         })))
         .unwrap();
         assert!(p.force && p.dry_run);
+        assert_eq!(p.wait_for_ci_min, 20);
         assert_eq!(p.up_to.as_deref(), Some("02-tests"));
         assert_eq!(p.branch_prefix.as_deref(), Some("me/"));
         for input in [
@@ -583,6 +634,7 @@ mod tests {
             json!({"stack": "sources/repo", "squash": "true"}),
             json!({"stack": "sources/repo", "trunk": "bad..name"}),
             json!({"stack": "sources/repo", "force": "maybe"}),
+            json!({"stack": "sources/repo", "wait-for-ci-min": "later"}),
         ] {
             assert!(parameters(&call(input.clone())).is_err(), "{input}");
         }

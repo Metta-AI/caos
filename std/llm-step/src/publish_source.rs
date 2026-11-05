@@ -34,12 +34,12 @@ pub(super) fn bool_or_string<'de, D: serde::Deserializer<'de>>(
             "true" | "1" | "yes" => Ok(true),
             "false" | "0" | "no" | "" => Ok(false),
             other => Err(D::Error::custom(format!(
-                "force is true or false, not {other:?}"
+                "expected true or false, not {other:?}"
             ))),
         },
         Value::Null => Ok(false),
         other => Err(D::Error::custom(format!(
-            "force is true or false, not {other}"
+            "expected true or false, not {other}"
         ))),
     }
 }

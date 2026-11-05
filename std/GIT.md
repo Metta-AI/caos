@@ -331,6 +331,8 @@ stack 367: unchanged
   call to run. A refusal pushes nothing and says so.
 - Repository and trunk come from `00-base.source.json`; pass `repository` and
   `trunk` when the base was imported by commit hash, or to publish elsewhere.
+  A repository that was renamed or moved to another owner since the import
+  is followed: the GitHub calls use the name GitHub gives it now.
 - `dry-run=true` reports the layers, branches, bases and titles without
   observing or changing anything. Use it first on a new stack.
 - The `.pr.md` is the description's home. A PR whose title or body differs is
@@ -391,14 +393,38 @@ run_tool(path="caos-std/stack-sync", arguments={"stack": "sources/<repo>", "remo
 - Before anything merges it refuses unless every selected layer has an open
   PR whose head is the layer's commit (run `stack-sync` and `stack-publish`
   first) and CI on each of those heads is passing. A failing or unfinished
-  check refuses the whole merge; `force=true` merges anyway. `dry-run=true`
-  reads the PRs and checks and says what it would do.
+  check refuses the whole merge, and the refusal lists every check of the
+  layers that are not passing; `force=true` merges anyway. `dry-run=true`
+  reads the PRs and checks and says what it would do. `wait-for-ci-min=20`
+  first waits up to 20 minutes for unfinished CI, ending as soon as a check
+  fails or none is pending.
 - Each PR is merged with GitHub's asynchronous merge, after GitHub has
   pointed it at the trunk, which it does itself for a linked stack once the
   PR below merges. A failure stops it there: the layers below are merged, the
   ones above are untouched, and running it again carries on.
 - `caos-std/ci-status` prints the checks of one branch: `branch` is a branch
-  name, a commit, or with `stack` a layer (`02-tests` or `tests`).
+  name, a commit, or with `stack` a layer (`02-tests` or `tests`). Its first
+  line is the verdict, and failing checks are listed first.
+
+### Waiting for CI
+
+GitHub has no long poll for checks, so waiting is polling, and the tools do
+it for you. `wait-min=<minutes>` makes `ci-status` read again
+every 15 seconds until a check fails or none is pending, then print as usual;
+if the time runs out first it says it is still pending. Run it with `start`
+and pick it up with `result`, so the wait does not hold up other work:
+
+```text
+start(path="caos-std/ci-status", arguments={
+  "stack": "sources/<repo>", "branch": "02-tests", "wait-min": "30"})
+... other work ...
+result(ticket=<ticket>)
+```
+
+Every call reads GitHub afresh: `ci-status` runs inside the step, which is
+keyed on the call itself, so the same arguments after a new push are a new
+read, not a cached answer. A check that has not been created yet is not
+waited for: right after a push the answer can be `no checks`.
 
 ### The repository's squash setting
 
