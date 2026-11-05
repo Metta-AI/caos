@@ -133,16 +133,15 @@ fn replace_in(
                 return Ok(Some((Mode::Commit, commit)));
             }
             let signature = inherited_signature(store, &commit)?;
-            let minted = store
-                .write_commit(&CommitInfo {
-                    tree: changed,
-                    parents: vec![commit],
-                    author: signature.clone(),
-                    committer: signature,
-                    extra_headers: Vec::new(),
-                    message: format!("{}\n", message.trim()).into_bytes(),
-                })
-                .map_err(String::from)?;
+            let info = CommitInfo {
+                tree: changed,
+                parents: vec![commit],
+                author: signature.clone(),
+                committer: signature,
+                extra_headers: Vec::new(),
+                message: format!("{}\n", message.trim()).into_bytes(),
+            };
+            let minted = store.write_commit(&info).map_err(String::from)?;
             commits.push(minted.clone());
             Ok(Some((Mode::Commit, minted)))
         }
