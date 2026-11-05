@@ -76,11 +76,14 @@ pub fn parse_head_ref(refname: &str) -> Result<String, String> {
 }
 
 pub fn parse_membership_ref(refname: &str) -> Result<(String, Membership, String), String> {
-    let rest = refname
+    let (user_key, rest) = refname
         .strip_prefix(USERS_PREFIX)
-        .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
-    let (user_key, rest) = rest
-        .split_once("/conversations/")
+        .and_then(|rest| rest.split_once(USER_SESSIONS))
+        .or_else(|| {
+            refname
+                .strip_prefix(LEGACY_USERS_PREFIX)
+                .and_then(|rest| rest.split_once(LEGACY_USER_SESSIONS))
+        })
         .ok_or_else(|| format!("invalid session membership ref {refname:?}"))?;
     let (membership, session_key) = if let Some(key) = rest.strip_prefix("active/") {
         (Membership::Active, key)
