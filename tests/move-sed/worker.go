@@ -129,53 +129,45 @@ func build() {
 	mint("l2", mktree("l2-t", "f.txt=base", "a.txt=one", "b.txt=two"), 1700000200, "layer 2", l1)
 	conv = session("/tmp/conv", "", nil)
 
-	args := func(dir, pattern, replacement string, extra ...string) []string {
-		a := []string{"--pattern=" + pattern, "--replacement=" + replacement}
-		if dir != "" {
-			a = append(a, "--dir="+dir)
-		}
-		return append(a, extra...)
+	args := func(pattern, replacement string, extra ...string) []string {
+		return append([]string{"--pattern=" + pattern, "--replacement=" + replacement}, extra...)
 	}
 	cases = []testCase{
 		// A layer and its description, renamed together: the split in
 		// design/stacks.md, where 01-feature becomes 02-y.
-		{name: "split", args: args("sources/repo", `^01-feature(\..+)?$`, "02-y$1"), dir: "sources/repo",
+		{name: "split", args: args(`^01-feature(\..+)?$`, "02-y$1"), dir: "sources/repo",
 			renames: map[string]string{"01-feature": "02-y", "01-feature.pr.md": "02-y.pr.md"}},
 		// A shift up by one, and a named group.
-		{name: "shift", args: args("sources/repo", `^02-(?P<rest>tests.*)$`, "03-${rest}"), dir: "sources/repo",
+		{name: "shift", args: args(`^02-(?P<rest>tests.*)$`, "03-${rest}"), dir: "sources/repo",
 			renames: map[string]string{"02-tests": "03-tests", "02-tests.pr.md": "03-tests.pr.md"}},
-		// The root, named as `.`, with .caos left alone because the pattern is anchored.
-		{name: "root", args: args(".", `^notes\.txt$`, "NOTES.txt"), dir: "",
+		// The session's top, with .caos left alone because the pattern is anchored.
+		{name: "top", args: args(`^notes\.txt$`, "NOTES.txt"), dir: "",
 			renames: map[string]string{"notes.txt": "NOTES.txt"}},
-		// A dry run lists the renames and proposes the session unchanged.
-		{name: "dry-run", args: args("sources/repo", `^01-feature(\..+)?$`, "02-y$1", "--dry-run=true"),
+		// A dry run lists the renames and answers the directory unchanged.
+		{name: "dry-run", args: args(`^01-feature(\..+)?$`, "02-y$1", "--dry-run=true"), dir: "sources/repo",
 			dryRun: true, says: []string{"dry run", "01-feature -> 02-y", "01-feature.pr.md -> 02-y.pr.md"}},
 		// Refusals, each before anything changes.
-		{name: "collide", args: args("sources/repo", `^01-feature$`, "02-tests"),
+		{name: "collide", args: args(`^01-feature$`, "02-tests"), dir: "sources/repo",
 			says: []string{"01-feature would become 02-tests, which exists and is not being renamed"}},
-		{name: "duplicate", args: args("sources/repo", `^0[12]-(feature|tests)$`, "same"),
+		{name: "duplicate", args: args(`^0[12]-(feature|tests)$`, "same"), dir: "sources/repo",
 			says: []string{"both 01-feature and 02-tests would become same"}},
-		{name: "no-match", args: args("sources/repo", `^zzz`, "x"),
+		{name: "no-match", args: args(`^zzz`, "x"), dir: "sources/repo",
 			says: []string{"no entry matches", "01-feature.pr.md"}},
-		{name: "no-op", args: args("sources/repo", `^01-feature$`, "01-feature"),
+		{name: "no-op", args: args(`^01-feature$`, "01-feature"), dir: "sources/repo",
 			says: []string{"keeps its name"}},
-		{name: "sed-group", args: args("sources/repo", `^01-(.*)$`, `02-\1`),
+		{name: "sed-group", args: args(`^01-(.*)$`, `02-\1`), dir: "sources/repo",
 			says: []string{`uses sed's \1`, "$1"}},
-		{name: "bad-regex", args: args("sources/repo", `(`, "x"),
+		{name: "bad-regex", args: args(`(`, "x"), dir: "sources/repo",
 			says: []string{"not a valid Go regular expression"}},
-		{name: "slash", args: args("sources/repo", `^01-feature$`, "a/b"),
+		{name: "slash", args: args(`^01-feature$`, "a/b"), dir: "sources/repo",
 			says: []string{`would become "a/b", which is not one directory entry name`}},
-		{name: "in-source-tree", args: args("src/sub", `.`, "x"),
-			says: []string{"src is a source tree", "use move"}},
-		{name: "missing-dir", args: args("sources/nowhere", `.`, "x"),
-			says: []string{"no such path: sources/nowhere"}},
-		{name: "a-file", args: args("notes.txt", `.`, "x"),
-			says: []string{"notes.txt is a blob, not a directory"}},
-		{name: "caos", args: args(".", `^\.caos$`, "x"),
+		{name: "nothing", args: args(`.`, "x"), dir: "-",
+			says: []string{"nothing is at the root path"}},
+		{name: "a-file", args: args(`.`, "x"), dir: "notes.txt",
+			says: []string{"the root is a blob, not a directory"}},
+		{name: "caos", args: args(`^\.caos$`, "x"), dir: "",
 			says: []string{".caos is protocol metadata"}},
-		{name: "dotdot", args: args("sources/../repo", `.`, "x"),
-			says: []string{"without . or .."}},
-		{name: "no-pattern", args: []string{"--dir=sources/repo", "--replacement=x"},
+		{name: "no-pattern", args: []string{"--replacement=x"}, dir: "sources/repo",
 			says: []string{"pattern is required"}},
 	}
 }
