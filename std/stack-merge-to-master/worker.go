@@ -138,8 +138,8 @@ func load() *State {
 	return &s
 }
 
-// results is std/github's answer; an operation that is not ok refuses, with
-// what GitHub said, unless it is the last and `lastMayFail`.
+// results is std/github's answer, one result per operation (any number when
+// n is negative).
 func results(n int) []map[string]any {
 	var rs []map[string]any
 	text := w.Read("/cas/args/result")
