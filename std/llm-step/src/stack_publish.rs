@@ -1130,6 +1130,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_moved_repository_is_named_as_github_names_it_now() {
+        // The repository answer after a transfer: the new owner and name.
+        let answer = json!({
+            "full_name": "softmax-universe/caos",
+            "name": "caos",
+            "owner": {"login": "softmax-universe"},
+        });
+        assert_eq!(
+            current_name(&answer),
+            Some(("softmax-universe".to_string(), "caos".to_string()))
+        );
+        assert_eq!(current_name(&json!({"message": "Not Found"})), None);
+        // The answer at the old name: where the repository is now.
+        let moved = json!({
+            "message": "Moved Permanently",
+            "url": "https://api.github.com/repositories/1272701271",
+        });
+        assert_eq!(redirect_path(&moved).as_deref(), Some("/repositories/1272701271"));
+        assert_eq!(redirect_path(&json!({"url": "https://example.com/x"})), None);
+        assert_eq!(redirect_path(&json!({})), None);
+    }
+
+    #[test]
     fn descriptions_take_the_first_line_as_title() {
         let d = parse_description("\n# Add the parser\n\nWhy it exists,\nover two lines.\n\n").unwrap();
         assert_eq!(d.title, "Add the parser");
