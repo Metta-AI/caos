@@ -1946,6 +1946,10 @@ fn callback_result(
     if read_arg_opt("op")?.as_deref() == Some("agent-wait") {
         return wait_callback_block(state, record);
     }
+    if let Some(root) = read_arg_opt("tool-root")? {
+        let writer = read_arg_opt("tool-writer")?;
+        return root_callback(state, record, &root, writer.as_deref());
+    }
     if let Some(tool) = read_arg_opt("tool-writer")? {
         return writer_callback(state, record, &tool);
     }
