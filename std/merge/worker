@@ -120,11 +120,12 @@ commit=/tmp/merge-commit
 } > "$commit"
 caos put-commit "$commit" /cas/mergecommit
 
-# The writer result: `{prop, out}` (SPEC, "CaosTools"). `prop` is the COMMIT
-# above rather than a tree, because a merge is the one case that needs a second
-# parent -- every other writer hands back a tree and lets the harness mint.
+# The writer result: `{stdout, root}` (design/tool-contract.md). `root` is the
+# COMMIT above rather than a tree, because a merge needs a second parent --
+# every other writer of a source tree hands back a tree and lets the harness
+# commit it.
 #
-# `out` IS WRITTEN HERE, not by the harness. It used to be composed in llm-step
+# `stdout` IS WRITTEN HERE, not by the harness. It used to be composed in llm-step
 # from `.caos/conflicts`, which meant the tool's own answer depended on who ran
 # it; the same reasoning already put this tool's `help` in its `.caos-expr`.
 res=/tmp/merge-result
