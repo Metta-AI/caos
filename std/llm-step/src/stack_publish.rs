@@ -567,7 +567,55 @@ fn pr_from(value: &Value) -> Option<Pr> {
     })
 }
 
+/// The owner and name GitHub gives a repository in its answer to
+/// `GET /repos/{owner}/{repo}`.
+fn current_name(repository: &Value) -> Option<(String, String)> {
+    Some((
+        repository["owner"]["login"].as_str()?.to_string(),
+        repository["name"].as_str()?.to_string(),
+    ))
+}
+
+/// Where a redirect from the API points, as a path under `API`: GitHub answers
+/// a moved repository's old name with its new location in `url`.
+fn redirect_path(answer: &Value) -> Option<String> {
+    answer["url"].as_str()?.strip_prefix(API).map(str::to_string)
+}
+
 impl Github {
+    /// The repository a URL names, under the owner and name GitHub uses for it
+    /// NOW. A renamed or transferred repository still answers most calls at its
+    /// old name, through redirects, but a `head=<owner>:<branch>` filter is
+    /// matched literally: under the old owner it finds no pull request, and
+    /// stack-publish then tried to open a second one, which GitHub refused. So
+    /// every Github starts with one read of the repository, following a
+    /// redirect, and takes the name from the answer. If that read fails the
+    /// names stay as given, and the next call reports the real problem.
+    pub(super) fn new(owner: String, repo: String, token: Option<String>) -> Github {
+        let mut github = Github { owner, repo, token };
+        let mut path = github.repo_path("");
+        for _ in 0..3 {
+            let Ok((status, answer)) = github.call("GET", &path, None) else {
+                break;
+            };
+            match status {
+                200 => {
+                    if let Some((owner, repo)) = current_name(&answer) {
+                        github.owner = owner;
+                        github.repo = repo;
+                    }
+                    break;
+                }
+                301 | 302 | 307 | 308 => match redirect_path(&answer) {
+                    Some(next) => path = next,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        github
+    }
+
     pub(super) fn repo_path(&self, rest: &str) -> String {
         format!("/repos/{}/{}{rest}", self.owner, self.repo)
     }
