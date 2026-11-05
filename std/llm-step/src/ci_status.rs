@@ -518,8 +518,9 @@ mod tests {
         assert_eq!(with(json!(30)), Ok(30));
         assert_eq!(with(json!("")), Ok(0));
         assert_eq!(with(Value::Null), Ok(0));
-        assert_eq!(with(json!(MAX_WAIT_MIN.to_string())), Ok(MAX_WAIT_MIN));
-        for bad in [json!("soon"), json!("1.5"), json!("-1"), json!(true), json!((MAX_WAIT_MIN + 1).to_string())] {
+        assert_eq!(with(json!("100000")), Ok(100000));
+        assert_eq!(with(json!(u64::MAX.to_string())), Ok(u64::MAX));
+        for bad in [json!("soon"), json!("1.5"), json!("-1"), json!(true)] {
             assert!(with(bad.clone()).is_err(), "{bad}");
         }
         let p = parameters(&call(json!({"branch": "feature", "repository": "https://github.com/o/r"})))
