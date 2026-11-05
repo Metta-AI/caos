@@ -90,11 +90,13 @@ fn failed(dir: &Path, op: &str, message: &str) -> Result<(), String> {
 }
 
 /// A reader's answer: `{stdout}`, or `{stdout, failed}` saying why.
-fn reader(outcome: Result<String, Fail>) -> Result<(), String> {
+fn reader(op: &str, outcome: Result<String, Fail>) -> Result<(), String> {
     let dir = scratch("files-out")?;
     match outcome {
-        Ok(text) => fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?,
-        Err(User(message)) => failed(&dir, "read", &message)?,
+        Ok(text) => {
+            fs::write(dir.join("stdout"), text).map_err(|e| format!("writing stdout: {e}"))?
+        }
+        Err(User(message)) => failed(&dir, op, &message)?,
         Err(Infra(error)) => return Err(error),
     }
     put(&dir)
