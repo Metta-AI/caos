@@ -500,6 +500,14 @@ pub struct Help {
     /// and the call id is unique to the call yet the same when a call is
     /// recovered, so a retry gets the stored result and a new call does not.
     pub call: bool,
+    /// `@request-id`: the tool reads or changes something outside caos, so a
+    /// result must never be reused by a later call that merely has the same
+    /// arguments. It gets an optional `request-id` parameter, which the harness
+    /// fills with the tool call's id when the caller leaves it out
+    /// (design/tool-contract.md, "`@request-id`"). The call id rather than a
+    /// random value because it is just as unique and it is in the transcript.
+    /// Replaces `@call`.
+    pub request_id: bool,
     /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
     /// TREE the argument `<param>` names (the path of a code reference in the
     /// session, such as `feature/01-change`).
