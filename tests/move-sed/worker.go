@@ -57,10 +57,23 @@ func mint(name, tree string, ts int, msg string, parents ...string) string {
 type testCase struct {
 	name    string
 	args    []string
-	dir     string            // the fixture directory the renames apply to ("" = root)
+	dir     string            // the fixture path bound as root ("" = the session's top, "-" = nothing)
 	renames map[string]string // old entry name -> new; nil for a refusal
 	dryRun  bool
 	says    []string
+}
+
+var seq int
+
+// object is the object at `path` inside the tree `tree`, as a CAS path.
+func object(tree, path string) string {
+	if path == "" {
+		return "/cas/" + filepath.Base(tree)
+	}
+	seq++
+	dest := fmt.Sprintf("/cas/object-%d", seq)
+	w.Caos("resolve", w.Hash(tree), path, dest)
+	return dest
 }
 
 var cases []testCase
