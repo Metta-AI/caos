@@ -73,7 +73,7 @@ read)
 denied)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" != "0" ] || fail "undeclared read did not fail"
-  grep -qi "permission denied" "$R/stderr" || fail "no EACCES in stderr"
+  grep -qi "permission denied" "$R/command-stderr" || fail "no EACCES in command-stderr"
   [ -f "$R/denied" ] || fail "no denied hint in the result"
   grep -q "a/b/two.txt" "$R/denied" || fail "hint misses the path"
   echo "  ok: EACCES surfaced, denied names a/b/two.txt" >&2
