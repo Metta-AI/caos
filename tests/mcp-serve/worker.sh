@@ -449,7 +449,7 @@ case "$status" in
 esac
 # And a call that needs the server fails promptly, saying so, instead of waiting.
 send "$(jq -nc --arg session "$session" \
-  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run",arguments:{caos_session:$session,caos_tool_use_id:"unreachable-1",path:"caos-std/read",arguments:{"file-path":"README.md"}}}}')"
+  '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"run",arguments:{caos_session:$session,caos_tool_use_id:"unreachable-1",path:"caos-std/read",arguments:{"root":"README.md"}}}}')"
 refused=$(await '"id":3' 120) || fail "a call did not fail promptly while the server was unreachable"
 case "$refused" in
   *DEGRADED*) ;;
