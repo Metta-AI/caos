@@ -167,7 +167,7 @@ fn integrity_depth(refname: &str) -> IntegrityDepth {
     }
 }
 
-// A v3 conversation head is never rewound: an older reflog value can name a
+// A v3 session head is never rewound: an older reflog value can name a
 // state whose write-ahead effects (a landed publication push, half of an atomic
 // spawn) already happened. The loose ref is dropped and the reflog kept for a
 // human to restore from.

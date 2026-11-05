@@ -7,17 +7,17 @@ use super::oid::Oid;
 use super::paths;
 use super::records::*;
 use super::tree::{CommitInfo, Mode, ObjectStore, Signature, TreeBuilder};
-use super::view::Conversation;
+use super::view::Session;
 
 #[allow(clippy::large_enum_variant, clippy::type_complexity)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Transition {
-    ConversationRoot {
+    SessionRoot {
         identity: Identity,
         title: String,
         content: Option<Oid>,
     },
-    ConversationFork {
+    SessionFork {
         identity: Identity,
         title: String,
         /// Content the fork starts with INSTEAD of its source's, when it merged
@@ -86,8 +86,8 @@ impl Transition {
 
     pub fn kind(&self) -> Kind {
         match self {
-            Transition::ConversationRoot { .. } => Kind::ConversationRoot,
-            Transition::ConversationFork { .. } => Kind::ConversationFork,
+            Transition::SessionRoot { .. } => Kind::SessionRoot,
+            Transition::SessionFork { .. } => Kind::SessionFork,
             Transition::TitleSet { .. } => Kind::MetadataTitleSet,
             Transition::MessageAppend { .. } => Kind::MessageAppend,
             Transition::ToolStart { .. } => Kind::ToolStart,
@@ -115,9 +115,9 @@ pub fn apply(
     parent_head: Option<&Oid>,
     transition: &Transition,
 ) -> Result<Applied, String> {
-    if matches!(transition, Transition::ConversationRoot { .. }) {
+    if matches!(transition, Transition::SessionRoot { .. }) {
         if parent_head.is_some() {
-            return Err("conversation root requires no parent tree".to_string());
+            return Err("session root requires no parent tree".to_string());
         }
     } else if parent_head.is_none() {
         return Err(format!(
@@ -134,14 +134,14 @@ pub fn apply(
     let mut ordinal = None;
 
     match transition {
-        Transition::ConversationRoot {
+        Transition::SessionRoot {
             identity,
             title,
             content,
         } => {
             canonical_shape(identity, "identity")?;
             if !matches!(identity.kind, IdentityKind::Root) {
-                return Err("conversation root identity must have root kind".to_string());
+                return Err("session root identity must have root kind".to_string());
             }
             builder.put(
                 paths::FORMAT,
@@ -159,20 +159,20 @@ pub fn apply(
                 }
             }
         }
-        Transition::ConversationFork {
+        Transition::SessionFork {
             identity,
             title,
             content,
         } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             canonical_shape(identity, "identity")?;
             if !matches!(identity.kind, IdentityKind::Fork { .. }) {
-                return Err("conversation fork identity must have fork kind".to_string());
+                return Err("session fork identity must have fork kind".to_string());
             }
-            if identity.id == conversation.identity()?.id {
-                return Err("conversation fork identity id must differ from its source".to_string());
+            if identity.id == session.identity()?.id {
+                return Err("session fork identity id must differ from its source".to_string());
             }
-            validate_fork_quiescence(&conversation)?;
+            validate_fork_quiescence(&session)?;
             if let Some(merged) = content {
                 // Everything outside .caos/ is replaced by the merged tree's
                 // entries. .caos/ is the fork's own record, never merged.
@@ -183,7 +183,7 @@ pub fn apply(
                 // Every one of them, including those the merge keeps: a put onto
                 // a directory the source has is refused unless that path was
                 // explicitly deleted first (`TreeBuilder`).
-                for entry in conversation.snapshot().list("")? {
+                for entry in session.snapshot().list("")? {
                     if entry.name != paths::CAOS_DIR {
                         builder.delete(&entry.name);
                     }
@@ -196,35 +196,35 @@ pub fn apply(
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
         }
         Transition::TitleSet { title } => {
-            let conversation = parent(store, parent_head)?;
-            if conversation.title()? == *title {
+            let session = parent(store, parent_head)?;
+            if session.title()? == *title {
                 return Err("no-op".to_string());
             }
             builder.put(paths::TITLE, Mode::Blob, encode_title(title)?);
         }
         Transition::MessageAppend { entry, payloads } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             if entry.role == Role::Assistant {
-                validate_declared_calls(&conversation, entry)?;
+                validate_declared_calls(&session, entry)?;
             } else if entry.tool_uses().next().is_some() {
                 return Err("only an assistant message declares tool calls".to_string());
             }
-            let next = conversation.transcript_len()?;
-            validate_entry_resolution(&conversation, entry, &mut builder)?;
+            let next = session.transcript_len()?;
+            validate_entry_resolution(&session, entry, &mut builder)?;
             put_transcript(&mut builder, next, entry, payloads)?;
             ordinal = Some(next);
         }
         Transition::ToolStart { record, payloads } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             canonical_shape(record, "tool")?;
             if record.status != CallStatus::Started {
                 return Err("tool.start requires started status".to_string());
             }
-            if conversation.tool(&record.id)?.is_some() {
+            if session.tool(&record.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", record.id));
             }
-            validate_tool_source_tree(&conversation, record)?;
-            validate_new_tool_payloads(&conversation, record, payloads)?;
+            validate_tool_source_tree(&session, record)?;
+            validate_new_tool_payloads(&session, record, payloads)?;
             put_tool_payloads(&mut events, record, payloads)?;
             put_tool(&mut events, record);
         }
@@ -233,9 +233,9 @@ pub fn apply(
             payloads,
             files,
         } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             validate_tool_completion(
-                &conversation,
+                &session,
                 record,
                 payloads,
                 files,
@@ -244,12 +244,12 @@ pub fn apply(
             )?;
         }
         Transition::AsyncStart { record } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             canonical_shape(record, "async record")?;
             if record.status != TaskStatus::Pending {
                 return Err("async.start requires pending status".to_string());
             }
-            if conversation.async_task(&record.task)?.is_some() {
+            if session.async_task(&record.task)?.is_some() {
                 return Err(format!("async task {} already exists", record.task));
             }
             put_async(&mut events, record);
@@ -260,8 +260,8 @@ pub fn apply(
             result,
             reason,
         } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = conversation
+            let session = parent(store, parent_head)?;
+            let mut record = session
                 .async_task(task)?
                 .ok_or_else(|| format!("async task {task} does not exist"))?;
             record.status = record.status.finish(*status)?;
@@ -275,10 +275,10 @@ pub fn apply(
             payloads,
             child,
         } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             canonical_shape(tool, "tool")?;
             canonical_shape(child, "child")?;
-            if conversation.tool(&tool.id)?.is_some() {
+            if session.tool(&tool.id)?.is_some() {
                 return Err(format!("tool {:?} already exists", tool.id));
             }
             let Some(ToolResult::Complete {
@@ -305,7 +305,7 @@ pub fn apply(
             if child.status != TaskStatus::Pending {
                 return Err("subagent spawn requires a running child".to_string());
             }
-            let expected = ids::child_id(&conversation.identity()?.id, &tool.id)?;
+            let expected = ids::child_id(&session.identity()?.id, &tool.id)?;
             if child.id != expected {
                 return Err(format!(
                     "subagent child id mismatch: got {:?}, expected {expected:?}",
@@ -315,10 +315,10 @@ pub fn apply(
             if child.spawn_intent.tool != tool.id {
                 return Err("subagent spawn intent does not match tool".to_string());
             }
-            if conversation.child(&child.id)?.is_some() {
+            if session.child(&child.id)?.is_some() {
                 return Err(format!("subagent {:?} already exists", child.id));
             }
-            validate_new_tool_payloads(&conversation, tool, payloads)?;
+            validate_new_tool_payloads(&session, tool, payloads)?;
             let payload_paths = put_tool_payloads(&mut events, tool, payloads)?;
             if !payload_paths.contains(observation) {
                 return Err(
@@ -333,26 +333,26 @@ pub fn apply(
             terminal_head,
             status,
         } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = require_child(&conversation, child)?;
+            let session = parent(store, parent_head)?;
+            let mut record = require_child(&session, child)?;
             record.status = record.status.finish(*status)?;
             record.terminal_head = Some(terminal_head.clone());
             canonical_shape(&record, "child record")?;
             put_child(&mut events, &record);
         }
         Transition::PublicationPending { record } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             canonical_shape(record, "publication")?;
             paths::validate_protocol_id_component(&record.id)?;
             if record.status != PublicationStatus::Pending {
                 return Err("publication.pending requires pending status".to_string());
             }
-            if conversation.publication(&record.id)?.is_some() {
+            if session.publication(&record.id)?.is_some() {
                 return Err(format!("publication {:?} already exists", record.id));
             }
             let projection = ids::projection_id(&record.descriptor.to_value())?;
             let expected = ids::publication_id(
-                &conversation.identity()?.id,
+                &session.identity()?.id,
                 &record.key,
                 &projection,
                 &record.planned_head,
@@ -371,8 +371,8 @@ pub fn apply(
             evidence,
             observed,
         } => {
-            let conversation = parent(store, parent_head)?;
-            let mut record = conversation
+            let session = parent(store, parent_head)?;
+            let mut record = session
                 .publication(publication)?
                 .ok_or_else(|| format!("publication {publication:?} does not exist"))?;
             if record.status != PublicationStatus::Pending {
@@ -388,11 +388,11 @@ pub fn apply(
             put_publication(&mut events, &record);
         }
         Transition::FilesApply { files } => {
-            let conversation = parent(store, parent_head)?;
+            let session = parent(store, parent_head)?;
             if files.is_empty() {
                 return Err("files.apply requires at least one file".to_string());
             }
-            apply_files(&conversation, &mut builder, files, "file path")?;
+            apply_files(&session, &mut builder, files, "file path")?;
         }
     }
 
@@ -403,8 +403,8 @@ pub fn apply(
     })
 }
 
-fn validate_fork_quiescence(_conversation: &Conversation<'_>) -> Result<(), String> {
-    // A conversation is a flat transcript; a fork copies it as it stands, with
+fn validate_fork_quiescence(_session: &Session<'_>) -> Result<(), String> {
+    // A session is a flat transcript; a fork copies it as it stands, with
     // no outstanding-work check. A call that started and never finished is just
     // a tool_use with no tool_result, which a reader renders as unfinished and a
     // resuming driver decides what to do with. (Formerly refused an active
@@ -424,13 +424,13 @@ pub fn mint(
 }
 
 /// Mint with further parents after the spine's `parent`: the commit a fork
-/// merged its content from. The first parent is always the conversation, which
+/// merged its content from. The first parent is always the session, which
 /// is how every reader walks it; the others are there so that git can find a
 /// merge base the next time that repository's newer commit is merged in.
 ///
 /// A root's parent is G3, or the commit whose tree is its content -- with the
-/// same purpose. Neither place takes a conversation commit: that would splice
-/// one conversation's history into another.
+/// same purpose. Neither place takes a session commit: that would splice
+/// one session's history into another.
 pub fn mint_with_parents(
     store: &mut dyn ObjectStore,
     parent: &Oid,
@@ -439,23 +439,23 @@ pub fn mint_with_parents(
     kind: Kind,
     signature: &Signature,
 ) -> Result<Oid, String> {
-    if kind == Kind::ConversationRoot {
-        if parent != &super::oid::g3() && is_conversation_commit(store, parent)? {
+    if kind == Kind::SessionRoot {
+        if parent != &super::oid::g3() && is_session_commit(store, parent)? {
             return Err(
-                "a conversation root parents G3 or the commit its content came from, \
-                 not a conversation commit"
+                "a session root parents G3 or the commit its content came from, \
+                 not a session commit"
                     .to_string(),
             );
         }
     } else if parent == &super::oid::g3() {
-        return Err("only a conversation root may parent G3".to_string());
+        return Err("only a session root may parent G3".to_string());
     }
-    if !merged.is_empty() && kind != Kind::ConversationFork {
-        return Err("only a conversation fork merges another commit in".to_string());
+    if !merged.is_empty() && kind != Kind::SessionFork {
+        return Err("only a session fork merges another commit in".to_string());
     }
     for commit in merged {
-        if is_conversation_commit(store, commit)? {
-            return Err("a fork merges a content commit in, not a conversation commit".to_string());
+        if is_session_commit(store, commit)? {
+            return Err("a fork merges a content commit in, not a session commit".to_string());
         }
     }
     store
@@ -470,9 +470,9 @@ pub fn mint_with_parents(
         .map_err(String::from)
 }
 
-/// Whether a commit's message names a conversation transition, which is what
-/// makes it part of a conversation rather than content.
-pub fn is_conversation_commit(store: &dyn ObjectStore, commit: &Oid) -> Result<bool, String> {
+/// Whether a commit's message names a session transition, which is what
+/// makes it part of a session rather than content.
+pub fn is_session_commit(store: &dyn ObjectStore, commit: &Oid) -> Result<bool, String> {
     let info = store.read_commit(commit).map_err(String::from)?;
     Ok(Kind::parse_message(&info.message).is_ok())
 }
@@ -493,8 +493,8 @@ pub fn client_signature(name: &str, email: &str, unix_time: i64) -> Signature {
     }
 }
 
-fn parent<'s>(store: &'s dyn ObjectStore, tree: Option<&Oid>) -> Result<Conversation<'s>, String> {
-    Conversation::open(store, tree.expect("non-root transition has parent commit"))
+fn parent<'s>(store: &'s dyn ObjectStore, tree: Option<&Oid>) -> Result<Session<'s>, String> {
+    Session::open(store, tree.expect("non-root transition has parent commit"))
 }
 
 fn canonical_shape<T: Record + PartialEq>(record: &T, what: &str) -> Result<(), String> {
@@ -582,15 +582,15 @@ fn validate_entry_payloads(
 
 /// An assistant message's `tool_use` ids are the ids its calls are recorded
 /// under, so they are unique: within the message, and against every call the
-/// conversation has already recorded.
+/// session has already recorded.
 fn validate_declared_calls(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     entry: &TranscriptEntry,
 ) -> Result<(), String> {
     let ids: Vec<String> = entry.tool_uses().map(|(id, _, _)| id.to_string()).collect();
     paths::validate_unique(&ids, "declared call id")?;
     for id in &ids {
-        if conversation.tool(id)?.is_some() {
+        if session.tool(id)?.is_some() {
             return Err(format!("call {id:?} is already recorded"));
         }
     }
@@ -598,7 +598,7 @@ fn validate_declared_calls(
 }
 
 fn validate_entry_resolution(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     entry: &TranscriptEntry,
     builder: &mut TreeBuilder,
 ) -> Result<(), String> {
@@ -606,7 +606,7 @@ fn validate_entry_resolution(
         .proposal
         .as_ref()
         .map(|proposal| {
-            let source_tree = conversation
+            let source_tree = session
                 .source_tree(&proposal.source_tree_name)?
                 .ok_or_else(|| {
                     format!("source tree {:?} does not exist", proposal.source_tree_name)
@@ -630,7 +630,7 @@ fn validate_entry_resolution(
 }
 
 fn validate_tool_source_tree(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     record: &CallRecord,
 ) -> Result<(), String> {
     if record.source_tree_name.is_some() && record.input_commit.is_none() {
@@ -638,13 +638,13 @@ fn validate_tool_source_tree(
     }
     if record.source_tree_name.is_none() {
         if let Some(input) = &record.input_commit {
-            if conversation.commit() != Some(input) {
-                return Err("tool input conversation is stale".into());
+            if session.commit() != Some(input) {
+                return Err("tool input session is stale".into());
             }
         }
     }
     if let (Some(name), Some(input)) = (&record.source_tree_name, &record.input_commit) {
-        let source_tree = conversation
+        let source_tree = session
             .source_tree(name)?
             .ok_or_else(|| format!("source tree {name:?} does not exist"))?;
         if source_tree.commit != *input {
@@ -656,7 +656,7 @@ fn validate_tool_source_tree(
 
 #[allow(clippy::type_complexity)]
 fn validate_tool_completion(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
     files: &[(String, Option<(Mode, Vec<u8>)>)],
@@ -667,7 +667,7 @@ fn validate_tool_completion(
     if record.status == CallStatus::Started {
         return Err("tool.complete requires a terminal status".to_string());
     }
-    let existing = conversation.tool(&record.id)?;
+    let existing = session.tool(&record.id)?;
     if let Some(started) = &existing {
         if started.status != CallStatus::Started {
             return Err("tool.complete requires an absent or started tool record".to_string());
@@ -681,12 +681,12 @@ fn validate_tool_completion(
             return Err("tool.complete identity fields do not match tool.start".to_string());
         }
     } else if let Some(task) = &record.task {
-        if conversation.task(task)?.is_none() {
+        if session.task(task)?.is_none() {
             return Err("startless tool.complete must refer to an existing task".to_string());
         }
     }
     if existing.is_none() {
-        validate_tool_source_tree(conversation, record)?;
+        validate_tool_source_tree(session, record)?;
     }
     let result = record
         .result
@@ -696,7 +696,7 @@ fn validate_tool_completion(
     {
         return Err("tool status does not match result and resolution".to_string());
     }
-    validate_new_tool_payloads(conversation, record, payloads)?;
+    validate_new_tool_payloads(session, record, payloads)?;
     let payload_paths = put_tool_payloads(events, record, payloads)?;
     let result_path = match result {
         ToolResult::Complete { observation, .. } => Some(observation),
@@ -715,13 +715,13 @@ fn validate_tool_completion(
     if supplied != record.files {
         return Err("tool.complete files do not match record.files".to_string());
     }
-    apply_files(conversation, builder, files, "tool file path")?;
+    apply_files(session, builder, files, "tool file path")?;
     if let Some(resolution) = &record.source_tree_resolution {
         let name = record
             .source_tree_name
             .as_ref()
             .ok_or_else(|| "tool source tree resolution requires source_tree_name".to_string())?;
-        let source_tree = conversation
+        let source_tree = session
             .source_tree(name)?
             .ok_or_else(|| format!("source tree {name:?} does not exist"))?;
         move_source_tree_pointer(
@@ -775,7 +775,7 @@ fn put_tool_payloads(
 }
 
 fn validate_new_tool_payloads(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     record: &CallRecord,
     payloads: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
@@ -783,7 +783,7 @@ fn validate_new_tool_payloads(
     for (name, _) in payloads {
         paths::validate_component(name)?;
         let path = format!("{dir}/{name}");
-        if conversation.snapshot().exists(&path)? {
+        if session.snapshot().exists(&path)? {
             return Err(format!("tool payload {path:?} already exists"));
         }
     }
@@ -792,7 +792,7 @@ fn validate_new_tool_payloads(
 
 #[allow(clippy::type_complexity)]
 fn apply_files(
-    conversation: &Conversation<'_>,
+    session: &Session<'_>,
     builder: &mut TreeBuilder,
     files: &[(String, Option<(Mode, Vec<u8>)>)],
     unique_what: &str,
@@ -802,7 +802,7 @@ fn apply_files(
     for (relative, value) in files {
         paths::validate_source_tree_name(relative)?;
         let path = paths::files_path(relative);
-        let before = conversation.snapshot().entry(&path)?;
+        let before = session.snapshot().entry(&path)?;
         let changed = match (before, value) {
             (None, None) => false,
             (Some(_), None) | (None, Some(_)) => true,
@@ -811,7 +811,7 @@ fn apply_files(
                     || if matches!(mode, Mode::Commit | Mode::Tree) {
                         entry.oid.encode_line() != *bytes
                     } else {
-                        conversation.snapshot().read(&path)?.as_deref() != Some(bytes.as_slice())
+                        session.snapshot().read(&path)?.as_deref() != Some(bytes.as_slice())
                     }
             }
         };
@@ -831,8 +831,8 @@ fn apply_files(
     Ok(())
 }
 
-fn require_child(conversation: &Conversation<'_>, child: &str) -> Result<ChildRecord, String> {
-    conversation
+fn require_child(session: &Session<'_>, child: &str) -> Result<ChildRecord, String> {
+    session
         .child(child)?
         .ok_or_else(|| format!("subagent {child:?} does not exist"))
 }

@@ -6,7 +6,7 @@
 # `instructions` that tell the model how the five fit together. `tools/list` is a
 # CONSTANT: it needs no step, no cache, no warm-up hook and no server, so there is
 # nothing for a re-list-averse client to miss. A call is one request to the server,
-# and what a tool runs is named by a PATH in the conversation.
+# and what a tool runs is named by a PATH in the session.
 #
 # The regressions this guards: a listing that waited on a worker run (a first
 # session in a tree built the step before the client's startup budget ran out, and

@@ -1,28 +1,28 @@
 # `caos tui`
 
 `caos tui` is a full-screen terminal client for the CAOS agent harness. It uses
-the same conversation engine as `caos talk`, while keeping terminal UI
+the same session engine as `caos talk`, while keeping terminal UI
 dependencies out of the worker-side `caos` binary.
 
-The interface keeps independent virtual conversations in a left sidebar. Each
+The interface keeps independent virtual sessions in a left sidebar. Each
 entry has a stable task title and a second row reserved for live operation or
-attention status. Idle conversations do not show a stripped message preview.
+attention status. Idle sessions do not show a stripped message preview.
 `Ctrl+N` allocates local state; a source tree operation or the first submitted
-message publishes its conversation head and active membership. The launcher's
-initial conversation is created immediately so its attachments are visible. The
+message publishes its session head and active membership. The launcher's
+initial session is created immediately so its attachments are visible. The
 first message also runs one separate, stateless `llm-call` title job concurrently
 with the agent turn. The result uses
 the existing durable title metadata, so reopening the TUI does not regenerate
 it or require any additional refs. Text ends with a visible ellipsis instead of
-hard terminal clipping, and internal conversation IDs stay hidden. Each
-conversation has its own durable history, multiline prompt, live activity,
+hard terminal clipping, and internal session IDs stay hidden. Each
+session has its own durable history, multiline prompt, live activity,
 completed-turn hashes, and source tree diff.
-Turns continue running when another conversation is selected, so several agent
+Turns continue running when another session is selected, so several agent
 source trees can advance concurrently without touching the working checkout.
-Agents may use `spawn_agent` to create an indexed child conversation. It runs
-through `run_async`; harvesting reconciles its changed conversation files and
+Agents may use `spawn_agent` to create an indexed child session. It runs
+through `run_async`; harvesting reconciles its changed session files and
 source trees into the parent, optionally restricted to named paths. Child rows use
-their prompt title and appear beneath the parent conversation.
+their prompt title and appear beneath the parent session.
 
 ## Build and run
 
@@ -45,7 +45,7 @@ worker images; the full test suite uses its own stack.
 
 
 The packaged TUI can run anywhere. Inside a checkout, it uses that checkout's `caos` remote;
-`--import <path>` starts a new conversation with its clean HEAD, while `--base <revision>` selects an
+`--import <path>` starts a new session with its clean HEAD, while `--base <revision>` selects an
 existing commit and excludes disk changes. `--import <path> <source> [revision]`
 also accepts another local repository or a Git URL; URLs require a full commit
 hash. Outside a checkout, it starts without code unless an import source is
@@ -62,7 +62,7 @@ nix build
 ```
 
 A session NAMES the two workers it runs — the durable turn (`llm-step`) and the
-one-shot call that titles a conversation (`llm-call`) — as ordinary image args.
+one-shot call that titles a session (`llm-call`) — as ordinary image args.
 Both are required; the TUI looks in no path of its own. The paths above are
 this repository's; a repo that mounted caos through
 `std/flake-input-loader` writes `--llm-step:@=caos-std/llm-step`, and one that
@@ -88,7 +88,7 @@ changed under it:
 - Run in caos itself, `--llm-step:@=std/llm-step` evaluates the working tree,
   which no `reader:@@=` grant covers once it differs from a commit in the
   grant's range. A grant on a branch you commit to covers committed work;
-  uncommitted work needs `reader:@=std/llm-step conversation=<id>`.
+  uncommitted work needs `reader:@=std/llm-step session=<id>`.
 
 Before submitting a chat turn, the client asks the server which secrets the
 request would be given, and refuses to send a turn whose `llm-step` would not
@@ -99,31 +99,31 @@ Below, `$W` stands for the two required image args
 worker, so they take neither.
 
 ```text
-caos tui $W                  continue the most recent conversation
-caos tui $W --username alice use alice's active conversation list
-caos tui $W --new            start a fresh conversation
+caos tui $W                  continue the most recent session
+caos tui $W --username alice use alice's active session list
+caos tui $W --new            start a fresh session
 caos tui $W --import imports/caos/base  load this checkout's clean HEAD at imports/caos/base
 caos tui $W --server URL     use a specific server
 caos tui $W --from 5ec3751   branch from a completed turn
-caos tui --list-archived     list archived conversation IDs and titles
-caos tui --unarchive ID      restore one conversation to the active list
+caos tui --list-archived     list archived session IDs and titles
+caos tui --unarchive ID      restore one session to the active list
 ```
 
 `--username` defaults to `$USER`. If `$USER` is a shared container account such
 as `root` or `ubuntu`, pass a personal `--username`; persisted identity is future
 work. Active and archived membership is stored on the
 CAOS server under `refs/caos/v3/users/<user-key>/conversations/{active,archived}/`.
-User and conversation keys are lowercase hex of their UTF-8 IDs, without an
-extra prefix. Usernames are limited to 126 bytes and conversation IDs to 124.
+User and session keys are lowercase hex of their UTF-8 IDs, without an
+extra prefix. Usernames are limited to 126 bytes and session IDs to 124.
 Only v3 refs populate this sidebar; earlier namespaces remain untouched.
 
 ## Controls
 
-The left pane lists conversations; keyboard input goes to the conversation
-pane. Change the selected conversation from anywhere with `Ctrl+Up` /
+The left pane lists sessions; keyboard input goes to the session
+pane. Change the selected session from anywhere with `Ctrl+Up` /
 `Ctrl+Down`, jump straight to one with `Ctrl+1` … `Ctrl+9`, or click its row
 in the sidebar. `Escape` stops a running turn or dismisses the current layer,
-so it never leaves the conversation pane.
+so it never leaves the session pane.
 
 | Input | Action |
 |---|---|
@@ -139,35 +139,35 @@ so it never leaves the conversation pane.
 | `Ctrl+W` | Delete the previous word |
 | `Ctrl+K` | Kill from the cursor to the end of the line |
 | `Ctrl+D` | Delete the character to the right of the cursor |
-| `Ctrl+Up` / `Ctrl+Down` | Select the previous or next conversation |
-| `Ctrl+1` … `Ctrl+9` | Select the Nth conversation (terminals with enhanced keyboard input) |
-| `Ctrl+N` | Start a new virtual conversation and select it |
+| `Ctrl+Up` / `Ctrl+Down` | Select the previous or next session |
+| `Ctrl+1` … `Ctrl+9` | Select the Nth session (terminals with enhanced keyboard input) |
+| `Ctrl+N` | Start a new virtual session and select it |
 | `Ctrl+H` | Enter or leave keyboard help |
 | `Ctrl+Shift+P` | Open or close the searchable command palette |
-| `Ctrl+Shift+T` | Show the tools available to the selected conversation |
+| `Ctrl+Shift+T` | Show the tools available to the selected session |
 | `Up` / `Down` in Activity | Select the previous or next activity entry |
 | `PageUp` / `PageDown` in Activity | Scroll the selected activity's full details |
-| `Escape` in Activity | Return to the conversation |
-| `PageUp` / `PageDown` in conversation | Scroll by rendered rows |
-| Mouse wheel over the transcript | Scroll the conversation by rendered rows |
+| `Escape` in Activity | Return to the session |
+| `PageUp` / `PageDown` in session | Scroll by rendered rows |
+| Mouse wheel over the transcript | Scroll the session by rendered rows |
 | Mouse wheel over Activity | Scroll the selected activity's full details |
 | Mouse drag over rendered text | Select and copy text anywhere in the interface |
 | `Ctrl+Y` | Release mouse capture and freeze redraws for native selection |
 | `/checkout <gitlink> [directory]` | Check out this commit, reusing its local directory when omitted |
-| `Ctrl+O` | Browse conversation files and source-tree diffs |
-| `Ctrl+R` | Reload completed conversation history |
+| `Ctrl+O` | Browse session files and source-tree diffs |
+| `Ctrl+R` | Reload completed session history |
 | `Ctrl+C` | Clear a non-empty prompt; exit when the prompt is empty |
 
 Failures from local UI commands are shown in a temporary red command-error
-panel instead of being inserted into the conversation transcript. Routine
+panel instead of being inserted into the session transcript. Routine
 operation status is shown only while the operation is running and is not added
 to the transcript or title. Completed imports, pushes, and PR creation or
 updates remain in the transcript as CAOS messages.
 
 Completed user and agent turns show branchable hashes in the transcript. Enter
-`/from <turn-hash>` to start a fresh conversation from one without leaving the
+`/from <turn-hash>` to start a fresh session from one without leaving the
 TUI. Enter `/title <new title>` to change the
-shared title without changing the conversation ID (the metadata update advances its conversation head). Enter `/model <name>` to select the client-wide model
+shared title without changing the session ID (the metadata update advances its session head). Enter `/model <name>` to select the client-wide model
 for later turns; known model names type ahead. `/model default` restores the
 client default. Enter `/update-tree <gitlink> <message>` to send an ordinary
 user turn whose commit also folds in edits in that gitlink's remembered checkout — the
@@ -176,7 +176,7 @@ intended companion to `/checkout <gitlink> [directory]` (check out the head, edi
 show the durable hashes of internal harness steps for inspection; those step
 trees contain harness metadata and are not branch points.
 
-Press `Ctrl+O` to open the read-only conversation filesystem. Up/Down select
+Press `Ctrl+O` to open the read-only session filesystem. Up/Down select
 entries and immediately preview them. The list includes each directory's immediate
 children, indented one level, and those children can be selected directly.
 Gitlinks are magenta; ordinary directories are cyan.
@@ -192,7 +192,7 @@ it; entering one shows file diffs, including deleted files. The oldest gitlink
 shows contents because it has no earlier boundary. The preview names the
 compared boundaries and hashes. No publishing destination is required.
 
-The browser pins the conversation head when opened. `r` refreshes it. There
+The browser pins the session head when opened. `r` refreshes it. There
 are no shell commands or controls that apply edits.
 
 On a source-tree entry, `o` selects the source for tool descriptions and local
@@ -212,10 +212,10 @@ There is no publish command. Ask the agent for a PR: it pushes the branch with
 `publish_source` and opens or updates the PR with `caos-std/github`
 (design/agent-github.md, "PRs"). Ctrl+P and Ctrl+L have no bindings.
 
-Conversation text renders `**bold**` and `_italic_` emphasis. Unmatched markers
+Session text renders `**bold**` and `_italic_` emphasis. Unmatched markers
 remain visible, and marker-like text inside inline backticks is left literal.
 
-A fresh conversation starts with a dimmed `New conversation` placeholder.
+A fresh session starts with a dimmed `New session` placeholder.
 Reopening it before sending a prompt preserves automatic naming. Its first prompt
 provides an immediate fallback title and starts a stateless `llm-call` job using
 that message alone. Title generation runs concurrently with the agent turn, so
@@ -227,7 +227,7 @@ checkout's clean HEAD as a gitlink at that path. Add `--base <revision>` to
 select an existing commit even when the checkout is dirty. Use
 `--import imports/caos/base <source> [revision]` for another repository;
 a Git URL requires a full commit hash.
-`/from <turn-hash>` forks the selected conversation history. Conversations in earlier formats
+`/from <turn-hash>` forks the selected session history. Sessions in earlier formats
 require the previous build; this version does not migrate them implicitly.
 
 Typing `/` at the start of the prompt shows matching slash commands and their
@@ -240,7 +240,7 @@ slash-prefixed prompt is sent normally.
 
 `Ctrl+Shift+P` or `/commands` opens a searchable command palette without
 changing the current draft. Type any words from an action, use Up and Down to
-choose a match, then press Enter to run it. The palette covers conversation,
+choose a match, then press Enter to run it. The palette covers session,
 file browsing, activity, tool, help, reload, archive, and selection actions.
 Escape closes the palette or slash-command menu while an agent turn keeps
 running. With the menu closed, Escape interrupts that work.
@@ -259,31 +259,31 @@ Choose Activity in the command palette to open its browser in all space
 above the composer. Up and Down select durable harness steps, and the
 pane beside the list shows the selected step's complete result. Scroll long
 results with PageUp, PageDown, or the mouse wheel. Escape returns
-to the conversation. Completed activity is reconstructed from the durable
+to the session. Completed activity is reconstructed from the durable
 step chain when the TUI restarts. If the selection is already on the newest
 step, new activity remains selected. Moving to an older step pauses that
 tail-follow behavior.
 
-Archive the selected conversation with `/archive` or from the command palette (`Ctrl+Shift+P`,
+Archive the selected session with `/archive` or from the command palette (`Ctrl+Shift+P`,
 then `archive`). Archiving atomically moves only the selected user's
-membership ref from `active` to `archived`; it does not move the conversation
-HEAD or affect other users. A running or publishing conversation must finish
-first. Closing an unsent virtual conversation simply discards it. Use
-`--list-archived` and `--unarchive <conversation-id>` outside the full-screen
-UI to recover old conversations.
+membership ref from `active` to `archived`; it does not move the session
+HEAD or affect other users. A running or publishing session must finish
+first. Closing an unsent virtual session simply discards it. Use
+`--list-archived` and `--unarchive <session-id>` outside the full-screen
+UI to recover old sessions.
 
-The transcript fills the conversation pane above the fixed composer. Use
+The transcript fills the session pane above the fixed composer. Use
 `PageUp`, `PageDown`, or the mouse wheel over the transcript to scroll it.
 Scrolling up pauses tail-follow and holds the viewport in place as new activity
-arrives. The conversation border shows how many rendered lines remain below the
+arrives. The session border shows how many rendered lines remain below the
 viewport and highlights the count when a new message arrived off-screen.
 Scrolling back to the bottom resumes tail-follow and marks the message read.
 
 Mouse-wheel routing requires terminal mouse capture, so CAOS implements visible
 selection over the entire rendered interface. Drag across the header, sidebar,
-conversation, activity, diff, help, prompt, or footer to highlight text and copy
+session, activity, diff, help, prompt, or footer to highlight text and copy
 automatically on mouse release. A click without a drag still selects a
-conversation in the sidebar. Local macOS sessions use `pbcopy` and show
+session in the sidebar. Local macOS sessions use `pbcopy` and show
 “Copied” after it succeeds. SSH sessions and other environments send the same
 text through the standard OSC 52 terminal clipboard sequence and show
 “Copy requested”. A clipboard helper or terminal write failure stays in the
@@ -297,7 +297,7 @@ Press `Ctrl+Y` or `Escape` to resume.
 ## Source tree safety
 
 Source tree code is referenced by ordinary commit hashes from the separate
-conversation history. Opening and running conversations never overwrite a
+session history. Opening and running sessions never overwrite a
 checkout. `/checkout <gitlink> [directory]` uses an explicit destination or
 reuses that gitlink's remembered local directory. The destination must be a clean Git checkout
 or an empty/new directory. The client imports the code objects and detaches HEAD

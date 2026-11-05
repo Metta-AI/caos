@@ -1,18 +1,18 @@
 // The `move-sed` tool's worker. Its docs live in the sibling `.caos-expr`
 // here-string, not in this header (SPEC, "CaosTools").
 //
-// A writer run on the conversation (SPEC, "Writers"). Args, under /cas/args:
+// A writer run on the session (SPEC, "Writers"). Args, under /cas/args:
 //
-//	in           the conversation tree it was run on
-//	dir          the conversation directory whose entries to rename
+//	in           the session tree it was run on
+//	dir          the session directory whose entries to rename
 //	pattern      a Go regular expression, matched against each entry's name
 //	replacement  the new name, with $1 / ${name} for the pattern's groups
 //	dry-run      optional: "true" lists the renames and changes nothing
 //
-// The result is {prop, out, message, failed?}. `prop` is the conversation with
+// The result is {prop, out, message, failed?}. `prop` is the session with
 // `dir` rebuilt: every matching entry under its new name, everything else
 // linked as it was, so a layer and its sidecar files move in ONE proposal
-// (design/publish-stack.md, "move-sed"). Nothing in the conversation is
+// (design/publish-stack.md, "move-sed"). Nothing in the session is
 // checked out: the rebuilt folders are links to the CAS entries they keep.
 //
 // A refusal proposes `in` unchanged and marks `failed`: the agent reads it
@@ -67,7 +67,7 @@ func entries(dir string) []string {
 	return names
 }
 
-// splitDir checks the directory's conversation path and splits it. The empty
+// splitDir checks the directory's session path and splits it. The empty
 // string and "." are the root.
 func splitDir(raw string) []string {
 	path := strings.Trim(strings.TrimSpace(raw), "/")
@@ -77,7 +77,7 @@ func splitDir(raw string) []string {
 	parts := strings.Split(path, "/")
 	for _, part := range parts {
 		if part == "" || part == "." || part == ".." {
-			refuse("dir must be a conversation-relative path without . or .., not %q", raw)
+			refuse("dir must be a session-relative path without . or .., not %q", raw)
 		}
 	}
 	return parts
@@ -85,7 +85,7 @@ func splitDir(raw string) []string {
 
 // walk fetches the directory level by level and returns its CAS path. A path
 // through a file is a mistake, and one through a gitlink is code: this tool
-// rebuilds conversation folders, never commits.
+// rebuilds session folders, never commits.
 func walk(parts []string) string {
 	dir := in
 	for i, part := range parts {
@@ -97,7 +97,7 @@ func walk(parts []string) string {
 		switch k := w.Caos("kind", next); k {
 		case "tree":
 		case "commit":
-			refuse("dir: %s is a source tree. This tool renames entries of the conversation tree; for files inside code use move.", sofar)
+			refuse("dir: %s is a source tree. This tool renames entries of the session tree; for files inside code use move.", sofar)
 		default:
 			refuse("dir: %s is a %s, not a directory", sofar, k)
 		}
@@ -229,7 +229,7 @@ func main() {
 		renames := plan(names, len(parts) == 0, pattern, replacement)
 		label := strings.Join(parts, "/")
 		if label == "" {
-			label = "the conversation root"
+			label = "the session root"
 		}
 
 		var report strings.Builder

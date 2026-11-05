@@ -177,10 +177,10 @@ parameter becomes part of an ArgTree and so of a cache key.
 | header | used by | meaning |
 |---|---|---|
 | `X-Caos-Secret-Readers` | all compute endpoints | the secret reader keys the caller presents; they decide which secrets the evaluation can use |
-| `X-Caos-Conversation` | all compute endpoints | the conversation the secrets are scoped to |
+| `X-Caos-Conversation` | all compute endpoints | the session the secrets are scoped to |
 | `X-Caos-Git-Token` | `GET /eval`, `POST /start`, `POST /submit`, `POST /git/import` | a token for one HTTPS Git URL, for private repositories |
 | `X-Caos-Step` | `/mcp` | the step that runs tools: a git locator, or a bare 40-hex hash |
-| `X-Caos-Max-Result-Chars` | `/mcp` | how long a tool's text may be before it is kept in the conversation and answered with a preview (default 50000; `0` for no limit) |
+| `X-Caos-Max-Result-Chars` | `/mcp` | how long a tool's text may be before it is kept in the session and answered with a preview (default 50000; `0` for no limit) |
 
 ## `POST /mcp`: the MCP tool server
 
@@ -194,11 +194,11 @@ Methods: `initialize`, `tools/list`, `tools/call`, `ping`. Anything else is
 JSON-RPC error `-32601`. The tool list is a constant: `run`, `help`, `start`,
 `result`, `eval-path`.
 
-Each `tools/call` names its conversation in the `caos_session` argument (the
-conversation id is `cc/<session>`) and optionally `caos_tool_use_id`. Both are
+Each `tools/call` names its session in the `caos_session` argument (the
+session id is `cc/<session>`) and optionally `caos_tool_use_id`. Both are
 supplied by the harness's PreToolUse hook. They map onto the endpoints above as
 follows, with the step (`X-Caos-Step`) as the `base` and the arguments
-`conversation`, `tools-only`, `tool`, `arguments` (JSON) and `max-result-chars`:
+`session`, `tools-only`, `tool`, `arguments` (JSON) and `max-result-chars`:
 
 | MCP tool | HTTP equivalent |
 |---|---|
@@ -209,11 +209,11 @@ follows, with the step (`X-Caos-Step`) as the `base` and the arguments
 
 `start` answers with the ticket at once; the job declares the call and runs it.
 The model may end its turn first, which closes nothing the call needs: a
-conversation records facts, not turns. The ticket is the same one `run` of that
+session records facts, not turns. The ticket is the same one `run` of that
 call would have used, so starting a call that has finished does not run it
 again.
 
-`help` with no `path` reports on the connection (conversation, head commit,
+`help` with no `path` reports on the connection (session, head commit,
 diagnostics) and needs no tool run. A tool that cannot run at all is a JSON-RPC
 error (`-32603`); one that ran and failed is a result with `isError: true`.
 

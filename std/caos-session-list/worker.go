@@ -1,10 +1,10 @@
-// The `caos-conversation-list` tool's worker. Its DOCS live in the sibling
+// The `caos-session-list` tool's worker. Its DOCS live in the sibling
 // `.caos-expr` here-string, not in this header (SPEC, "Tools").
 //
-// It lists the conversations recorded on the server it runs against, newest
-// first, so a caller has a tip hash to give `caos-conversation`.
+// It lists the sessions recorded on the server it runs against, newest
+// first, so a caller has a tip hash to give `caos-session`.
 //
-// WHERE A CONVERSATION LIVES (v3/refs.rs): in two kinds of git ref on the server,
+// WHERE A SESSION LIVES (v3/refs.rs): in two kinds of git ref on the server,
 // with every id hex-encoded into its ref path:
 //   - `refs/caos/v3/conversations/<key>/head`: the tip commit.
 //   - `refs/caos/v3/users/<user key>/conversations/{active,archived}/<key>`:
@@ -15,18 +15,18 @@
 // remote every worker already pushes to.
 //
 // WHEN: a ref carries no time, but the tip COMMIT does. Its committer time is
-// when the last event was recorded, which is the last message. (std/caos-conversation's
+// when the last event was recorded, which is the last message. (std/caos-session's
 // recording-gaps.md says commit timestamps are all identical; on this server they
 // are not, and that note is the stale one.) So listing newest-first means reading
 // every tip commit, one `caos get-hash` each, BEFORE the limit is applied.
 //
-// A tip's title is `.caos/title` in its tree, read the way caos-conversation
-// reads it. It is best-effort: a conversation whose tip cannot be read is still
+// A tip's title is `.caos/title` in its tree, read the way caos-session
+// reads it. It is best-effort: a session whose tip cannot be read is still
 // listed, with a note, because a listing that drops what it cannot describe is
-// how a conversation goes missing without a trace. Such a conversation has no
+// how a session goes missing without a trace. Such a session has no
 // time and sorts last.
 //
-// EVERY OUTCOME IS THE VALUE, as in caos-conversation: a server that cannot be
+// EVERY OUTCOME IS THE VALUE, as in caos-session: a server that cannot be
 // reached comes back as text, never as a job error.
 package main
 
@@ -74,7 +74,7 @@ func unkey(key string) (string, bool) {
 	return string(b), true
 }
 
-type conversation struct {
+type session struct {
 	id      string
 	tip     string
 	members []string
@@ -106,7 +106,7 @@ func refs(server string, patterns ...string) (map[string]string, string) {
 }
 
 // readTip fills in the tip's tree and time from its commit.
-func (c *conversation) readTip(n int) {
+func (c *session) readTip(n int) {
 	dest := fmt.Sprintf("/cas/c%d", n)
 	if errText, code := w.Try(script.Exec("caos get-hash " + c.tip + " " + dest)); code != 0 {
 		c.note = "tip not fetchable: " + firstLine(errText)
@@ -138,7 +138,7 @@ func (c *conversation) readTip(n int) {
 }
 
 // readTitle reads `.caos/title` from the tip's tree.
-func (c *conversation) readTitle(n int) {
+func (c *session) readTitle(n int) {
 	if c.tree == "" {
 		return
 	}
@@ -177,7 +177,7 @@ func main() {
 	})
 }
 
-// list renders the conversations into out. Every answer, including a server
+// list renders the sessions into out. Every answer, including a server
 // that cannot be asked, is a return here rather than a failure.
 func list() {
 	server := os.Getenv("CAOS_SERVER_URL")
@@ -201,10 +201,10 @@ func list() {
 	// matching has no way to say "a user, then /conversations/".
 	memberRefs, failure := refs(server, usersPrefix+"*")
 	if failure != "" {
-		say("listed the conversations but not who has them (%s): %s", server, firstLine(failure))
+		say("listed the sessions but not who has them (%s): %s", server, firstLine(failure))
 	}
 
-	byID := map[string]*conversation{}
+	byID := map[string]*session{}
 	var skipped []string
 	for name, tip := range heads {
 		key, ok := strings.CutSuffix(strings.TrimPrefix(name, headPrefix), headSuffix)
@@ -213,7 +213,7 @@ func list() {
 			skipped = append(skipped, name)
 			continue
 		}
-		byID[id] = &conversation{id: id, tip: tip}
+		byID[id] = &session{id: id, tip: tip}
 	}
 	for name := range memberRefs {
 		rest := strings.TrimPrefix(name, usersPrefix)
@@ -236,9 +236,9 @@ func list() {
 		}
 	}
 
-	// Newest first. The id breaks ties, and orders the conversations whose tip
+	// Newest first. The id breaks ties, and orders the sessions whose tip
 	// could not be read (time 0) among themselves, at the end.
-	all := make([]*conversation, 0, len(byID))
+	all := make([]*session, 0, len(byID))
 	for _, c := range byID {
 		sort.Strings(c.members)
 		all = append(all, c)
@@ -250,7 +250,7 @@ func list() {
 	sort.SliceStable(all, func(i, j int) bool { return all[i].when > all[j].when })
 
 	// With a filter the title is part of what is matched, so every title is
-	// read; without one, only the conversations that will be printed.
+	// read; without one, only the sessions that will be printed.
 	if wantTitles {
 		reading := all
 		if filter == "" && limit > 0 && len(reading) > limit {
@@ -261,14 +261,14 @@ func list() {
 		}
 	}
 
-	var shown []*conversation
+	var shown []*session
 	for _, c := range all {
 		if filter == "" || strings.Contains(strings.ToLower(c.id+"\n"+c.title), filter) {
 			shown = append(shown, c)
 		}
 	}
 
-	say("%d conversations on %s, newest first", len(all), server)
+	say("%d sessions on %s, newest first", len(all), server)
 	if filter != "" {
 		say("%d match %q", len(shown), filter)
 	}

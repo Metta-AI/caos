@@ -607,7 +607,7 @@ fn remove_git_config_value(git_dir: &str, key: &str, value: &str) -> Result<(), 
 
 const MANAGED_HOOK_MARKERS: [&str; 2] = [
     "# managed by caos-server: append-only refs",
-    "# managed by caos-server: append-only conversation heads",
+    "# managed by caos-server: append-only session heads",
 ];
 
 // TODO: Remove this one-time migration after every supported repository has
@@ -768,7 +768,7 @@ fn serve_mcp(config: &Arc<Config>, mut request: Request) -> std::io::Result<()> 
     }
 }
 
-/// The secrets a request's SecretReaderKeys hold, for its conversation.
+/// The secrets a request's SecretReaderKeys hold, for its session.
 /// Headers, never the ArgTree: a key is a credential.
 fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context, HttpError> {
     let header = |name: &'static str| {
@@ -781,7 +781,7 @@ fn secret_context(config: &Config, request: &Request) -> Result<secrets::Context
     secrets::Context::admit(
         config,
         &header(caos_world::secrets::READERS_HEADER).unwrap_or_default(),
-        header(caos_world::secrets::CONVERSATION_HEADER).as_deref(),
+        header(caos_world::secrets::SESSION_HEADER).as_deref(),
     )
 }
 

@@ -3,7 +3,7 @@
 # from the tree the build sees: editing the docs re-keys this tool's ArgTree and
 # nothing it builds from.
 HELP=<<END
-Write a file at a path in the conversation or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs and redirection via bash. Writing inside a source tree makes a child commit of it. `.caos` is protocol metadata and cannot be written.
+Write a file at a path in the session or beneath a code reference (creating parent directories, overwriting an existing file). Prefer this over heredocs and redirection via bash. Writing inside a source tree makes a child commit of it. `.caos` is protocol metadata and cannot be written.
 @param file-path Path of the file, such as feature/dirty/README.md.
 @param content The full new file content.
 @writer

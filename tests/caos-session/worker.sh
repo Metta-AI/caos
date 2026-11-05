@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# What std/caos-conversation prints for a LONG conversation: it must be possible
-# to read one in pieces. A conversation of a few hundred entries overflowed what
+# What std/caos-session prints for a LONG session: it must be possible
+# to read one in pieces. A session of a few hundred entries overflowed what
 # a caller can read, and `width` (which cuts only tool calls) did not help, so:
 #
 #   from/to     the entries printed, by the `[n]` numbers the listing shows
@@ -9,7 +9,7 @@
 #   call-id     one call in full (NOT `call`: that name is reserved by llm-step,
 #               which drops a `@param call`, so the tool never accepted it)
 #
-# The conversation is recorded through `caos mcp hook` only -- no tool server, no
+# The session is recorded through `caos mcp hook` only -- no tool server, no
 # model -- so it holds user and assistant messages and no tool calls. What that
 # leaves untested is `only=failed` against a real failing call and `call-id`
 # against a real call id; both were run by hand against recorded sessions.
@@ -47,14 +47,14 @@ prompt "$session" "third prompt"
 stop "$session" "third answer"
 # The hooks write on the server; fetch what they recorded.
 git fetch -q caos "+$(ref_of "cc/$session"):$(ref_of "cc/$session")" \
-  || fail "the conversation was never recorded"
+  || fail "the session was never recorded"
 head=$(git rev-parse --verify -q "$(ref_of "cc/$session")") \
-  || fail "the conversation was never recorded"
+  || fail "the session was never recorded"
 
 n=0
 read_conv() { # <tool args...> ; prints the tool's output
   n=$((n + 1))
-  "$CAOS_CLI" run "out$n" --base:@=DEEP-DEPS/caos-conversation --hash="$head" "$@" >&2
+  "$CAOS_CLI" run "out$n" --base:@=DEEP-DEPS/caos-session --hash="$head" "$@" >&2
   cat "out$n"
 }
 count() { grep -c "$1" <<<"$2" || true; }
@@ -106,6 +106,6 @@ echo "== bad values come back as text, not as a failure ==" >&2
 bad=$(read_conv --only=nonsense)
 grep -qF 'is not one of user, assistant, failed' <<<"$bad" || fail "bad only: $bad"
 nocall=$(read_conv --call-id=toolu_nope)
-grep -qF 'no call toolu_nope in this conversation' <<<"$nocall" || fail "bad call-id: $nocall"
+grep -qF 'no call toolu_nope in this session' <<<"$nocall" || fail "bad call-id: $nocall"
 
 echo "  ok" >&2

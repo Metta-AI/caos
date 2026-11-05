@@ -1,13 +1,13 @@
-# Conversations and source trees
+# Sessions and source trees
 
-A conversation has one filesystem. It holds messages and protocol metadata under
+A session has one filesystem. It holds messages and protocol metadata under
 `.caos/`, ordinary files such as notes and memories, and references to code.
 The agent imports HTTPS repositories into this filesystem. The TUI imports
 local checkouts, exports code for local editing, and publishes to remotes.
 
 | Name | Meaning |
 | --- | --- |
-| `C` | A conversation commit in CAOS Git. Its tree is the conversation filesystem; its commit message records the operation that produced it. |
+| `C` | A session commit in CAOS Git. Its tree is the session filesystem; its commit message records the operation that produced it. |
 | `ST` | A source-tree commit: an ordinary Git commit with code, parents, and a commit message. |
 | `P` | A branch in the destination Git repository pointing to a published `ST`. |
 
@@ -15,11 +15,11 @@ A source-tree reference is a Git tree entry with mode `160000`, called a gitlink
 Its value is a commit hash, not a tree hash or a text file containing a hash.
 The agent sees it as a directory containing that commit's files.
 
-For example, one conversation tree might contain:
+For example, one session tree might contain:
 
 ```text
-.caos/                         conversation metadata and transcript
-memories/project.md            an ordinary conversation file
+.caos/                         session metadata and transcript
+memories/project.md            an ordinary session file
 imports/repo/base              gitlink -> ST_0
 imports/repo/base.source.json  optional repository provenance
 feature/00-base                gitlink -> ST_0
@@ -31,12 +31,12 @@ If the agent calls `write` or `edit` on
 `feature/01-change/README.md` and changes its contents, saving the tool result
 automatically creates a new source-tree commit. Its tree contains the edited
 files and its parent is the previously referenced commit, here `ST_4`. The
-harness then records a conversation commit whose `feature/01-change` gitlink
+harness then records a session commit whose `feature/01-change` gitlink
 points to that new commit. The agent does not separately commit or update the
 gitlink; bash edits use the same save path.
 
 Other references, including `00-base` and `02-tests`, stay unchanged.
-An unchanged source tree keeps its existing commit. Many conversation commits
+An unchanged source tree keeps its existing commit. Many session commits
 can therefore reference the same `ST`: messages and tool activity need not
 change code.
 
@@ -48,7 +48,7 @@ history is reachable.
 ```mermaid
 flowchart TB
     subgraph caos["CAOS Git"]
-        C["C: conversation snapshot"]
+        C["C: session snapshot"]
         C -.->|"feature/00-base"| ST0["ST_0"]
         C -.->|"feature/01-change"| ST4["ST_4"]
         C -.->|"feature/02-tests"| ST8["ST_8"]
@@ -65,17 +65,17 @@ This example's boundaries share ancestry. Source histories can also branch and
 merge; folder order imposes no ancestry relationship. Naming a review point
 neither combines its commits into one nor discards their history.
 
-## Conversation commits
+## Session commits
 
-A conversation ref, `refs/caos/v3/conversations/<hex(id)>/head`, identifies its
+A session ref, `refs/caos/v3/conversations/<hex(id)>/head`, identifies its
 current `C` in CAOS Git. A normal update creates a commit parented by the previous
 `C`, then advances the ref only if it still points to the expected head.
 
-Each `C`'s tree is a complete snapshot of the conversation filesystem.
+Each `C`'s tree is a complete snapshot of the session filesystem.
 `.caos/transcript` holds its ordered messages; `.caos/title` holds its title.
 Notes, memories, source-tree references, and other agent-owned content live
 outside `.caos/`. Git shares unchanged objects between successive snapshots.
-Agents can read conversation protocol files, but cannot edit them.
+Agents can read session protocol files, but cannot edit them.
 
 Execution events in commit messages record which computation ran, its input,
 tool calls and results, and subagent activity. The TUI reads these events in
@@ -86,7 +86,7 @@ For a user message and an agent turn:
 
 1. Append the message and create `C_0`.
 2. Form a computation request whose input is `C_0`. Computing the request hash
-   creates no conversation commit.
+   creates no session commit.
 3. Create `C_1` recording that request's hash and settings. This must follow
    `C_0`: putting the request hash in its own input would make the hashes depend
    on each other.
@@ -97,7 +97,7 @@ For a user message and an agent turn:
    a start commit. History tools use Git against the named source commit; revision
    names resolve only from the supplied ref snapshot.
 
-Conversation parent edges connect conversation commits; source-tree ancestry
+Session parent edges connect session commits; source-tree ancestry
 is carried by the `ST` commits referenced in their trees. Imports and saves
 transfer source commits through CAOS's internal content-addressed refs, so each
 source-tree reference does not need its own named branch.
@@ -112,8 +112,8 @@ result/bin/caos tui \
 ```
 
 The worker paths resolve in the client harness, independently of target code.
-A fresh conversation can start empty and import code afterward. The optional
-`--import <conversation-path> [<source> [<revision>]]` flag starts a new conversation using the same
+A fresh session can start empty and import code afterward. The optional
+`--import <session-path> [<source> [<revision>]]` flag starts a new session using the same
 commit-only rules as `/import`. Omitting the source imports the launching
 checkout; `--base <revision>` selects a revision for that shorthand.
 For example, `--import imports/repo/base /path/to/repo main` imports a local
@@ -128,26 +128,26 @@ commands for the user to run.
 ## Reusing sent prompts
 
 Up and Down move within a multiline or wrapped prompt. At the first line, Up
-recalls your earlier messages in the selected conversation; at the last line,
+recalls your earlier messages in the selected session; at the last line,
 Down moves toward newer messages and restores your unfinished draft. Drafts
 retain their cursor and pasted content while browsing. History comes from the
-saved conversation, so it remains available after reopening the TUI. Messages
+saved session, so it remains available after reopening the TUI. Messages
 from other participants, the agent, and CAOS are excluded.
 
 ## Agent remote imports
 
 Ask the agent to import an HTTPS repository. `import_source` accepts its URL,
 an optional branch/ref or full commit hash, and an unused destination. It is
-available in an empty conversation. An omitted revision selects the remote's
+available in an empty session. An omitted revision selects the remote's
 default branch. The result is an unchanged gitlink plus `.source.json` with
 repository, requested revision, commit, observation time and default branch
 when known. Reading or merging that snapshot needs no new remote fetch.
 
 The inline handler resolves the remote revision and saves its hash and
-provenance in the conversation's tool.start payload before transfer.
+provenance in the session's tool.start payload before transfer.
 It then calls caos import-git with that exact hash. POST /git/import accepts
 only the repository URL and commit; it fetches directly into the server's
-bare object store. Retries reuse the conversation's saved hash. The server's
+bare object store. Retries reuse the session's saved hash. The server's
 completion markers certify full history and allow object reuse.
 
 The handler atomically records its result and attaches the gitlink/provenance
@@ -177,7 +177,7 @@ The client then:
 4. Creates a `C` adding a gitlink at `imports/repo/base` pointing to `ST_0`.
    When available, it also records repository provenance beside the gitlink.
 5. Appends a message recording the import in another `C`, then pushes both
-   conversation commits with one update of the conversation ref, conditional on
+   session commits with one update of the session ref, conditional on
    its previous head. The TUI adopts the new head and displays the message as
    `CAOS`.
 
@@ -197,7 +197,7 @@ rejected. Pinned locators such as `git+https://…?rev=<full-commit-hash>` also 
 Local imports require a Git checkout root with an existing HEAD; linked worktrees
 work too. Plain directories, individual files, and checkout subdirectories are
 not supported. Paths are relative to the TUI's launch directory or absolute.
-Quote spaces; `~` and environment variables are not expanded. The conversation
+Quote spaces; `~` and environment variables are not expanded. The session
 destination must be unused.
 
 ### Repository provenance
@@ -213,10 +213,10 @@ unchanged under `imports/`, separate from feature work.
 
 ## Ordinary agent work
 
-Every command starts from the conversation root. File tools and grep use paths
+Every command starts from the session root. File tools and grep use paths
 such as `memories/project.md` or `feature/01-change/README.md`; grep can descend
 through gitlinks. Bash can choose a relative `cwd` for one call, but its declared
-`paths` are always conversation-relative. Declared directories include their
+`paths` are always session-relative. Declared directories include their
 descendants; undeclared content stays lazy until requested.
 
 To start work, the agent uses ordinary operations:
@@ -233,10 +233,10 @@ The copies initially reference the same `ST_0`. Suppose the agent then writes
 1. The harness exposes the requested source-tree files as a writable directory.
 2. The tool writes the file.
 3. Saving the result creates `ST_1` with the edited tree and `ST_0` as parent.
-4. The conversation update changes `feature/01-change` to point to `ST_1`.
+4. The session update changes `feature/01-change` to point to `ST_1`.
    `imports/repo/base` and `feature/00-base` keep their original references.
 
-Writing `memories/project.md` changes the conversation tree directly and creates
+Writing `memories/project.md` changes the session tree directly and creates
 no source-tree commit. One tool call can edit ordinary files and several source
 trees together. Several shell commands inside that call are saved together.
 
@@ -248,19 +248,19 @@ preserving this attribute produces ordinary files and loses the gitlink boundary
 The harness prepares requested files before each tool call and stores the
 result through `caos put`. To reference a commit
 already stored in CAOS, an agent can use `caos get-hash <commit> /cas/source` and
-link that CAS object into the conversation tree; the next tool call exposes it
+link that CAS object into the session tree; the next tool call exposes it
 as a directory.
 
-Repository tools are called with `run_tool` at a conversation-relative path,
+Repository tools are called with `run_tool` at a session-relative path,
 such as `feature/01-change/caos-tools/test`, and described by `tool_help` at
 that same path. The harness resolves the tool from the captured snapshot. Its
 input is the outermost source tree containing that path; a tool outside source
-trees receives the conversation tree.
+trees receives the session tree.
 
 Nothing lists the available tools. A tool is any directory whose `.caos-expr`
 binds a `help`, each repository documents its own, and `tool_help` is the
 authoritative description of what one takes (SPEC, "CaosTools"). The tool list
-is therefore the same whatever source trees a conversation gains.
+is therefore the same whatever source trees a session gains.
 
 ### Stacks
 
@@ -269,7 +269,7 @@ A sequence of PRs lives here as sibling gitlinks, one per layer: see
 
 ## Subagents and merging their work
 
-`spawn_agent` creates a separate conversation with its own ref and transcript.
+`spawn_agent` creates a separate session with its own ref and transcript.
 It starts with a snapshot of the parent's ordinary content and source-tree
 references, or only the paths selected by the parent. Selected paths keep their
 names. Source trees are selected as whole gitlinks.
@@ -278,7 +278,7 @@ The child receives the task prompt supplied to `spawn_agent` and the harness
 instructions, but
 not the parent's transcript. Its copies initially reference the same immutable
 `ST` commits. Editing a child reference creates new source commits and advances
-only the child's conversation; the parent's files and references stay unchanged.
+only the child's session; the parent's files and references stay unchanged.
 
 After the child finishes, `harvest_agent` compares its final content with its
 starting content and applies that difference to the parent. It can restrict the
@@ -302,21 +302,21 @@ including conflicts without text markers.
 The agent fixes each path and removes its ledger rows. Saving the resolution
 removes an empty ledger and prunes its `.caos` directory if empty. Other metadata
 and unresolved entries remain. This source-tree ledger is separate from the
-protected `.caos` at the conversation root.
+protected `.caos` at the session root.
 
 Fetching or importing a newer branch only makes that commit available. Integrating
 it into a feature requires an explicit merge or rebase.
 
 ## Viewing files and working locally
 
-`Ctrl+O` opens a read-only browser of the conversation filesystem, including
+`Ctrl+O` opens a read-only browser of the session filesystem, including
 protocol files. Ordinary files show contents. A directory containing sibling
 gitlinks previews its newest two boundaries in descending filename order.
 Selecting a boundary compares it with the next older sibling; the oldest shows
 content. Inside a comparison, files show diffs, including deletions, with the
 compared paths and hashes identified.
 
-The browser pins the conversation head when opened; refresh reads the latest
+The browser pins the session head when opened; refresh reads the latest
 head. Its comparisons are between named snapshots, not against a remote PR base.
 
 To work in a host checkout, the user enters:
@@ -329,10 +329,10 @@ This is a TUI command. It imports the needed objects into the local checkout and
 checks out the named source commit with detached HEAD. The destination must be
 a clean Git checkout or an empty/new directory.
 
-The client remembers that destination locally, keyed by server, conversation,
+The client remembers that destination locally, keyed by server, session,
 and gitlink path. A later `/checkout feature/01-change` can reuse it.
 `/update-tree feature/01-change <message>` commits edits in that path's remembered
-checkout, submits them back to that source, and continues the conversation with
+checkout, submits them back to that source, and continues the session with
 the user's message. The source path is explicit in both commands.
 
 Browser selection does not choose checkout targets, and does not change the

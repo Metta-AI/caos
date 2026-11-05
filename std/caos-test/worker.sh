@@ -24,7 +24,7 @@ caos get /cas/args/in
 caos get /cas/args/in/dev 2>/dev/null || true
 
 # WRONG SOURCE TREE — a CLEAN RESULT, not an error. caos-test is registered on
-# every conversation (it is one of the harness's own tools), so it is offered
+# every session (it is one of the harness's own tools), so it is offered
 # even when the source tree is not caos. There it has no stack to build and no
 # suite to run: rather than fail the turn, put a plain note saying so and exit 0,
 # so the model reads a calm "not applicable here" tool_result instead of a red

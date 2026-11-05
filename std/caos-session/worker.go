@@ -1,10 +1,10 @@
-// The `caos-conversation` tool's worker. Its DOCS live in the sibling
+// The `caos-session` tool's worker. Its DOCS live in the sibling
 // `.caos-expr` here-string, not in this header (SPEC, "Tools").
 //
-// It reads a recorded conversation by the hash of its tip commit, and prints it
+// It reads a recorded session by the hash of its tip commit, and prints it
 // as text for an agent that is reviewing how a session went.
 //
-// WHERE A CONVERSATION LIVES (design/chat.md, v3/events.rs, v3/paths.rs):
+// WHERE A SESSION LIVES (design/chat.md, v3/events.rs, v3/paths.rs):
 //   - the TIP'S TREE holds the transcript: `.caos/transcript/<n>-<id>.json`, one
 //     entry per message, and beside it `<n>-<id>/args-<call>.json`, the arguments
 //     of the tool calls that message declared.
@@ -14,7 +14,7 @@
 //     of numbers) plus a `tool` event whose `result.observation` names that path.
 //
 // So this walks the chain root-ward with `caos get-hash` (a worker fetches any
-// object by hash from the same git the conversations are recorded in), gathers
+// object by hash from the same git the sessions are recorded in), gathers
 // the events oldest-first, and reads the transcript out of the tip's tree.
 //
 // EVERY OUTCOME IS THE VALUE, as in caos-test-result: a bad hash comes back as
@@ -106,7 +106,7 @@ type entry struct {
 	Blocks []block `json:"blocks"`
 }
 
-// The conversation as read: later records of the same id replace earlier ones,
+// The session as read: later records of the same id replace earlier ones,
 // so the walk's oldest-first replay leaves each call and request at its last
 // state.
 var (
@@ -150,7 +150,7 @@ func walk(tip string) (tree string, n int, perCommit [][]event, answer string) {
 		if err != nil || !bytes.HasPrefix(raw, []byte("tree ")) {
 			if n == 0 {
 				return "", 0, nil, tip + " is not a commit.\n\n" +
-					"Pass the hash of a conversation's tip commit, not of a tree or a file."
+					"Pass the hash of a session's tip commit, not of a tree or a file."
 			}
 			notes = append(notes, "history walk stopped: "+cur+" is not a commit")
 			break
@@ -477,12 +477,12 @@ func main() {
 	})
 }
 
-// read renders the conversation into out. Every answer, including a hash that
+// read renders the session into out. Every answer, including a hash that
 // names nothing, is a return here rather than a failure.
 func read() {
 	hash := optArg("hash", "")
 	if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(hash) {
-		say("not a hash: %s\n\nPass the 40-character hash of the commit at the tip of a conversation.", hash)
+		say("not a hash: %s\n\nPass the 40-character hash of the commit at the tip of a session.", hash)
 		return
 	}
 	// Not `call`: that name is reserved (llm-step's RESERVED_ARGS), so a
@@ -532,7 +532,7 @@ func read() {
 			renderEntries(files, 0, want, opts{})
 			return
 		}
-		say("no call %s in this conversation.\n\nCalls it recorded (ids as the default listing prints them):", want)
+		say("no call %s in this session.\n\nCalls it recorded (ids as the default listing prints them):", want)
 		ids := make([]string, 0, len(calls))
 		for id := range calls {
 			ids = append(ids, id)
@@ -545,9 +545,9 @@ func read() {
 	}
 
 	if title != "" {
-		say("Conversation: %s", title)
+		say("Session: %s", title)
 	} else {
-		say("Conversation")
+		say("Session")
 	}
 	say("tip %s (%d commits walked, %d transcript entries)", hash, n, len(files))
 	say("calls: %s", callSummary())

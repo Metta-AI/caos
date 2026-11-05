@@ -1,4 +1,4 @@
-use super::{ui, App, Composer, ConversationState, EntryRole};
+use super::{ui, App, Composer, SessionState, EntryRole};
 use ratatui_core::buffer::CellWidth;
 
 /// A browsing session freezes the transcript order while remote updates arrive.
@@ -18,7 +18,7 @@ impl App {
     }
 }
 
-impl ConversationState {
+impl SessionState {
     fn navigate_input(&mut self, up: bool, width: Option<u16>) {
         let moved = match width {
             Some(width) => self.composer.move_visual_vertical(up, width),
@@ -110,8 +110,8 @@ mod tests {
     use super::*;
     use caos_cli::TurnOptions;
 
-    fn conversation(messages: &[&str]) -> ConversationState {
-        let mut state = ConversationState::new(
+    fn session(messages: &[&str]) -> SessionState {
+        let mut state = SessionState::new(
             "history".into(),
             "History".into(),
             TurnOptions::default(),
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn history_preserves_draft_pastes_cursor_and_edits_to_recalled_messages() {
-        let mut state = conversation(&["first", "second"]);
+        let mut state = session(&["first", "second"]);
         state
             .composer
             .insert_paste(&"long pasted text ".repeat(100));
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn history_excludes_peers_agents_and_notices() {
-        let mut state = conversation(&["mine", "peer", "agent", "notice", " "]);
+        let mut state = session(&["mine", "peer", "agent", "notice", " "]);
         state.transcript[1].role = EntryRole::Peer("someone else".into());
         state.transcript[2].role = EntryRole::Agent(None);
         state.transcript[3].role = EntryRole::Info;
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn history_keeps_multiline_editing_until_the_first_or_last_line() {
-        let mut state = conversation(&["older", "one\ntwo"]);
+        let mut state = session(&["older", "one\ntwo"]);
         state.composer.insert_str("draft\nline");
         state.navigate_input(true, None);
         assert_eq!(state.composer.text, "draft\nline");
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn history_waits_until_the_first_wrapped_row_and_handles_wide_characters() {
-        let mut state = conversation(&["previous"]);
+        let mut state = session(&["previous"]);
         state.composer.insert_str("ab界cdef");
         state.navigate_input(true, Some(4));
         assert_eq!(state.composer.text, "ab界cdef");
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn history_snapshot_is_stable_when_messages_arrive_and_refreshes_after_submission() {
-        let mut state = conversation(&["first", "second"]);
+        let mut state = session(&["first", "second"]);
         state.navigate_input(true, None);
         state.transcript.push(TranscriptEntry {
             role: EntryRole::Human,
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn arrows_without_history_preserve_the_draft() {
-        let mut state = conversation(&[]);
+        let mut state = session(&[]);
         state.composer.insert_str("draft");
         let draft = state.composer.clone();
         state.navigate_input(true, None);

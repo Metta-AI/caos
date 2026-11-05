@@ -32,21 +32,21 @@ pub(crate) struct Context {
     /// it named at admission, so one run sees one answer. `None` when it could
     /// not be resolved, which grants nothing.
     pins: Arc<HashMap<String, Option<String>>>,
-    /// Every input a grant depends on — the stores' trees, the conversation,
-    /// the pinned commits — so a push, a moved branch or another conversation
+    /// Every input a grant depends on — the stores' trees, the session,
+    /// the pinned commits — so a push, a moved branch or another session
     /// sees none of this run's records.
     scope: String,
-    conversation: Option<String>,
-    /// The conversation's head tree, when a `reader:@=` grant names it.
+    session: Option<String>,
+    /// The session's head tree, when a `reader:@=` grant names it.
     head: Option<String>,
 }
 
 impl Context {
-    /// Resolve a request's SecretReaderKeys (space-separated) and conversation.
+    /// Resolve a request's SecretReaderKeys (space-separated) and session.
     pub(crate) fn admit(
         config: &Config,
         readers: &str,
-        conversation: Option<&str>,
+        session: Option<&str>,
     ) -> Result<Context, HttpError> {
         let keys: Vec<String> = readers.split_whitespace().map(str::to_string).collect();
         if keys.is_empty() {
@@ -54,7 +54,7 @@ impl Context {
         }
         let (stored, trees) =
             crate::secret_store::load(config, &keys).map_err(|e| HttpError::new(400, e))?;
-        let conversation = conversation.filter(|c| !c.is_empty()).map(str::to_string);
+        let session = session.filter(|c| !c.is_empty()).map(str::to_string);
         let mut pins = HashMap::new();
         let mut head = None;
         for reader in stored.iter().flat_map(|s| &s.readers) {
@@ -65,11 +65,11 @@ impl Context {
                     });
                     pins.insert(locator.clone(), pinned.ok());
                 }
-                Reader::Conversation {
-                    conversation: id, ..
-                } if Some(id) == conversation.as_ref() && head.is_none() => {
-                    head = conversation_head(config, id).unwrap_or_else(|e| {
-                        eprintln!("secrets: conversation {id}: {e}");
+                Reader::Session {
+                    session: id, ..
+                } if Some(id) == session.as_ref() && head.is_none() => {
+                    head = session_head(config, id).unwrap_or_else(|e| {
+                        eprintln!("secrets: session {id}: {e}");
                         None
                     });
                 }
@@ -82,12 +82,12 @@ impl Context {
             scope: format!(
                 "{}|{}|{}",
                 trees.join(","),
-                conversation.as_deref().unwrap_or(""),
+                session.as_deref().unwrap_or(""),
                 pinned.join(",")
             ),
             stored: Arc::new(stored),
             pins: Arc::new(pins),
-            conversation,
+            session,
             head,
         })
     }
@@ -510,14 +510,14 @@ pub(crate) fn granted_names(
 /// locator, split both paths into owned `Vec`s, rebuild the roots-cache key)
 /// was most of the server's CPU once the membership scans were gone.
 enum Matcher<'a> {
-    /// Nothing can match: no pin, another conversation, no head yet, or a
+    /// Nothing can match: no pin, another session, no head yet, or a
     /// locator that could not be resolved (reported once, here).
     Never,
     Locator {
         dir: Vec<String>,
         roots: Arc<HashSet<String>>,
     },
-    Conversation {
+    Session {
         config: &'a Config,
         head: &'a str,
         path: &'a str,
@@ -552,12 +552,12 @@ impl<'a> Matcher<'a> {
                 }
                 _ => Matcher::Never,
             },
-            Reader::Conversation { path, conversation } => {
-                if context.conversation.as_deref() != Some(conversation.as_str()) {
+            Reader::Session { path, session } => {
+                if context.session.as_deref() != Some(session.as_str()) {
                     return Matcher::Never;
                 }
                 match &context.head {
-                    Some(head) => Matcher::Conversation { config, head, path },
+                    Some(head) => Matcher::Session { config, head, path },
                     None => Matcher::Never,
                 }
             }
@@ -571,8 +571,8 @@ impl<'a> Matcher<'a> {
                 components(&origin.path).eq(dir.iter().map(String::as_str))
                     && roots.contains(&origin.root)
             }
-            Matcher::Conversation { config, head, path } => {
-                match_conversation(config, head, path, origin).unwrap_or_else(|e| {
+            Matcher::Session { config, head, path } => {
+                match_session(config, head, path, origin).unwrap_or_else(|e| {
                     eprintln!("secrets: a reader could not be checked, so it grants nothing: {e}");
                     false
                 })
@@ -587,10 +587,10 @@ fn components(path: &str) -> impl Iterator<Item = &str> {
     path.split('/').filter(|c| !c.is_empty() && *c != ".")
 }
 
-/// The tree of the conversation's head commit, or `None` with no head yet.
-fn conversation_head(config: &Config, conversation: &str) -> Result<Option<String>, String> {
+/// The tree of the session's head commit, or `None` with no head yet.
+fn session_head(config: &Config, session: &str) -> Result<Option<String>, String> {
     let repo = config.repo.to_thread_local();
-    let refname = conversation_protocol::v3::refs::head_ref(conversation)?;
+    let refname = session_protocol::v3::refs::head_ref(session)?;
     let Ok(mut reference) = repo.find_reference(refname.as_str()) else {
         return Ok(None);
     };
@@ -603,10 +603,10 @@ fn conversation_head(config: &Config, conversation: &str) -> Result<Option<Strin
     Ok(Some(tree))
 }
 
-/// `path` in the conversation's head tree, evaluated the way the conversation
+/// `path` in the session's head tree, evaluated the way the session
 /// evaluates it: from the root of whichever tree along the path the walk
 /// started at, a source tree's gitlink included.
-fn match_conversation(
+fn match_session(
     config: &Config,
     head: &str,
     path: &str,

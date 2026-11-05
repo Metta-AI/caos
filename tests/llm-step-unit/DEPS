@@ -9,6 +9,6 @@
 # source, because `cargo test` needs the same layout rustc makes.
 ../../std/llm-step llm-step
 ../../std/llm-client llm-client
-../../rust/crates/conversation-protocol conversation-protocol
+../../rust/crates/session-protocol session-protocol
 ../../rust/crates/git-locator git-locator
 ../../rust/crates/worker-common worker-common

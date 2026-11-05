@@ -7,7 +7,7 @@ edition = "2021"
 # `/object`, runs the container `entrypoint`, and is installed setuid-root in
 # worker images so an unprivileged worker reaches the root-owned /cas. Host
 # clients depend on the library for the object model, currying, args trees,
-# CAS materialization, and Git transport; conversation policy lives in the
+# CAS materialization, and Git transport; session policy lives in the
 # separate `caos-cli` crate.
 
 [lib]

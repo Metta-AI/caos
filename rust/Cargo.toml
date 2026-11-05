@@ -4,7 +4,7 @@ members = [
     "crates/caos",
     "crates/git-locator",
     "crates/caos-cli",
-    "crates/conversation-protocol",
+    "crates/session-protocol",
     "crates/caos-world",
     "crates/caos-eval",
     "crates/caos-iroh",

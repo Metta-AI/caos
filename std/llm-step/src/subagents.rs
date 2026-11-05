@@ -1,8 +1,8 @@
-//! Durable child conversations and their model-facing tools.
+//! Durable child sessions and their model-facing tools.
 
 use std::path::Path;
 
-use conversation_protocol::v3::{refs, Oid};
+use session_protocol::v3::{refs, Oid};
 use serde_json::{json, Value};
 use worker_common::{arg, caos, caos_recurry, own_args_tree, prepare_request, Arg};
 
@@ -18,19 +18,19 @@ pub fn declarations() -> [Value; 3] {
     [
         json!({
             "name": SPAWN_TOOL,
-            "description": "Start a focused coding agent in a durable child conversation. The child receives an isolated copy of the conversation files and source trees (excluding protocol metadata) and can be joined with wait_agent, then selected content can be applied with harvest_agent.",
+            "description": "Start a focused coding agent in a durable child session. The child receives an isolated copy of the session files and source trees (excluding protocol metadata) and can be joined with wait_agent, then selected content can be applied with harvest_agent.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "A self-contained task with the desired output and constraints."},
-                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional conversation-relative paths to copy. Omit for all content. Select gitlinks as whole source trees. Protocol metadata is always excluded."}
+                    "paths": {"type":"array", "items":{"type":"string"}, "description":"Optional session-relative paths to copy. Omit for all content. Select gitlinks as whole source trees. Protocol metadata is always excluded."}
                 },
                 "required": ["prompt"]
             }
         }),
         json!({
             "name": WAIT_TOOL,
-            "description": "Wait for one owned child agent to report a terminal checkpoint. This joins the child's durable relay rather than polling its moving conversation ref.",
+            "description": "Wait for one owned child agent to report a terminal checkpoint. This joins the child's durable relay rather than polling its moving session ref.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -41,7 +41,7 @@ pub fn declarations() -> [Value; 3] {
         }),
         json!({
             "name": HARVEST_TOOL,
-            "description": "Apply selected content changes from a terminal child using the same atomic reconciliation as file tools. Code, memories, and notes keep their conversation-relative paths; protocol metadata is excluded.",
+            "description": "Apply selected content changes from a terminal child using the same atomic reconciliation as file tools. Code, memories, and notes keep their session-relative paths; protocol metadata is excluded.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -86,7 +86,7 @@ pub fn child_request(
     parent_system: &str,
 ) -> Result<(Oid, Oid), String> {
     const DROP: &[&str] = &[
-        "conversation",
+        "session",
         "head",
         "system",
         "subagent",
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn child_title_uses_the_conversation_fallback_rule() {
+    fn child_title_uses_the_session_fallback_rule() {
         assert_eq!(
             agent_title("  Inspect\n the delegated snapshot  "),
             "Inspect the delegated snapshot"

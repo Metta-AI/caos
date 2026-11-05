@@ -17,7 +17,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
     let mut seed = TreeBuilder::from(None);
     seed.put("notes.md", Mode::Blob, b"seeded notes\n".to_vec());
     let files_seed = seed.build(store).expect("build files seed");
-    let root = Transition::ConversationRoot {
+    let root = Transition::SessionRoot {
         identity: Identity {
             id: "golden-conversation".to_string(),
             kind: IdentityKind::Root,
@@ -49,7 +49,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "user-0".to_string(),
-                conversation: "golden-conversation".to_string(),
+                session: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
                 model: None,
@@ -70,7 +70,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "interjection-1".to_string(),
-                conversation: "golden-conversation".to_string(),
+                session: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
                 model: None,
@@ -256,7 +256,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "interjection-3".to_string(),
-                conversation: "golden-conversation".to_string(),
+                session: "golden-conversation".to_string(),
                 role: Role::User,
                 actor: "user".to_string(),
                 model: None,
@@ -389,7 +389,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: "interrupt-6".to_string(),
-                conversation: "golden-conversation".to_string(),
+                session: "golden-conversation".to_string(),
                 role: Role::System,
                 actor: "user".to_string(),
                 model: None,
@@ -404,7 +404,7 @@ pub(crate) fn golden_with_applied(store: &mut dyn ObjectStore) -> (Oid, [Applied
         &signature,
     );
 
-    let fork = Transition::ConversationFork {
+    let fork = Transition::SessionFork {
         identity: Identity {
             id: "golden-fork".to_string(),
             kind: IdentityKind::Fork {
@@ -434,7 +434,7 @@ fn assistant_message(
     ordinal: u64,
     message_id: &str,
     calls: &[(&str, &str)],
-    conversation: &str,
+    session: &str,
 ) -> Transition {
     let mut blocks = vec![Block::Text {
         text: "Working".to_string(),
@@ -455,7 +455,7 @@ fn assistant_message(
     Transition::MessageAppend {
         entry: TranscriptEntry {
             message_id: message_id.to_string(),
-            conversation: conversation.to_string(),
+            session: session.to_string(),
             role: Role::Assistant,
             actor: "model".to_string(),
             model: Some("model".to_string()),

@@ -27,7 +27,7 @@ fn run() -> Result<(), String> {
     // (`RESERVED_ARGS` in llm-step), and declaring `@in` is how a tool asks for
     // it AS A PARAMETER — which is what lets a caller redirect it. That matters
     // here: this tool is reached at `caos-std/bash-tool`, a path in the
-    // conversation's own evaluated tree, so the tree it SITS in is never the
+    // session's own evaluated tree, so the tree it SITS in is never the
     // tree a caller means. Without `in` naming the tree there is no way to say
     // which.
     //
@@ -55,7 +55,7 @@ fn run() -> Result<(), String> {
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir))
     {
-        return Err("cwd must be a conversation-relative directory".into());
+        return Err("cwd must be a session-relative directory".into());
     }
     let cwd = work
         .join(cwd)
@@ -185,7 +185,7 @@ fn tail(bytes: &[u8]) -> Vec<u8> {
 /// Scan stderr for permission-denied complaints and collect the mentioned
 /// paths that resolve to unmaterialized placeholders in the working tree —
 /// the structured "retry with these in `paths`" hint. Tokens on offending
-/// lines are tried as conversation-relative (or work-tree-absolute) paths; one
+/// lines are tried as session-relative (or work-tree-absolute) paths; one
 /// counts if its resolution crosses a placeholder symlink.
 fn scan_denied(stderr: &str, work: &Path) -> BTreeSet<String> {
     let mut hits = BTreeSet::new();

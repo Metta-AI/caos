@@ -1,7 +1,7 @@
 # What this test reaches for (format `<path> <name>`); see tests/mcp-serve/DEPS.
 # The hook resolves `--llm-step` to form a request, so the step and what it is
-# built from come with it; caos-conversation is the tool under test.
-../../std/caos-conversation caos-conversation
+# built from come with it; caos-session is the tool under test.
+../../std/caos-session caos-session
 ../../std/bash-tool bash-tool
 ../../std/llm-step llm-step
 ../../std/rgrep rgrep

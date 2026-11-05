@@ -29,7 +29,7 @@ pub fn projection_id(descriptor: &Value) -> Result<String, String> {
 }
 
 pub fn publication_id(
-    conversation: &str,
+    session: &str,
     key: &str,
     qp: &str,
     planned_head: &Oid,
@@ -38,7 +38,7 @@ pub fn publication_id(
     expected_old: Option<&Oid>,
 ) -> Result<String, String> {
     let fields = canonical_object(&[
-        ("conversation", Value::String(conversation.to_string())),
+        ("conversation", Value::String(session.to_string())),
         ("key", Value::String(key.to_string())),
         ("qp", Value::String(qp.to_string())),
         (

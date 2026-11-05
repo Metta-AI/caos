@@ -35,7 +35,7 @@ printf '%s\n' \
   > /tmp/stub/response-2.json
 start_stub /tmp/stub
 
-new_llm_conversation tools-copy "$STUB_PORT" "$ws"
+new_llm_session tools-copy "$STUB_PORT" "$ws"
 dispatch_turn "exercise copy"
 wait_turn || fail "the turn never reached a terminal head"
 

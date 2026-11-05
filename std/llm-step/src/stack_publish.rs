@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use conversation_protocol::v3::publication::Outcome;
-use conversation_protocol::v3::source_trees::validate_branch;
-use conversation_protocol::v3::{Descriptor, Evidence, GitStore, PublicationRecord, PublicationStatus};
+use session_protocol::v3::publication::Outcome;
+use session_protocol::v3::source_trees::validate_branch;
+use session_protocol::v3::{Descriptor, Evidence, GitStore, PublicationRecord, PublicationStatus};
 
 use crate::publish_source::bool_or_string;
 
@@ -126,7 +126,7 @@ pub(super) struct Stack {
 /// Read the stack directory: `00-base`, the layers in name order, and each
 /// layer's description. Refused: a layer-named entry that is not a gitlink, a
 /// description with no layer, and a described layer above an undescribed one.
-pub(super) fn read_stack(view: &Conversation<'_>, dir: &str) -> Result<Stack, String> {
+pub(super) fn read_stack(view: &Session<'_>, dir: &str) -> Result<Stack, String> {
     let entries = view
         .snapshot()
         .list(dir)
@@ -210,7 +210,7 @@ pub(super) struct Provenance {
     pub default_branch: Option<String>,
 }
 
-pub(super) fn provenance(view: &Conversation<'_>, dir: &str) -> Result<Provenance, String> {
+pub(super) fn provenance(view: &Session<'_>, dir: &str) -> Result<Provenance, String> {
     let path = format!("{dir}/00-base.source.json");
     let Some(bytes) = view.snapshot().read(&path)? else {
         return Ok(Provenance::default());
@@ -262,7 +262,7 @@ struct Plan {
 }
 
 /// Everything checked and decided before anything is observed or pushed.
-fn prepare(view: &Conversation<'_>, store: &GitStore, p: &Parameters) -> Result<Plan, String> {
+fn prepare(view: &Session<'_>, store: &GitStore, p: &Parameters) -> Result<Plan, String> {
     let dir = &p.stack;
     let stack = read_stack(view, dir)?;
     let provenance = provenance(view, dir)?;
@@ -372,7 +372,7 @@ pub(super) fn pin_path(site: &CallSite<'_>) -> String {
 
 /// The pinned plan and publications of a started call, or None before the pin.
 fn pinned(
-    view: &Conversation<'_>,
+    view: &Session<'_>,
     site: &CallSite<'_>,
 ) -> Result<Option<(Plan, Vec<PublicationRecord>)>, String> {
     if view
@@ -411,7 +411,7 @@ fn pin_all(
     }))?;
     for _ in 0..32 {
         state.reload()?;
-        let view = state.conversation()?;
+        let view = state.session()?;
         if view
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
@@ -441,14 +441,14 @@ fn pin_all(
             return Ok(Some(records.to_vec()));
         }
     }
-    Err("conversation kept moving while pinning the stack's publications".into())
+    Err("session kept moving while pinning the stack's publications".into())
 }
 
 /// Record one layer's push outcome as its publication's terminal transition.
 fn settle(state: &mut progress::State, id: &str, outcome: &Outcome) -> Result<(), String> {
     for _ in 0..32 {
         state.reload()?;
-        let view = state.conversation()?;
+        let view = state.session()?;
         let record = view
             .publication(id)?
             .ok_or("publication disappeared")?;
@@ -471,7 +471,7 @@ fn settle(state: &mut progress::State, id: &str, outcome: &Outcome) -> Result<()
             return Ok(());
         }
     }
-    Err("conversation kept moving while recording a publication".into())
+    Err("session kept moving while recording a publication".into())
 }
 
 /// Complete the started call with its report.
@@ -484,7 +484,7 @@ fn complete(
     for _ in 0..32 {
         state.reload()?;
         if state
-            .conversation()?
+            .session()?
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
@@ -508,7 +508,7 @@ fn complete(
             return Ok(());
         }
     }
-    Err("conversation kept moving while completing stack-publish".into())
+    Err("session kept moving while completing stack-publish".into())
 }
 
 /// The owner and repository of a github.com HTTPS URL, or None for any other
@@ -878,15 +878,15 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         Err(error) => return site.fail(state, &error),
     };
     // Bound before the match: a temporary in the scrutinee would hold the
-    // conversation borrowed through every arm, and the arms write to it.
-    let already = pinned(&state.conversation()?, site)?;
+    // session borrowed through every arm, and the arms write to it.
+    let already = pinned(&state.session()?, site)?;
     let (plan, records) = match already {
         Some(pinned) => pinned,
         None => {
-            // Everything that reads the conversation, before anything that
+            // Everything that reads the session, before anything that
             // writes it or reaches the remote.
             let prepared = {
-                let view = state.conversation()?;
+                let view = state.session()?;
                 prepare(&view, state.store(), &p).and_then(|plan| {
                     let bases = plan
                         .layers
@@ -896,7 +896,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                     Ok((plan, bases, view.identity()?.id))
                 })
             };
-            let (plan, bases, conversation) = match prepared {
+            let (plan, bases, session) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     return site.fail(
@@ -915,7 +915,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 .transpose()
                 .map_err(|_| "reading GitHub token")?;
             let token = token.as_deref().map(str::trim_end);
-            let key = publish_source::invocation(&conversation, site)?[..32].to_string();
+            let key = publish_source::invocation(&session, site)?[..32].to_string();
             let mut records = Vec::new();
             for (layer, base) in plan.layers.iter().zip(bases) {
                 let old = match git_locator::publish::read_branch(&plan.repository, &layer.branch, token)
@@ -939,7 +939,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
                 };
                 let refname = format!("refs/heads/{}", layer.branch);
                 let id = ids::publication_id(
-                    &conversation,
+                    &session,
                     &key,
                     &ids::projection_id(&descriptor.to_value())?,
                     &layer.commit,

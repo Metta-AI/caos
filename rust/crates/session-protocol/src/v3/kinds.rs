@@ -1,7 +1,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
-    ConversationRoot,
-    ConversationFork,
+    SessionRoot,
+    SessionFork,
     MetadataTitleSet,
     MessageAppend,
     ToolStart,
@@ -17,8 +17,8 @@ pub enum Kind {
 
 impl Kind {
     pub const ALL: [Kind; 13] = [
-        Kind::ConversationRoot,
-        Kind::ConversationFork,
+        Kind::SessionRoot,
+        Kind::SessionFork,
         Kind::MetadataTitleSet,
         Kind::MessageAppend,
         Kind::ToolStart,
@@ -34,8 +34,8 @@ impl Kind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::ConversationRoot => "conversation.root",
-            Kind::ConversationFork => "conversation.fork",
+            Kind::SessionRoot => "conversation.root",
+            Kind::SessionFork => "conversation.fork",
             Kind::MetadataTitleSet => "metadata.title.set",
             Kind::MessageAppend => "message.append",
             Kind::ToolStart => "tool.start",
@@ -54,7 +54,7 @@ impl Kind {
         Self::ALL
             .into_iter()
             .find(|kind| kind.as_str() == name)
-            .ok_or_else(|| format!("unregistered conversation kind {name:?}"))
+            .ok_or_else(|| format!("unregistered session kind {name:?}"))
     }
 
     pub fn message(self) -> Vec<u8> {

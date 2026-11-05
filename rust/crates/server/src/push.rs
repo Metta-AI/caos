@@ -1,6 +1,6 @@
 //! Push one pinned code commit directly from the server object store.
 use crate::{Config, HttpError};
-use conversation_protocol::v3::PublicationStatus;
+use session_protocol::v3::PublicationStatus;
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use sha2::{Digest, Sha256};

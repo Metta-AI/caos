@@ -9,34 +9,34 @@
 //!
 //! THE TOOLS ARE FIVE, AND THEY NEVER CHANGE: `run`, `help`, `start`, `result`
 //! and `eval-path`. They are the server's own primitives, and what they run is
-//! named by a PATH in the conversation (`caos-std/read`), so there is nothing to
+//! named by a PATH in the session (`caos-std/read`), so there is nothing to
 //! list and nothing to resolve first: `tools/list` is a constant, and a client
 //! that reads it once or ignores `tools/list_changed` is correct, not stale.
 //!
 //! A call is `llm-step` in its tools-only mode, evaluated by the server the way
 //! `POST /eval/run` evaluates anything: the step declares the call (an assistant
 //! message carrying its `tool_use`), runs it, and answers with the call's record.
-//! Nothing here writes a conversation.
+//! Nothing here writes a session.
 //!
 //! WHAT A REQUEST CARRIES, as headers, because a request is all a stateless
 //! server has: `X-Caos-Step` names the step that runs the tools (a git locator,
 //! or a bare 40-hex hash), and `X-Caos-Secret-Readers` the reader keys, as
-//! everywhere else. The conversation is not a header: each tool call names its
+//! everywhere else. The session is not a header: each tool call names its
 //! session in the `caos_session` argument, which the harness's PreToolUse hook
-//! fills in, and the conversation id derives from that.
+//! fills in, and the session id derives from that.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use conversation_protocol::v3::refs;
+use session_protocol::v3::refs;
 
 use caos_world::mcp::{fail, initialize, reply, tools, INSTRUCTIONS, SESSION_ARG};
 
 use crate::{compute, storage, Config};
 
-/// Conversation ids for recorded sessions live under one component so they are
-/// obvious in the sidebar and cannot collide with a hand-named conversation.
+/// Session ids for recorded sessions live under one component so they are
+/// obvious in the sidebar and cannot collide with a hand-named session.
 const SESSION_PREFIX: &str = "cc/";
 
 pub(crate) struct Caller {
@@ -45,7 +45,7 @@ pub(crate) struct Caller {
     /// `X-Caos-Secret-Readers`, as sent.
     pub(crate) readers: String,
     /// `X-Caos-Max-Result-Chars`: how long a tool's text may be before it is kept
-    /// in the conversation and answered with a preview ([`DEFAULT_MAX_RESULT_CHARS`]
+    /// in the session and answered with a preview ([`DEFAULT_MAX_RESULT_CHARS`]
     /// when the header is absent; 0 for no limit).
     pub(crate) max_result_chars: usize,
 }
@@ -91,12 +91,12 @@ fn step_tool(name: &str) -> Option<&'static str> {
     }
 }
 
-/// A session's conversation id is derived, never stored: the ref is the only
+/// A session's session id is derived, never stored: the ref is the only
 /// state. A session id is the one ref component we do not author, so it is
 /// validated through the protocol's own parser rather than trusted.
-fn conversation_id_for(session: &str) -> Result<String, String> {
+fn session_id_for(session: &str) -> Result<String, String> {
     let id = format!("{SESSION_PREFIX}{session}");
-    refs::validate_conversation_id(&id)?;
+    refs::validate_session_id(&id)?;
     Ok(id)
 }
 
@@ -122,8 +122,8 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         .cloned()
         .unwrap_or_else(|| json!({}));
     let session = args.get(SESSION_ARG).and_then(Value::as_str);
-    // `help` with no path reports on the server and belongs to no conversation
-    // call: it takes the session only to say which conversation that is.
+    // `help` with no path reports on the server and belongs to no session
+    // call: it takes the session only to say which session that is.
     if name == "help"
         && args
             .get("path")
@@ -135,7 +135,7 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
     let session = session.ok_or_else(|| {
         format!(
             "{SESSION_ARG} is missing: the PreToolUse hook that supplies it \
-             is not installed, so this call cannot be attributed to a conversation"
+             is not installed, so this call cannot be attributed to a session"
         )
     })?;
     if name == "result" {
@@ -146,10 +146,10 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         return tool_result(config, ticket.trim(), caller.max_result_chars);
     }
     let step_name = step_tool(name).ok_or_else(|| format!("unknown tool {name:?}"))?;
-    let conversation = conversation_id_for(session)?;
-    let secrets = crate::secrets::Context::admit(config, &caller.readers, Some(&conversation))
+    let session = session_id_for(session)?;
+    let secrets = crate::secrets::Context::admit(config, &caller.readers, Some(&session))
         .map_err(|e| e.message().to_string())?;
-    let params = step_params(caller, &conversation, step_name, &args)?;
+    let params = step_params(caller, &session, step_name, &args)?;
     if name == "start" {
         // The ticket goes back at once, and the job declares its call and runs it
         // whenever it gets there. The model may end its turn first: a turn's end
@@ -176,10 +176,10 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
 }
 
 /// The form a tools-only run of the step takes, as the `/eval/run` parameter
-/// string: the step, the conversation, and the call.
+/// string: the step, the session, and the call.
 fn step_params(
     caller: &Caller,
-    conversation: &str,
+    session: &str,
     step_name: &str,
     args: &Value,
 ) -> Result<String, String> {
@@ -197,12 +197,12 @@ fn step_params(
         ("base:@@", step)
     };
     let arguments = declared_args(args).to_string();
-    // The step saves what is longer than this in the conversation and answers
+    // The step saves what is longer than this in the session and answers
     // with where (see `spill_notice`).
     let limit = caller.max_result_chars.to_string();
     let pairs = [
         step_arg,
-        ("conversation", conversation),
+        ("conversation", session),
         ("tools-only", call),
         ("tool", step_name),
         ("arguments", arguments.as_str()),
@@ -259,7 +259,7 @@ fn tool_result(config: &Arc<Config>, ticket: &str, limit: usize) -> Result<Value
 }
 
 /// What a tools-only run answered, as the model reads it: the call's `status`
-/// and `observation`, the same bytes the conversation recorded.
+/// and `observation`, the same bytes the session recorded.
 fn decode_result(config: &Config, kind: &str, hash: &str, limit: usize) -> Result<Value, String> {
     if kind != "tree" {
         return Err(format!("the step answered a {kind}, not a tool result"));
@@ -281,7 +281,7 @@ fn decode_result(config: &Config, kind: &str, hash: &str, limit: usize) -> Resul
     Ok(text_result(text, is_error))
 }
 
-/// A tool's text longer than this many characters is kept in the conversation
+/// A tool's text longer than this many characters is kept in the session
 /// and answered with a preview. Claude Code refuses an MCP result past 25,000
 /// tokens, and what it does instead is write the whole thing to a file on ITS
 /// disk and tell the model to read that -- a path the model usually cannot open
@@ -294,7 +294,7 @@ pub(crate) const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
 /// what it is before deciding how to page through it.
 const RESULT_PREVIEW_CHARS: usize = 2_000;
 
-/// What the model reads instead of a result the step saved in the conversation:
+/// What the model reads instead of a result the step saved in the session:
 /// the start of it, cut at a line, and how to get the rest. `spilled` is the
 /// step's own description of where it went: the path, then the blob's hash.
 ///
@@ -320,7 +320,7 @@ fn spill_notice(text: &str, limit: usize, spilled: &str) -> String {
     };
     format!(
         "{preview}\n\n[caos: this result is {chars} characters over {lines} lines, too long to \
-         return. The whole of it is saved in the conversation at {path}. Page through it with \
+         return. The whole of it is saved in the session at {path}. Page through it with \
          `read` (file-path={path}, offset, limit){by_hash}.]"
     )
 }
@@ -373,15 +373,15 @@ fn tool_result_text(value: &Value) -> String {
 /// `help` with no path: how caos is doing here. A model that finds caos missing
 /// should be able to ask and get the reason, not conclude caos is absent.
 fn overview(config: &Config, caller: &Caller, session: Option<&str>) -> Value {
-    let conversation = match session {
+    let session = match session {
         None => format!(
-            "conversation: unknown -- this call carried no {SESSION_ARG}, so the \
+            "session: unknown -- this call carried no {SESSION_ARG}, so the \
              PreToolUse hook that supplies it is not installed\n"
         ),
-        Some(session) => match conversation_id_for(session) {
-            Err(error) => format!("conversation: session {session:?} is unusable: {error}\n"),
+        Some(session) => match session_id_for(session) {
+            Err(error) => format!("session: session {session:?} is unusable: {error}\n"),
             Ok(id) => format!(
-                "conversation: {id}\nconversation head: {}\n",
+                "session: {id}\nsession head: {}\n",
                 head_of(config, &id)
             ),
         },
@@ -391,15 +391,15 @@ fn overview(config: &Config, caller: &Caller, session: Option<&str>) -> Value {
         None => "step: NONE -- this connection carried no X-Caos-Step, so no tool can run\n",
     };
     text_result(
-        format!("{INSTRUCTIONS}\n\n{conversation}{step}server: reachable\n"),
+        format!("{INSTRUCTIONS}\n\n{session}{step}server: reachable\n"),
         false,
     )
 }
 
-fn head_of(config: &Config, conversation: &str) -> String {
+fn head_of(config: &Config, session: &str) -> String {
     let repo = config.repo.to_thread_local();
-    let Ok(refname) = refs::head_ref(conversation) else {
-        return "<invalid conversation id>".to_string();
+    let Ok(refname) = refs::head_ref(session) else {
+        return "<invalid session id>".to_string();
     };
     match repo.find_reference(refname.as_str()) {
         Ok(mut reference) => match reference.peel_to_commit() {

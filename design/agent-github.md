@@ -14,7 +14,7 @@ For each tool call:
 
 1. Resolve the revision with `git ls-remote`, using the agent's existing Git
    binary. A full commit hash needs no lookup.
-2. Save the chosen hash H and provenance in the conversation's `tool.start`
+2. Save the chosen hash H and provenance in the session's `tool.start`
    payload. Resumed attempts reuse H; concurrent attempts use the first saved
    observation. A new call resolves the remote again.
 3. Run `caos import-git <source> H`. This sends
@@ -38,7 +38,7 @@ staging, verifies them, and publishes the complete pack into the server store. I
 negotiation tips; standalone trees and blobs may still be downloaded again.
 A completion marker for the same URL and H skips fetch and verification.
 The endpoint handles object availability; callers handle ref resolution and
-conversation state.
+session state.
 
 Supply the token through your secret store (SPEC.md, "Secrets"):
 
@@ -119,7 +119,7 @@ person confirms a GitHub write; the agent makes it, as it already pushes.
 ## Merges
 
 Clean merges use the existing merge worker. On conflict, preserve the source O
-and keep the attempt beside it in the conversation:
+and keep the attempt beside it in the session:
 
 ```text
 feature/01-core            gitlink -> O
@@ -138,7 +138,7 @@ code tree; newly created sources and drafts contain no `.caos/conflicts`.
 the draft's current tree R and creates `M = commit(tree=R, parents=[O,T])`.
 Verify O and T against the attempt's creation record, recheck the draft, and
 advance the target only if it still points to O. Otherwise retain the result
-for reconciliation. Draft commits stay in conversation history, outside M's
+for reconciliation. Draft commits stay in session history, outside M's
 ancestry. Test the final source before publication.
 
 Finishing explicitly asserts resolution. Preserve Git's complete conflict
@@ -149,4 +149,4 @@ Abandoning an attempt leaves the source unchanged. Handle old source-tree
 conflict ledgers before removing their compatibility cleanup.
 
 Merge computation remains cached by its inputs; draft edits and completion use
-conditional conversation updates.
+conditional session updates.

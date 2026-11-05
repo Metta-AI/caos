@@ -49,6 +49,6 @@ under test, not the place the tools run.
   untouched.
 - Not understood yet: `harvest` returned `harvested=0` and `drive conv` found no
   head on the host server, even after a session had completed turns against the
-  stack. Do not rely on either to retrieve the conversation until that is
+  stack. Do not rely on either to retrieve the session until that is
   explained.
 - Clean up: `drive archive`, `drive env-delete`, then `caos-stack stop`.

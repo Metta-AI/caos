@@ -144,18 +144,18 @@ this section is the rest, and none of it is assumed anywhere.
 
 A CaosTool is an ArgTree designed to be run by an agent, distinguished from any
 other ArgTree by carrying a `help` argument that describes the arguments it
-accepts. A tool is therefore any directory in the conversation whose
+accepts. A tool is therefore any directory in the session whose
 `.caos-expr` binds a `--help`. There is no registry, no reserved directory name,
 and nothing enumerates them.
 
 Two built-in tools address one by PATH:
 
-- `tool_help --path=<conversation path>` returns that tool's description and
+- `tool_help --path=<session path>` returns that tool's description and
   parameters. It evaluates the path, including the target expression, and reads
   the resulting ArgTree's `help` binding. This can build the tool; it does not
   invoke it. Missing paths and invalid tools are recoverable tool errors.
   Missing paths also name sibling directories.
-- `run_tool --path=<conversation path> --arguments=<object>` evaluates the same
+- `run_tool --path=<session path> --arguments=<object>` evaluates the same
   path, validates arguments against the evaluated help, and invokes the tool.
   An undeclared argument, a missing required one, or a non-string value is
   answered as an error tool_result before invocation.
@@ -165,7 +165,7 @@ Additionally a human runs a tool with `caos-cli run-tool <path> [--k=v ...]`.
 **Agents discover tools from documentation** — a repository's own `AGENTS.md`,
 README or design docs — not from a listing. That is the whole point of the
 change: enumerating them meant injecting every source tree's tools into the
-system prompt, so a conversation that gained a source tree mid-run re-keyed the
+system prompt, so a session that gained a source tree mid-run re-keyed the
 prompt and grew it per tree. Naming a path instead makes the tool list
 TREE-INDEPENDENT, which is also what lets `caos mcp` offer a FIXED list of five tools and
 makes a client that ignores `tools/list_changed` correct rather than stale. The
@@ -173,7 +173,7 @@ price is real and deliberate: an undocumented tool is invisible. Prose may drift
 from the tool; `tool_help` is the authority.
 
 **WHAT IS REGISTERED IS WHAT HAS NO PATH.** A tool that lives in caos' `std/` is
-reachable as `caos-std/<name>` from any conversation whose tree mounts caos
+reachable as `caos-std/<name>` from any session whose tree mounts caos
 through `std/flake-input-loader` (`design/flake-inputs.md`), so `tool_help`
 describes it and `run_tool` runs it. Registering it as well would be a second way
 to call one thing, and the two can disagree about which version runs — the
@@ -190,9 +190,9 @@ cannot be reached by path yet and registering it is the only way to have it.
 
 ## Resolution
 
-A path names a tree and a tool within it: the conversation-path prefix selects
+A path names a tree and a tool within it: the session-path prefix selects
 the source tree, and the remainder is evaluated against THAT TREE'S ROOT. Both
-halves matter. Evaluating against the conversation root instead would skip a
+halves matter. Evaluating against the session root instead would skip a
 repository's root `.caos-expr`, so `--base:@=DEEP-DEPS/<x>` inside the tool
 would resolve to nothing. And it is why a human's `run-tool` lands on the same
 ArgTree: the human has one source tree — the worktree — so the prefix is empty
@@ -202,9 +202,9 @@ Both tools use ordinary CAOS evaluation, including its dependency-resolution
 semantics. Thus a root expression may generate a `tools/check` directory absent
 from the stored tree: both tools can reach and evaluate it.
 
-Resolution uses the current conversation snapshot on every call. The
+Resolution uses the current session snapshot on every call. The
 definition's evaluated tree is separate from the input: what invocation binds as
-`in` is the original selected source tree — or the original conversation tree
+`in` is the original selected source tree — or the original session tree
 when no source-tree prefix was selected — and it binds it ONLY for a tool that
 declared `@in`.
 
@@ -291,8 +291,8 @@ away with nothing to notice.
 
 An object parameter is still a STRING to the model — it NAMES one:
 
-- `{tree}` takes a CONVERSATION-RELATIVE PATH or a tree hash. The path resolves
-  against the conversation tree, not the source tree the tool runs in; that is
+- `{tree}` takes a SESSION-RELATIVE PATH or a tree hash. The path resolves
+  against the session tree, not the source tree the tool runs in; that is
   the vocabulary the model has, and the only one that can name a tree OTHER
   than the one the tool is running over
 - `{commit}` takes a hash, and only a hash. A path cannot name a commit because
@@ -350,7 +350,7 @@ declares no `@in`: `grep`'s is the scope it searches, bound by its own dispatch.
 gives the tool an optional `{tree}` argument named `in`, listed by `tool_help`;
 supplying it runs the tool over THAT tree, and omitting it falls back to the
 tree the tool's own path selected. Without this the input is derived from where
-a tool happens to SIT, which is wrong for any tool the conversation itself
+a tool happens to SIT, which is wrong for any tool the session itself
 generated — a `caos-build` mounted at `caos-std/` could only ever build
 `caos-std/`, never the source tree you meant. A tool may not declare `@param
 in` by hand: `in` is what the interpreter binds, and `@in` is how to ask for it.
@@ -360,13 +360,13 @@ However it arrives, `in` is bound in exactly ONE place — the request — becau
 curry while the request bound the default would be exactly that.
 
 **`@git` reaches only a DISPATCHED READER, and both halves matter.** An
-in-process built-in is handed the conversation's store directly and ignores the
+in-process built-in is handed the session's store directly and ignores the
 tag — `log`, `show` and `diff` declared it for years and it did nothing for
 them. And a WRITER's input commit is not a caller's to choose: its proposal must
 descend from the commit whose pointer is being advanced, so the input commit is
 pinned to the scope rather than offered as a parameter. `merge`, the one tool
 that really needs it, takes it as `ours` bound by the launch — "a model naming
-it would be naming the conversation it is already in" — which is also why the
+it would be naming the session it is already in" — which is also why the
 generic tag has no users: the tool that needed the input commit predates it and
 binds it under a name of its own.
 
@@ -424,8 +424,8 @@ the harness reads it there. What remains keyed by name in
 subagent join — presentation and plumbing, not the right to change a tree.
 
 **SCOPE comes from the invocation, not the declaration.** A writer run on a
-source tree returns a source commit; one run on the conversation returns a
-conversation commit. The path the caller named already decides which, so the
+source tree returns a source commit; one run on the session returns a
+session commit. The path the caller named already decides which, so the
 declaration says only WHETHER a tool writes, never where.
 
 A writer's `out` SHALL be its own. Composing it in the harness — as the merge
@@ -443,10 +443,10 @@ is the same reason the `help` lives in the expression.
   error there takes the agent's turn down with it
 - Unexpected failures die, per the reliability principles above
 
-## A conversation's history is trusted
+## A session's history is trusted
 
 **A writer checks what it adds; nobody re-checks what is already there.**
-Everything in a conversation's history was written by caos, and every writer
+Everything in a session's history was written by caos, and every writer
 mints its transition through `apply`, which checks it against the parent's
 state before it is pushed. So a reader — `caos mcp`'s hooks and tool server,
 the tui, `llm-step`, `run-and-update-ref` — opens the head it fetched and uses
@@ -454,12 +454,12 @@ it. `fetch_head` (`caos-cli`) says so where the head is read.
 
 The reason is cost, and it is not small. `validate_spine` replays every
 transition back to the root, and most readers are fresh processes: each hook is
-one, and each tool call is an `llm-step` container. A 446-commit conversation
+one, and each tool call is an `llm-step` container. A 446-commit session
 took 2.3s to validate in a local release build, so every tool call and every
 hook grew with the length of the session, until a long session's prompt hook
 outlived its timeout and every tool call of that turn was refused.
 
-`validate_spine` remains for checking what is NEW: a child conversation
+`validate_spine` remains for checking what is NEW: a child session
 `llm-step` has just minted, and tests that check what the client writes.
 
 ## Not built
@@ -471,7 +471,7 @@ on any of it, and each is written down because the reason is easy to lose.
   ArgTree, so describing a compiled tool may build it. Skipping the target
   expression is a possible performance optimization when help is in its text.
 - **`caos-std/README.md` cannot be READ.** It is the index a model is pointed at,
-  and `caos-std/` exists only in the EVALUATED conversation tree, so the file
+  and `caos-std/` exists only in the EVALUATED session tree, so the file
   tools — which do not evaluate — cannot open it. The system prompt names the std
   tools inline instead of naming the file.
 - **`merge` is still reached by NAME**, for the reason under "What is registered
@@ -527,7 +527,7 @@ value=<secret>
 # or read from a file, relative to this one
 value:@=<file>
 reader:@@=git+https://github.com/Metta-AI/caos?rev=<sha>&dir=std/llm-step since=<sha>
-reader:@=imports/caos/std/llm-step conversation=<id>
+reader:@=imports/caos/std/llm-step session=<id>
 ```
 
 ## Readers
@@ -540,8 +540,8 @@ reader:@=imports/caos/std/llm-step conversation=<id>
   `ref=` in place of `rev=` names a branch, resolved when a request is admitted
   (`git+caos://` is this server's own; any other URL is asked), so the range
   moves with it — and trusts whoever can move that branch.
-- **`reader:@=<path> conversation=<id>`** grants whatever is at `path` in that
-  conversation's tree, and only in that conversation. The agent can edit that
+- **`reader:@=<path> session=<id>`** grants whatever is at `path` in that
+  session's tree, and only in that session. The agent can edit that
   code, so this exposes the secret to the agent.
 
 Matching happens where evaluation applies a node's `.caos-expr`. Every node
@@ -558,15 +558,15 @@ during the
 walk, never written into a tree: an ungranted node evaluates exactly as it
 would with no secrets, and a granted one differs only by `secret-hash`. Origins
 and grant records are kept, so a walk is memoized on its tree, its path and
-what a grant depends on (the stores, the conversation and its head, the
+what a grant depends on (the stores, the session and its head, the
 resolved branches).
 - `reader:@@=` matches when `P` is `dir=` and `T` is `C^{tree}` for a commit `C`
   in its range. The allowed set is `git log --first-parent --format=%T`,
   computed once per pushed tree, and needs no evaluation. A root that differs
   from every commit in the range, anywhere, matches nothing; modified code is
   what `reader:@=` is for.
-- `reader:@=` matches when the origin is `path` in the tree of conversation
-  `id`'s current head, for a request of that conversation (named out of band,
+- `reader:@=` matches when the origin is `path` in the tree of session
+  `id`'s current head, for a request of that session (named out of band,
   like the keys).
 
 This check runs on every evaluation, including one that is a memo hit.
@@ -632,7 +632,7 @@ The server holds every pushed value. We can revisit if this becomes a problem.
 
 # Agent/harness integration
 
-When a user uses caos with an agent harness, caos creates a conversation commit based on the repo that it's started from. This repo should be some version of a caos-client repo, not a normal repo that contains the files that the user wants to work on. The repo:
+When a user uses caos with an agent harness, caos creates a session commit based on the repo that it's started from. This repo should be some version of a caos-client repo, not a normal repo that contains the files that the user wants to work on. The repo:
 - Must contain flake.nix and flake.lock with a caos input, and a matching .caos-expr that loads the caos flake
 - Possibly contains a some readmes and agents.md
 - Possibly contains some caos expressions that load in other repos, that
@@ -640,9 +640,9 @@ contain helpful tools, and the readmes describe those tools
 
 When starting a session:
 - The claude cloud env's setup field runs `go run <url>/integrations/claude-code/cloud/bootstrap.go --base=... --server=...`. That reads the flake/expression's caos pin, fetches the payload that pin names, and runs the `install.go` from it — which installs everything. Two stages because the installer is part of the payload, so dev mode can replace it
-- We start the conversation commit from this repo's default branch, or whatever branch the user chooses. The repo's TREE becomes the conversation's content, at the root — its readmes and its agents.md are conversation files, not a source tree. A fresh conversation therefore carries the client repo and nothing else; there are no source trees until something is imported.
+- We start the session commit from this repo's default branch, or whatever branch the user chooses. The repo's TREE becomes the session's content, at the root — its readmes and its agents.md are session files, not a source tree. A fresh session therefore carries the client repo and nothing else; there are no source trees until something is imported.
 
-The user will then say something like "import <repo name>" and the agent will find the repo in github, import it as a source tree in the conversation commit and then start working on it 
+The user will then say something like "import <repo name>" and the agent will find the repo in github, import it as a source tree in the session commit and then start working on it 
 
 # Codebase
 
@@ -742,7 +742,7 @@ The build and test tools (`std/caos-build`, `std/caos-test`, `dev/caos-stack`) d
 
 We use one resident test worker per tree, with persistent data. This weakens test isolation, but we already expect tests to tolerate other tests' data (because it was too slow to start a fresh stack per test)
 
-`dev/test-stack` is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's conversations to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
+`dev/test-stack` is a resident worker keyed by the oid of the tree under test, so every message about one tree reaches one container that keeps the tree's dev stack up between messages. Its ops are `start` (bring the stack up, publish an iroh listener, return the `caos://` ticket a cloud session connects by; needs a `relay`), `run-tests` (bring the stack up if needed, run the suite, return its result), `status`, `logs`, `harvest` (copy the stack's sessions to this server under `refs/stacks/<tree>/`) and `stop`. The last four never start a stack. The build and tools are:
 - `std/caos-build <tree-oid>`: sends `build` (a `nix build` of the tree). Starts no stack and leaves none
 - `std/caos-test <tree-oid>`: sends `run-tests` to the tree's daemon. The first call per tree builds and brings the stack up; later calls, with any `--only` or `--test-salt`, skip both
 - `dev/caos-stack <tree-oid> --op=<op> --request-id=<fresh>`: sends one of the other ops. `request-id` must be fresh per call or the answer comes from the cache. `start` also publishes a client for the stack as `refs/caos/dev` on it and returns that `dev_commit`; with `--cloud-env=1` it then creates a new cloud environment, `z Caos Dev <commit>`, whose setup points at the stack
@@ -770,17 +770,17 @@ An agent merges into a selected source tree using
 `merge --theirs=<ref|hash>`, then resolves conflicts by producing ordinary
 source tree commits. There is no index or staging step in the worker.
 
-[Chat v3](design/chat.md) defines the conversation and source tree histories,
-their refs, reconciliation, and publication. Conversation commits hold
+[Chat v3](design/chat.md) defines the session and source tree histories,
+their refs, reconciliation, and publication. Session commits hold
 protocol state; source tree commits hold code. They are connected by hashes
-in conversation records, never by parent edges.
+in session records, never by parent edges.
 
-File tools, grep, and a shell reached at a conversation-root path start at the
-conversation root and traverse commit-valued source-tree entries. Such a shell
-can edit ordinary conversation files and several source trees together; one
+File tools, grep, and a shell reached at a session-root path start at the
+session root and traverse commit-valued source-tree entries. Such a shell
+can edit ordinary session files and several source trees together; one
 reached inside a source tree sees only that tree. Source-tree directories preserve
 commit identity through `mv` and `cp -a`; changes produce child code commits.
-Repository tools are addressed with `run_tool` and one conversation-relative
+Repository tools are addressed with `run_tool` and one session-relative
 path. Git operations such as merge still name their target source tree.
 
 The TUI uses a separate harness checkout and explicit worker image arguments.
@@ -790,14 +790,14 @@ See [Chat](design/chat.md) for storage, reconciliation, and publication.
 ## Tools thread a commit, not a tree
 
 Code mutations retain their input commit as a parent; merge retains both
-inputs. Filesystem tools pin a conversation snapshot and preserve each
+inputs. Filesystem tools pin a session snapshot and preserve each
 contained source tree's commit boundary.
 
 - **Read-only tools** (`read`, `ls`, `grep`) return the input
   commit UNCHANGED — no new object, no no-op commit.
 - **Mutations** (`write`, `edit`, a shell) create a single-parent
-  code commit for each changed source tree. Ordinary conversation-file
-  changes stay in the conversation tree.
+  code commit for each changed source tree. Ordinary session-file
+  changes stay in the session tree.
 - **`merge`** returns a two-parent commit `commit(merged tree, parents =
   [input commit, theirs])` — the only tool that fills a second parent, but
   otherwise an ordinary tool with the ordinary signature.
@@ -807,14 +807,14 @@ the rules in [Chat v3](design/chat.md). Accepted source tree commits
 preserve the mutation and merge ancestry. Equal trees do not make that
 ancestry redundant. Read-only proposals leave the source tree unchanged.
 
-Publication preserves the selected source tree's code history. Conversation
-records (prompts, tool calls, and results) stay on the conversation branch;
+Publication preserves the selected source tree's code history. Session
+records (prompts, tool calls, and results) stay on the session branch;
 publishing them is deferred.
 
 The worker command `caos import-git <https-url> <commit>` posts that exact
 commit to /git/import and prints its hash. It optionally reads a token file
 specified by --github-token-file=PATH and forwards it in a sensitive header.
-Ref resolution, provenance, and conversation attachment belong to callers.
+Ref resolution, provenance, and session attachment belong to callers.
 
 The inline `import_source(source, revision?, into)` tool resolves a remote
 revision in the agent container. Before importing objects it records the
@@ -825,7 +825,7 @@ persisted observation. A new tool call observes the remote again.
 
 After import, the tool atomically adds the gitlink, sibling .source.json
 provenance and completed tool result. It rejects occupied destinations.
-The tool is available in an empty conversation. Local paths use /import.
+The tool is available in an empty session. Local paths use /import.
 Only github.com on the default HTTPS port receives the mounted GitHub token
 automatically.
 
@@ -844,7 +844,7 @@ object-availability operation: a cache hit does not recheck remote access,
 just as reading an available hash through the object API does not.
 Token values never enter Git objects or completion markers.
 
-The endpoint does not edit conversations or create import refs. Automatic GC
+The endpoint does not edit sessions or create import refs. Automatic GC
 remains disabled; future GC must retain imported commits because gitlinks
 and completion markers do not root them.
 
@@ -874,7 +874,7 @@ credential helper to one HTTPS URL. A `path:` locator names a directory on the
 machine that wrote the expression and is refused.
 
 Resolution happening here, rather than on a client, is what lets a SERVER-SIDE
-evaluation follow a pin — an agent's, which is every conversation's. The
+evaluation follow a pin — an agent's, which is every session's. The
 content-addressing rule it used to be justified by is unchanged: the locator
 becomes an oid before the ArgTree carrying it is assembled, so a URL never
 enters a cache key. See [flake inputs](design/flake-inputs.md).
@@ -948,11 +948,11 @@ assertion, trusted exactly as git trusts `add` (no re-scan). An empty
 `.caos/conflicts` means resolution is done. Recording an edited source tree
 removes its empty ledger and prunes the `.caos` directory if empty. Bash and
 inline edits share this rule. Unchanged commits, unresolved entries, other
-metadata, and ordinary conversation files are preserved.
+metadata, and ordinary session files are preserved.
 
 `.caos/conflicts` lives in the source tree, alongside the code. Inline
 file tools can edit it; compute tools receive it with the rest of the
-source tree. Conversation protocol files live in a separate tree, so no
+source tree. Session protocol files live in a separate tree, so no
 step metadata needs to be injected or preserved in the source tree.
 
 Publication rejects any `.caos` content in the final source tree, including
@@ -965,7 +965,7 @@ so a mid-merge head is fully reviewable.
 
 ## Reading by hash (`read`/`ls` with `root`)
 
-Both file readers default to the conversation root but accept a `root` — a
+Both file readers default to the session root but accept a `root` — a
 commit, tree, or blob hash — to read/list as of another revision. A commit or
 tree `root` navigates its tree by path; a bare blob `root` (no path) reads that
 object directly. This is load-bearing, not a convenience: the stage oids in

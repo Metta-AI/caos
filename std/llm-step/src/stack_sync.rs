@@ -2,16 +2,16 @@
 //! (design/stack-publish.md, "stack-sync"): the trunk's head becomes `00-base`,
 //! a branch GitHub rewrote is adopted under the layer's local edits, a branch
 //! someone else pushed to is merged in, and each layer is restacked onto the
-//! one below. Nothing is pushed: the merges are minted in the conversation's
+//! one below. Nothing is pushed: the merges are minted in the session's
 //! store and the stack's gitlinks move in one append, so `stack-publish` can
 //! fast-forward afterwards.
 use std::process::Command;
 
 use super::*;
-use conversation_protocol::v3::reconcile::MergeOutcome;
-use conversation_protocol::v3::source_trees::validate_branch;
-use conversation_protocol::v3::tree::Signature;
-use conversation_protocol::v3::GitStore;
+use session_protocol::v3::reconcile::MergeOutcome;
+use session_protocol::v3::source_trees::validate_branch;
+use session_protocol::v3::tree::Signature;
+use session_protocol::v3::GitStore;
 
 use crate::publish_source::bool_or_string;
 use crate::stack_publish::{github_repo, infer_trunk, provenance, read_stack, Github};
@@ -143,7 +143,7 @@ pub(super) fn merge_into(
 }
 
 /// Fetch a remote commit into the server's store, as `import_source` does, so
-/// the conversation's store can reach it.
+/// the session's store can reach it.
 fn import_commit(repository: &str, commit: &Oid, token_file: Option<&str>) -> Result<(), String> {
     let mut command = Command::new("caos");
     command.args(["import-git", repository, commit.as_str()]);
@@ -202,7 +202,7 @@ fn complete(
     for _ in 0..32 {
         state.reload()?;
         if state
-            .conversation()?
+            .session()?
             .tool(&site.call.id)?
             .is_some_and(|r| r.is_terminal())
         {
@@ -228,7 +228,7 @@ fn complete(
             return Ok(());
         }
     }
-    Err("conversation kept moving while completing stack-sync".into())
+    Err("session kept moving while completing stack-sync".into())
 }
 
 pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Result<(), String> {
@@ -238,7 +238,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
     };
     let dir = p.stack.clone();
     let read = {
-        let view = state.conversation()?;
+        let view = state.session()?;
         read_stack(&view, &dir).and_then(|stack| {
             let prov = provenance(&view, &dir)?;
             let repository = p
@@ -521,7 +521,7 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conversation_protocol::v3::tree::{CommitInfo, TreeBuilder};
+    use session_protocol::v3::tree::{CommitInfo, TreeBuilder};
 
     fn scratch_store(name: &str) -> GitStore {
         let dir = std::env::temp_dir().join(format!("stack-sync-{name}-{}", std::process::id()));

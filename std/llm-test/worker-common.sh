@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared worker-side plumbing for the scripted v3 conversation tests.
+# Shared worker-side plumbing for the scripted v3 session tests.
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -88,7 +88,7 @@ llm_test_setup() {
   git init -q .
   git config gc.auto 0
   git remote add caos "$CAOS_SERVER_URL"
-  LLM_TEST_NEW_CONVERSATION=1
+  LLM_TEST_NEW_SESSION=1
 }
 
 start_stub() {
@@ -134,12 +134,12 @@ mint_commit() {
   caos put-commit /tmp/llm-test-commit "$dst" || fail "minting $dst"
 }
 
-new_llm_conversation() {
+new_llm_session() {
   local suffix=$1 stub_port=$2 tree=$3 system=${4:-You are a coding agent.}
   local existing_base=${5:-} curry_failure=${6:-currying llm-step} test_run_id
   test_run_id="$(date +%s%N)-$$-$RANDOM"
   conv="${test_run_id}-${suffix}"
-  conversation_ref=""
+  session_ref=""
   LLM_TEST_ROOT_WORKSPACE=""
   if [ "$tree" != - ]; then
     base=$(mint_commit "/cas/conv-base-$suffix" "$tree" "base ($SALT)")
@@ -149,12 +149,12 @@ new_llm_conversation() {
     LLM_TEST_ROOT_WORKSPACE=$base
   fi
   head=""
-  LLM_TEST_NEW_CONVERSATION=1
+  LLM_TEST_NEW_SESSION=1
   printf '%s' "$system" > /tmp/system.txt
   caos put /tmp/system.txt "/cas/system-$suffix" >/dev/null || fail "publishing the system prompt"
   llm=$(caos curry --base:hash="$LLM_TEST_LLM_STEP" \
     --system:@="/cas/system-$suffix" --model=test-model \
-    --base-url="http://$stub_host:$stub_port" --conversation="$conv") \
+    --base-url="http://$stub_host:$stub_port" --session="$conv") \
     || fail "$curry_failure"
 }
 
@@ -166,7 +166,7 @@ admit_turn() {
   turn_args=(turn --repo /tmp/repo --id "$conv" --user "$username" --title "$conv"
     --actor "$username" --text "$message" --secret-hash "$LLM_TEST_SECRET_HASH"
     --configuration "$llm")
-  if [ "$LLM_TEST_NEW_CONVERSATION" -eq 1 ]; then
+  if [ "$LLM_TEST_NEW_SESSION" -eq 1 ]; then
     if [ -n "$LLM_TEST_ROOT_WORKSPACE" ]; then
       turn_args+=(--source-tree "main=$LLM_TEST_ROOT_WORKSPACE")
     fi
@@ -182,17 +182,17 @@ admit_turn() {
       ref) parsed_ref=$value ;;
     esac
   done <<<"$output"
-  assert_oid "$parsed_head" "the admitted conversation head"
+  assert_oid "$parsed_head" "the admitted session head"
   assert_oid "$parsed_request" "the prepared turn request"
   assert_oid "$parsed_human" "the human message head"
-  [ -n "$parsed_ref" ] || fail "the turn helper did not report the conversation ref"
+  [ -n "$parsed_ref" ] || fail "the turn helper did not report the session ref"
   admitted=$parsed_head
   request=$parsed_request
   # The prompt the request answers: the head it was prepared with (`--head`).
   human=$parsed_human
-  conversation_ref=$parsed_ref
+  session_ref=$parsed_ref
   head=$admitted
-  LLM_TEST_NEW_CONVERSATION=0
+  LLM_TEST_NEW_SESSION=0
 }
 
 start_turn() {
@@ -211,7 +211,7 @@ remote_tip() {
   printf '%s\n' "${line%%[[:space:]]*}"
 }
 
-dump_conversation() {
+dump_session() {
   local parent_ref=$1 parent_request=$2 parent_tip payload child_id child_ref child_tip child_request
   echo "--- diagnostics: parent and child state ---" >&2; parent_tip=$(remote_tip "$parent_ref") || parent_tip=""
   $TOOL fetch --repo /tmp/repo --ref "$parent_ref" >&2 || true;
@@ -232,7 +232,7 @@ dump_conversation() {
 
 wait_turn() {
   local limit=${1:-120} output rc=0 key value terminal="" status=""
-  output=$($TOOL wait-terminal --repo /tmp/repo --ref "$conversation_ref" \
+  output=$($TOOL wait-terminal --repo /tmp/repo --ref "$session_ref" \
     --request "$request" --timeout-secs "$limit") || rc=$?
   while read -r key value; do
     case "$key" in
@@ -245,7 +245,7 @@ wait_turn() {
     fail "the turn did not finish successfully (status ${status:-unknown}, exit $rc)"
   fi
   [ "$status" = idle ] || fail "the turn ended with status ${status:-unknown}"
-  assert_oid "$terminal" "the terminal conversation head"
+  assert_oid "$terminal" "the terminal session head"
   head=$terminal
   printf '%s\n' "$terminal"
 }
@@ -255,8 +255,8 @@ record() {
 }
 
 source_tree_commit() {
-  local conversation_head=$1 name=${2:-main} output key value commit=""
-  output=$($TOOL source-tree --repo /tmp/repo --head "$conversation_head" --name "$name") \
+  local session_head=$1 name=${2:-main} output key value commit=""
+  output=$($TOOL source-tree --repo /tmp/repo --head "$session_head" --name "$name") \
     || fail "reading source_tree $name"
   while read -r key value; do
     if [ "$key" = commit ]; then commit=$value; fi
@@ -266,20 +266,20 @@ source_tree_commit() {
 }
 
 assert_spine() {
-  local conversation_head=$1 parents last="" oid kind
-  parents=$($TOOL parents --repo /tmp/repo --head "$conversation_head" --validate) \
-    || fail "walking the conversation spine"
+  local session_head=$1 parents last="" oid kind
+  parents=$($TOOL parents --repo /tmp/repo --head "$session_head" --validate) \
+    || fail "walking the session spine"
   while read -r oid kind; do
     assert_oid "$oid" "spine commit"
     [ -n "$kind" ] || fail "spine commit $oid has no registered kind"
     last=$kind
   done <<<"$parents"
-  [ "$last" = conversation.root ] || fail "the conversation spine did not end at its root"
+  [ "$last" = conversation.root ] || fail "the session spine did not end at its root"
 }
 
 transcript_text() {
-  local conversation_head=$1 _ordinal _role _actor _message_id encoded
+  local session_head=$1 _ordinal _role _actor _message_id encoded
   while read -r _ordinal _role _actor _message_id encoded; do
     printf '%s\n' "$encoded" | jq -r .
-  done < <($TOOL transcript --repo /tmp/repo --head "$conversation_head")
+  done < <($TOOL transcript --repo /tmp/repo --head "$session_head")
 }

@@ -1308,7 +1308,7 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         store_git_tree(self.config, entries)
     }
     /// `:@@=`. This is what a worker's `eval` continuation ultimately reaches,
-    /// and it is why a conversation can evaluate a repository that pins caos:
+    /// and it is why a session can evaluate a repository that pins caos:
     /// the walk is the server's, so the fetch has to be too (`crate::locator`).
     ///
     /// The content-addressing rule is unchanged — the locator becomes an oid
@@ -1327,7 +1327,7 @@ impl caos_eval::EvalHost for ServerEvalHost<'_> {
         let root = crate::locator::resolve_root(self.config, &git_ref, None)
             .map_err(|e| format!("git ref {value:?}: {e}"))?;
         if git_ref.raw {
-            // The pinned commit's own tree, unevaluated: a conversation's content,
+            // The pinned commit's own tree, unevaluated: a session's content,
             // which is code to read, not an expression to run.
             let (kind, hash) = raw_walk(self.config, &root, git_ref.dir.as_deref().unwrap_or(""))
                 .map_err(|e| format!("git ref {value:?}: {e}"))?;

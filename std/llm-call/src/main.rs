@@ -4,7 +4,7 @@
 //! configuration: `base-url`. Call inputs:
 //! `system`, a JSON `messages` array, and optionally `model` and `max-tokens`.
 //! The result is the response's text blocks as a plain blob. This worker owns
-//! no conversation commits, tools, status refs, or presentation-specific
+//! no session commits, tools, status refs, or presentation-specific
 //! prompts.
 
 use std::fs;

@@ -28,7 +28,7 @@ printf '%s\n' \
   > /tmp/stub/response-2.json
 start_stub /tmp/stub
 
-new_llm_conversation tools-inline "$STUB_PORT" "$ws"
+new_llm_session tools-inline "$STUB_PORT" "$ws"
 dispatch_turn "exercise the file tools"
 wait_turn || fail "the turn never reached a terminal head"
 
@@ -65,7 +65,7 @@ grep -qF 'old-string not found' /tmp/stub/request-2.json \
   || fail "bad edit error not explained"
 [ ! -f /tmp/stub/request-3.json ] || fail "inline tools cost extra model rounds"
 
-stage "conversation files work without a source tree"
+stage "session files work without a source tree"
 mkdir -p /tmp/stub-zero
 printf '%s\n' \
   '{"content":[{"id":"tu_no_source_tree","input":{"file-path":"plan.md","content":"root plan"},"name":"write","type":"tool_use"},{"id":"tu_files","input":{"file-path":"files/plan.md","content":"right place"},"name":"write","type":"tool_use"}],"stop_reason":"tool_use"}' \
@@ -76,16 +76,16 @@ printf '%s\n' \
 zero_pid=""
 zero_port=""
 start_stub /tmp/stub-zero zero_pid zero_port
-new_llm_conversation tools-zero "$zero_port" - "You are a coding agent." "" \
+new_llm_session tools-zero "$zero_port" - "You are a coding agent." "" \
   "currying zero-source_tree llm-step"
 dispatch_turn "exercise files without a source tree"
 wait_turn || fail "the zero-source_tree turn did not finish"
 $TOOL tools --repo /tmp/repo --head "$head" > /tmp/zero-tools.jsonl
 jq -s -e 'length == 2 and all(.[]; .status == "complete")' \
-  /tmp/zero-tools.jsonl >/dev/null || fail "conversation writes did not complete"
+  /tmp/zero-tools.jsonl >/dev/null || fail "session writes did not complete"
 [ "$(record "$head" plan.md)" = "root plan" ] \
-  || fail "root conversation file did not land"
+  || fail "root session file did not land"
 [ "$(record "$head" files/plan.md)" = "right place" ] \
-  || fail "conversation-files write did not land"
+  || fail "session-files write did not land"
 
 pass chat-tools

@@ -248,7 +248,7 @@ fn diagnostics() -> String {
         match (stamped("rev"), dev_client) {
             (Some(rev), true) => format!(
                 "on -- the whole install package came from refs/caos/dev at {}, \
-                 and this conversation seeds from {} rather than from HEAD",
+                 and this session seeds from {} rather than from HEAD",
                 &rev[..rev.len().min(12)],
                 stamped("seed").map_or_else(
                     || "<none>".to_string(),
@@ -286,7 +286,7 @@ fn diagnostics() -> String {
     d.push_str(&format!("git-remote-caos: {}\n", git_remote_helper()));
     // The CROSS-PROCESS phase journal, which is the only way this session can
     // see what the other caos processes did. `mcp hook` fires per prompt and
-    // pays the conversation-base push. It
+    // pays the session-base push. It
     // cannot print to a transcript, and a cloud session has no shell to go looking
     // with -- so it writes here and this reads it back.
     let phases = caos::timing::tail(25);

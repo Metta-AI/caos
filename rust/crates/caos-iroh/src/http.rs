@@ -159,7 +159,7 @@ pub fn encode_request(
 /// is the whole client, with no endpoint or runtime involved.
 ///
 /// Finishing the send side is part of the request: `Connection: close` says this
-/// exchange is the whole conversation, and the EOF is what makes the server act
+/// exchange is the whole session, and the EOF is what makes the server act
 /// on it rather than wait for a second request.
 pub async fn exchange(
     mut send: SendStream,

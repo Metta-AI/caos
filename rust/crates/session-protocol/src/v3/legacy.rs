@@ -1,16 +1,16 @@
-//! Carrying a v5 conversation (one with turn records) into this format.
+//! Carrying a v5 session (one with turn records) into this format.
 //!
-//! A v5 conversation cannot be read or forked as it stands: its history holds
-//! the turn transitions this format removed, and reading a conversation walks
-//! its history. So a v5 conversation is carried over instead: a NEW root
-//! conversation is rebuilt from it, with its content, its transcript, and the
+//! A v5 session cannot be read or forked as it stands: its history holds
+//! the turn transitions this format removed, and reading a session walks
+//! its history. So a v5 session is carried over instead: a NEW root
+//! session is rebuilt from it, with its content, its transcript, and the
 //! result of every call it recorded, and a closing system message naming the v5
 //! head it came from. The v5 history itself is left untouched, and stays
 //! readable by the earlier build.
 //!
 //! What does not come across is what this format no longer has, and what would
 //! no longer validate on a new root: turn records, a call's start and task (the
-//! task belongs to the v5 conversation), a call's source tree and resolution
+//! task belongs to the v5 session), a call's source tree and resolution
 //! (the pointer move already happened, and is in the content), a message's
 //! proposal, and async, subagent and publication records.
 
@@ -29,29 +29,29 @@ use super::tree::{Mode, ObjectStore, Signature, Snapshot, TreeBuilder};
 
 const V5_FORMAT: &[u8] = b"caos-conversation-v5\n";
 
-/// Whether `commit` is a v5 conversation commit.
+/// Whether `commit` is a v5 session commit.
 pub fn is_v5(store: &dyn ObjectStore, commit: &Oid) -> Result<bool, String> {
     let tree = store.read_commit(commit).map_err(String::from)?.tree;
     Ok(Snapshot::new(store, tree).read(paths::FORMAT)?.as_deref() == Some(V5_FORMAT))
 }
 
-/// The conversation id a v5 commit records.
+/// The session id a v5 commit records.
 pub fn v5_id(store: &dyn ObjectStore, commit: &Oid) -> Result<String, String> {
     let tree = store.read_commit(commit).map_err(String::from)?.tree;
     let bytes = Snapshot::new(store, tree)
         .read(paths::IDENTITY)?
-        .ok_or("v5 conversation has no identity")?;
+        .ok_or("v5 session has no identity")?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     value["id"]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| "v5 conversation identity has no id".to_string())
+        .ok_or_else(|| "v5 session identity has no id".to_string())
 }
 
-/// The root commit of the conversation at `head`, in this format or v5: found by
+/// The root commit of the session at `head`, in this format or v5: found by
 /// commit kind name alone, which every format shares, so a v5 history with kinds
 /// this build no longer has can still be walked.
-pub fn conversation_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> {
+pub fn session_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, String> {
     let mut current = head.clone();
     loop {
         let info = store.read_commit(&current).map_err(String::from)?;
@@ -62,11 +62,11 @@ pub fn conversation_root(store: &dyn ObjectStore, head: &Oid) -> Result<Oid, Str
             .parents
             .first()
             .cloned()
-            .ok_or_else(|| format!("{current} has no parent before its conversation's root"))?;
+            .ok_or_else(|| format!("{current} has no parent before its session's root"))?;
     }
 }
 
-/// Rebuild the v5 conversation at `source` as a new root conversation `id`,
+/// Rebuild the v5 session at `source` as a new root session `id`,
 /// titled `title`, parented on `parent` (G3, or the commit its content came
 /// from). Its content is `content` when given (a tree without `.caos/`), or
 /// the source's own. Returns the head commit, not pushed.
@@ -80,7 +80,7 @@ pub fn migrate_v5(
     signature: &Signature,
 ) -> Result<Oid, String> {
     if !is_v5(store, source)? {
-        return Err(format!("{source} is not a v5 conversation"));
+        return Err(format!("{source} is not a v5 session"));
     }
     let source_tree = store.read_commit(source).map_err(String::from)?.tree;
     let content = match content {
@@ -94,7 +94,7 @@ pub fn migrate_v5(
     let (tools, payloads) = v5_calls(store, source)?;
     let entries = v5_transcript(store, &source_tree)?;
 
-    let root = Transition::ConversationRoot {
+    let root = Transition::SessionRoot {
         identity: Identity {
             id: id.to_string(),
             kind: IdentityKind::Root,
@@ -138,13 +138,13 @@ pub fn migrate_v5(
         Transition::MessageAppend {
             entry: TranscriptEntry {
                 message_id: note,
-                conversation: id.to_string(),
+                session: id.to_string(),
                 role: Role::System,
                 actor: "caos".to_string(),
                 model: None,
                 blocks: vec![Block::Text {
                     text: format!(
-                        "Carried over from the v5 conversation at {source}: its content, \
+                        "Carried over from the v5 session at {source}: its content, \
                          transcript and call results, without its turn records."
                     ),
                 }],
@@ -376,7 +376,7 @@ mod tests {
     use crate::v3::oid::ensure_genesis;
     use crate::v3::tree::{CommitInfo, MemoryStore};
     use crate::v3::validate_spine;
-    use crate::v3::view::Conversation;
+    use crate::v3::view::Session;
 
     const REQUEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -410,9 +410,9 @@ mod tests {
         bytes
     }
 
-    /// A v5 conversation: a prompt, an admitted request, an answer declaring a
+    /// A v5 session: a prompt, an admitted request, an answer declaring a
     /// read, the read's completion, and the request's terminal.
-    fn v5_conversation(store: &mut MemoryStore) -> Oid {
+    fn v5_session(store: &mut MemoryStore) -> Oid {
         let genesis = ensure_genesis(store).unwrap();
         let mut tree = TreeBuilder::from(None);
         tree.put(paths::FORMAT, Mode::Blob, V5_FORMAT.to_vec());
@@ -511,13 +511,13 @@ mod tests {
     }
 
     #[test]
-    fn a_v5_conversation_is_carried_into_a_new_root() {
+    fn a_v5_session_is_carried_into_a_new_root() {
         let mut store = MemoryStore::new();
-        let source = v5_conversation(&mut store);
+        let source = v5_session(&mut store);
         assert!(is_v5(&store, &source).unwrap());
         assert_eq!(v5_id(&store, &source).unwrap(), "old");
         // This build cannot read it as it stands, and says why.
-        let refused = Conversation::open(&store, &source).err().unwrap();
+        let refused = Session::open(&store, &source).err().unwrap();
         assert!(refused.contains("v5"), "{refused}");
 
         let genesis = ensure_genesis(&mut store).unwrap();
@@ -529,7 +529,7 @@ mod tests {
         validate_spine(&store, &head, &mut HashSet::new()).unwrap();
         assert!(!is_v5(&store, &head).unwrap());
 
-        let view = Conversation::open(&store, &head).unwrap();
+        let view = Session::open(&store, &head).unwrap();
         assert_eq!(view.identity().unwrap().id, "new");
         assert_eq!(view.identity().unwrap().kind, IdentityKind::Root);
         assert_eq!(view.title().unwrap(), "Carried");

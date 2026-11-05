@@ -923,7 +923,7 @@ fn serve_next_socket(tx: mpsc::Sender<Event>) -> Result<(), String> {
     Ok(())
 }
 
-/// One `caos next` conversation. The request is one JSON line:
+/// One `caos next` session. The request is one JSON line:
 /// `{"op":"next","error":<text|absent>}` — answered with one line when the next
 /// job is ready — or `{"op":"stream"}`, which stays open for the worker's life.
 /// Answers are `job`, `leave` or `refused <why>`.
@@ -987,7 +987,7 @@ fn serve_next_connection(stream: UnixStream, tx: &mpsc::Sender<Event>) -> std::i
 }
 
 /// `caos next [--error <text>]` and `caos next --stream`: the worker's side of
-/// the conversation above. Returns the process's exit status: 0 with the next
+/// the session above. Returns the process's exit status: 0 with the next
 /// job's args at `/cas/args`, [`LEAVE_STATUS`] when the worker should stop.
 pub fn next_client(args: &[String]) -> Result<u8, String> {
     let (request, stream) = match args {
@@ -1027,7 +1027,7 @@ fn answer_status(answer: &str) -> Result<u8, String> {
 
 /// `--stream`: stdin lines go to the runner and its lines come back on stdout,
 /// so a daemon that does not want a process per job reads `job` lines and
-/// writes `done`. EOF on stdin closes the conversation; `leave` ends it with
+/// writes `done`. EOF on stdin closes the session; `leave` ends it with
 /// [`LEAVE_STATUS`].
 fn stream_client(socket: UnixStream) -> Result<u8, String> {
     let mut upstream = socket.try_clone().map_err(|e| e.to_string())?;

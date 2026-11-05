@@ -1,7 +1,7 @@
 //! Client imports of explicitly selected commits.
 use super::*;
-use conversation_protocol::v3::source_trees::{validate_repository, validate_source};
-use conversation_protocol::v3::Mode;
+use session_protocol::v3::source_trees::{validate_repository, validate_source};
+use session_protocol::v3::Mode;
 
 /// Transfer history between the trusted local checkout and client repository.
 /// upload-pack otherwise forbids fetching promised objects from a partial clone.
@@ -212,7 +212,7 @@ pub fn import_source(
         &refs::head_ref(id)?,
         "importing content",
         |store, head| {
-            let view = Conversation::open(store, head)?;
+            let view = Session::open(store, head)?;
             let snapshot = view.snapshot();
             if snapshot.exists(name)? {
                 return Err(format!("path {name:?} already exists"));

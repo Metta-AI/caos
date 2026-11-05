@@ -168,7 +168,7 @@ sandbox = false''
               # cache of work, and an idle one is evicted as soon as anything else
               # wants its slot, so the cap is only the backstop for a quiet
               # machine. The grace period is how long a stack has to harvest its
-              # conversations between SIGTERM and SIGKILL.
+              # sessions between SIGTERM and SIGKILL.
               "CAOS_RESIDENT=1"
               "CAOS_RESIDENT_MAX_SECS=7200"
               "CAOS_RESIDENT_GRACE_SECS=60"

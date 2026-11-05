@@ -19,7 +19,7 @@ static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 pub(super) struct Browser {
     pub visible: bool,
-    conversation: String,
+    session: String,
     snapshot: Option<SnapshotInfo>,
     path: String,
     entries: Vec<Row>,
@@ -103,10 +103,10 @@ impl App {
     }
 
     pub(super) fn open_browser(&mut self) {
-        let conversation = self.selected().id.clone();
+        let session = self.selected().id.clone();
         self.browser = Some(Browser {
             visible: true,
-            conversation,
+            session,
             snapshot: None,
             path: String::new(),
             entries: Vec::new(),
@@ -140,7 +140,7 @@ impl App {
 
     fn refresh_browser(&mut self) {
         let Some(b) = &self.browser else { return };
-        let id = b.conversation.clone();
+        let id = b.session.clone();
         self.browser_job("Loading files…", move |t| {
             let snapshot = fs::snapshot(t, &id)?;
             let entries = load_rows(t, &snapshot.tree, "")?;
@@ -262,7 +262,7 @@ impl App {
             KeyCode::PageDown => b.scroll = b.scroll.saturating_add(15),
             KeyCode::Char('r') => self.refresh_browser(),
             // This selects the source for tool descriptions and local edits; it does not
-            // change the conversation filesystem or agent execution.
+            // change the session filesystem or agent execution.
             KeyCode::Char('o') => {
                 let Some(entry) = b.entries.get(b.selected) else {
                     return;
@@ -361,7 +361,7 @@ pub(super) fn render(app: &App, frame: &mut Frame<'_>) {
             Line::raw(format!(
                 "Files  /{}   ·   {} {head}",
                 safe(&b.path),
-                safe(&b.conversation)
+                safe(&b.session)
             )),
             Line::from(vec![
                 Span::styled("Gitlinks", Style::default().fg(Color::Magenta)),
@@ -440,7 +440,7 @@ mod tests {
     fn browser(entries: Vec<Row>) -> Browser {
         Browser {
             visible: true,
-            conversation: "browser-test".into(),
+            session: "browser-test".into(),
             snapshot: None,
             path: String::new(),
             entries,

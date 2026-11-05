@@ -21,7 +21,7 @@ move. That is the section worth reading if you are about to optimise this
 suite again.
 
 A later split happened under different conditions: `llm-step` had grown from
-one conversation test into four serial scenarios (core replay/interjection,
+one session test into four serial scenarios (core replay/interjection,
 independent work, subagents, and Escape), while `chat-tools` still ran three
 tool scenarios serially. They were again 12–22s tails. The focused
 `llm-{step,async,subagent,interrupt}` and `chat-tools{,-mixed,-grep}` suites
@@ -328,7 +328,7 @@ name it, whether or not the turn calls the tool. That is the 45s -> 103s
 regression: the same work, multiplied by the number of stacks.
 
 And it lands at the HEAD of the longest serial chains — nothing in
-chat-offline's conversation starts until llm-step's whole tool set is built.
+chat-offline's session starts until llm-step's whole tool set is built.
 
 **The other duplication is the stacks themselves.** Every test brings up redis,
 a server, a runnerd and a seeder, and git-fetches its deps and the seed records.
@@ -431,7 +431,7 @@ tests are done. A needs a timeout anyway: a failed subtree must not hang it.
 into both A and B — one mint, threaded down, rather than either child deriving
 its own. Two reasons, and the second is not optional:
 
-- Two suites running at once (two tui conversations) must not share a ref.
+- Two suites running at once (two tui sessions) must not share a ref.
 - **A MUST NOT CACHE.** A cached stack-starter returns a result without starting
   a stack. The token in its args is what prevents that — and it has to cover B
   as well, or the bad case is B cached and A not: a stack comes up that nobody

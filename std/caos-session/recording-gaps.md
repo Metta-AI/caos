@@ -1,7 +1,7 @@
 # Shortcomings of what `caos mcp hook` records
 
-Found while building and running `caos-conversation` against a real recorded
-session (92 commits). What `caos-conversation` can show is limited by these; they
+Found while building and running `caos-session` against a real recorded
+session (92 commits). What `caos-session` can show is limited by these; they
 are candidates for fixing in `rust/crates/caos-cli/src/mcp/`.
 
 1. **The model's text between tool calls is not recorded.** Only the user's
@@ -32,7 +32,7 @@ are candidates for fixing in `rust/crates/caos-cli/src/mcp/`.
 8. **Harness context is not recorded.** The system reminders and hook output the
    model saw with each prompt are not in the transcript, so a reader cannot tell
    what instructions the model actually had.
-9. **A tool-server restart can leave the conversation without an active
+9. **A tool-server restart can leave the session without an active
    request.** Mid-session the MCP server restarted, the next user prompt was not
    recorded as a request, and every caos tool call then failed with "no active
    request ... a tool call arrived before this session's prompt" until a later

@@ -1,6 +1,6 @@
 use super::apply::{apply, client_signature, mint, Transition};
 use super::events::Event;
-use super::view::Conversation;
+use super::view::Session;
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 
@@ -10,7 +10,7 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
     let fork = fixtures::golden(&mut store);
     let source = store.read_commit(&fork).unwrap().parents[0].clone();
     validate_spine(&store, &fork, &mut HashSet::new()).unwrap();
-    let view = Conversation::open(&store, &source).unwrap();
+    let view = Session::open(&store, &source).unwrap();
     for path in [
         ".caos/source_trees",
         ".caos/requests",
@@ -44,7 +44,7 @@ fn execution_roundtrip_leaves_no_lifecycle_files() {
         .unwrap()
         .1
         .is_interrupt());
-    let fork_view = Conversation::open(&store, &fork).unwrap();
+    let fork_view = Session::open(&store, &fork).unwrap();
     assert_eq!(
         fork_view.reference_start("main").unwrap(),
         fork_view.source_tree("main").unwrap().unwrap().commit
@@ -112,7 +112,7 @@ fn code_paths_are_content_and_renaming_preserves_code_history() {
     let g3 = oid::ensure_genesis(&mut store).unwrap();
     let sig = client_signature("Test", "test@example.com", 1);
     let w = Oid::parse(&"a".repeat(40), "code").unwrap();
-    let root = Transition::ConversationRoot {
+    let root = Transition::SessionRoot {
         identity: Identity {
             id: "content-test".into(),
             kind: IdentityKind::Root,
@@ -148,7 +148,7 @@ fn code_paths_are_content_and_renaming_preserves_code_history() {
     let applied = apply(&mut store, Some(&head), &edits).unwrap();
     let next = mint(&mut store, &head, &applied, edits.kind(), &sig).unwrap();
     validate_spine(&store, &next, &mut HashSet::new()).unwrap();
-    let view = Conversation::open(&store, &next).unwrap();
+    let view = Session::open(&store, &next).unwrap();
     assert_eq!(
         view.source_tree_names().unwrap(),
         ["feature/00-base", "feature/01-change"]
@@ -167,14 +167,14 @@ fn code_paths_are_content_and_renaming_preserves_code_history() {
             .0,
         "feature/00-base"
     );
-    assert!(Conversation::open(&store, &head)
+    assert!(Session::open(&store, &head)
         .unwrap()
         .source_tree("feature/01-draft")
         .unwrap()
         .is_some());
 }
 
-/// A plain commit standing for a client repo's: its files, no conversation kind.
+/// A plain commit standing for a client repo's: its files, no session kind.
 fn content_commit(store: &mut MemoryStore, parents: &[Oid], files: &[(&str, &str)]) -> (Oid, Oid) {
     let mut builder = crate::v3::tree::TreeBuilder::from(None);
     for (name, text) in files {
@@ -223,7 +223,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     );
 
     // The root: its parent is the commit its content came from.
-    let root = Transition::ConversationRoot {
+    let root = Transition::SessionRoot {
         identity: Identity {
             id: "pinned".into(),
             kind: IdentityKind::Root,
@@ -236,7 +236,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     let head = mint(&mut store, &old, &applied, root.kind(), &sig).unwrap();
     validate_spine(&store, &head, &mut HashSet::new()).unwrap();
     assert_eq!(
-        Conversation::open(&store, &head)
+        Session::open(&store, &head)
             .unwrap()
             .snapshot()
             .read(".caos-expr")
@@ -246,7 +246,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     );
 
     // A root whose content is not its parent's tree is refused, and so is one
-    // parenting a conversation commit.
+    // parenting a session commit.
     let other = mint(&mut store, &new, &applied, root.kind(), &sig).unwrap();
     assert!(validate_commit(&store, &other)
         .unwrap_err()
@@ -254,11 +254,11 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
         .contains("differs from its parent"));
     assert!(mint(&mut store, &head, &applied, root.kind(), &sig)
         .unwrap_err()
-        .contains("not a conversation commit"));
+        .contains("not a session commit"));
 
     // The fork merges the newer commit in: content replaced, .caos/ kept, the
     // merged commit as second parent.
-    let fork = Transition::ConversationFork {
+    let fork = Transition::SessionFork {
         identity: Identity {
             id: "pinned-again".into(),
             kind: IdentityKind::Fork {
@@ -280,7 +280,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     )
     .unwrap();
     validate_spine(&store, &forked, &mut HashSet::new()).unwrap();
-    let view = Conversation::open(&store, &forked).unwrap();
+    let view = Session::open(&store, &forked).unwrap();
     assert_eq!(view.snapshot().read(".caos-expr").unwrap().unwrap(), b"new");
     assert_eq!(
         view.snapshot()
@@ -303,7 +303,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
     // but a fork, is refused.
     let bare = mint(&mut store, &head, &applied, fork.kind(), &sig).unwrap();
     assert!(validate_commit(&store, &bare).is_err());
-    let plain = Transition::ConversationFork {
+    let plain = Transition::SessionFork {
         identity: Identity {
             id: "plain".into(),
             kind: IdentityKind::Fork {
@@ -326,7 +326,7 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
         &sig
     )
     .unwrap_err()
-    .contains("not a conversation commit"));
+    .contains("not a session commit"));
     let title = Transition::TitleSet {
         title: "Renamed".into(),
     };
@@ -340,5 +340,5 @@ fn a_root_parents_its_content_commit_and_a_fork_merges_a_newer_one_in() {
         &sig
     )
     .unwrap_err()
-    .contains("only a conversation fork"));
+    .contains("only a session fork"));
 }

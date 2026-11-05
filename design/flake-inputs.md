@@ -219,7 +219,7 @@ mirror, or ssh-vs-https key identical content differently. That is still true,
 and the server resolves at the same point in the same walk — `caos_eval`'s
 `EvalHost::eval_remote`, called while the args tree is being assembled.
 
-**What broke it:** the agent. A conversation's tree is evaluated SERVER-SIDE
+**What broke it:** the agent. A session's tree is evaluated SERVER-SIDE
 (`eval-path-then`, the `eval` continuation), and a session now starts from a
 commit in a client repo — a handful of text files that pin caos and mount its
 `std/` (`integrations/claude-code/cloud/README.md`). There is no source tree on
@@ -229,7 +229,7 @@ it has nowhere to go. Measured, before: `eval_path ./caos-std` died with
 resolved by the CLIENT`, and `run_tool`/`tool_help` only worked because
 `caos mcp serve` pre-resolved their paths against the session's own checkout and
 shipped the answer as `--client-tool-root`/`-path`/`-tree`. That handoff was a
-second resolver, reading a different tree from the one the conversation records,
+second resolver, reading a different tree from the one the session records,
 and the two could disagree about which version of a tool runs.
 
 **What it is now.** `server::locator` turns a pin into a tree three ways, in

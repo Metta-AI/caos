@@ -105,4 +105,4 @@ the agent must remove them or adjust the rules before publication.
 Merge conflicts currently create a tracked .caos/conflicts ledger inside a
 source tree, including conflicts without inline markers. llm-step must resolve
 and clear it before publishing. The generic endpoint does not scan for that
-ledger, inline markers, or conversation ancestry.
+ledger, inline markers, or session ancestry.

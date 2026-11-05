@@ -229,7 +229,7 @@ This takes three steps:
    message=Test the feature
    ```
 
-   `onto` and each `commit` are a conversation path to a gitlink or a full
+   `onto` and each `commit` are a session path to a gitlink or a full
    commit hash. Each `layer=` starts a block that becomes `<into>/<layer>`; its
    `message=` lines, in order, are its commit message.
 

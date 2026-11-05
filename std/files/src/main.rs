@@ -1,4 +1,4 @@
-//! The file tools of a conversation tree: `read`, `ls`, `write`, `edit`, `copy`,
+//! The file tools of a session tree: `read`, `ls`, `write`, `edit`, `copy`,
 //! `move` and `remove`.
 //!
 //! They were built into `llm-step`, which registered them with the model and ran
@@ -194,11 +194,11 @@ fn components(name: &str) -> Result<Vec<String>, Fail> {
 }
 
 /// `.caos` at the root is protocol metadata: a model changes it through the
-/// conversation's own commands, not by writing files.
+/// session's own commands, not by writing files.
 fn reject_protocol(comps: &[String]) -> Result<(), Fail> {
     if comps.first().is_some_and(|c| c == ".caos") {
         return Err(User(
-            ".caos is protocol metadata; use conversation commands to change it".to_string(),
+            ".caos is protocol metadata; use session commands to change it".to_string(),
         ));
     }
     Ok(())

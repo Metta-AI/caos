@@ -528,7 +528,7 @@ In outline:
 4. Watch it: `drive info` and `drive conv` for the session; `status` and `logs`
    for the stack.
 5. Collect results with `harvest`, then read them with `log`, `show` and
-   `read` from the outer conversation.
+   `read` from the outer session.
 6. Clean up: `drive archive`, `drive env-delete`, then `stop`.
 
 The session's caos tools resolve against the inner stack, which is built from the
@@ -540,7 +540,7 @@ existing dev mode, `refs/caos/dev` and `--dev-commit`) is future work.
 
 ## Results: harvest
 
-The cloud session records its conversation into the inner stack's git, and that
+The cloud session records its session into the inner stack's git, and that
 dies with the container. `harvest` copies it out.
 
 - The daemon script, running with the outer `/bin/caos`, reads the inner stack's

@@ -12,7 +12,7 @@ use super::records::{
 use super::tree::{Mode, ObjectStore, Snapshot, TreeEntry};
 
 /// Latest records, reconstructed newest-first once for this immutable commit.
-/// The context flag distinguishes this conversation's execution from inherited
+/// The context flag distinguishes this session's execution from inherited
 /// results that remain readable in a fork's transcript.
 #[derive(Default)]
 struct Execution {
@@ -25,7 +25,7 @@ struct Execution {
     fork_source: Option<Oid>,
 }
 
-pub struct Conversation<'s> {
+pub struct Session<'s> {
     store: &'s dyn ObjectStore,
     execution: OnceCell<Execution>,
     commit: Option<Oid>,
@@ -35,15 +35,15 @@ pub struct Conversation<'s> {
     snapshot: Snapshot<'s>,
 }
 
-impl<'s> Conversation<'s> {
-    pub fn open(store: &'s dyn ObjectStore, commit: &Oid) -> Result<Conversation<'s>, String> {
+impl<'s> Session<'s> {
+    pub fn open(store: &'s dyn ObjectStore, commit: &Oid) -> Result<Session<'s>, String> {
         let info = store.read_commit(commit).map_err(String::from)?;
-        // The FIRST parent is the conversation's spine; a fork that merged a
+        // The FIRST parent is the session's spine; a fork that merged a
         // content commit in carries that commit as a second parent.
         if info.parents.is_empty() {
-            return Err(format!("conversation commit {commit} must have a parent"));
+            return Err(format!("session commit {commit} must have a parent"));
         }
-        let mut conversation = Conversation {
+        let mut session = Session {
             store,
             execution: OnceCell::new(),
             commit: Some(commit.clone()),
@@ -52,15 +52,15 @@ impl<'s> Conversation<'s> {
             tree: info.tree.clone(),
             snapshot: Snapshot::new(store, info.tree),
         };
-        // The format before the kind: a conversation of an older format names
+        // The format before the kind: a session of an older format names
         // kinds this build no longer has, and its format says why.
-        conversation.require_format()?;
-        conversation.kind = Some(Kind::parse_message(&info.message)?);
-        Ok(conversation)
+        session.require_format()?;
+        session.kind = Some(Kind::parse_message(&info.message)?);
+        Ok(session)
     }
 
-    pub fn open_tree(store: &'s dyn ObjectStore, tree: &Oid) -> Result<Conversation<'s>, String> {
-        let conversation = Conversation {
+    pub fn open_tree(store: &'s dyn ObjectStore, tree: &Oid) -> Result<Session<'s>, String> {
+        let session = Session {
             store,
             execution: OnceCell::new(),
             commit: None,
@@ -69,8 +69,8 @@ impl<'s> Conversation<'s> {
             tree: tree.clone(),
             snapshot: Snapshot::new(store, tree.clone()),
         };
-        conversation.require_format()?;
-        Ok(conversation)
+        session.require_format()?;
+        Ok(session)
     }
 
     pub(crate) fn current_events(&self) -> Result<Vec<Event>, String> {
@@ -117,7 +117,7 @@ impl<'s> Conversation<'s> {
     }
 
     pub fn source_tree_names(&self) -> Result<Vec<String>, String> {
-        fn walk(view: &Conversation<'_>, dir: &str, names: &mut Vec<String>) -> Result<(), String> {
+        fn walk(view: &Session<'_>, dir: &str, names: &mut Vec<String>) -> Result<(), String> {
             for entry in view.snapshot.list(dir)? {
                 if dir.is_empty() && entry.name == ".caos" {
                     continue;
@@ -152,7 +152,7 @@ impl<'s> Conversation<'s> {
         Ok(Some(SourceTreeRecord { commit: entry.oid }))
     }
 
-    /// The first value at this path in the current conversation context.
+    /// The first value at this path in the current session context.
     /// Read it from history only when a comparison or harvest needs a base.
     pub fn reference_start(&self, name: &str) -> Result<Oid, String> {
         paths::validate_source_tree_name(name)?;
@@ -172,7 +172,7 @@ impl<'s> Conversation<'s> {
             }
             if matches!(
                 Kind::parse_message(&info.message)?,
-                Kind::ConversationRoot | Kind::ConversationFork
+                Kind::SessionRoot | Kind::SessionFork
             ) {
                 break;
             }
@@ -251,12 +251,12 @@ impl<'s> Conversation<'s> {
                         _ => {}
                     }
                 }
-                if kind == Kind::ConversationFork && in_context {
+                if kind == Kind::SessionFork && in_context {
                     result.fork_source =
                         Some(info.parents.first().ok_or("fork has no source")?.clone());
                     in_context = false;
                 }
-                if kind == Kind::ConversationRoot {
+                if kind == Kind::SessionRoot {
                     break;
                 }
                 current = info.parents.first().cloned();
@@ -266,8 +266,8 @@ impl<'s> Conversation<'s> {
         Ok(self.execution.get().expect("loaded"))
     }
 
-    /// The record of the call with this id, in this conversation or inherited by
-    /// a fork. A call id is unique within a conversation.
+    /// The record of the call with this id, in this session or inherited by
+    /// a fork. A call id is unique within a session.
     pub fn tool(&self, id: &str) -> Result<Option<CallRecord>, String> {
         Ok(self.execution()?.tools.get(id).cloned())
     }
@@ -398,7 +398,7 @@ impl<'s> Conversation<'s> {
             .chain(
                 self.children()?
                     .into_iter()
-                    .map(super::TaskRecord::Conversation),
+                    .map(super::TaskRecord::Session),
             )
             .collect())
     }
@@ -411,7 +411,7 @@ impl<'s> Conversation<'s> {
             .children()?
             .into_iter()
             .find(|child| &child.relay == computation)
-            .map(super::TaskRecord::Conversation))
+            .map(super::TaskRecord::Session))
     }
 
     pub fn publication(&self, id: &str) -> Result<Option<PublicationRecord>, String> {

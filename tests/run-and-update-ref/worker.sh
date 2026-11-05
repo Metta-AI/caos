@@ -98,10 +98,10 @@ esac
 
 case "$stage" in
 start)
-  echo "== initialize v3 conversation roots ==" >&2
+  echo "== initialize v3 session roots ==" >&2
   mkdir -p /tmp/ws
   printf 'source tree survives\n' > /tmp/ws/source_tree.txt
-  caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the conversation source_tree"
+  caos put /tmp/ws /cas/ws >/dev/null || fail "publishing the session source_tree"
   ws_tree=$(caos hash /cas/ws)
   { printf 'tree %s\n' "$ws_tree"
     printf 'author caos <test@caos> %s +0000\n' "$TS"
@@ -124,9 +124,9 @@ start)
     --source-tree "main=$source_tree")
   failure_root=${failure_root#head }
   $TOOL create --repo /tmp/repo --ref "$success_ref" --user tester \
-    --id "$success_id" --new "$success_root" >/dev/null || fail "creating success conversation"
+    --id "$success_id" --new "$success_root" >/dev/null || fail "creating success session"
   $TOOL create --repo /tmp/repo --ref "$failure_ref" --user tester \
-    --id "$failure_id" --new "$failure_root" >/dev/null || fail "creating failure conversation"
+    --id "$failure_id" --new "$failure_root" >/dev/null || fail "creating failure session"
 
   success_task=$(caos prepare-request --base:hash="$UPDATER" \
     --subreq="$success_request" --target-ref="$success_ref") \

@@ -10,7 +10,7 @@ verified objects enter the shared object store.
 The JSON body is `{"source": "<https-url>", "commit": "<full-40-character-hash>"}`.
 An optional `X-Caos-Git-Token` header carries credentials. The caller resolves
 branch names and pins the chosen commit H before requesting an import.
-Conversation attachment and provenance also belong to the caller.
+Session attachment and provenance also belong to the caller.
 
 The server:
 

@@ -5,9 +5,9 @@ caos get /cas/args/common
 # shellcheck disable=SC1090
 source /cas/args/common
 
-stage "an import run by path, in an empty conversation"
+stage "an import run by path, in an empty session"
 llm_test_setup
-# The turn helper fetches its configuration before publishing the conversation; git
+# The turn helper fetches its configuration before publishing the session; git
 # refuses that when every server ref is hidden, so advertise one private fixture ref.
 fixture_ref="refs/heads/llm-import-path-fixture-$(date +%s%N)-$$"
 fixture=$(git -c user.name=test -c user.email=test@example.invalid commit-tree "$(git mktree </dev/null)" -m fixture)
@@ -29,7 +29,7 @@ cat > /tmp/stub/response-3.json <<'JSON'
 JSON
 printf '%s\n' '{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}' > /tmp/stub/response-4.json
 start_stub /tmp/stub
-new_llm_conversation llm-import-path "$STUB_PORT" - "Import the requested code and report errors."
+new_llm_session llm-import-path "$STUB_PORT" - "Import the requested code and report errors."
 dispatch_turn "Import the public Hello-World repository by path. ($SALT)"
 wait_turn 600
 
@@ -44,7 +44,7 @@ jq -e --arg commit "$imported" '.commit == $commit and .repository == "https://g
 # `tool_help` describes the entry: its parameters are the model's whole documentation.
 jq -r '.messages[].content | select(type == "array") | .[] | select(.type == "tool_result" and .tool_use_id == "help") | .content | if type == "array" then .[0].text else . end' /tmp/stub/request-3.json > /tmp/help.text
 grep -q "into" /tmp/help.text || fail "tool_help did not describe the entry: $(cat /tmp/help.text)"
-grep -q "Unused conversation path" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
+grep -q "Unused session path" /tmp/help.text || fail "tool_help lost the parameter docs: $(cat /tmp/help.text)"
 grep -qF 'Hello World!' /tmp/stub/request-4.json || fail "the read could not see the imported blob"
 
 # Mistakes are values the model can act on: a taken path, and an argument the operation

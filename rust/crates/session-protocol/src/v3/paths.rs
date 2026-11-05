@@ -18,9 +18,9 @@ pub const MAX_JSON_INT: u64 = 9_007_199_254_740_991;
 pub fn validate_format(bytes: &[u8]) -> Result<(), String> {
     match bytes {
         bytes if bytes == FORMAT_BYTES.as_bytes() => Ok(()),
-        b"caos-conversation-v5\n" => Err("unsupported conversation format v5 (turn records); this build reads v6, a flat transcript. Open it with an earlier v5 build".into()),
-        b"caos-conversation-v4\n" => Err("unsupported conversation format v4; this build reads v6. Open it with the earlier v4 build".into()),
-        _ => Err("conversation format is invalid".into()),
+        b"caos-conversation-v5\n" => Err("unsupported session format v5 (turn records); this build reads v6, a flat transcript. Open it with an earlier v5 build".into()),
+        b"caos-conversation-v4\n" => Err("unsupported session format v4; this build reads v6. Open it with the earlier v4 build".into()),
+        _ => Err("session format is invalid".into()),
     }
 }
 
@@ -105,7 +105,7 @@ pub fn transcript_payload_dir(ordinal: u64, message_id: &str) -> String {
 }
 
 /// Where a call's payloads live: under its id alone, which is unique within a
-/// conversation (a model's `tool_use` id, or the harness's).
+/// session (a model's `tool_use` id, or the harness's).
 pub fn call_payload_dir(tool_id: &str) -> String {
     format!("{CALLS_DIR}/{}", admit_external_id(tool_id))
 }
