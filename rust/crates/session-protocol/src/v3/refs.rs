@@ -120,10 +120,31 @@ fn membership_ref(user: &str, membership: Membership, id: &str) -> Result<String
         Membership::Archived => "archived",
     };
     Ok(format!(
-        "{USERS_PREFIX}{}/conversations/{kind}/{}",
+        "{USERS_PREFIX}{}{USER_SESSIONS}{kind}/{}",
         key_of(user),
         key_of(id)
     ))
+}
+
+/// The pre-rename name of a v4 head or membership ref, which a reader falls
+/// back to when the v4 ref does not exist: `refs/caos/v4/sessions/<k>/head` ->
+/// `refs/caos/v3/conversations/<k>/head`, and
+/// `refs/caos/v4/users/<u>/sessions/<m>/<k>` ->
+/// `refs/caos/v3/users/<u>/conversations/<m>/<k>`. `None` for any other name.
+pub fn legacy_ref(refname: &str) -> Option<String> {
+    if let Some(rest) = refname.strip_prefix(SESSIONS_PREFIX) {
+        return Some(format!("{LEGACY_SESSIONS_PREFIX}{rest}"));
+    }
+    let (user_key, rest) = refname.strip_prefix(USERS_PREFIX)?.split_once(USER_SESSIONS)?;
+    Some(format!("{LEGACY_USERS_PREFIX}{user_key}{LEGACY_USER_SESSIONS}{rest}"))
+}
+
+/// The refs a session's head may be under, newest naming first: where to look
+/// when reading it directly rather than through a store that falls back.
+pub fn head_refs(id: &str) -> Result<[String; 2], String> {
+    let current = head_ref(id)?;
+    let legacy = legacy_ref(&current).expect("a head ref has a legacy name");
+    Ok([current, legacy])
 }
 
 #[cfg(test)]
