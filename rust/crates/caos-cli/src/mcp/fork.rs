@@ -101,6 +101,20 @@ mod tests {
         );
     }
 
+    /// A command installed before the rename still forks.
+    #[test]
+    fn the_pre_rename_command_and_marker_still_fork() {
+        let want = Some(commit(Some(HASH)).unwrap());
+        assert_eq!(
+            parse_command(&format!("/fork-caos-conversation {HASH}")).unwrap(),
+            want
+        );
+        assert_eq!(
+            parse_command(&format!("text\ncaos-conversation-command: fork {HASH}")).unwrap(),
+            want
+        );
+    }
+
     #[test]
     fn other_prompts_and_builtin_commands_are_not_ours() {
         assert_eq!(parse_command("fix the bug").unwrap(), None);
