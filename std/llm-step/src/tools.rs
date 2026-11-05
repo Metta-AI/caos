@@ -527,6 +527,16 @@ pub struct Help {
     /// random value because it is just as unique and it is in the transcript.
     /// Replaces `@call`.
     pub request_id: bool,
+    /// `@root`: the tool takes a REQUIRED `root` parameter, a path relative to
+    /// the session root, and is given the object there as `/cas/args/root` (a
+    /// blob, a tree or a gitlink's commit; absent when nothing is there) and
+    /// nothing else. Where the tool sits never decides what it runs over. Its
+    /// result is `{stdout, failed?}`, and a writer's adds `root` or `deleted`,
+    /// and `commit-message`; the harness puts a writer's new object back and
+    /// rewrites everything above it (design/tool-contract.md, "`root`").
+    /// Replaces `@in`, `@git` and `@scope`, which a `@root` tool may not also
+    /// declare.
+    pub root: bool,
     /// `@scope <param>`: the tool runs over, and a writer changes, the SOURCE
     /// TREE the argument `<param>` names (the path of a code reference in the
     /// session, such as `feature/01-change`).
