@@ -102,11 +102,13 @@ write)
 failed)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "7" ] || fail "exit code not surfaced: $(cat "$R/exit")"
-  grep -q "oops" "$R/stderr" || fail "stderr not captured"
-  # `failed` PRESENT is what makes the call an error tool_result. A marker, not
-  # a banner in `out`: command output says FAILED in passing all the time.
-  [ -e "$R/failed" ] || fail "a non-zero exit left no failed marker"
-  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "failed run mangled the tree"
+  grep -q "oops" "$R/command-stderr" || fail "stderr not captured"
+  # NO `failed` for a non-zero exit: under the root contract `failed` means
+  # nothing is applied, and a command's writes are kept whatever it exits with.
+  # The exit code leads `stdout`.
+  [ ! -e "$R/failed" ] || fail "a non-zero exit was marked failed, so its writes would be dropped"
+  grep -q '^exit: 7' "$R/stdout" || fail "stdout does not lead with exit 7: $(cat "$R/stdout")"
+  [ "$(caos hash "$R/root")" = "$(ws_oid)" ] || fail "failed run mangled the tree"
   echo "  ok: exit 7 + stderr returned as a value" >&2
 
   echo "== the executable bit round-trips (declared, loaded copy) ==" >&2
