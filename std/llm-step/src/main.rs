@@ -2275,10 +2275,8 @@ fn close_unfinished<S: progress::RefStore>(
             None,
         );
         let expected = state.head().clone();
-        if let progress::TryAppend::Appended(_) = state.try_append_at(
-            &expected,
-            tool_complete_transition(record, &block, Vec::new())?,
-        )? {
+        let transition = tool_complete_transition(record, &block, Vec::new())?;
+        if let progress::TryAppend::Appended(_) = state.try_append_at(&expected, transition)? {
             return Ok(());
         }
     }
