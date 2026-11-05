@@ -83,6 +83,8 @@ func stack(base string, layers []layer, files map[string]string) {
 func files(hash string) map[string]string {
 	const repo = "/tmp/check"
 	if _, err := os.Stat(repo); err != nil {
+		// `git -C` needs the directory to exist, even for `init`.
+		w.Must(os.MkdirAll(repo, 0o755))
 		for _, args := range [][]string{{"init", "-q"}, {"remote", "add", "origin", os.Getenv("CAOS_SERVER_URL")}} {
 			w.Must(exec.Command("git", append([]string{"-C", repo}, args...)...).Run())
 		}
