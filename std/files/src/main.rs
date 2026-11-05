@@ -363,9 +363,7 @@ fn write(root: Option<&str>) -> Result<Written, Fail> {
     Ok((New::Content(content.into_bytes()), out))
 }
 
-fn edit(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
+fn edit(root: Option<&str>) -> Result<Written, Fail> {
     let old = input("old-string")?
         .filter(|s| !s.is_empty())
         .ok_or_else(|| User("edit needs a non-empty `old-string`".to_string()))?;
