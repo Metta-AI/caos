@@ -3516,7 +3516,7 @@ mod ticket_state_tests {
     #[test]
     fn a_finished_ticket_is_answered_without_looking_further() {
         let state = settle_ticket_state("ok tree abc".into(), live_sequence(&[]), no_reread);
-        assert_eq!(state.unwrap(), "ok tree abc");
+        assert_eq!(answer(state), "ok tree abc");
     }
 
     #[test]
