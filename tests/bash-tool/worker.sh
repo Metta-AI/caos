@@ -59,10 +59,10 @@ start)
 read)
   R=/cas/args/result; caos get -r "$R" || fail "reading the result"
   [ "$(cat "$R/exit")" = "0" ] || fail "read: exit $(cat "$R/exit")"
-  [ "$(cat "$R/stdout")" = "one" ] || fail "read: stdout $(cat "$R/stdout")"
+  [ "$(cat "$R/command-stdout")" = "one" ] || fail "read: command-stdout $(cat "$R/command-stdout")"
   [ ! -e "$R/failed" ] || fail "a clean run left a failed marker"
-  [ -s "$R/out" ] || fail "the result carries no rendered out"
-  [ "$(caos hash "$R/prop")" = "$(ws_oid)" ] || fail "read-only run changed the tree"
+  grep -q '^exit: 0' "$R/stdout" || fail "stdout does not lead with the exit code: $(cat "$R/stdout")"
+  [ "$(caos hash "$R/root")" = "$(ws_oid)" ] || fail "read-only run changed the tree"
   echo "  ok: read its file; tree unchanged (identical hash)" >&2
 
   echo "== undeclared touch: EACCES + structured retry hint ==" >&2
