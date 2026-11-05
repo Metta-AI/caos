@@ -35,8 +35,8 @@ previous run wrote there. Refused, naming both, unless each layer's commit
 contains the one before it (or onto): merge a changed lower layer up first.
 
 Then publish_source each <into>/<layer>, bottom to top, with force=true.
-@param plan Session path of the plan file, e.g. `mystack.plan`.
+@param plan Path of the plan file, relative to root, e.g. `mystack.plan`.
 @writer
-@in
+@root
 END
 curry --base:@=DEEP-DEPS/go --worker1:@=worker.go --help=$HELP
