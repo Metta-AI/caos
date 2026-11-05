@@ -50,20 +50,18 @@ use Fail::{Infra, User};
 
 fn run() -> Result<(), String> {
     let op = read_arg("op")?;
-    let ws = arg("in");
-    if !Path::new(&ws).exists() {
-        return Err(format!(
-            "no input tree at {ws}: {op} runs over the tree bound as `in`"
-        ));
-    }
+    let bound = arg("root");
+    // Absent when nothing is at the root path: what `write` creates.
+    let root = fs::symlink_metadata(&bound).is_ok().then_some(bound);
+    let root = root.as_deref();
     match op.as_str() {
-        "read" => reader(read(&ws)),
-        "ls" => reader(ls(&ws)),
-        "write" => writer(&ws, "write", write(&ws)),
-        "edit" => writer(&ws, "edit", edit(&ws)),
-        "copy" => writer(&ws, "copy", copy(&ws)),
-        "move" => writer(&ws, "move", move_entry(&ws)),
-        "remove" => writer(&ws, "remove", remove(&ws)),
+        "read" => reader(read(root)),
+        "ls" => reader(ls(root)),
+        "write" => writer("write", write(root)),
+        "edit" => writer("edit", edit(root)),
+        "copy" => writer("copy", copy(root)),
+        "move" => writer("move", move_entry(root)),
+        "remove" => writer("remove", remove(root)),
         other => Err(format!("unknown file tool {other:?}")),
     }
 }
