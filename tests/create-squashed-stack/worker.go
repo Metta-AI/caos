@@ -246,16 +246,15 @@ func check(i int) {
 	}
 	const r = "/cas/args/result"
 	caos("get", r)
-	for _, part := range []string{"prop", "out"} {
-		_, err := os.Lstat(filepath.Join(r, part))
-		w.True(err == nil, "case %s: the result has no %s", c.name, part)
-	}
-	out := read(filepath.Join(r, "out"))
+	_, err := os.Lstat(filepath.Join(r, "stdout"))
+	w.True(err == nil, "case %s: the result has no stdout", c.name)
+	out := read(filepath.Join(r, "stdout"))
 	_, failedErr := os.Lstat(filepath.Join(r, "failed"))
 	failed := failedErr == nil
-	prop := caos("hash", filepath.Join(r, "prop"))
+	_, rootErr := os.Lstat(filepath.Join(r, "root"))
 	if c.into != "" {
-		w.True(!failed, "case %s was refused: %s", c.name, out)
+		w.True(!failed && rootErr == nil, "case %s was refused: %s", c.name, out)
+		prop := caos("hash", filepath.Join(r, "root"))
 		session("/tmp/expect", c.into+"=squashed")
 		caos("put", "/tmp/expect", "/cas/expect")
 		w.True(prop == caos("hash", "/cas/expect"),
