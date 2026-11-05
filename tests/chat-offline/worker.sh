@@ -225,7 +225,7 @@ last_kind=""
 while read -r _spine_commit spine_kind; do
   last_kind=$spine_kind
 done < talk.parents
-[ "$last_kind" = conversation.root ] || fail "session spine did not end at its root"
+[ "$last_kind" = session.root ] || fail "session spine did not end at its root"
 [ "$(git rev-list --first-parent "$tip" | tail -1)" = a2519b3360c5b1ded9a8cb7e5869d32901eae743 ] \
   || fail "session spine did not end at G3"
 

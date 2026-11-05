@@ -148,7 +148,7 @@ git merge-base --is-ancestor "$initial_head" "$child_tip" \
   || fail "child ref does not descend from its recorded initial head"
 initial_kinds=$($TOOL parents --repo /tmp/repo --head "$initial_head" --validate \
   | while read -r _ kind; do printf '%s\n' "$kind"; done | paste -sd,)
-[ "$initial_kinds" = message.append,conversation.root ] \
+[ "$initial_kinds" = message.append,session.root ] \
   || fail "child initial chain is not prompt -> root: $initial_kinds"
 record "$initial_head" .caos/identity.json > /tmp/child-identity.json
 [ "$(jq -r '.id' /tmp/child-identity.json)" = "$child" ] \

@@ -274,7 +274,7 @@ assert_spine() {
     [ -n "$kind" ] || fail "spine commit $oid has no registered kind"
     last=$kind
   done <<<"$parents"
-  [ "$last" = conversation.root ] || fail "the session spine did not end at its root"
+  [ "$last" = session.root ] || fail "the session spine did not end at its root"
 }
 
 transcript_text() {

@@ -72,8 +72,8 @@ esac
 git grep -q "first prompt of the original" "$head_f" -- .caos/transcript \
   || fail "the fork lost the original's transcript"
 case "$(subjects "$head_f")" in
-  *"conversation.fork "*) ;;
-  *) fail "no conversation.fork on the fork's branch: $(subjects "$head_f")" ;;
+  *"session.fork "*) ;;
+  *) fail "no session.fork on the fork's branch: $(subjects "$head_f")" ;;
 esac
 # A second prompt is an ordinary one: the Claude Code session already has its caos session.
 prompt "$f" "/fork-caos-session $head_a" >/dev/null
@@ -97,7 +97,7 @@ head_g=$(head_of "cc/$g")
 # No settle: the fork lands straight on the open head, whose newest commit is
 # b's own prompt. (It used to settle an open request before forking.)
 case "$(subjects "$head_g")" in
-  "message.append conversation.fork message.append "*) ;;
+  "message.append session.fork message.append "*) ;;
   *) fail "the fork did not land directly on the open head: $(subjects "$head_g")" ;;
 esac
 [ "$(head_of "cc/$b")" = "$head_b" ] || fail "forking an open head moved the original"
@@ -126,8 +126,8 @@ esac
 head_p=$(head_of "cc/$p")
 [ -n "$head_p" ] || fail "the fork of the G3-rooted session has no session of its own"
 fork_p=$(git log --first-parent --format='%H %s' "$head_p" \
-  | awk '$2 == "conversation.fork" && !found { print $1; found = 1 }')
-[ -n "$fork_p" ] || fail "no conversation.fork on the fork's branch: $(subjects "$head_p")"
+  | awk '$2 == "session.fork" && !found { print $1; found = 1 }')
+[ -n "$fork_p" ] || fail "no session.fork on the fork's branch: $(subjects "$head_p")"
 [ "$(git rev-parse "$fork_p^1")" = "$head_o" ] || fail "the fork's first parent is not its source"
 [ "$(git rev-parse -q --verify "$fork_p^2")" = "$content" ] \
   || fail "the fork's second parent is not the content commit $content"

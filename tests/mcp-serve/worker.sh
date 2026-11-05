@@ -324,7 +324,7 @@ sync_held
 # Stop (which came while the call ran), the call's start, and its declaration.
 subjects=$(git log --format=%s "$held_ref" | tr '\n' ' ')
 case "$subjects" in
-  "message.append message.append tool.complete message.append tool.start message.append message.append conversation.root "*) ;;
+  "message.append message.append tool.complete message.append tool.start message.append message.append session.root "*) ;;
   *) fail "the backgrounded call was not recorded as it happened: $subjects" ;;
 esac
 
