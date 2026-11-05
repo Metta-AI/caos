@@ -610,12 +610,7 @@ fn session_head(config: &Config, session: &str) -> Result<Option<String>, String
 /// `path` in the session's head tree, evaluated the way the session
 /// evaluates it: from the root of whichever tree along the path the walk
 /// started at, a source tree's gitlink included.
-fn match_session(
-    config: &Config,
-    head: &str,
-    path: &str,
-    origin: &Origin,
-) -> Result<bool, String> {
+fn match_session(config: &Config, head: &str, path: &str, origin: &Origin) -> Result<bool, String> {
     let parts: Vec<&str> = components(path).collect();
     let rest: Vec<&str> = components(&origin.path).collect();
     if rest.len() > parts.len() || parts[parts.len() - rest.len()..] != rest[..] {
