@@ -443,7 +443,12 @@ impl<'s> Session<'s> {
     }
 
     fn require_format(&self) -> Result<(), String> {
-        paths::validate_format(&self.required_blob(paths::FORMAT)?)
+        self.format().map(|_| ())
+    }
+
+    /// v7, or v6 for a session recorded before the rename.
+    pub fn format(&self) -> Result<paths::Format, String> {
+        paths::parse_format(&self.required_blob(paths::FORMAT)?)
     }
 
     fn optional_blob(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
