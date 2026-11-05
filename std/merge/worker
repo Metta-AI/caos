@@ -7,8 +7,9 @@
 #
 # The merge worker (SPEC "Merging and conflict resolution"). The caos runner
 # execs us as /worker with the args materialized under /cas/args:
-#   wc     (:commit=)  the source tree commit to merge into (the current side), bound
-#                      by the launch because the tool declares `@scope source-tree`
+#   root   (:commit=)  the source tree commit to merge into (the current side):
+#                      the tool declares `@root`, and the root is a source tree
+#                      (design/tool-contract.md)
 #   theirs (:commit=)  the commit to merge in
 #   merge-base (:commit=)  optional: the merge base to use instead of the one
 #                      git finds, e.g. the old tip of the layer below when
