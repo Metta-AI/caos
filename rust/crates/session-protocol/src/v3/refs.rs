@@ -154,8 +154,28 @@ mod tests {
     #[test]
     fn head_refs_round_trip() {
         let refname = head_ref("talk-1").unwrap();
-        assert_eq!(refname, "refs/caos/v3/conversations/74616c6b2d31/head");
+        assert_eq!(refname, "refs/caos/v4/sessions/74616c6b2d31/head");
         assert_eq!(parse_head_ref(&refname).unwrap(), "talk-1");
+    }
+
+    #[test]
+    fn legacy_refs_name_the_same_session() {
+        let head = head_ref("talk-1").unwrap();
+        let legacy = legacy_ref(&head).unwrap();
+        assert_eq!(legacy, "refs/caos/v3/conversations/74616c6b2d31/head");
+        assert_eq!(parse_head_ref(&legacy).unwrap(), "talk-1");
+        assert_eq!(head_refs("talk-1").unwrap(), [head, legacy]);
+
+        let active = active_membership_ref("user@example", "talk-1").unwrap();
+        let legacy = legacy_ref(&active).unwrap();
+        assert_eq!(
+            legacy,
+            "refs/caos/v3/users/75736572406578616d706c65/conversations/active/74616c6b2d31"
+        );
+        assert_eq!(parse_membership_ref(&legacy), parse_membership_ref(&active));
+
+        assert_eq!(legacy_ref("refs/heads/main"), None);
+        assert_eq!(legacy_ref(&legacy), None);
     }
 
     #[test]
