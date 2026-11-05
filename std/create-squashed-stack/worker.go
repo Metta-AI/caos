@@ -463,8 +463,8 @@ func main() {
 		report.WriteString("Next: publish_source each, bottom to top, with force=true.\n")
 		run("caos", "put", squashed, "/cas/squashed")
 
-		rebuild(in, "/tmp/squash-prop", strings.Split(into, "/"), "/cas/squashed")
-		run("caos", "put", "/tmp/squash-prop", "/cas/prop")
-		finish("/cas/prop", report.String(), "create-squashed-stack: "+into+"\n", false)
+		rebuild(in, "/tmp/squash-root", strings.Split(into, "/"), "/cas/squashed")
+		run("caos", "put", "/tmp/squash-root", "/cas/new-root")
+		finish("/cas/new-root", report.String(), "create-squashed-stack: "+into+"\n", false)
 	})
 }
