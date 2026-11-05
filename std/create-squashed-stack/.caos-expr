@@ -22,7 +22,8 @@ The plan is one key=value per line:
   message=Test the feature
 
 onto and into come once, before the first layer=. onto and each commit are a
-session path to a gitlink or a full commit hash. Each layer= starts a block
+path to a gitlink, relative to root, or a full commit hash; into is a path
+relative to root. Each layer= starts a block
 that becomes <into>/<layer>, with one commit= and its message= lines, which in
 order are that layer's commit message.
 
