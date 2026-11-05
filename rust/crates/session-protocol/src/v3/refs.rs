@@ -11,7 +11,6 @@ pub const LEGACY_SESSIONS_PREFIX: &str = "refs/caos/v3/conversations/";
 pub const LEGACY_USERS_PREFIX: &str = "refs/caos/v3/users/";
 const LEGACY_USER_SESSIONS: &str = "/conversations/";
 pub const HEAD_SUFFIX: &str = "/head";
-pub const HEAD_SUFFIX: &str = "/head";
 pub const MAX_SESSION_ID_BYTES: usize = 124;
 pub const MAX_USER_ID_BYTES: usize = 126;
 
