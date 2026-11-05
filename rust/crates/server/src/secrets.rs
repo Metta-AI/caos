@@ -590,8 +590,13 @@ fn components(path: &str) -> impl Iterator<Item = &str> {
 /// The tree of the session's head commit, or `None` with no head yet.
 fn session_head(config: &Config, session: &str) -> Result<Option<String>, String> {
     let repo = config.repo.to_thread_local();
-    let refname = session_protocol::v3::refs::head_ref(session)?;
-    let Ok(mut reference) = repo.find_reference(refname.as_str()) else {
+    // Under its v4 name, or for a session recorded before the rename, v3.
+    let names = session_protocol::v3::refs::head_refs(session)?;
+    let Some((refname, mut reference)) = names.iter().find_map(|refname| {
+        repo.find_reference(refname.as_str())
+            .ok()
+            .map(|reference| (refname, reference))
+    }) else {
         return Ok(None);
     };
     let tree = reference
