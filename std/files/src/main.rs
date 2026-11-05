@@ -223,10 +223,9 @@ fn resolve(ws: &str, comps: &[String]) -> Result<PathBuf, Fail> {
 fn resolve_failure(relative: &str, stderr: &str) -> String {
     if stderr.contains("no such path") {
         format!(
-            "{relative} is not in this tree. Check the path first: `ls` its parent, and note \
-             an import lives where `import_source` put it (e.g. imports/<repo>/<revision>). \
+            "{relative} is not in this tree. Check the path first: `ls` its parent. \
              A mount such as caos-std/ exists only in the EVALUATED tree: evaluate its path \
-             and pass the result as `in`."
+             and pass `<hash>/<path>` as `root`."
         )
     } else {
         let reason = stderr.strip_prefix("caos: ").unwrap_or(stderr);
