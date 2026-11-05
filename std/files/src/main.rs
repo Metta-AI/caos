@@ -55,8 +55,8 @@ fn run() -> Result<(), String> {
     let root = fs::symlink_metadata(&bound).is_ok().then_some(bound);
     let root = root.as_deref();
     match op.as_str() {
-        "read" => reader(read(root)),
-        "ls" => reader(ls(root)),
+        "read" => reader("read", read(root)),
+        "ls" => reader("ls", ls(root)),
         "write" => writer("write", write(root)),
         "edit" => writer("edit", edit(root)),
         "copy" => writer("copy", copy(root)),
