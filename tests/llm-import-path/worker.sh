@@ -22,7 +22,7 @@ jq -n --arg entry "$entry" '{content:[{type:"tool_use",id:"stage",name:"write",
   input:{"file-path":"tools/import-source/.caos-expr",content:("curry --base:hash=" + $entry + "\n")}}],
   stop_reason:"tool_use"}' > /tmp/stub/response-1.json
 cat > /tmp/stub/response-2.json <<'JSON'
-{"content":[{"type":"tool_use","id":"help","name":"tool_help","input":{"path":"tools/import-source"}},{"type":"tool_use","id":"import","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/hello/base"}}}],"stop_reason":"tool_use"}
+{"content":[{"type":"tool_use","id":"help","name":"tool_help","input":{"path":"tools/import-source"}},{"type":"tool_use","id":"import","name":"run_tool","input":{"path":"tools/import-source","arguments":{"root":"imports/hello","source":"https://github.com/octocat/Hello-World.git","into":"base"}}}],"stop_reason":"tool_use"}
 JSON
 cat > /tmp/stub/response-3.json <<'JSON'
 {"content":[{"type":"tool_use","id":"read","name":"read","input":{"file-path":"imports/hello/base/README"}},{"type":"tool_use","id":"occupied","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/hello/base"}}},{"type":"tool_use","id":"stray","name":"run_tool","input":{"path":"tools/import-source","arguments":{"source":"https://github.com/octocat/Hello-World.git","into":"imports/other","branch":"main"}}}],"stop_reason":"tool_use"}
