@@ -26,6 +26,11 @@ Three events, three jobs, matching serve.rs/mod.rs exactly:
 3. post_llm_call -- the Stop job. Same subprocess shape, firing once per
    turn after a *successful* turn.
 
+4. transform_llm_output -- what Claude Code shows from UserPromptSubmit's
+   `systemMessage`: the conversation's ref, on the turn that created or
+   forked it. Hermes has no user-only channel, so it becomes the last line of
+   that turn's reply, which the model also sees in later turns.
+
 Deliberately NOT wired for v1: StopFailure. post_llm_call does not fire on
 an interrupted/errored turn, and Hermes has no exact equivalent hook in the
 current catalog. This is a known gap, not a silent one -- but it is also
@@ -318,6 +323,12 @@ def on_pre_llm_call(
             "prompt": user_message,
         }
     )
+    # The conversation's ref, on the prompt that created or forked it. Claude
+    # Code shows this `systemMessage` to the user; Hermes has no such channel,
+    # so it is appended to the reply (on_transform_llm_output).
+    ref = (answer or {}).get("systemMessage")
+    if ref:
+        _pending_refs[session_id] = ref
     # The conversation's AGENTS.md, on the prompt that created it. Hermes
     # appends it to this turn's user message and replays it on later turns.
     context = ((answer or {}).get("hookSpecificOutput") or {}).get("additionalContext")
@@ -326,11 +337,36 @@ def on_pre_llm_call(
     return None
 
 
+# A ref waiting for the session's next reply, and what was appended to it. The
+# ref waits for a reply with text: transform_llm_output does not fire on an
+# empty one.
+_pending_refs: dict[str, str] = {}
+_appended: dict[str, str] = {}
+
+
+def on_transform_llm_output(
+    response_text: str = "",
+    session_id: str = "",
+    **_kwargs: Any,
+) -> Optional[str]:
+    ref = _pending_refs.pop(session_id, None)
+    if not ref:
+        return None
+    suffix = f"\n\n{ref}"
+    _appended[session_id] = suffix
+    return response_text + suffix
+
+
 def on_post_llm_call(
     session_id: str = "",
     assistant_response: str = "",
     **_kwargs: Any,
 ) -> None:
+    # Hermes hands over the transformed reply; the ref is not the model's words,
+    # so the conversation records the reply without it.
+    suffix = _appended.pop(session_id, "")
+    if suffix and assistant_response.endswith(suffix):
+        assistant_response = assistant_response[: -len(suffix)]
     _run_hook(
         {
             "hook_event_name": "Stop",
@@ -344,4 +380,5 @@ def on_post_llm_call(
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
+    ctx.register_hook("transform_llm_output", on_transform_llm_output)
     ctx.register_hook("post_llm_call", on_post_llm_call)
