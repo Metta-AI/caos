@@ -138,8 +138,8 @@ pub fn tools() -> Vec<Value> {
             "name": "eval-path",
             "description": "Evaluate a path in the caos session and return the hash of \
                             what it produces: the build product of a tree, without having to \
-                            know which tool makes it. caos-std exists only this way. Pass the \
-                            hash as `in` to read, ls or grep to look inside it.",
+                            know which tool makes it. caos-std exists only this way. Pass \
+                            `<hash>[/<path>]` as `root` to read, ls or grep to look inside it.",
             "inputSchema": with_injected(json!({
                 "type": "object",
                 "properties": {
