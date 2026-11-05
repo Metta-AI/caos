@@ -2253,7 +2253,10 @@ something outside caos (a push, an import, a GitHub request), look at the remote
 /// Close a call that a previous step left started, as failed with
 /// [`UNFINISHED`]. Concurrent completion wins: a call that is terminal by the
 /// time this looks again is left alone.
-fn close_unfinished(state: &mut progress::State, started: &CallRecord) -> Result<(), String> {
+fn close_unfinished<S: progress::RefStore>(
+    state: &mut progress::State<S>,
+    started: &CallRecord,
+) -> Result<(), String> {
     let block = error_block(&started.id, UNFINISHED);
     for _ in 0..progress::MAX_APPEND_ATTEMPTS {
         state.reload()?;
