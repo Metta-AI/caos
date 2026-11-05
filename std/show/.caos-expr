@@ -6,7 +6,7 @@ HELP=<<END
 Show one commit of a source tree: its hash, parents, author, full message, and the unified diff it introduced (against its first parent). Optionally scope the diff to a path. `root` is the source tree, such as sources/repo/01-layer.
 @param [rev] The commit to show (default HEAD, the source tree's own commit). A commit hash, or HEAD with ~N or ^ ancestry.
 @param [path] Restrict the shown diff to this source-tree-relative path.
-@in
+@root
 END
 IMAGE=run --base:@=DEEP-DEPS/rustc --src:@=DEEP-DEPS/git-history --dep0:@=DEEP-DEPS/session-protocol --dep1:@=DEEP-DEPS/git-locator --output-runner:@=DEEP-DEPS/git-runner
 curry --base=$IMAGE --op=show --help=$HELP
