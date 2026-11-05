@@ -251,7 +251,7 @@ impl GitStore {
         Ok(matches.pop())
     }
 
-    pub fn fetch_ref(&self, refname: &str) -> Result<Option<Oid>, String> {
+    fn fetch_ref_exact(&self, refname: &str) -> Result<Option<Oid>, String> {
         let remote = self
             .remote
             .as_deref()
