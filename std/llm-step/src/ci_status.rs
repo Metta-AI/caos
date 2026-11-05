@@ -2,7 +2,11 @@
 //! commit statuses, and the verdict `stack-merge-to-master` gates on
 //! (design/stack-publish.md, "ci-status"). `ci-status` is the operation that
 //! prints it for a branch, a layer or a commit; `stack_merge_to_master` reads the same
-//! thing for every pull request head before it merges anything.
+//! thing for every pull request head before it merges anything. Both can wait
+//! for CI to settle (`wait-min`, `wait-for-ci-min`), polling with `wait_until`.
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
 use super::*;
 
 use crate::stack_publish::{github_repo, provenance, read_stack, Github};
@@ -17,6 +21,80 @@ struct Parameters {
     repository: Option<String>,
     #[serde(default, rename = "branch-prefix", alias = "branch_prefix")]
     branch_prefix: Option<String>,
+    #[serde(
+        default,
+        rename = "wait-min",
+        alias = "wait_min",
+        deserialize_with = "minutes_or_string"
+    )]
+    wait_min: u64,
+}
+
+/// How often a wait reads CI again. GitHub has no long poll for checks, so a
+/// wait is a poll; each read is three requests or more, and CI moves in
+/// minutes, so a read every 15 seconds is plenty.
+const POLL: Duration = Duration::from_secs(15);
+
+/// A number of minutes, as a JSON number or as the string a tool's arguments
+/// are; empty or absent is 0, no wait. There is no upper limit.
+pub(super) fn minutes_or_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    let minutes = match <Value as serde::Deserialize>::deserialize(deserializer)? {
+        Value::Null => Some(0),
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) if text.trim().is_empty() => Some(0),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    minutes.ok_or_else(|| D::Error::custom("a wait is a whole number of minutes, such as 20"))
+}
+
+/// Consecutive failed reads a wait rides out: a long wait sees the odd 502.
+const TOLERATED_ERRORS: u32 = 3;
+
+/// Call `settled` until it says yes or `minutes` have passed, sleeping `POLL`
+/// between calls; with 0 minutes it is called once. True if it settled, false
+/// if the time ran out first. An error on the first call stops the wait, and
+/// so does one on a later call once `TOLERATED_ERRORS` have come in a row.
+pub(super) fn wait_until(
+    minutes: u64,
+    mut settled: impl FnMut() -> Result<bool, String>,
+) -> Result<bool, String> {
+    // A wait too long for the clock to represent has no deadline.
+    let deadline = Instant::now().checked_add(Duration::from_secs(minutes.saturating_mul(60)));
+    let mut first = true;
+    let mut errors = 0;
+    loop {
+        match settled() {
+            Ok(true) => return Ok(true),
+            Ok(false) => errors = 0,
+            Err(error) if first || errors >= TOLERATED_ERRORS => return Err(error),
+            Err(_) => errors += 1,
+        }
+        first = false;
+        let now = Instant::now();
+        match deadline {
+            Some(deadline) if now >= deadline => return Ok(false),
+            Some(deadline) => sleep(POLL.min(deadline - now)),
+            None => sleep(POLL),
+        }
+    }
+}
+
+/// Whether a wait on these verdicts is over: as soon as anything fails, since
+/// the verdict can no longer turn to passing, else once nothing is pending.
+pub(super) fn settled(verdicts: impl IntoIterator<Item = Option<Standing>>) -> bool {
+    let mut pending = false;
+    for verdict in verdicts {
+        match verdict {
+            Some(Standing::Failing) => return true,
+            Some(Standing::Pending) => pending = true,
+            _ => {}
+        }
+    }
+    !pending
 }
 
 fn blank(value: Option<String>) -> Option<String> {
@@ -219,12 +297,21 @@ pub(super) fn read(github: &Github, reference: &str) -> Result<Checks, String> {
     Ok(Checks { head, checks })
 }
 
+/// The verdict first, so a failure is the first thing read, then where, then
+/// the checks with the failing ones first and the pending ones next.
 pub(super) fn render(repository: &str, reference: &str, checks: &Checks) -> String {
     let mut text = format!(
-        "repository {repository}  branch {reference}  head {}\n",
+        "checks: {}\nrepository {repository}  branch {reference}  head {}\n",
+        checks.summary(),
         &checks.head[..checks.head.len().min(12)]
     );
-    for check in &checks.checks {
+    let mut listed: Vec<&Check> = checks.checks.iter().collect();
+    listed.sort_by_key(|check| match check.standing {
+        Standing::Failing => 0,
+        Standing::Pending => 1,
+        Standing::Passing => 2,
+    });
+    for check in listed {
         text.push_str(&format!("{:<16} {}", check.state, check.name));
         if !check.url.is_empty() {
             text.push_str("  ");
@@ -232,7 +319,6 @@ pub(super) fn render(repository: &str, reference: &str, checks: &Checks) -> Stri
         }
         text.push('\n');
     }
-    text.push_str(&format!("checks: {}\n", checks.summary()));
     text
 }
 
@@ -288,16 +374,26 @@ pub(super) fn execute(state: &mut progress::State, site: &CallSite<'_>) -> Resul
         repo,
         token: token_for(&repository)?,
     };
-    match read(&github, &reference) {
-        Ok(checks) => {
-            let block = result_block(
-                &site.call.id,
-                &render(&repository, &reference, &checks),
-                false,
-            );
-            site.complete(state, block, None, None, None)
+    let mut last: Option<Checks> = None;
+    let waited = wait_until(p.wait_min, || {
+        let checks = read(&github, &reference)?;
+        let done = settled([checks.verdict()]);
+        last = Some(checks);
+        Ok(done)
+    });
+    match (waited, last) {
+        (Ok(done), Some(checks)) => {
+            let mut text = render(&repository, &reference, &checks);
+            if !done {
+                text.push_str(&format!(
+                    "still pending after waiting {} min; run ci-status again to wait longer\n",
+                    p.wait_min
+                ));
+            }
+            site.complete(state, result_block(&site.call.id, &text, false), None, None, None)
         }
-        Err(error) => site.fail(state, &format!("ci-status: {error}")),
+        (Ok(_), None) => site.fail(state, "ci-status: nothing was read"),
+        (Err(error), _) => site.fail(state, &format!("ci-status: {error}")),
     }
 }
 
@@ -364,8 +460,74 @@ mod tests {
         assert_eq!(red.verdict(), Some(Standing::Failing));
         assert_eq!(red.summary(), "FAILING: build; pending: test");
         let text = render("r", "f", &red);
-        assert!(text.starts_with("repository r  branch f  head 0123456789ab\n"));
-        assert!(text.ends_with("checks: FAILING: build; pending: test\n"));
+        assert!(text.starts_with(
+            "checks: FAILING: build; pending: test\nrepository r  branch f  head 0123456789ab\n"
+        ));
+        let red_first = Checks {
+            head: "0123456789abcdef".into(),
+            checks: vec![
+                check("lint", Standing::Passing),
+                check("test", Standing::Pending),
+                check("build", Standing::Failing),
+            ],
+        };
+        let listed = render("r", "f", &red_first);
+        let names: Vec<&str> = listed
+            .lines()
+            .skip(2)
+            .map(|line| line.trim())
+            .collect();
+        assert_eq!(names, ["build", "test", "lint"], "failing, then pending, then passing");
+    }
+
+    #[test]
+    fn a_wait_ends_on_the_first_failure_or_when_nothing_is_pending() {
+        use Standing::*;
+        assert!(settled(Vec::<Option<Standing>>::new()));
+        assert!(settled([None]));
+        assert!(settled([Some(Passing), Some(Passing)]));
+        assert!(!settled([Some(Passing), Some(Pending)]));
+        assert!(settled([Some(Pending), Some(Failing)]));
+        assert!(settled([Some(Failing), Some(Pending)]));
+    }
+
+    #[test]
+    fn wait_until_with_no_time_asks_once_and_errors_only_stop_it_when_they_persist() {
+        let mut calls = 0;
+        assert_eq!(wait_until(0, || { calls += 1; Ok(false) }), Ok(false));
+        assert_eq!(calls, 1);
+        assert_eq!(wait_until(0, || Ok(true)), Ok(true));
+        assert_eq!(wait_until(0, || Err::<bool, _>("down".to_string())), Err("down".into()));
+        // A wait too long for the clock has no deadline and does not panic.
+        assert_eq!(wait_until(u64::MAX, || Ok(true)), Ok(true));
+    }
+
+    #[test]
+    fn wait_min_is_whole_minutes_with_no_limit() {
+        let call = |input: Value| Call {
+            id: "a".into(),
+            name: "run_tool".into(),
+            input,
+        };
+        let with = |wait: Value| {
+            parameters(&call(json!({
+                "branch": "feature", "repository": "https://github.com/o/r", "wait-min": wait
+            })))
+            .map(|p| p.wait_min)
+        };
+        assert_eq!(with(json!("20")), Ok(20));
+        assert_eq!(with(json!(" 5 ")), Ok(5));
+        assert_eq!(with(json!(30)), Ok(30));
+        assert_eq!(with(json!("")), Ok(0));
+        assert_eq!(with(Value::Null), Ok(0));
+        assert_eq!(with(json!("100000")), Ok(100000));
+        assert_eq!(with(json!(u64::MAX.to_string())), Ok(u64::MAX));
+        for bad in [json!("soon"), json!("1.5"), json!("-1"), json!(true)] {
+            assert!(with(bad.clone()).is_err(), "{bad}");
+        }
+        let p = parameters(&call(json!({"branch": "feature", "repository": "https://github.com/o/r"})))
+            .unwrap();
+        assert_eq!(p.wait_min, 0);
     }
 
     #[test]

@@ -322,7 +322,17 @@ gives a verdict: FAILING if any failed (a completed run whose conclusion is
 not success, neutral or skipped; a status of failure or error), else pending
 if any has not finished, else passing; `no checks` when there are none,
 which does not block a merge. `stack-merge-to-master` gates on the same
-verdict. It is a step operation only for the token: a worker of its own
+verdict. The verdict is the first line of the output and the failing checks
+are listed first, so a failure is never buried under a long list.
+
+Waiting (`wait-min` here, `wait-for-ci-min` on `stack-merge-to-master`) is a
+poll: GitHub's REST API has no long poll and its webhooks need a listener we
+do not have. Every 15 seconds the unfinished heads are read again, until a
+check fails (the verdict cannot recover, so there is no point waiting for the
+rest) or none is pending, for at most the given minutes, which have no upper limit. Up to
+three failed reads in a row are ridden out. A wait does not know about checks
+that have not been created yet: right after a push it can end at once on `no
+checks`. It is a step operation only for the token: a worker of its own
 would need its own secret grant.
 
 ## `move-sed`: renaming a layer and its description together
