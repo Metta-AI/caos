@@ -329,7 +329,7 @@ Waiting (`wait-min` here, `wait-for-ci-min` on `stack-merge-to-master`) is a
 poll: GitHub's REST API has no long poll and its webhooks need a listener we
 do not have. Every 15 seconds the unfinished heads are read again, until a
 check fails (the verdict cannot recover, so there is no point waiting for the
-rest) or none is pending, for at most the given minutes (180 at most). Up to
+rest) or none is pending, for at most the given minutes, which have no upper limit. Up to
 three failed reads in a row are ridden out. A wait does not know about checks
 that have not been created yet: right after a push it can end at once on `no
 checks`. It is a step operation only for the token: a worker of its own
