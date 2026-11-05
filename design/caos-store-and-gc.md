@@ -146,7 +146,7 @@ per-connection cost; everything else is fetched by bare hash.
 | `refs/caos/req/<hash>` | client `ensure_pushed` (`push <hash>:refs/caos/req/<hash>`) | negotiation base for that client's next push; hidden from upload-pack; the server's only deletion: swept every 120 s, kept 600 s by loose-ref mtime; "they anchor nothing" |
 | `refs/caos/res/<argTree>` | server `pin_result`, top-level external runs only | durability pin "so a client can fetch it by ref and it survives gc"; hidden from advertisement; never read back as a cache; accumulates forever. Sub-runs, map children and cache hits pin nothing |
 | `refs/caos/locator-trees/<rev>` | locator | rev-to-tree memo and retention root for a tree closure; hidden |
-| `refs/caos/v3/conversations/<id>/head` | llm-step, run-and-update-ref, MCP hook, TUI | conversation tip; never rewound by repair |
+| `refs/caos/v3/conversations/<id>/head` | llm-step, run-and-update-ref, MCP hook, TUI | session tip; never rewound by repair |
 | `refs/caos/v3/users/<key>/conversations/{active,archived}/<key>` | clients | membership |
 | `refs/caos/seed`, `refs/caos/dev`, `refs/caos/bins` | bootstrap, `caosd up`, test-stack image | seed records, the dev checkout, host binaries |
 | `refs/heads/actors/<name>` | `std/actor` | actor state branch, CAS by `--force-with-lease` |
@@ -165,8 +165,8 @@ on `.lock` contention (`pin_result_in` retries eight times),
 evaluation and for `GET`/`HEAD /object/<hash>`. Clients fetch anything by
 bare hash (`uploadpack.allowAnySHA1InWant true`, `uploadpack.allowFilter
 true`), with hidden-ref juggling so result objects stay visible to
-receive-pack negotiation. `caos-conversation-list` is `git ls-remote --refs`
-over the v3 prefixes; `caos-conversation` walks the first-parent chain from
+receive-pack negotiation. `caos-session-list` is `git ls-remote --refs`
+over the v3 prefixes; `caos-session` walks the first-parent chain from
 a tip hash.
 
 **Integrity and repair.** `core.fsync objects,reference`, `core.fsyncMethod
@@ -182,23 +182,23 @@ restore from.
 Objects fall into two classes, and git's model is nearly right for one and
 wrong for the other.
 
-**Ref-rooted.** Conversation heads and membership, actor branches, seed,
+**Ref-rooted.** Session heads and membership, actor branches, seed,
 dev, bins, pinned top-level results, locator trees. One hole: gitlinks. A
-conversation tree names every attached source tree as a mode-160000 entry,
+session tree names every attached source tree as a mode-160000 entry,
 and result trees carry `commit <hash>` entries the same way. Git's
 reachability never crosses a gitlink (SPEC: "gitlinks name separate
-histories"), so every imported repository a conversation depends on is
-unreachable from that conversation's head.
+histories"), so every imported repository a session depends on is
+unreachable from that session's head.
 
 **Hash-rooted.** Everything else, which is most of the store: every ArgTree
 after its `req` ref is swept; every result of a sub-run, map child or cache
 hit; every imported or locator-fetched commit; `/cas/out-trace` blobs whose
 hash lives only in a Redis trace event; every `<kind> <hash>` that
 `GET /eval` returned to a model and that the model later passes back as
-`root` or `in`; the tip hashes that `caos-conversation` and
-`/fork-caos-conversation` take. Their referrers are Redis values, process
+`root` or `in`; the tip hashes that `caos-session` and
+`/fork-caos-session` take. Their referrers are Redis values, process
 memory, a model's context window, tickets, trace lines, and text inside
-conversation events (`"result":"<object>"`), none of which git can see.
+session events (`"result":"<object>"`), none of which git can see.
 
 ### 4.1 Resurrection
 
@@ -235,9 +235,9 @@ Fourteen, grouped: liveness (P1–P6), policy (P7–P8), the store itself
 
 **P1. Roots and references must be structural.** The walker can only follow
 tree entries, commit parents and gitlinks. Today some durable references
-are textual (`"result":"<hash>"` in conversation events, out-trace hashes in
+are textual (`"result":"<hash>"` in session events, out-trace hashes in
 Redis, `<kind> <hash>` strings). Either the protocol makes everything a
-conversation depends on a tree entry or gitlink in its tree, or the walker
+session depends on a tree entry or gitlink in its tree, or the walker
 parses every such format forever. Hashes a model writes into free text are
 not roots; the grace window covers them.
 
@@ -270,7 +270,7 @@ by construction, so no live object points at a dead one. The sweep deletes
 only from the complement, never partially; a crash mid-sweep leaves either
 state, not a mix. The startup closure check stays as the audit.
 
-**P7. Retention policy.** Proposed classes: conversation heads, membership,
+**P7. Retention policy.** Proposed classes: session heads, membership,
 actors, seed, dev, bins: keep. Pinned results and locator trees: `T_res`
 (90 d) since last pin or touch, then the pin drops. Import markers:
 `T_cache` (90 d); re-import re-verifies. `req` refs: 600 s as now. Redis
@@ -308,7 +308,7 @@ server-side process. `secrets.git` stays separate with immediate deletion.
 walk already visits all of them), dual-run with the new store
 authoritative, verify by sampled reads, then make the git repo a disposable
 export. The export must be all objects, not reachable objects: the gitlink
-roots conversations depend on are not reachable today.
+roots sessions depend on are not reachable today.
 
 **P14. Observability first.** Before any deletion: a store report counting
 objects and bytes by root class, age since last touch, and gitlink fan-out;
@@ -377,7 +377,7 @@ back under the same name. At no point can a write that succeeded leave the
 store with a missing child.
 
 Policy knobs: `G`, the tombstone window, `T_res`, `T_cache`, and whether
-archived conversations expire.
+archived sessions expire.
 
 ## 8. Sequencing
 
@@ -388,7 +388,7 @@ and move the hash-rooted class first.
    design/chat.md and README's "run `git gc`".
 2. Measure: P9 (delta savings on the real repo) and P14 (store report by
    class and age), on prod and dev.
-3. Make conversation references structural (P1). Independently valuable and
+3. Make session references structural (P1). Independently valuable and
    a prerequisite for either store.
 4. Build the caos store behind the existing object API, with the ref table
    and journal; dual-run; migrate the hash-rooted class first (results,
@@ -405,7 +405,7 @@ and move the hash-rooted class first.
 - Is losing a sub-run result older than `G` and never pinned acceptable
   when the recompute is an `llm-call`?
 - Does anything external depend on `git fetch caos <hash>` or on
-  `ls-remote` of conversation refs?
+  `ls-remote` of session refs?
 - How aggressively to delta within a segment, after the P9 measurement.
-- Do archived conversations ever expire, and are a conversation's gitlinked
-  source trees pinned per conversation or shared?
+- Do archived sessions ever expire, and are a session's gitlinked
+  source trees pinned per session or shared?
