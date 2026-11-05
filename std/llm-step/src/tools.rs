@@ -879,7 +879,9 @@ pub fn describe(tool: &TreeTool, path: &str) -> String {
     } else {
         "\nRead-only: returns a value and changes nothing.\n"
     });
-    out.push_str(if tool.wants_in {
+    out.push_str(if tool.root {
+        "Works on the path its `root` parameter names, and sees nothing else.\n"
+    } else if tool.wants_in {
         "Reads a tree, named by its `in` parameter below.\n"
     } else {
         "Does not read the tree: its arguments are its whole input.\n"
