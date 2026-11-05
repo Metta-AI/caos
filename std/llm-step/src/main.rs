@@ -1846,10 +1846,20 @@ fn launch_root_tool(
     };
     let root_path = nested["input"][tools::ROOT].as_str().unwrap_or_default();
     let base = state.head().clone();
-    let located = root::components(root_path).and_then(|components| {
-        let tree = state.store().tree_of(&base)?;
-        root::resolve(state.store(), &tree, &components)
-    });
+    let located = match root::locate(root_path) {
+        Ok(root::Located::Session(components)) => state
+            .store()
+            .tree_of(&base)
+            .and_then(|tree| root::resolve(state.store(), &tree, &components)),
+        Ok(root::Located::Object(..)) if tool.writer => Err(format!(
+            "root {root_path:?} names an object outside the session; a writer's root is a \
+             path in the session, such as sources/<repo>/<layer>/<file>"
+        )),
+        Ok(root::Located::Object(oid, components)) => {
+            root::resolve_object(state.store(), &oid, &components)
+        }
+        Err(error) => Err(error),
+    };
     let object = match located {
         Ok(object) => object,
         Err(error) => {
