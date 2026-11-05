@@ -8,11 +8,11 @@ tests plus every `tests/<name>`:
 
 ```
 run_tool(path="caos-std/caos-test",
-         arguments={"in": "sources/caos/<layer>", "only": "git-import"})
+         arguments={"root": "sources/caos/<layer>", "only": "git-import"})
 ```
 
-- `in` is the source tree you edited. Omitting it tests the tree the tool sits
-  in, which is not your change.
+- `root` is the source tree you edited. It is required: nothing is implied by
+  where the tool sits.
 - `only` takes bare `tests/` directory names, space-separated, no `tests/`
   prefix. Use it while iterating; run the whole suite before you finish.
 - `test-salt=<fresh value>` re-runs cached tests. Use it for anything on a push
