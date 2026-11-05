@@ -269,7 +269,7 @@ func check(i int) {
 	}
 	w.True(failed, "case %s was not refused: %s", c.name, out)
 	w.True(strings.HasPrefix(out, "FAILED: "), "case %s has no FAILED banner: %s", c.name, out)
-	w.True(prop == conv, "case %s: a refusal changed the session", c.name)
+	w.True(rootErr != nil, "case %s: a refusal answered a root", c.name)
 	for _, s := range c.says {
 		w.True(strings.Contains(out, s), "case %s does not say %q: %s", c.name, s, out)
 	}
