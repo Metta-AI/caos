@@ -560,6 +560,7 @@ fn parse_help(ctx: &str, text: &str) -> Help {
     let mut writer = false;
     let mut wants_in = false;
     let mut call = false;
+    let mut request_id = false;
     let mut scope: Option<String> = None;
     let mut op: Option<String> = None;
     let mut in_tags = false;
