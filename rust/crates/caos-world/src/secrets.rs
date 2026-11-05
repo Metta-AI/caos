@@ -155,7 +155,7 @@ fn parse_session_reader(file_name: &str, val: &str) -> Result<Reader, String> {
     let mut session = None;
     for word in words {
         match word.split_once('=') {
-            Some(("conversation", id)) if !id.is_empty() => session = Some(id.to_string()),
+            Some(("conversation" | "session", id)) if !id.is_empty() => session = Some(id.to_string()),
             _ => return Err(format!("secret {file_name}: unknown reader field {word:?}")),
         }
     }
