@@ -73,7 +73,7 @@ sources/<repo>/
 - **`99-dirty`** is where you work between layers. Edit it freely, and let its
   history grow. It has no `.pr.md`, so it is never published. When the work in
   it is a finished chunk, `move` it to the next layer name
-  (`move(from="sources/<repo>/99-dirty", to="sources/<repo>/02-<name>")`),
+  (`move(root="sources/<repo>", from="99-dirty", to="02-<name>")`),
   write `sources/<repo>/02-<name>.pr.md`, then `copy` that layer to a fresh
   `99-dirty` to carry on.
 - **Make a new layer only where you would normally start a new layer of a
