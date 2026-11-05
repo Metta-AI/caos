@@ -561,10 +561,13 @@ reach usually means the grant is missing.
 
 - This file is `std/GIT.md`, upper case. `read` and `ls` cannot see `caos-std/`
   directly: `eval_path(path="caos-std")` gives a tree hash, then
-  `ls(root=<hash>)` and `read(file-path="GIT.md", root=<hash>)`. A lowercase
+  `ls(root=<hash>)` and `read(root="<hash>/GIT.md")`. A lowercase
   `git.md` is "no such path".
-- `edit` takes `file-path`, `old-string` and `new-string` (hyphens, not
-  underscores), and the old string must occur exactly once.
+- Every file tool takes `root`, the path it works on, relative to the session:
+  the file for `read`, `write`, `edit` and `remove`; the directory holding both
+  paths for `copy` and `move`, whose `from` and `to` are relative to it.
+- `edit` takes `old-string` and `new-string` (hyphens, not underscores), and
+  the old string must occur exactly once.
 - `theirs` for `merge` is a full commit hash or the path of a source tree in
   the session, never a branch name.
 - `copy` and `move` refuse an existing destination; `remove` first. `move`
