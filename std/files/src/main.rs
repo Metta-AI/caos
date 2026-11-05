@@ -427,46 +427,15 @@ fn move_entry(root: Option<&str>) -> Result<Written, Fail> {
             to.join("/")
         )));
     }
-    let copied = copy_entry(ws, &from, &to)?;
-    let prop = remove_entry(&copied, &from)?;
-    Ok((
-        prop,
-        format!("moved {} to {}", from.join("/"), to.join("/")),
-        format!("move {} to {}", from.join("/"), to.join("/")),
-    ))
+    let copied = copy_entry(path(&dir), &from, &to)?;
+    let new = remove_entry(&copied, &from)?;
+    let out = format!("moved {} to {}", from.join("/"), to.join("/"));
+    Ok((New::Object(new), out))
 }
 
-fn remove(ws: &str) -> Result<Written, Fail> {
-    let comps = components("file-path")?;
-    reject_protocol(&comps)?;
-    let prop = remove_entry(ws, &comps)?;
-    Ok((
-        prop,
-        format!("removed {}", comps.join("/")),
-        format!("remove {}", comps.join("/")),
-    ))
-}
-
-/// Rebuild the tree with `comps` holding `content` (mode `mode`, default 0644):
-/// at each level every untouched entry is a link (staging resolves links by
-/// recorded hash, so nothing else is fetched) and the target component is
-/// descended into or written. A source tree boundary on the way is restored by
-/// `caos put`, which is how editing inside one makes a child commit.
-fn rebuild(ws: &str, comps: &[String], content: &[u8], mode: Option<u32>) -> Result<String, Fail> {
-    let work = scratch(&fresh_name("files")).map_err(Infra)?;
-    let relative = comps.join("/");
-    worker_common::files::materialize(ws, &work, std::slice::from_ref(&relative)).map_err(Infra)?;
-    refuse_symlinks(&work, &comps[..comps.len() - 1], "write/edit")?;
-    let target = work.join(&relative);
-    fs::create_dir_all(target.parent().unwrap()).map_err(|e| Infra(e.to_string()))?;
-    fs::write(&target, content).map_err(|e| Infra(e.to_string()))?;
-    if let Some(mode) = mode {
-        fs::set_permissions(&target, fs::Permissions::from_mode(mode))
-            .map_err(|e| Infra(e.to_string()))?;
-    }
-    let out = fresh("files-out");
-    caos(["put", path(&work), &out]).map_err(Infra)?;
-    Ok(out)
+fn remove(root: Option<&str>) -> Result<Written, Fail> {
+    present(root)?;
+    Ok((New::Deleted, "removed".to_string()))
 }
 
 fn refuse_symlinks(work: &Path, ancestors: &[String], what: &str) -> Result<(), Fail> {
