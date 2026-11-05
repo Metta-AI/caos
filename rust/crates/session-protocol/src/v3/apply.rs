@@ -211,7 +211,7 @@ pub fn apply(
             }
             let next = session.transcript_len()?;
             validate_entry_resolution(&session, entry, &mut builder)?;
-            put_transcript(&mut builder, next, entry, payloads)?;
+            put_transcript(&mut builder, session.format()?, next, entry, payloads)?;
             ordinal = Some(next);
         }
         Transition::ToolStart { record, payloads } => {
@@ -522,6 +522,7 @@ fn put_publication(events: &mut Vec<Event>, record: &PublicationRecord) {
 
 fn put_transcript(
     builder: &mut TreeBuilder,
+    format: paths::Format,
     ordinal: u64,
     entry: &TranscriptEntry,
     payloads: &[(String, Vec<u8>)],
@@ -537,7 +538,7 @@ fn put_transcript(
     builder.put(
         &paths::transcript_entry_path(ordinal, &entry.message_id),
         Mode::Blob,
-        entry.encode(),
+        entry.encode_as(format),
     );
     Ok(())
 }
