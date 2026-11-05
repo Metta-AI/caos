@@ -245,13 +245,14 @@ func main() {
 			return use(id, "publish_source", map[string]any{"source_tree": source,
 				"repository": "https://caos-squash-publish.invalid/repo.git", "branch": "feature", "force": true})
 		}
-		// The same operation reached BY PATH: std/publish-source is an entry for an
-		// operation of the step (`@op`), so a session that mounts it runs it with
-		// run_tool like any tool. Its arguments are strings, like every tool's.
+		// The same publication reached BY PATH: std/publish-source is an ordinary
+		// worker (design/tool-contract.md), run with run_tool like any tool, with
+		// the source tree as `root`. Without force it reads the branch first, which
+		// is where a `.invalid` host stops it.
 		publishByPath := func(id, source string) map[string]any {
 			return use(id, "run_tool", map[string]any{"path": "tools/publish-source", "arguments": map[string]any{
-				"source-tree": source, "repository": "https://caos-squash-publish.invalid/repo.git",
-				"branch": "feature", "force": "true"}})
+				"root": source, "repository": "https://caos-squash-publish.invalid/repo.git",
+				"branch": "feature"}})
 		}
 		respond(1,
 			write("tu_sh", "tools/sh/.caos-expr", "curry --base:hash="+caos("hash", "/cas/args/bash-tool")),
