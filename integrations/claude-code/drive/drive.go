@@ -755,14 +755,14 @@ func joinAny(v any) string {
 	return strings.Join(out, ", ")
 }
 
-// conv finds the SESSION a session records into, on the caos server.
+// conv finds the caos SESSION a Claude Code session records into, on the caos server.
 //
 // THE ID IS NOT THE ONE IN THE URL. A session is `cc/<the Claude Code
 // INTERNAL session uuid>`, which appears only in hook payloads, and the ref
 // spells that HEX-ENCODED — so neither the session id you can see nor a plain
 // grep of the refs will find it.
 //
-// Why bother: the session tree is the one place that says what a session
+// Why bother: the session tree is the one place that says what a Claude Code session
 // actually evaluates. A checkout can be rewritten (dev mode rewrites
 // .caos-expr) while the session still carries the committed file, and
 // from inside the session the two are indistinguishable — mcp__caos__read
@@ -796,7 +796,7 @@ func conv(o opts) error {
 	}
 	if internal == "" {
 		return fmt.Errorf("no hook payload in %s yet, so no internal session id.\n"+
-			"  A session that has not run a turn has no session.", id)
+			"  A Claude Code session that has not run a turn has no caos session yet.", id)
 	}
 	name := "cc/" + internal
 	ref := "refs/caos/v3/conversations/" + fmt.Sprintf("%x", name) + "/head"

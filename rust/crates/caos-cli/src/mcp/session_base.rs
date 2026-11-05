@@ -1,4 +1,4 @@
-//! Where a new session's session content comes from: a git locator naming a
+//! Where a new Claude Code session's caos session content comes from: a git locator naming a
 //! COMMIT.
 //!
 //! The harness puts whatever it wants the session to start from into a git

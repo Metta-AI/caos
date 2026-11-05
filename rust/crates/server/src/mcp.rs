@@ -91,10 +91,10 @@ fn step_tool(name: &str) -> Option<&'static str> {
     }
 }
 
-/// A session's session id is derived, never stored: the ref is the only
+/// A Claude Code session's caos session id is derived, never stored: the ref is the only
 /// state. A session id is the one ref component we do not author, so it is
 /// validated through the protocol's own parser rather than trusted.
-fn session_id_for(session: &str) -> Result<String, String> {
+fn session_id_for(claude_session: &str) -> Result<String, String> {
     let id = format!("{SESSION_PREFIX}{session}");
     refs::validate_session_id(&id)?;
     Ok(id)
@@ -123,7 +123,7 @@ fn call(config: &Arc<Config>, caller: &Caller, params: &Value) -> Result<Value, 
         .unwrap_or_else(|| json!({}));
     let session = args.get(SESSION_ARG).and_then(Value::as_str);
     // `help` with no path reports on the server and belongs to no session
-    // call: it takes the session only to say which session that is.
+    // call: it takes the Claude Code session only to say which caos session that is.
     if name == "help"
         && args
             .get("path")
@@ -379,7 +379,7 @@ fn overview(config: &Config, caller: &Caller, session: Option<&str>) -> Value {
              PreToolUse hook that supplies it is not installed\n"
         ),
         Some(session) => match session_id_for(session) {
-            Err(error) => format!("session: session {session:?} is unusable: {error}\n"),
+            Err(error) => format!("session: Claude Code session {claude_session:?} is unusable: {error}\n"),
             Ok(id) => format!(
                 "session: {id}\nsession head: {}\n",
                 head_of(config, &id)

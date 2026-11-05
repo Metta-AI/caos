@@ -183,7 +183,7 @@ pub(crate) fn usage() -> String {
 pub(crate) mod tests {
     use super::Args;
 
-    /// A session session names its two workers, so every parse that is
+    /// A TUI run on a session names its two workers, so every parse that is
     /// meant to SUCCEED carries them. `app.rs` uses this too.
     pub(crate) fn with_images(raw: &[&str]) -> Vec<String> {
         ["--llm-step:@=std/llm-step", "--llm-call:@=std/llm-call"]

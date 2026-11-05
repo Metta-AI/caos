@@ -195,7 +195,7 @@ JSON-RPC error `-32601`. The tool list is a constant: `run`, `help`, `start`,
 `result`, `eval-path`.
 
 Each `tools/call` names its session in the `caos_session` argument (the
-session id is `cc/<session>`) and optionally `caos_tool_use_id`. Both are
+session id is `cc/<Claude Code session id>`) and optionally `caos_tool_use_id`. Both are
 supplied by the harness's PreToolUse hook. They map onto the endpoints above as
 follows, with the step (`X-Caos-Step`) as the `base` and the arguments
 `session`, `tools-only`, `tool`, `arguments` (JSON) and `max-result-chars`:

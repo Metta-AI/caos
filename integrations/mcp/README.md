@@ -8,7 +8,7 @@ is a stdio JSON-RPC MCP server (rust/crates/caos-cli/src/mcp/, documented in tha
 crate's `MCP.md`). It offers five fixed tools — `run`, `help`, `start`, `result` and
 `eval-path` — and what they run is named by a path in the session (`caos-std/read`,
 `caos-std/bash-tool`, ...), each call a caos run recorded into a
-session. `caos mcp hook` records the session.
+session. `caos mcp hook` records the Claude Code session.
 
 What a PARTICULAR client needs to launch, configure and record against it — its
 config format, its hooks, its cloud packaging — lives under that client's name

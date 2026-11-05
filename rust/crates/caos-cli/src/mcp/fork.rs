@@ -5,7 +5,7 @@
 //! moves):
 //!
 //! ```text
-//! /fork-caos-session <hash>     a NEW branch: the new session's own
+//! /fork-caos-session <hash>     a NEW branch: the new Claude Code session's own
 //!                                    `cc/<session>` session, whose
 //!                                    history is <hash>'s, then diverges
 //! ```
@@ -19,7 +19,7 @@
 //! The fork itself is the step's (`llm-step --record=prompt --from=<hash>`): it
 //! settles the source, forks it and records the prompt on the server. A fork
 //! needs no bookkeeping here -- its id is derived from the session id like any
-//! other, so a session's session is always `session_id_for(session)`.
+//! other, so a Claude Code session's caos session is always `session_id_for(claude_session)`.
 
 use session_protocol::v3::oid::Oid;
 

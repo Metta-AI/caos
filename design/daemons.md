@@ -540,7 +540,7 @@ existing dev mode, `refs/caos/dev` and `--dev-commit`) is future work.
 
 ## Results: harvest
 
-The cloud session records its session into the inner stack's git, and that
+The cloud session records itself into the inner stack's git, and that
 dies with the container. `harvest` copies it out.
 
 - The daemon script, running with the outer `/bin/caos`, reads the inner stack's

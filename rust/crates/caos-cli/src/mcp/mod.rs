@@ -403,7 +403,7 @@ fn debug_log_hook(
 /// refusal (not the head, not on this server) is never seen by anyone.
 fn refuse_prompt(error: &str) -> ! {
     eprintln!(
-        "caos: this session is NOT attached to that session: {error}\n\
+        "caos: this Claude Code session is NOT attached to that caos session: {error}\n\
          Nothing was recorded; fix the command and send it again."
     );
     std::process::exit(2)
@@ -417,12 +417,12 @@ fn on_user_prompt(config: &Config, payload: &Value) -> Result<(), String> {
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    // `/fork-caos-session <hash>` makes the session this session records
+    // `/fork-caos-session <hash>` makes the caos session this Claude Code session records
     // into, as a fork of that commit. The step does it with the first prompt, and
-    // does nothing once the session has its session.
+    // does nothing once the Claude Code session has its caos session.
     //
     // A refusal exits 2, the one status with which Claude Code blocks the prompt
-    // and shows the reason: a session that ran on would have no session
+    // and shows the reason: a Claude Code session that ran on would have no caos session
     // behind it, and a tool call would fail with a reason nobody sees.
     let from = match fork::parse_command(prompt) {
         Ok(from) => from,
@@ -494,7 +494,7 @@ fn agents_md(config: &Config, head: &str) -> Result<Option<String>, String> {
         .take(64_000)
         .collect();
     Ok(Some(format!(
-        "The session's AGENTS.md, its instructions for this session:\n\n{text}"
+        "The session's AGENTS.md, its instructions for this Claude Code session:\n\n{text}"
     )))
 }
 
@@ -547,7 +547,7 @@ fn username() -> Result<String, String> {
     Ok(crate::ambient_username(std::env::var("USER"))?.unwrap_or_else(|| "user".to_string()))
 }
 
-/// Record a user's prompt, creating the session on the session's first one;
+/// Record a user's prompt, creating the caos session on the Claude Code session's first one;
 /// the step's status says what happened (`created`, `forked`, `recorded`, ...).
 ///
 /// The step appends the message and nothing else: a session keeps no turn
@@ -557,7 +557,7 @@ fn username() -> Result<String, String> {
 /// A NEW session needs where it starts from, which the step cannot find for
 /// itself: `from`, the commit it forks, and the locator naming its content. With
 /// `from` alone the fork keeps its source's content; with both, the content
-/// commit is merged into the fork, which is how a session picks a session
+/// commit is merged into the fork, which is how a Claude Code session picks a caos session
 /// up on a newer client repo. Both go with every prompt and the step uses them
 /// only when the session does not exist yet.
 fn record_prompt(
@@ -633,18 +633,18 @@ fn on_pre_tool_use(payload: &Value) -> Result<(), String> {
     Ok(())
 }
 
-/// The session a hook payload's session records into.
+/// The caos session a hook payload's Claude Code session records into.
 fn recorded_session(payload: &Value) -> Result<String, String> {
     session_id_for(string_field(payload, "session_id")?)
 }
 
-/// A session's session id is derived, never stored: the ref is the only
+/// A Claude Code session's caos session id is derived, never stored: the ref is the only
 /// state, so there is no map to fall out of step with the sessions it names.
 ///
 /// A session id is the one ref component we do not author, so it is validated
 /// through the protocol's own parser rather than trusted — whether it arrives
 /// in a hook payload or as a tool argument.
-fn session_id_for(session: &str) -> Result<String, String> {
+fn session_id_for(claude_session: &str) -> Result<String, String> {
     let id = format!("{SESSION_PREFIX}{session}");
     refs::validate_session_id(&id)?;
     Ok(id)
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_become_valid_session_ids() {
+    fn claude_session_ids_become_valid_session_ids() {
         let payload = json!({"session_id": "88888abc-9ae5-4d07-a44d-54b366776bdc"});
         assert_eq!(
             recorded_session(&payload).unwrap(),
@@ -744,7 +744,7 @@ mod tests {
         );
     }
 
-    /// A session id is the one part of a session id we do not author.
+    /// A Claude Code session id is the one part of a caos session id we do not author.
     /// v3 puts the id in its ref path HEX-ENCODED, so a hostile one cannot
     /// escape the namespace or name a directory -- which is what this pins,
     /// rather than a rejection the protocol deliberately does not perform.

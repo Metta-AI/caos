@@ -259,7 +259,7 @@ func main() {
 		timeout, _ := promptHook["timeout"].(float64)
 		w.True(timeout >= 300, "the prompt hook's timeout is %v, not the 300s a resume over iroh needs", promptHook["timeout"])
 
-		// The slash command that starts a session from a recorded session.
+		// The slash command that starts a Claude Code session from a recorded caos session.
 		// The marker line is what the prompt hook keys on if it is handed the
 		// expansion rather than what was typed, so it is asserted, not just the
 		// file.

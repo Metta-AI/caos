@@ -269,9 +269,9 @@ one: a `Stop` for an unknown session fails rather than inventing a root, so
 hooks installed mid-session are a loud error and not a transcript that begins in
 the middle.
 
-The session id is derived from the session id rather than stored in a map,
+The caos session id is derived from the Claude Code session id rather than stored in a map,
 so the ref is the whole record. `claude --resume` keeps its session id, so a
-resumed session extends the same session.
+resumed Claude Code session extends the same caos session.
 
 **A call is one request to the server.** `POST /eval/run` of the step, as a
 form: `base:hash` (the step), `session`, `tools-only=<tool_use_id>`, `tool`
@@ -302,7 +302,7 @@ previous one left. The compare-and-swap retries are therefore not a concurrency
 model — they protect against another writer, such as an interjection typed into
 the tui against the same session.
 
-## Picking a session up in a new session
+## Picking a session up in a new Claude Code session
 
 A cloud session is disposable and its Claude Code context dies with it; the
 session does not. One slash command takes the session COMMIT to start
@@ -312,7 +312,7 @@ with no path. A commit, because it is immutable where a ref moves.
 `/fork-caos-session <hash>` makes a NEW branch: the session's own
 `cc/<session>` session, made by `conversation.fork` on `<hash>`. The original
 does not move. There is no command that continues the SAME branch from a new
-session: a session's session is always the one its id derives, so nothing
+session: a Claude Code session's caos session is always the one its id derives, so nothing
 about it is kept locally.
 
 **The fork brings the session's client repo in.** The hook sends its content

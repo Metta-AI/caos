@@ -130,7 +130,7 @@ func main() {
 	// file existing is the whole claim.
 	if rev := dev["rev"]; rev != "" {
 		fmt.Printf("caos dev mode: ON -- the whole install package came from "+
-			"refs/caos/dev at %s, and this session's session seeds from %s "+
+			"refs/caos/dev at %s, and this session seeds from %s "+
 			"(HEAD pointed at the dev server; the checkout is untouched).\n", short(rev), short(dev["seed"]))
 		reportDev(rev, <-served)
 	} else {

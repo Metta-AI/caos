@@ -430,12 +430,12 @@ The earlier session's context is not in your head, so recover it before doing an
 
 var commands = map[string]string{
 	"fork-caos-session.md": `---
-description: Fork a recorded caos session into this session (a new branch from the same commit)
+description: Fork a recorded caos session into this Claude Code session (a new branch from the same commit)
 argument-hint: <session-commit-hash>
 ---
 caos-session-command: fork $ARGUMENTS
 
-You are picking up work recorded in another caos session. This session's session is a FORK of commit $ARGUMENTS: it starts with that session's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original. The fork also merged in this session's client repo, so the tools under caos-std/ and the instructions are this session's, not the ones the earlier session ran with.
+You are picking up work recorded in another caos session. This Claude Code session records into a FORK of commit $ARGUMENTS: it starts with that session's whole history and its workspace (imports/, feature/, and so on) and is its own branch from here. Nothing you do changes the original. The fork also merged in this session's client repo, so the tools under caos-std/ and the instructions are this session's, not the ones the earlier session ran with.
 ` + commandFooter,
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# `/fork-caos-session <hash>`, as the hook sees it on a new session's first
-# prompt: the new session gets its OWN session, whose history is <hash>'s;
+# `/fork-caos-session <hash>`, as the hook sees it on a new Claude Code session's first
+# prompt: the new Claude Code session gets its OWN caos session, whose history is <hash>'s;
 # the original does not move.
 #
 # A head left open (a session that died mid-turn) is forked as it is: a
@@ -75,7 +75,7 @@ case "$(subjects "$head_f")" in
   *"conversation.fork "*) ;;
   *) fail "no conversation.fork on the fork's branch: $(subjects "$head_f")" ;;
 esac
-# A second prompt is an ordinary one: the session already has its session.
+# A second prompt is an ordinary one: the Claude Code session already has its caos session.
 prompt "$f" "/fork-caos-session $head_a" >/dev/null
 stop "$f" "forked and done"
 
