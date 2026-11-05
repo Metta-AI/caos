@@ -9,6 +9,8 @@ tool, including the git operations, can meet as an ordinary worker:
    answered as such and the agent decides what to do.
 2. The git `@op` tools (`import-source`, `publish-source`, `stack-publish`,
    `stack-sync`, `stack-merge-to-master`, `ci-status`) become ordinary workers.
+   None holds the token: each hands its remote work to its neighbour
+   `std/github`, so one grant covers them all.
 3. Every tool that reads or changes a tree names it with one argument, `root`.
    A writer returns a new object for `root`; the harness rewrites everything
    above it.
