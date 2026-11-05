@@ -67,9 +67,34 @@ neither combines its commits into one nor discards their history.
 
 ## Session commits
 
-A session ref, `refs/caos/v3/conversations/<hex(id)>/head`, identifies its
+A session ref, `refs/caos/v4/sessions/<hex(id)>/head`, identifies its
 current `C` in CAOS Git. A normal update creates a commit parented by the previous
 `C`, then advances the ref only if it still points to the expected head.
+
+### Sessions from before the rename
+
+caos used to call a session a conversation, and its stored names said so. A
+session recorded then is unchanged and stays readable, appendable and forkable:
+
+- **Refs.** Its head is `refs/caos/v3/conversations/<hex(id)>/head` and each
+  user's membership `refs/caos/v3/users/<hex(user)>/conversations/{active,archived}/<hex(id)>`
+  (v4: `refs/caos/v4/users/<hex(user)>/sessions/...`). A reader that finds no
+  v4 ref reads the v3 one (`refs::legacy_ref`), and the first write after that
+  creates the v4 ref with the v3 head as its parent. Nothing writes or deletes
+  v3 refs, so the old name keeps naming the old history.
+- **Format.** Its `.caos/format` is `caos-conversation-v6`: v7 under the old
+  names, with `conversation.root`/`conversation.fork` commit messages and a
+  transcript entry's `conversation` key. Both formats are read; an append to a
+  v6 session is written as v6, so its history validates as it was written.
+  Forking a v6 session (`/fork-caos-session <hash>`, which still answers to
+  `/fork-caos-conversation`) makes a v7 session: the fork commit rewrites the
+  format marker and the transcript entries the v7 way.
+
+Two stored names keep the old word for good, because they are hashed rather
+than read: the genesis commit G3's message `caos-conversation-genesis-v3`
+(changing it changes G3, the parent of every root), and the `conversation` key
+that derived ids hash (`ids::child_id`, publication invocations), which a
+session that is already running must keep deriving the same way.
 
 Each `C`'s tree is a complete snapshot of the session filesystem.
 `.caos/transcript` holds its ordered messages; `.caos/title` holds its title.
