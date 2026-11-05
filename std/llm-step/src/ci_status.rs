@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_min_is_whole_minutes_up_to_the_limit() {
+    fn wait_min_is_whole_minutes_with_no_limit() {
         let call = |input: Value| Call {
             id: "a".into(),
             name: "run_tool".into(),
